@@ -1,0 +1,31 @@
+[package]
+name = "theme_json"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/theme_json.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+derive_more.workspace = true
+gpui.workspace = true
+log.workspace = true
+palette.workspace = true
+refineable.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_lenient.workspace = true
+settings_macros.workspace = true
+strum.workspace = true
+theme.workspace = true
+util.workspace = true
+uuid.workspace = true

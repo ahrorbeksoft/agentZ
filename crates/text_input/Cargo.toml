@@ -1,0 +1,19 @@
+[package]
+name = "text_input"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lib]
+path = "src/text_input.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui.workspace = true
+log.workspace = true
+theme.workspace = true
+unicode-segmentation.workspace = true

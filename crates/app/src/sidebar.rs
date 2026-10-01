@@ -1,0 +1,248 @@
+use gpui::{AnyElement, Context, Entity, Subscription, Window};
+use projects::{Project, ProjectScope, ProjectStore, Thread};
+use ui::{ContextMenu, Tooltip, prelude::*, right_click_menu};
+
+use crate::OpenFolder;
+
+const ROW_HEIGHT: Pixels = px(28.);
+pub const SIDEBAR_WIDTH: Pixels = px(290.);
+
+pub struct Sidebar {
+    store: Entity<ProjectStore>,
+    _subscription: Subscription,
+}
+
+impl Sidebar {
+    pub fn new(store: Entity<ProjectStore>, cx: &mut Context<Self>) -> Self {
+        let subscription = cx.observe(&store, |_, _, cx| cx.notify());
+        Self {
+            store,
+            _subscription: subscription,
+        }
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_all_scope = self.store.read(cx).scope() == ProjectScope::All;
+        h_flex()
+            .h(px(40.))
+            .flex_none()
+            .px_3()
+            .justify_between()
+            .child(
+                Label::new(if is_all_scope { "Projects" } else { "Threads" }).color(Color::Muted),
+            )
+            .when(is_all_scope, |header| {
+                header.child(
+                    IconButton::new("sidebar-open-folder", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(|_, cx| Tooltip::for_action("Open Folder…", &OpenFolder, cx))
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx)),
+                )
+            })
+    }
+
+    fn render_project(
+        &self,
+        project: &Project,
+        show_header: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let store = self.store.read(cx);
+        let threads: Vec<Thread> = store.threads_for(project.id).cloned().collect();
+        let is_collapsed = show_header && store.is_collapsed(project.id);
+
+        v_flex()
+            .w_full()
+            .when(show_header, |group| {
+                group.child(self.render_project_header(project, threads.len(), is_collapsed, cx))
+            })
+            .when(!is_collapsed, |group| {
+                let indent = if show_header { px(22.) } else { px(0.) };
+                if threads.is_empty() {
+                    group.child(
+                        h_flex().h(ROW_HEIGHT).pl(indent + px(14.)).child(
+                            Label::new("No threads yet")
+                                .size(LabelSize::Small)
+                                .color(Color::Placeholder),
+                        ),
+                    )
+                } else {
+                    let mut rows = Vec::with_capacity(threads.len());
+                    for thread in threads {
+                        rows.push(self.render_thread(thread, indent, cx));
+                    }
+                    group.children(rows)
+                }
+            })
+            .into_any_element()
+    }
+
+    fn render_project_header(
+        &self,
+        project: &Project,
+        thread_count: usize,
+        is_collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let project_id = project.id;
+        let name = project.name();
+        let store = self.store.clone();
+        let hover_background = cx.theme().colors().ghost_element_hover;
+        let menu_open_background = cx.theme().colors().ghost_element_selected;
+
+        right_click_menu(("project-menu", project_id.0))
+            .trigger(move |is_menu_open, _, _| {
+                h_flex()
+                    .id(("project-header", project_id.0))
+                    .h(ROW_HEIGHT)
+                    .w_full()
+                    .px_2()
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .when(is_menu_open, |row| row.bg(menu_open_background))
+                    .hover(|row| row.bg(hover_background))
+                    .child(
+                        Icon::new(if is_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1().min_w_0().child(Label::new(name).truncate()))
+                    .when(thread_count > 0, |row| {
+                        row.child(
+                            Label::new(thread_count.to_string())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .on_click({
+                        let store = store.clone();
+                        move |_, _, cx| {
+                            store.update(cx, |store, cx| store.toggle_collapsed(project_id, cx))
+                        }
+                    })
+            })
+            .menu({
+                let store = self.store.clone();
+                move |window, cx| {
+                    let is_all_scope = store.read(cx).scope() == ProjectScope::All;
+                    let store = store.clone();
+                    ContextMenu::build(window, cx, move |menu, _, _| {
+                        let scope_store = store.clone();
+                        let remove_store = store.clone();
+                        menu.entry(
+                            if is_all_scope {
+                                "Show Only This Project"
+                            } else {
+                                "Show All Projects"
+                            },
+                            None,
+                            move |_, cx| {
+                                let scope = if is_all_scope {
+                                    ProjectScope::Project(project_id)
+                                } else {
+                                    ProjectScope::All
+                                };
+                                scope_store.update(cx, |store, cx| store.set_scope(scope, cx));
+                            },
+                        )
+                        .separator()
+                        .entry("Remove From List", None, move |_, cx| {
+                            remove_store
+                                .update(cx, |store, cx| store.remove_project(project_id, cx));
+                        })
+                    })
+                }
+            })
+    }
+
+    fn render_thread(&self, thread: Thread, indent: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let hover_background = cx.theme().colors().ghost_element_hover;
+        h_flex()
+            .id(("thread", thread.id.0))
+            .h(ROW_HEIGHT)
+            .w_full()
+            .pl(indent + px(8.))
+            .pr_2()
+            .gap_1p5()
+            .cursor_pointer()
+            .hover(|row| row.bg(hover_background))
+            .child(
+                Icon::new(IconName::Terminal)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(thread.title).truncate()),
+            )
+            .into_any_element()
+    }
+
+    fn render_empty_state(&self) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(Label::new("No projects yet").color(Color::Muted))
+            .child(
+                Button::new("empty-open-folder", "Open Folder…")
+                    .style(ButtonStyle::Outlined)
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx)),
+            )
+    }
+}
+
+impl Render for Sidebar {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().colors().border;
+        let border_variant = cx.theme().colors().border_variant;
+        let panel_background = cx.theme().colors().panel_background;
+        let store = self.store.read(cx);
+        let show_headers = store.scope() == ProjectScope::All;
+        let projects: Vec<Project> = store.visible_projects().cloned().collect();
+
+        v_flex()
+            .w(SIDEBAR_WIDTH)
+            .h_full()
+            .flex_none()
+            .border_r_1()
+            .border_color(border)
+            .bg(panel_background)
+            .child(self.render_header(cx))
+            .child(if projects.is_empty() {
+                self.render_empty_state().into_any_element()
+            } else {
+                let mut groups = Vec::with_capacity(projects.len());
+                for (index, project) in projects.iter().enumerate() {
+                    groups.push(
+                        div()
+                            .when(show_headers && index > 0, |group| {
+                                group.border_t_1().border_color(border_variant)
+                            })
+                            .child(self.render_project(project, show_headers, cx)),
+                    );
+                }
+                v_flex()
+                    .id("sidebar-projects")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .pb_2()
+                    .children(groups)
+                    .into_any_element()
+            })
+    }
+}

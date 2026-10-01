@@ -1,0 +1,33 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "agentz"
+path = "src/main.rs"
+
+[features]
+# Compiles Metal shaders at runtime so macOS builds work without a full Xcode install.
+default = ["runtime_shaders"]
+runtime_shaders = ["gpui_platform/runtime_shaders"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+assets.workspace = true
+dirs.workspace = true
+env_logger.workspace = true
+gpui.workspace = true
+gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+log.workspace = true
+menu.workspace = true
+projects.workspace = true
+text_input.workspace = true
+theme.workspace = true
+theme_json.workspace = true
+ui.workspace = true

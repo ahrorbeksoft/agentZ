@@ -1,0 +1,71 @@
+// This crate was essentially pulled out verbatim from main `zed` crate to avoid having to run RustEmbed macro whenever zed has to be rebuilt. It saves a second or two on an incremental build.
+
+use anyhow::Context as _;
+use gpui::{App, AssetSource, Result, SharedString};
+
+// Release builds embed the assets; dev builds read them from the checkout at
+// runtime so edits show up on the next launch without a rebuild and no
+// build-time path is baked in (which corgi's sandbox rejects). See
+// `util::fs_embed!`.
+util::fs_embed! {
+    pub struct Assets,
+    crate_relative = "../../assets",
+    root_relative = "assets",
+    include = [
+        "fonts/**/*",
+        "icons/**/*",
+        "images/**/*",
+        "themes/**/*",
+        "sounds/**/*",
+        "prompts/**/*",
+        "*.md",
+    ],
+    exclude = ["themes/src/*", "*.DS_Store"],
+}
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        Self::get(path)
+            .map(|f| Some(f.data))
+            .with_context(|| format!("loading asset at path {path:?}"))
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        Ok(Self::iter()
+            .filter_map(|p| {
+                if p.starts_with(path) {
+                    Some(p.into())
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+}
+
+impl Assets {
+    /// Populate the [`TextSystem`] of the given [`AppContext`] with all `.ttf` fonts in the `fonts` directory.
+    pub fn load_fonts(&self, cx: &App) -> anyhow::Result<()> {
+        let font_paths = self.list("fonts")?;
+        let mut embedded_fonts = Vec::new();
+        for font_path in font_paths {
+            if font_path.ends_with(".ttf") {
+                let font_bytes = cx
+                    .asset_source()
+                    .load(&font_path)?
+                    .expect("Assets should never return None");
+                embedded_fonts.push(font_bytes);
+            }
+        }
+
+        cx.text_system().add_fonts(embedded_fonts)
+    }
+
+    pub fn load_test_fonts(&self, cx: &App) {
+        cx.text_system()
+            .add_fonts(vec![
+                self.load("fonts/lilex/Lilex-Regular.ttf").unwrap().unwrap(),
+            ])
+            .unwrap()
+    }
+}
