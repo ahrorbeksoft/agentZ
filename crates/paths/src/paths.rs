@@ -35,3 +35,18 @@ pub fn settings_file() -> PathBuf {
 pub fn registry_dir() -> PathBuf {
     data_dir().join("agents").join("registry")
 }
+
+/// Where `agentz-server` listens.
+pub fn server_socket() -> PathBuf {
+    data_dir().join("server.sock")
+}
+
+/// The running server's process id.
+pub fn server_pid_file() -> PathBuf {
+    data_dir().join("server.pid")
+}
+
+/// The server's log, when it was started in the background.
+pub fn server_log_file() -> PathBuf {
+    data_dir().join("logs").join("server.log")
+}

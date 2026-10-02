@@ -101,7 +101,12 @@ impl ServerHandle {
         });
     }
 
-    /// Resolves once the server has shut down, after a client asked it to.
+    /// Stops the agents, saves, and ends the server.
+    pub fn shut_down(&self) {
+        self.inputs.unbounded_send(Input::Shutdown).ok();
+    }
+
+    /// Resolves once the server has shut down.
     pub async fn stopped(&self) {
         let mut stopped = self.stopped.clone();
         if stopped.wait_for(|stopped| *stopped).await.is_err() {

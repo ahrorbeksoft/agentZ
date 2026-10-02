@@ -9,6 +9,10 @@ license = "GPL-3.0-or-later"
 path = "src/agentz_server.rs"
 doctest = false
 
+[[bin]]
+name = "agentz-server"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -17,16 +21,20 @@ agent-client-protocol.workspace = true
 agent_thread.workspace = true
 agentz_protocol.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 collections.workspace = true
+env_logger.workspace = true
 futures.workspace = true
 gpui_shared_string.workspace = true
 http_client.workspace = true
 log.workspace = true
+paths.workspace = true
 projects.workspace = true
 registry.workspace = true
+reqwest_client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 util.workspace = true
 uuid.workspace = true
 

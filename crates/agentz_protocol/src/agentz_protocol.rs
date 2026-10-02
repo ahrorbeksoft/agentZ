@@ -45,6 +45,8 @@ pub struct ClientHello {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClientKind {
     App,
+    /// `agentz-server` itself, e.g. for `stop`.
+    Cli,
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -357,7 +359,7 @@ mod tests {
         let message: ServerMessage =
             serde_json::from_str(r#"{"Event":{"Novel":[1]}}"#).expect("decodes");
         assert!(matches!(message, ServerMessage::Event(Event::Unknown(_))));
-        let kind: ClientKind = serde_json::from_str(r#""Cli""#).expect("decodes");
+        let kind: ClientKind = serde_json::from_str(r#""Mcp""#).expect("decodes");
         assert!(matches!(kind, ClientKind::Unknown(_)));
     }
 

@@ -39,6 +39,7 @@ pub(crate) enum Input {
     Disconnected(ClientId),
     Registry(RegistryMessage),
     Thread(ConnectionId, ThreadMessage),
+    Shutdown,
 }
 
 struct Client {
@@ -186,6 +187,7 @@ impl Server {
                 self.registry.handle(message);
                 self.registry_changed = true;
             }
+            Input::Shutdown => self.stopping = true,
             Input::Thread(connection, message) => {
                 let thread = match connection {
                     ConnectionId::Thread(id) => self.threads.get_mut(&id),

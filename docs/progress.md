@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 1, the server binary: a socket and pid file in the data directory, `proxy`, and
-starting detached. Then the app as a client.
+**Next:** Phase 1, the app as a client: start the server with `agentz-server start`, connect,
+reconnect, and keep client copies of projects, the registry, agent settings and threads.
 
 | Phase | Status |
 |---|---|
@@ -63,11 +63,11 @@ Then the server:
   - [x] request/response and subscription messages;
   - [x] serde types for projects, threads, entries, tool calls, permissions, config options and
         states.
-- [ ] `crates/agentz_server`, a GPUI-free tokio binary:
-  - [ ] socket listener in the data directory, with a pid file;
+- [x] `crates/agentz_server`, a GPUI-free tokio binary:
+  - [x] socket listener in the data directory, with a pid file;
   - [x] owns `ProjectStore`, `AgentRegistryStore`, `AppSettings` agent settings, and the
         `AgentThread`s;
-  - [ ] `proxy` subcommand that starts the server if needed.
+  - [x] `proxy` subcommand that starts the server if needed.
 - [x] A thread-management service shared by every transport: the app, MCP and CLI (t3code's
       `ThreadManagementService`).
 - [x] Session subscription: projects, threads, states, as a snapshot and then events.
@@ -359,6 +359,17 @@ Then the server:
     belongs to the client that opened it.
   - **Custom agents** (`ServerConfig::custom_agents`) run a fixed command instead of a registry
     agent. Tests use them for the mock agent.
+  - **The binary** is `agentz-server` with `run` (the default), `start`, `proxy` and `stop`.
+    It listens on `server.sock` in the data directory (mode 0600) and writes `server.pid`.
+    `start` launches `run` in its own process group with output in `logs/server.log` and
+    returns once the socket accepts. A socket left by a killed server is removed, as herdr does.
+    SIGTERM and Ctrl-C shut down cleanly. Like the app, it loads the login shell's environment
+    when stdout isn't a terminal, and answers `--printenv`.
+  - **herdr's macOS bootstrap switch is skipped.** herdr moves its daemon to the per-user Mach
+    bootstrap so it outlives logout. agentZ's server stays in the login session, which keeps
+    the Keychain working for agents. Revisit if that matters.
+  - **It still cross-builds**: 10.8 MB static and stripped for `x86_64-unknown-linux-musl`, in
+    1m 38s with a warm cache.
 
 ## Open questions
 
@@ -399,4 +410,6 @@ Then the server:
 - 2026-10-03: Phase 1: `projects` (86606b5), `registry` (8b46efe) and `agent_thread` are plain
   Rust on tokio, wrapped by GPUI entities in the app. That finishes the GPUI-free core.
 - 2026-10-03: Phase 1: `agentz_protocol` (9cf8256) and the `agentz_server` library, tested over
-  in-memory streams with the mock agent, including a turn that outlives its client.
+  in-memory streams with the mock agent, including a turn that outlives its client (687d42b).
+- 2026-10-03: Phase 1: the `agentz-server` binary, with `start`, `proxy` and `stop`, tested as
+  processes against a scratch data directory.
