@@ -317,6 +317,21 @@ impl SettingsPage {
                     })
                     .children(items),
             )
+            .child(
+                // Same place as the sidebar's settings button, so going back needs no
+                // mouse movement.
+                h_flex()
+                    .flex_none()
+                    .p_1()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(
+                        IconButton::new("settings-back", IconName::ArrowLeft)
+                            .icon_size(IconSize::Small)
+                            .tooltip(|_, cx| Tooltip::for_action("Back", &CloseSettings, cx))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsPageEvent::Close))),
+                    ),
+            )
     }
 
     fn render_nav_item(
