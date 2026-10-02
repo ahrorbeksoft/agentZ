@@ -231,6 +231,11 @@ pub struct AgentThread {
     last_stop_reason: Option<acp::StopReason>,
     turn_error: Option<SharedString>,
     stderr_lines: VecDeque<String>,
+    /// False for a connection made only to log in or out (from settings), which never opens a
+    /// session.
+    opens_session: bool,
+    /// The outcome of the last log in or out on such a connection.
+    account_notice: Option<SharedString>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -247,8 +252,32 @@ impl AgentThread {
         previous_session: Option<acp::SessionId>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut this = Self::new(agent_name, ConnectionStatus::Connecting, cwd);
+        this.previous_session = previous_session;
+        this.connect_agent(command, cx);
+        this
+    }
+
+    /// Starts the agent only to log in or out of it, as from its settings. No session is opened,
+    /// so the agent starts in a scratch directory.
+    pub fn start_for_account(
+        agent_name: SharedString,
+        command: Task<Result<AgentCommand>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(
+            agent_name,
+            ConnectionStatus::Connecting,
+            std::env::temp_dir(),
+        );
+        this.opens_session = false;
+        this.connect_agent(command, cx);
+        this
+    }
+
+    fn connect_agent(&mut self, command: Task<Result<AgentCommand>>, cx: &mut Context<Self>) {
         let connect = cx.spawn({
-            let cwd = cwd.clone();
+            let cwd = self.cwd.clone();
             async move |this, cx| {
                 let result = async {
                     let command = command.await?;
@@ -262,7 +291,12 @@ impl AgentThread {
                         this.connection = Some(connected.connection);
                         this.capabilities = connected.capabilities;
                         this.auth_methods = connected.auth_methods;
-                        this.open_session(cx);
+                        if this.opens_session {
+                            this.open_session(cx);
+                        } else {
+                            this.status = ConnectionStatus::Ready;
+                            cx.notify();
+                        }
                     }
                     Err(error) => {
                         log::error!("failed to start agent: {error:#}");
@@ -272,11 +306,86 @@ impl AgentThread {
                 .ok();
             }
         });
+        self._tasks.push(connect);
+    }
 
-        let mut this = Self::new(agent_name, ConnectionStatus::Connecting, cwd);
-        this.previous_session = previous_session;
-        this._tasks.push(connect);
-        this
+    /// Zed's "Reload Agent": restarts the agent and reopens the session, whose history the
+    /// agent replays when it can load sessions.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self.command.clone() else {
+            return;
+        };
+        // Dropping the tasks stops the agent process along with its connection.
+        self._tasks.clear();
+        self.connection = None;
+        self.session = None;
+        self.entries.clear();
+        self.plan.clear();
+        self.permission_requests.clear();
+        self.queued_prompts.clear();
+        self.auth_error = None;
+        self.turn_error = None;
+        self.status = ConnectionStatus::Connecting;
+        self.set_working(false, cx);
+        self.connect_agent(Task::ready(Ok(command)), cx);
+        cx.notify();
+    }
+
+    /// Whether the agent advertises ACP's logout method.
+    pub fn supports_logout(&self) -> bool {
+        self.capabilities.auth.logout.is_some()
+    }
+
+    /// Zed's "Reauthenticate": shows the agent's login methods again.
+    pub fn reauthenticate(&mut self, cx: &mut Context<Self>) {
+        if self.auth_methods.is_empty() || self.connection.is_none() {
+            return;
+        }
+        self.status = ConnectionStatus::AuthRequired;
+        self.auth_error = None;
+        self.account_notice = None;
+        cx.notify();
+    }
+
+    /// Logs out of the agent. A thread then asks to log in again, as in Zed.
+    pub fn logout(&mut self, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        if !self.supports_logout() {
+            return;
+        }
+        let request = connection
+            .send_request(acp::LogoutRequest::new())
+            .block_task();
+        self.account_notice = None;
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.auth_error = None;
+                        if this.opens_session {
+                            this.status = ConnectionStatus::AuthRequired;
+                        } else {
+                            this.account_notice = Some("Logged out.".into());
+                        }
+                    }
+                    Err(error) => {
+                        this.auth_error =
+                            Some(format!("Couldn't log out: {}", error_message(&error)).into())
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What happened on the last log in or out of an account connection.
+    pub fn account_notice(&self) -> Option<&SharedString> {
+        self.account_notice.as_ref()
     }
 
     /// A thread that cannot start, e.g. because its agent is not installed.
@@ -315,6 +424,8 @@ impl AgentThread {
             last_stop_reason: None,
             turn_error: None,
             stderr_lines: VecDeque::new(),
+            opens_session: true,
+            account_notice: None,
             _tasks: Vec::new(),
         }
     }
@@ -382,12 +493,19 @@ impl AgentThread {
         let request = connection
             .send_request(acp::AuthenticateRequest::new(method_id))
             .block_task();
+        self.account_notice = None;
         self.status = ConnectionStatus::Connecting;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = request.await;
             this.update(cx, |this, cx| match result {
-                Ok(_) => this.open_session(cx),
+                Ok(_) if this.opens_session => this.open_session(cx),
+                Ok(_) => {
+                    this.status = ConnectionStatus::Ready;
+                    this.auth_error = None;
+                    this.account_notice = Some("Logged in.".into());
+                    cx.notify();
+                }
                 Err(error) => {
                     this.status = ConnectionStatus::AuthRequired;
                     this.auth_error = Some(error_message(&error).into());
@@ -1274,6 +1392,114 @@ mod tests {
             new_text: "x\ny\n".into(),
         };
         assert_eq!(created.line_counts(), (2, 0));
+    }
+
+    /// Logging in and out from settings, against `test_support/mock_agent.py`.
+    #[gpui::test]
+    fn logs_in_and_out_of_an_account(cx: &mut gpui::TestAppContext) {
+        let Some(python) = which_python() else {
+            eprintln!("skipping: python3 not found");
+            return;
+        };
+        cx.executor().allow_parking();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
+        let command = AgentCommand {
+            path: python,
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+        };
+        let account = cx
+            .new(|cx| AgentThread::start_for_account("Mock".into(), Task::ready(Ok(command)), cx));
+        let wait_until = |cx: &mut gpui::TestAppContext, done: &dyn Fn(&AgentThread) -> bool| {
+            for _ in 0..500 {
+                cx.run_until_parked();
+                if account.read_with(cx, |account, _| done(account)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let status = account.read_with(cx, |account, _| account.status().clone());
+            panic!("timed out; status {status:?}");
+        };
+
+        wait_until(cx, &|account| account.status() == &ConnectionStatus::Ready);
+        account.read_with(cx, |account, _| {
+            assert!(account.supports_logout());
+            assert_eq!(account.auth_methods().len(), 1);
+            assert!(
+                account.session.is_none(),
+                "an account connection opens no session"
+            );
+        });
+
+        account.update(cx, |account, cx| {
+            account.authenticate(acp::AuthMethodId::new("mock-login"), cx)
+        });
+        wait_until(cx, &|account| account.account_notice().is_some());
+        account.read_with(cx, |account, _| {
+            assert_eq!(
+                account.account_notice().map(|n| n.as_ref()),
+                Some("Logged in.")
+            );
+            assert!(account.session.is_none());
+        });
+
+        account.update(cx, |account, cx| account.logout(cx));
+        wait_until(cx, &|account| {
+            account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
+        });
+    }
+
+    /// Zed's Log Out and Reload Agent on a thread, against `test_support/mock_agent.py`.
+    #[gpui::test]
+    fn logs_out_and_reloads_a_thread(cx: &mut gpui::TestAppContext) {
+        let Some(python) = which_python() else {
+            eprintln!("skipping: python3 not found");
+            return;
+        };
+        cx.executor().allow_parking();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
+        let command = AgentCommand {
+            path: python,
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+        };
+        let thread = cx.new(|cx| {
+            AgentThread::start(
+                "Mock".into(),
+                Task::ready(Ok(command)),
+                std::env::temp_dir(),
+                None,
+                cx,
+            )
+        });
+        let wait_until = |cx: &mut gpui::TestAppContext, done: &dyn Fn(&AgentThread) -> bool| {
+            for _ in 0..500 {
+                cx.run_until_parked();
+                if thread.read_with(cx, |thread, _| done(thread)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let status = thread.read_with(cx, |thread, _| thread.status().clone());
+            panic!("timed out; status {status:?}");
+        };
+
+        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
+        thread.update(cx, |thread, cx| thread.logout(cx));
+        wait_until(cx, &|thread| {
+            thread.status() == &ConnectionStatus::AuthRequired
+        });
+        thread.update(cx, |thread, cx| {
+            thread.authenticate(acp::AuthMethodId::new("mock-login"), cx)
+        });
+        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
+
+        thread.update(cx, |thread, cx| thread.reload(cx));
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), &ConnectionStatus::Connecting)
+        });
+        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
     }
 
     /// Runs the real process and protocol plumbing against `test_support/mock_agent.py`.

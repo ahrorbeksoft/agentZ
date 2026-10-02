@@ -313,6 +313,25 @@ impl AgentView {
         if text.trim().is_empty() {
             return;
         }
+        // As in Zed, `/login` and `/logout` bring up the agent's login methods, unless the agent
+        // has its own `/logout`, which may need to reset its state.
+        let trimmed = text.trim();
+        if trimmed == "/login" || trimmed == "/logout" {
+            let thread = self.thread.read(cx);
+            let can_login = !thread.auth_methods().is_empty();
+            let agent_handles_logout = trimmed == "/logout"
+                && thread
+                    .available_commands()
+                    .iter()
+                    .any(|command| command.name == "logout");
+            if can_login && !agent_handles_logout {
+                self.composer
+                    .update(cx, |composer, cx| composer.set_text("", cx));
+                self.thread
+                    .update(cx, |thread, cx| thread.reauthenticate(cx));
+                return;
+            }
+        }
         self.composer
             .update(cx, |composer, cx| composer.set_text("", cx));
         if self.thread.read(cx).is_working() || !self.queued_messages.is_empty() {
@@ -449,8 +468,9 @@ impl AgentView {
             .blend(colors.element_selected.opacity(0.3))
     }
 
-    fn render_toolbar(&self, cx: &App) -> impl IntoElement {
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_name = self.agent_name(cx);
+        let thread = self.thread.clone();
         h_flex()
             .h(px(36.))
             .flex_none()
@@ -472,6 +492,52 @@ impl AgentView {
                 Label::new(agent_name)
                     .size(LabelSize::Small)
                     .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                // Zed's agent options: log in again, log out, or restart the agent.
+                PopoverMenu::new("thread-options")
+                    .menu(move |window, cx| {
+                        let thread = thread.clone();
+                        let (has_auth_methods, supports_logout, can_reload) = {
+                            let thread = thread.read(cx);
+                            (
+                                !thread.auth_methods().is_empty(),
+                                thread.supports_logout()
+                                    && thread.status() == &ConnectionStatus::Ready,
+                                !matches!(thread.status(), ConnectionStatus::Connecting),
+                            )
+                        };
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            if has_auth_methods {
+                                let thread = thread.clone();
+                                menu = menu.entry("Reauthenticate", None, move |_, cx| {
+                                    thread.update(cx, |thread, cx| thread.reauthenticate(cx))
+                                });
+                            }
+                            if supports_logout {
+                                let thread = thread.clone();
+                                menu = menu.entry("Log Out", None, move |_, cx| {
+                                    thread.update(cx, |thread, cx| thread.logout(cx))
+                                });
+                            }
+                            if has_auth_methods || supports_logout {
+                                menu = menu.separator();
+                            }
+                            menu.when(can_reload, |menu| {
+                                let thread = thread.clone();
+                                menu.entry("Reload Agent", None, move |_, cx| {
+                                    thread.update(cx, |thread, cx| thread.reload(cx))
+                                })
+                            })
+                        }))
+                    })
+                    .trigger_with_tooltip(
+                        IconButton::new("thread-options-trigger", IconName::Ellipsis)
+                            .icon_size(IconSize::Small),
+                        Tooltip::text("Agent Options"),
+                    )
+                    .anchor(gpui::Anchor::TopRight),
             )
     }
 
@@ -2392,7 +2458,7 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
 }
 
 /// Opens the system terminal running `command` in `cwd`, for agents that log in interactively.
-async fn open_in_terminal(
+pub(crate) async fn open_in_terminal(
     command: &registry::AgentCommand,
     cwd: &std::path::Path,
 ) -> anyhow::Result<()> {

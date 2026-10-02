@@ -12,6 +12,10 @@ use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
 
+use agent_client_protocol::schema::v1 as acp;
+use agent_thread::{AgentThread, ConnectionStatus};
+
+use crate::agent_view::open_in_terminal;
 use crate::app_settings::{AppSettingsStore, ThemeMode};
 use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfo, ProjectInfoStore, automatic_monogram, monogram_swatch,
@@ -55,6 +59,8 @@ pub struct SettingsPage {
     monogram_input: Entity<TextInput>,
     registry: Entity<AgentRegistryStore>,
     agent_search: Entity<TextInput>,
+    /// The agent whose account panel is open, with the connection made to log in or out.
+    account: Option<AccountPanel>,
     nav_scroll: ScrollHandle,
     content_scroll: ScrollHandle,
     /// Detected favicons, so automatic icons match the sidebar's.
@@ -120,6 +126,7 @@ impl SettingsPage {
             monogram_input,
             registry,
             agent_search,
+            account: None,
             nav_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
             project_info,
@@ -602,6 +609,10 @@ impl SettingsPage {
             None => Icon::new(IconName::Terminal),
         };
         let element_id = |action: &str| SharedString::from(format!("agent-{action}-{}", id.0));
+        let is_account_open = self
+            .account
+            .as_ref()
+            .is_some_and(|account| &account.agent_id == id);
         let install = {
             let id = id.clone();
             cx.listener(move |this, _, _, cx| {
@@ -629,6 +640,18 @@ impl SettingsPage {
                     },
                     h_flex()
                         .gap_2()
+                        .child(
+                            Button::new(element_id("account"), "Account")
+                                .style(ButtonStyle::Outlined)
+                                .toggle_state(is_account_open)
+                                .on_click({
+                                    let id = id.clone();
+                                    let name = name.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.toggle_account(&id, &name, cx)
+                                    })
+                                }),
+                        )
                         .when(update_available, |controls| {
                             controls.child(
                                 Button::new(element_id("update"), "Update")
@@ -667,26 +690,199 @@ impl SettingsPage {
                     .into_any_element(),
             ),
         };
-        h_flex()
-            .px_4()
-            .py_3()
-            .gap_3()
-            .child(icon.size(IconSize::Medium).color(Color::Muted))
+        let account_panel = is_account_open.then(|| self.render_account_panel(cx));
+        v_flex()
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(Label::new(name))
+                h_flex()
+                    .px_4()
+                    .py_3()
+                    .gap_3()
+                    .child(icon.size(IconSize::Medium).color(Color::Muted))
                     .child(
-                        Label::new(detail)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(Label::new(name))
+                            .child(
+                                Label::new(detail)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(div().flex_none().child(controls)),
+            )
+            .children(account_panel)
+            .into_any_element()
+    }
+
+    /// Opens the agent's account panel, starting the agent to talk to it, or closes it (which
+    /// stops the agent again).
+    fn toggle_account(&mut self, id: &AgentId, name: &SharedString, cx: &mut Context<Self>) {
+        if self
+            .account
+            .as_ref()
+            .is_some_and(|account| &account.agent_id == id)
+        {
+            self.account = None;
+            cx.notify();
+            return;
+        }
+        let command = self.registry.read(cx).command(id, cx);
+        let name = name.clone();
+        let connection = cx.new(|cx| AgentThread::start_for_account(name, command, cx));
+        let subscription = cx.observe(&connection, |_, _, cx| cx.notify());
+        self.account = Some(AccountPanel {
+            agent_id: id.clone(),
+            connection,
+            terminal_hint: None,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// The agent's own ways to log in (the same ones a thread offers when it needs a login), and
+    /// ACP's logout when the agent supports it.
+    fn render_account_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(account) = &self.account else {
+            return div().into_any_element();
+        };
+        let colors = cx.theme().colors().clone();
+        let connection = account.connection.read(cx);
+        let agent_name = connection.agent_name().clone();
+        let status = connection.status().clone();
+        let mut buttons: Vec<AnyElement> = Vec::new();
+        let (message, color): (SharedString, Color) = match &status {
+            ConnectionStatus::Connecting => {
+                (format!("Talking to {agent_name}…").into(), Color::Muted)
+            }
+            ConnectionStatus::Failed(error) => (error.clone(), Color::Error),
+            ConnectionStatus::Ready | ConnectionStatus::AuthRequired => {
+                for method in connection.auth_methods() {
+                    let (method_id, method_name, description, is_terminal) = match method {
+                        acp::AuthMethod::Agent(method) => (
+                            method.id.clone(),
+                            method.name.clone(),
+                            method.description.clone(),
+                            false,
+                        ),
+                        acp::AuthMethod::Terminal(method) => (
+                            method.id.clone(),
+                            method.name.clone(),
+                            method.description.clone(),
+                            true,
+                        ),
+                        _ => continue,
+                    };
+                    buttons.push(
+                        Button::new(
+                            SharedString::from(format!("account-auth-{}", method_id.0)),
+                            method_name,
+                        )
+                        .style(ButtonStyle::Outlined)
+                        .when_some(description, |button, description| {
+                            button.tooltip(Tooltip::text(description))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.log_in(method_id.clone(), is_terminal, cx)
+                        }))
+                        .into_any_element(),
+                    );
+                }
+                if connection.supports_logout() {
+                    buttons.push(
+                        Button::new("account-logout", "Log Out")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(account) = &mut this.account {
+                                    account.terminal_hint = None;
+                                    account
+                                        .connection
+                                        .update(cx, |connection, cx| connection.logout(cx));
+                                }
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if let Some(error) = connection.auth_error() {
+                    (error.clone(), Color::Error)
+                } else if let Some(notice) = connection.account_notice() {
+                    (notice.clone(), Color::Success)
+                } else if let Some(hint) = &account.terminal_hint {
+                    (hint.clone(), Color::Muted)
+                } else if buttons.is_empty() {
+                    (
+                        format!("{agent_name} doesn't offer logging in or out from agentZ.").into(),
+                        Color::Muted,
+                    )
+                } else {
+                    (
+                        format!(
+                            "Log in with one of {agent_name}'s methods. It keeps the login for every thread."
+                        )
+                        .into(),
+                        Color::Muted,
+                    )
+                }
+            }
+        };
+        v_flex()
+            .mx_4()
+            .mb_3()
+            .p_3()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .child(Label::new(message).size(LabelSize::Small).color(color))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(buttons)
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("account-done", "Done")
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.account = None;
+                                cx.notify();
+                            })),
                     ),
             )
-            .child(div().flex_none().child(controls))
             .into_any_element()
+    }
+
+    /// Agent methods log in through the agent; terminal methods run the agent's login command
+    /// in Terminal, as a thread does.
+    fn log_in(&mut self, method_id: acp::AuthMethodId, is_terminal: bool, cx: &mut Context<Self>) {
+        let Some(account) = &mut self.account else {
+            return;
+        };
+        if !is_terminal {
+            account.terminal_hint = None;
+            account
+                .connection
+                .update(cx, |connection, cx| connection.authenticate(method_id, cx));
+            return;
+        }
+        let command = account
+            .connection
+            .read(cx)
+            .terminal_auth_command(&method_id);
+        let cwd = account.connection.read(cx).cwd().clone();
+        if let Some(command) = command {
+            account.terminal_hint = Some("Finish logging in in Terminal.".into());
+            cx.background_spawn(async move {
+                if let Err(error) = open_in_terminal(&command, &cwd).await {
+                    log::error!("couldn't open a terminal to log in: {error:#}");
+                }
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     fn confirm_uninstall(
@@ -847,6 +1043,14 @@ impl SettingsPage {
             ),
         ]
     }
+}
+
+struct AccountPanel {
+    agent_id: AgentId,
+    /// A session-less connection to the agent, alive only while the panel is open.
+    connection: Entity<AgentThread>,
+    terminal_hint: Option<SharedString>,
+    _subscription: Subscription,
 }
 
 /// t3code's settings section: a small heading over a bordered group of rows.

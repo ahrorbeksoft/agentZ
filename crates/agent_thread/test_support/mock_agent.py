@@ -86,8 +86,12 @@ for line in sys.stdin:
     elif method == "initialize":
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
-                         "agentCapabilities": {"loadSession": HISTORY_PATH is not None},
-                         "authMethods": []}})
+                         "agentCapabilities": {"loadSession": HISTORY_PATH is not None,
+                                               "auth": {"logout": {}}},
+                         "authMethods": [{"id": "mock-login", "name": "Log In",
+                                          "description": "Log in to the mock agent"}]}})
+    elif method in ("authenticate", "logout"):
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
     elif method == "session/new":
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"sessionId": "session-1", "configOptions": config_options()}})
