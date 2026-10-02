@@ -155,9 +155,9 @@ From Zed's guidelines, which this code follows:
 
 ## State of the work
 
-**Current project:** background servers, agent control (MCP/CLI), subthreads, diffs, terminals and SSH machines. The design is in
-[`docs/plan.md`](docs/plan.md). Where it stands, and what to do next, is in
-[`docs/progress.md`](docs/progress.md). Keep progress.md up to date as you work.
+**Current project:** background servers, agent control (MCP/CLI), subthreads, diffs, terminals
+and SSH machines. The design is in [`docs/plan.md`](docs/plan.md). Where it stands, and what to
+do next, is in [`docs/progress.md`](docs/progress.md). Keep progress.md up to date as you work.
 
 Done:
 - Multi-project with an "All projects" scope.
