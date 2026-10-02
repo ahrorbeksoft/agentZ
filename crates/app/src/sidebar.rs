@@ -6,7 +6,7 @@ use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
     KeyBinding, PromptLevel, Subscription, Task, Window,
 };
-use projects::{Project, ProjectId, ProjectStore, Thread, ThreadId, ThreadOrder};
+use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
@@ -342,7 +342,12 @@ impl Sidebar {
         let thread_id = thread.id;
         let icon = self.agent_icon(&thread, cx);
         let project_icon = self.render_project_icon(project.as_ref(), cx);
-        let project_name = project.as_ref().map(|project| project.name());
+        // With one project selected, its name on every card would be noise.
+        let shows_all_projects = self.store.read(cx).scope() == ProjectScope::All;
+        let project_name = project
+            .as_ref()
+            .filter(|_| shows_all_projects)
+            .map(|project| project.name());
         let git_head = project
             .as_ref()
             .and_then(|project| self.project_info.get(&project.id))
