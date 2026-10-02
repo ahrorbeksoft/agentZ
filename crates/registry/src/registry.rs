@@ -27,40 +27,16 @@ use tokio::task::JoinSet;
 use url::Url;
 use util::ResultExt as _;
 
+pub use agentz_protocol::agents::{
+    AgentCommand, AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
+};
+
 const REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const REFRESH_THROTTLE_DURATION: Duration = Duration::from_secs(60 * 60);
 // Bounds the whole request including the body; the HTTP client only has a connect timeout.
 const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRY_ICON_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const NPX_DIR_NAME: &str = "npx";
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AgentId(pub SharedString);
-
-impl AgentId {
-    pub fn new(id: impl Into<SharedString>) -> Self {
-        AgentId(id.into())
-    }
-}
-
-impl std::fmt::Display for AgentId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RegistryAgentMetadata {
-    pub id: AgentId,
-    pub name: SharedString,
-    pub description: SharedString,
-    pub version: SharedString,
-    pub repository: Option<SharedString>,
-    pub website: Option<SharedString>,
-    pub license_url: Option<SharedString>,
-    /// Absolute path of the cached SVG icon.
-    pub icon_path: Option<SharedString>,
-}
 
 #[derive(Clone, Debug)]
 pub struct RegistryBinaryAgent {
@@ -125,25 +101,6 @@ pub struct RegistryTargetConfig {
     pub cmd: String,
     pub args: Vec<String>,
     pub sha256: Option<String>,
-    pub env: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum InstallState {
-    NotInstalled,
-    Installing,
-    Installed {
-        version: SharedString,
-        update_available: bool,
-    },
-    Failed(SharedString),
-}
-
-/// How to start an installed agent.
-#[derive(Clone, Debug)]
-pub struct AgentCommand {
-    pub path: PathBuf,
-    pub args: Vec<String>,
     pub env: HashMap<String, String>,
 }
 
@@ -257,6 +214,23 @@ impl AgentRegistryStore {
             return InstallState::Failed(error.clone());
         }
         InstallState::NotInstalled
+    }
+
+    /// The registry as clients see it.
+    pub fn snapshot(&self) -> RegistrySnapshot {
+        RegistrySnapshot {
+            agents: self
+                .agents
+                .iter()
+                .map(|agent| AgentListing {
+                    metadata: agent.metadata().clone(),
+                    supports_current_platform: agent.supports_current_platform(),
+                    install_state: self.install_state(agent.id()),
+                })
+                .collect(),
+            is_fetching: self.is_fetching,
+            fetch_error: self.fetch_error.clone(),
+        }
     }
 
     /// Fetches the latest registry from the network and updates the cache.

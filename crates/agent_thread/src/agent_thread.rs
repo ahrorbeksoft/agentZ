@@ -11,11 +11,16 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::SystemTime;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
+pub use agentz_protocol::thread::{
+    ConnectionStatus, ContextUsage, DiffLineKind, Entry, FileDiff, PermissionOption,
+    PermissionRequest, PlanItem, SessionDefaults, SessionRestore, ThreadState, ThreadView,
+    ToolCall,
+};
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt as _, StreamExt as _};
@@ -26,163 +31,6 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::task::JoinSet;
 
 const STDERR_LINES_KEPT: usize = 20;
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ConnectionStatus {
-    Connecting,
-    /// The agent is running but needs the user to log in before a session can start.
-    AuthRequired,
-    Ready,
-    Failed(SharedString),
-}
-
-/// Context-window usage reported by the agent.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ContextUsage {
-    pub used: u64,
-    pub size: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Entry {
-    UserMessage(String),
-    AgentMessage(String),
-    AgentThought(String),
-    ToolCall(ToolCall),
-    /// Where the plan first appeared; the plan itself is kept up to date in [`AgentThread::plan`].
-    Plan,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolCall {
-    pub id: acp::ToolCallId,
-    pub title: String,
-    pub kind: acp::ToolKind,
-    pub status: acp::ToolCallStatus,
-    pub text: Vec<String>,
-    pub diffs: Vec<FileDiff>,
-    pub locations: Vec<PathBuf>,
-    /// The tool's input as markdown (JSON in a code block), for Zed's "Raw Input" view.
-    pub raw_input: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileDiff {
-    pub path: PathBuf,
-    pub old_text: Option<String>,
-    pub new_text: String,
-}
-
-impl FileDiff {
-    /// The lines that differ between the old and new text, as one removed and one added block.
-    /// The shared prefix and suffix are trimmed, which is enough for a summary card.
-    pub fn changed_lines(&self) -> (Vec<&str>, Vec<&str>) {
-        let new_lines: Vec<&str> = self.new_text.lines().collect();
-        let Some(old_text) = &self.old_text else {
-            return (Vec::new(), new_lines);
-        };
-        let old_lines: Vec<&str> = old_text.lines().collect();
-        let common_prefix = old_lines
-            .iter()
-            .zip(&new_lines)
-            .take_while(|(old, new)| old == new)
-            .count();
-        let common_suffix = old_lines[common_prefix..]
-            .iter()
-            .rev()
-            .zip(new_lines[common_prefix..].iter().rev())
-            .take_while(|(old, new)| old == new)
-            .count();
-        (
-            old_lines[common_prefix..old_lines.len() - common_suffix].to_vec(),
-            new_lines[common_prefix..new_lines.len() - common_suffix].to_vec(),
-        )
-    }
-
-    /// The changed region with up to `context` unchanged lines on each side, as a diff editor
-    /// would show it.
-    pub fn hunk(&self, context: usize) -> Vec<(DiffLineKind, &str)> {
-        let new_lines: Vec<&str> = self.new_text.lines().collect();
-        let old_lines: Vec<&str> = self
-            .old_text
-            .as_deref()
-            .map(|text| text.lines().collect())
-            .unwrap_or_default();
-        let common_prefix = old_lines
-            .iter()
-            .zip(&new_lines)
-            .take_while(|(old, new)| old == new)
-            .count();
-        let common_suffix = old_lines[common_prefix..]
-            .iter()
-            .rev()
-            .zip(new_lines[common_prefix..].iter().rev())
-            .take_while(|(old, new)| old == new)
-            .count();
-
-        let mut lines = Vec::new();
-        for line in &new_lines[common_prefix.saturating_sub(context)..common_prefix] {
-            lines.push((DiffLineKind::Context, *line));
-        }
-        for line in &old_lines[common_prefix..old_lines.len() - common_suffix] {
-            lines.push((DiffLineKind::Removed, *line));
-        }
-        for line in &new_lines[common_prefix..new_lines.len() - common_suffix] {
-            lines.push((DiffLineKind::Added, *line));
-        }
-        let suffix_start = new_lines.len() - common_suffix;
-        for line in &new_lines[suffix_start..(suffix_start + context).min(new_lines.len())] {
-            lines.push((DiffLineKind::Context, *line));
-        }
-        lines
-    }
-
-    /// Line counts added and removed, for the "+84 −12" summary.
-    pub fn line_counts(&self) -> (usize, usize) {
-        let (removed, added) = self.changed_lines();
-        (added.len(), removed.len())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiffLineKind {
-    Context,
-    Removed,
-    Added,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PlanItem {
-    pub content: String,
-    pub status: acp::PlanEntryStatus,
-}
-
-#[derive(Clone, Debug)]
-pub struct PermissionOption {
-    pub id: acp::PermissionOptionId,
-    pub name: String,
-    pub kind: acp::PermissionOptionKind,
-}
-
-pub struct PermissionRequest {
-    pub tool_call_id: acp::ToolCallId,
-    pub title: String,
-    pub options: Vec<PermissionOption>,
-    responder: Responder<acp::RequestPermissionResponse>,
-}
-
-/// How the thread's ACP session was set up when the agent started.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionRestore {
-    /// A brand-new conversation.
-    New,
-    /// The previous session was loaded and the agent replayed its history.
-    Loaded,
-    /// The previous session continues, but the agent can't show its earlier messages.
-    ResumedWithoutHistory,
-    /// The previous session couldn't be restored, so a new one was started.
-    Unavailable,
-}
 
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
@@ -200,13 +48,6 @@ pub enum AgentThreadEvent {
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
     LoggedOut,
-}
-
-/// Settings applied to new sessions (not to loaded ones), as Zed's per-agent defaults are.
-#[derive(Clone, Debug, Default)]
-pub struct SessionDefaults {
-    pub mode: Option<acp::SessionModeId>,
-    pub config_options: Vec<(acp::SessionConfigId, acp::SessionConfigOptionValue)>,
 }
 
 /// The result of background work, for [`AgentThread::handle`].
@@ -276,44 +117,20 @@ struct Session {
 }
 
 pub struct AgentThread {
-    agent_name: SharedString,
-    status: ConnectionStatus,
-    entries: Vec<Entry>,
-    plan: Vec<PlanItem>,
-    /// Settings the agent exposes for this session (model, effort, mode, …).
-    config_options: Vec<acp::SessionConfigOption>,
-    /// Session modes from agents that predate config options.
-    modes: Option<acp::SessionModeState>,
-    session_restore: Option<SessionRestore>,
-    permission_requests: Vec<PermissionRequest>,
+    /// What clients see.
+    view: ThreadView,
+    /// Answers to the permission requests in `view`, by tool call.
+    permission_responders: Vec<(acp::ToolCallId, Responder<acp::RequestPermissionResponse>)>,
     /// Set once the agent is initialized; kept so a session can be (re)opened after logging in.
     connection: Option<ConnectionTo<Agent>>,
-    capabilities: acp::AgentCapabilities,
-    auth_methods: Vec<acp::AuthMethod>,
-    auth_error: Option<SharedString>,
-    command: Option<AgentCommand>,
-    cwd: PathBuf,
     previous_session: Option<acp::SessionId>,
     session: Option<Session>,
-    usage: Option<ContextUsage>,
-    cost: Option<acp::Cost>,
-    available_commands: Vec<acp::AvailableCommand>,
     pending_title: Option<String>,
     queued_prompts: Vec<String>,
-    turn_started_at: Option<Instant>,
-    last_stop_reason: Option<acp::StopReason>,
-    turn_error: Option<SharedString>,
     stderr_lines: VecDeque<String>,
     /// False for a connection made only to log in or out (from settings), which never opens a
     /// session.
     opens_session: bool,
-    /// The outcome of the last log in or out on such a connection.
-    account_notice: Option<SharedString>,
-    /// What the agent says about itself when it starts.
-    agent_info: Option<acp::Implementation>,
-    /// Whether the agent let a session open (logged in) or asked for a login. ACP has no way to
-    /// ask directly, so this is the closest status there is. `None` until known.
-    logged_in: Option<bool>,
     defaults: SessionDefaults,
     events: Vec<AgentThreadEvent>,
     /// `None` for a thread that never starts.
@@ -323,6 +140,14 @@ pub struct AgentThread {
     /// The agent process, its connection and requests in flight. Dropping the thread (or
     /// reloading it) aborts them, which also stops the agent.
     tasks: JoinSet<()>,
+}
+
+impl std::ops::Deref for AgentThread {
+    type Target = ThreadView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
 }
 
 impl AgentThread {
@@ -383,35 +208,23 @@ impl AgentThread {
     ) -> (Self, ThreadInbox) {
         let (messages, inbox) = mpsc::unbounded();
         let this = Self {
-            agent_name,
-            status,
-            entries: Vec::new(),
-            plan: Vec::new(),
-            config_options: Vec::new(),
-            modes: None,
-            session_restore: None,
-            permission_requests: Vec::new(),
+            view: ThreadView {
+                state: ThreadState {
+                    agent_name,
+                    status,
+                    cwd,
+                    ..ThreadState::default()
+                },
+                entries: Vec::new(),
+            },
+            permission_responders: Vec::new(),
             connection: None,
-            capabilities: acp::AgentCapabilities::default(),
-            auth_methods: Vec::new(),
-            auth_error: None,
-            command: None,
-            cwd,
             previous_session: None,
             session: None,
-            usage: None,
-            cost: None,
-            available_commands: Vec::new(),
             pending_title: None,
             queued_prompts: Vec::new(),
-            turn_started_at: None,
-            last_stop_reason: None,
-            turn_error: None,
             stderr_lines: VecDeque::new(),
             opens_session: true,
-            account_notice: None,
-            agent_info: None,
-            logged_in: None,
             defaults: SessionDefaults::default(),
             events: Vec::new(),
             runtime,
@@ -448,7 +261,7 @@ impl AgentThread {
 
     fn spawn_task(&mut self, task: impl Future<Output = ()> + Send + 'static) {
         let Some(runtime) = &self.runtime else {
-            log::error!("{} can't start background work", self.agent_name);
+            log::error!("{} can't start background work", self.view.state.agent_name);
             return;
         };
         while self.tasks.try_join_next().is_some() {}
@@ -456,7 +269,7 @@ impl AgentThread {
     }
 
     fn connect_agent(&mut self, command: CommandFuture) {
-        let cwd = self.cwd.clone();
+        let cwd = self.view.state.cwd.clone();
         let sender = self.sender();
         self.spawn_task(async move {
             // The agent's own tasks, which stop the agent when dropped.
@@ -486,11 +299,11 @@ impl AgentThread {
         }
         match message.kind {
             MessageKind::Connected(Ok((command, connected))) => {
-                self.command = Some(command);
+                self.view.state.command = Some(command);
                 self.connection = Some(connected.connection);
-                self.capabilities = connected.capabilities;
-                self.auth_methods = connected.auth_methods;
-                self.agent_info = connected.agent_info;
+                self.view.state.capabilities = connected.capabilities;
+                self.view.state.auth_methods = connected.auth_methods;
+                self.view.state.agent_info = connected.agent_info;
                 // An account connection opens an empty session too: it is how the login
                 // status (and the agent's settings) can be learned over ACP.
                 self.open_session();
@@ -514,38 +327,38 @@ impl AgentThread {
                         self.emit(AgentThreadEvent::LoggedIn(method_name));
                     }
                     if !self.opens_session {
-                        self.account_notice = Some("Logged in.".into());
+                        self.view.state.account_notice = Some("Logged in.".into());
                         self.session = None;
                     }
                     self.open_session();
                 }
                 Err(error) => {
-                    self.status = ConnectionStatus::AuthRequired;
-                    self.auth_error = Some(error_message(&error).into());
+                    self.view.state.status = ConnectionStatus::AuthRequired;
+                    self.view.state.auth_error = Some(error_message(&error).into());
                 }
             },
             MessageKind::LoggedOut(result) => match result {
                 Ok(()) => {
-                    self.auth_error = None;
-                    self.logged_in = Some(false);
+                    self.view.state.auth_error = None;
+                    self.view.state.logged_in = Some(false);
                     self.emit(AgentThreadEvent::LoggedOut);
                     if self.opens_session {
-                        self.status = ConnectionStatus::AuthRequired;
+                        self.view.state.status = ConnectionStatus::AuthRequired;
                     } else {
-                        self.account_notice = Some("Logged out.".into());
+                        self.view.state.account_notice = Some("Logged out.".into());
                         self.session = None;
                     }
                 }
                 Err(error) => {
-                    self.auth_error =
+                    self.view.state.auth_error =
                         Some(format!("Couldn't log out: {}", error_message(&error)).into())
                 }
             },
             MessageKind::ConfigOptionSet { previous, result } => match result {
-                Ok(response) => self.config_options = response.config_options,
+                Ok(response) => self.view.state.config_options = response.config_options,
                 Err(error) => {
                     log::error!("failed to change an agent setting: {error:?}");
-                    self.config_options = previous;
+                    self.view.state.config_options = previous;
                 }
             },
             MessageKind::ModeSet {
@@ -554,17 +367,17 @@ impl AgentThread {
             } => {
                 if let Err(error) = result {
                     log::error!("failed to change the agent's mode: {error:?}");
-                    if let Some(modes) = &mut self.modes {
+                    if let Some(modes) = &mut self.view.state.modes {
                         modes.current_mode_id = previous_mode;
                     }
                 }
             }
             MessageKind::PromptFinished(result) => {
                 match result {
-                    Ok(response) => self.last_stop_reason = Some(response.stop_reason),
+                    Ok(response) => self.view.state.last_stop_reason = Some(response.stop_reason),
                     Err(error) => {
                         log::error!("agent prompt failed: {error:?}");
-                        self.turn_error = Some(error_message(&error).into());
+                        self.view.state.turn_error = Some(error_message(&error).into());
                     }
                 }
                 // A finished turn can't still be waiting on a permission answer.
@@ -577,7 +390,7 @@ impl AgentThread {
     /// Zed's "Reload Agent": restarts the agent and reopens the session, whose history the
     /// agent replays when it can load sessions.
     pub fn reload(&mut self) {
-        let Some(command) = self.command.clone() else {
+        let Some(command) = self.view.state.command.clone() else {
             return;
         };
         // Aborting the tasks stops the agent process along with its connection.
@@ -585,30 +398,25 @@ impl AgentThread {
         self.generation += 1;
         self.connection = None;
         self.session = None;
-        self.entries.clear();
-        self.plan.clear();
+        self.view.entries.clear();
+        self.view.state.plan.clear();
         self.cancel_permission_requests();
         self.queued_prompts.clear();
-        self.auth_error = None;
-        self.turn_error = None;
-        self.status = ConnectionStatus::Connecting;
+        self.view.state.auth_error = None;
+        self.view.state.turn_error = None;
+        self.view.state.status = ConnectionStatus::Connecting;
         self.set_working(false);
         self.connect_agent(futures::future::ready(Ok(command)).boxed());
     }
 
-    /// Whether the agent advertises ACP's logout method.
-    pub fn supports_logout(&self) -> bool {
-        self.capabilities.auth.logout.is_some()
-    }
-
     /// Zed's "Reauthenticate": shows the agent's login methods again.
     pub fn reauthenticate(&mut self) {
-        if self.auth_methods.is_empty() || self.connection.is_none() {
+        if self.view.state.auth_methods.is_empty() || self.connection.is_none() {
             return;
         }
-        self.status = ConnectionStatus::AuthRequired;
-        self.auth_error = None;
-        self.account_notice = None;
+        self.view.state.status = ConnectionStatus::AuthRequired;
+        self.view.state.auth_error = None;
+        self.view.state.account_notice = None;
     }
 
     /// Logs out of the agent. A thread then asks to log in again, as in Zed.
@@ -622,7 +430,7 @@ impl AgentThread {
         let request = connection
             .send_request(acp::LogoutRequest::new())
             .block_task();
-        self.account_notice = None;
+        self.view.state.account_notice = None;
         self.spawn(async move { MessageKind::LoggedOut(request.await.map(|_| ())) });
     }
 
@@ -633,13 +441,8 @@ impl AgentThread {
             return;
         }
         self.session = None;
-        self.account_notice = None;
+        self.view.state.account_notice = None;
         self.open_session();
-    }
-
-    /// Whether the agent is logged in, as far as ACP can tell; see the field.
-    pub fn logged_in(&self) -> Option<bool> {
-        self.logged_in
     }
 
     /// Settings for new sessions; see [`SessionDefaults`].
@@ -647,16 +450,12 @@ impl AgentThread {
         self.defaults = defaults;
     }
 
-    pub fn agent_info(&self) -> Option<&acp::Implementation> {
-        self.agent_info.as_ref()
-    }
-
     /// Applies the defaults the session doesn't already match. Values the agent no longer
     /// offers are skipped.
     fn apply_defaults(&mut self) {
         let defaults = self.defaults.clone();
         if let Some(mode) = defaults.mode
-            && let Some(modes) = &self.modes
+            && let Some(modes) = &self.view.state.modes
             && modes.current_mode_id != mode
             && modes
                 .available_modes
@@ -667,6 +466,8 @@ impl AgentThread {
         }
         for (config_id, value) in defaults.config_options {
             let Some(option) = self
+                .view
+                .state
                 .config_options
                 .iter()
                 .find(|option| option.id == config_id)
@@ -690,21 +491,16 @@ impl AgentThread {
         }
     }
 
-    /// What happened on the last log in or out of an account connection.
-    pub fn account_notice(&self) -> Option<&SharedString> {
-        self.account_notice.as_ref()
-    }
-
     fn open_session(&mut self) {
         let Some(connection) = self.connection.clone() else {
             return;
         };
-        self.status = ConnectionStatus::Connecting;
-        self.auth_error = None;
+        self.view.state.status = ConnectionStatus::Connecting;
+        self.view.state.auth_error = None;
         let opening = open_session(
             connection.clone(),
-            self.capabilities.clone(),
-            self.cwd.clone(),
+            self.view.state.capabilities.clone(),
+            self.view.state.cwd.clone(),
             self.previous_session.clone(),
         );
         self.spawn(async move {
@@ -722,9 +518,9 @@ impl AgentThread {
     ) {
         match result {
             Ok(setup) => {
-                self.config_options = setup.config_options;
-                self.modes = setup.modes;
-                self.session_restore = Some(setup.restore);
+                self.view.state.config_options = setup.config_options;
+                self.view.state.modes = setup.modes;
+                self.view.state.session_restore = Some(setup.restore);
                 self.session = Some(Session {
                     connection,
                     session_id: setup.session_id,
@@ -735,8 +531,8 @@ impl AgentThread {
                 ) {
                     self.remember_session();
                 }
-                self.status = ConnectionStatus::Ready;
-                self.logged_in = Some(true);
+                self.view.state.status = ConnectionStatus::Ready;
+                self.view.state.logged_in = Some(true);
                 if setup.restore == SessionRestore::New && self.opens_session {
                     self.apply_defaults();
                 }
@@ -745,20 +541,12 @@ impl AgentThread {
                 }
             }
             Err(error) if is_auth_required(&error) => {
-                self.status = ConnectionStatus::AuthRequired;
-                self.logged_in = Some(false);
+                self.view.state.status = ConnectionStatus::AuthRequired;
+                self.view.state.logged_in = Some(false);
                 self.set_working(false);
             }
             Err(error) => self.fail(format!("starting a session: {}", error_message(&error))),
         }
-    }
-
-    pub fn auth_methods(&self) -> &[acp::AuthMethod] {
-        &self.auth_methods
-    }
-
-    pub fn auth_error(&self) -> Option<&SharedString> {
-        self.auth_error.as_ref()
     }
 
     /// Logs in with one of the agent's own methods, then opens the session.
@@ -767,6 +555,8 @@ impl AgentThread {
             return;
         };
         let method_name = self
+            .view
+            .state
             .auth_methods
             .iter()
             .find(|method| *method.id() == method_id)
@@ -774,8 +564,8 @@ impl AgentThread {
         let request = connection
             .send_request(acp::AuthenticateRequest::new(method_id))
             .block_task();
-        self.account_notice = None;
-        self.status = ConnectionStatus::Connecting;
+        self.view.state.account_notice = None;
+        self.view.state.status = ConnectionStatus::Connecting;
         self.spawn(async move {
             MessageKind::Authenticated {
                 method_name,
@@ -786,101 +576,13 @@ impl AgentThread {
 
     /// Tries to open the session again, e.g. after logging in through a terminal.
     pub fn retry_session(&mut self) {
-        if self.status == ConnectionStatus::AuthRequired {
+        if self.view.state.status == ConnectionStatus::AuthRequired {
             self.open_session();
         }
     }
 
-    /// The command to run in a terminal for one of the agent's terminal login methods.
-    pub fn terminal_auth_command(&self, method_id: &acp::AuthMethodId) -> Option<AgentCommand> {
-        let command = self.command.as_ref()?;
-        let method = self.auth_methods.iter().find_map(|method| match method {
-            acp::AuthMethod::Terminal(terminal) if &terminal.id == method_id => Some(terminal),
-            _ => None,
-        })?;
-        let mut auth_command = command.clone();
-        auth_command.args.extend(method.args.iter().cloned());
-        auth_command.env.extend(
-            method
-                .env
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
-        Some(auth_command)
-    }
-
-    pub fn cwd(&self) -> &PathBuf {
-        &self.cwd
-    }
-
-    pub fn context_usage(&self) -> Option<ContextUsage> {
-        self.usage
-    }
-
-    pub fn cost(&self) -> Option<&acp::Cost> {
-        self.cost.as_ref()
-    }
-
-    pub fn available_commands(&self) -> &[acp::AvailableCommand] {
-        &self.available_commands
-    }
-
-    pub fn supports_images(&self) -> bool {
-        self.capabilities.prompt_capabilities.image
-    }
-
     pub fn clear_plan(&mut self) {
-        self.plan.clear();
-    }
-
-    pub fn agent_name(&self) -> &SharedString {
-        &self.agent_name
-    }
-
-    pub fn status(&self) -> &ConnectionStatus {
-        &self.status
-    }
-
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
-    }
-
-    pub fn session_restore(&self) -> Option<SessionRestore> {
-        self.session_restore
-    }
-
-    pub fn config_options(&self) -> &[acp::SessionConfigOption] {
-        &self.config_options
-    }
-
-    pub fn modes(&self) -> Option<&acp::SessionModeState> {
-        self.modes.as_ref()
-    }
-
-    /// The display name of the model the agent's model selector currently has chosen.
-    pub fn model_name(&self) -> Option<String> {
-        self.config_options.iter().find_map(|option| {
-            if option.category != Some(acp::SessionConfigOptionCategory::Model) {
-                return None;
-            }
-            let acp::SessionConfigKind::Select(select) = &option.kind else {
-                return None;
-            };
-            let current = &select.current_value;
-            let name = match &select.options {
-                acp::SessionConfigSelectOptions::Ungrouped(options) => options
-                    .iter()
-                    .find(|choice| choice.value == *current)
-                    .map(|choice| choice.name.clone()),
-                acp::SessionConfigSelectOptions::Grouped(groups) => groups
-                    .iter()
-                    .flat_map(|group| &group.options)
-                    .find(|choice| choice.value == *current)
-                    .map(|choice| choice.name.clone()),
-                _ => None,
-            };
-            Some(name.unwrap_or_else(|| current.0.to_string()))
-        })
+        self.view.state.plan.clear();
     }
 
     /// Changes one of the agent's session settings at the user's request, which also makes it
@@ -909,8 +611,10 @@ impl AgentThread {
         let Some(session) = &self.session else {
             return;
         };
-        let previous = self.config_options.clone();
+        let previous = self.view.state.config_options.clone();
         if let Some(option) = self
+            .view
+            .state
             .config_options
             .iter_mut()
             .find(|option| option.id == config_id)
@@ -944,7 +648,7 @@ impl AgentThread {
 
     /// Changes the mode at the user's request, which also makes it the agent's default.
     pub fn set_mode(&mut self, mode_id: acp::SessionModeId) {
-        if self.session.is_none() || self.modes.is_none() {
+        if self.session.is_none() || self.view.state.modes.is_none() {
             return;
         }
         self.emit(AgentThreadEvent::ModeChanged(mode_id.clone()));
@@ -955,7 +659,7 @@ impl AgentThread {
         let Some(session) = &self.session else {
             return;
         };
-        let Some(modes) = &mut self.modes else {
+        let Some(modes) = &mut self.view.state.modes else {
             return;
         };
         let previous_mode = std::mem::replace(&mut modes.current_mode_id, mode_id.clone());
@@ -969,56 +673,22 @@ impl AgentThread {
         });
     }
 
-    pub fn plan(&self) -> &[PlanItem] {
-        &self.plan
-    }
-
-    pub fn permission_request(&self, tool_call_id: &acp::ToolCallId) -> Option<&PermissionRequest> {
-        self.permission_requests
-            .iter()
-            .find(|request| &request.tool_call_id == tool_call_id)
-    }
-
-    /// Permission requests whose tool call isn't shown as an entry.
-    pub fn orphan_permission_requests(&self) -> impl Iterator<Item = &PermissionRequest> {
-        self.permission_requests.iter().filter(|request| {
-            !self.entries.iter().any(|entry| {
-                matches!(entry, Entry::ToolCall(tool_call) if tool_call.id == request.tool_call_id)
-            })
-        })
-    }
-
-    pub fn is_working(&self) -> bool {
-        self.turn_started_at.is_some()
-    }
-
-    pub fn turn_started_at(&self) -> Option<Instant> {
-        self.turn_started_at
-    }
-
-    pub fn turn_error(&self) -> Option<&SharedString> {
-        self.turn_error.as_ref()
-    }
-
-    pub fn last_stop_reason(&self) -> Option<&acp::StopReason> {
-        self.last_stop_reason.as_ref()
-    }
-
     pub fn send(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.is_working() {
             return;
         }
         if !self
+            .view
             .entries
             .iter()
             .any(|entry| matches!(entry, Entry::UserMessage(_)))
         {
             self.emit(AgentThreadEvent::FirstPrompt(text.clone()));
         }
-        self.entries.push(Entry::UserMessage(text.clone()));
-        self.turn_error = None;
-        match self.status {
+        self.view.entries.push(Entry::UserMessage(text.clone()));
+        self.view.state.turn_error = None;
+        match self.view.state.status {
             ConnectionStatus::Ready => self.send_to_agent(text),
             ConnectionStatus::Connecting => {
                 self.queued_prompts.push(text);
@@ -1083,29 +753,29 @@ impl AgentThread {
         tool_call_id: &acp::ToolCallId,
         option_id: acp::PermissionOptionId,
     ) {
-        let Some(index) = self
+        self.view
+            .state
             .permission_requests
+            .retain(|request| &request.tool_call_id != tool_call_id);
+        let Some(index) = self
+            .permission_responders
             .iter()
-            .position(|request| &request.tool_call_id == tool_call_id)
+            .position(|(id, _)| id == tool_call_id)
         else {
             return;
         };
-        let request = self.permission_requests.remove(index);
-        if let Err(error) = request
-            .responder
-            .respond(acp::RequestPermissionResponse::new(
-                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
-                    option_id,
-                )),
-            ))
-        {
+        let (_, responder) = self.permission_responders.remove(index);
+        if let Err(error) = responder.respond(acp::RequestPermissionResponse::new(
+            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(option_id)),
+        )) {
             log::error!("failed to answer the agent's permission request: {error:?}");
         }
     }
 
     fn cancel_permission_requests(&mut self) {
-        for request in self.permission_requests.drain(..) {
-            cancel_permission(request.responder);
+        self.view.state.permission_requests.clear();
+        for (_, responder) in self.permission_responders.drain(..) {
+            cancel_permission(responder);
         }
     }
 
@@ -1113,7 +783,7 @@ impl AgentThread {
         if working == self.is_working() {
             return;
         }
-        self.turn_started_at = working.then(Instant::now);
+        self.view.state.turn_started_at = working.then(SystemTime::now);
         self.emit(AgentThreadEvent::WorkingChanged(working));
     }
 
@@ -1123,7 +793,7 @@ impl AgentThread {
             message.push_str("\n\n");
             message.push_str(&Vec::from(self.stderr_lines.clone()).join("\n"));
         }
-        self.status = ConnectionStatus::Failed(message.into());
+        self.view.state.status = ConnectionStatus::Failed(message.into());
         self.session = None;
         self.queued_prompts.clear();
         self.set_working(false);
@@ -1149,7 +819,9 @@ impl AgentThread {
                 // Permission requests can describe a tool call we haven't been told about yet.
                 self.apply_tool_call_update(request.tool_call.clone());
                 let title = request.tool_call.fields.title.clone().unwrap_or_default();
-                self.permission_requests.push(PermissionRequest {
+                self.permission_responders
+                    .push((tool_call_id.clone(), responder));
+                self.view.state.permission_requests.push(PermissionRequest {
                     tool_call_id,
                     title,
                     options: request
@@ -1161,7 +833,6 @@ impl AgentThread {
                             kind: option.kind,
                         })
                         .collect(),
-                    responder,
                 });
             }
         }
@@ -1196,7 +867,7 @@ impl AgentThread {
             acp::SessionUpdate::ToolCall(tool_call) => self.upsert_tool_call(tool_call),
             acp::SessionUpdate::ToolCallUpdate(update) => self.apply_tool_call_update(update),
             acp::SessionUpdate::Plan(plan) => {
-                self.plan = plan
+                self.view.state.plan = plan
                     .entries
                     .into_iter()
                     .map(|entry| PlanItem {
@@ -1204,29 +875,29 @@ impl AgentThread {
                         status: entry.status,
                     })
                     .collect();
-                if !self.entries.contains(&Entry::Plan) {
-                    self.entries.push(Entry::Plan);
+                if !self.view.entries.contains(&Entry::Plan) {
+                    self.view.entries.push(Entry::Plan);
                 }
             }
             acp::SessionUpdate::ConfigOptionUpdate(update) => {
-                self.config_options = update.config_options;
+                self.view.state.config_options = update.config_options;
             }
             acp::SessionUpdate::CurrentModeUpdate(update) => {
-                if let Some(modes) = &mut self.modes {
+                if let Some(modes) = &mut self.view.state.modes {
                     modes.current_mode_id = update.current_mode_id;
                 }
             }
             acp::SessionUpdate::UsageUpdate(update) => {
-                self.usage = Some(ContextUsage {
+                self.view.state.usage = Some(ContextUsage {
                     used: update.used,
                     size: update.size,
                 });
                 if update.cost.is_some() {
-                    self.cost = update.cost;
+                    self.view.state.cost = update.cost;
                 }
             }
             acp::SessionUpdate::AvailableCommandsUpdate(update) => {
-                self.available_commands = update.available_commands;
+                self.view.state.available_commands = update.available_commands;
             }
             acp::SessionUpdate::SessionInfoUpdate(update) => {
                 if let agent_client_protocol::schema::MaybeUndefined::Value(title) = update.title {
@@ -1246,10 +917,10 @@ impl AgentThread {
         let acp::ContentBlock::Text(text) = content else {
             return;
         };
-        if let Some(existing) = self.entries.last_mut().and_then(existing_text) {
+        if let Some(existing) = self.view.entries.last_mut().and_then(existing_text) {
             existing.push_str(&text.text);
         } else {
-            self.entries.push(new_entry(text.text));
+            self.view.entries.push(new_entry(text.text));
         }
     }
 
@@ -1272,7 +943,7 @@ impl AgentThread {
         if let Some(existing) = self.tool_call_mut(&entry.id) {
             *existing = entry;
         } else {
-            self.entries.push(Entry::ToolCall(entry));
+            self.view.entries.push(Entry::ToolCall(entry));
         }
     }
 
@@ -1295,7 +966,7 @@ impl AgentThread {
                 raw_input: fields.raw_input.as_ref().and_then(raw_input_text),
             };
             set_tool_call_content(&mut entry, fields.content.unwrap_or_default());
-            self.entries.push(Entry::ToolCall(entry));
+            self.view.entries.push(Entry::ToolCall(entry));
             return;
         };
         if let Some(title) = fields.title {
@@ -1322,10 +993,14 @@ impl AgentThread {
     }
 
     fn tool_call_mut(&mut self, id: &acp::ToolCallId) -> Option<&mut ToolCall> {
-        self.entries.iter_mut().rev().find_map(|entry| match entry {
-            Entry::ToolCall(tool_call) if &tool_call.id == id => Some(tool_call),
-            _ => None,
-        })
+        self.view
+            .entries
+            .iter_mut()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::ToolCall(tool_call) if &tool_call.id == id => Some(tool_call),
+                _ => None,
+            })
     }
 }
 

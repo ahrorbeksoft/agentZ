@@ -37,6 +37,7 @@ members = [
     "crates/ztracing_macro",
     "tooling/perf",
     "crates/agent_thread",
+    "crates/agentz_protocol",
     "crates/app",
     "crates/paths",
     "crates/projects",
@@ -60,6 +61,7 @@ edition = "2024"
 #
 
 agent_thread = { path = "crates/agent_thread" }
+agentz_protocol = { path = "crates/agentz_protocol" }
 assets = { path = "crates/assets" }
 bench_metrics = { path = "crates/bench_metrics" }
 collections = { path = "crates/collections", version = "0.1.0" }

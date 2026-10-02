@@ -5,8 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1 as acp;
-use agent_thread::SessionDefaults;
+pub use agentz_protocol::agents::AgentSettings;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task, WindowAppearance};
 use serde::{Deserialize, Serialize};
@@ -33,36 +32,6 @@ pub struct AppSettings {
     pub dark_theme: String,
     /// Per-agent settings, keyed by registry id.
     pub agents: BTreeMap<String, AgentSettings>,
-}
-
-/// What Zed keeps for each external agent: its environment and the defaults for new sessions,
-/// which follow the user's last choices in a thread.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AgentSettings {
-    pub env: BTreeMap<String, String>,
-    pub default_mode: Option<acp::SessionModeId>,
-    pub default_config_options: BTreeMap<String, acp::SessionConfigOptionValue>,
-    /// The settings and modes the agent last offered, so its settings page can list them
-    /// without starting a session.
-    pub known_config_options: Vec<acp::SessionConfigOption>,
-    pub known_modes: Option<acp::SessionModeState>,
-    /// The login method last used from agentZ, to say how the agent is logged in. ACP has no way
-    /// to ask the agent.
-    pub login_method: Option<String>,
-}
-
-impl AgentSettings {
-    pub fn session_defaults(&self) -> SessionDefaults {
-        SessionDefaults {
-            mode: self.default_mode.clone(),
-            config_options: self
-                .default_config_options
-                .iter()
-                .map(|(id, value)| (acp::SessionConfigId::new(id.clone()), value.clone()))
-                .collect(),
-        }
-    }
 }
 
 impl Default for AppSettings {

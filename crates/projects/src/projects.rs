@@ -116,6 +116,18 @@ impl ProjectScope {
     }
 }
 
+/// The whole store as a server sends it to clients.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectsSnapshot {
+    pub projects: Vec<Project>,
+    pub threads: Vec<Thread>,
+    pub scope: ProjectScope,
+    pub thread_order: ThreadOrder,
+    pub archived_expanded: bool,
+    pub working_threads: Vec<ThreadId>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
@@ -495,6 +507,37 @@ impl ProjectStore {
             thread.last_activity_at = Some(SystemTime::now());
             self.changed();
         }
+    }
+
+    /// Everything in the store, for a client's copy.
+    pub fn snapshot(&self) -> ProjectsSnapshot {
+        let mut working_threads: Vec<_> = self.working_threads.iter().copied().collect();
+        working_threads.sort();
+        ProjectsSnapshot {
+            projects: self.projects.clone(),
+            threads: self.threads.clone(),
+            scope: self.scope,
+            thread_order: self.thread_order,
+            archived_expanded: self.archived_expanded,
+            working_threads,
+        }
+    }
+
+    /// A client's read-only copy of a server's store. Nothing is saved.
+    pub fn from_snapshot(snapshot: ProjectsSnapshot) -> Self {
+        let mut this = Self::from_state(
+            PersistedState {
+                next_id: 0,
+                projects: snapshot.projects,
+                threads: snapshot.threads,
+                scope: snapshot.scope,
+                thread_order: snapshot.thread_order,
+                archived_expanded: snapshot.archived_expanded,
+            },
+            None,
+        );
+        this.working_threads = snapshot.working_threads.into_iter().collect();
+        this
     }
 
     fn allocate_id(&mut self) -> u64 {

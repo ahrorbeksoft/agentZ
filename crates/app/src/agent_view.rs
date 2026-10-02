@@ -1202,7 +1202,7 @@ impl AgentView {
                 matches!(entry, Entry::ToolCall(tool_call)
                     if thread.permission_request(&tool_call.id).is_some())
             });
-        let elapsed = started_at.elapsed().as_secs();
+        let elapsed = started_at.elapsed().unwrap_or_default().as_secs();
         let elapsed_label = if elapsed >= 60 {
             format!("{}m {:02}s", elapsed / 60, elapsed % 60)
         } else {
