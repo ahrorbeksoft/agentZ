@@ -4,13 +4,13 @@
 use collections::HashMap;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, Subscription, Window, actions,
+    PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Window, actions,
 };
 use projects::{Project, ProjectIcon, ProjectId, ProjectStore, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
-use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, prelude::*};
+use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
 
 use crate::app_settings::{AppSettingsStore, ThemeMode};
 use crate::project_info::{
@@ -55,6 +55,8 @@ pub struct SettingsPage {
     monogram_input: Entity<TextInput>,
     registry: Entity<AgentRegistryStore>,
     agent_search: Entity<TextInput>,
+    nav_scroll: ScrollHandle,
+    content_scroll: ScrollHandle,
     /// Detected favicons, so automatic icons match the sidebar's.
     project_info: HashMap<ProjectId, ProjectInfo>,
     _subscriptions: Vec<Subscription>,
@@ -118,6 +120,8 @@ impl SettingsPage {
             monogram_input,
             registry,
             agent_search,
+            nav_scroll: ScrollHandle::new(),
+            content_scroll: ScrollHandle::new(),
             project_info,
             _subscriptions: subscriptions,
         }
@@ -132,6 +136,9 @@ impl SettingsPage {
     }
 
     fn select(&mut self, section: Section, cx: &mut Context<Self>) {
+        if self.section != section {
+            self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        }
         self.section = section;
         if section == Section::Agents {
             self.registry
@@ -230,7 +237,7 @@ impl SettingsPage {
         .detach();
     }
 
-    fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_nav(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let projects: Vec<Project> = self.store.read(cx).projects().to_vec();
         let mut items = vec![
@@ -293,6 +300,7 @@ impl SettingsPage {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.nav_scroll)
                     .p_1()
                     .gap_px()
                     .children(items.drain(..3))
@@ -305,7 +313,8 @@ impl SettingsPage {
                             ),
                         )
                     })
-                    .children(items),
+                    .children(items)
+                    .vertical_scrollbar_for(&self.nav_scroll, window, cx),
             )
             // Where the sidebar's Settings row was, so going back needs no mouse movement.
             .child(render_footer_item(
@@ -904,7 +913,7 @@ impl Render for SettingsPage {
             .on_action(cx.listener(|_, _: &CloseSettings, _, cx| cx.emit(SettingsPageEvent::Close)))
             .size_full()
             .bg(colors.editor_background)
-            .child(self.render_nav(cx))
+            .child(self.render_nav(window, cx))
             .child(
                 v_flex()
                     .id("settings-content")
@@ -912,6 +921,7 @@ impl Render for SettingsPage {
                     .min_w_0()
                     .h_full()
                     .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
                     .items_center()
                     .child(
                         v_flex()
@@ -922,7 +932,8 @@ impl Render for SettingsPage {
                             .gap_6()
                             .child(Headline::new(title).size(HeadlineSize::Small))
                             .children(sections),
-                    ),
+                    )
+                    .vertical_scrollbar_for(&self.content_scroll, window, cx),
             )
     }
 }
