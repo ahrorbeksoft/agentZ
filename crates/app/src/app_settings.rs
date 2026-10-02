@@ -47,6 +47,9 @@ pub struct AgentSettings {
     /// without starting a session.
     pub known_config_options: Vec<acp::SessionConfigOption>,
     pub known_modes: Option<acp::SessionModeState>,
+    /// The login method last used from agentZ, to say how the agent is logged in. ACP has no way
+    /// to ask the agent.
+    pub login_method: Option<String>,
 }
 
 impl AgentSettings {

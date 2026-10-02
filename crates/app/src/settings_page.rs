@@ -13,7 +13,7 @@ use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{AgentThread, ConnectionStatus};
+use agent_thread::{AgentThread, AgentThreadEvent, ConnectionStatus};
 
 use std::collections::BTreeMap;
 
@@ -755,6 +755,19 @@ impl SettingsPage {
                     connection.modes().cloned(),
                 )
             };
+            // A login started in Terminal counts once a check finds the agent logged in.
+            let logged_in = connection.read(cx).logged_in() == Some(true);
+            let finished_terminal_login = this
+                .account
+                .as_mut()
+                .filter(|_| logged_in)
+                .and_then(|panel| panel.pending_terminal_method.take());
+            if let Some(method) = finished_terminal_login {
+                let method = method.to_string();
+                this.app_settings.update(cx, |settings, cx| {
+                    settings.update_agent(&agent_id, |agent| agent.login_method = Some(method), cx)
+                });
+            }
             if !options.is_empty() || modes.is_some() {
                 this.app_settings.update(cx, |settings, cx| {
                     settings.update_agent(
@@ -769,6 +782,21 @@ impl SettingsPage {
             }
             cx.notify();
         });
+        let events_agent_id = id.0.to_string();
+        let events = cx.subscribe(&connection, move |this, _, event: &AgentThreadEvent, cx| {
+            let login_method = match event {
+                AgentThreadEvent::LoggedIn(method) => Some(method.to_string()),
+                AgentThreadEvent::LoggedOut => None,
+                _ => return,
+            };
+            this.app_settings.update(cx, |settings, cx| {
+                settings.update_agent(
+                    &events_agent_id,
+                    |agent| agent.login_method = login_method,
+                    cx,
+                )
+            });
+        });
         let env_rows = agent_settings
             .env
             .iter()
@@ -778,8 +806,9 @@ impl SettingsPage {
             agent_id: id.clone(),
             connection,
             terminal_hint: None,
+            pending_terminal_method: None,
             env_rows,
-            _subscription: subscription,
+            _subscriptions: [subscription, events],
         });
         cx.notify();
     }
@@ -1027,31 +1056,14 @@ impl SettingsPage {
         }
         if rows.is_empty() {
             let connection = panel.connection.read(cx);
-            let is_loading = connection.status() == &ConnectionStatus::Connecting;
-            let can_load = connection.status() == &ConnectionStatus::Ready;
-            return v_flex()
-                .gap_2()
-                .items_start()
-                .child(
-                    Label::new(format!(
-                        "Start a thread with {agent_name} to see its settings here, or load them now. \
-                         That opens an empty {agent_name} session; nothing is sent to the model."
-                    ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
-                .child(
-                    Button::new("load-agent-settings", if is_loading { "Loading…" } else { "Load Settings" })
-                        .style(ButtonStyle::Outlined)
-                        .disabled(!can_load)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(panel) = &this.account {
-                                panel
-                                    .connection
-                                    .update(cx, |connection, cx| connection.load_settings(cx));
-                            }
-                        })),
-                )
+            let message = match (connection.status(), connection.logged_in()) {
+                (_, Some(false)) => format!("Log in to {agent_name} to see its settings here."),
+                (ConnectionStatus::Connecting, _) => format!("Loading {agent_name}'s settings…"),
+                _ => format!("{agent_name} doesn't offer any settings."),
+            };
+            return Label::new(message)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
                 .into_any_element();
         }
         v_flex()
@@ -1173,19 +1185,22 @@ impl SettingsPage {
                     buttons.push(
                         Button::new(
                             SharedString::from(format!("account-auth-{}", method_id.0)),
-                            method_name,
+                            method_name.clone(),
                         )
                         .style(ButtonStyle::Outlined)
                         .when_some(description, |button, description| {
                             button.tooltip(Tooltip::text(description))
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.log_in(method_id.clone(), is_terminal, cx)
-                        }))
+                        .on_click({
+                            let method_name: SharedString = method_name.clone().into();
+                            cx.listener(move |this, _, _, cx| {
+                                this.log_in(method_id.clone(), method_name.clone(), is_terminal, cx)
+                            })
+                        })
                         .into_any_element(),
                     );
                 }
-                if connection.supports_logout() {
+                if connection.supports_logout() && connection.logged_in() == Some(true) {
                     buttons.push(
                         Button::new("account-logout", "Log Out")
                             .style(ButtonStyle::Outlined)
@@ -1202,8 +1217,6 @@ impl SettingsPage {
                 }
                 if let Some(error) = connection.auth_error() {
                     (error.clone(), Color::Error)
-                } else if let Some(notice) = connection.account_notice() {
-                    (notice.clone(), Color::Success)
                 } else if let Some(hint) = &account.terminal_hint {
                     (hint.clone(), Color::Muted)
                 } else if buttons.is_empty() {
@@ -1213,27 +1226,79 @@ impl SettingsPage {
                     )
                 } else {
                     (
-                        format!(
-                            "Log in with one of {agent_name}'s methods. It keeps the login for every thread."
-                        )
-                        .into(),
+                        format!("{agent_name} keeps its login for every thread.").into(),
                         Color::Muted,
                     )
                 }
             }
         };
-        // ACP has no way to ask who is logged in; the agent only says what it is.
+        // ACP can't say which account is logged in, only whether a session opens; the method is
+        // the one last used from agentZ.
+        let login_method = self
+            .app_settings
+            .read(cx)
+            .agent(&account.agent_id.0)
+            .login_method;
+        let (status_icon, status_text, status_color): (IconName, SharedString, Color) =
+            match (&status, connection.logged_in()) {
+                (ConnectionStatus::Failed(_), _) => {
+                    (IconName::XCircle, "Couldn't start".into(), Color::Error)
+                }
+                (_, Some(true)) => (
+                    IconName::Check,
+                    match login_method.as_deref().and_then(login_method_subject) {
+                        Some(subject) => format!("Logged in with {subject}").into(),
+                        None => "Logged in".into(),
+                    },
+                    Color::Success,
+                ),
+                (_, Some(false)) => (IconName::Warning, "Not logged in".into(), Color::Warning),
+                _ => (
+                    IconName::LoadCircle,
+                    "Checking whether it's logged in…".into(),
+                    Color::Muted,
+                ),
+            };
+        let can_check = matches!(
+            status,
+            ConnectionStatus::Ready | ConnectionStatus::AuthRequired
+        );
         let agent_info = connection.agent_info().map(|info| {
             let name = info.title.clone().unwrap_or_else(|| info.name.clone());
-            format!(
-                "Running {name} {}. Agents don't share which account they're logged in with.",
-                info.version
-            )
+            format!("{name} {}", info.version)
         });
         v_flex()
             .gap_2()
-            .children(
-                agent_info.map(|info| Label::new(info).size(LabelSize::Small).color(Color::Muted)),
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(status_icon)
+                            .size(IconSize::Small)
+                            .color(status_color),
+                    )
+                    .child(Label::new(status_text).color(status_color))
+                    .children(agent_info.map(|info| {
+                        Label::new(format!("· {info}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                    }))
+                    .child(div().flex_1())
+                    .when(can_check, |row| {
+                        row.child(
+                            Button::new("account-check", "Check Again")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(account) = &mut this.account {
+                                        account.terminal_hint = None;
+                                        account.connection.update(cx, |connection, cx| {
+                                            connection.check_login(cx)
+                                        });
+                                    }
+                                })),
+                        )
+                    }),
             )
             .child(Label::new(message).size(LabelSize::Small).color(color))
             .when(!buttons.is_empty(), |panel| {
@@ -1244,7 +1309,13 @@ impl SettingsPage {
 
     /// Agent methods log in through the agent; terminal methods run the agent's login command
     /// in Terminal, as a thread does.
-    fn log_in(&mut self, method_id: acp::AuthMethodId, is_terminal: bool, cx: &mut Context<Self>) {
+    fn log_in(
+        &mut self,
+        method_id: acp::AuthMethodId,
+        method_name: SharedString,
+        is_terminal: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(account) = &mut self.account else {
             return;
         };
@@ -1261,7 +1332,9 @@ impl SettingsPage {
             .terminal_auth_command(&method_id);
         let cwd = account.connection.read(cx).cwd().clone();
         if let Some(command) = command {
-            account.terminal_hint = Some("Finish logging in in Terminal.".into());
+            account.terminal_hint =
+                Some("Finish logging in in Terminal, then choose Check Again.".into());
+            account.pending_terminal_method = Some(method_name);
             cx.background_spawn(async move {
                 if let Err(error) = open_in_terminal(&command, &cwd).await {
                     log::error!("couldn't open a terminal to log in: {error:#}");
@@ -1437,14 +1510,36 @@ struct AccountPanel {
     /// A session-less connection to the agent, alive only while the panel is open.
     connection: Entity<AgentThread>,
     terminal_hint: Option<SharedString>,
+    /// A login method started in Terminal, credited once a check finds the agent logged in.
+    pending_terminal_method: Option<SharedString>,
     env_rows: Vec<EnvRow>,
-    _subscription: Subscription,
+    _subscriptions: [Subscription; 2],
 }
 
 struct EnvRow {
     key: Entity<TextInput>,
     value: Entity<TextInput>,
     _subscriptions: [Subscription; 2],
+}
+
+/// What a login method logs in with, from its name: "Log in with Google" gives "Google", "API
+/// Key" stays, and a bare "Log In" gives nothing.
+fn login_method_subject(method: &str) -> Option<String> {
+    let trimmed = method.trim();
+    let lower = trimmed.to_lowercase();
+    for prefix in [
+        "log in with ",
+        "login with ",
+        "sign in with ",
+        "signin with ",
+    ] {
+        if lower.starts_with(prefix) {
+            return Some(trimmed[prefix.len()..].trim().to_string())
+                .filter(|rest| !rest.is_empty());
+        }
+    }
+    let is_bare = ["log in", "login", "sign in", "signin"].contains(&lower.as_str());
+    (!is_bare && !trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn render_default_row(name: SharedString, control: AnyElement) -> AnyElement {
@@ -1575,5 +1670,26 @@ impl Render for SettingsPage {
                     )
                     .vertical_scrollbar_for(&self.content_scroll, window, cx),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_method_subject;
+
+    #[test]
+    fn login_method_subjects() {
+        assert_eq!(
+            login_method_subject("Log in with Google").as_deref(),
+            Some("Google")
+        );
+        assert_eq!(
+            login_method_subject("Login with opencode").as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(login_method_subject("ChatGPT").as_deref(), Some("ChatGPT"));
+        assert_eq!(login_method_subject("API Key").as_deref(), Some("API Key"));
+        assert_eq!(login_method_subject("Log In"), None);
+        assert_eq!(login_method_subject("Login"), None);
     }
 }

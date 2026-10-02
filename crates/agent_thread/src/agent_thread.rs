@@ -191,6 +191,9 @@ pub enum AgentThreadEvent {
     ConfigOptionChanged(acp::SessionConfigId, acp::SessionConfigOptionValue),
     /// The user changed the session's mode; Zed keeps it as the agent's default.
     ModeChanged(acp::SessionModeId),
+    /// Logging in with the named method succeeded.
+    LoggedIn(SharedString),
+    LoggedOut,
 }
 
 /// Settings applied to new sessions (not to loaded ones), as Zed's per-agent defaults are.
@@ -249,6 +252,9 @@ pub struct AgentThread {
     account_notice: Option<SharedString>,
     /// What the agent says about itself when it starts.
     agent_info: Option<acp::Implementation>,
+    /// Whether the agent let a session open (logged in) or asked for a login. ACP has no way to
+    /// ask directly, so this is the closest status there is. `None` until known.
+    logged_in: Option<bool>,
     defaults: SessionDefaults,
     _tasks: Vec<Task<()>>,
 }
@@ -306,12 +312,9 @@ impl AgentThread {
                         this.capabilities = connected.capabilities;
                         this.auth_methods = connected.auth_methods;
                         this.agent_info = connected.agent_info;
-                        if this.opens_session {
-                            this.open_session(cx);
-                        } else {
-                            this.status = ConnectionStatus::Ready;
-                            cx.notify();
-                        }
+                        // An account connection opens an empty session too: it is how the login
+                        // status (and the agent's settings) can be learned over ACP.
+                        this.open_session(cx);
                     }
                     Err(error) => {
                         log::error!("failed to start agent: {error:#}");
@@ -380,10 +383,13 @@ impl AgentThread {
                 match result {
                     Ok(_) => {
                         this.auth_error = None;
+                        this.logged_in = Some(false);
+                        cx.emit(AgentThreadEvent::LoggedOut);
                         if this.opens_session {
                             this.status = ConnectionStatus::AuthRequired;
                         } else {
                             this.account_notice = Some("Logged out.".into());
+                            this.session = None;
                         }
                     }
                     Err(error) => {
@@ -398,12 +404,20 @@ impl AgentThread {
         .detach();
     }
 
-    /// For a connection made from settings: opens an empty session, sending no prompt, only to
-    /// read the agent's settings and modes, which ACP reports per session.
-    pub fn load_settings(&mut self, cx: &mut Context<Self>) {
-        if !self.opens_session && self.session.is_none() && self.connection.is_some() {
-            self.open_session(cx);
+    /// For a connection made from settings: opens a fresh empty session (sending no prompt) to
+    /// learn again whether the agent is logged in, e.g. after logging in through a terminal.
+    pub fn check_login(&mut self, cx: &mut Context<Self>) {
+        if self.opens_session || self.connection.is_none() {
+            return;
         }
+        self.session = None;
+        self.account_notice = None;
+        self.open_session(cx);
+    }
+
+    /// Whether the agent is logged in, as far as ACP can tell; see the field.
+    pub fn logged_in(&self) -> Option<bool> {
+        self.logged_in
     }
 
     /// Settings for new sessions; see [`SessionDefaults`].
@@ -498,6 +512,7 @@ impl AgentThread {
             opens_session: true,
             account_notice: None,
             agent_info: None,
+            logged_in: None,
             defaults: SessionDefaults::default(),
             _tasks: Vec::new(),
         }
@@ -531,6 +546,7 @@ impl AgentThread {
                         session_id: setup.session_id,
                     });
                     this.status = ConnectionStatus::Ready;
+                    this.logged_in = Some(true);
                     if setup.restore == SessionRestore::New && this.opens_session {
                         this.apply_defaults(cx);
                     }
@@ -541,6 +557,7 @@ impl AgentThread {
                 }
                 Err(error) if is_auth_required(&error) => {
                     this.status = ConnectionStatus::AuthRequired;
+                    this.logged_in = Some(false);
                     this.set_working(false, cx);
                     cx.notify();
                 }
@@ -566,6 +583,11 @@ impl AgentThread {
         let Some(connection) = self.connection.clone() else {
             return;
         };
+        let method_name = self
+            .auth_methods
+            .iter()
+            .find(|method| *method.id() == method_id)
+            .map(|method| SharedString::from(method.name().to_string()));
         let request = connection
             .send_request(acp::AuthenticateRequest::new(method_id))
             .block_task();
@@ -575,12 +597,15 @@ impl AgentThread {
         cx.spawn(async move |this, cx| {
             let result = request.await;
             this.update(cx, |this, cx| match result {
-                Ok(_) if this.opens_session => this.open_session(cx),
                 Ok(_) => {
-                    this.status = ConnectionStatus::Ready;
-                    this.auth_error = None;
-                    this.account_notice = Some("Logged in.".into());
-                    cx.notify();
+                    if let Some(method_name) = method_name {
+                        cx.emit(AgentThreadEvent::LoggedIn(method_name));
+                    }
+                    if !this.opens_session {
+                        this.account_notice = Some("Logged in.".into());
+                        this.session = None;
+                    }
+                    this.open_session(cx);
                 }
                 Err(error) => {
                     this.status = ConnectionStatus::AuthRequired;
@@ -1543,31 +1568,38 @@ mod tests {
         account.read_with(cx, |account, _| {
             assert!(account.supports_logout());
             assert_eq!(account.auth_methods().len(), 1);
-            assert!(
-                account.session.is_none(),
-                "an account connection opens no session"
+            assert_eq!(
+                account.logged_in(),
+                Some(true),
+                "the mock opens sessions freely"
             );
+            assert_eq!(account.config_options().len(), 4);
         });
 
         account.update(cx, |account, cx| {
             account.authenticate(acp::AuthMethodId::new("mock-login"), cx)
         });
-        wait_until(cx, &|account| account.account_notice().is_some());
+        wait_until(cx, &|account| {
+            account.account_notice().is_some() && account.status() == &ConnectionStatus::Ready
+        });
         account.read_with(cx, |account, _| {
             assert_eq!(
                 account.account_notice().map(|n| n.as_ref()),
                 Some("Logged in.")
             );
-            assert!(account.session.is_none());
+            assert_eq!(account.logged_in(), Some(true));
         });
 
         account.update(cx, |account, cx| account.logout(cx));
         wait_until(cx, &|account| {
             account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
         });
+        account.read_with(cx, |account, _| {
+            assert_eq!(account.logged_in(), Some(false))
+        });
 
-        account.update(cx, |account, cx| account.load_settings(cx));
-        wait_until(cx, &|account| account.config_options().len() == 4);
+        account.update(cx, |account, cx| account.check_login(cx));
+        wait_until(cx, &|account| account.logged_in() == Some(true));
     }
 
     /// New sessions start with the agent's saved defaults, against `test_support/mock_agent.py`.

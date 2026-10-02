@@ -138,9 +138,12 @@ From Zed's guidelines, which this code follows:
   not by name.
 - **Some npm agents ship a native binary as their `bin`** (Factory Droid). `registry::runs_with_node`
   decides whether to run it through `node`.
-- **ACP reports an agent's settings only inside a session.** Per-agent defaults are learned from
-  threads, or from Settings › Agents › Load Settings, which opens an empty session.
-- **ACP can't say which account is logged in.** Don't promise an email.
+- **ACP reports an agent's settings only inside a session**, and has no login-status request.
+  Opening an agent's Settings panel opens an empty session (no prompt). If it works, the agent is
+  logged in, and its settings are learned; "authentication required" means it's logged out. The
+  method shown ("Logged in with ChatGPT") is the one last used from agentZ.
+- **Stay within ACP for agent status.** Don't read agents' own credential files: every agent stores
+  its login differently.
 - **Threads from older builds may lack `session_id` or `model`.** They fill in the next time the
   thread is opened.
 

@@ -298,6 +298,29 @@ impl Shell {
                         });
                     }
                 }
+                AgentThreadEvent::LoggedIn(method) => {
+                    if let Some(agent_id) = &settings_agent_id {
+                        let method = method.to_string();
+                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
+                            settings.update_agent(
+                                &agent_id.0,
+                                |agent| agent.login_method = Some(method),
+                                cx,
+                            )
+                        });
+                    }
+                }
+                AgentThreadEvent::LoggedOut => {
+                    if let Some(agent_id) = &settings_agent_id {
+                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
+                            settings.update_agent(
+                                &agent_id.0,
+                                |agent| agent.login_method = None,
+                                cx,
+                            )
+                        });
+                    }
+                }
                 AgentThreadEvent::ModeChanged(mode) => {
                     if let Some(agent_id) = &settings_agent_id {
                         let mode = mode.clone();
