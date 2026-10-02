@@ -51,8 +51,6 @@ pub struct Sidebar {
     search: Entity<TextInput>,
     archived_shown: usize,
     project_info: HashMap<ProjectId, ProjectInfo>,
-    /// This Mac's name, for the thread details popover.
-    machine_name: Option<SharedString>,
     /// The thread whose details popover is showing, after hovering it for a moment.
     details_thread: Option<ThreadId>,
     /// A popover waiting out the hover delay, and the thread it's for.
@@ -129,33 +127,6 @@ impl Sidebar {
                 }
             }
         });
-        cx.spawn(async move |this, cx| {
-            let output = smol::process::Command::new("scutil")
-                .args(["--get", "ComputerName"])
-                .output()
-                .await;
-            let name = match output {
-                Ok(output) if output.status.success() => {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
-                }
-                Ok(output) => {
-                    log::warn!("couldn't read the computer name: {}", output.status);
-                    return;
-                }
-                Err(error) => {
-                    log::warn!("couldn't read the computer name: {error}");
-                    return;
-                }
-            };
-            if !name.is_empty() {
-                this.update(cx, |this, cx| {
-                    this.machine_name = Some(name.into());
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
         Self {
             store,
             registry,
@@ -163,7 +134,6 @@ impl Sidebar {
             search,
             archived_shown: ARCHIVED_INITIAL_COUNT,
             project_info: HashMap::default(),
-            machine_name: None,
             details_thread: None,
             details_delay: None,
             hovered_thread: None,
@@ -431,7 +401,6 @@ impl Sidebar {
             title: thread.title.clone().into(),
             project: project
                 .map(|project| (project.name(), self.project_info.get(&project.id).cloned())),
-            machine_name: self.machine_name.clone(),
             branch: project
                 .and_then(|project| self.project_info.get(&project.id))
                 .and_then(|info| info.git_head.as_ref())
@@ -1029,11 +998,10 @@ impl Render for Sidebar {
     }
 }
 
-/// t3code's thread popover: the title, then the project, machine, branch, and model with agent.
+/// t3code's thread popover: the title, then the project, branch, and model with agent.
 struct ThreadDetails {
     title: SharedString,
     project: Option<(SharedString, Option<ProjectInfo>)>,
-    machine_name: Option<SharedString>,
     branch: Option<SharedString>,
     agent: Option<(Option<SharedString>, SharedString)>,
 }
@@ -1063,12 +1031,6 @@ impl ThreadDetails {
             rows.push(detail_row(
                 render_project_icon(name, info.as_ref(), px(12.), cx),
                 Label::new(name.clone()).truncate(),
-            ));
-        }
-        if let Some(machine_name) = &self.machine_name {
-            rows.push(detail_row(
-                small_icon(IconName::Screen),
-                Label::new(machine_name.clone()).truncate(),
             ));
         }
         if let Some(branch) = &self.branch {
