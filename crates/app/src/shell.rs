@@ -457,7 +457,10 @@ impl Render for Shell {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.sidebar.clone())
+                    // Settings brings its own navigation in place of the thread list.
+                    .when(settings_page.is_none(), |row| {
+                        row.child(self.sidebar.clone())
+                    })
                     .child(
                         div()
                             .flex_1()

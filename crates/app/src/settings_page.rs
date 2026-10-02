@@ -17,9 +17,9 @@ use crate::app_settings::{AppSettingsStore, ThemeMode};
 use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfo, automatic_monogram, monogram_swatch, render_project_icon,
 };
+use crate::sidebar::SIDEBAR_WIDTH;
 
 const KEY_CONTEXT: &str = "SettingsPage";
-const NAV_WIDTH: Pixels = px(220.);
 const CONTENT_WIDTH: Pixels = px(720.);
 
 actions!(
@@ -274,7 +274,7 @@ impl SettingsPage {
         }
         items.extend(project_items);
         v_flex()
-            .w(NAV_WIDTH)
+            .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_none()
             .border_r_1()
