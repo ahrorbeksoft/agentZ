@@ -14,6 +14,8 @@ This file is for any agent continuing the work. Read it before changing anything
 - **t3code** (`references/t3code`, a read-only clone, gitignored) is the model for the sidebar,
   thread cards, details popover, settings layout and search. Archiving replaces t3code's
   "settle".
+- **herdr** (`references/herdr`, a read-only clone, gitignored, Apache-2.0) is the model for
+  background servers, attention states, terminal panes and SSH machines. See the plan below.
 - **Don't invent extras.** Build what was asked, the way Zed or t3code does it. If neither has
   it, keep it minimal and say what you chose.
 
@@ -152,6 +154,10 @@ From Zed's guidelines, which this code follows:
   thread is opened.
 
 ## State of the work
+
+**Current project:** background servers, terminals and SSH machines. The design is in
+[`docs/plan.md`](docs/plan.md). Where it stands, and what to do next, is in
+[`docs/progress.md`](docs/progress.md). Keep progress.md up to date as you work.
 
 Done:
 - Multi-project with an "All projects" scope.
