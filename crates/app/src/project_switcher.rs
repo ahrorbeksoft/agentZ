@@ -5,13 +5,13 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, Subscription, Window,
+    KeyBinding, ScrollHandle, Subscription, Window,
 };
 use projects::{ProjectId, ProjectScope, ProjectStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Divider, HighlightedLabel, KeyBinding as KeyBindingHint, ListItem, ListItemSpacing,
-    ListSubHeader, Tooltip, prelude::*,
+    ListSubHeader, Tooltip, WithScrollbar as _, prelude::*,
 };
 
 use crate::OpenFolder;
@@ -52,6 +52,7 @@ pub struct ProjectSwitcher {
     /// Byte positions of the search's letters in each entry's name, for highlighting.
     match_positions: Vec<Vec<usize>>,
     selected_index: usize,
+    scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -87,6 +88,7 @@ impl ProjectSwitcher {
             entries: Vec::new(),
             match_positions: Vec::new(),
             selected_index: 0,
+            scroll_handle: ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         this.update_entries(cx);
@@ -137,8 +139,21 @@ impl ProjectSwitcher {
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         if !self.entries.is_empty() {
             self.selected_index = (self.selected_index + 1) % self.entries.len();
+            self.scroll_to_selection();
             cx.notify();
         }
+    }
+
+    /// Keeps the selected row in view. The list's children are its rows plus the "Projects"
+    /// header just before the first project.
+    fn scroll_to_selection(&self) {
+        let header_before = self.entries.first() == Some(&Entry::AllProjects)
+            && matches!(
+                self.entries.get(self.selected_index),
+                Some(Entry::Project(_))
+            );
+        self.scroll_handle
+            .scroll_to_item(self.selected_index + usize::from(header_before));
     }
 
     fn select_previous(
@@ -152,6 +167,7 @@ impl ProjectSwitcher {
                 .selected_index
                 .checked_sub(1)
                 .unwrap_or(self.entries.len() - 1);
+            self.scroll_to_selection();
             cx.notify();
         }
     }
@@ -254,7 +270,7 @@ impl ProjectSwitcher {
 }
 
 impl Render for ProjectSwitcher {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border_variant = cx.theme().colors().border_variant;
         let has_projects = !self.store.read(cx).projects().is_empty();
         let mut rows = Vec::with_capacity(self.entries.len() + 1);
@@ -281,6 +297,8 @@ impl Render for ProjectSwitcher {
 
         v_flex()
             .key_context(KEY_CONTEXT)
+            // Like Zed's menus, a click anywhere outside closes it.
+            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
             .w(rems(22.))
             .elevation_3(cx)
             .overflow_hidden()
@@ -303,24 +321,31 @@ impl Render for ProjectSwitcher {
                     .child(self.search.clone()),
             )
             .child(
-                v_flex()
-                    .id("project-switcher-entries")
-                    .max_h(rems(24.))
-                    .overflow_y_scroll()
-                    .p_1()
-                    .children(rows)
-                    .when(self.entries.is_empty(), |list| {
-                        list.child(
-                            div().px_2().py_1p5().child(
-                                Label::new(if has_projects {
-                                    "No matching projects"
-                                } else {
-                                    "Open a folder to add your first project"
-                                })
-                                .color(Color::Muted),
-                            ),
-                        )
-                    }),
+                // The scrollbar sits on this non-scrolling wrapper so it stays put, as in Zed.
+                div()
+                    .id("project-switcher-scroll")
+                    .child(
+                        v_flex()
+                            .id("project-switcher-entries")
+                            .max_h(rems(24.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .p_1()
+                            .children(rows)
+                            .when(self.entries.is_empty(), |list| {
+                                list.child(
+                                    div().px_2().py_1p5().child(
+                                        Label::new(if has_projects {
+                                            "No matching projects"
+                                        } else {
+                                            "Open a folder to add your first project"
+                                        })
+                                        .color(Color::Muted),
+                                    ),
+                                )
+                            }),
+                    )
+                    .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
             .child(
                 h_flex()

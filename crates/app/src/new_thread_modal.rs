@@ -3,12 +3,12 @@
 
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, Subscription, Window,
+    KeyBinding, ScrollHandle, Subscription, Window,
 };
 use projects::{ProjectId, ProjectStore, ThreadId};
 use registry::{AgentId, AgentRegistryStore, InstallState};
 use text_input::{TextInput, TextInputEvent};
-use ui::{ButtonLike, ListItem, ListItemSpacing, prelude::*};
+use ui::{ButtonLike, ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};
 
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::compact_path;
@@ -45,6 +45,7 @@ pub struct NewThreadModal {
     project_rows: Vec<ProjectId>,
     agent_rows: Vec<AgentId>,
     selected_index: usize,
+    scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -88,6 +89,7 @@ impl NewThreadModal {
             project_rows: Vec::new(),
             agent_rows: Vec::new(),
             selected_index: 0,
+            scroll_handle: ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         this.go_to(project_id.map_or(Step::Project, Step::Agent), cx);
@@ -97,6 +99,7 @@ impl NewThreadModal {
     fn go_to(&mut self, step: Step, cx: &mut Context<Self>) {
         self.step = step;
         self.selected_index = 0;
+        self.scroll_handle.set_offset(gpui::point(px(0.), px(0.)));
         let placeholder = match step {
             Step::Project => "Search projects…",
             Step::Agent(_) => "Search agents…",
@@ -162,6 +165,7 @@ impl NewThreadModal {
         let count = self.row_count();
         if count > 0 {
             self.selected_index = (self.selected_index + 1) % count;
+            self.scroll_handle.scroll_to_item(self.selected_index);
             cx.notify();
         }
     }
@@ -175,6 +179,7 @@ impl NewThreadModal {
         let count = self.row_count();
         if count > 0 {
             self.selected_index = self.selected_index.checked_sub(1).unwrap_or(count - 1);
+            self.scroll_handle.scroll_to_item(self.selected_index);
             cx.notify();
         }
     }
@@ -361,7 +366,7 @@ impl NewThreadModal {
 }
 
 impl Render for NewThreadModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border_variant = cx.theme().colors().border_variant;
         let rows: Vec<AnyElement> = match self.step {
             Step::Project => self
@@ -399,14 +404,20 @@ impl Render for NewThreadModal {
             .on_action(cx.listener(Self::cancel))
             .child(self.render_header(cx))
             .child(
-                v_flex()
-                    .id("new-thread-rows")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_1()
-                    .children(rows)
-                    .children(empty_state),
+                // The scrollbar sits on this non-scrolling wrapper so it stays put, as in Zed.
+                div()
+                    .id("new-thread-rows-scroll")
+                    .child(
+                        v_flex()
+                            .id("new-thread-rows")
+                            .max_h(rems(26.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .p_1()
+                            .children(rows)
+                            .children(empty_state),
+                    )
+                    .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
             .when(matches!(self.step, Step::Agent(_)), |modal| {
                 modal.child(
