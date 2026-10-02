@@ -3,9 +3,12 @@
 It answers initialize and session/new, and replies to every prompt by streaming
 "Echo: <prompt>" and a completed tool call, then ending the turn. A prompt of
 "permission" first asks the client for permission and reports the chosen option.
+A prompt of "mcp" starts the first stdio MCP server given in session/new, calls
+its first tool, and replies "MCP: <tool result>".
 """
 import json
 import os
+import subprocess
 import sys
 
 # Optional path where conversations are recorded so `session/load` can replay them.
@@ -15,6 +18,7 @@ LONG_BUILD_OUTPUT = "".join(f"   Compiling page {n}/60\n" for n in range(1, 61))
 
 next_request_id = 1000
 pending = {}
+mcp_servers = []
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
 
 
@@ -76,6 +80,35 @@ def finish_prompt(request_id, session_id, prompt_text, chosen=None):
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
+def call_first_mcp_tool():
+    """Speaks MCP's stdio transport (newline-delimited JSON-RPC) to the first stdio server."""
+    server = next((s for s in mcp_servers if "command" in s), None)
+    if server is None:
+        return "no stdio MCP server"
+    env = dict(os.environ)
+    env.update({variable["name"]: variable["value"] for variable in server.get("env", [])})
+    process = subprocess.Popen([server["command"], *server.get("args", [])], env=env,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    def request(request_id, method, params):
+        process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id,
+                                        "method": method, "params": params}) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    try:
+        request(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                  "clientInfo": {"name": "mock-agent", "version": "0"}})
+        process.stdin.write(json.dumps({"jsonrpc": "2.0",
+                                        "method": "notifications/initialized"}) + "\n")
+        tools = request(2, "tools/list", {})["result"]["tools"]
+        result = request(3, "tools/call", {"name": tools[0]["name"], "arguments": {}})["result"]
+        return "".join(block.get("text", "") for block in result["content"])
+    finally:
+        process.stdin.close()
+        process.wait()
+
+
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
@@ -93,6 +126,7 @@ for line in sys.stdin:
     elif method in ("authenticate", "logout"):
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
     elif method == "session/new":
+        mcp_servers = message["params"].get("mcpServers", [])
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"sessionId": "session-1", "configOptions": config_options()}})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {
@@ -124,6 +158,10 @@ for line in sys.stdin:
                              "options": [
                                  {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
                                  {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}})
+        elif prompt_text == "mcp":
+            update(params["sessionId"], text_chunk("agent_message_chunk",
+                                                   "MCP: " + call_first_mcp_tool()))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "demo":
             session_id = params["sessionId"]
             update(session_id, text_chunk("agent_thought_chunk",
