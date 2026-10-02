@@ -11,7 +11,7 @@ use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, IconPosition, PopoverMenu, Tooltip, prelude::*,
-    right_click_menu,
+    right_click_menu, tooltip_container,
 };
 
 use crate::project_info::{ProjectInfo, render_project_icon};
@@ -50,6 +50,8 @@ pub struct Sidebar {
     search: Entity<TextInput>,
     archived_shown: usize,
     project_info: HashMap<ProjectId, ProjectInfo>,
+    /// This Mac's name, for the thread details popover.
+    machine_name: Option<SharedString>,
     renaming_thread: Option<ThreadId>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
@@ -120,6 +122,33 @@ impl Sidebar {
                 }
             }
         });
+        cx.spawn(async move |this, cx| {
+            let output = smol::process::Command::new("scutil")
+                .args(["--get", "ComputerName"])
+                .output()
+                .await;
+            let name = match output {
+                Ok(output) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                Ok(output) => {
+                    log::warn!("couldn't read the computer name: {}", output.status);
+                    return;
+                }
+                Err(error) => {
+                    log::warn!("couldn't read the computer name: {error}");
+                    return;
+                }
+            };
+            if !name.is_empty() {
+                this.update(cx, |this, cx| {
+                    this.machine_name = Some(name.into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
         Self {
             store,
             registry,
@@ -127,6 +156,7 @@ impl Sidebar {
             search,
             archived_shown: ARCHIVED_INITIAL_COUNT,
             project_info: HashMap::default(),
+            machine_name: None,
             renaming_thread: None,
             rename_input,
             _rename_blur: None,
@@ -318,10 +348,45 @@ impl Sidebar {
 
     fn render_project_icon(&self, project: Option<&Project>, cx: &App) -> AnyElement {
         match project {
-            Some(project) => {
-                render_project_icon(&project.name(), self.project_info.get(&project.id), cx)
-            }
+            Some(project) => render_project_icon(
+                &project.name(),
+                self.project_info.get(&project.id),
+                px(16.),
+                cx,
+            ),
             None => div().size_4().flex_none().into_any_element(),
+        }
+    }
+
+    fn thread_details(
+        &self,
+        thread: &Thread,
+        project: Option<&Project>,
+        cx: &App,
+    ) -> ThreadDetails {
+        let agent = thread.agent_id.as_ref().map(|agent_id| {
+            let agent_id = AgentId::new(agent_id.clone());
+            let registry_agent = self.registry.read(cx).agent(&agent_id);
+            let agent_name = registry_agent
+                .map(|agent| agent.name().clone())
+                .unwrap_or_else(|| agent_id.0.clone());
+            let label = match &thread.model {
+                Some(model) => format!("{model} · {agent_name}").into(),
+                None => agent_name,
+            };
+            let icon_path = registry_agent.and_then(|agent| agent.icon_path().cloned());
+            (icon_path, label)
+        });
+        ThreadDetails {
+            title: thread.title.clone().into(),
+            project: project
+                .map(|project| (project.name(), self.project_info.get(&project.id).cloned())),
+            machine_name: self.machine_name.clone(),
+            branch: project
+                .and_then(|project| self.project_info.get(&project.id))
+                .and_then(|info| info.git_head.as_ref())
+                .map(|git_head| git_head.branch.clone().into()),
+            agent,
         }
     }
 
@@ -341,6 +406,7 @@ impl Sidebar {
         let is_working = self.store.read(cx).is_thread_working(thread.id);
         let thread_id = thread.id;
         let icon = self.agent_icon(&thread, cx);
+        let details = self.thread_details(&thread, project.as_ref(), cx);
         // With one project selected, every card would repeat it, so the project line goes and
         // the status moves next to the title.
         let shows_all_projects = self.store.read(cx).scope() == ProjectScope::All;
@@ -458,6 +524,7 @@ impl Sidebar {
         let card = v_flex()
             .id(("thread-card", thread.id.0))
             .group(group_name)
+            .tooltip(move |_, cx| cx.new(|_| details.clone()).into())
             .relative()
             .w_full()
             .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
@@ -596,6 +663,7 @@ impl Sidebar {
         let thread_id = thread.id;
         let project = self.store.read(cx).project(thread.project_id).cloned();
         let project_icon = self.render_project_icon(project.as_ref(), cx);
+        let details = self.thread_details(&thread, project.as_ref(), cx);
         let time = thread
             .archived_at
             .map(|time| format_relative_time(time, SystemTime::now()));
@@ -606,6 +674,7 @@ impl Sidebar {
         let row = h_flex()
             .id(("archived-thread", thread.id.0))
             .group(group_name.clone())
+            .tooltip(move |_, cx| cx.new(|_| details.clone()).into())
             .relative()
             .h(ARCHIVED_ROW_HEIGHT)
             .w_full()
@@ -869,6 +938,88 @@ impl Render for Sidebar {
             } else {
                 self.render_empty_state().into_any_element()
             })
+    }
+}
+
+/// t3code's thread popover: the title, then the project, machine, branch, and model with agent.
+#[derive(Clone)]
+struct ThreadDetails {
+    title: SharedString,
+    project: Option<(SharedString, Option<ProjectInfo>)>,
+    machine_name: Option<SharedString>,
+    branch: Option<SharedString>,
+    agent: Option<(Option<SharedString>, SharedString)>,
+}
+
+impl Render for ThreadDetails {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let detail_color = Color::Custom(cx.theme().colors().text.opacity(0.75));
+        let detail_row = |icon: AnyElement, label: Label| {
+            h_flex()
+                .min_w_0()
+                .gap_2()
+                .child(div().flex_none().child(icon))
+                .child(
+                    div()
+                        .min_w_0()
+                        .child(label.size(LabelSize::Small).color(detail_color)),
+                )
+        };
+        let small_icon = |name: IconName| {
+            Icon::new(name)
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
+        };
+        let mut rows = Vec::new();
+        if let Some((name, info)) = &self.project {
+            rows.push(detail_row(
+                render_project_icon(name, info.as_ref(), px(12.), cx),
+                Label::new(name.clone()).truncate(),
+            ));
+        }
+        if let Some(machine_name) = &self.machine_name {
+            rows.push(detail_row(
+                small_icon(IconName::Screen),
+                Label::new(machine_name.clone()).truncate(),
+            ));
+        }
+        if let Some(branch) = &self.branch {
+            rows.push(detail_row(
+                small_icon(IconName::GitBranch),
+                Label::new(branch.clone()).truncate_middle(),
+            ));
+        }
+        if let Some((icon_path, label)) = &self.agent {
+            let icon = icon_path
+                .clone()
+                .map(Icon::from_external_svg)
+                .unwrap_or_else(|| Icon::new(IconName::Terminal));
+            rows.push(detail_row(
+                div()
+                    .opacity(0.6)
+                    .child(icon.size(IconSize::XSmall).color(Color::Muted))
+                    .into_any_element(),
+                Label::new(label.clone()).truncate(),
+            ));
+        }
+        let title = self.title.clone();
+        tooltip_container(cx, move |container, _| {
+            container.child(
+                v_flex()
+                    .max_w(px(320.))
+                    .gap_2()
+                    .px_1()
+                    .py_2()
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::MEDIUM)
+                            .truncate(),
+                    )
+                    .child(v_flex().gap_1p5().pl_0p5().children(rows)),
+            )
+        })
     }
 }
 

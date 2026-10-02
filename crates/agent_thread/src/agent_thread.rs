@@ -473,6 +473,32 @@ impl AgentThread {
         self.modes.as_ref()
     }
 
+    /// The display name of the model the agent's model selector currently has chosen.
+    pub fn model_name(&self) -> Option<String> {
+        self.config_options.iter().find_map(|option| {
+            if option.category != Some(acp::SessionConfigOptionCategory::Model) {
+                return None;
+            }
+            let acp::SessionConfigKind::Select(select) = &option.kind else {
+                return None;
+            };
+            let current = &select.current_value;
+            let name = match &select.options {
+                acp::SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .find(|choice| choice.value == *current)
+                    .map(|choice| choice.name.clone()),
+                acp::SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|group| &group.options)
+                    .find(|choice| choice.value == *current)
+                    .map(|choice| choice.name.clone()),
+                _ => None,
+            };
+            Some(name.unwrap_or_else(|| current.0.to_string()))
+        })
+    }
+
     /// Changes one of the agent's session settings. The new value shows immediately and is
     /// reverted if the agent rejects it.
     pub fn set_config_option(

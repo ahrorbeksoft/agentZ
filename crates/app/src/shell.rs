@@ -23,7 +23,7 @@ const MAX_THREAD_TITLE_CHARS: usize = 48;
 /// An open thread. Kept while the app runs so its agent keeps working in the background.
 struct OpenThread {
     view: Entity<AgentView>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 pub struct Shell {
@@ -212,6 +212,13 @@ impl Shell {
             });
         let title = SharedString::from(thread.title);
         let registry = self.registry.clone();
+        // Remembered so the sidebar can name the model of threads that aren't open.
+        let model_subscription = cx.observe(&agent_thread, move |this, agent_thread, cx| {
+            if let Some(model) = agent_thread.read(cx).model_name() {
+                this.store
+                    .update(cx, |store, cx| store.set_thread_model(thread_id, model, cx));
+            }
+        });
         let is_archived = thread.archived_at.is_some();
         let view = cx.new(|cx| {
             let mut view = AgentView::new(agent_thread, title, registry, agent_id, cx);
@@ -225,7 +232,7 @@ impl Shell {
         });
         Some(OpenThread {
             view,
-            _subscriptions: [thread_subscription, view_subscription],
+            _subscriptions: [thread_subscription, model_subscription, view_subscription],
         })
     }
 

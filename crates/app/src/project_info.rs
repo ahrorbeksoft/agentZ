@@ -200,35 +200,46 @@ fn branch_from_head(head: &str) -> Option<String> {
 }
 
 /// The project's favicon, or t3code's monogram tile when it has none or it fails to load.
-pub fn render_project_icon(name: &str, info: Option<&ProjectInfo>, cx: &App) -> AnyElement {
+pub fn render_project_icon(
+    name: &str,
+    info: Option<&ProjectInfo>,
+    size: Pixels,
+    cx: &App,
+) -> AnyElement {
     let text = SharedString::from(monogram(name));
     let color = monogram_color(name, cx.theme().appearance().is_light());
     let font_family = theme::theme_settings(cx).buffer_font(cx).family.clone();
     match info.and_then(|info| info.favicon.clone()) {
         Some(favicon) => img(favicon)
-            .size_4()
+            .size(size)
             .flex_none()
             .rounded_sm()
             .with_fallback(move || {
-                render_monogram(text.clone(), color, font_family.clone()).into_any_element()
+                render_monogram(text.clone(), color, font_family.clone(), size).into_any_element()
             })
             .into_any_element(),
-        None => render_monogram(text, color, font_family).into_any_element(),
+        None => render_monogram(text, color, font_family, size).into_any_element(),
     }
 }
 
-fn render_monogram(text: SharedString, color: Hsla, font_family: SharedString) -> Div {
+/// t3code draws the monogram on a 16px tile with 8.25px text and a 25% corner radius.
+fn render_monogram(
+    text: SharedString,
+    color: Hsla,
+    font_family: SharedString,
+    size: Pixels,
+) -> Div {
     div()
-        .size_4()
+        .size(size)
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(4.))
+        .rounded(size * 0.25)
         .bg(color.opacity(0.14))
         .text_color(color)
-        .text_size(px(8.25))
-        .line_height(px(16.))
+        .text_size(size * (8.25 / 16.))
+        .line_height(size)
         .font_weight(FontWeight::BOLD)
         .font_family(font_family)
         .child(text)

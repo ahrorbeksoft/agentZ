@@ -52,6 +52,9 @@ pub struct Thread {
     /// The user renamed the thread, so automatic titles no longer replace it.
     #[serde(default)]
     pub has_custom_title: bool,
+    /// The model last selected in the thread, as the agent names it.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// How threads (and, in "All projects", the projects themselves) are ordered.
@@ -315,6 +318,7 @@ impl ProjectStore {
             session_id: None,
             archived_at: None,
             has_custom_title: false,
+            model: None,
         });
         self.changed(cx);
         Some(id)
@@ -374,6 +378,15 @@ impl ProjectStore {
             && thread.session_id.as_deref() != Some(session_id.as_str())
         {
             thread.session_id = Some(session_id);
+            self.changed(cx);
+        }
+    }
+
+    pub fn set_thread_model(&mut self, id: ThreadId, model: String, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.model.as_deref() != Some(model.as_str())
+        {
+            thread.model = Some(model);
             self.changed(cx);
         }
     }
