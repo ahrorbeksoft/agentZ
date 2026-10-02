@@ -10,8 +10,8 @@ use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId,
 use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
-    CommonAnimationExt as _, ContextMenu, IconPosition, PopoverMenu, Tooltip, prelude::*,
-    right_click_menu,
+    CommonAnimationExt as _, ContextMenu, ContextMenuEntry, IconPosition, PopoverMenu, Tooltip,
+    prelude::*, right_click_menu,
 };
 
 use crate::project_info::{ProjectInfo, render_project_icon};
@@ -338,6 +338,84 @@ impl Sidebar {
         }
     }
 
+    /// Rename, Archive or Unarchive, and Delete, each with its icon.
+    fn thread_menu(
+        &self,
+        thread_id: ThreadId,
+        title: SharedString,
+        is_archived: bool,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&mut Window, &mut App) -> Entity<ContextMenu> + 'static {
+        let sidebar = cx.entity().downgrade();
+        move |window, cx| {
+            let sidebar = sidebar.clone();
+            let title = title.clone();
+            ContextMenu::build(window, cx, move |menu, _, _| {
+                let rename = {
+                    let sidebar = sidebar.clone();
+                    let title = title.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.start_renaming(thread_id, title.clone(), window, cx)
+                            })
+                            .ok();
+                    }
+                };
+                let toggle_archived = {
+                    let sidebar = sidebar.clone();
+                    move |_: &mut Window, cx: &mut App| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.store.update(cx, |store, cx| {
+                                    if is_archived {
+                                        store.unarchive_thread(thread_id, cx)
+                                    } else {
+                                        store.archive_thread(thread_id, cx)
+                                    }
+                                })
+                            })
+                            .ok();
+                    }
+                };
+                let delete = {
+                    let sidebar = sidebar.clone();
+                    let title = title.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.confirm_delete_thread(thread_id, title.clone(), window, cx)
+                            })
+                            .ok();
+                    }
+                };
+                menu.item(
+                    ContextMenuEntry::new("Rename")
+                        .icon(IconName::Pencil)
+                        .icon_color(Color::Muted)
+                        .handler(rename),
+                )
+                .item(
+                    ContextMenuEntry::new(if is_archived { "Unarchive" } else { "Archive" })
+                        .icon(if is_archived {
+                            IconName::Undo
+                        } else {
+                            IconName::Archive
+                        })
+                        .icon_color(Color::Muted)
+                        .handler(toggle_archived),
+                )
+                .separator()
+                .item(
+                    ContextMenuEntry::new("Delete…")
+                        .icon(IconName::Trash)
+                        .icon_color(Color::Muted)
+                        .handler(delete),
+                )
+            })
+        }
+    }
+
     /// Shows the hovered thread's details after a moment, like t3code's row tooltip.
     fn thread_hovered(&mut self, thread_id: ThreadId, hovered: bool, cx: &mut Context<Self>) {
         if !hovered {
@@ -572,9 +650,6 @@ impl Sidebar {
                     this.thread_hovered(thread_id, *hovered, cx)
                 }))
                 .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-                .when(self.details_thread == Some(thread_id), |this| {
-                    this.child(render_details_popover(details, cx))
-                })
                 .relative()
                 .w_full()
                 .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
@@ -631,32 +706,18 @@ impl Sidebar {
                         ),
                 );
 
-        let sidebar = cx.entity().downgrade();
+        // The details popover stays hidden while the thread's menu is open.
+        let details_popover =
+            (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
+        let menu = self.thread_menu(thread_id, title, false, cx);
         right_click_menu(("thread-menu", thread.id.0))
-            .trigger(move |_, _, _| div().py_0p5().child(card))
-            .menu(move |window, cx| {
-                let sidebar = sidebar.clone();
-                let title = title.clone();
-                ContextMenu::build(window, cx, move |menu, _, _| {
-                    let archive_sidebar = sidebar.clone();
-                    menu.entry("Rename Title", None, move |window, cx| {
-                        sidebar
-                            .update(cx, |sidebar, cx| {
-                                sidebar.start_renaming(thread_id, title.clone(), window, cx)
-                            })
-                            .ok();
-                    })
-                    .entry("Archive Thread", None, move |_, cx| {
-                        archive_sidebar
-                            .update(cx, |sidebar, cx| {
-                                sidebar
-                                    .store
-                                    .update(cx, |store, cx| store.archive_thread(thread_id, cx))
-                            })
-                            .ok();
-                    })
-                })
+            .trigger(move |is_menu_open, _, _| {
+                div()
+                    .relative()
+                    .child(div().py_0p5().child(card))
+                    .when(!is_menu_open, |this| this.children(details_popover))
             })
+            .menu(menu)
             .into_any_element()
     }
 
@@ -729,9 +790,6 @@ impl Sidebar {
                     this.thread_hovered(thread_id, *hovered, cx)
                 }))
                 .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-                .when(self.details_thread == Some(thread_id), |this| {
-                    this.child(render_details_popover(details, cx))
-                })
                 .relative()
                 .h(ARCHIVED_ROW_HEIGHT)
                 .w_full()
@@ -791,49 +849,18 @@ impl Sidebar {
                     )
                 });
 
-        let sidebar = cx.entity().downgrade();
+        // The details popover stays hidden while the thread's menu is open.
+        let details_popover =
+            (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
+        let menu = self.thread_menu(thread_id, title, true, cx);
         right_click_menu(("archived-thread-menu", thread.id.0))
-            .trigger(move |_, _, _| row)
-            .menu(move |window, cx| {
-                let sidebar = sidebar.clone();
-                let title = title.clone();
-                ContextMenu::build(window, cx, move |menu, _, _| {
-                    let rename_sidebar = sidebar.clone();
-                    let rename_title = title.clone();
-                    let unarchive_sidebar = sidebar.clone();
-                    let delete_sidebar = sidebar.clone();
-                    let delete_title = title.clone();
-                    menu.entry("Rename Title", None, move |window, cx| {
-                        rename_sidebar
-                            .update(cx, |sidebar, cx| {
-                                sidebar.start_renaming(thread_id, rename_title.clone(), window, cx)
-                            })
-                            .ok();
-                    })
-                    .entry("Unarchive Thread", None, move |_, cx| {
-                        unarchive_sidebar
-                            .update(cx, |sidebar, cx| {
-                                sidebar
-                                    .store
-                                    .update(cx, |store, cx| store.unarchive_thread(thread_id, cx))
-                            })
-                            .ok();
-                    })
-                    .separator()
-                    .entry("Delete Thread…", None, move |window, cx| {
-                        delete_sidebar
-                            .update(cx, |sidebar, cx| {
-                                sidebar.confirm_delete_thread(
-                                    thread_id,
-                                    delete_title.clone(),
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .ok();
-                    })
-                })
+            .trigger(move |is_menu_open, _, _| {
+                div()
+                    .relative()
+                    .child(row)
+                    .when(!is_menu_open, |this| this.children(details_popover))
             })
+            .menu(menu)
             .into_any_element()
     }
 
