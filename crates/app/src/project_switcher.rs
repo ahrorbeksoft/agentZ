@@ -1,10 +1,12 @@
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, Subscription, Window,
+    KeyBinding, PromptLevel, Subscription, Window,
 };
 use projects::{ProjectId, ProjectScope, ProjectStore};
 use text_input::{TextInput, TextInputEvent};
-use ui::{ButtonLike, KeyBinding as KeyBindingHint, ListItem, ListItemSpacing, prelude::*};
+use ui::{
+    ButtonLike, KeyBinding as KeyBindingHint, ListItem, ListItemSpacing, Tooltip, prelude::*,
+};
 
 use crate::OpenFolder;
 
@@ -149,10 +151,45 @@ impl ProjectSwitcher {
         cx.emit(DismissEvent);
     }
 
+    /// Removing a project also drops its threads from the list, so it asks first.
+    fn confirm_remove_project(
+        &mut self,
+        project_id: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self
+            .store
+            .read(cx)
+            .project(project_id)
+            .map(|project| project.name())
+        else {
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Remove “{name}” from the list?"),
+            Some("Its threads are removed too. Nothing on disk is touched."),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        let store = self.store.clone();
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                store.update(cx, |store, cx| store.remove_project(project_id, cx));
+            }
+        })
+        .detach();
+    }
+
     fn render_entry(&self, index: usize, entry: Entry, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
         let is_current = store.scope() == entry.scope();
 
+        let project_id = match entry {
+            Entry::AllProjects => None,
+            Entry::Project(id) => Some(id),
+        };
         let (icon, label, detail) = match entry {
             Entry::AllProjects => {
                 let count = store.projects().len();
@@ -202,6 +239,18 @@ impl ProjectSwitcher {
                     Icon::new(IconName::Check)
                         .size(IconSize::Small)
                         .color(Color::Accent),
+                )
+            })
+            .when_some(project_id, |item, project_id| {
+                item.end_slot_on_hover(
+                    IconButton::new(("remove-project", index), IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Remove From List"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.confirm_remove_project(project_id, window, cx);
+                        })),
                 )
             })
             .on_click(cx.listener(move |this, _, _, cx| this.choose(entry, cx)))

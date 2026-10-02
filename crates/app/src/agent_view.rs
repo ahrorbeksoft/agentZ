@@ -10,8 +10,8 @@ use agent_thread::{
 };
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding, ScrollHandle,
-    Subscription, Task, Window,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding,
+    ScrollHandle, Subscription, Task, Window,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use registry::{AgentId, AgentRegistryStore};
@@ -51,7 +51,13 @@ type MarkdownKey = (usize, usize);
 /// The [`MarkdownKey`] part holding a tool call's raw input.
 const RAW_INPUT_PART: usize = usize::MAX;
 
+pub enum AgentViewEvent {
+    Unarchive,
+}
+
 pub struct AgentView {
+    /// Archived threads stay readable but take no new messages until they're unarchived.
+    is_archived: bool,
     thread: Entity<AgentThread>,
     title: SharedString,
     registry: Entity<AgentRegistryStore>,
@@ -122,6 +128,7 @@ impl AgentView {
         let mut this = Self {
             thread,
             title,
+            is_archived: false,
             registry,
             agent_id,
             composer,
@@ -142,6 +149,13 @@ impl AgentView {
         };
         this.sync_markdowns(cx);
         this
+    }
+
+    pub fn set_archived(&mut self, is_archived: bool, cx: &mut Context<Self>) {
+        if self.is_archived != is_archived {
+            self.is_archived = is_archived;
+            cx.notify();
+        }
     }
 
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
@@ -283,6 +297,9 @@ impl AgentView {
     }
 
     fn send(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_archived {
+            return;
+        }
         let commands = self.matching_commands(cx);
         if let Some(command) = commands.get(
             self.command_menu_index
@@ -309,7 +326,8 @@ impl AgentView {
 
     fn send_next_queued_message(&mut self, cx: &mut Context<Self>) {
         let thread = self.thread.read(cx);
-        if self.queued_messages.is_empty()
+        if self.is_archived
+            || self.queued_messages.is_empty()
             || thread.is_working()
             || thread.status() != &ConnectionStatus::Ready
         {
@@ -1163,6 +1181,24 @@ impl AgentView {
     }
 
     /// Zed's notice for agents that continue a session without showing its earlier messages.
+    /// Takes the composer's place while the thread is archived, like t3code's notice for a
+    /// settled thread.
+    fn render_archived_notice(&self, cx: &mut Context<Self>) -> AnyElement {
+        Callout::new()
+            .border_position(ui::CalloutBorderPosition::Top)
+            .severity(Severity::Info)
+            .icon(IconName::Info)
+            .title("This thread is archived")
+            .description("Unarchive it to send new messages.")
+            .actions_slot(
+                Button::new("unarchive-thread", "Unarchive")
+                    .style(ButtonStyle::Filled)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentViewEvent::Unarchive))),
+            )
+            .into_any_element()
+    }
+
     fn render_restore_notice(&self, cx: &App) -> Option<AnyElement> {
         let (title, description) = match self.thread.read(cx).session_restore()? {
             SessionRestore::ResumedWithoutHistory => (
@@ -2204,6 +2240,8 @@ impl Focusable for AgentView {
     }
 }
 
+impl EventEmitter<AgentViewEvent> for AgentView {}
+
 impl Render for AgentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panel_background = cx.theme().colors().panel_background;
@@ -2267,7 +2305,13 @@ impl Render for AgentView {
             .children(self.render_auth_required(cx))
             .children(self.render_errors(cx))
             .children(self.render_activity_bar(window, cx))
-            .child(self.render_message_editor(cx))
+            .map(|this| {
+                if self.is_archived {
+                    this.child(self.render_archived_notice(cx))
+                } else {
+                    this.child(self.render_message_editor(cx))
+                }
+            })
     }
 }
 

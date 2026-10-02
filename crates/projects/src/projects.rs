@@ -84,15 +84,9 @@ struct PersistedState {
     #[serde(default)]
     scope: ProjectScope,
     #[serde(default)]
-    collapsed: Vec<ProjectId>,
-    #[serde(default)]
     thread_order: ThreadOrder,
-    #[serde(default = "default_group_by_project")]
-    group_by_project: bool,
-}
-
-fn default_group_by_project() -> bool {
-    true
+    #[serde(default)]
+    archived_expanded: bool,
 }
 
 pub struct ProjectStore {
@@ -100,10 +94,9 @@ pub struct ProjectStore {
     projects: Vec<Project>,
     threads: Vec<Thread>,
     scope: ProjectScope,
-    collapsed: HashSet<ProjectId>,
     thread_order: ThreadOrder,
-    /// In "All projects", whether threads are grouped under their project or listed together.
-    group_by_project: bool,
+    /// Whether the sidebar's Archived shelf is open.
+    archived_expanded: bool,
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
@@ -140,9 +133,8 @@ impl ProjectStore {
             projects: state.projects,
             threads: state.threads,
             scope: state.scope,
-            collapsed: state.collapsed.into_iter().collect(),
             thread_order: state.thread_order,
-            group_by_project: state.group_by_project,
+            archived_expanded: state.archived_expanded,
             working_threads: HashSet::default(),
             state_path,
             _save_task: None,
@@ -192,19 +184,17 @@ impl ProjectStore {
         threads.into_iter()
     }
 
-    pub fn group_by_project(&self) -> bool {
-        self.group_by_project
+    pub fn archived_expanded(&self) -> bool {
+        self.archived_expanded
     }
 
-    pub fn set_group_by_project(&mut self, group: bool, cx: &mut Context<Self>) {
-        if self.group_by_project != group {
-            self.group_by_project = group;
-            self.changed(cx);
-        }
+    pub fn toggle_archived_expanded(&mut self, cx: &mut Context<Self>) {
+        self.archived_expanded = !self.archived_expanded;
+        self.changed(cx);
     }
 
     /// Unarchived threads of every visible project, in the current [`ThreadOrder`].
-    pub fn visible_threads(&self) -> Vec<&Thread> {
+    pub fn active_threads(&self) -> Vec<&Thread> {
         let mut threads: Vec<&Thread> = self
             .visible_projects()
             .flat_map(|project| self.threads_for(project.id))
@@ -278,26 +268,11 @@ impl ProjectStore {
         }
     }
 
-    pub fn is_collapsed(&self, id: ProjectId) -> bool {
-        self.collapsed.contains(&id)
-    }
-
-    pub fn toggle_collapsed(&mut self, id: ProjectId, cx: &mut Context<Self>) {
-        if !self.collapsed.remove(&id) {
-            self.collapsed.insert(id);
-        }
-        self.changed(cx);
-    }
-
     /// Adds the folder at `path` (or finds it if it was already added) and returns its id.
     pub fn add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) -> ProjectId {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(existing) = self.projects.iter().find(|project| project.path == path) {
-            let id = existing.id;
-            if self.collapsed.remove(&id) {
-                self.changed(cx);
-            }
-            return id;
+            return existing.id;
         }
         let id = ProjectId(self.allocate_id());
         self.projects.push(Project { id, path });
@@ -316,7 +291,6 @@ impl ProjectStore {
         let threads = &self.threads;
         self.working_threads
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
-        self.collapsed.remove(&id);
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
         }
@@ -351,7 +325,7 @@ impl ProjectStore {
     }
 
     /// Every thread of the visible projects, archived or not, most recent activity first.
-    /// Archived threads in the current scope, most recently active first.
+    /// Archived threads in the current scope, most recently archived first.
     pub fn archived_threads(&self) -> Vec<&Thread> {
         let mut threads: Vec<&Thread> = self
             .threads
@@ -362,7 +336,7 @@ impl ProjectStore {
                 ProjectScope::Project(id) => thread.project_id == id,
             })
             .collect();
-        threads.sort_by_key(|thread| std::cmp::Reverse((thread.last_activity_at, thread.id)));
+        threads.sort_by_key(|thread| std::cmp::Reverse((thread.archived_at, thread.id)));
         threads
     }
 
@@ -464,13 +438,8 @@ impl ProjectStore {
             projects: self.projects.clone(),
             threads: self.threads.clone(),
             scope: self.scope,
-            collapsed: {
-                let mut collapsed: Vec<_> = self.collapsed.iter().copied().collect();
-                collapsed.sort();
-                collapsed
-            },
             thread_order: self.thread_order,
-            group_by_project: self.group_by_project,
+            archived_expanded: self.archived_expanded,
         };
         let executor = cx.background_executor().clone();
         self._save_task = Some(cx.background_spawn(async move {

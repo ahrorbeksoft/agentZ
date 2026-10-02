@@ -9,7 +9,7 @@ use projects::{ProjectId, ProjectScope, ProjectStore, ThreadId};
 use registry::{AgentId, AgentRegistryStore};
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 
-use crate::agent_view::AgentView;
+use crate::agent_view::{AgentView, AgentViewEvent};
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_switcher::ProjectSwitcher;
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
@@ -23,7 +23,7 @@ const MAX_THREAD_TITLE_CHARS: usize = 48;
 /// An open thread. Kept while the app runs so its agent keeps working in the background.
 struct OpenThread {
     view: Entity<AgentView>,
-    _subscription: Subscription,
+    _subscriptions: [Subscription; 2],
 }
 
 pub struct Shell {
@@ -49,21 +49,21 @@ impl Shell {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), registry.clone(), cx));
         let subscriptions = vec![
             cx.observe(&store, |this, store, cx| {
-                // Close views (and stop their agents) for threads that were deleted, archived,
-                // or removed along with their project.
+                // Close views (and stop their agents) for threads that were deleted or removed
+                // along with their project. Archived threads stay open, read-only.
                 let store = store.read(cx);
-                let is_live = |thread_id: ThreadId| {
-                    store
-                        .thread(thread_id)
-                        .is_some_and(|thread| thread.archived_at.is_none())
-                };
+                let is_live = |thread_id: ThreadId| store.thread(thread_id).is_some();
                 this.open_threads.retain(|thread_id, _| is_live(*thread_id));
-                let titles: Vec<(Entity<AgentView>, SharedString)> = this
+                let states: Vec<(Entity<AgentView>, SharedString, bool)> = this
                     .open_threads
                     .iter()
                     .filter_map(|(thread_id, open_thread)| {
                         let thread = store.thread(*thread_id)?;
-                        Some((open_thread.view.clone(), thread.title.clone().into()))
+                        Some((
+                            open_thread.view.clone(),
+                            thread.title.clone().into(),
+                            thread.archived_at.is_some(),
+                        ))
                     })
                     .collect();
                 if this
@@ -77,15 +77,15 @@ impl Shell {
                         sidebar.update(cx, |sidebar, cx| sidebar.set_active_thread(None, cx))
                     });
                 }
-                for (view, title) in titles {
-                    view.update(cx, |view, cx| view.set_title(title, cx));
+                for (view, title, is_archived) in states {
+                    view.update(cx, |view, cx| {
+                        view.set_title(title, cx);
+                        view.set_archived(is_archived, cx);
+                    });
                 }
                 cx.notify();
             }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
-                SidebarEvent::NewThread(project_id) => {
-                    this.open_new_thread_modal(*project_id, window, cx)
-                }
                 SidebarEvent::OpenThread(thread_id) => this.open_thread(*thread_id, window, cx),
             }),
         ];
@@ -105,9 +105,15 @@ impl Shell {
 
     fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
+        // Without a project scope, a new thread goes where the open thread is, or else to the
+        // project with the latest activity.
         let project_id = match store.scope() {
             ProjectScope::Project(id) => Some(id),
-            ProjectScope::All => store.projects().first().map(|project| project.id),
+            ProjectScope::All => self
+                .active_thread
+                .and_then(|thread_id| store.thread(thread_id))
+                .map(|thread| thread.project_id)
+                .or_else(|| store.visible_projects().next().map(|project| project.id)),
         };
         match project_id {
             Some(project_id) => self.open_new_thread_modal(project_id, window, cx),
@@ -181,34 +187,45 @@ impl Shell {
             }
             None => AgentThread::failed(agent_name.clone(), "This thread has no agent."),
         });
-        let subscription = cx.subscribe(&agent_thread, move |this, _, event, cx| match event {
-            AgentThreadEvent::WorkingChanged(working) => {
-                this.store.update(cx, |store, cx| {
-                    store.set_thread_working(thread_id, *working, cx)
-                });
-            }
-            AgentThreadEvent::SessionStarted(session_id) => {
-                this.store.update(cx, |store, cx| {
-                    store.set_thread_session(thread_id, session_id.0.to_string(), cx)
-                });
-            }
-            AgentThreadEvent::TitleChanged(title) => {
-                let title = thread_title_from_prompt(title);
-                this.store
-                    .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
-            }
-            AgentThreadEvent::FirstPrompt(prompt) => {
-                let title = thread_title_from_prompt(prompt);
-                this.store
-                    .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
-            }
-        });
+        let thread_subscription =
+            cx.subscribe(&agent_thread, move |this, _, event, cx| match event {
+                AgentThreadEvent::WorkingChanged(working) => {
+                    this.store.update(cx, |store, cx| {
+                        store.set_thread_working(thread_id, *working, cx)
+                    });
+                }
+                AgentThreadEvent::SessionStarted(session_id) => {
+                    this.store.update(cx, |store, cx| {
+                        store.set_thread_session(thread_id, session_id.0.to_string(), cx)
+                    });
+                }
+                AgentThreadEvent::TitleChanged(title) => {
+                    let title = thread_title_from_prompt(title);
+                    this.store
+                        .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
+                }
+                AgentThreadEvent::FirstPrompt(prompt) => {
+                    let title = thread_title_from_prompt(prompt);
+                    this.store
+                        .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
+                }
+            });
         let title = SharedString::from(thread.title);
         let registry = self.registry.clone();
-        let view = cx.new(|cx| AgentView::new(agent_thread, title, registry, agent_id, cx));
+        let is_archived = thread.archived_at.is_some();
+        let view = cx.new(|cx| {
+            let mut view = AgentView::new(agent_thread, title, registry, agent_id, cx);
+            view.set_archived(is_archived, cx);
+            view
+        });
+        let view_subscription = cx.subscribe(&view, move |this, _, event, cx| match event {
+            AgentViewEvent::Unarchive => this
+                .store
+                .update(cx, |store, cx| store.unarchive_thread(thread_id, cx)),
+        });
         Some(OpenThread {
             view,
-            _subscription: subscription,
+            _subscriptions: [thread_subscription, view_subscription],
         })
     }
 
