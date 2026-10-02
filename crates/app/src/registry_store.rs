@@ -1,60 +1,34 @@
-//! The app's handle on [`registry::AgentRegistryStore`]: a GPUI entity that reads through to the
-//! store, feeds it the results of its background work and notifies observers.
+//! The app's copy of the server's agent registry. Refreshing, installing and uninstalling are
+//! requests to the server.
 
 use std::ops::Deref;
-use std::sync::Arc;
 
-use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Context, Entity, Global, Task};
-use http_client::HttpClient;
-use registry::{AgentId, CommandFuture, ShellEnvironmentReady};
+use agentz_protocol::Request;
+use agentz_protocol::agents::{AgentId, RegistrySnapshot};
+use gpui::{App, AppContext as _, Context, Entity, Global};
+
+use crate::server_client::ServerClient;
 
 pub struct AgentRegistryStore {
-    store: registry::AgentRegistryStore,
-    _messages: Task<()>,
+    snapshot: RegistrySnapshot,
 }
 
 struct GlobalAgentRegistryStore(Entity<AgentRegistryStore>);
 
 impl Global for GlobalAgentRegistryStore {}
 
-pub fn init(
-    http_client: Arc<dyn HttpClient>,
-    shell_environment_ready: ShellEnvironmentReady,
-    cx: &mut App,
-) {
-    let store = cx.new(|cx| {
-        let (store, mut inbox) = registry::AgentRegistryStore::new(
-            reqwest_client::runtime().handle().clone(),
-            http_client,
-            shell_environment_ready,
-            paths::registry_dir(),
-        );
-        let messages = cx.spawn(async move |this, cx| {
-            while let Some(message) = inbox.next().await {
-                let delivered = this.update(cx, |this: &mut AgentRegistryStore, cx| {
-                    this.store.handle(message);
-                    cx.notify();
-                });
-                if delivered.is_err() {
-                    break;
-                }
-            }
-        });
-        AgentRegistryStore {
-            store,
-            _messages: messages,
-        }
+pub fn init(cx: &mut App) {
+    let store = cx.new(|_| AgentRegistryStore {
+        snapshot: RegistrySnapshot::default(),
     });
-    cx.set_global(GlobalAgentRegistryStore(store.clone()));
-    store.update(cx, |store, cx| store.refresh_if_stale(cx));
+    cx.set_global(GlobalAgentRegistryStore(store));
 }
 
 impl Deref for AgentRegistryStore {
-    type Target = registry::AgentRegistryStore;
+    type Target = RegistrySnapshot;
 
     fn deref(&self) -> &Self::Target {
-        &self.store
+        &self.snapshot
     }
 }
 
@@ -63,27 +37,30 @@ impl AgentRegistryStore {
         cx.global::<GlobalAgentRegistryStore>().0.clone()
     }
 
+    pub(crate) fn set_snapshot(&mut self, snapshot: RegistrySnapshot, cx: &mut Context<Self>) {
+        if snapshot != self.snapshot {
+            self.snapshot = snapshot;
+            cx.notify();
+        }
+    }
+
+    fn send(&self, request: Request, cx: &App) {
+        ServerClient::global(cx).read(cx).send(request, cx);
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.store.refresh();
-        cx.notify();
+        self.send(Request::RefreshRegistry { if_stale: false }, cx)
     }
 
     pub fn refresh_if_stale(&mut self, cx: &mut Context<Self>) {
-        self.store.refresh_if_stale();
-        cx.notify();
+        self.send(Request::RefreshRegistry { if_stale: true }, cx)
     }
 
     pub fn install(&mut self, id: &AgentId, cx: &mut Context<Self>) {
-        self.store.install(id);
-        cx.notify();
+        self.send(Request::InstallAgent(id.clone()), cx)
     }
 
     pub fn uninstall(&mut self, id: &AgentId, cx: &mut Context<Self>) {
-        self.store.uninstall(id);
-        cx.notify();
-    }
-
-    pub fn command_when_loaded(&mut self, id: &AgentId) -> CommandFuture {
-        self.store.command_when_loaded(id)
+        self.send(Request::UninstallAgent(id.clone()), cx)
     }
 }

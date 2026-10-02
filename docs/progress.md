@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 1, the app as a client: start the server with `agentz-server start`, connect,
-reconnect, and keep client copies of projects, the registry, agent settings and threads.
+**Next:** Phase 1, the rest: a reattach test (the app restarts mid-prompt, the turn continues and
+the view catches up), Settings "Stop server", and `AGENTS.md`'s layout.
 
 | Phase | Status |
 |---|---|
@@ -78,9 +78,9 @@ Then the server:
         archive, unarchive, delete;
   - [x] agents: login, logout, reload;
   - [x] the registry: install, update, uninstall.
-- [ ] App: a client connection that starts the local server detached if it isn't running, and
+- [x] App: a client connection that starts the local server detached if it isn't running, and
       reconnects.
-- [ ] App: client-side thread copies with `AgentThread`'s API. Port `agent_view`, `sidebar`,
+- [x] App: client-side thread copies with `AgentThread`'s API. Port `agent_view`, `sidebar`,
       `settings_page` and `shell` to them.
 - [ ] Reattach after an app restart mid-prompt: the turn continues, and the view catches up.
 - [ ] Settings: "Stop server".
@@ -370,6 +370,25 @@ Then the server:
     the Keychain working for agents. Revisit if that matters.
   - **It still cross-builds**: 10.8 MB static and stripped for `x86_64-unknown-linux-musl`, in
     1m 38s with a warm cache.
+- 2026-10-03: The app as a client (phase 1, step 2):
+  - **`crates/agentz_client`** connects to the socket, sends requests (each future resolves with
+    its response) and reads events. `Events::next` also routes responses, so a response never
+    overtakes the events sent before it. The server sends a request's changes before its
+    response, so after `CreateThread` returns, the client already has the thread.
+  - **The app keeps the same entity names and methods** (`ProjectStore`, `AgentRegistryStore`,
+    `AgentThread`), now as copies of the server's state. Changes are requests; the copy updates
+    when the server's event arrives. `server_client::ServerClient` owns the connection, starts
+    the server with `agentz-server start` when nothing listens, and reconnects with backoff
+    (250 ms up to 5 s). After a reconnect, open threads subscribe again and take the new
+    snapshot.
+  - **The title bar shows a "disconnected" icon**, as Zed's does, with the error in its tooltip.
+  - **Agent settings** are the server's; the app sends each change as an `AgentSettingsChange`.
+  - **Custom agents** load from `agents/custom.json` in the data directory and show as
+    installed. That's how the mock agent runs in a scratch data directory for screenshots and
+    manual tests.
+  - **Checked by hand** in a scratch data directory: the app started the server, a throwaway
+    protocol client created a project and a mock thread and disconnected, the turn finished on
+    the server, and the app showed the thread and its messages.
 
 ## Open questions
 
@@ -413,3 +432,5 @@ Then the server:
   in-memory streams with the mock agent, including a turn that outlives its client (687d42b).
 - 2026-10-03: Phase 1: the `agentz-server` binary, with `start`, `proxy` and `stop`, tested as
   processes against a scratch data directory.
+- 2026-10-03: Phase 1: the app is a client of the server (`agentz_client`, client-side copies
+  of projects, the registry, agent settings and threads).

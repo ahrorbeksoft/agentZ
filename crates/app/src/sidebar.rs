@@ -1,13 +1,13 @@
 use std::time::{Duration, SystemTime};
 
 use crate::project_store::ProjectStore;
+use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
     KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, svg,
 };
 use projects::{Project, ProjectId, ProjectScope, Thread, ThreadId};
-use registry::AgentId;
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,

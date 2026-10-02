@@ -21,6 +21,7 @@ use futures::channel::mpsc;
 use gpui_shared_string::SharedString;
 use http_client::HttpClient;
 use registry::{AgentCommand, ShellEnvironmentReady};
+use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub use agent_settings::AgentSettingsStore;
@@ -37,7 +38,7 @@ pub struct ServerConfig {
     pub custom_agents: BTreeMap<AgentId, CustomAgent>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct CustomAgent {
     pub name: SharedString,
     pub command: AgentCommand,
@@ -51,6 +52,19 @@ pub struct ServerHandle {
     welcome: Arc<ServerWelcome>,
     next_client_id: Arc<AtomicU64>,
     stopped: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Reads `agents/custom.json`: agent ids, each with a `name` and a `command` (`path`, `args`,
+/// `env`).
+pub fn load_custom_agents(data_dir: &Path) -> Result<BTreeMap<AgentId, CustomAgent>> {
+    let path = data_dir.join("agents").join("custom.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Starts the server on the runtime.

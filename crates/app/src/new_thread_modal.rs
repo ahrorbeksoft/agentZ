@@ -2,12 +2,12 @@
 //! installed agents. Installing agents lives in Settings › Agents.
 
 use crate::project_store::ProjectStore;
+use agentz_protocol::agents::{AgentId, InstallState};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Window,
 };
 use projects::{ProjectId, ThreadId};
-use registry::{AgentId, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use ui::{ButtonLike, ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};
 
@@ -211,14 +211,21 @@ impl NewThreadModal {
     }
 
     fn start_thread(&mut self, project_id: ProjectId, agent_id: &AgentId, cx: &mut Context<Self>) {
-        let agent_id = agent_id.0.to_string();
-        let thread_id = self.projects.update(cx, |projects, cx| {
-            projects.add_thread(project_id, projects::NEW_THREAD_TITLE, Some(agent_id), cx)
+        let created = self.projects.update(cx, |projects, cx| {
+            projects.create_thread(project_id, agent_id.clone(), cx)
         });
-        match thread_id {
-            Some(thread_id) => cx.emit(NewThreadModalEvent::ThreadCreated(thread_id)),
-            None => cx.emit(DismissEvent),
-        }
+        cx.spawn(async move |this, cx| {
+            let created = created.await;
+            this.update(cx, |_, cx| match created {
+                Ok(thread_id) => cx.emit(NewThreadModalEvent::ThreadCreated(thread_id)),
+                Err(error) => {
+                    log::error!("failed to create the thread: {error:#}");
+                    cx.emit(DismissEvent);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn render_project_row(

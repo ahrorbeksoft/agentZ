@@ -2,19 +2,19 @@
 //! Appearance, then one entry per project) and the chosen section's rows on the right.
 
 use crate::project_store::ProjectStore;
+use agentz_protocol::agents::{AgentId, InstallState};
 use collections::HashMap;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Window, actions,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadOrder};
-use registry::{AgentId, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{AgentThreadEvent, ConnectionStatus};
+use agentz_protocol::thread::ConnectionStatus;
 
 use std::collections::BTreeMap;
 
@@ -25,7 +25,6 @@ use crate::project_info::{
     render_project_icon,
 };
 use crate::registry_store::AgentRegistryStore;
-use crate::shell::with_agent_env;
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
 use crate::thread_entity::AgentThread;
 
@@ -740,22 +739,13 @@ impl SettingsPage {
             return;
         }
         let agent_settings = self.app_settings.read(cx).agent(&id.0);
-        let command = with_agent_env(
-            self.registry.read(cx).command(id),
-            agent_settings.env.clone(),
-        );
         let name = name.clone();
-        let connection = cx.new(|cx| AgentThread::start_for_account(name, command, cx));
+        let account_agent_id = id.clone();
+        let connection = cx.new(|cx| AgentThread::open_account(account_agent_id, name, cx));
         let agent_id = id.0.to_string();
+        // The server remembers the options and modes the agent offers, and logins made in
+        // the panel.
         let subscription = cx.observe(&connection, move |this, connection, cx| {
-            // Settings read by Load Settings are remembered like a thread's.
-            let (options, modes) = {
-                let connection = connection.read(cx);
-                (
-                    connection.config_options().to_vec(),
-                    connection.modes().cloned(),
-                )
-            };
             // A login started in Terminal counts once a check finds the agent logged in.
             let logged_in = connection.read(cx).logged_in() == Some(true);
             let finished_terminal_login = this
@@ -769,34 +759,7 @@ impl SettingsPage {
                     settings.update_agent(&agent_id, |agent| agent.login_method = Some(method), cx)
                 });
             }
-            if !options.is_empty() || modes.is_some() {
-                this.app_settings.update(cx, |settings, cx| {
-                    settings.update_agent(
-                        &agent_id,
-                        |agent| {
-                            agent.known_config_options = options;
-                            agent.known_modes = modes;
-                        },
-                        cx,
-                    )
-                });
-            }
             cx.notify();
-        });
-        let events_agent_id = id.0.to_string();
-        let events = cx.subscribe(&connection, move |this, _, event: &AgentThreadEvent, cx| {
-            let login_method = match event {
-                AgentThreadEvent::LoggedIn(method) => Some(method.to_string()),
-                AgentThreadEvent::LoggedOut => None,
-                _ => return,
-            };
-            this.app_settings.update(cx, |settings, cx| {
-                settings.update_agent(
-                    &events_agent_id,
-                    |agent| agent.login_method = login_method,
-                    cx,
-                )
-            });
         });
         let env_rows = agent_settings
             .env
@@ -809,7 +772,7 @@ impl SettingsPage {
             terminal_hint: None,
             pending_terminal_method: None,
             env_rows,
-            _subscriptions: [subscription, events],
+            _subscriptions: [subscription],
         });
         cx.notify();
     }
@@ -1514,7 +1477,7 @@ struct AccountPanel {
     /// A login method started in Terminal, credited once a check finds the agent logged in.
     pending_terminal_method: Option<SharedString>,
     env_rows: Vec<EnvRow>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 1],
 }
 
 struct EnvRow {

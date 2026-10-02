@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, ThreadMessage, ThreadView};
-use agentz_protocol::agents::{AgentId, RegistrySnapshot};
+use agentz_protocol::agents::{
+    AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
+};
 use agentz_protocol::{
     AgentSettingsChange, ConnectionId, ErrorResponse, Event, Request, Response, ServerMessage,
     SessionSnapshot,
@@ -102,7 +104,7 @@ impl Server {
             inputs,
             custom_agents: config.custom_agents,
             projects_revision_sent: projects.revision(),
-            registry_sent: registry.snapshot(),
+            registry_sent: RegistrySnapshot::default(),
             agent_settings_revision_sent: agent_settings.revision(),
             projects,
             registry,
@@ -117,6 +119,7 @@ impl Server {
             forwarders: JoinSet::new(),
         };
         server.forward(registry_inbox, Input::Registry);
+        server.registry_sent = server.registry_snapshot();
         server
     }
 
@@ -176,6 +179,9 @@ impl Server {
                     .map_err(|error| ErrorResponse {
                         message: format!("{error:#}"),
                     });
+                // What the request changed goes first, so a client that hears back from, say,
+                // `CreateThread` already has the thread.
+                self.send_changes();
                 self.send(client, ServerMessage::Response { id, result });
             }
             Input::Disconnected(client) => {
@@ -212,7 +218,7 @@ impl Server {
                 client.subscribed_to_session = true;
                 Ok(Response::Session(SessionSnapshot {
                     projects: self.projects.snapshot(),
-                    registry: self.registry.snapshot(),
+                    registry: self.registry_snapshot(),
                     agent_settings: self.agent_settings.all().clone(),
                 }))
             }
@@ -522,6 +528,31 @@ impl Server {
         Ok(agent_thread)
     }
 
+    /// The registry's agents, then the custom ones, which count as installed.
+    fn registry_snapshot(&self) -> RegistrySnapshot {
+        let mut snapshot = self.registry.snapshot();
+        snapshot
+            .agents
+            .extend(self.custom_agents.iter().map(|(id, agent)| AgentListing {
+                metadata: RegistryAgentMetadata {
+                    id: id.clone(),
+                    name: agent.name.clone(),
+                    description: "A custom agent".into(),
+                    version: "custom".into(),
+                    repository: None,
+                    website: None,
+                    license_url: None,
+                    icon_path: None,
+                },
+                supports_current_platform: true,
+                install_state: InstallState::Installed {
+                    version: "custom".into(),
+                    update_available: false,
+                },
+            }));
+        snapshot
+    }
+
     fn agent_name(&self, agent_id: &AgentId) -> SharedString {
         if let Some(agent) = self.custom_agents.get(agent_id) {
             return agent.name.clone();
@@ -669,7 +700,7 @@ impl Server {
             self.broadcast(Event::Projects(self.projects.snapshot()));
         }
         if std::mem::take(&mut self.registry_changed) {
-            let registry = self.registry.snapshot();
+            let registry = self.registry_snapshot();
             if registry != self.registry_sent {
                 self.registry_sent = registry.clone();
                 self.broadcast(Event::Registry(registry));

@@ -5,18 +5,17 @@ mod project_info;
 mod project_store;
 mod project_switcher;
 mod registry_store;
+mod server_client;
 mod settings_page;
 mod shell;
 mod sidebar;
 mod thread_entity;
 
-use std::io::IsTerminal as _;
 use std::sync::Arc;
 
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use assets::Assets;
-use futures::FutureExt as _;
 use gpui::{
     App, Bounds, Focusable as _, Font, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions,
     WindowBounds, WindowOptions, actions, point, px, size,
@@ -116,28 +115,7 @@ fn init_actions(cx: &mut App) {
     .detach();
 }
 
-/// Loads the login shell's environment (notably `PATH`) when the app was not started from a
-/// terminal, so agents and `npm` resolve the same way they do in the user's shell.
-fn load_shell_environment(cx: &App) -> registry::ShellEnvironmentReady {
-    let started_from_terminal = std::io::stdout().is_terminal();
-    cx.background_executor()
-        .spawn(async move {
-            #[cfg(unix)]
-            if !started_from_terminal && let Err(error) = util::load_login_shell_environment().await
-            {
-                log::error!("failed to load the login shell environment: {error:#}");
-            }
-        })
-        .boxed()
-        .shared()
-}
-
 fn main() {
-    // The login-shell environment capture re-runs this binary with `--printenv`.
-    if std::env::args().any(|argument| argument == "--printenv") {
-        util::shell_env::print_env();
-        return;
-    }
     env_logger::init();
 
     let http_client = match ReqwestClient::user_agent(concat!("agentZ/", env!("CARGO_PKG_VERSION")))
@@ -151,8 +129,8 @@ fn main() {
 
     gpui_platform::application()
         .with_assets(Assets)
-        .with_http_client(http_client.clone())
-        .run(move |cx: &mut App| {
+        .with_http_client(http_client)
+        .run(|cx: &mut App| {
             if let Err(error) = Assets.load_fonts(cx) {
                 log::error!("failed to load fonts: {error:#}");
             }
@@ -165,8 +143,8 @@ fn main() {
             settings_page::init(cx);
             project_store::init(cx);
             project_info::init(cx);
-            let shell_environment_ready = load_shell_environment(cx);
-            registry_store::init(http_client, shell_environment_ready, cx);
+            registry_store::init(cx);
+            server_client::init(cx);
             init_actions(cx);
 
             let store = ProjectStore::global(cx);

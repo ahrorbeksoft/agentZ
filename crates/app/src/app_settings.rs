@@ -1,16 +1,22 @@
 //! App-wide preferences, saved as JSON in the data directory. For now that's the theme, picked
 //! the way Zed picks it: a mode, plus one theme for light appearance and one for dark.
+//!
+//! Agent settings belong to the server; this keeps the app's copy of them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agentz_protocol::agents::AgentId;
 pub use agentz_protocol::agents::AgentSettings;
+use agentz_protocol::{AgentSettingsChange, Request};
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task, WindowAppearance};
 use serde::{Deserialize, Serialize};
 use theme::{ActiveTheme as _, DEFAULT_DARK_THEME, GlobalTheme, ThemeRegistry};
 use util::ResultExt as _;
+
+use crate::server_client::ServerClient;
 
 const DEFAULT_LIGHT_THEME: &str = "One Light";
 
@@ -30,8 +36,6 @@ pub struct AppSettings {
     pub theme_mode: ThemeMode,
     pub light_theme: String,
     pub dark_theme: String,
-    /// Per-agent settings, keyed by registry id.
-    pub agents: BTreeMap<String, AgentSettings>,
 }
 
 impl Default for AppSettings {
@@ -40,13 +44,13 @@ impl Default for AppSettings {
             theme_mode: ThemeMode::default(),
             light_theme: DEFAULT_LIGHT_THEME.to_string(),
             dark_theme: DEFAULT_DARK_THEME.to_string(),
-            agents: BTreeMap::new(),
         }
     }
 }
 
 pub struct AppSettingsStore {
     settings: AppSettings,
+    agents: BTreeMap<AgentId, AgentSettings>,
     path: PathBuf,
     _save: Option<Task<()>>,
 }
@@ -62,6 +66,7 @@ pub fn init(cx: &mut App) {
     apply_theme(&settings, cx);
     let store = cx.new(|_| AppSettingsStore {
         settings,
+        agents: BTreeMap::new(),
         path,
         _save: None,
     });
@@ -93,29 +98,86 @@ impl AppSettingsStore {
     }
 
     pub fn agent(&self, agent_id: &str) -> AgentSettings {
-        self.settings
-            .agents
-            .get(agent_id)
+        self.agents
+            .get(&AgentId::new(agent_id.to_string()))
             .cloned()
             .unwrap_or_default()
     }
 
+    pub(crate) fn set_agent_settings(
+        &mut self,
+        agents: BTreeMap<AgentId, AgentSettings>,
+        cx: &mut Context<Self>,
+    ) {
+        if agents != self.agents {
+            self.agents = agents;
+            cx.notify();
+        }
+    }
+
+    /// Asks the server to make the change. The copy here follows when the server says so. The
+    /// options and modes an agent offers are the server's to remember, so changes to them are
+    /// ignored.
     pub fn update_agent(
         &mut self,
         agent_id: &str,
         change: impl FnOnce(&mut AgentSettings),
         cx: &mut Context<Self>,
     ) {
-        self.update(
-            |settings| change(settings.agents.entry(agent_id.to_string()).or_default()),
-            cx,
-        );
+        let previous = self.agent(agent_id);
+        let mut settings = previous.clone();
+        change(&mut settings);
+        let client = ServerClient::global(cx);
+        for change in agent_settings_changes(&previous, &settings) {
+            client.read(cx).send(
+                Request::UpdateAgentSettings {
+                    agent_id: AgentId::new(agent_id.to_string()),
+                    change,
+                },
+                cx,
+            );
+        }
     }
 
     /// Re-applies the theme, for when macOS switches between light and dark.
     pub fn reapply_theme(&self, cx: &mut App) {
         apply_theme(&self.settings, cx);
     }
+}
+
+fn agent_settings_changes(
+    previous: &AgentSettings,
+    settings: &AgentSettings,
+) -> Vec<AgentSettingsChange> {
+    let mut changes = Vec::new();
+    if settings.env != previous.env {
+        changes.push(AgentSettingsChange::SetEnv(settings.env.clone()));
+    }
+    if settings.login_method != previous.login_method {
+        changes.push(AgentSettingsChange::SetLoginMethod(
+            settings.login_method.clone(),
+        ));
+    }
+    if settings.default_mode != previous.default_mode {
+        changes.push(AgentSettingsChange::SetDefaultMode(
+            settings.default_mode.clone(),
+        ));
+    }
+    let config_ids: BTreeSet<&String> = previous
+        .default_config_options
+        .keys()
+        .chain(settings.default_config_options.keys())
+        .collect();
+    for config_id in config_ids {
+        let value = settings.default_config_options.get(config_id);
+        if value != previous.default_config_options.get(config_id) {
+            changes.push(AgentSettingsChange::SetDefaultConfigOption {
+                config_id: config_id.clone(),
+                value: value.cloned(),
+            });
+        }
+    }
+    changes
 }
 
 fn apply_theme(settings: &AppSettings, cx: &mut App) {

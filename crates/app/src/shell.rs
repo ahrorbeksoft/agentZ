@@ -1,14 +1,11 @@
 use crate::project_store::ProjectStore;
-use agent_client_protocol::schema::v1 as acp;
-use agent_thread::AgentThreadEvent;
+use agentz_protocol::agents::AgentId;
 use collections::HashMap;
-use futures::FutureExt as _;
 use gpui::{
     App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
     Subscription, Window, WindowControlArea,
 };
 use projects::{ProjectId, ProjectScope, ThreadId};
-use registry::AgentId;
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 
 use crate::agent_view::{AgentView, AgentViewEvent};
@@ -17,6 +14,7 @@ use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
 use crate::registry_store::AgentRegistryStore;
+use crate::server_client::{ServerClient, ServerStatus};
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::thread_entity::AgentThread;
@@ -25,12 +23,11 @@ use crate::{NewThread, OpenFolder, OpenSettings, ToggleProjectSwitcher};
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 /// Leaves room for the macOS traffic lights.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
-const MAX_THREAD_TITLE_CHARS: usize = 48;
 
 /// An open thread. Kept while the app runs so its agent keeps working in the background.
 struct OpenThread {
     view: Entity<AgentView>,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 1],
 }
 
 pub struct Shell {
@@ -107,6 +104,7 @@ impl Shell {
                 }
             }),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
+            cx.observe(&ServerClient::global(cx), |_, _, cx| cx.notify()),
             // With the theme mode set to System, the theme follows macOS's appearance.
             cx.observe_window_appearance(window, |_, _, cx| {
                 AppSettingsStore::global(cx).update(cx, |store, cx| store.reapply_theme(cx));
@@ -238,10 +236,7 @@ impl Shell {
     }
 
     fn start_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) -> Option<OpenThread> {
-        let store = self.store.read(cx);
-        let thread = store.thread(thread_id)?.clone();
-        let cwd = store.project(thread.project_id)?.path.clone();
-
+        let thread = self.store.read(cx).thread(thread_id)?.clone();
         let agent_id = thread.agent_id.clone().map(AgentId::new);
         let agent_name = agent_id
             .as_ref()
@@ -249,142 +244,9 @@ impl Shell {
             .map(|agent| agent.name().clone())
             .or_else(|| agent_id.as_ref().map(|agent_id| agent_id.0.clone()))
             .unwrap_or_else(|| "Agent".into());
-        let agent_settings = agent_id
-            .as_ref()
-            .map(|agent_id| AppSettingsStore::global(cx).read(cx).agent(&agent_id.0))
-            .unwrap_or_default();
-        let command = agent_id.as_ref().map(|agent_id| {
-            let command = self
-                .registry
-                .update(cx, |registry, _| registry.command_when_loaded(agent_id));
-            with_agent_env(command, agent_settings.env.clone())
-        });
-
-        let agent_thread = cx.new(|cx| match command {
-            Some(command) => {
-                // Older builds saved a session for every new thread, even before its first
-                // prompt. An untitled thread never got one, so the agent has nothing to load.
-                let never_prompted =
-                    !thread.has_custom_title && thread.title == projects::NEW_THREAD_TITLE;
-                let previous_session = thread
-                    .session_id
-                    .clone()
-                    .filter(|_| !never_prompted)
-                    .map(acp::SessionId::new);
-                let mut agent_thread =
-                    AgentThread::start(agent_name.clone(), command, cwd, previous_session, cx);
-                agent_thread.set_defaults(agent_settings.session_defaults());
-                agent_thread
-            }
-            None => AgentThread::failed(agent_name.clone(), "This thread has no agent."),
-        });
-        let settings_agent_id = agent_id.clone();
-        let thread_subscription =
-            cx.subscribe(&agent_thread, move |this, _, event, cx| match event {
-                AgentThreadEvent::WorkingChanged(working) => {
-                    this.store.update(cx, |store, cx| {
-                        store.set_thread_working(thread_id, *working, cx)
-                    });
-                }
-                AgentThreadEvent::SessionStarted(session_id) => {
-                    this.store.update(cx, |store, cx| {
-                        store.set_thread_session(thread_id, session_id.0.to_string(), cx)
-                    });
-                }
-                AgentThreadEvent::TitleChanged(title) => {
-                    let title = thread_title_from_prompt(title);
-                    this.store
-                        .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
-                }
-                AgentThreadEvent::FirstPrompt(prompt) => {
-                    let title = thread_title_from_prompt(prompt);
-                    this.store
-                        .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
-                }
-                // As in Zed, the user's last choice becomes the agent's default.
-                AgentThreadEvent::ConfigOptionChanged(config_id, value) => {
-                    if let Some(agent_id) = &settings_agent_id {
-                        let (config_id, value) = (config_id.0.to_string(), value.clone());
-                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
-                            settings.update_agent(
-                                &agent_id.0,
-                                |agent| {
-                                    agent.default_config_options.insert(config_id, value);
-                                },
-                                cx,
-                            )
-                        });
-                    }
-                }
-                AgentThreadEvent::LoggedIn(method) => {
-                    if let Some(agent_id) = &settings_agent_id {
-                        let method = method.to_string();
-                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
-                            settings.update_agent(
-                                &agent_id.0,
-                                |agent| agent.login_method = Some(method),
-                                cx,
-                            )
-                        });
-                    }
-                }
-                AgentThreadEvent::LoggedOut => {
-                    if let Some(agent_id) = &settings_agent_id {
-                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
-                            settings.update_agent(
-                                &agent_id.0,
-                                |agent| agent.login_method = None,
-                                cx,
-                            )
-                        });
-                    }
-                }
-                AgentThreadEvent::ModeChanged(mode) => {
-                    if let Some(agent_id) = &settings_agent_id {
-                        let mode = mode.clone();
-                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
-                            settings.update_agent(
-                                &agent_id.0,
-                                |agent| agent.default_mode = Some(mode),
-                                cx,
-                            )
-                        });
-                    }
-                }
-            });
+        let agent_thread = cx.new(|cx| AgentThread::open(thread_id, agent_name, cx));
         let title = SharedString::from(thread.title);
         let registry = self.registry.clone();
-        let known_agent_id = agent_id.clone();
-        let model_subscription = cx.observe(&agent_thread, move |this, agent_thread, cx| {
-            let (model, options, modes) = {
-                let agent_thread = agent_thread.read(cx);
-                (
-                    agent_thread.model_name(),
-                    agent_thread.config_options().to_vec(),
-                    agent_thread.modes().cloned(),
-                )
-            };
-            // Remembered so the sidebar can name the model of threads that aren't open.
-            if let Some(model) = model {
-                this.store
-                    .update(cx, |store, cx| store.set_thread_model(thread_id, model, cx));
-            }
-            // And so the agent's settings can list its options without starting it.
-            if let Some(agent_id) = &known_agent_id
-                && (!options.is_empty() || modes.is_some())
-            {
-                AppSettingsStore::global(cx).update(cx, |settings, cx| {
-                    settings.update_agent(
-                        &agent_id.0,
-                        |agent| {
-                            agent.known_config_options = options;
-                            agent.known_modes = modes;
-                        },
-                        cx,
-                    )
-                });
-            }
-        });
         let is_archived = thread.archived_at.is_some();
         let view = cx.new(|cx| {
             let mut view = AgentView::new(agent_thread, title, registry, agent_id, cx);
@@ -398,7 +260,7 @@ impl Shell {
         });
         Some(OpenThread {
             view,
-            _subscriptions: [thread_subscription, model_subscription, view_subscription],
+            _subscriptions: [view_subscription],
         })
     }
 
@@ -432,13 +294,17 @@ impl Shell {
                     return;
                 }
             };
-            store.update(cx, |store, cx| {
-                let mut last_added = None;
-                for path in paths {
-                    last_added = Some(store.add_project(path, cx));
+            let mut last_added = None;
+            for path in paths {
+                let added = store.update(cx, |store, cx| store.add_project(path, cx));
+                match added.await {
+                    Ok(id) => last_added = Some(id),
+                    Err(error) => log::error!("failed to add the project: {error:#}"),
                 }
-                // In "All projects" the new project simply appears; otherwise switch to it so
-                // it doesn't get added out of sight.
+            }
+            // In "All projects" the new project simply appears; otherwise switch to it so it
+            // doesn't get added out of sight.
+            store.update(cx, |store, cx| {
                 if let Some(id) = last_added
                     && store.scope() != ProjectScope::All
                 {
@@ -558,6 +424,25 @@ impl Shell {
                             .offset(gpui::point(px(0.), px(4.))),
                     ),
             )
+            .child(div().flex_1())
+            .children(self.render_connection_status(cx))
+    }
+
+    fn render_connection_status(&self, cx: &App) -> Option<AnyElement> {
+        match ServerClient::global(cx).read(cx).status() {
+            ServerStatus::Connecting | ServerStatus::Connected => None,
+            ServerStatus::Disconnected(error) => {
+                let tooltip: SharedString =
+                    format!("Disconnected from agentz-server: {error}").into();
+                Some(
+                    div()
+                        .id("disconnected")
+                        .child(Icon::new(IconName::Disconnected).size(IconSize::Small))
+                        .tooltip(Tooltip::text(tooltip))
+                        .into_any_element(),
+                )
+            }
+        }
     }
 }
 
@@ -655,47 +540,4 @@ fn render_no_thread_selected() -> impl IntoElement {
                 .style(ButtonStyle::Outlined)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
         )
-}
-
-/// Adds the agent's environment variables from its settings to its command.
-pub(crate) fn with_agent_env(
-    command: registry::CommandFuture,
-    env: std::collections::BTreeMap<String, String>,
-) -> registry::CommandFuture {
-    async move {
-        let mut command = command.await?;
-        command.env.extend(env);
-        Ok(command)
-    }
-    .boxed()
-}
-
-/// The first line of the first prompt, shortened to fit the sidebar.
-fn thread_title_from_prompt(prompt: &str) -> String {
-    let first_line = prompt.lines().next().unwrap_or_default().trim();
-    if first_line.chars().count() <= MAX_THREAD_TITLE_CHARS {
-        return first_line.to_string();
-    }
-    let shortened: String = first_line
-        .chars()
-        .take(MAX_THREAD_TITLE_CHARS - 1)
-        .collect();
-    format!("{}…", shortened.trim_end())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::thread_title_from_prompt;
-
-    #[test]
-    fn thread_titles() {
-        assert_eq!(
-            thread_title_from_prompt("Fix the login bug\nmore detail"),
-            "Fix the login bug"
-        );
-        let long = "Build a checkout page with a cart summary, a pay button and order history";
-        let title = thread_title_from_prompt(long);
-        assert_eq!(title.chars().count(), super::MAX_THREAD_TITLE_CHARS);
-        assert!(title.ends_with('…'));
-    }
 }

@@ -58,19 +58,27 @@ Data lives in `~/Library/Application Support/agentZ/`: `state.json` (projects an
 
 ## Build, run, test
 
-- **Build:** `cargo build`. This machine has no full Xcode, so Metal shaders compile at runtime
-  (the `runtime_shaders` feature, on by default in `crates/app`).
+- **Build:** `cargo build` builds the app and `agentz-server`. The app looks for the server next
+  to its own executable (or at `AGENTZ_SERVER_BIN`) and starts it if nothing listens on
+  `server.sock`. This machine has no full Xcode, so Metal shaders compile at runtime (the
+  `runtime_shaders` feature, on by default in `crates/app`).
 - **Run:**
   ```sh
   pkill -f "target/debug/agentz$"
-  nohup ./target/debug/agentz > /dev/null 2>&1 & disown
+  # Only after changing the server. This ends turns in progress.
+  ./target/debug/agentz-server stop
+  python3 -c 'import subprocess; subprocess.Popen(["./target/debug/agentz"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)'
   ```
-  Relaunch the user's app this way after each change you ship.
+  Relaunch the user's app this way after each change you ship. A plain `nohup … & disown` can be
+  killed along with the shell that started it; `start_new_session` avoids that. The server keeps
+  running when the app quits, and logs to `logs/server.log` in the data directory.
 - **Check:**
   ```sh
   cargo fmt --all
-  cargo clippy -p app -p agent_thread -p projects -p registry -p text_input --all-targets
-  cargo test -p app -p agent_thread -p projects -p registry
+  cargo clippy -p app -p agent_thread -p projects -p registry -p text_input -p agentz_protocol \
+    -p agentz_server -p agentz_client --all-targets
+  cargo test -p app -p agent_thread -p projects -p registry -p agentz_protocol -p agentz_server \
+    -p agentz_client
   ```
   `cargo clippy --workspace` fails on a gpui example that needs an unported crate; that's
   expected.

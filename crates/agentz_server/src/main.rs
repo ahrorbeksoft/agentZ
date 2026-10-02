@@ -121,7 +121,9 @@ async fn serve(socket: &Path) -> Result<()> {
             version: VERSION.to_string(),
             http_client,
             shell_environment_ready,
-            custom_agents: Default::default(),
+            custom_agents: agentz_server::load_custom_agents(paths::data_dir())
+                .log_err()
+                .unwrap_or_default(),
         },
     )?;
     log::info!(

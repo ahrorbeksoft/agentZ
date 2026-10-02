@@ -182,6 +182,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentz_client"
+version = "0.1.0"
+dependencies = [
+ "agentz_protocol",
+ "agentz_server",
+ "anyhow",
+ "collections",
+ "futures",
+ "http_client",
+ "log",
+ "parking_lot",
+ "projects",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "agentz_protocol"
 version = "0.1.0"
 dependencies = [
@@ -355,7 +372,7 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
- "agent_thread",
+ "agentz_client",
  "agentz_protocol",
  "anyhow",
  "assets",
@@ -372,7 +389,6 @@ dependencies = [
  "menu",
  "paths",
  "projects",
- "registry",
  "reqwest_client",
  "serde",
  "serde_json",
@@ -380,6 +396,7 @@ dependencies = [
  "text_input",
  "theme",
  "theme_json",
+ "tokio",
  "ui",
  "util",
 ]

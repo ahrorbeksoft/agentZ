@@ -4,7 +4,8 @@
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{
+use agentz_protocol::agents::AgentId;
+use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
 };
 use collections::{HashMap, HashSet};
@@ -13,7 +14,6 @@ use gpui::{
     Focusable, Hsla, KeyBinding, ScrollHandle, Subscription, Task, Window, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use registry::AgentId;
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     Callout, CommonAnimationExt as _, ContextMenu, Disclosure, IconPosition, PopoverMenu, Severity,
@@ -2482,7 +2482,7 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
 
 /// Opens the system terminal running `command` in `cwd`, for agents that log in interactively.
 pub(crate) async fn open_in_terminal(
-    command: &registry::AgentCommand,
+    command: &agentz_protocol::agents::AgentCommand,
     cwd: &std::path::Path,
 ) -> anyhow::Result<()> {
     fn shell_quote(text: &str) -> String {
