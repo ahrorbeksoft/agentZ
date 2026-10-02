@@ -398,6 +398,14 @@ impl AgentThread {
         .detach();
     }
 
+    /// For a connection made from settings: opens an empty session, sending no prompt, only to
+    /// read the agent's settings and modes, which ACP reports per session.
+    pub fn load_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.opens_session && self.session.is_none() && self.connection.is_some() {
+            self.open_session(cx);
+        }
+    }
+
     /// Settings for new sessions; see [`SessionDefaults`].
     pub fn set_defaults(&mut self, defaults: SessionDefaults) {
         self.defaults = defaults;
@@ -523,7 +531,7 @@ impl AgentThread {
                         session_id: setup.session_id,
                     });
                     this.status = ConnectionStatus::Ready;
-                    if setup.restore == SessionRestore::New {
+                    if setup.restore == SessionRestore::New && this.opens_session {
                         this.apply_defaults(cx);
                     }
                     for prompt in std::mem::take(&mut this.queued_prompts) {
@@ -1557,6 +1565,9 @@ mod tests {
         wait_until(cx, &|account| {
             account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
         });
+
+        account.update(cx, |account, cx| account.load_settings(cx));
+        wait_until(cx, &|account| account.config_options().len() == 4);
     }
 
     /// New sessions start with the agent's saved defaults, against `test_support/mock_agent.py`.

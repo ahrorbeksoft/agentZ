@@ -979,6 +979,14 @@ fn agent_command(
                 .join("node_modules")
                 .join(package_name);
             let executable = read_package_executable(&package_dir)?;
+            // Like npx, run the bin as what it is: some packages ship a native binary there.
+            if !runs_with_node(&executable) {
+                return Ok(AgentCommand {
+                    path: executable,
+                    args: agent.args.clone(),
+                    env: agent.env.clone(),
+                });
+            }
             let mut args = vec![executable.to_string_lossy().into_owned()];
             args.extend(agent.args.iter().cloned());
             Ok(AgentCommand {
@@ -988,6 +996,33 @@ fn agent_command(
             })
         }
     }
+}
+
+/// Whether an npm bin is a Node script (a `node` shebang, or JavaScript without one) rather than
+/// a native executable or a script for another interpreter.
+fn runs_with_node(executable: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(executable) else {
+        return true;
+    };
+    let mut head = [0u8; 256];
+    let read = std::io::Read::read(&mut file, &mut head).unwrap_or(0);
+    let head = &head[..read];
+    if let Some(shebang) = head.strip_prefix(b"#!") {
+        let line_end = shebang
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(shebang.len());
+        return String::from_utf8_lossy(&shebang[..line_end]).contains("node");
+    }
+    const NATIVE_MAGIC: [[u8; 4]; 6] = [
+        [0x7f, b'E', b'L', b'F'],
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xca, 0xfe, 0xba, 0xbe],
+    ];
+    !NATIVE_MAGIC.iter().any(|magic| head.starts_with(magic))
 }
 
 /// Reads the first `bin` entry of an installed npm package.
@@ -1190,6 +1225,26 @@ mod tests {
         ],
         "extensions": []
     }"#;
+
+    #[test]
+    fn npm_bins_run_as_what_they_are() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write");
+            path
+        };
+        assert!(runs_with_node(&write(
+            "cli.js",
+            b"#!/usr/bin/env node\nconsole.log(1)"
+        )));
+        assert!(runs_with_node(&write("plain.js", b"module.exports = 1")));
+        assert!(!runs_with_node(&write("tool.sh", b"#!/bin/sh\necho hi")));
+        assert!(!runs_with_node(&write(
+            "droid",
+            &[0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1]
+        )));
+    }
 
     #[test]
     fn parses_registry_index() {

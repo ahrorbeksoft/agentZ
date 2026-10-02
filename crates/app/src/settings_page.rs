@@ -745,7 +745,30 @@ impl SettingsPage {
         );
         let name = name.clone();
         let connection = cx.new(|cx| AgentThread::start_for_account(name, command, cx));
-        let subscription = cx.observe(&connection, |_, _, cx| cx.notify());
+        let agent_id = id.0.to_string();
+        let subscription = cx.observe(&connection, move |this, connection, cx| {
+            // Settings read by Load Settings are remembered like a thread's.
+            let (options, modes) = {
+                let connection = connection.read(cx);
+                (
+                    connection.config_options().to_vec(),
+                    connection.modes().cloned(),
+                )
+            };
+            if !options.is_empty() || modes.is_some() {
+                this.app_settings.update(cx, |settings, cx| {
+                    settings.update_agent(
+                        &agent_id,
+                        |agent| {
+                            agent.known_config_options = options;
+                            agent.known_modes = modes;
+                        },
+                        cx,
+                    )
+                });
+            }
+            cx.notify();
+        });
         let env_rows = agent_settings
             .env
             .iter()
@@ -1003,12 +1026,33 @@ impl SettingsPage {
             ));
         }
         if rows.is_empty() {
-            return Label::new(format!(
-                "Start a thread with {agent_name} to see its settings here."
-            ))
-            .size(LabelSize::Small)
-            .color(Color::Muted)
-            .into_any_element();
+            let connection = panel.connection.read(cx);
+            let is_loading = connection.status() == &ConnectionStatus::Connecting;
+            let can_load = connection.status() == &ConnectionStatus::Ready;
+            return v_flex()
+                .gap_2()
+                .items_start()
+                .child(
+                    Label::new(format!(
+                        "Start a thread with {agent_name} to see its settings here, or load them now. \
+                         That opens an empty {agent_name} session; nothing is sent to the model."
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Button::new("load-agent-settings", if is_loading { "Loading…" } else { "Load Settings" })
+                        .style(ButtonStyle::Outlined)
+                        .disabled(!can_load)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(panel) = &this.account {
+                                panel
+                                    .connection
+                                    .update(cx, |connection, cx| connection.load_settings(cx));
+                            }
+                        })),
+                )
+                .into_any_element();
         }
         v_flex()
             .gap_1()
