@@ -89,8 +89,6 @@ struct PersistedState {
     thread_order: ThreadOrder,
     #[serde(default = "default_group_by_project")]
     group_by_project: bool,
-    #[serde(default)]
-    show_archived: bool,
 }
 
 fn default_group_by_project() -> bool {
@@ -106,8 +104,6 @@ pub struct ProjectStore {
     thread_order: ThreadOrder,
     /// In "All projects", whether threads are grouped under their project or listed together.
     group_by_project: bool,
-    /// Whether archived threads are listed alongside the others.
-    show_archived: bool,
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
@@ -147,7 +143,6 @@ impl ProjectStore {
             collapsed: state.collapsed.into_iter().collect(),
             thread_order: state.thread_order,
             group_by_project: state.group_by_project,
-            show_archived: state.show_archived,
             working_threads: HashSet::default(),
             state_path,
             _save_task: None,
@@ -180,22 +175,12 @@ impl ProjectStore {
     }
 
     /// The project's threads in the current [`ThreadOrder`].
-    /// The project's threads in the current [`ThreadOrder`]; archived ones only when
-    /// [`Self::show_archived`] is on.
     pub fn threads_for(&self, project_id: ProjectId) -> impl Iterator<Item = &Thread> {
         let mut threads: Vec<&Thread> = self
             .threads
             .iter()
-            .filter(|thread| {
-                thread.project_id == project_id
-                    && (self.show_archived || thread.archived_at.is_none())
-            })
+            .filter(|thread| thread.project_id == project_id && thread.archived_at.is_none())
             .collect();
-        self.sort_threads(&mut threads);
-        threads.into_iter()
-    }
-
-    fn sort_threads(&self, threads: &mut [&Thread]) {
         match self.thread_order {
             ThreadOrder::LastActivity => threads.sort_by(|a, b| {
                 b.last_activity_at
@@ -204,17 +189,7 @@ impl ProjectStore {
             }),
             ThreadOrder::Created => threads.sort_by_key(|thread| std::cmp::Reverse(thread.id)),
         }
-    }
-
-    pub fn show_archived(&self) -> bool {
-        self.show_archived
-    }
-
-    pub fn set_show_archived(&mut self, show: bool, cx: &mut Context<Self>) {
-        if self.show_archived != show {
-            self.show_archived = show;
-            self.changed(cx);
-        }
+        threads.into_iter()
     }
 
     pub fn group_by_project(&self) -> bool {
@@ -228,13 +203,20 @@ impl ProjectStore {
         }
     }
 
-    /// The threads of every visible project together, as [`Self::threads_for`] lists them.
+    /// Unarchived threads of every visible project, in the current [`ThreadOrder`].
     pub fn visible_threads(&self) -> Vec<&Thread> {
         let mut threads: Vec<&Thread> = self
             .visible_projects()
             .flat_map(|project| self.threads_for(project.id))
             .collect();
-        self.sort_threads(&mut threads);
+        match self.thread_order {
+            ThreadOrder::LastActivity => threads.sort_by(|a, b| {
+                b.last_activity_at
+                    .cmp(&a.last_activity_at)
+                    .then(b.id.cmp(&a.id))
+            }),
+            ThreadOrder::Created => threads.sort_by_key(|thread| std::cmp::Reverse(thread.id)),
+        }
         threads
     }
 
@@ -369,6 +351,19 @@ impl ProjectStore {
     }
 
     /// Every thread of the visible projects, archived or not, most recent activity first.
+    pub fn thread_history(&self) -> Vec<&Thread> {
+        let mut threads: Vec<&Thread> = self
+            .threads
+            .iter()
+            .filter(|thread| match self.scope {
+                ProjectScope::All => true,
+                ProjectScope::Project(id) => thread.project_id == id,
+            })
+            .collect();
+        threads.sort_by_key(|thread| std::cmp::Reverse((thread.last_activity_at, thread.id)));
+        threads
+    }
+
     pub fn archive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.archived_at.is_none()
@@ -474,7 +469,6 @@ impl ProjectStore {
             },
             thread_order: self.thread_order,
             group_by_project: self.group_by_project,
-            show_archived: self.show_archived,
         };
         let executor = cx.background_executor().clone();
         self._save_task = Some(cx.background_spawn(async move {
@@ -584,9 +578,7 @@ mod tests {
                 .expect("thread");
             store.archive_thread(thread, cx);
             assert!(store.threads_for(first).all(|t| t.id != thread));
-            store.set_show_archived(true, cx);
-            assert!(store.threads_for(first).any(|t| t.id == thread));
-            store.set_show_archived(false, cx);
+            assert!(store.thread_history().iter().any(|t| t.id == thread));
             store.unarchive_thread(thread, cx);
             assert!(store.threads_for(first).any(|t| t.id == thread));
             store.set_custom_title(thread, "Mine".into(), cx);
