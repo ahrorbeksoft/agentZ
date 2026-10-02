@@ -6873,6 +6873,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spike_server"
+version = "0.1.0"
+dependencies = [
+ "agent_thread",
+ "anyhow",
+ "futures",
+ "gpui",
+ "gpui_platform",
+ "projects",
+ "registry",
+ "reqwest_client",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

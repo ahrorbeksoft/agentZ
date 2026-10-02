@@ -543,12 +543,9 @@ Each phase ships on its own, keeps the app working, and is committed.
    1. **GPUI-free core.** Rewrite `agent_thread`, `projects` and `registry` as plain Rust on
       tokio. In the meantime, the app wraps them in thin GPUI entities in-process. Their tests
       become plain async tests against the mock agent.
-   2. **Server.** Add the `agentz_protocol` and `agentz_server` crates, and move the core into the
-      server.
-   - Move the stores and threads into the server.
-   - In the app, the threads become client copies with the same API as `AgentThread`, so
-     `agent_view` changes little.
-   - Reattach: a snapshot, then live events.
+   2. **Server.** Add the `agentz_protocol` and `agentz_server` crates, and move the stores and
+      threads into the server. In the app, the threads become client copies with the same API
+      as `AgentThread`, so `agent_view` changes little. Reattach: a snapshot, then live events.
 
    Result: the same app, but threads survive quitting it.
 2. **Attention states and notifications** for ACP threads.
