@@ -58,6 +58,14 @@ impl Shell {
                         .is_some_and(|thread| thread.archived_at.is_none())
                 };
                 this.open_threads.retain(|thread_id, _| is_live(*thread_id));
+                let titles: Vec<(Entity<AgentView>, SharedString)> = this
+                    .open_threads
+                    .iter()
+                    .filter_map(|(thread_id, open_thread)| {
+                        let thread = store.thread(*thread_id)?;
+                        Some((open_thread.view.clone(), thread.title.clone().into()))
+                    })
+                    .collect();
                 if this
                     .active_thread
                     .is_some_and(|thread_id| !is_live(thread_id))
@@ -68,6 +76,9 @@ impl Shell {
                     cx.defer(move |cx| {
                         sidebar.update(cx, |sidebar, cx| sidebar.set_active_thread(None, cx))
                     });
+                }
+                for (view, title) in titles {
+                    view.update(cx, |view, cx| view.set_title(title, cx));
                 }
                 cx.notify();
             }),
@@ -183,25 +194,13 @@ impl Shell {
             }
             AgentThreadEvent::TitleChanged(title) => {
                 let title = thread_title_from_prompt(title);
-                this.store.update(cx, |store, cx| {
-                    store.rename_thread(thread_id, title.clone(), cx)
-                });
-                if let Some(open_thread) = this.open_threads.get(&thread_id) {
-                    open_thread
-                        .view
-                        .update(cx, |view, cx| view.set_title(title.into(), cx));
-                }
+                this.store
+                    .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
             }
             AgentThreadEvent::FirstPrompt(prompt) => {
                 let title = thread_title_from_prompt(prompt);
-                this.store.update(cx, |store, cx| {
-                    store.rename_thread(thread_id, title.clone(), cx)
-                });
-                if let Some(open_thread) = this.open_threads.get(&thread_id) {
-                    open_thread
-                        .view
-                        .update(cx, |view, cx| view.set_title(title.into(), cx));
-                }
+                this.store
+                    .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
             }
         });
         let title = SharedString::from(thread.title);

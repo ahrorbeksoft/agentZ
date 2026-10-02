@@ -2,7 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Datelike as _, Local, NaiveDate, TimeDelta};
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, MouseButton, PromptLevel, Subscription, Task, Window,
+    AnyElement, App, Context, Entity, EventEmitter, Focusable as _, KeyBinding, MouseButton,
+    PromptLevel, Subscription, Task, Window,
 };
 use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore};
@@ -17,6 +18,14 @@ const ROW_HEIGHT: Pixels = px(28.);
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
+const RENAME_KEY_CONTEXT: &str = "SidebarRename";
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
+    ]);
+}
 
 pub enum SidebarEvent {
     NewThread(ProjectId),
@@ -31,6 +40,9 @@ pub struct Sidebar {
     showing_history: bool,
     history_search: Entity<TextInput>,
     history_archived_only: bool,
+    renaming_thread: Option<ThreadId>,
+    rename_input: Entity<TextInput>,
+    _rename_blur: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     _activity_refresh: Task<()>,
 }
@@ -44,7 +56,11 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Self {
         let history_search = cx.new(|cx| TextInput::new("Search all threads…", cx));
+        let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let subscriptions = vec![
+            cx.subscribe(&rename_input, |this, _, _: &TextInputEvent, cx| {
+                this.apply_rename(cx)
+            }),
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.observe(&registry, |_, _, cx| cx.notify()),
             cx.subscribe(&history_search, |_, _, _: &TextInputEvent, cx| cx.notify()),
@@ -66,6 +82,9 @@ impl Sidebar {
             showing_history: false,
             history_search,
             history_archived_only: false,
+            renaming_thread: None,
+            rename_input,
+            _rename_blur: None,
             _subscriptions: subscriptions,
             _activity_refresh: activity_refresh,
         }
@@ -76,8 +95,80 @@ impl Sidebar {
         cx.notify();
     }
 
+    fn start_renaming(
+        &mut self,
+        thread_id: ThreadId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .renaming_thread
+            .is_some_and(|renaming| renaming != thread_id)
+        {
+            self.finish_renaming(cx);
+        }
+        // Set before editing the text so the resulting change event doesn't count as a rename.
+        self.renaming_thread = None;
+        self.rename_input.update(cx, |input, cx| {
+            input.set_text(title, cx);
+            input.select_all_text(cx);
+        });
+        self.renaming_thread = Some(thread_id);
+        let focus_handle = self.rename_input.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        // Like Zed, clicking elsewhere ends the rename.
+        self._rename_blur = Some(cx.on_blur(&focus_handle, window, |this, _, cx| {
+            this.finish_renaming(cx)
+        }));
+        cx.notify();
+    }
+
+    /// Zed renames as you type; an empty title is ignored.
+    fn apply_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.renaming_thread else {
+            return;
+        };
+        let title = self.rename_input.read(cx).text().trim().to_string();
+        let is_unchanged = self
+            .store
+            .read(cx)
+            .thread(thread_id)
+            .is_none_or(|thread| thread.title == title);
+        if title.is_empty() || is_unchanged {
+            return;
+        }
+        self.store
+            .update(cx, |store, cx| store.set_custom_title(thread_id, title, cx));
+    }
+
+    fn finish_renaming(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_thread.take().is_some() {
+            self._rename_blur = None;
+            cx.notify();
+        }
+    }
+
+    fn render_rename_input(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .key_context(RENAME_KEY_CONTEXT)
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.finish_renaming(cx);
+                window.blur(cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                this.finish_renaming(cx);
+                window.blur(cx);
+            }))
+            .child(self.rename_input.clone())
+            .into_any_element()
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_all_scope = self.store.read(cx).scope() == ProjectScope::All;
+        let is_grouped = self.store.read(cx).group_by_project();
         let add_button = if is_all_scope {
             IconButton::new("sidebar-open-folder", IconName::Plus)
                 .icon_size(IconSize::Small)
@@ -96,7 +187,12 @@ impl Sidebar {
             .px_3()
             .justify_between()
             .child(
-                Label::new(if is_all_scope { "Projects" } else { "Threads" }).color(Color::Muted),
+                Label::new(if is_all_scope && is_grouped {
+                    "Projects"
+                } else {
+                    "Threads"
+                })
+                .color(Color::Muted),
             )
             .child(
                 h_flex()
@@ -106,6 +202,7 @@ impl Sidebar {
                             .menu(move |window, cx| {
                                 let store = store.clone();
                                 let current = store.read(cx).thread_order();
+                                let is_grouped = store.read(cx).group_by_project();
                                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
                                     let mut menu = menu.header("Sort Threads");
                                     for (order, label) in [
@@ -125,13 +222,27 @@ impl Sidebar {
                                             },
                                         );
                                     }
+                                    if is_all_scope {
+                                        let store = store.clone();
+                                        menu = menu.separator().toggleable_entry(
+                                            "Group by Project",
+                                            is_grouped,
+                                            IconPosition::End,
+                                            None,
+                                            move |_, cx| {
+                                                store.update(cx, |store, cx| {
+                                                    store.set_group_by_project(!is_grouped, cx)
+                                                })
+                                            },
+                                        );
+                                    }
                                     menu
                                 }))
                             })
                             .trigger_with_tooltip(
                                 IconButton::new("thread-order-trigger", IconName::Filter)
                                     .icon_size(IconSize::Small),
-                                Tooltip::text("Sort Threads"),
+                                Tooltip::text("Thread Display Options"),
                             )
                             .anchor(gpui::Anchor::TopRight),
                     )
@@ -167,7 +278,7 @@ impl Sidebar {
                 } else {
                     let mut rows = Vec::with_capacity(threads.len());
                     for thread in threads {
-                        rows.push(self.render_thread(thread, indent, cx));
+                        rows.push(self.render_thread(thread, indent, None, cx));
                     }
                     group.children(rows)
                 }
@@ -279,10 +390,19 @@ impl Sidebar {
             })
     }
 
-    fn render_thread(&self, thread: Thread, indent: Pixels, cx: &mut Context<Self>) -> AnyElement {
+    /// `project_name` is shown on a second line when threads aren't grouped by project.
+    fn render_thread(
+        &self,
+        thread: Thread,
+        indent: Pixels,
+        project_name: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let hover_background = cx.theme().colors().ghost_element_hover;
         let active_background = cx.theme().colors().ghost_element_selected;
+        let menu_open_background = cx.theme().colors().ghost_element_selected;
         let is_active = self.active_thread == Some(thread.id);
+        let is_renaming = self.renaming_thread == Some(thread.id);
         let thread_id = thread.id;
         let icon = thread
             .agent_id
@@ -302,65 +422,173 @@ impl Sidebar {
             .flatten()
             .map(|time| format_relative_time(time, SystemTime::now()));
         let group_name = SharedString::from(format!("thread-row-{}", thread.id.0));
+        let title = SharedString::from(thread.title);
         let store = self.store.clone();
-        h_flex()
-            .id(("thread", thread.id.0))
-            .group(group_name.clone())
-            .h(ROW_HEIGHT)
-            .w_full()
-            .pl(indent + px(8.))
-            .pr_2()
-            .gap_1p5()
-            .cursor_pointer()
-            .when(is_active, |row| row.bg(active_background))
-            .hover(|row| row.bg(hover_background))
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::OpenThread(thread_id))))
-            .child(icon.size(IconSize::Small).color(Color::Muted))
+        let sidebar = cx.entity().downgrade();
+
+        let title_element = if is_renaming {
+            self.render_rename_input(cx)
+        } else {
+            Label::new(title.clone()).truncate().into_any_element()
+        };
+        let text = match project_name {
+            Some(project_name) => v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(title_element)
+                .child(
+                    Label::new(project_name)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .into_any_element(),
+            None => div()
+                .flex_1()
+                .min_w_0()
+                .child(title_element)
+                .into_any_element(),
+        };
+        let hover_actions = h_flex()
+            .absolute()
+            .right_1()
+            .gap_0p5()
+            .visible_on_hover(group_name.clone())
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Label::new(thread.title).truncate()),
+                IconButton::new(("rename-thread", thread.id.0), IconName::Pencil)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Rename Thread"))
+                    .on_click({
+                        let title = title.clone();
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.start_renaming(thread_id, title.clone(), window, cx);
+                        })
+                    }),
             )
-            .when(is_working, |row| {
-                row.child(
-                    h_flex()
-                        .gap_1()
-                        .child(Indicator::dot().color(Color::Accent))
-                        .child(
-                            Label::new("working")
-                                .size(LabelSize::Small)
-                                .color(Color::Accent),
-                        ),
-                )
-            })
-            .when_some(activity, |row, activity| {
-                row.child(
-                    div()
-                        .group_hover(group_name.clone(), |this| this.invisible())
-                        .child(
-                            Label::new(activity)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                )
-            })
             .child(
-                div()
-                    .absolute()
-                    .right_1()
-                    .visible_on_hover(group_name)
-                    .child(
-                        IconButton::new(("archive-thread", thread.id.0), IconName::Archive)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Archive Thread"))
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
-                            }),
+                IconButton::new(("archive-thread", thread.id.0), IconName::Archive)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Archive Thread"))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
+                    }),
+            );
+
+        let menu_sidebar = sidebar.clone();
+        let menu_title = title;
+        right_click_menu(("thread-menu", thread.id.0))
+            .trigger(move |is_menu_open, _, _| {
+                h_flex()
+                    .id(("thread", thread_id.0))
+                    .group(group_name.clone())
+                    .relative()
+                    .min_h(ROW_HEIGHT)
+                    .py_0p5()
+                    .w_full()
+                    .pl(indent + px(8.))
+                    .pr_2()
+                    .gap_1p5()
+                    .when(is_active || is_menu_open, |row| {
+                        row.bg(if is_menu_open {
+                            menu_open_background
+                        } else {
+                            active_background
+                        })
+                    })
+                    .when(!is_renaming, |row| {
+                        row.cursor_pointer()
+                            .hover(|row| row.bg(hover_background))
+                            .on_click({
+                                let sidebar = sidebar.clone();
+                                move |_, _, cx| {
+                                    sidebar
+                                        .update(cx, |_, cx| {
+                                            cx.emit(SidebarEvent::OpenThread(thread_id))
+                                        })
+                                        .ok();
+                                }
+                            })
+                    })
+                    .child(icon.size(IconSize::Small).color(Color::Muted))
+                    .child(text)
+                    .when(is_working, |row| {
+                        row.child(
+                            h_flex()
+                                .gap_1()
+                                .child(Indicator::dot().color(Color::Accent))
+                                .child(
+                                    Label::new("working")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Accent),
+                                ),
+                        )
+                    })
+                    .when_some(activity, |row, activity| {
+                        row.child(
+                            div()
+                                .when(!is_renaming, |this| {
+                                    this.group_hover(group_name.clone(), |this| this.invisible())
+                                })
+                                .child(
+                                    Label::new(activity)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
+                    .when(!is_renaming, |row| row.child(hover_actions))
+            })
+            .menu(move |window, cx| {
+                let sidebar = menu_sidebar.clone();
+                let title = menu_title.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("Rename Title", None, move |window, cx| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.start_renaming(thread_id, title.clone(), window, cx)
+                            })
+                            .ok();
+                    })
+                })
+            })
+            .into_any_element()
+    }
+
+    /// "All projects" without grouping: one list, each thread naming its project.
+    fn render_flat_threads(&self, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let threads: Vec<(Thread, Option<SharedString>)> = store
+            .visible_threads()
+            .into_iter()
+            .map(|thread| {
+                let project_name = store
+                    .project(thread.project_id)
+                    .map(|project| project.name());
+                (thread.clone(), project_name)
+            })
+            .collect();
+        let mut rows = Vec::with_capacity(threads.len());
+        for (thread, project_name) in threads {
+            rows.push(self.render_thread(thread, px(0.), project_name, cx));
+        }
+        v_flex()
+            .id("sidebar-threads")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .pb_2()
+            .when(rows.is_empty(), |list| {
+                list.child(
+                    h_flex().h(ROW_HEIGHT).px_3().child(
+                        Label::new("No threads yet")
+                            .size(LabelSize::Small)
+                            .color(Color::Placeholder),
                     ),
-            )
-            .relative()
+                )
+            })
+            .children(rows)
             .into_any_element()
     }
 
@@ -689,6 +917,7 @@ impl Render for Sidebar {
         let panel_background = cx.theme().colors().panel_background;
         let store = self.store.read(cx);
         let show_headers = store.scope() == ProjectScope::All;
+        let is_flat = show_headers && !store.group_by_project();
         let projects: Vec<Project> = store.visible_projects().cloned().collect();
 
         v_flex()
@@ -705,6 +934,8 @@ impl Render for Sidebar {
                 self.render_history(cx)
             } else if projects.is_empty() {
                 self.render_empty_state().into_any_element()
+            } else if is_flat {
+                self.render_flat_threads(cx)
             } else {
                 let mut groups = Vec::with_capacity(projects.len());
                 for (index, project) in projects.iter().enumerate() {

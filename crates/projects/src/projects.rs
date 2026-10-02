@@ -49,6 +49,9 @@ pub struct Thread {
     /// Set when the thread is archived; archived threads only show in Thread History.
     #[serde(default)]
     pub archived_at: Option<SystemTime>,
+    /// The user renamed the thread, so automatic titles no longer replace it.
+    #[serde(default)]
+    pub has_custom_title: bool,
 }
 
 /// How threads (and, in "All projects", the projects themselves) are ordered.
@@ -84,6 +87,12 @@ struct PersistedState {
     collapsed: Vec<ProjectId>,
     #[serde(default)]
     thread_order: ThreadOrder,
+    #[serde(default = "default_group_by_project")]
+    group_by_project: bool,
+}
+
+fn default_group_by_project() -> bool {
+    true
 }
 
 pub struct ProjectStore {
@@ -93,6 +102,8 @@ pub struct ProjectStore {
     scope: ProjectScope,
     collapsed: HashSet<ProjectId>,
     thread_order: ThreadOrder,
+    /// In "All projects", whether threads are grouped under their project or listed together.
+    group_by_project: bool,
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
@@ -131,6 +142,7 @@ impl ProjectStore {
             scope: state.scope,
             collapsed: state.collapsed.into_iter().collect(),
             thread_order: state.thread_order,
+            group_by_project: state.group_by_project,
             working_threads: HashSet::default(),
             state_path,
             _save_task: None,
@@ -178,6 +190,34 @@ impl ProjectStore {
             ThreadOrder::Created => threads.sort_by_key(|thread| std::cmp::Reverse(thread.id)),
         }
         threads.into_iter()
+    }
+
+    pub fn group_by_project(&self) -> bool {
+        self.group_by_project
+    }
+
+    pub fn set_group_by_project(&mut self, group: bool, cx: &mut Context<Self>) {
+        if self.group_by_project != group {
+            self.group_by_project = group;
+            self.changed(cx);
+        }
+    }
+
+    /// Unarchived threads of every visible project, in the current [`ThreadOrder`].
+    pub fn visible_threads(&self) -> Vec<&Thread> {
+        let mut threads: Vec<&Thread> = self
+            .visible_projects()
+            .flat_map(|project| self.threads_for(project.id))
+            .collect();
+        match self.thread_order {
+            ThreadOrder::LastActivity => threads.sort_by(|a, b| {
+                b.last_activity_at
+                    .cmp(&a.last_activity_at)
+                    .then(b.id.cmp(&a.id))
+            }),
+            ThreadOrder::Created => threads.sort_by_key(|thread| std::cmp::Reverse(thread.id)),
+        }
+        threads
     }
 
     pub fn thread_order(&self) -> ThreadOrder {
@@ -300,6 +340,7 @@ impl ProjectStore {
             last_activity_at: Some(SystemTime::now()),
             session_id: None,
             archived_at: None,
+            has_custom_title: false,
         });
         self.changed(cx);
         Some(id)
@@ -361,11 +402,23 @@ impl ProjectStore {
         }
     }
 
+    /// Sets an automatic title (from the first prompt or the agent), unless the user renamed
+    /// the thread.
     pub fn rename_thread(&mut self, id: ThreadId, title: String, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && !thread.has_custom_title
             && thread.title != title
         {
             thread.title = title;
+            self.changed(cx);
+        }
+    }
+
+    /// Sets a title chosen by the user.
+    pub fn set_custom_title(&mut self, id: ThreadId, title: String, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+            thread.title = title;
+            thread.has_custom_title = true;
             self.changed(cx);
         }
     }
@@ -415,6 +468,7 @@ impl ProjectStore {
                 collapsed
             },
             thread_order: self.thread_order,
+            group_by_project: self.group_by_project,
         };
         let executor = cx.background_executor().clone();
         self._save_task = Some(cx.background_spawn(async move {
@@ -527,6 +581,9 @@ mod tests {
             assert!(store.thread_history().iter().any(|t| t.id == thread));
             store.unarchive_thread(thread, cx);
             assert!(store.threads_for(first).any(|t| t.id == thread));
+            store.set_custom_title(thread, "Mine".into(), cx);
+            store.rename_thread(thread, "Automatic".into(), cx);
+            assert_eq!(store.thread(thread).map(|t| t.title.as_str()), Some("Mine"));
             store.delete_thread(thread, cx);
             assert!(store.thread(thread).is_none());
         });

@@ -145,8 +145,10 @@ impl AgentView {
     }
 
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
-        self.title = title;
-        cx.notify();
+        if self.title != title {
+            self.title = title;
+            cx.notify();
+        }
     }
 
     /// Keeps a markdown entity per message so streamed text is appended instead of reparsed.

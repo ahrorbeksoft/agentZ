@@ -152,6 +152,7 @@ fn main() {
             project_switcher::init(cx);
             new_thread_modal::init(cx);
             agent_view::init(cx);
+            sidebar::init(cx);
             projects::init(cx);
             let shell_environment_ready = load_shell_environment(cx);
             registry::init(http_client, shell_environment_ready, cx);
