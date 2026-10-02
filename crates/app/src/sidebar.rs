@@ -3,13 +3,14 @@ use std::time::{Duration, SystemTime};
 use collections::HashMap;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
-    KeyBinding, PromptLevel, Subscription, Task, Window, anchored, deferred, svg,
+    KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, svg,
 };
 use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId};
 use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
-    CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, prelude::*, right_click_menu,
+    CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,
+    prelude::*, right_click_menu,
 };
 
 use crate::project_info::{ProjectInfo, ProjectInfoStore, render_project_icon};
@@ -21,6 +22,7 @@ const CARD_HEIGHT: Pixels = px(78.);
 const DETAILS_DELAY: Duration = Duration::from_millis(500);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 const RENAME_KEY_CONTEXT: &str = "SidebarRename";
+const SEARCH_KEY_CONTEXT: &str = "SidebarSearch";
 const ARCHIVED_ROW_HEIGHT: Pixels = px(36.);
 /// t3code pages its settled shelf: recent history is the common lookup, the deep tail stays
 /// behind "Show more".
@@ -31,6 +33,10 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
+        KeyBinding::new("up", menu::SelectPrevious, Some(SEARCH_KEY_CONTEXT)),
+        KeyBinding::new("down", menu::SelectNext, Some(SEARCH_KEY_CONTEXT)),
+        KeyBinding::new("enter", menu::Confirm, Some(SEARCH_KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(SEARCH_KEY_CONTEXT)),
     ]);
 }
 
@@ -46,6 +52,9 @@ pub struct Sidebar {
     registry: Entity<AgentRegistryStore>,
     active_thread: Option<ThreadId>,
     search: Entity<TextInput>,
+    /// The highlighted search result, which Enter opens.
+    search_index: usize,
+    search_scroll: ScrollHandle,
     archived_shown: usize,
     project_info: HashMap<ProjectId, ProjectInfo>,
     /// The thread whose details popover is showing, after hovering it for a moment.
@@ -78,7 +87,11 @@ impl Sidebar {
             }),
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.observe(&registry, |_, _, cx| cx.notify()),
-            cx.subscribe(&search, |_, _, _: &TextInputEvent, cx| cx.notify()),
+            cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
+                this.search_index = 0;
+                this.search_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                cx.notify();
+            }),
         ];
         let activity_refresh = cx.spawn(async move |this, cx| {
             loop {
@@ -101,6 +114,8 @@ impl Sidebar {
             registry,
             active_thread: None,
             search,
+            search_index: 0,
+            search_scroll: ScrollHandle::new(),
             archived_shown: ARCHIVED_INITIAL_COUNT,
             project_info,
             details_thread: None,
@@ -195,9 +210,64 @@ impl Sidebar {
         self.search.read(cx).text().trim().to_lowercase()
     }
 
+    /// t3code's search results: every matching thread, active then archived, in one list.
+    fn search_results(&self, cx: &App) -> Vec<Thread> {
+        let query = self.search_query(cx);
+        let store = self.store.read(cx);
+        store
+            .active_threads()
+            .into_iter()
+            .chain(store.archived_threads())
+            .filter(|thread| matches_query(thread, &query))
+            .cloned()
+            .collect()
+    }
+
+    fn move_search_highlight(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.search_results(cx).len();
+        if count == 0 {
+            return;
+        }
+        self.search_index = if forward {
+            (self.search_index + 1) % count
+        } else {
+            self.search_index.checked_sub(1).unwrap_or(count - 1)
+        };
+        self.search_scroll.scroll_to_item(self.search_index);
+        cx.notify();
+    }
+
+    /// Opening a result ends the search, as in t3code.
+    fn open_search_result(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.search.update(cx, |search, cx| search.set_text("", cx));
+        cx.emit(SidebarEvent::OpenThread(thread_id));
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = !self.search_query(cx).is_empty();
         h_flex()
+            .key_context(SEARCH_KEY_CONTEXT)
+            .on_action(
+                cx.listener(|this, _: &menu::SelectNext, _, cx| {
+                    this.move_search_highlight(true, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, _, cx| {
+                this.move_search_highlight(false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
+                let result = this.search_results(cx).into_iter().nth(this.search_index);
+                if let Some(thread) = result {
+                    this.open_search_result(thread.id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
+                if this.search_query(cx).is_empty() {
+                    cx.propagate();
+                } else {
+                    this.search.update(cx, |search, cx| search.set_text("", cx));
+                }
+            }))
             .h(px(40.))
             .flex_none()
             .pl_3()
@@ -884,23 +954,126 @@ impl Sidebar {
             )
     }
 
-    fn render_threads(&self, cx: &mut Context<Self>) -> AnyElement {
-        let query = self.search_query(cx);
+    /// t3code's search result row: the project's icon, the title, and the time, highlighted
+    /// under the keyboard or mouse.
+    fn render_search_result(
+        &self,
+        index: usize,
+        thread: Thread,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let selected_background = colors.ghost_element_selected;
+        let hover_background = colors.ghost_element_hover;
+        let thread_id = thread.id;
+        let project = self.store.read(cx).project(thread.project_id).cloned();
+        let details = self.thread_details(&thread, project.as_ref(), cx);
+        let is_highlighted = index == self.search_index;
+        let is_active = self.active_thread == Some(thread_id);
+        let time = thread
+            .last_activity_at
+            .map(|time| format_relative_time(time, SystemTime::now()));
+        div()
+            .relative()
+            .child(
+                h_flex()
+                    .id(("search-result", thread_id.0))
+                    .min_h(px(36.))
+                    .px_2p5()
+                    .py_1()
+                    .gap_2p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(is_highlighted || is_active, |row| {
+                        row.bg(selected_background)
+                    })
+                    .when(!is_highlighted && !is_active, |row| {
+                        row.hover(|row| row.bg(hover_background))
+                    })
+                    .child(self.render_project_icon(project.as_ref(), cx))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(thread.title.clone())
+                                .truncate()
+                                .when(!is_highlighted && !is_active, |label| {
+                                    label.color(Color::Muted)
+                                }),
+                        ),
+                    )
+                    .children(
+                        time.map(|time| {
+                            Label::new(time).size(LabelSize::Small).color(Color::Muted)
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        if this.search_index != index {
+                            this.search_index = index;
+                            cx.notify();
+                        }
+                    }))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.thread_hovered(thread_id, *hovered, cx)
+                    }))
+                    .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.open_search_result(thread_id, cx)),
+                    ),
+            )
+            .when(self.details_thread == Some(thread_id), |row| {
+                row.child(render_details_popover(details, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_search_results(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let results = self.search_results(cx);
+        let rows: Vec<AnyElement> = results
+            .into_iter()
+            .enumerate()
+            .map(|(index, thread)| self.render_search_result(index, thread, cx))
+            .collect();
+        div()
+            .id("sidebar-search-results-scroll")
+            .flex_1()
+            .min_h_0()
+            .child(
+                v_flex()
+                    .id("sidebar-search-results")
+                    .size_full()
+                    .px_1()
+                    .pt_1()
+                    .pb_2()
+                    .gap_px()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.search_scroll)
+                    .when(rows.is_empty(), |list| {
+                        list.child(
+                            h_flex().justify_center().py_6().child(
+                                Label::new("No threads found")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                    })
+                    .children(rows),
+            )
+            .vertical_scrollbar_for(&self.search_scroll, window, cx)
+            .into_any_element()
+    }
+
+    fn render_threads(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // While searching, t3code swaps the list for the matching threads.
+        if !self.search_query(cx).is_empty() {
+            return self.render_search_results(window, cx);
+        }
         let store = self.store.read(cx);
         let active: Vec<(Thread, Option<Project>)> = store
             .active_threads()
             .into_iter()
-            .filter(|thread| matches_query(thread, &query))
             .map(|thread| (thread.clone(), store.project(thread.project_id).cloned()))
             .collect();
-        let archived: Vec<Thread> = store
-            .archived_threads()
-            .into_iter()
-            .filter(|thread| matches_query(thread, &query))
-            .cloned()
-            .collect();
-        // Matches are shown even while the shelf is collapsed.
-        let is_archived_expanded = store.archived_expanded() || !query.is_empty();
+        let archived: Vec<Thread> = store.archived_threads().into_iter().cloned().collect();
+        let is_archived_expanded = store.archived_expanded();
 
         let mut rows = Vec::with_capacity(active.len());
         for (thread, project) in active {
@@ -912,13 +1085,9 @@ impl Sidebar {
                     .h_8()
                     .px_2p5()
                     .child(
-                        Label::new(if query.is_empty() {
-                            "No threads yet"
-                        } else {
-                            "No matching threads"
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Placeholder),
+                        Label::new("No threads yet")
+                            .size(LabelSize::Small)
+                            .color(Color::Placeholder),
                     )
                     .into_any_element(),
             );
@@ -957,7 +1126,7 @@ impl Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let border = colors.border;
         let panel_background = colors.panel_background;
@@ -972,7 +1141,7 @@ impl Render for Sidebar {
             .bg(panel_background)
             .child(self.render_header(cx))
             .child(if has_projects {
-                self.render_threads(cx)
+                self.render_threads(window, cx)
             } else {
                 self.render_empty_state().into_any_element()
             })
