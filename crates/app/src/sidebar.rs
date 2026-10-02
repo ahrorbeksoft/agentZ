@@ -486,7 +486,6 @@ impl Sidebar {
                     .size(IconSize::XSmall)
                     .color(Color::Muted),
             )
-            .tooltip(Tooltip::text("Archive Thread"))
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
                 store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
