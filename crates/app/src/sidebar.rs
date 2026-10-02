@@ -55,7 +55,10 @@ pub struct Sidebar {
     machine_name: Option<SharedString>,
     /// The thread whose details popover is showing, after hovering it for a moment.
     details_thread: Option<ThreadId>,
-    details_delay: Option<Task<()>>,
+    /// A popover waiting out the hover delay, and the thread it's for.
+    details_delay: Option<(ThreadId, Task<()>)>,
+    /// The row under the mouse.
+    hovered_thread: Option<ThreadId>,
     renaming_thread: Option<ThreadId>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
@@ -163,6 +166,7 @@ impl Sidebar {
             machine_name: None,
             details_thread: None,
             details_delay: None,
+            hovered_thread: None,
             renaming_thread: None,
             rename_input,
             _rename_blur: None,
@@ -367,22 +371,34 @@ impl Sidebar {
     /// Shows the hovered thread's details after a moment, like t3code's row tooltip.
     fn thread_hovered(&mut self, thread_id: ThreadId, hovered: bool, cx: &mut Context<Self>) {
         if !hovered {
-            if self.details_thread == Some(thread_id) {
+            if self.hovered_thread == Some(thread_id) {
+                self.hovered_thread = None;
+            }
+            // Leaving one row may be reported after entering the next, so only this row's
+            // popover is cancelled.
+            let is_pending = self
+                .details_delay
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == thread_id);
+            if is_pending || self.details_thread == Some(thread_id) {
                 self.hide_details(cx);
             }
             return;
         }
+        self.hovered_thread = Some(thread_id);
         if self.details_thread == Some(thread_id) {
             return;
         }
-        self.details_delay = Some(cx.spawn(async move |this, cx| {
+        let delay = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DETAILS_DELAY).await;
             this.update(cx, |this, cx| {
+                this.details_delay = None;
                 this.details_thread = Some(thread_id);
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.details_delay = Some((thread_id, delay));
     }
 
     fn hide_details(&mut self, cx: &mut Context<Self>) {
@@ -502,6 +518,15 @@ impl Sidebar {
                     .group_hover(button_group, |this| this.text_color(bright_text)),
             )
             .child("Archive")
+            // The details would sit beside the button, so they give way to it.
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                if *hovered {
+                    this.hide_details(cx);
+                } else if this.hovered_thread == Some(thread_id) {
+                    // Back on the card rather than off it.
+                    this.thread_hovered(thread_id, true, cx);
+                }
+            }))
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
                 store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
