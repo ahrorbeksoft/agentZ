@@ -4,14 +4,14 @@ use std::time::{Duration, SystemTime};
 use collections::HashMap;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
-    KeyBinding, PromptLevel, Subscription, Task, Window,
+    KeyBinding, PromptLevel, Subscription, Task, Window, anchored, deferred,
 };
 use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, IconPosition, PopoverMenu, Tooltip, prelude::*,
-    right_click_menu, tooltip_container,
+    right_click_menu,
 };
 
 use crate::project_info::{ProjectInfo, render_project_icon};
@@ -22,6 +22,7 @@ const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// How often project icons and checked-out branches are re-read.
 const PROJECT_INFO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const CARD_HEIGHT: Pixels = px(78.);
+const DETAILS_DELAY: Duration = Duration::from_millis(500);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 const RENAME_KEY_CONTEXT: &str = "SidebarRename";
 const ARCHIVED_ROW_HEIGHT: Pixels = px(36.);
@@ -52,6 +53,9 @@ pub struct Sidebar {
     project_info: HashMap<ProjectId, ProjectInfo>,
     /// This Mac's name, for the thread details popover.
     machine_name: Option<SharedString>,
+    /// The thread whose details popover is showing, after hovering it for a moment.
+    details_thread: Option<ThreadId>,
+    details_delay: Option<Task<()>>,
     renaming_thread: Option<ThreadId>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
@@ -157,6 +161,8 @@ impl Sidebar {
             archived_shown: ARCHIVED_INITIAL_COUNT,
             project_info: HashMap::default(),
             machine_name: None,
+            details_thread: None,
+            details_delay: None,
             renaming_thread: None,
             rename_input,
             _rename_blur: None,
@@ -358,6 +364,34 @@ impl Sidebar {
         }
     }
 
+    /// Shows the hovered thread's details after a moment, like t3code's row tooltip.
+    fn thread_hovered(&mut self, thread_id: ThreadId, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            if self.details_thread == Some(thread_id) {
+                self.hide_details(cx);
+            }
+            return;
+        }
+        if self.details_thread == Some(thread_id) {
+            return;
+        }
+        self.details_delay = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DETAILS_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.details_thread = Some(thread_id);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn hide_details(&mut self, cx: &mut Context<Self>) {
+        self.details_delay = None;
+        if self.details_thread.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn thread_details(
         &self,
         thread: &Thread,
@@ -521,65 +555,72 @@ impl Sidebar {
             (None, title_line)
         };
 
-        let card = v_flex()
-            .id(("thread-card", thread.id.0))
-            .group(group_name)
-            .tooltip(move |_, cx| cx.new(|_| details.clone()).into())
-            .relative()
-            .w_full()
-            .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
-            .px_2p5()
-            .py_2()
-            .rounded_md()
-            .when(is_active, |card| card.bg(selected_background))
-            .when(!is_renaming, |card| {
-                card.cursor_pointer()
-                    .hover(|card| card.bg(hover_background))
-                    .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
-            })
-            .children(project_line)
-            .child(title_line)
-            .child(
-                h_flex()
-                    .mt_0p5()
-                    .min_w_0()
-                    .gap_1p5()
-                    .child(h_flex().flex_1().min_w_0().gap_1().when_some(
-                        git_head,
-                        |this, git_head| {
-                            this.when_some(git_head.worktree.clone(), |this, worktree| {
-                                let tooltip = format!(
-                                    "Worktree: {} ({})",
-                                    worktree.display(),
-                                    git_head.branch
-                                );
-                                this.child(
-                                    div()
-                                        .id(("thread-worktree", thread_id.0))
-                                        .flex_none()
-                                        .tooltip(Tooltip::text(tooltip))
-                                        .child(
-                                            Icon::new(IconName::GitWorktree)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Custom(faint_text)),
-                                        ),
+        let card =
+            v_flex()
+                .id(("thread-card", thread.id.0))
+                .group(group_name)
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    this.thread_hovered(thread_id, *hovered, cx)
+                }))
+                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+                .when(self.details_thread == Some(thread_id), |this| {
+                    this.child(render_details_popover(details, cx))
+                })
+                .relative()
+                .w_full()
+                .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
+                .px_2p5()
+                .py_2()
+                .rounded_md()
+                .when(is_active, |card| card.bg(selected_background))
+                .when(!is_renaming, |card| {
+                    card.cursor_pointer()
+                        .hover(|card| card.bg(hover_background))
+                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
+                })
+                .children(project_line)
+                .child(title_line)
+                .child(
+                    h_flex()
+                        .mt_0p5()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(h_flex().flex_1().min_w_0().gap_1().when_some(
+                            git_head,
+                            |this, git_head| {
+                                this.when_some(git_head.worktree.clone(), |this, worktree| {
+                                    let tooltip = format!(
+                                        "Worktree: {} ({})",
+                                        worktree.display(),
+                                        git_head.branch
+                                    );
+                                    this.child(
+                                        div()
+                                            .id(("thread-worktree", thread_id.0))
+                                            .flex_none()
+                                            .tooltip(Tooltip::text(tooltip))
+                                            .child(
+                                                Icon::new(IconName::GitWorktree)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Custom(faint_text)),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    Label::new(git_head.branch)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Custom(faint_text))
+                                        .truncate_middle(),
                                 )
-                            })
-                            .child(
-                                Label::new(git_head.branch)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Custom(faint_text))
-                                    .truncate_middle(),
-                            )
-                        },
-                    ))
-                    .child(
-                        div()
-                            .flex_none()
-                            .opacity(0.6)
-                            .child(icon.size(IconSize::Small).color(Color::Muted)),
-                    ),
-            );
+                            },
+                        ))
+                        .child(
+                            div()
+                                .flex_none()
+                                .opacity(0.6)
+                                .child(icon.size(IconSize::Small).color(Color::Muted)),
+                        ),
+                );
 
         let sidebar = cx.entity().downgrade();
         right_click_menu(("thread-menu", thread.id.0))
@@ -671,68 +712,75 @@ impl Sidebar {
         let title = SharedString::from(thread.title);
         let store = self.store.clone();
 
-        let row = h_flex()
-            .id(("archived-thread", thread.id.0))
-            .group(group_name.clone())
-            .tooltip(move |_, cx| cx.new(|_| details.clone()).into())
-            .relative()
-            .h(ARCHIVED_ROW_HEIGHT)
-            .w_full()
-            .px_2p5()
-            .gap_2p5()
-            .rounded_md()
-            .when(is_active, |row| row.bg(selected_background))
-            .when(!is_renaming, |row| {
-                row.cursor_pointer()
-                    .hover(|row| row.bg(hover_background))
-                    .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
-            })
-            .child(
-                div()
-                    .flex_none()
-                    .when(!is_active, |this| {
-                        this.opacity(0.4)
-                            .group_hover(group_name.clone(), |this| this.opacity(1.))
-                    })
-                    .child(project_icon),
-            )
-            .child(if is_renaming {
-                self.render_rename_input(cx)
-            } else {
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Label::new(title.clone()).color(Color::Muted).truncate())
-                    .into_any_element()
-            })
-            .when_some(time.filter(|_| !is_renaming), |row, time| {
-                row.child(
+        let row =
+            h_flex()
+                .id(("archived-thread", thread.id.0))
+                .group(group_name.clone())
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    this.thread_hovered(thread_id, *hovered, cx)
+                }))
+                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+                .when(self.details_thread == Some(thread_id), |this| {
+                    this.child(render_details_popover(details, cx))
+                })
+                .relative()
+                .h(ARCHIVED_ROW_HEIGHT)
+                .w_full()
+                .px_2p5()
+                .gap_2p5()
+                .rounded_md()
+                .when(is_active, |row| row.bg(selected_background))
+                .when(!is_renaming, |row| {
+                    row.cursor_pointer()
+                        .hover(|row| row.bg(hover_background))
+                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
+                })
+                .child(
                     div()
                         .flex_none()
-                        .group_hover(group_name.clone(), |this| this.invisible())
-                        .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
+                        .when(!is_active, |this| {
+                            this.opacity(0.4)
+                                .group_hover(group_name.clone(), |this| this.opacity(1.))
+                        })
+                        .child(project_icon),
                 )
-            })
-            .when(!is_renaming, |row| {
-                row.child(
+                .child(if is_renaming {
+                    self.render_rename_input(cx)
+                } else {
                     div()
-                        .absolute()
-                        .right_1()
-                        .visible_on_hover(group_name.clone())
-                        .child(
-                            IconButton::new(("unarchive-thread", thread.id.0), IconName::Undo)
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Unarchive Thread"))
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    store.update(cx, |store, cx| {
-                                        store.unarchive_thread(thread_id, cx)
-                                    });
-                                }),
-                        ),
-                )
-            });
+                        .flex_1()
+                        .min_w_0()
+                        .child(Label::new(title.clone()).color(Color::Muted).truncate())
+                        .into_any_element()
+                })
+                .when_some(time.filter(|_| !is_renaming), |row, time| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .group_hover(group_name.clone(), |this| this.invisible())
+                            .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
+                    )
+                })
+                .when(!is_renaming, |row| {
+                    row.child(
+                        div()
+                            .absolute()
+                            .right_1()
+                            .visible_on_hover(group_name.clone())
+                            .child(
+                                IconButton::new(("unarchive-thread", thread.id.0), IconName::Undo)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Unarchive Thread"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        store.update(cx, |store, cx| {
+                                            store.unarchive_thread(thread_id, cx)
+                                        });
+                                    }),
+                            ),
+                    )
+                });
 
         let sidebar = cx.entity().downgrade();
         right_click_menu(("archived-thread-menu", thread.id.0))
@@ -942,7 +990,6 @@ impl Render for Sidebar {
 }
 
 /// t3code's thread popover: the title, then the project, machine, branch, and model with agent.
-#[derive(Clone)]
 struct ThreadDetails {
     title: SharedString,
     project: Option<(SharedString, Option<ProjectInfo>)>,
@@ -951,8 +998,8 @@ struct ThreadDetails {
     agent: Option<(Option<SharedString>, SharedString)>,
 }
 
-impl Render for ThreadDetails {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ThreadDetails {
+    fn render(self, cx: &App) -> AnyElement {
         let detail_color = Color::Custom(cx.theme().colors().text.opacity(0.75));
         let detail_row = |icon: AnyElement, label: Label| {
             h_flex()
@@ -1003,24 +1050,45 @@ impl Render for ThreadDetails {
                 Label::new(label.clone()).truncate(),
             ));
         }
-        let title = self.title.clone();
-        tooltip_container(cx, move |container, _| {
-            container.child(
+        v_flex()
+            .elevation_2(cx)
+            .font(theme::theme_settings(cx).ui_font(cx).clone())
+            .text_ui(cx)
+            .py_1()
+            .px_2()
+            .child(
                 v_flex()
                     .max_w(px(320.))
                     .gap_2()
                     .px_1()
                     .py_2()
                     .child(
-                        Label::new(title)
+                        Label::new(self.title)
                             .size(LabelSize::Small)
                             .weight(FontWeight::MEDIUM)
                             .truncate(),
                     )
                     .child(v_flex().gap_1p5().pl_0p5().children(rows)),
             )
-        })
+            .into_any_element()
     }
+}
+
+/// Placed beside the row's right edge, top-aligned, as t3code places its row tooltip.
+fn render_details_popover(details: ThreadDetails, cx: &App) -> AnyElement {
+    div()
+        .absolute()
+        .top_0()
+        .left_full()
+        .child(
+            deferred(
+                anchored()
+                    .snap_to_window_with_margin(px(8.))
+                    .child(div().ml_1().child(details.render(cx))),
+            )
+            .with_priority(1),
+        )
+        .into_any_element()
 }
 
 fn matches_query(thread: &Thread, query: &str) -> bool {
