@@ -1,12 +1,15 @@
+use agent_thread::{AgentThread, AgentThreadEvent};
+use collections::HashMap;
 use gpui::{
     App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
     Subscription, Window, WindowControlArea,
 };
-use projects::{ProjectId, ProjectScope, ProjectStore};
-use registry::AgentRegistryStore;
+use projects::{ProjectId, ProjectScope, ProjectStore, ThreadId};
+use registry::{AgentId, AgentRegistryStore};
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 
-use crate::new_thread_modal::NewThreadModal;
+use crate::agent_view::AgentView;
+use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_switcher::ProjectSwitcher;
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::{NewThread, OpenFolder, ToggleProjectSwitcher};
@@ -14,6 +17,13 @@ use crate::{NewThread, OpenFolder, ToggleProjectSwitcher};
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 /// Leaves room for the macOS traffic lights.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
+const MAX_THREAD_TITLE_CHARS: usize = 48;
+
+/// An open thread. Kept while the app runs so its agent keeps working in the background.
+struct OpenThread {
+    view: Entity<AgentView>,
+    _subscription: Subscription,
+}
 
 pub struct Shell {
     focus_handle: FocusHandle,
@@ -21,7 +31,9 @@ pub struct Shell {
     registry: Entity<AgentRegistryStore>,
     sidebar: Entity<Sidebar>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
-    new_thread_modal: Option<(Entity<NewThreadModal>, Subscription)>,
+    new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
+    open_threads: HashMap<ThreadId, OpenThread>,
+    active_thread: Option<ThreadId>,
     should_move_window: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -35,11 +47,24 @@ impl Shell {
     ) -> Self {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), registry.clone(), cx));
         let subscriptions = vec![
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&store, |this, store, cx| {
+                // Drop views for threads that were removed (e.g. with their project).
+                let store = store.read(cx);
+                this.open_threads
+                    .retain(|thread_id, _| store.thread(*thread_id).is_some());
+                if this
+                    .active_thread
+                    .is_some_and(|thread_id| store.thread(thread_id).is_none())
+                {
+                    this.active_thread = None;
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::NewThread(project_id) => {
                     this.open_new_thread_modal(*project_id, window, cx)
                 }
+                SidebarEvent::OpenThread(thread_id) => this.open_thread(*thread_id, window, cx),
             }),
         ];
         Self {
@@ -49,6 +74,8 @@ impl Shell {
             sidebar,
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
+            open_threads: HashMap::default(),
+            active_thread: None,
             should_move_window: false,
             _subscriptions: subscriptions,
         }
@@ -75,17 +102,96 @@ impl Shell {
         let store = self.store.clone();
         let registry = self.registry.clone();
         let modal = cx.new(|cx| NewThreadModal::new(project_id, store, registry, window, cx));
-        let subscription =
+        let subscriptions = vec![
             cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
                 this.dismiss_new_thread_modal(window, cx);
-            });
-        self.new_thread_modal = Some((modal, subscription));
+            }),
+            cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
+                NewThreadModalEvent::ThreadCreated(thread_id) => {
+                    this.dismiss_new_thread_modal(window, cx);
+                    this.open_thread(*thread_id, window, cx);
+                }
+            }),
+        ];
+        self.new_thread_modal = Some((modal, subscriptions));
         cx.notify();
+    }
+
+    fn open_thread(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.open_threads.contains_key(&thread_id) {
+            let Some(open_thread) = self.start_thread(thread_id, cx) else {
+                return;
+            };
+            self.open_threads.insert(thread_id, open_thread);
+        }
+        self.active_thread = Some(thread_id);
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_active_thread(Some(thread_id), cx)
+        });
+        if let Some(open_thread) = self.open_threads.get(&thread_id) {
+            window.focus(&open_thread.view.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    fn start_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) -> Option<OpenThread> {
+        let store = self.store.read(cx);
+        let thread = store.thread(thread_id)?.clone();
+        let cwd = store.project(thread.project_id)?.path.clone();
+
+        let agent_id = thread.agent_id.clone().map(AgentId::new);
+        let agent_name = agent_id
+            .as_ref()
+            .and_then(|agent_id| self.registry.read(cx).agent(agent_id))
+            .map(|agent| agent.name().clone())
+            .or_else(|| agent_id.as_ref().map(|agent_id| agent_id.0.clone()))
+            .unwrap_or_else(|| "Agent".into());
+        let command = agent_id.as_ref().map(|agent_id| {
+            self.registry.update(cx, |registry, cx| {
+                registry.command_when_loaded(agent_id, cx)
+            })
+        });
+
+        let agent_thread = cx.new(|cx| match command {
+            Some(command) => AgentThread::start(agent_name.clone(), command, cwd, cx),
+            None => AgentThread::failed(agent_name.clone(), "This thread has no agent."),
+        });
+        let subscription = cx.subscribe(&agent_thread, move |this, _, event, cx| match event {
+            AgentThreadEvent::WorkingChanged(working) => {
+                this.store.update(cx, |store, cx| {
+                    store.set_thread_working(thread_id, *working, cx)
+                });
+            }
+            AgentThreadEvent::FirstPrompt(prompt) => {
+                let title = thread_title_from_prompt(prompt);
+                this.store.update(cx, |store, cx| {
+                    store.rename_thread(thread_id, title.clone(), cx)
+                });
+                if let Some(open_thread) = this.open_threads.get(&thread_id) {
+                    open_thread
+                        .view
+                        .update(cx, |view, cx| view.set_title(title.into(), cx));
+                }
+            }
+        });
+        let title = SharedString::from(thread.title);
+        let registry = self.registry.clone();
+        let view = cx.new(|cx| AgentView::new(agent_thread, title, registry, agent_id, cx));
+        Some(OpenThread {
+            view,
+            _subscription: subscription,
+        })
     }
 
     fn dismiss_new_thread_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.new_thread_modal.take().is_some() {
-            window.focus(&self.focus_handle, cx);
+            match self
+                .active_thread
+                .and_then(|thread_id| self.open_threads.get(&thread_id))
+            {
+                Some(open_thread) => window.focus(&open_thread.view.focus_handle(cx), cx),
+                None => window.focus(&self.focus_handle, cx),
+            }
             cx.notify();
         }
     }
@@ -233,6 +339,10 @@ impl Render for Shell {
         let background = cx.theme().colors().background;
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
+        let active_view = self
+            .active_thread
+            .and_then(|thread_id| self.open_threads.get(&thread_id))
+            .map(|open_thread| open_thread.view.clone());
 
         v_flex()
             .key_context("Shell")
@@ -257,7 +367,11 @@ impl Render for Shell {
                             .flex_1()
                             .min_w(SIDEBAR_WIDTH)
                             .h_full()
-                            .bg(main_background),
+                            .bg(main_background)
+                            .map(|main| match active_view {
+                                Some(view) => main.child(view),
+                                None => main.child(render_no_thread_selected()),
+                            }),
                     ),
             )
             .when_some(
@@ -287,5 +401,49 @@ impl Render for Shell {
                     )
                 },
             )
+    }
+}
+
+fn render_no_thread_selected() -> impl IntoElement {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(Label::new("Select a thread, or start a new one").color(Color::Muted))
+        .child(
+            Button::new("start-thread", "New Thread")
+                .style(ButtonStyle::Outlined)
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
+        )
+}
+
+/// The first line of the first prompt, shortened to fit the sidebar.
+fn thread_title_from_prompt(prompt: &str) -> String {
+    let first_line = prompt.lines().next().unwrap_or_default().trim();
+    if first_line.chars().count() <= MAX_THREAD_TITLE_CHARS {
+        return first_line.to_string();
+    }
+    let shortened: String = first_line
+        .chars()
+        .take(MAX_THREAD_TITLE_CHARS - 1)
+        .collect();
+    format!("{}…", shortened.trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thread_title_from_prompt;
+
+    #[test]
+    fn thread_titles() {
+        assert_eq!(
+            thread_title_from_prompt("Fix the login bug\nmore detail"),
+            "Fix the login bug"
+        );
+        let long = "Build a checkout page with a cart summary, a pay button and order history";
+        let title = thread_title_from_prompt(long);
+        assert_eq!(title.chars().count(), super::MAX_THREAD_TITLE_CHARS);
+        assert!(title.ends_with('…'));
     }
 }

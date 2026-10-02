@@ -18,7 +18,10 @@ runtime_shaders = ["gpui_platform/runtime_shaders"]
 workspace = true
 
 [dependencies]
+agent-client-protocol.workspace = true
+agent_thread.workspace = true
 anyhow.workspace = true
+collections.workspace = true
 assets.workspace = true
 dirs.workspace = true
 env_logger.workspace = true
@@ -26,6 +29,7 @@ futures.workspace = true
 gpui.workspace = true
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 log.workspace = true
+markdown.workspace = true
 menu.workspace = true
 projects.workspace = true
 registry.workspace = true

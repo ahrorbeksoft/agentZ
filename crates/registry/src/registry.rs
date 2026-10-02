@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
 use futures::AsyncReadExt as _;
+use futures::channel::oneshot;
 use futures::future::{Shared, join_all};
 use gpui::{
     App, AppContext as _, BackgroundExecutor, Context, Entity, FutureExt as _, Global,
@@ -164,6 +165,9 @@ pub struct AgentRegistryStore {
     fetch_error: Option<SharedString>,
     pending_refresh: Option<Task<()>>,
     last_refresh: Option<Instant>,
+    /// Set once the agent list is known, from the cache or the network.
+    has_loaded: bool,
+    loaded_waiters: Vec<oneshot::Sender<()>>,
 }
 
 pub fn init(
@@ -206,6 +210,8 @@ impl AgentRegistryStore {
             fetch_error: None,
             pending_refresh: None,
             last_refresh: None,
+            has_loaded: false,
+            loaded_waiters: Vec::new(),
         };
         store.load_cached_registry(cx);
         store
@@ -295,6 +301,7 @@ impl AgentRegistryStore {
                     }
                 }
                 this.set_installed_versions(installed_versions);
+                this.mark_loaded();
                 cx.notify();
             })
             .ok();
@@ -376,6 +383,32 @@ impl AgentRegistryStore {
         })
     }
 
+    /// Like [`Self::command`], but waits until the agent list has loaded, so threads opened
+    /// right after launch can still find their agent.
+    pub fn command_when_loaded(
+        &mut self,
+        id: &AgentId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<AgentCommand>> {
+        if self.has_loaded {
+            return self.command(id, cx);
+        }
+        let (sender, receiver) = oneshot::channel();
+        self.loaded_waiters.push(sender);
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            receiver.await.ok();
+            this.update(cx, |this, cx| this.command(&id, cx))?.await
+        })
+    }
+
+    fn mark_loaded(&mut self) {
+        self.has_loaded = true;
+        for waiter in self.loaded_waiters.drain(..) {
+            waiter.send(()).ok();
+        }
+    }
+
     fn set_installed_versions(&mut self, installed_versions: HashMap<AgentId, SharedString>) {
         for id in installed_versions.keys() {
             self.install_errors.remove(id);
@@ -426,6 +459,9 @@ impl AgentRegistryStore {
                     this.agents = agents;
                 }
                 this.set_installed_versions(installed_versions);
+                if !this.agents.is_empty() {
+                    this.mark_loaded();
+                }
                 cx.notify();
             })?;
             Ok(())

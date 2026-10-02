@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime};
 
 use gpui::{AnyElement, Context, Entity, EventEmitter, MouseButton, Subscription, Task, Window};
-use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread};
+use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId};
 use registry::{AgentId, AgentRegistryStore};
 use ui::{ContextMenu, Indicator, Tooltip, prelude::*, right_click_menu};
 
@@ -14,11 +14,13 @@ pub const SIDEBAR_WIDTH: Pixels = px(290.);
 
 pub enum SidebarEvent {
     NewThread(ProjectId),
+    OpenThread(ThreadId),
 }
 
 pub struct Sidebar {
     store: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
+    active_thread: Option<ThreadId>,
     _subscriptions: Vec<Subscription>,
     _activity_refresh: Task<()>,
 }
@@ -48,9 +50,15 @@ impl Sidebar {
         Self {
             store,
             registry,
+            active_thread: None,
             _subscriptions: subscriptions,
             _activity_refresh: activity_refresh,
         }
+    }
+
+    pub fn set_active_thread(&mut self, thread_id: Option<ThreadId>, cx: &mut Context<Self>) {
+        self.active_thread = thread_id;
+        cx.notify();
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -228,6 +236,9 @@ impl Sidebar {
 
     fn render_thread(&self, thread: Thread, indent: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let hover_background = cx.theme().colors().ghost_element_hover;
+        let active_background = cx.theme().colors().ghost_element_selected;
+        let is_active = self.active_thread == Some(thread.id);
+        let thread_id = thread.id;
         let icon = thread
             .agent_id
             .as_ref()
@@ -253,7 +264,9 @@ impl Sidebar {
             .pr_2()
             .gap_1p5()
             .cursor_pointer()
+            .when(is_active, |row| row.bg(active_background))
             .hover(|row| row.bg(hover_background))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::OpenThread(thread_id))))
             .child(icon.size(IconSize::Small).color(Color::Muted))
             .child(
                 div()

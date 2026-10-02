@@ -2,7 +2,7 @@ use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, Subscription, Window,
 };
-use projects::{ProjectId, ProjectStore};
+use projects::{ProjectId, ProjectStore, ThreadId};
 use registry::{AgentId, AgentRegistryStore, InstallState, RegistryAgent};
 use text_input::{TextInput, TextInputEvent};
 use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
@@ -34,6 +34,10 @@ impl Row {
     }
 }
 
+pub enum NewThreadModalEvent {
+    ThreadCreated(ThreadId),
+}
+
 pub struct NewThreadModal {
     project_id: ProjectId,
     projects: Entity<ProjectStore>,
@@ -47,6 +51,7 @@ pub struct NewThreadModal {
 }
 
 impl EventEmitter<DismissEvent> for NewThreadModal {}
+impl EventEmitter<NewThreadModalEvent> for NewThreadModal {}
 
 impl Focusable for NewThreadModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -167,10 +172,13 @@ impl NewThreadModal {
     fn start_thread(&mut self, agent_id: &AgentId, cx: &mut Context<Self>) {
         let project_id = self.project_id;
         let agent_id = agent_id.0.to_string();
-        self.projects.update(cx, |projects, cx| {
-            projects.add_thread(project_id, "New thread", Some(agent_id), cx);
+        let thread_id = self.projects.update(cx, |projects, cx| {
+            projects.add_thread(project_id, "New thread", Some(agent_id), cx)
         });
-        cx.emit(DismissEvent);
+        match thread_id {
+            Some(thread_id) => cx.emit(NewThreadModalEvent::ThreadCreated(thread_id)),
+            None => cx.emit(DismissEvent),
+        }
     }
 
     fn render_row(&self, index: usize, row: Row, cx: &mut Context<Self>) -> AnyElement {

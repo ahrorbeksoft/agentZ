@@ -1,0 +1,879 @@
+//! One conversation with an ACP agent: starts the agent process, runs an ACP session in the
+//! project folder, and keeps the conversation (messages, tool calls, plan, permission
+//! requests) as it streams in.
+//!
+//! The connection setup follows Zed's `agent_servers::acp`: the SDK's handlers must be `Send`,
+//! so they forward everything onto a channel that is processed on the foreground thread.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Instant;
+
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
+use anyhow::{Context as _, Result, anyhow};
+use futures::channel::{mpsc, oneshot};
+use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _};
+use gpui::{AppContext as _, Context, EventEmitter, SharedString, Task};
+use registry::AgentCommand;
+
+const STDERR_LINES_KEPT: usize = 20;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConnectionStatus {
+    Connecting,
+    Ready,
+    Failed(SharedString),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry {
+    UserMessage(String),
+    AgentMessage(String),
+    AgentThought(String),
+    ToolCall(ToolCall),
+    /// Where the plan first appeared; the plan itself is kept up to date in [`AgentThread::plan`].
+    Plan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCall {
+    pub id: acp::ToolCallId,
+    pub title: String,
+    pub kind: acp::ToolKind,
+    pub status: acp::ToolCallStatus,
+    pub text: Vec<String>,
+    pub diffs: Vec<FileDiff>,
+    pub locations: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileDiff {
+    pub path: PathBuf,
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
+
+impl FileDiff {
+    /// The lines that differ between the old and new text, as one removed and one added block.
+    /// The shared prefix and suffix are trimmed, which is enough for a summary card.
+    pub fn changed_lines(&self) -> (Vec<&str>, Vec<&str>) {
+        let new_lines: Vec<&str> = self.new_text.lines().collect();
+        let Some(old_text) = &self.old_text else {
+            return (Vec::new(), new_lines);
+        };
+        let old_lines: Vec<&str> = old_text.lines().collect();
+        let common_prefix = old_lines
+            .iter()
+            .zip(&new_lines)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let common_suffix = old_lines[common_prefix..]
+            .iter()
+            .rev()
+            .zip(new_lines[common_prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        (
+            old_lines[common_prefix..old_lines.len() - common_suffix].to_vec(),
+            new_lines[common_prefix..new_lines.len() - common_suffix].to_vec(),
+        )
+    }
+
+    /// Line counts added and removed, for the "+84 −12" summary.
+    pub fn line_counts(&self) -> (usize, usize) {
+        let (removed, added) = self.changed_lines();
+        (added.len(), removed.len())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanItem {
+    pub content: String,
+    pub status: acp::PlanEntryStatus,
+}
+
+#[derive(Clone, Debug)]
+pub struct PermissionOption {
+    pub id: acp::PermissionOptionId,
+    pub name: String,
+    pub kind: acp::PermissionOptionKind,
+}
+
+pub struct PermissionRequest {
+    pub tool_call_id: acp::ToolCallId,
+    pub title: String,
+    pub options: Vec<PermissionOption>,
+    responder: Responder<acp::RequestPermissionResponse>,
+}
+
+pub enum AgentThreadEvent {
+    /// The agent started or finished working on a prompt.
+    WorkingChanged(bool),
+    /// The first prompt of a new conversation was sent; useful as a title.
+    FirstPrompt(String),
+}
+
+enum Incoming {
+    Notification(acp::SessionNotification),
+    Permission(
+        acp::RequestPermissionRequest,
+        Responder<acp::RequestPermissionResponse>,
+    ),
+}
+
+struct Session {
+    connection: ConnectionTo<Agent>,
+    session_id: acp::SessionId,
+}
+
+pub struct AgentThread {
+    agent_name: SharedString,
+    status: ConnectionStatus,
+    entries: Vec<Entry>,
+    plan: Vec<PlanItem>,
+    permission_requests: Vec<PermissionRequest>,
+    session: Option<Session>,
+    queued_prompts: Vec<String>,
+    turn_started_at: Option<Instant>,
+    last_stop_reason: Option<acp::StopReason>,
+    turn_error: Option<SharedString>,
+    stderr_lines: VecDeque<String>,
+    _tasks: Vec<Task<()>>,
+}
+
+impl EventEmitter<AgentThreadEvent> for AgentThread {}
+
+impl AgentThread {
+    /// Starts the agent and an ACP session in `cwd`. Prompts sent before the session is ready
+    /// are queued.
+    pub fn start(
+        agent_name: SharedString,
+        command: Task<Result<AgentCommand>>,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let connect = cx.spawn(async move |this, cx| {
+            let result = async {
+                let command = command.await?;
+                connect(command, cwd, this.clone(), cx).await
+            }
+            .await;
+            this.update(cx, |this, cx| match result {
+                Ok(session) => {
+                    this.session = Some(session);
+                    this.status = ConnectionStatus::Ready;
+                    for prompt in std::mem::take(&mut this.queued_prompts) {
+                        this.send_to_agent(prompt, cx);
+                    }
+                    cx.notify();
+                }
+                Err(error) => {
+                    log::error!("failed to start agent: {error:#}");
+                    this.fail(format!("{error:#}"), cx);
+                }
+            })
+            .ok();
+        });
+
+        Self {
+            agent_name,
+            status: ConnectionStatus::Connecting,
+            entries: Vec::new(),
+            plan: Vec::new(),
+            permission_requests: Vec::new(),
+            session: None,
+            queued_prompts: Vec::new(),
+            turn_started_at: None,
+            last_stop_reason: None,
+            turn_error: None,
+            stderr_lines: VecDeque::new(),
+            _tasks: vec![connect],
+        }
+    }
+
+    /// A thread that cannot start, e.g. because its agent is not installed.
+    pub fn failed(agent_name: SharedString, error: impl Into<SharedString>) -> Self {
+        Self {
+            agent_name,
+            status: ConnectionStatus::Failed(error.into()),
+            entries: Vec::new(),
+            plan: Vec::new(),
+            permission_requests: Vec::new(),
+            session: None,
+            queued_prompts: Vec::new(),
+            turn_started_at: None,
+            last_stop_reason: None,
+            turn_error: None,
+            stderr_lines: VecDeque::new(),
+            _tasks: Vec::new(),
+        }
+    }
+
+    pub fn agent_name(&self) -> &SharedString {
+        &self.agent_name
+    }
+
+    pub fn status(&self) -> &ConnectionStatus {
+        &self.status
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn plan(&self) -> &[PlanItem] {
+        &self.plan
+    }
+
+    pub fn permission_request(&self, tool_call_id: &acp::ToolCallId) -> Option<&PermissionRequest> {
+        self.permission_requests
+            .iter()
+            .find(|request| &request.tool_call_id == tool_call_id)
+    }
+
+    /// Permission requests whose tool call isn't shown as an entry.
+    pub fn orphan_permission_requests(&self) -> impl Iterator<Item = &PermissionRequest> {
+        self.permission_requests.iter().filter(|request| {
+            !self.entries.iter().any(|entry| {
+                matches!(entry, Entry::ToolCall(tool_call) if tool_call.id == request.tool_call_id)
+            })
+        })
+    }
+
+    pub fn is_working(&self) -> bool {
+        self.turn_started_at.is_some()
+    }
+
+    pub fn turn_started_at(&self) -> Option<Instant> {
+        self.turn_started_at
+    }
+
+    pub fn turn_error(&self) -> Option<&SharedString> {
+        self.turn_error.as_ref()
+    }
+
+    pub fn last_stop_reason(&self) -> Option<&acp::StopReason> {
+        self.last_stop_reason.as_ref()
+    }
+
+    pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() || self.is_working() {
+            return;
+        }
+        if !self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::UserMessage(_)))
+        {
+            cx.emit(AgentThreadEvent::FirstPrompt(text.clone()));
+        }
+        self.entries.push(Entry::UserMessage(text.clone()));
+        self.turn_error = None;
+        match self.status {
+            ConnectionStatus::Ready => self.send_to_agent(text, cx),
+            ConnectionStatus::Connecting => {
+                self.queued_prompts.push(text);
+                self.set_working(true, cx);
+            }
+            ConnectionStatus::Failed(_) => {}
+        }
+        cx.notify();
+    }
+
+    fn send_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let request = acp::PromptRequest::new(
+            session.session_id.clone(),
+            vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+        );
+        let response = session.connection.send_request(request).block_task();
+        self.set_working(true, cx);
+        cx.spawn(async move |this, cx| {
+            let result = response.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(response) => this.last_stop_reason = Some(response.stop_reason),
+                    Err(error) => {
+                        log::error!("agent prompt failed: {error:?}");
+                        this.turn_error = Some(error_message(&error).into());
+                    }
+                }
+                // A finished turn can't still be waiting on a permission answer.
+                for request in this.permission_requests.drain(..) {
+                    request
+                        .responder
+                        .respond(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Cancelled,
+                        ))
+                        .ok();
+                }
+                this.set_working(false, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks the agent to stop the current turn.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.is_working() {
+            return;
+        }
+        if let Some(session) = &self.session {
+            if let Err(error) = session
+                .connection
+                .send_notification(acp::CancelNotification::new(session.session_id.clone()))
+            {
+                log::error!("failed to cancel the agent's turn: {error:?}");
+            }
+        } else {
+            self.queued_prompts.clear();
+            self.set_working(false, cx);
+        }
+        for request in self.permission_requests.drain(..) {
+            request
+                .responder
+                .respond(acp::RequestPermissionResponse::new(
+                    acp::RequestPermissionOutcome::Cancelled,
+                ))
+                .ok();
+        }
+        cx.notify();
+    }
+
+    pub fn respond_to_permission(
+        &mut self,
+        tool_call_id: &acp::ToolCallId,
+        option_id: acp::PermissionOptionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .permission_requests
+            .iter()
+            .position(|request| &request.tool_call_id == tool_call_id)
+        else {
+            return;
+        };
+        let request = self.permission_requests.remove(index);
+        if let Err(error) = request
+            .responder
+            .respond(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    option_id,
+                )),
+            ))
+        {
+            log::error!("failed to answer the agent's permission request: {error:?}");
+        }
+        cx.notify();
+    }
+
+    fn set_working(&mut self, working: bool, cx: &mut Context<Self>) {
+        if working == self.is_working() {
+            return;
+        }
+        self.turn_started_at = working.then(Instant::now);
+        cx.emit(AgentThreadEvent::WorkingChanged(working));
+    }
+
+    fn fail(&mut self, error: String, cx: &mut Context<Self>) {
+        let mut message = error;
+        if !self.stderr_lines.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&Vec::from(self.stderr_lines.clone()).join("\n"));
+        }
+        self.status = ConnectionStatus::Failed(message.into());
+        self.session = None;
+        self.queued_prompts.clear();
+        self.set_working(false, cx);
+        cx.notify();
+    }
+
+    fn record_stderr(&mut self, line: String) {
+        if self.stderr_lines.len() == STDERR_LINES_KEPT {
+            self.stderr_lines.pop_front();
+        }
+        self.stderr_lines.push_back(line);
+    }
+
+    fn handle_incoming(&mut self, incoming: Incoming, cx: &mut Context<Self>) {
+        match incoming {
+            Incoming::Notification(notification) => self.apply_update(notification.update),
+            Incoming::Permission(request, responder) => {
+                let tool_call_id = request.tool_call.tool_call_id.clone();
+                // Permission requests can describe a tool call we haven't been told about yet.
+                self.apply_tool_call_update(request.tool_call.clone());
+                let title = request.tool_call.fields.title.clone().unwrap_or_default();
+                self.permission_requests.push(PermissionRequest {
+                    tool_call_id,
+                    title,
+                    options: request
+                        .options
+                        .into_iter()
+                        .map(|option| PermissionOption {
+                            id: option.option_id,
+                            name: option.name,
+                            kind: option.kind,
+                        })
+                        .collect(),
+                    responder,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_update(&mut self, update: acp::SessionUpdate) {
+        match update {
+            acp::SessionUpdate::UserMessageChunk(chunk) => self.append_text(
+                chunk.content,
+                |text| Entry::UserMessage(text),
+                |entry| match entry {
+                    Entry::UserMessage(text) => Some(text),
+                    _ => None,
+                },
+            ),
+            acp::SessionUpdate::AgentMessageChunk(chunk) => self.append_text(
+                chunk.content,
+                |text| Entry::AgentMessage(text),
+                |entry| match entry {
+                    Entry::AgentMessage(text) => Some(text),
+                    _ => None,
+                },
+            ),
+            acp::SessionUpdate::AgentThoughtChunk(chunk) => self.append_text(
+                chunk.content,
+                |text| Entry::AgentThought(text),
+                |entry| match entry {
+                    Entry::AgentThought(text) => Some(text),
+                    _ => None,
+                },
+            ),
+            acp::SessionUpdate::ToolCall(tool_call) => self.upsert_tool_call(tool_call),
+            acp::SessionUpdate::ToolCallUpdate(update) => self.apply_tool_call_update(update),
+            acp::SessionUpdate::Plan(plan) => {
+                self.plan = plan
+                    .entries
+                    .into_iter()
+                    .map(|entry| PlanItem {
+                        content: entry.content,
+                        status: entry.status,
+                    })
+                    .collect();
+                if !self.entries.contains(&Entry::Plan) {
+                    self.entries.push(Entry::Plan);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn append_text(
+        &mut self,
+        content: acp::ContentBlock,
+        new_entry: impl FnOnce(String) -> Entry,
+        existing_text: impl FnOnce(&mut Entry) -> Option<&mut String>,
+    ) {
+        let acp::ContentBlock::Text(text) = content else {
+            return;
+        };
+        if let Some(existing) = self.entries.last_mut().and_then(existing_text) {
+            existing.push_str(&text.text);
+        } else {
+            self.entries.push(new_entry(text.text));
+        }
+    }
+
+    fn upsert_tool_call(&mut self, tool_call: acp::ToolCall) {
+        let mut entry = ToolCall {
+            id: tool_call.tool_call_id,
+            title: tool_call.title,
+            kind: tool_call.kind,
+            status: tool_call.status,
+            text: Vec::new(),
+            diffs: Vec::new(),
+            locations: tool_call
+                .locations
+                .into_iter()
+                .map(|location| location.path)
+                .collect(),
+        };
+        set_tool_call_content(&mut entry, tool_call.content);
+        if let Some(existing) = self.tool_call_mut(&entry.id) {
+            *existing = entry;
+        } else {
+            self.entries.push(Entry::ToolCall(entry));
+        }
+    }
+
+    fn apply_tool_call_update(&mut self, update: acp::ToolCallUpdate) {
+        let fields = update.fields;
+        let Some(existing) = self.tool_call_mut(&update.tool_call_id) else {
+            let mut entry = ToolCall {
+                id: update.tool_call_id,
+                title: fields.title.unwrap_or_default(),
+                kind: fields.kind.unwrap_or_default(),
+                status: fields.status.unwrap_or_default(),
+                text: Vec::new(),
+                diffs: Vec::new(),
+                locations: fields
+                    .locations
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|location| location.path)
+                    .collect(),
+            };
+            set_tool_call_content(&mut entry, fields.content.unwrap_or_default());
+            self.entries.push(Entry::ToolCall(entry));
+            return;
+        };
+        if let Some(title) = fields.title {
+            existing.title = title;
+        }
+        if let Some(kind) = fields.kind {
+            existing.kind = kind;
+        }
+        if let Some(status) = fields.status {
+            existing.status = status;
+        }
+        if let Some(locations) = fields.locations {
+            existing.locations = locations
+                .into_iter()
+                .map(|location| location.path)
+                .collect();
+        }
+        if let Some(content) = fields.content {
+            set_tool_call_content(existing, content);
+        }
+    }
+
+    fn tool_call_mut(&mut self, id: &acp::ToolCallId) -> Option<&mut ToolCall> {
+        self.entries.iter_mut().rev().find_map(|entry| match entry {
+            Entry::ToolCall(tool_call) if &tool_call.id == id => Some(tool_call),
+            _ => None,
+        })
+    }
+}
+
+fn set_tool_call_content(tool_call: &mut ToolCall, content: Vec<acp::ToolCallContent>) {
+    tool_call.text.clear();
+    tool_call.diffs.clear();
+    for item in content {
+        match item {
+            acp::ToolCallContent::Content(content) => {
+                if let acp::ContentBlock::Text(text) = content.content {
+                    tool_call.text.push(text.text);
+                }
+            }
+            acp::ToolCallContent::Diff(diff) => tool_call.diffs.push(FileDiff {
+                path: diff.path,
+                old_text: diff.old_text,
+                new_text: diff.new_text,
+            }),
+            _ => {}
+        }
+    }
+}
+
+fn error_message(error: &agent_client_protocol::Error) -> String {
+    match &error.data {
+        Some(data) => format!("{} ({data})", error.message),
+        None => error.message.clone(),
+    }
+}
+
+/// Spawns the agent, wires up the ACP connection, and creates a session.
+async fn connect(
+    command: AgentCommand,
+    cwd: PathBuf,
+    this: gpui::WeakEntity<AgentThread>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<Session> {
+    let mut child = smol::process::Command::new(&command.path)
+        .args(&command.args)
+        .envs(&command.env)
+        .current_dir(&cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("starting {}", command.path.display()))?;
+    let stdin = child.stdin.take().context("agent has no stdin")?;
+    let stdout = child.stdout.take().context("agent has no stdout")?;
+    let stderr = child.stderr.take().context("agent has no stderr")?;
+
+    let incoming_lines = futures::io::BufReader::new(stdout).lines().boxed();
+    let outgoing_lines = Box::pin(futures::sink::unfold(
+        Box::pin(stdin),
+        async move |mut writer, line: String| {
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).await?;
+            writer.flush().await?;
+            Ok::<_, std::io::Error>(writer)
+        },
+    ));
+
+    let (incoming_sender, mut incoming_receiver) = mpsc::unbounded::<Incoming>();
+    let (connection_sender, connection_receiver) = oneshot::channel();
+    let connection_future = {
+        let notification_sender = incoming_sender.clone();
+        let permission_sender = incoming_sender;
+        Client
+            .builder()
+            .name("agentZ")
+            .on_receive_notification(
+                async move |notification: acp::SessionNotification, _connection| {
+                    notification_sender
+                        .unbounded_send(Incoming::Notification(notification))
+                        .ok();
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |request: acp::RequestPermissionRequest,
+                            responder: Responder<acp::RequestPermissionResponse>,
+                            _connection| {
+                    if let Err(error) =
+                        permission_sender.unbounded_send(Incoming::Permission(request, responder))
+                    {
+                        let Incoming::Permission(_, responder) = error.into_inner() else {
+                            return Ok(());
+                        };
+                        responder.respond(acp::RequestPermissionResponse::new(
+                            acp::RequestPermissionOutcome::Cancelled,
+                        ))?;
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(
+                Lines::new(outgoing_lines, incoming_lines),
+                move |connection: ConnectionTo<Agent>| async move {
+                    connection_sender.send(connection).ok();
+                    // Keep the connection open until the transport closes.
+                    futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
+                },
+            )
+    };
+
+    let io_task = cx.background_spawn(async move {
+        if let Err(error) = connection_future.await {
+            log::error!("ACP connection error: {error:?}");
+        }
+    });
+    let stderr_task = cx.spawn({
+        let this = this.clone();
+        async move |cx| {
+            let mut lines = futures::io::BufReader::new(stderr).lines();
+            while let Some(Ok(line)) = lines.next().await {
+                log::warn!("agent stderr: {line}");
+                if this.update(cx, |this, _| this.record_stderr(line)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let incoming_task = cx.spawn({
+        let this = this.clone();
+        async move |cx| {
+            while let Some(incoming) = incoming_receiver.next().await {
+                if this
+                    .update(cx, |this, cx| this.handle_incoming(incoming, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    let exit_task = cx.spawn({
+        let this = this.clone();
+        async move |cx| {
+            let status = child.status().await;
+            this.update(cx, |this, cx| {
+                let message = match status {
+                    Ok(status) => format!("The agent exited ({status})."),
+                    Err(error) => format!("The agent stopped: {error}"),
+                };
+                this.fail(message, cx);
+            })
+            .ok();
+        }
+    });
+    this.update(cx, |this, _| {
+        this._tasks
+            .extend([io_task, stderr_task, incoming_task, exit_task]);
+    })?;
+
+    let connection = connection_receiver
+        .await
+        .map_err(|_| anyhow!("the agent closed the connection before it was ready"))?;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let initialize = connection
+        .send_request(
+            acp::InitializeRequest::new(ProtocolVersion::V1)
+                .client_capabilities(acp::ClientCapabilities::new())
+                .client_info(acp::Implementation::new("agentZ", version)),
+        )
+        .block_task()
+        .map(|result| result.map_err(|error| anyhow!(error_message(&error))));
+    let initialize_response = initialize.await.context("initializing the agent")?;
+    anyhow::ensure!(
+        initialize_response.protocol_version >= ProtocolVersion::V1,
+        "the agent speaks an unsupported ACP version"
+    );
+
+    let new_session = connection
+        .send_request(acp::NewSessionRequest::new(cwd))
+        .block_task()
+        .await
+        .map_err(|error| anyhow!(error_message(&error)))
+        .context("starting a session")?;
+
+    Ok(Session {
+        connection,
+        session_id: new_session.session_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_line_counts() {
+        let diff = FileDiff {
+            path: PathBuf::from("a.rs"),
+            old_text: Some("a\nb\nc\nd\n".into()),
+            new_text: "a\nB\nB2\nc\nd\n".into(),
+        };
+        assert_eq!(diff.line_counts(), (2, 1));
+        assert_eq!(diff.changed_lines(), (vec!["b"], vec!["B", "B2"]));
+        let created = FileDiff {
+            path: PathBuf::from("b.rs"),
+            old_text: None,
+            new_text: "x\ny\n".into(),
+        };
+        assert_eq!(created.line_counts(), (2, 0));
+    }
+
+    /// Runs the real process and protocol plumbing against `test_support/mock_agent.py`.
+    #[gpui::test]
+    fn talks_to_a_real_agent_process(cx: &mut gpui::TestAppContext) {
+        let Some(python) = which_python() else {
+            eprintln!("skipping: python3 not found");
+            return;
+        };
+        cx.executor().allow_parking();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
+        let command = AgentCommand {
+            path: python,
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+        };
+        let cwd = std::env::temp_dir();
+        let thread =
+            cx.new(|cx| AgentThread::start("Mock".into(), Task::ready(Ok(command)), cwd, cx));
+
+        let wait_until = |cx: &mut gpui::TestAppContext, done: &dyn Fn(&AgentThread) -> bool| {
+            for _ in 0..500 {
+                cx.run_until_parked();
+                if thread.read_with(cx, |thread, _| done(thread)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let status = thread.read_with(cx, |thread, _| thread.status().clone());
+            panic!("timed out; status {status:?}");
+        };
+
+        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
+        thread.update(cx, |thread, cx| thread.send("hello".into(), cx));
+        wait_until(cx, &|thread| {
+            !thread.is_working() && thread.entries().len() >= 3
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries()[0], Entry::UserMessage("hello".into()));
+            assert_eq!(thread.entries()[1], Entry::AgentMessage("Echo: hello".into()));
+            assert!(matches!(&thread.entries()[2], Entry::ToolCall(call) if call.title == "Read README.md"));
+            assert_eq!(thread.last_stop_reason(), Some(&acp::StopReason::EndTurn));
+        });
+
+        thread.update(cx, |thread, cx| thread.send("permission".into(), cx));
+        let tool_call_id = acp::ToolCallId::new("call-2");
+        wait_until(cx, &|thread| {
+            thread.permission_request(&tool_call_id).is_some()
+        });
+        thread.update(cx, |thread, cx| {
+            let request = thread.permission_request(&tool_call_id).expect("request");
+            assert_eq!(request.options.len(), 2);
+            let allow = request.options[0].id.clone();
+            thread.respond_to_permission(&tool_call_id, allow, cx);
+        });
+        wait_until(cx, &|thread| !thread.is_working());
+        thread.read_with(cx, |thread, _| {
+            let last_message = thread.entries().iter().rev().find_map(|entry| match entry {
+                Entry::AgentMessage(text) => Some(text.clone()),
+                _ => None,
+            });
+            assert_eq!(
+                last_message.as_deref(),
+                Some("Echo: permission (chose allow)")
+            );
+        });
+    }
+
+    fn which_python() -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+    }
+
+    #[gpui::test]
+    fn streams_updates_into_entries(cx: &mut gpui::TestAppContext) {
+        let thread = cx.new(|_| AgentThread::failed("Test".into(), "not started"));
+        thread.update(cx, |thread, cx| {
+            let chunk = |text: &str| {
+                acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
+            };
+            thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("Hel")));
+            thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("lo")));
+            thread.apply_update(acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("call-1", "Read src/main.rs").kind(acp::ToolKind::Read),
+            ));
+            thread.apply_update(acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new(
+                    "call-1",
+                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                ),
+            ));
+            thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("Done")));
+            cx.notify();
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.entries().len(), 3);
+            assert_eq!(thread.entries()[0], Entry::AgentMessage("Hello".into()));
+            match &thread.entries()[1] {
+                Entry::ToolCall(tool_call) => {
+                    assert_eq!(tool_call.title, "Read src/main.rs");
+                    assert_eq!(tool_call.status, acp::ToolCallStatus::Completed);
+                }
+                other => panic!("expected a tool call, got {other:?}"),
+            }
+            assert_eq!(thread.entries()[2], Entry::AgentMessage("Done".into()));
+        });
+    }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "agent_thread"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/agent_thread.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-client-protocol.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+log.workspace = true
+registry.workspace = true
+smol.workspace = true
+util.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

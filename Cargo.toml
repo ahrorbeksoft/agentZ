@@ -19,6 +19,7 @@ members = [
     "crates/http_client",
     "crates/http_client_tls",
     "crates/icons",
+    "crates/markdown",
     "crates/menu",
     "crates/path",
     "crates/refineable",
@@ -35,11 +36,13 @@ members = [
     "crates/ztracing",
     "crates/ztracing_macro",
     "tooling/perf",
+    "crates/agent_thread",
     "crates/app",
     "crates/paths",
     "crates/projects",
     "crates/registry",
     "crates/reqwest_client",
+    "crates/rope",
     "crates/settings_macros",
     "crates/text_input",
     "crates/theme_json",
@@ -56,6 +59,7 @@ edition = "2024"
 # Workspace member crates
 #
 
+agent_thread = { path = "crates/agent_thread" }
 assets = { path = "crates/assets" }
 bench_metrics = { path = "crates/bench_metrics" }
 collections = { path = "crates/collections", version = "0.1.0" }
@@ -76,6 +80,7 @@ gpui_windows = { path = "crates/gpui_windows", default-features = false }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
 icons = { path = "crates/icons" }
+markdown = { path = "crates/markdown" }
 menu = { path = "crates/menu" }
 path = { path = "crates/path" }
 perf = { path = "tooling/perf" }
@@ -88,6 +93,7 @@ paths = { path = "crates/paths" }
 projects = { path = "crates/projects" }
 registry = { path = "crates/registry" }
 reqwest_client = { path = "crates/reqwest_client" }
+rope = { path = "crates/rope" }
 settings_macros = { path = "crates/settings_macros" }
 text_input = { path = "crates/text_input" }
 theme = { path = "crates/theme" }

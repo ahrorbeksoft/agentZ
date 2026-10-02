@@ -242,6 +242,19 @@ impl ProjectStore {
         Some(id)
     }
 
+    pub fn thread(&self, id: ThreadId) -> Option<&Thread> {
+        self.threads.iter().find(|thread| thread.id == id)
+    }
+
+    pub fn rename_thread(&mut self, id: ThreadId, title: String, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.title != title
+        {
+            thread.title = title;
+            self.changed(cx);
+        }
+    }
+
     pub fn is_thread_working(&self, id: ThreadId) -> bool {
         self.working_threads.contains(&id)
     }
