@@ -5,7 +5,7 @@ The goal is a herdr-like experience in agentZ:
 - Agents keep working after the app quits, and the app reattaches to them.
 - The sidebar shows which threads need you.
 - Agents can manage other agents (threads, subthreads, archive, …) through MCP or a CLI.
-- Threads can work in their own git worktree, or an instant copy-on-write copy (cow).
+- Threads can work in their own git worktree, or an instant copy-on-write pasture (cow).
 - Diffs show what each turn changed.
 - Real terminals run agents' own CLIs.
 - Other machines are reached over SSH, all in one window. The same repository on several machines
@@ -262,40 +262,40 @@ t3code's checkpoints:
   conversation, so t3code starts a fresh session after a rollback.
 - Projects that aren't git repositories get no checkpoints, and the panel says so.
 
-### Worktrees and copies
+### Worktrees and pastures
 
 t3code's workspace model, with herdr's folder layout and removal, plus cow's copy-on-write
-copies.
+pastures.
 
 **A thread runs in a workspace**, one of:
 
 - the project's own checkout;
 - a **worktree**: a `git worktree` on its own branch, sharing the project's `.git`;
-- a **copy** (cow's "pasture"): an instant copy-on-write clone of the whole project folder,
+- a **pasture** (cow's name): an instant copy-on-write clone of the whole project folder,
   `.git` included, on its own branch.
 
 Details:
 
 - The thread stores its workspace kind, path and branch. Its ACP session's `cwd` is the
   workspace.
-- Workspaces stay part of their project and are never separate projects. Copies keep the same
+- Workspaces stay part of their project and are never separate projects. Pastures keep the same
   remotes, so t3code's grouping treats them as the same repository.
 - Projects that aren't git repositories only have their own checkout.
 
-**Why copies** (cow's README):
+**Why pastures** (cow's README):
 
 - A worktree checks out tracked files only. It has no `node_modules`, `.env` or build caches, so
   every new one needs an install and a build.
-- A copy is made with APFS `clonefile(2)` in one syscall. A 2 GB repository copies in about
+- A pasture is made with APFS `clonefile(2)` in one syscall. A 2 GB repository copies in about
   130 ms, and only modified blocks use disk. Dependencies, `.env` and caches are there
   immediately.
 
 **Choosing it.** New Thread gets a last step, **Workspace** (t3code's workspace menu):
 
 - **Current checkout**, the default;
-- **New copy** or **New worktree**, from a base branch (the checkout's current branch unless
+- **New pasture** or **New worktree**, from a base branch (the checkout's current branch unless
   changed);
-- an existing worktree or copy of this project.
+- an existing worktree or pasture of this project.
 
 A thread's menu also offers **New thread in this workspace**.
 
@@ -309,16 +309,16 @@ A thread's menu also offers **New thread in this workspace**.
 - Submodules are initialized recursively, as in t3code.
 - t3code's per-project setup scripts (`t3.json`) are not planned.
 
-**Creating a copy** ports cow's `create` (MIT, `references/cow/src/commands/create.rs`):
+**Creating a pasture** ports cow's `create` (MIT, `references/cow/src/commands/create.rs`):
 
-1. **Clone the folder** to `<data dir>/copies/<repo>/<branch>`.
+1. **Clone the folder** to `<data dir>/pastures/<repo>/<branch>`.
    - On macOS, `clonefile(2)` on the whole folder.
    - cow skips build-output folders (`target`, `.build`, `DerivedData`, `.turbo`) by cloning
      around them. Their copies would go stale as soon as the source rebuilt.
    - On Linux, `cp --reflink=always` (btrfs, xfs). If the filesystem can't do that, cow falls
      back to a full copy with a warning. agentZ instead offers only worktrees on that machine,
      because a full copy of a large repository isn't cheap.
-2. **Fix git** in the copy:
+2. **Fix git** in the pasture:
    - delete the `.git/worktrees` entries inherited from the source;
    - set `checkout.guess false`;
    - check out the branch, or create it from the base.
@@ -326,7 +326,7 @@ A thread's menu also offers **New thread in this workspace**.
    - remove `*.pid`, `*.sock` and `*.socket`;
    - honor a repository's `.cow.json` `post_clone` (`remove` patterns, then `run` commands), so
      repositories set up for cow work the same.
-4. **Undo on failure:** if any step fails, remove the partial copy.
+4. **Undo on failure:** if any step fails, remove the partial pasture.
 
 Left out of cow, at least at first:
 
@@ -334,17 +334,17 @@ Left out of cow, at least at first:
   and its `materialise` undo. cow does it to save time on huge trees, and its own docs note it
   breaks some bundlers, like Turbopack.
 - **jj support.**
-- **The AGENTS.md / CLAUDE.md orientation files** cow writes into each copy. agentZ's
+- **The AGENTS.md / CLAUDE.md orientation files** cow writes into each pasture. agentZ's
   `agentz_workspace_status` tool gives agents that context instead.
 
-**Bringing work back from a copy.** A copy has its own `.git`, so its commits must be moved
+**Bringing work back from a pasture.** A pasture has its own `.git`, so its commits must be moved
 explicitly. These are cow's `sync` and `extract`, offered in the thread's menu and as tools:
 
 - **Sync from project:** fetch a branch from the project's checkout through a temporary remote,
   then rebase onto it (or merge). On conflicts, abort the rebase and report the conflicted
   files.
-- **Bring branch to project:** create the copy's branch in the project's checkout at the copy's
-  `HEAD`, ready to review and push from there.
+- **Bring branch to project:** create the pasture's branch in the project's checkout at the
+  pasture's `HEAD`, ready to review and push from there.
 
 Worktrees share `.git` with the project, so their branches are already there.
 
@@ -353,41 +353,41 @@ Worktrees share `.git` with the project, so their branches are already there.
 - Thread cards show the thread's own branch: the workspace's branch, or the checkout's. This
   replaces "only the project's current branch" from the backlog.
 - The details popover shows the workspace kind and folder.
-- **Project Settings › Checkouts** lists the project's worktrees and copies.
+- **Project Settings › Checkouts** lists the project's worktrees and pastures.
 
 **Removing.** Deleting or archiving a thread never deletes its workspace.
 
 - Remove a workspace from Project Settings › Checkouts.
   - A worktree uses `git worktree remove`. If git refuses because of changed or untracked files,
     agentZ asks again before forcing it.
-  - A copy warns about uncommitted changes and unpushed commits, then deletes the folder (cow's
+  - A pasture warns about uncommitted changes and unpushed commits, then deletes the folder (cow's
     `remove`).
 - Branches are kept (herdr).
 - A workspace in use by a running thread or terminal can't be removed.
 - Automatic cleanup policies come later, if wanted. Examples: t3code's inactive-days and
   merged rules, and cow's `gc` for branches already pushed or merged.
 
-**Agent control** (t3code's tools, renamed from worktree to workspace because of copies):
+**Agent control** (t3code's tools, renamed from worktree to workspace because of pastures):
 
 - `agentz_workspace_status`: the thread's workspace kind, folder, branch, and the project root.
-- `agentz_workspace_list`: the repository's branches and their worktrees and copies.
-- `agentz_workspace_handoff`: move the calling thread into a new worktree or copy. With an
+- `agentz_workspace_list`: the repository's branches and their worktrees and pastures.
+- `agentz_workspace_handoff`: move the calling thread into a new worktree or pasture. With an
   optional `continuationPrompt`, the next turn starts there.
   - The ACP session has to be reopened in the new `cwd`. agentZ uses `session/load` with the new
     `cwd` when the agent supports it, otherwise a new session.
 - `agentz_workspace_sync` and `agentz_workspace_bring_back`: cow's `sync` and `extract
-  --branch`, for copies.
+  --branch`, for pastures.
 - `agentz_thread_launch` and `delegate_task` take a `workspaceStrategy`, as in t3code:
   - `root`, the default;
-  - `worktree` or `copy`, with `baseRef`;
+  - `worktree` or `pasture`, with `baseRef`;
   - `existing`, with a path.
 
-  So an agent can fan work out to subthreads, each in its own copy or worktree. cow's MCP has
+  So an agent can fan work out to subthreads, each in its own pasture or worktree. cow's MCP has
   the same tools for one agent at a time.
 
 **Elsewhere:**
 
-- **Diffs:** checkpoints work the same in a worktree or copy. Restoring files is only offered
+- **Diffs:** checkpoints work the same in a worktree or pasture. Restoring files is only offered
   for a thread in its own workspace, and refused when another thread or terminal uses that
   folder (t3code).
 - **Terminals:** the thread terminal drawer opens in the thread's workspace.
@@ -484,8 +484,8 @@ Worktrees share `.git` with the project, so their branches are already there.
 2. **Machine.** Only shown when the project is on more than one machine. The default is the
    machine last used for that project. Offline machines are listed but disabled.
 3. **Agent.** Agents installed on that machine.
-4. **Workspace.** Current checkout, new copy, new worktree, or an existing one (see Worktrees and
-   copies).
+4. **Workspace.** Current checkout, new pasture, new worktree, or an existing one (see Worktrees and
+   pastures).
 
 **UI** (t3code):
 
@@ -521,11 +521,11 @@ Each phase ships on its own, keeps the app working, and is committed.
    - the Agents control;
    - permissions forwarded to the parent.
 5. **Diffs:** checkpoints, the diff panel, `agentz_thread_diff`.
-6. **Worktrees and copies:**
+6. **Worktrees and pastures:**
    - the thread workspace;
    - the Workspace step in New Thread;
-   - creating and removing worktrees and copies;
-   - syncing a copy, and bringing its branch back;
+   - creating and removing worktrees and pastures;
+   - syncing a pasture, and bringing its branch back;
    - branches on cards;
    - Checkouts in Project Settings;
    - the workspace tools.
@@ -558,15 +558,15 @@ need phase 3. Otherwise phases 3–8 and 9 can go in any order.
   - Test delegation, wait, cancel, archive and policy denials end to end, as t3code's
     integration test does.
 - **Diffs:** temporary git repositories with scripted edits between turns.
-- **Worktrees and copies:** temporary repositories:
-  - create, reuse and remove worktrees and copies;
+- **Worktrees and pastures:** temporary repositories:
+  - create, reuse and remove worktrees and pastures;
   - excluded build folders;
   - `.cow.json`;
   - sync with and without conflicts;
   - bringing a branch back;
   - refused removals;
   - a handoff with the mock agent.
-- Copy tests need APFS, which the temp directory on this Mac is. cow's tests are macOS-only for
+- Pasture tests need APFS, which the temp directory on this Mac is. cow's tests are macOS-only for
   the same reason.
 - **Proxy and reconnect:** run `agentz-server proxy` directly as the transport, with no SSH. Kill
   it to simulate a dropped connection.
