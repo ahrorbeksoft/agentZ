@@ -341,13 +341,9 @@ impl Sidebar {
         let is_working = self.store.read(cx).is_thread_working(thread.id);
         let thread_id = thread.id;
         let icon = self.agent_icon(&thread, cx);
-        let project_icon = self.render_project_icon(project.as_ref(), cx);
-        // With one project selected, its name on every card would be noise.
+        // With one project selected, every card would repeat it, so the project line goes and
+        // the status moves next to the title.
         let shows_all_projects = self.store.read(cx).scope() == ProjectScope::All;
-        let project_name = project
-            .as_ref()
-            .filter(|_| shows_all_projects)
-            .map(|project| project.name());
         let git_head = project
             .as_ref()
             .and_then(|project| self.project_info.get(&project.id))
@@ -396,12 +392,75 @@ impl Sidebar {
                 store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
             });
 
+        // The status yields to the Archive button on hover.
+        let status_slot = div()
+            .flex_none()
+            .when(!is_renaming, |this| {
+                this.group_hover(group_name.clone(), |this| this.invisible())
+            })
+            .child(status);
+        let archive_slot = (!is_renaming).then(|| {
+            // Centered on its line, like t3code's Settle button.
+            h_flex()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .visible_on_hover(group_name.clone())
+                .child(archive_button)
+        });
+        let title_element = if is_renaming {
+            self.render_rename_input(cx)
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    Label::new(title.clone())
+                        .weight(FontWeight::MEDIUM)
+                        .truncate(),
+                )
+                .into_any_element()
+        };
+        let (project_line, title_line) = if shows_all_projects {
+            let project_line = h_flex()
+                .relative()
+                .h_5()
+                .min_w_0()
+                .gap_1p5()
+                .child(self.render_project_icon(project.as_ref(), cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .children(project.as_ref().map(|project| {
+                            Label::new(project.name())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate()
+                        })),
+                )
+                .child(status_slot)
+                .children(archive_slot);
+            let title_line = h_flex().mt_1().min_w_0().child(title_element);
+            (Some(project_line), title_line)
+        } else {
+            let title_line = h_flex()
+                .relative()
+                .min_w_0()
+                .gap_1p5()
+                .child(title_element)
+                .child(status_slot)
+                .children(archive_slot);
+            (None, title_line)
+        };
+
         let card = v_flex()
             .id(("thread-card", thread.id.0))
-            .group(group_name.clone())
+            .group(group_name)
             .relative()
             .w_full()
-            .h(CARD_HEIGHT)
+            .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
             .px_2p5()
             .py_2()
             .rounded_md()
@@ -411,54 +470,8 @@ impl Sidebar {
                     .hover(|card| card.bg(hover_background))
                     .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
             })
-            .child(
-                h_flex()
-                    .relative()
-                    .h_5()
-                    .min_w_0()
-                    .gap_1p5()
-                    .child(project_icon)
-                    .child(div().flex_1().min_w_0().children(project_name.map(|name| {
-                        Label::new(name)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate()
-                    })))
-                    .child(
-                        // The status yields to the Archive button on hover.
-                        div()
-                            .flex_none()
-                            .when(!is_renaming, |this| {
-                                this.group_hover(group_name.clone(), |this| this.invisible())
-                            })
-                            .child(status),
-                    )
-                    .when(!is_renaming, |row| {
-                        row.child(
-                            // Centered on the project line, like t3code's Settle button.
-                            h_flex()
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .right_0()
-                                .visible_on_hover(group_name.clone())
-                                .child(archive_button),
-                        )
-                    }),
-            )
-            .child(h_flex().mt_1().min_w_0().child(if is_renaming {
-                self.render_rename_input(cx)
-            } else {
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        Label::new(title.clone())
-                            .weight(FontWeight::MEDIUM)
-                            .truncate(),
-                    )
-                    .into_any_element()
-            }))
+            .children(project_line)
+            .child(title_line)
             .child(
                 h_flex()
                     .mt_0p5()
