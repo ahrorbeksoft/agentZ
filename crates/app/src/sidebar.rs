@@ -993,7 +993,7 @@ impl Sidebar {
                     .child(self.render_project_icon(project.as_ref(), cx))
                     .child(
                         div().flex_1().min_w_0().child(
-                            Label::new(thread.title.clone())
+                            Label::new(thread.title)
                                 .truncate()
                                 .when(!is_highlighted && !is_active, |label| {
                                     label.color(Color::Muted)
