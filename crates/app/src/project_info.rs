@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{AnyElement, App, FontWeight, Hsla, img, rgb};
+use projects::{Project, ProjectIcon};
 use ui::{StyledImage as _, prelude::*};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -199,17 +200,41 @@ fn branch_from_head(head: &str) -> Option<String> {
     })
 }
 
-/// The project's favicon, or t3code's monogram tile when it has none or it fails to load.
+/// The icon picked in the project's settings, else its favicon, else t3code's monogram tile
+/// (also shown when an image fails to load).
 pub fn render_project_icon(
-    name: &str,
+    project: &Project,
     info: Option<&ProjectInfo>,
     size: Pixels,
     cx: &App,
 ) -> AnyElement {
-    let text = SharedString::from(monogram(name));
-    let color = monogram_color(name, cx.theme().appearance().is_light());
+    let name = project.name();
+    let is_light = cx.theme().appearance().is_light();
     let font_family = theme::theme_settings(cx).buffer_font(cx).family.clone();
-    match info.and_then(|info| info.favicon.clone()) {
+    let (text, color, image) = match &project.icon {
+        Some(ProjectIcon::Monogram { text, color }) => {
+            let color = MONOGRAM_COLORS
+                .iter()
+                .find(|(name, _, _)| name == color)
+                .map(|(_, light, dark)| rgb(if is_light { *light } else { *dark }).into())
+                .unwrap_or_else(|| monogram_color(&name, is_light));
+            let text: String = text.chars().take(2).collect();
+            return render_monogram(text.to_uppercase().into(), color, font_family, size)
+                .into_any_element();
+        }
+        Some(ProjectIcon::Image { path }) => (
+            monogram(&name),
+            monogram_color(&name, is_light),
+            Some(path.clone()),
+        ),
+        None => (
+            monogram(&name),
+            monogram_color(&name, is_light),
+            info.and_then(|info| info.favicon.clone()),
+        ),
+    };
+    let text = SharedString::from(text);
+    match image {
         Some(favicon) => img(favicon)
             .size(size)
             .flex_none()
@@ -280,33 +305,52 @@ fn monogram(name: &str) -> String {
 }
 
 /// t3code's project colors: Tailwind's 600 shades on light themes and 400 shades on dark ones.
-const MONOGRAM_COLORS: [(u32, u32); 18] = [
-    (0x4b5563, 0x9ca3af), // gray
-    (0xdc2626, 0xf87171), // red
-    (0xea580c, 0xfb923c), // orange
-    (0xd97706, 0xfbbf24), // amber
-    (0xca8a04, 0xfacc15), // yellow
-    (0x65a30d, 0xa3e635), // lime
-    (0x16a34a, 0x4ade80), // green
-    (0x059669, 0x34d399), // emerald
-    (0x0d9488, 0x2dd4bf), // teal
-    (0x0891b2, 0x22d3ee), // cyan
-    (0x0284c7, 0x38bdf8), // sky
-    (0x2563eb, 0x60a5fa), // blue
-    (0x4f46e5, 0x818cf8), // indigo
-    (0x7c3aed, 0xa78bfa), // violet
-    (0x9333ea, 0xc084fc), // purple
-    (0xc026d3, 0xe879f9), // fuchsia
-    (0xdb2777, 0xf472b6), // pink
-    (0xe11d48, 0xfb7185), // rose
+pub const MONOGRAM_COLORS: [(&str, u32, u32); 18] = [
+    ("gray", 0x4b5563, 0x9ca3af),
+    ("red", 0xdc2626, 0xf87171),
+    ("orange", 0xea580c, 0xfb923c),
+    ("amber", 0xd97706, 0xfbbf24),
+    ("yellow", 0xca8a04, 0xfacc15),
+    ("lime", 0x65a30d, 0xa3e635),
+    ("green", 0x16a34a, 0x4ade80),
+    ("emerald", 0x059669, 0x34d399),
+    ("teal", 0x0d9488, 0x2dd4bf),
+    ("cyan", 0x0891b2, 0x22d3ee),
+    ("sky", 0x0284c7, 0x38bdf8),
+    ("blue", 0x2563eb, 0x60a5fa),
+    ("indigo", 0x4f46e5, 0x818cf8),
+    ("violet", 0x7c3aed, 0xa78bfa),
+    ("purple", 0x9333ea, 0xc084fc),
+    ("fuchsia", 0xc026d3, 0xe879f9),
+    ("pink", 0xdb2777, 0xf472b6),
+    ("rose", 0xe11d48, 0xfb7185),
 ];
 
+/// The named color in the current theme's shade.
+pub fn monogram_swatch(light: u32, dark: u32, cx: &App) -> Hsla {
+    rgb(if cx.theme().appearance().is_light() {
+        light
+    } else {
+        dark
+    })
+    .into()
+}
+
 fn monogram_color(name: &str, is_light: bool) -> Hsla {
-    let (light, dark) = MONOGRAM_COLORS
+    let (_, light, dark) = MONOGRAM_COLORS
         .get(monogram_color_index(name))
         .copied()
-        .unwrap_or((0x2563eb, 0x60a5fa));
+        .unwrap_or(("blue", 0x2563eb, 0x60a5fa));
     rgb(if is_light { light } else { dark }).into()
+}
+
+/// The monogram and color name a project gets automatically, as a starting point for a
+/// custom one.
+pub fn automatic_monogram(name: &str) -> (String, &'static str) {
+    let color = MONOGRAM_COLORS
+        .get(monogram_color_index(name))
+        .map_or("blue", |(color, _, _)| color);
+    (monogram(name), color)
 }
 
 /// A stable color per project name, hashed the way t3code does.

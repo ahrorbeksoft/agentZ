@@ -24,12 +24,35 @@ pub struct ThreadId(pub u64);
 pub struct Project {
     pub id: ProjectId,
     pub path: PathBuf,
+    /// A name chosen in the project's settings, shown instead of the folder name.
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    /// An icon chosen in the project's settings, shown instead of the detected one.
+    #[serde(default)]
+    pub icon: Option<ProjectIcon>,
 }
 
 impl Project {
     pub fn name(&self) -> SharedString {
+        match &self.custom_name {
+            Some(name) => name.clone().into(),
+            None => self.folder_name(),
+        }
+    }
+
+    pub fn folder_name(&self) -> SharedString {
         project_name(&self.path)
     }
+}
+
+/// A project icon picked by the user, as in t3code's project settings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectIcon {
+    /// Up to two letters on a tile of the named color.
+    Monogram { text: String, color: String },
+    /// An image file anywhere on disk.
+    Image { path: PathBuf },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -278,12 +301,45 @@ impl ProjectStore {
             return existing.id;
         }
         let id = ProjectId(self.allocate_id());
-        self.projects.push(Project { id, path });
+        self.projects.push(Project {
+            id,
+            path,
+            custom_name: None,
+            icon: None,
+        });
         self.changed(cx);
         id
     }
 
     /// Removes the project from the list. Nothing on disk is touched.
+    /// Sets the project's display name; an empty name goes back to the folder name.
+    pub fn set_project_name(&mut self, id: ProjectId, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        let Some(project) = self.projects.iter_mut().find(|project| project.id == id) else {
+            return;
+        };
+        let custom_name =
+            (!name.is_empty() && *name != *project.folder_name()).then(|| name.to_string());
+        if project.custom_name != custom_name {
+            project.custom_name = custom_name;
+            self.changed(cx);
+        }
+    }
+
+    pub fn set_project_icon(
+        &mut self,
+        id: ProjectId,
+        icon: Option<ProjectIcon>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(project) = self.projects.iter_mut().find(|project| project.id == id)
+            && project.icon != icon
+        {
+            project.icon = icon;
+            self.changed(cx);
+        }
+    }
+
     pub fn remove_project(&mut self, id: ProjectId, cx: &mut Context<Self>) {
         let count_before = self.projects.len();
         self.projects.retain(|project| project.id != id);
@@ -570,6 +626,28 @@ mod tests {
             assert_eq!(store.thread(thread).map(|t| t.title.as_str()), Some("Mine"));
             store.delete_thread(thread, cx);
             assert!(store.thread(thread).is_none());
+        });
+
+        store.update(cx, |store, cx| {
+            store.set_project_name(first, "  Renamed ", cx);
+            assert_eq!(
+                store.project(first).map(|p| p.name()),
+                Some("Renamed".into())
+            );
+            store.set_project_name(first, "first", cx);
+            assert_eq!(
+                store.project(first).and_then(|p| p.custom_name.clone()),
+                None
+            );
+            let icon = ProjectIcon::Monogram {
+                text: "FI".into(),
+                color: "teal".into(),
+            };
+            store.set_project_icon(first, Some(icon.clone()), cx);
+            assert_eq!(
+                store.project(first).and_then(|p| p.icon.clone()),
+                Some(icon)
+            );
         });
 
         store.update(cx, |store, cx| store.remove_project(second, cx));

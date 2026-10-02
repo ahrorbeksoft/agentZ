@@ -15,7 +15,7 @@ use ui::{
 };
 
 use crate::project_info::{ProjectInfo, render_project_icon};
-use crate::{NewThread, OpenFolder};
+use crate::{NewThread, OpenFolder, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -328,12 +328,9 @@ impl Sidebar {
 
     fn render_project_icon(&self, project: Option<&Project>, cx: &App) -> AnyElement {
         match project {
-            Some(project) => render_project_icon(
-                &project.name(),
-                self.project_info.get(&project.id),
-                px(16.),
-                cx,
-            ),
+            Some(project) => {
+                render_project_icon(project, self.project_info.get(&project.id), px(16.), cx)
+            }
             None => div().size_4().flex_none().into_any_element(),
         }
     }
@@ -478,7 +475,7 @@ impl Sidebar {
         ThreadDetails {
             title: thread.title.clone().into(),
             project: project
-                .map(|project| (project.name(), self.project_info.get(&project.id).cloned())),
+                .map(|project| (project.clone(), self.project_info.get(&project.id).cloned())),
             branch: project
                 .and_then(|project| self.project_info.get(&project.id))
                 .and_then(|info| info.git_head.as_ref())
@@ -1022,13 +1019,28 @@ impl Render for Sidebar {
             } else {
                 self.render_empty_state().into_any_element()
             })
+            .child(
+                h_flex()
+                    .flex_none()
+                    .p_1()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        IconButton::new("open-settings", IconName::Settings)
+                            .icon_size(IconSize::Small)
+                            .tooltip(|_, cx| Tooltip::for_action("Settings", &OpenSettings, cx))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenSettings), cx)
+                            }),
+                    ),
+            )
     }
 }
 
 /// t3code's thread popover: the title, then the project, branch, and model with agent.
 struct ThreadDetails {
     title: SharedString,
-    project: Option<(SharedString, Option<ProjectInfo>)>,
+    project: Option<(Project, Option<ProjectInfo>)>,
     branch: Option<SharedString>,
     agent: Option<(Option<SharedString>, SharedString)>,
 }
@@ -1054,10 +1066,10 @@ impl ThreadDetails {
                 .into_any_element()
         };
         let mut rows = Vec::new();
-        if let Some((name, info)) = &self.project {
+        if let Some((project, info)) = &self.project {
             rows.push(detail_row(
-                render_project_icon(name, info.as_ref(), px(12.), cx),
-                Label::new(name.clone()).truncate(),
+                render_project_icon(project, info.as_ref(), px(12.), cx),
+                Label::new(project.name()).truncate(),
             ));
         }
         if let Some(branch) = &self.branch {

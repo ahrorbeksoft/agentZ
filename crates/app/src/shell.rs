@@ -10,10 +10,12 @@ use registry::{AgentId, AgentRegistryStore};
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 
 use crate::agent_view::{AgentView, AgentViewEvent};
+use crate::app_settings::AppSettingsStore;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_switcher::ProjectSwitcher;
+use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
-use crate::{NewThread, OpenFolder, ToggleProjectSwitcher};
+use crate::{NewThread, OpenFolder, OpenSettings, ToggleProjectSwitcher};
 
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 /// Leaves room for the macOS traffic lights.
@@ -33,6 +35,8 @@ pub struct Shell {
     sidebar: Entity<Sidebar>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
+    /// Shown in the main area in place of the thread while open.
+    settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadId, OpenThread>,
     active_thread: Option<ThreadId>,
     should_move_window: bool,
@@ -88,6 +92,10 @@ impl Shell {
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::OpenThread(thread_id) => this.open_thread(*thread_id, window, cx),
             }),
+            // With the theme mode set to System, the theme follows macOS's appearance.
+            cx.observe_window_appearance(window, |_, _, cx| {
+                AppSettingsStore::global(cx).update(cx, |store, cx| store.reapply_theme(cx));
+            }),
         ];
         Self {
             focus_handle: cx.focus_handle(),
@@ -96,6 +104,7 @@ impl Shell {
             sidebar,
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
+            settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
             should_move_window: false,
@@ -145,7 +154,39 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        let page = match &self.settings_page {
+            Some((page, _)) => page.clone(),
+            None => {
+                let page = cx.new(|cx| SettingsPage::new(self.store.clone(), cx));
+                let subscription =
+                    cx.subscribe_in(&page, window, |this, _, event, window, cx| match event {
+                        SettingsPageEvent::Close => this.close_settings(window, cx),
+                    });
+                self.settings_page = Some((page.clone(), subscription));
+                page
+            }
+        };
+        window.focus(&page.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_page.take().is_none() {
+            return;
+        }
+        match self
+            .active_thread
+            .and_then(|thread_id| self.open_threads.get(&thread_id))
+        {
+            Some(open_thread) => window.focus(&open_thread.view.focus_handle(cx), cx),
+            None => window.focus(&self.focus_handle, cx),
+        }
+        cx.notify();
+    }
+
     fn open_thread(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_page = None;
         if !self.open_threads.contains_key(&thread_id) {
             let Some(open_thread) = self.start_thread(thread_id, cx) else {
                 return;
@@ -392,6 +433,7 @@ impl Render for Shell {
         let background = cx.theme().colors().background;
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
+        let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
         let active_view = self
             .active_thread
             .and_then(|thread_id| self.open_threads.get(&thread_id))
@@ -403,6 +445,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_project_switcher))
             .on_action(cx.listener(Self::new_thread))
+            .on_action(cx.listener(Self::open_settings))
             .relative()
             .size_full()
             .bg(background)
@@ -421,9 +464,10 @@ impl Render for Shell {
                             .min_w(SIDEBAR_WIDTH)
                             .h_full()
                             .bg(main_background)
-                            .map(|main| match active_view {
-                                Some(view) => main.child(view),
-                                None => main.child(render_no_thread_selected()),
+                            .map(|main| match (settings_page, active_view) {
+                                (Some(page), _) => main.child(page),
+                                (None, Some(view)) => main.child(view),
+                                (None, None) => main.child(render_no_thread_selected()),
                             }),
                     ),
             )

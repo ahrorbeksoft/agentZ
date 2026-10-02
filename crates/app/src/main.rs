@@ -1,7 +1,9 @@
 mod agent_view;
+mod app_settings;
 mod new_thread_modal;
 mod project_info;
 mod project_switcher;
+mod settings_page;
 mod shell;
 mod sidebar;
 
@@ -17,9 +19,7 @@ use gpui::{
 use projects::ProjectStore;
 use registry::AgentRegistryStore;
 use reqwest_client::ReqwestClient;
-use theme::{
-    DEFAULT_DARK_THEME, GlobalTheme, LoadThemes, ThemeRegistry, ThemeSettingsProvider, UiDensity,
-};
+use theme::{LoadThemes, ThemeRegistry, ThemeSettingsProvider, UiDensity};
 use ui::prelude::*;
 
 use crate::shell::Shell;
@@ -35,6 +35,8 @@ actions!(
         ToggleProjectSwitcher,
         /// Starts a new thread in the selected project.
         NewThread,
+        /// Opens the settings page.
+        OpenSettings,
     ]
 );
 
@@ -72,10 +74,6 @@ fn init_theme(cx: &mut App) {
     theme::init(LoadThemes::All(Box::new(Assets)), cx);
     let registry = ThemeRegistry::global(cx);
     theme_json::load_bundled_themes(&registry);
-    match registry.get(DEFAULT_DARK_THEME) {
-        Ok(theme) => GlobalTheme::update_theme(cx, theme),
-        Err(error) => log::error!("{error:#}"),
-    }
     theme::set_theme_settings_provider(
         Box::new(AppThemeSettings {
             ui_font: gpui::font(UI_FONT_FAMILY),
@@ -83,6 +81,7 @@ fn init_theme(cx: &mut App) {
         }),
         cx,
     );
+    app_settings::init(cx);
 }
 
 fn init_actions(cx: &mut App) {
@@ -92,9 +91,14 @@ fn init_actions(cx: &mut App) {
         KeyBinding::new("secondary-o", OpenFolder, None),
         KeyBinding::new("secondary-alt-o", ToggleProjectSwitcher, None),
         KeyBinding::new("secondary-n", NewThread, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
     ]);
     cx.set_menus([
-        Menu::new("agentZ").items([MenuItem::action("Quit agentZ", Quit)]),
+        Menu::new("agentZ").items([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit agentZ", Quit),
+        ]),
         Menu::new("File").items([
             MenuItem::action("New Thread…", NewThread),
             MenuItem::action("Open Folder…", OpenFolder),
@@ -154,6 +158,7 @@ fn main() {
             new_thread_modal::init(cx);
             agent_view::init(cx);
             sidebar::init(cx);
+            settings_page::init(cx);
             projects::init(cx);
             let shell_environment_ready = load_shell_environment(cx);
             registry::init(http_client, shell_environment_ready, cx);

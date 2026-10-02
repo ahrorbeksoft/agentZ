@@ -26,6 +26,11 @@ pub fn state_file() -> PathBuf {
     data_dir().join("state.json")
 }
 
+/// App-wide preferences, such as the theme.
+pub fn settings_file() -> PathBuf {
+    data_dir().join("settings.json")
+}
+
 /// Agents installed from the ACP registry, and the cached registry index.
 pub fn registry_dir() -> PathBuf {
     data_dir().join("agents").join("registry")

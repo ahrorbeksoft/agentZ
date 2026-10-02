@@ -32,9 +32,12 @@ gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 log.workspace = true
 markdown.workspace = true
 menu.workspace = true
+paths.workspace = true
 projects.workspace = true
 registry.workspace = true
 reqwest_client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 smol.workspace = true
 text_input.workspace = true
 theme.workspace = true
