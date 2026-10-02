@@ -7,12 +7,13 @@ use gpui::{
     KeyBinding, ScrollHandle, Subscription, Window,
 };
 use projects::{ProjectId, ThreadId};
-use registry::{AgentId, AgentRegistryStore, InstallState};
+use registry::{AgentId, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use ui::{ButtonLike, ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};
 
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::compact_path;
+use crate::registry_store::AgentRegistryStore;
 
 const KEY_CONTEXT: &str = "NewThreadModal";
 

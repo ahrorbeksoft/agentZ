@@ -14,12 +14,14 @@ use gpui::{
     Focusable, Hsla, KeyBinding, ScrollHandle, Subscription, Task, Window, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use registry::{AgentId, AgentRegistryStore};
+use registry::AgentId;
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     Callout, CommonAnimationExt as _, ContextMenu, Disclosure, IconPosition, PopoverMenu, Severity,
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
+
+use crate::registry_store::AgentRegistryStore;
 
 const KEY_CONTEXT: &str = "AgentComposer";
 

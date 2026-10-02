@@ -4,24 +4,26 @@
 //! Ported from Zed's `project::agent_registry_store` and the registry parts of
 //! `project::agent_server_store`, without Zed's settings and fs layers. npx agents run with
 //! the system's `node`/`npm`.
+//!
+//! Plain Rust on tokio, so the server can own it. Background work reports back as
+//! [`RegistryMessage`]s, which the store's owner passes to [`AgentRegistryStore::handle`].
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use futures::AsyncReadExt as _;
-use futures::channel::oneshot;
-use futures::future::{Shared, join_all};
-use gpui::{
-    App, AppContext as _, BackgroundExecutor, Context, Entity, FutureExt as _, Global,
-    SharedString, Task, TaskExt as _,
-};
+use futures::channel::{mpsc, oneshot};
+use futures::future::{BoxFuture, FutureExt as _, Shared, join_all};
+use gpui_shared_string::SharedString;
 use http_client::github::AssetKind;
 use http_client::{AsyncBody, HttpClient, StatusCode};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
+use tokio::task::JoinSet;
 use url::Url;
 use util::ResultExt as _;
 
@@ -147,74 +149,79 @@ pub struct AgentCommand {
 
 /// Resolves once the user's login-shell environment (and with it `PATH`) has been loaded, so
 /// `npm` and `node` can be found when the app was started from Finder.
-pub type ShellEnvironmentReady = Shared<Task<()>>;
+pub type ShellEnvironmentReady = Shared<BoxFuture<'static, ()>>;
 
-struct GlobalAgentRegistryStore(Entity<AgentRegistryStore>);
+/// Resolves to the command that starts an agent.
+pub type CommandFuture = BoxFuture<'static, Result<AgentCommand>>;
 
-impl Global for GlobalAgentRegistryStore {}
+/// The result of background work, for [`AgentRegistryStore::handle`].
+pub struct RegistryMessage(MessageKind);
+
+pub type RegistryInbox = mpsc::UnboundedReceiver<RegistryMessage>;
+
+enum MessageKind {
+    CacheLoaded(Result<(Option<Vec<RegistryAgent>>, HashMap<AgentId, SharedString>)>),
+    Refreshed {
+        agents: Result<Vec<RegistryAgent>>,
+        installed_versions: HashMap<AgentId, SharedString>,
+    },
+    Installed {
+        id: AgentId,
+        result: Result<()>,
+        installed_versions: HashMap<AgentId, SharedString>,
+    },
+    Uninstalled(HashMap<AgentId, SharedString>),
+}
 
 pub struct AgentRegistryStore {
+    runtime: tokio::runtime::Handle,
     http_client: Arc<dyn HttpClient>,
     shell_environment_ready: ShellEnvironmentReady,
     registry_dir: PathBuf,
     agents: Vec<RegistryAgent>,
     installed_versions: HashMap<AgentId, SharedString>,
-    installing: HashMap<AgentId, Task<()>>,
+    installing: HashSet<AgentId>,
     install_errors: HashMap<AgentId, SharedString>,
     is_fetching: bool,
     fetch_error: Option<SharedString>,
-    pending_refresh: Option<Task<()>>,
     last_refresh: Option<Instant>,
     /// Set once the agent list is known, from the cache or the network.
     has_loaded: bool,
-    loaded_waiters: Vec<oneshot::Sender<()>>,
-}
-
-pub fn init(
-    http_client: Arc<dyn HttpClient>,
-    shell_environment_ready: ShellEnvironmentReady,
-    cx: &mut App,
-) {
-    let store = cx.new(|cx| {
-        AgentRegistryStore::new(
-            http_client,
-            shell_environment_ready,
-            paths::registry_dir(),
-            cx,
-        )
-    });
-    cx.set_global(GlobalAgentRegistryStore(store.clone()));
-    store.update(cx, |store, cx| store.refresh_if_stale(cx));
+    loaded_waiters: Vec<(AgentId, oneshot::Sender<CommandFuture>)>,
+    messages: mpsc::UnboundedSender<RegistryMessage>,
+    /// Dropping the store cancels its background work.
+    tasks: JoinSet<()>,
 }
 
 impl AgentRegistryStore {
-    pub fn global(cx: &App) -> Entity<Self> {
-        cx.global::<GlobalAgentRegistryStore>().0.clone()
-    }
-
-    fn new(
+    /// Creates the store and starts loading the cached registry. Pass what arrives on the
+    /// returned inbox to [`Self::handle`].
+    pub fn new(
+        runtime: tokio::runtime::Handle,
         http_client: Arc<dyn HttpClient>,
         shell_environment_ready: ShellEnvironmentReady,
         registry_dir: PathBuf,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    ) -> (Self, RegistryInbox) {
+        let (messages, inbox) = mpsc::unbounded();
         let mut store = Self {
+            runtime,
             http_client,
             shell_environment_ready,
             registry_dir,
             agents: Vec::new(),
             installed_versions: HashMap::default(),
-            installing: HashMap::default(),
+            installing: HashSet::default(),
             install_errors: HashMap::default(),
             is_fetching: false,
             fetch_error: None,
-            pending_refresh: None,
             last_refresh: None,
             has_loaded: false,
             loaded_waiters: Vec::new(),
+            messages,
+            tasks: JoinSet::new(),
         };
-        store.load_cached_registry(cx);
-        store
+        store.load_cached_registry();
+        (store, inbox)
     }
 
     pub fn agents(&self) -> &[RegistryAgent] {
@@ -234,7 +241,7 @@ impl AgentRegistryStore {
     }
 
     pub fn install_state(&self, id: &AgentId) -> InstallState {
-        if self.installing.contains_key(id) {
+        if self.installing.contains(id) {
             return InstallState::Installing;
         }
         if let Some(version) = self.installed_versions.get(id) {
@@ -253,29 +260,25 @@ impl AgentRegistryStore {
     }
 
     /// Fetches the latest registry from the network and updates the cache.
-    pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.pending_refresh.is_some() {
+    pub fn refresh(&mut self) {
+        if self.is_fetching {
             return;
         }
 
         self.is_fetching = true;
         self.fetch_error = None;
         self.last_refresh = Some(Instant::now());
-        cx.notify();
 
         let http_client = self.http_client.clone();
         let registry_dir = self.registry_dir.clone();
-        let executor = cx.background_executor().clone();
-
-        self.pending_refresh = Some(cx.spawn(async move |this, cx| {
-            let result = match fetch_registry_index(http_client.clone(), &executor).await {
+        self.spawn(async move {
+            let agents = match fetch_registry_index(http_client.clone()).await {
                 Ok(data) => {
                     build_registry_agents(
                         http_client,
                         registry_dir.clone(),
                         data.index,
                         Some(data.raw_body),
-                        &executor,
                     )
                     .await
                 }
@@ -284,162 +287,185 @@ impl AgentRegistryStore {
                     Err(error)
                 }
             };
-            let installed_versions = executor
-                .spawn(async move { scan_installed_versions(&registry_dir) })
-                .await;
-
-            this.update(cx, |this, cx| {
-                this.pending_refresh = None;
-                this.is_fetching = false;
-                match result {
-                    Ok(agents) => {
-                        this.agents = agents;
-                        this.fetch_error = None;
-                    }
-                    Err(error) => {
-                        this.fetch_error = Some(SharedString::from(format!("{error:#}")));
-                    }
-                }
-                this.set_installed_versions(installed_versions);
-                this.mark_loaded();
-                cx.notify();
-            })
-            .ok();
-        }));
+            let installed_versions = scan_installed_versions_in_background(registry_dir).await;
+            MessageKind::Refreshed {
+                agents,
+                installed_versions,
+            }
+        });
     }
 
     /// Refreshes at most once an hour.
-    pub fn refresh_if_stale(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_if_stale(&mut self) {
         let should_refresh = self
             .last_refresh
             .map(|last| last.elapsed() >= REFRESH_THROTTLE_DURATION)
             .unwrap_or(true);
         if should_refresh {
-            self.refresh(cx);
+            self.refresh();
         }
     }
 
     /// Installs (or updates to) the registry's current version of the agent.
-    pub fn install(&mut self, id: &AgentId, cx: &mut Context<Self>) {
-        if self.installing.contains_key(id) {
+    pub fn install(&mut self, id: &AgentId) {
+        if self.installing.contains(id) {
             return;
         }
         let Some(agent) = self.agent(id).cloned() else {
             return;
         };
         self.install_errors.remove(id);
+        self.installing.insert(id.clone());
 
         let http_client = self.http_client.clone();
         let registry_dir = self.registry_dir.clone();
         let shell_environment_ready = self.shell_environment_ready.clone();
-        let executor = cx.background_executor().clone();
         let id = id.clone();
-        let task = cx.spawn({
-            let id = id.clone();
-            async move |this, cx| {
-                shell_environment_ready.await;
-                let install_result = {
-                    let registry_dir = registry_dir.clone();
-                    executor
-                        .spawn(async move {
-                            install_agent(&agent, &registry_dir, http_client.as_ref()).await
-                        })
-                        .await
-                };
-                let installed_versions = executor
-                    .spawn(async move { scan_installed_versions(&registry_dir) })
-                    .await;
-
-                this.update(cx, |this, cx| {
-                    this.installing.remove(&id);
-                    if let Err(error) = install_result {
-                        log::error!("failed to install agent {id}: {error:#}");
-                        this.install_errors
-                            .insert(id.clone(), SharedString::from(format!("{error:#}")));
-                    }
-                    this.set_installed_versions(installed_versions);
-                    cx.notify();
-                })
-                .ok();
+        self.spawn(async move {
+            shell_environment_ready.await;
+            let result = install_agent(&agent, &registry_dir, http_client.as_ref()).await;
+            let installed_versions = scan_installed_versions_in_background(registry_dir).await;
+            MessageKind::Installed {
+                id,
+                result,
+                installed_versions,
             }
         });
-        self.installing.insert(id, task);
-        cx.notify();
     }
 
     /// Deletes an installed agent's files.
-    pub fn uninstall(&mut self, id: &AgentId, cx: &mut Context<Self>) {
-        if self.installing.contains_key(id) || !self.installed_versions.contains_key(id) {
+    pub fn uninstall(&mut self, id: &AgentId) {
+        if self.installing.contains(id) || !self.installed_versions.contains_key(id) {
             return;
         }
         let registry_dir = self.registry_dir.clone();
-        let executor = cx.background_executor().clone();
         let id = id.clone();
-        cx.spawn(async move |this, cx| {
-            let installed_versions = executor
-                .spawn(async move {
-                    // Binary agents live in `<id>/<version>`, npx agents in `npx/<id>`.
-                    for dir in [
-                        registry_dir.join(&*id.0),
-                        registry_dir.join(NPX_DIR_NAME).join(&*id.0),
-                    ] {
-                        if dir.exists() {
-                            std::fs::remove_dir_all(&dir)
-                                .with_context(|| format!("removing {}", dir.display()))
-                                .log_err();
-                        }
+        self.spawn(async move {
+            let installed_versions = tokio::task::spawn_blocking(move || {
+                // Binary agents live in `<id>/<version>`, npx agents in `npx/<id>`.
+                for dir in [
+                    registry_dir.join(&*id.0),
+                    registry_dir.join(NPX_DIR_NAME).join(&*id.0),
+                ] {
+                    if dir.exists() {
+                        std::fs::remove_dir_all(&dir)
+                            .with_context(|| format!("removing {}", dir.display()))
+                            .log_err();
                     }
-                    scan_installed_versions(&registry_dir)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.set_installed_versions(installed_versions);
-                cx.notify();
+                }
+                scan_installed_versions(&registry_dir)
             })
-            .ok();
-        })
-        .detach();
+            .await
+            .unwrap_or_default();
+            MessageKind::Uninstalled(installed_versions)
+        });
     }
 
     /// Builds the command that starts an installed agent.
-    pub fn command(&self, id: &AgentId, cx: &App) -> Task<Result<AgentCommand>> {
+    pub fn command(&self, id: &AgentId) -> CommandFuture {
         let Some(agent) = self.agent(id).cloned() else {
-            return Task::ready(Err(anyhow!("agent {id} is not in the registry")));
+            return futures::future::ready(Err(anyhow!("agent {id} is not in the registry")))
+                .boxed();
         };
         let Some(installed_version) = self.installed_versions.get(id).cloned() else {
-            return Task::ready(Err(anyhow!("agent {id} is not installed")));
+            return futures::future::ready(Err(anyhow!("agent {id} is not installed"))).boxed();
         };
         let registry_dir = self.registry_dir.clone();
         let shell_environment_ready = self.shell_environment_ready.clone();
-        cx.background_spawn(async move {
+        async move {
             shell_environment_ready.await;
             agent_command(&agent, &installed_version, &registry_dir)
-        })
+        }
+        .boxed()
     }
 
     /// Like [`Self::command`], but waits until the agent list has loaded, so threads opened
     /// right after launch can still find their agent.
-    pub fn command_when_loaded(
-        &mut self,
-        id: &AgentId,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<AgentCommand>> {
+    pub fn command_when_loaded(&mut self, id: &AgentId) -> CommandFuture {
         if self.has_loaded {
-            return self.command(id, cx);
+            return self.command(id);
         }
         let (sender, receiver) = oneshot::channel();
-        self.loaded_waiters.push(sender);
-        let id = id.clone();
-        cx.spawn(async move |this, cx| {
-            receiver.await.ok();
-            this.update(cx, |this, cx| this.command(&id, cx))?.await
-        })
+        self.loaded_waiters.push((id.clone(), sender));
+        async move {
+            let command = receiver
+                .await
+                .map_err(|_| anyhow!("the agent registry closed before loading"))?;
+            command.await
+        }
+        .boxed()
+    }
+
+    /// Applies the result of background work.
+    pub fn handle(&mut self, message: RegistryMessage) {
+        match message.0 {
+            MessageKind::CacheLoaded(Err(error)) => {
+                log::error!("failed to load the cached registry: {error:#}")
+            }
+            MessageKind::CacheLoaded(Ok((agents, installed_versions))) => {
+                // A network refresh may have finished first; its list is newer.
+                if let Some(agents) = agents
+                    && self.agents.is_empty()
+                {
+                    self.agents = agents;
+                }
+                self.set_installed_versions(installed_versions);
+                if !self.agents.is_empty() {
+                    self.mark_loaded();
+                }
+            }
+            MessageKind::Refreshed {
+                agents,
+                installed_versions,
+            } => {
+                self.is_fetching = false;
+                match agents {
+                    Ok(agents) => {
+                        self.agents = agents;
+                        self.fetch_error = None;
+                    }
+                    Err(error) => {
+                        self.fetch_error = Some(SharedString::from(format!("{error:#}")));
+                    }
+                }
+                self.set_installed_versions(installed_versions);
+                self.mark_loaded();
+            }
+            MessageKind::Installed {
+                id,
+                result,
+                installed_versions,
+            } => {
+                self.installing.remove(&id);
+                if let Err(error) = result {
+                    log::error!("failed to install agent {id}: {error:#}");
+                    self.install_errors
+                        .insert(id, SharedString::from(format!("{error:#}")));
+                }
+                self.set_installed_versions(installed_versions);
+            }
+            MessageKind::Uninstalled(installed_versions) => {
+                self.set_installed_versions(installed_versions)
+            }
+        }
+    }
+
+    fn spawn(&mut self, work: impl Future<Output = MessageKind> + Send + 'static) {
+        while self.tasks.try_join_next().is_some() {}
+        let messages = self.messages.clone();
+        self.tasks.spawn_on(
+            async move {
+                let message = work.await;
+                messages.unbounded_send(RegistryMessage(message)).ok();
+            },
+            &self.runtime,
+        );
     }
 
     fn mark_loaded(&mut self) {
         self.has_loaded = true;
-        for waiter in self.loaded_waiters.drain(..) {
-            waiter.send(()).ok();
+        for (id, waiter) in std::mem::take(&mut self.loaded_waiters) {
+            waiter.send(self.command(&id)).ok();
         }
     }
 
@@ -450,15 +476,14 @@ impl AgentRegistryStore {
         self.installed_versions = installed_versions;
     }
 
-    fn load_cached_registry(&mut self, cx: &mut Context<Self>) {
+    fn load_cached_registry(&mut self) {
         let http_client = self.http_client.clone();
         let registry_dir = self.registry_dir.clone();
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| -> Result<()> {
-            let (bytes, installed_versions) = {
-                let registry_dir = registry_dir.clone();
-                executor
-                    .spawn(async move {
+        self.spawn(async move {
+            let result = async {
+                let (bytes, installed_versions) = {
+                    let registry_dir = registry_dir.clone();
+                    tokio::task::spawn_blocking(move || {
                         let cache_path = registry_dir.join("registry.json");
                         let bytes = match std::fs::read(&cache_path) {
                             Ok(bytes) => Some(bytes),
@@ -470,38 +495,30 @@ impl AgentRegistryStore {
                         };
                         (bytes, scan_installed_versions(&registry_dir))
                     })
-                    .await
-            };
-
-            let agents = match bytes {
-                Some(bytes) => {
-                    let index: RegistryIndex =
-                        serde_json::from_slice(&bytes).context("parsing cached registry")?;
-                    Some(
-                        build_registry_agents(http_client, registry_dir, index, None, &executor)
-                            .await?,
-                    )
-                }
-                None => None,
-            };
-
-            this.update(cx, |this, cx| {
-                // A network refresh may have finished first; its list is newer.
-                if let Some(agents) = agents
-                    && this.agents.is_empty()
-                {
-                    this.agents = agents;
-                }
-                this.set_installed_versions(installed_versions);
-                if !this.agents.is_empty() {
-                    this.mark_loaded();
-                }
-                cx.notify();
-            })?;
-            Ok(())
-        })
-        .detach_and_log_err(cx);
+                    .await?
+                };
+                let agents = match bytes {
+                    Some(bytes) => {
+                        let index: RegistryIndex =
+                            serde_json::from_slice(&bytes).context("parsing cached registry")?;
+                        Some(build_registry_agents(http_client, registry_dir, index, None).await?)
+                    }
+                    None => None,
+                };
+                anyhow::Ok((agents, installed_versions))
+            }
+            .await;
+            MessageKind::CacheLoaded(result)
+        });
     }
+}
+
+async fn scan_installed_versions_in_background(
+    registry_dir: PathBuf,
+) -> HashMap<AgentId, SharedString> {
+    tokio::task::spawn_blocking(move || scan_installed_versions(&registry_dir))
+        .await
+        .unwrap_or_default()
 }
 
 struct RegistryFetchResult {
@@ -509,14 +526,10 @@ struct RegistryFetchResult {
     raw_body: Vec<u8>,
 }
 
-async fn fetch_registry_index(
-    http_client: Arc<dyn HttpClient>,
-    executor: &BackgroundExecutor,
-) -> Result<RegistryFetchResult> {
-    let (status, body) =
-        fetch_url_body(http_client, REGISTRY_URL, REGISTRY_FETCH_TIMEOUT, executor)
-            .await
-            .context("fetching ACP registry")?;
+async fn fetch_registry_index(http_client: Arc<dyn HttpClient>) -> Result<RegistryFetchResult> {
+    let (status, body) = fetch_url_body(http_client, REGISTRY_URL, REGISTRY_FETCH_TIMEOUT)
+        .await
+        .context("fetching ACP registry")?;
 
     if !status.is_success() {
         let text = String::from_utf8_lossy(body.as_slice());
@@ -540,27 +553,25 @@ async fn build_registry_agents(
     registry_dir: PathBuf,
     index: RegistryIndex,
     raw_body: Option<Vec<u8>>,
-    executor: &BackgroundExecutor,
 ) -> Result<Vec<RegistryAgent>> {
     let icons_dir = registry_dir.join("icons");
     let update_cache = raw_body.is_some();
     if let Some(raw_body) = raw_body {
         let registry_dir = registry_dir.clone();
-        executor
-            .spawn(async move {
-                std::fs::create_dir_all(registry_dir.join("icons"))
-                    .with_context(|| format!("creating {}", registry_dir.display()))?;
-                std::fs::write(registry_dir.join("registry.json"), raw_body)
-                    .context("writing registry cache")
-            })
-            .await?;
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(registry_dir.join("icons"))
+                .with_context(|| format!("creating {}", registry_dir.display()))?;
+            std::fs::write(registry_dir.join("registry.json"), raw_body)
+                .context("writing registry cache")
+        })
+        .await??;
     }
 
     let icon_paths = join_all(index.agents.iter().map(|entry| {
         let http_client = http_client.clone();
         let icons_dir = icons_dir.clone();
         async move {
-            resolve_icon_path(entry, &icons_dir, update_cache, http_client, executor)
+            resolve_icon_path(entry, &icons_dir, update_cache, http_client)
                 .await
                 .log_err()
                 .flatten()
@@ -648,7 +659,6 @@ async fn resolve_icon_path(
     icons_dir: &Path,
     update_cache: bool,
     http_client: Arc<dyn HttpClient>,
-    executor: &BackgroundExecutor,
 ) -> Result<Option<SharedString>> {
     let Some(icon_url) = resolve_icon_url(entry) else {
         return Ok(None);
@@ -657,13 +667,8 @@ async fn resolve_icon_path(
     let icon_path = icons_dir.join(format!("{}.svg", sanitize_path_component(&entry.id)));
     if update_cache && !icon_path.is_file() {
         let download = async {
-            let (status, body) = fetch_url_body(
-                http_client,
-                &icon_url,
-                REGISTRY_ICON_FETCH_TIMEOUT,
-                executor,
-            )
-            .await?;
+            let (status, body) =
+                fetch_url_body(http_client, &icon_url, REGISTRY_ICON_FETCH_TIMEOUT).await?;
             if !status.is_success() {
                 bail!("icon status error {}", status.as_u16());
             }
@@ -687,9 +692,8 @@ async fn fetch_url_body(
     http_client: Arc<dyn HttpClient>,
     url: &str,
     timeout: Duration,
-    executor: &BackgroundExecutor,
 ) -> Result<(StatusCode, Vec<u8>)> {
-    async {
+    let request = async {
         let mut response = http_client
             .get(url, AsyncBody::default(), true)
             .await
@@ -704,10 +708,8 @@ async fn fetch_url_body(
             .with_context(|| format!("reading response from {url}"))?;
 
         Ok((status, body))
-    }
-    .with_timeout(timeout, executor)
-    .await
-    .map_err(|_| {
+    };
+    tokio::time::timeout(timeout, request).await.map_err(|_| {
         anyhow!(
             "timed out after {}s while fetching {url}",
             timeout.as_secs()
@@ -935,7 +937,7 @@ async fn install_npx_agent(agent: &RegistryNpxAgent, registry_dir: &Path) -> Res
     }
 
     let (_, package_spec) = bounded_npm_package_spec(&agent.package);
-    let output = smol::process::Command::new(find_program("npm")?)
+    let output = tokio::process::Command::new(find_program("npm")?)
         .args([
             "install",
             package_spec.as_str(),
@@ -1196,6 +1198,7 @@ struct RegistryNpxDistribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
 
     const SAMPLE_INDEX: &str = r#"{
         "version": "1.0.0",
@@ -1332,6 +1335,47 @@ mod tests {
             read_package_executable(&package_dir).expect("executable"),
             package_dir.join("cli.js")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_loads_the_cache_and_keeps_it_when_a_refresh_fails() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("registry.json"), SAMPLE_INDEX).expect("write");
+        std::fs::create_dir_all(dir.path().join("binary-agent").join("0.9.0")).expect("mkdir");
+
+        let (mut store, mut inbox) = AgentRegistryStore::new(
+            tokio::runtime::Handle::current(),
+            Arc::new(http_client::BlockedHttpClient),
+            futures::future::ready(()).boxed().shared(),
+            dir.path().to_path_buf(),
+        );
+        let binary_agent = AgentId::new("binary-agent");
+        let command = store.command_when_loaded(&binary_agent);
+        assert_eq!(
+            store.install_state(&binary_agent),
+            InstallState::NotInstalled
+        );
+
+        let message = inbox.next().await.expect("cache message");
+        store.handle(message);
+        assert_eq!(store.agents().len(), 2);
+        assert_eq!(
+            store.install_state(&binary_agent),
+            InstallState::Installed {
+                version: "0.9.0".into(),
+                update_available: false,
+            }
+        );
+        let command = command.await.expect("command");
+        assert!(command.path.starts_with(dir.path().join("binary-agent")));
+
+        store.refresh();
+        assert!(store.is_fetching());
+        let message = inbox.next().await.expect("refresh message");
+        store.handle(message);
+        assert!(!store.is_fetching());
+        assert!(store.fetch_error().is_some());
+        assert_eq!(store.agents().len(), 2);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use gpui::{
     PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Window, actions,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadOrder};
-use registry::{AgentId, AgentRegistryStore, InstallState};
+use registry::{AgentId, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
@@ -24,6 +24,7 @@ use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfo, ProjectInfoStore, automatic_monogram, monogram_swatch,
     render_project_icon,
 };
+use crate::registry_store::AgentRegistryStore;
 use crate::shell::with_agent_env;
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
 
@@ -739,7 +740,7 @@ impl SettingsPage {
         }
         let agent_settings = self.app_settings.read(cx).agent(&id.0);
         let command = with_agent_env(
-            self.registry.read(cx).command(id, cx),
+            self.registry.read(cx).command(id),
             agent_settings.env.clone(),
             cx,
         );

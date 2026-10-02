@@ -7,7 +7,7 @@ use gpui::{
     KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, svg,
 };
 use projects::{Project, ProjectId, ProjectScope, Thread, ThreadId};
-use registry::{AgentId, AgentRegistryStore};
+use registry::AgentId;
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,
@@ -15,6 +15,7 @@ use ui::{
 };
 
 use crate::project_info::{ProjectInfo, ProjectInfoStore, render_project_icon};
+use crate::registry_store::AgentRegistryStore;
 use crate::{NewThread, OpenFolder, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.

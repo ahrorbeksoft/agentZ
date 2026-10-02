@@ -4,6 +4,7 @@ mod new_thread_modal;
 mod project_info;
 mod project_store;
 mod project_switcher;
+mod registry_store;
 mod settings_page;
 mod shell;
 mod sidebar;
@@ -12,13 +13,13 @@ use std::io::IsTerminal as _;
 use std::sync::Arc;
 
 use crate::project_store::ProjectStore;
+use crate::registry_store::AgentRegistryStore;
 use assets::Assets;
 use futures::FutureExt as _;
 use gpui::{
     App, Bounds, Focusable as _, Font, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions,
     WindowBounds, WindowOptions, actions, point, px, size,
 };
-use registry::AgentRegistryStore;
 use reqwest_client::ReqwestClient;
 use theme::{LoadThemes, ThemeRegistry, ThemeSettingsProvider, UiDensity};
 use ui::prelude::*;
@@ -126,6 +127,7 @@ fn load_shell_environment(cx: &App) -> registry::ShellEnvironmentReady {
                 log::error!("failed to load the login shell environment: {error:#}");
             }
         })
+        .boxed()
         .shared()
 }
 
@@ -163,7 +165,7 @@ fn main() {
             project_store::init(cx);
             project_info::init(cx);
             let shell_environment_ready = load_shell_environment(cx);
-            registry::init(http_client, shell_environment_ready, cx);
+            registry_store::init(http_client, shell_environment_ready, cx);
             init_actions(cx);
 
             let store = ProjectStore::global(cx);

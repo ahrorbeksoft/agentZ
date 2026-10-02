@@ -7,7 +7,7 @@ use gpui::{
     Subscription, Window, WindowControlArea,
 };
 use projects::{ProjectId, ProjectScope, ThreadId};
-use registry::{AgentId, AgentRegistryStore};
+use registry::AgentId;
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 
 use crate::agent_view::{AgentView, AgentViewEvent};
@@ -15,6 +15,7 @@ use crate::app_settings::AppSettingsStore;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
+use crate::registry_store::AgentRegistryStore;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::{NewThread, OpenFolder, OpenSettings, ToggleProjectSwitcher};
@@ -251,9 +252,9 @@ impl Shell {
             .map(|agent_id| AppSettingsStore::global(cx).read(cx).agent(&agent_id.0))
             .unwrap_or_default();
         let command = agent_id.as_ref().map(|agent_id| {
-            let command = self.registry.update(cx, |registry, cx| {
-                registry.command_when_loaded(agent_id, cx)
-            });
+            let command = self
+                .registry
+                .update(cx, |registry, _| registry.command_when_loaded(agent_id));
             with_agent_env(command, agent_settings.env.clone(), cx)
         });
 
@@ -654,10 +655,9 @@ fn render_no_thread_selected() -> impl IntoElement {
         )
 }
 
-/// The first line of the first prompt, shortened to fit the sidebar.
 /// Adds the agent's environment variables from its settings to its command.
 pub(crate) fn with_agent_env(
-    command: gpui::Task<anyhow::Result<registry::AgentCommand>>,
+    command: registry::CommandFuture,
     env: std::collections::BTreeMap<String, String>,
     cx: &App,
 ) -> gpui::Task<anyhow::Result<registry::AgentCommand>> {
@@ -668,6 +668,7 @@ pub(crate) fn with_agent_env(
     })
 }
 
+/// The first line of the first prompt, shortened to fit the sidebar.
 fn thread_title_from_prompt(prompt: &str) -> String {
     let first_line = prompt.lines().next().unwrap_or_default().trim();
     if first_line.chars().count() <= MAX_THREAD_TITLE_CHARS {

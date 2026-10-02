@@ -8,13 +8,13 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 1, step 1. Rewrite `projects` as plain Rust (no `Global`/`Context`), with the
-app wrapping it in a thin GPUI entity.
+**Next:** Phase 1, step 1. Rewrite `agent_thread` on tokio, with events on a channel and the app
+wrapping it in a thin GPUI entity, as `project_store` and `registry_store` do.
 
 | Phase | Status |
 |---|---|
 | 0. Spike | Done |
-| 1. Local server split | Not started |
+| 1. Local server split | In progress |
 | 2. Attention states and notifications | Not started |
 | 3. Agent control (MCP and CLI) | Not started |
 | 4. Subthreads | Not started |
@@ -50,8 +50,8 @@ read through `alacritty_terminal` without GPUI, and a minimal stdio MCP server.
 
 GPUI-free core first, with the app working throughout:
 
-- [ ] `projects`: plain structs, events on a channel, no `Global`/`Context`.
-- [ ] `registry`: tokio tasks and `tokio::process`, no GPUI.
+- [x] `projects`: plain structs, no `Global`/`Context`.
+- [x] `registry`: tokio tasks and `tokio::process`, no GPUI.
 - [ ] `agent_thread`: tokio tasks, events on a channel, `Arc<str>` for `SharedString`.
 - [ ] App: thin GPUI entities wrapping the core in-process, so the UI works as before.
 - [ ] Tests: plain async tests against the mock agent. All current tests still pass.
@@ -320,6 +320,17 @@ Then the server:
   - **`alacritty_terminal` needs no GPUI.** `tty::new`, `Term` and `EventLoop`, with a
     channel-backed `EventListener`, are enough. The event loop runs on its own thread.
 
+- 2026-10-03: How the core and the app fit together (phase 1, step 1):
+  - **`SharedString` stays.** `gpui_shared_string` is its own crate with no GPUI dependency,
+    so the core uses it as is. No `Arc<str>` conversion is needed.
+  - **`projects` needs no event channel.** Every change is a synchronous `&mut self` call, so
+    the store keeps a `revision()` counter instead. The app's `project_store::ProjectStore`
+    notifies when a call changes it. Saving is debounced on a plain thread.
+  - **`registry` reports background work as messages.** `AgentRegistryStore::new` takes a
+    tokio runtime handle and returns an inbox. The owner passes each message to `handle()`.
+    The app's `registry_store::AgentRegistryStore` pumps the inbox and notifies. The server
+    will do the same from its own loop. For now the app uses `reqwest_client`'s runtime.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -356,3 +367,5 @@ Then the server:
   user's request.
 - 2026-10-03: Finished phase 0 (8430863). The GPUI-free spike cross-builds for x86_64 musl and
   runs on `devbox1`, and the mock agent calls MCP tools. See Findings.
+- 2026-10-03: Phase 1: `projects` (86606b5) and `registry` are plain Rust, wrapped by GPUI
+  entities in the app.
