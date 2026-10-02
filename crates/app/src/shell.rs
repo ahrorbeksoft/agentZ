@@ -1,3 +1,4 @@
+use crate::project_store::ProjectStore;
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent};
 use collections::HashMap;
@@ -5,7 +6,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
     Subscription, Window, WindowControlArea,
 };
-use projects::{ProjectId, ProjectScope, ProjectStore, ThreadId};
+use projects::{ProjectId, ProjectScope, ThreadId};
 use registry::{AgentId, AgentRegistryStore};
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 

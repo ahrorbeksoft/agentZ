@@ -5559,9 +5559,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
- "gpui",
+ "gpui_shared_string",
  "log",
- "paths",
  "serde",
  "serde_json",
  "tempfile",

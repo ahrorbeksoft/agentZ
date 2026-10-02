@@ -4,12 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::project_store::ProjectStore;
 use collections::HashMap;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, Global, Hsla, Subscription,
     Task, img, rgb,
 };
-use projects::{Project, ProjectIcon, ProjectId, ProjectStore};
+use projects::{Project, ProjectIcon, ProjectId};
 use ui::{StyledImage as _, prelude::*};
 
 #[derive(Clone, Debug, Default, PartialEq)]

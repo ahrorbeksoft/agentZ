@@ -1,11 +1,12 @@
 use std::time::{Duration, SystemTime};
 
+use crate::project_store::ProjectStore;
 use collections::HashMap;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
     KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, svg,
 };
-use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId};
+use projects::{Project, ProjectId, ProjectScope, Thread, ThreadId};
 use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{

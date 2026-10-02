@@ -15,13 +15,11 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
-gpui.workspace = true
+gpui_shared_string.workspace = true
 log.workspace = true
-paths.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 util.workspace = true
 
 [dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

@@ -2,6 +2,7 @@ mod agent_view;
 mod app_settings;
 mod new_thread_modal;
 mod project_info;
+mod project_store;
 mod project_switcher;
 mod settings_page;
 mod shell;
@@ -10,13 +11,13 @@ mod sidebar;
 use std::io::IsTerminal as _;
 use std::sync::Arc;
 
+use crate::project_store::ProjectStore;
 use assets::Assets;
 use futures::FutureExt as _;
 use gpui::{
     App, Bounds, Focusable as _, Font, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions,
     WindowBounds, WindowOptions, actions, point, px, size,
 };
-use projects::ProjectStore;
 use registry::AgentRegistryStore;
 use reqwest_client::ReqwestClient;
 use theme::{LoadThemes, ThemeRegistry, ThemeSettingsProvider, UiDensity};
@@ -159,7 +160,7 @@ fn main() {
             agent_view::init(cx);
             sidebar::init(cx);
             settings_page::init(cx);
-            projects::init(cx);
+            project_store::init(cx);
             project_info::init(cx);
             let shell_environment_ready = load_shell_environment(cx);
             registry::init(http_client, shell_environment_ready, cx);

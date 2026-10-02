@@ -1,11 +1,12 @@
 //! Starting a thread: pick the project (only when all projects are shown), then one of the
 //! installed agents. Installing agents lives in Settings › Agents.
 
+use crate::project_store::ProjectStore;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Window,
 };
-use projects::{ProjectId, ProjectStore, ThreadId};
+use projects::{ProjectId, ThreadId};
 use registry::{AgentId, AgentRegistryStore, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use ui::{ButtonLike, ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};

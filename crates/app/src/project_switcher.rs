@@ -3,11 +3,12 @@
 
 use std::rc::Rc;
 
+use crate::project_store::ProjectStore;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Window,
 };
-use projects::{ProjectId, ProjectScope, ProjectStore};
+use projects::{ProjectId, ProjectScope};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Divider, HighlightedLabel, KeyBinding as KeyBindingHint, ListItem, ListItemSpacing,

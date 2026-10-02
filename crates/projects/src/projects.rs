@@ -1,12 +1,16 @@
 //! The set of project folders the user has opened, their threads, and which of them the
 //! window is currently showing ("All projects" or a single project).
+//!
+//! Plain Rust with no UI framework, so the server can own it. Whoever owns the store learns of
+//! changes through [`ProjectStore::revision`].
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use collections::HashSet;
-use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
+use gpui_shared_string::SharedString;
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
 
@@ -112,7 +116,7 @@ impl ProjectScope {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
     next_id: u64,
@@ -139,25 +143,15 @@ pub struct ProjectStore {
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
-    state_path: Option<PathBuf>,
-    _save_task: Option<Task<()>>,
-}
-
-struct GlobalProjectStore(Entity<ProjectStore>);
-
-impl Global for GlobalProjectStore {}
-
-pub fn init(cx: &mut App) {
-    let store = cx.new(|_| ProjectStore::load(Some(paths::state_file())));
-    cx.set_global(GlobalProjectStore(store));
+    /// Counts changes, so the owner can tell whether a call changed anything.
+    revision: u64,
+    saver: Option<Saver>,
 }
 
 impl ProjectStore {
-    pub fn global(cx: &App) -> Entity<Self> {
-        cx.global::<GlobalProjectStore>().0.clone()
-    }
-
-    fn load(state_path: Option<PathBuf>) -> Self {
+    /// Loads the store from `state_path`, and saves every change back to it. With `None`,
+    /// nothing is read or saved.
+    pub fn load(state_path: Option<PathBuf>) -> Self {
         let state = state_path
             .as_deref()
             .and_then(|path| read_state(path).log_err())
@@ -175,8 +169,8 @@ impl ProjectStore {
             thread_order: state.thread_order,
             archived_expanded: state.archived_expanded,
             working_threads: HashSet::default(),
-            state_path,
-            _save_task: None,
+            revision: 0,
+            saver: state_path.map(Saver::new),
         };
         let highest_id = this
             .projects
@@ -195,6 +189,11 @@ impl ProjectStore {
             this.scope = ProjectScope::All;
         }
         this
+    }
+
+    /// Goes up by at least one with every change.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn projects(&self) -> &[Project] {
@@ -227,9 +226,9 @@ impl ProjectStore {
         self.archived_expanded
     }
 
-    pub fn toggle_archived_expanded(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_archived_expanded(&mut self) {
         self.archived_expanded = !self.archived_expanded;
-        self.changed(cx);
+        self.changed();
     }
 
     /// Unarchived threads of every visible project, in the current [`ThreadOrder`].
@@ -253,10 +252,10 @@ impl ProjectStore {
         self.thread_order
     }
 
-    pub fn set_thread_order(&mut self, order: ThreadOrder, cx: &mut Context<Self>) {
+    pub fn set_thread_order(&mut self, order: ThreadOrder) {
         if self.thread_order != order {
             self.thread_order = order;
-            self.changed(cx);
+            self.changed();
         }
     }
 
@@ -295,7 +294,7 @@ impl ProjectStore {
         projects.into_iter()
     }
 
-    pub fn set_scope(&mut self, scope: ProjectScope, cx: &mut Context<Self>) {
+    pub fn set_scope(&mut self, scope: ProjectScope) {
         if let ProjectScope::Project(id) = scope
             && self.project(id).is_none()
         {
@@ -303,12 +302,12 @@ impl ProjectStore {
         }
         if self.scope != scope {
             self.scope = scope;
-            self.changed(cx);
+            self.changed();
         }
     }
 
     /// Adds the folder at `path` (or finds it if it was already added) and returns its id.
-    pub fn add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) -> ProjectId {
+    pub fn add_project(&mut self, path: PathBuf) -> ProjectId {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(existing) = self.projects.iter().find(|project| project.path == path) {
             return existing.id;
@@ -320,13 +319,13 @@ impl ProjectStore {
             custom_name: None,
             icon: None,
         });
-        self.changed(cx);
+        self.changed();
         id
     }
 
     /// Removes the project from the list. Nothing on disk is touched.
     /// Sets the project's display name; an empty name goes back to the folder name.
-    pub fn set_project_name(&mut self, id: ProjectId, name: &str, cx: &mut Context<Self>) {
+    pub fn set_project_name(&mut self, id: ProjectId, name: &str) {
         let name = name.trim();
         let Some(project) = self.projects.iter_mut().find(|project| project.id == id) else {
             return;
@@ -335,25 +334,20 @@ impl ProjectStore {
             (!name.is_empty() && *name != *project.folder_name()).then(|| name.to_string());
         if project.custom_name != custom_name {
             project.custom_name = custom_name;
-            self.changed(cx);
+            self.changed();
         }
     }
 
-    pub fn set_project_icon(
-        &mut self,
-        id: ProjectId,
-        icon: Option<ProjectIcon>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_project_icon(&mut self, id: ProjectId, icon: Option<ProjectIcon>) {
         if let Some(project) = self.projects.iter_mut().find(|project| project.id == id)
             && project.icon != icon
         {
             project.icon = icon;
-            self.changed(cx);
+            self.changed();
         }
     }
 
-    pub fn remove_project(&mut self, id: ProjectId, cx: &mut Context<Self>) {
+    pub fn remove_project(&mut self, id: ProjectId) {
         let count_before = self.projects.len();
         self.projects.retain(|project| project.id != id);
         if self.projects.len() == count_before {
@@ -366,7 +360,7 @@ impl ProjectStore {
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
         }
-        self.changed(cx);
+        self.changed();
     }
 
     pub fn add_thread(
@@ -374,7 +368,6 @@ impl ProjectStore {
         project_id: ProjectId,
         title: impl Into<String>,
         agent_id: Option<String>,
-        cx: &mut Context<Self>,
     ) -> Option<ThreadId> {
         self.project(project_id)?;
         let id = ThreadId(self.allocate_id());
@@ -389,7 +382,7 @@ impl ProjectStore {
             has_custom_title: false,
             model: None,
         });
-        self.changed(cx);
+        self.changed();
         Some(id)
     }
 
@@ -413,71 +406,71 @@ impl ProjectStore {
         threads
     }
 
-    pub fn archive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+    pub fn archive_thread(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.archived_at.is_none()
         {
             thread.archived_at = Some(SystemTime::now());
             self.working_threads.remove(&id);
-            self.changed(cx);
+            self.changed();
         }
     }
 
-    pub fn unarchive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+    pub fn unarchive_thread(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.archived_at.is_some()
         {
             thread.archived_at = None;
-            self.changed(cx);
+            self.changed();
         }
     }
 
     /// Removes the thread for good.
-    pub fn delete_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+    pub fn delete_thread(&mut self, id: ThreadId) {
         let count_before = self.threads.len();
         self.threads.retain(|thread| thread.id != id);
         if self.threads.len() != count_before {
             self.working_threads.remove(&id);
-            self.changed(cx);
+            self.changed();
         }
     }
 
-    pub fn set_thread_session(&mut self, id: ThreadId, session_id: String, cx: &mut Context<Self>) {
+    pub fn set_thread_session(&mut self, id: ThreadId, session_id: String) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.session_id.as_deref() != Some(session_id.as_str())
         {
             thread.session_id = Some(session_id);
-            self.changed(cx);
+            self.changed();
         }
     }
 
-    pub fn set_thread_model(&mut self, id: ThreadId, model: String, cx: &mut Context<Self>) {
+    pub fn set_thread_model(&mut self, id: ThreadId, model: String) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.model.as_deref() != Some(model.as_str())
         {
             thread.model = Some(model);
-            self.changed(cx);
+            self.changed();
         }
     }
 
     /// Sets an automatic title (from the first prompt or the agent), unless the user renamed
     /// the thread.
-    pub fn rename_thread(&mut self, id: ThreadId, title: String, cx: &mut Context<Self>) {
+    pub fn rename_thread(&mut self, id: ThreadId, title: String) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && !thread.has_custom_title
             && thread.title != title
         {
             thread.title = title;
-            self.changed(cx);
+            self.changed();
         }
     }
 
     /// Sets a title chosen by the user.
-    pub fn set_custom_title(&mut self, id: ThreadId, title: String, cx: &mut Context<Self>) {
+    pub fn set_custom_title(&mut self, id: ThreadId, title: String) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.title = title;
             thread.has_custom_title = true;
-            self.changed(cx);
+            self.changed();
         }
     }
 
@@ -486,21 +479,21 @@ impl ProjectStore {
     }
 
     /// Marks whether the thread's agent is running; either change counts as activity.
-    pub fn set_thread_working(&mut self, id: ThreadId, working: bool, cx: &mut Context<Self>) {
+    pub fn set_thread_working(&mut self, id: ThreadId, working: bool) {
         let changed = if working {
             self.working_threads.insert(id)
         } else {
             self.working_threads.remove(&id)
         };
         if changed {
-            self.record_thread_activity(id, cx);
+            self.record_thread_activity(id);
         }
     }
 
-    pub fn record_thread_activity(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+    pub fn record_thread_activity(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.last_activity_at = Some(SystemTime::now());
-            self.changed(cx);
+            self.changed();
         }
     }
 
@@ -510,24 +503,71 @@ impl ProjectStore {
         id
     }
 
-    fn changed(&mut self, cx: &mut Context<Self>) {
-        cx.notify();
-        let Some(state_path) = self.state_path.clone() else {
+    fn changed(&mut self) {
+        self.revision += 1;
+        let Some(saver) = &self.saver else {
             return;
         };
-        let state = PersistedState {
+        saver.save(PersistedState {
             next_id: self.next_id,
             projects: self.projects.clone(),
             threads: self.threads.clone(),
             scope: self.scope,
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
-        };
-        let executor = cx.background_executor().clone();
-        self._save_task = Some(cx.background_spawn(async move {
-            executor.timer(SAVE_DEBOUNCE).await;
-            write_state(&state_path, &state).log_err();
-        }));
+        });
+    }
+}
+
+/// Writes the state on its own thread, once changes have paused for [`SAVE_DEBOUNCE`]. Dropping
+/// it writes any pending state before returning, so nothing is lost on quit.
+struct Saver {
+    sender: Option<mpsc::Sender<PersistedState>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Saver {
+    fn new(state_path: PathBuf) -> Self {
+        let (sender, receiver) = mpsc::channel::<PersistedState>();
+        let thread = std::thread::Builder::new()
+            .name("projects-saver".into())
+            .spawn(move || {
+                while let Ok(mut state) = receiver.recv() {
+                    loop {
+                        match receiver.recv_timeout(SAVE_DEBOUNCE) {
+                            Ok(newer) => state = newer,
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                write_state(&state_path, &state).log_err();
+                                return;
+                            }
+                        }
+                    }
+                    write_state(&state_path, &state).log_err();
+                }
+            })
+            .log_err();
+        Self {
+            sender: thread.is_some().then_some(sender),
+            thread,
+        }
+    }
+
+    fn save(&self, state: PersistedState) {
+        if let Some(sender) = &self.sender {
+            sender.send(state).log_err();
+        }
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            log::error!("the projects saver thread panicked");
+        }
     }
 }
 
@@ -568,10 +608,9 @@ fn write_state(path: &Path, state: &PersistedState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
 
-    #[gpui::test]
-    async fn adding_removing_and_scoping_projects(cx: &mut TestAppContext) {
+    #[test]
+    fn adding_removing_and_scoping_projects() {
         let dir = tempfile::tempdir().expect("temp dir");
         let state_path = dir.path().join("state.json");
         let first_folder = dir.path().join("first");
@@ -579,95 +618,93 @@ mod tests {
         std::fs::create_dir_all(&first_folder).expect("create first");
         std::fs::create_dir_all(&second_folder).expect("create second");
 
-        let store = cx.new(|_| ProjectStore::load(Some(state_path.clone())));
-        let (first, second) = store.update(cx, |store, cx| {
-            let first = store.add_project(first_folder.clone(), cx);
-            let second = store.add_project(second_folder.clone(), cx);
-            assert_eq!(store.add_project(first_folder.clone(), cx), first);
-            store.add_thread(first, "Fix login bug", None, cx);
-            store.set_scope(ProjectScope::Project(second), cx);
-            (first, second)
-        });
+        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let revision = store.revision();
+        let first = store.add_project(first_folder.clone());
+        let second = store.add_project(second_folder);
+        assert!(store.revision() > revision);
+        let revision = store.revision();
+        assert_eq!(store.add_project(first_folder), first);
+        assert_eq!(store.revision(), revision, "re-adding changes nothing");
+        store.add_thread(first, "Fix login bug", None);
+        store.set_scope(ProjectScope::Project(second));
 
-        store.read_with(cx, |store, _| {
-            assert_eq!(store.projects().len(), 2);
-            assert_eq!(store.thread_count(first), 1);
-            let visible: Vec<_> = store.visible_projects().map(|p| p.id).collect();
-            assert_eq!(visible, vec![second]);
-        });
+        assert_eq!(store.projects().len(), 2);
+        assert_eq!(store.thread_count(first), 1);
+        let visible: Vec<_> = store.visible_projects().map(|p| p.id).collect();
+        assert_eq!(visible, vec![second]);
 
-        cx.executor().advance_clock(SAVE_DEBOUNCE * 2);
-        cx.run_until_parked();
-        let reloaded = ProjectStore::load(Some(state_path.clone()));
-        assert_eq!(reloaded.projects().len(), 2);
-        assert_eq!(reloaded.scope(), ProjectScope::Project(second));
+        // Dropping the store writes what's pending.
+        drop(store);
+        let mut store = ProjectStore::load(Some(state_path));
+        assert_eq!(store.projects().len(), 2);
+        assert_eq!(store.scope(), ProjectScope::Project(second));
+        assert_eq!(store.project(first).map(|p| p.name()), Some("first".into()));
+
+        let older = store.add_thread(first, "Older", None).expect("thread");
+        let newer = store.add_thread(first, "Newer", None).expect("thread");
+        store.set_thread_order(ThreadOrder::LastActivity);
+        store.set_thread_working(older, true);
+        let order: Vec<_> = store.threads_for(first).map(|thread| thread.id).collect();
+        assert_eq!(order[0], older, "most recent activity first");
+        store.set_thread_order(ThreadOrder::Created);
+        let order: Vec<_> = store.threads_for(first).map(|thread| thread.id).collect();
+        assert_eq!(order[0], newer, "newest thread first");
+        store.set_thread_session(newer, "session-7".into());
         assert_eq!(
-            reloaded.project(first).map(|p| p.name()),
-            Some("first".into())
+            store
+                .thread(newer)
+                .and_then(|thread| thread.session_id.clone()),
+            Some("session-7".into())
         );
 
-        store.update(cx, |store, cx| {
-            let older = store.add_thread(first, "Older", None, cx).expect("thread");
-            let newer = store.add_thread(first, "Newer", None, cx).expect("thread");
-            store.set_thread_order(ThreadOrder::LastActivity, cx);
-            store.set_thread_working(older, true, cx);
-            let order: Vec<_> = store.threads_for(first).map(|thread| thread.id).collect();
-            assert_eq!(order[0], older, "most recent activity first");
-            store.set_thread_order(ThreadOrder::Created, cx);
-            let order: Vec<_> = store.threads_for(first).map(|thread| thread.id).collect();
-            assert_eq!(order[0], newer, "newest thread first");
-            store.set_thread_session(newer, "session-7".into(), cx);
-            assert_eq!(
-                store
-                    .thread(newer)
-                    .and_then(|thread| thread.session_id.clone()),
-                Some("session-7".into())
-            );
-        });
+        store.set_scope(ProjectScope::All);
+        let thread = store.add_thread(first, "To archive", None).expect("thread");
+        store.archive_thread(thread);
+        assert!(store.threads_for(first).all(|t| t.id != thread));
+        assert!(store.archived_threads().iter().any(|t| t.id == thread));
+        store.unarchive_thread(thread);
+        assert!(store.threads_for(first).any(|t| t.id == thread));
+        store.set_custom_title(thread, "Mine".into());
+        store.rename_thread(thread, "Automatic".into());
+        assert_eq!(store.thread(thread).map(|t| t.title.as_str()), Some("Mine"));
+        store.delete_thread(thread);
+        assert!(store.thread(thread).is_none());
 
-        store.update(cx, |store, cx| {
-            store.set_scope(ProjectScope::All, cx);
-            let thread = store
-                .add_thread(first, "To archive", None, cx)
-                .expect("thread");
-            store.archive_thread(thread, cx);
-            assert!(store.threads_for(first).all(|t| t.id != thread));
-            assert!(store.archived_threads().iter().any(|t| t.id == thread));
-            store.unarchive_thread(thread, cx);
-            assert!(store.threads_for(first).any(|t| t.id == thread));
-            store.set_custom_title(thread, "Mine".into(), cx);
-            store.rename_thread(thread, "Automatic".into(), cx);
-            assert_eq!(store.thread(thread).map(|t| t.title.as_str()), Some("Mine"));
-            store.delete_thread(thread, cx);
-            assert!(store.thread(thread).is_none());
-        });
+        store.set_project_name(first, "  Renamed ");
+        assert_eq!(
+            store.project(first).map(|p| p.name()),
+            Some("Renamed".into())
+        );
+        store.set_project_name(first, "first");
+        assert_eq!(
+            store.project(first).and_then(|p| p.custom_name.clone()),
+            None
+        );
+        let icon = ProjectIcon::Monogram {
+            text: "FI".into(),
+            color: "teal".into(),
+        };
+        store.set_project_icon(first, Some(icon.clone()));
+        assert_eq!(
+            store.project(first).and_then(|p| p.icon.clone()),
+            Some(icon)
+        );
 
-        store.update(cx, |store, cx| {
-            store.set_project_name(first, "  Renamed ", cx);
-            assert_eq!(
-                store.project(first).map(|p| p.name()),
-                Some("Renamed".into())
-            );
-            store.set_project_name(first, "first", cx);
-            assert_eq!(
-                store.project(first).and_then(|p| p.custom_name.clone()),
-                None
-            );
-            let icon = ProjectIcon::Monogram {
-                text: "FI".into(),
-                color: "teal".into(),
-            };
-            store.set_project_icon(first, Some(icon.clone()), cx);
-            assert_eq!(
-                store.project(first).and_then(|p| p.icon.clone()),
-                Some(icon)
-            );
-        });
+        store.remove_project(second);
+        assert_eq!(store.scope(), ProjectScope::All);
+        assert_eq!(store.projects().len(), 1);
+    }
 
-        store.update(cx, |store, cx| store.remove_project(second, cx));
-        store.read_with(cx, |store, _| {
-            assert_eq!(store.scope(), ProjectScope::All);
-            assert_eq!(store.projects().len(), 1);
-        });
+    #[test]
+    fn saves_after_changes_pause() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut store = ProjectStore::load(Some(state_path.clone()));
+        store.add_project(dir.path().to_path_buf());
+        assert!(!state_path.exists(), "saving waits for changes to pause");
+        std::thread::sleep(SAVE_DEBOUNCE * 3);
+        let saved = read_state(&state_path).expect("readable").expect("saved");
+        assert_eq!(saved.projects.len(), 1);
     }
 }

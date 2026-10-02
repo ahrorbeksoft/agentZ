@@ -1,12 +1,13 @@
 //! The settings page, laid out like t3code's: a list of sections on the left (General,
 //! Appearance, then one entry per project) and the chosen section's rows on the right.
 
+use crate::project_store::ProjectStore;
 use collections::HashMap;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Window, actions,
 };
-use projects::{Project, ProjectIcon, ProjectId, ProjectStore, ThreadOrder};
+use projects::{Project, ProjectIcon, ProjectId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
