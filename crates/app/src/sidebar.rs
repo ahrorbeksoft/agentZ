@@ -1060,6 +1060,7 @@ impl ThreadDetails {
             .px_2()
             .child(
                 v_flex()
+                    .min_w(px(220.))
                     .max_w(px(320.))
                     .gap_2()
                     .px_1()
