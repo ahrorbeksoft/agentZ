@@ -16,6 +16,8 @@ This file is for any agent continuing the work. Read it before changing anything
   "settle".
 - **herdr** (`references/herdr`, a read-only clone, gitignored, Apache-2.0) is the model for
   background servers, attention states, terminal panes and SSH machines. See the plan below.
+- **cow** (`references/cow`, a read-only clone, gitignored, MIT) is the model for copy-on-write
+  workspaces (instant APFS copies of a project for each thread).
 - **Don't invent extras.** Build what was asked, the way Zed or t3code does it. If neither has
   it, keep it minimal and say what you chose.
 
@@ -155,8 +157,8 @@ From Zed's guidelines, which this code follows:
 
 ## State of the work
 
-**Current project:** background servers, agent control (MCP/CLI), subthreads, diffs, worktrees,
-terminals and SSH machines. The design is in [`docs/plan.md`](docs/plan.md). Where it stands, and what to
+**Current project:** background servers, agent control (MCP/CLI), subthreads, diffs, worktrees
+and copies, terminals and SSH machines. The design is in [`docs/plan.md`](docs/plan.md). Where it stands, and what to
 do next, is in [`docs/progress.md`](docs/progress.md). Keep progress.md up to date as you work.
 
 Done:

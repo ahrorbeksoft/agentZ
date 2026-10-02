@@ -18,7 +18,7 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 3. Agent control (MCP and CLI) | Not started |
 | 4. Subthreads | Not started |
 | 5. Diffs | Not started |
-| 6. Worktrees | Not started |
+| 6. Worktrees and copies | Not started |
 | 7. Terminals | Not started |
 | 8. Terminal agent detection | Not started |
 | 9. Machines over SSH | Not started |
@@ -124,29 +124,41 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Diff panel: This turn / All changes, files and hunks, mark as viewed.
 - [ ] Tests with temporary repositories.
 
-## 6. Worktrees
+## 6. Worktrees and copies
 
-- [ ] Thread workspace in `projects`: worktree path and branch. The ACP session's `cwd` follows
-      it.
-- [ ] Server: create a worktree:
+- [ ] Thread workspace in `projects`: kind (checkout, worktree, copy), path and branch. The ACP
+      session's `cwd` follows it.
+- [ ] Server, worktrees:
   - [ ] `git worktree add -b agentz/<id> <data>/worktrees/<repo>/<branch> <base>`;
-  - [ ] recursive submodules;
-  - [ ] list the project's worktrees.
-- [ ] New Thread › Workspace: Current checkout / New worktree (base branch) / existing
-      worktree. Thread menu: New thread in this worktree.
-- [ ] Cards show the thread's own branch. The details popover shows the worktree folder.
+  - [ ] recursive submodules.
+- [ ] Server, copies (port of cow's `create`):
+  - [ ] `clonefile(2)` on macOS, skipping `target`, `.build`, `DerivedData`, `.turbo`;
+  - [ ] `cp --reflink=always` on Linux, or offer only worktrees there;
+  - [ ] git fixes: drop `.git/worktrees`, `checkout.guess false`, branch;
+  - [ ] cleanup: `*.pid`, `*.sock`, `*.socket`, plus `.cow.json` `post_clone`;
+  - [ ] roll back on failure.
+- [ ] Copies: sync from the project (temporary remote, rebase or merge, abort on conflict) and
+      bring the branch back to the project.
+- [ ] List the project's worktrees and copies.
+- [ ] New Thread › Workspace: Current checkout / New copy / New worktree (base branch) /
+      existing. Thread menu: New thread in this workspace, Sync, Bring branch to project.
+- [ ] Cards show the thread's own branch. The details popover shows the workspace kind and
+      folder.
 - [ ] Project Settings › Checkouts:
-  - [ ] list worktrees;
-  - [ ] remove with `git worktree remove`, asking again before forcing;
+  - [ ] list worktrees and copies;
+  - [ ] remove a worktree with `git worktree remove`, asking again before forcing;
+  - [ ] remove a copy, warning about uncommitted or unpushed work;
   - [ ] keep branches;
-  - [ ] refuse while the worktree is in use.
+  - [ ] refuse while the workspace is in use.
 - [ ] Tools:
-  - [ ] `agentz_worktree_status`, `agentz_worktree_list`;
-  - [ ] `agentz_worktree_handoff`, reopening the session with `session/load` in the new `cwd`
-        or a new session;
-  - [ ] `workspaceStrategy` on `agentz_thread_launch` and `delegate_task`.
-- [ ] Diffs: restoring files only for a thread in its own, unshared worktree.
-- [ ] Tests with temporary repositories.
+  - [ ] `agentz_workspace_status`, `agentz_workspace_list`;
+  - [ ] `agentz_workspace_handoff`, reopening the session with `session/load` in the new
+        `cwd` or a new session;
+  - [ ] `agentz_workspace_sync`, `agentz_workspace_bring_back`;
+  - [ ] `workspaceStrategy` (root, worktree, copy, existing) on `agentz_thread_launch` and
+        `delegate_task`.
+- [ ] Diffs: restoring files only for a thread in its own, unshared workspace.
+- [ ] Tests with temporary repositories (APFS for copies).
 
 ## 7. Terminals
 
@@ -222,6 +234,9 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 
 ## Open questions
 
+- **Default for new workspaces.** Should New Thread's workspace step suggest a copy (cow's
+  argument: instant, dependencies ready) or a worktree (t3code and herdr) when both are
+  possible? The plan offers both, with the current checkout as the default.
 - **"Same state" for merged projects.** t3code merges by repository only, whatever branch or
   commit each checkout is on. The plan copies that. Should agentZ also require the same branch
   or commit?
@@ -242,3 +257,6 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   - branches aren't compared.
 - 2026-10-03: Added worktrees (phase 6), from t3code's workspace model and herdr's layout and
   safe removal. Later phases are renumbered.
+- 2026-10-03: Read cow (cloned into `references/cow`, MIT). Added copy-on-write copies next to
+  worktrees in phase 6, with cow's sync and bring-back. Renamed the worktree tools to workspace
+  tools.
