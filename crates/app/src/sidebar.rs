@@ -99,7 +99,7 @@ impl Sidebar {
         v_flex()
             .w_full()
             .when(show_header, |group| {
-                group.child(self.render_project_header(project, threads.len(), is_collapsed, cx))
+                group.child(self.render_project_header(project, is_collapsed, cx))
             })
             .when(!is_collapsed, |group| {
                 let indent = if show_header { px(22.) } else { px(0.) };
@@ -125,7 +125,6 @@ impl Sidebar {
     fn render_project_header(
         &self,
         project: &Project,
-        thread_count: usize,
         is_collapsed: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -164,13 +163,6 @@ impl Sidebar {
                             .color(Color::Muted),
                     )
                     .child(div().flex_1().min_w_0().child(Label::new(name).truncate()))
-                    .when(thread_count > 0, |row| {
-                        row.child(
-                            Label::new(thread_count.to_string())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    })
                     .child(
                         // Stops the press from also toggling the group.
                         div()
