@@ -120,9 +120,27 @@ agent CLI in a terminal ─► agentz <command> --json ─unix socket─► agen
 Clients never substitute their own files, credentials or agents for the server's (t3code's
 rule).
 
-**The server is a headless GPUI app**, as Zed's `remote_server` is, using
-`gpui_platform::headless()`. `agent_thread`, `projects` and `registry` move into it with few
-changes. Headless GPUI builds for Linux without wayland or x11.
+**The server doesn't use GPUI.** Only the app draws, so only the app links GPUI. (Zed's
+`remote_server` runs GPUI headless instead. That was the first plan, rejected on 2026-10-03.)
+
+- **Why:** headless GPUI on Linux pulls in about 450 crates: fonts (`fontdb`,
+  `fontconfig-parser`), desktop portals (`ashpd`), text layout, images. That's a few hundred
+  more than the server needs. The cost is a bigger binary, slower cross-builds, and more C code
+  to cross-compile, on machines as small as `t3-home`.
+- **The core crates become plain Rust.** Today `agent_thread`, `projects` and `registry` (about
+  4,000 lines) are GPUI entities:
+  - `Context<Self>`, `cx.notify()` and `cx.emit()` become plain structs that publish events
+    on a channel subscribers listen to.
+  - `cx.spawn` and `Task` become tasks on **tokio**:
+    - `reqwest_client` already runs tokio, and herdr uses it.
+    - The current `smol::process` calls become `tokio::process`.
+  - `Global` stores become fields owned by the server.
+  - `SharedString` becomes `Arc<str>` or `String`.
+  - ACP handling, the registry logic, persistence and the mock agent stay as they are.
+- **Shared crates stay as they are.** `http_client`, `reqwest_client`, `util`, `paths` and
+  `collections` already work without GPUI. They only use the small `gpui_util`.
+- **In the app**, the client copies of projects and threads are GPUI entities, filled from the
+  protocol. `agent_view` and the rest of the UI keep reading them through `cx`.
 
 **The app is a client.** It connects to every enabled machine at once:
 
@@ -398,8 +416,11 @@ Worktrees share `.git` with the project, so their branches are already there.
 
 ### Terminals
 
-- **Server side:** a port of Zed's `terminal` crate (PTY plus `alacritty_terminal`), without
-  settings, tasks or workspace.
+- **Server side:** a GPUI-free port of the model in Zed's `terminal` crate:
+  - the PTY and `alacritty_terminal`'s `Term` and event loop;
+  - no settings, tasks, workspace or GPUI entity.
+
+  Zed's crate wraps these in a GPUI entity; the server uses them directly.
   - The server keeps the terminal running, and keeps its screen and scrollback, while nobody is
     watching.
   - t3code keeps 5,000 lines and 8 MiB.
@@ -408,7 +429,8 @@ Worktrees share `.git` with the project, so their branches are already there.
   - It renders a terminal content snapshot (cells, cursor, mode, selection) received from the
     server.
   - It sends keystrokes, paste, resize, scroll and selection back.
-  - Key-to-bytes mapping uses Zed's `mappings/`.
+  - Key-to-bytes mapping uses Zed's `mappings/`. It runs in the app, since it needs GPUI
+    keystrokes and the terminal mode from the snapshot.
 - **Streaming:** only for terminals a client is viewing (herdr's "surface interest"), throttled
   to frame rate. Background terminals still parse output, for detection.
 - **Where terminals appear:**
@@ -511,11 +533,18 @@ Worktrees share `.git` with the project, so their branches are already there.
 Each phase ships on its own, keeps the app working, and is committed.
 
 0. **Spike.** Prove the risky parts before building on them:
-   - headless GPUI cross-compiles to Linux musl via zigbuild;
+   - a GPUI-free binary with the server's real dependencies (tokio, `agent-client-protocol`,
+     `http_client`/`reqwest_client`, `alacritty_terminal`) cross-compiles to Linux musl via
+     zigbuild, and runs on `devbox1`;
    - `alacritty_terminal` builds here;
    - an ACP agent (the mock) accepts a stdio MCP server in `session/new`;
    - measure disk use.
-1. **Local server split.** Add the `agentz_protocol` and `agentz_server` crates.
+1. **Local server split.** Two steps, with the app working after each:
+   1. **GPUI-free core.** Rewrite `agent_thread`, `projects` and `registry` as plain Rust on
+      tokio. In the meantime, the app wraps them in thin GPUI entities in-process. Their tests
+      become plain async tests against the mock agent.
+   2. **Server.** Add the `agentz_protocol` and `agentz_server` crates, and move the core into the
+      server.
    - Move the stores and threads into the server.
    - In the app, the threads become client copies with the same API as `AgentThread`, so
      `agent_view` changes little.
@@ -591,6 +620,9 @@ need phase 3. Otherwise phases 3–8 and 9 can go in any order.
 
 ## Risks
 
+- **The GPUI-free rewrite of the core** is the first part of phase 1. It's plumbing, not logic,
+  but it touches every event and async call in about 4,000 lines. Keep the mock-agent tests
+  passing throughout.
 - **Phase 1 touches almost everything.** Thread state crossing a socket, reattach snapshots, and
   keeping `agent_view` unchanged. Keep tests green at every step.
 - **MCP support varies by agent.** Agents that ignore `mcpServers` get the CLI fallback through

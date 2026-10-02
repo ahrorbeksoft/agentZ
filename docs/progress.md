@@ -8,7 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 0. Check that headless GPUI cross-compiles to Linux musl with `cargo zigbuild`.
+**Next:** Phase 0. Check that a GPUI-free binary with the server's dependencies cross-compiles to
+Linux musl with `cargo zigbuild`.
 
 | Phase | Status |
 |---|---|
@@ -29,24 +30,36 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Check `df -h ~`. Install `zig` and `cargo-zigbuild`, and add the
       `x86_64-unknown-linux-musl` target. That's what both of the user's machines need;
       `aarch64-unknown-linux-musl` can wait.
-- [ ] Cross-build a minimal headless GPUI binary (`gpui_platform::headless()`) for Linux musl,
-      using `agent_thread`, `projects` and `registry`. Note the size and any crates that fail.
+- [ ] Cross-build a minimal GPUI-free binary for Linux musl with the server's real dependencies:
+      tokio, `agent-client-protocol`, `http_client`/`reqwest_client` (the C code in `ring`,
+      `aws-lc-sys` and `zstd-sys`), and `alacritty_terminal`. Note the size and any crates that
+      fail.
 - [ ] Build `alacritty_terminal` (Zed's pinned version) in the workspace. Spawn a PTY running
       `sh` and read the screen.
 - [ ] Have the mock agent receive a stdio MCP server in `session/new`, start it, and call a tool.
-- [ ] Copy the Linux binary to `devbox1` under `~/.agentz/spike/`, check that it starts
-      headless, then remove it.
+- [ ] Copy the Linux binary to `devbox1` under `~/.agentz/spike/`, check that it runs (for
+      example, an HTTPS request and spawning a process), then remove it.
 - [ ] Record the disk cost of the Linux target directories.
 - [ ] Decide on anything the spike changes, and update the plan.
 
 ## 1. Local server split
+
+GPUI-free core first, with the app working throughout:
+
+- [ ] `projects`: plain structs, events on a channel, no `Global`/`Context`.
+- [ ] `registry`: tokio tasks and `tokio::process`, no GPUI.
+- [ ] `agent_thread`: tokio tasks, events on a channel, `Arc<str>` for `SharedString`.
+- [ ] App: thin GPUI entities wrapping the core in-process, so the UI works as before.
+- [ ] Tests: plain async tests against the mock agent. All current tests still pass.
+
+Then the server:
 
 - [ ] `crates/agentz_protocol`:
   - [ ] framing and handshake (versions, machine id, OS/arch, capabilities);
   - [ ] request/response and subscription messages;
   - [ ] serde types for projects, threads, entries, tool calls, permissions, config options and
         states.
-- [ ] `crates/agentz_server`, a headless GPUI binary:
+- [ ] `crates/agentz_server`, a GPUI-free tokio binary:
   - [ ] socket listener in the data directory, with a pid file;
   - [ ] owns `ProjectStore`, `AgentRegistryStore`, `AppSettings` agent settings, and the
         `AgentThread`s;
@@ -260,6 +273,12 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   - **No Rust.** Building on the remote isn't an option, so we cross-build here.
   - **`t3-home` is small** (2 CPUs, 3.7 GB RAM). Keep the server light.
 
+- 2026-10-03: The server won't use GPUI. Headless GPUI on Linux pulls in about 450 crates
+  (fonts, portals, layout). `http_client`, `reqwest_client` and `agent-client-protocol` are
+  about 110 each, and `util`, `paths` and `collections` are already GPUI-free. Phase 1 starts by
+  rewriting `agent_thread`, `projects` and `registry` as plain Rust on tokio. `reqwest_client`
+  already runs tokio.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -292,3 +311,5 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - 2026-10-03: Checked `t3-home` and `devbox1` (read-only) and recorded them under Findings.
 - 2026-10-03: Corrected the plan: cow supports Linux (reflink, else a full copy with a warning).
   Pastures are offered there too, as in cow.
+- 2026-10-03: Switched the server from headless GPUI to a GPUI-free core on tokio, at the
+  user's request.
