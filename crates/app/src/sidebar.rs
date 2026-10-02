@@ -5,12 +5,11 @@ use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
     KeyBinding, PromptLevel, Subscription, Task, Window, anchored, deferred, svg,
 };
-use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId, ThreadOrder};
+use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId};
 use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
-    CommonAnimationExt as _, ContextMenu, ContextMenuEntry, IconPosition, PopoverMenu, Tooltip,
-    prelude::*, right_click_menu,
+    CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, prelude::*, right_click_menu,
 };
 
 use crate::project_info::{ProjectInfo, ProjectInfoStore, render_project_icon};
@@ -71,7 +70,7 @@ impl Sidebar {
         registry: Entity<AgentRegistryStore>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search = cx.new(|cx| TextInput::new("Search threads…", cx));
+        let search = cx.new(|cx| TextInput::new("Search…", cx));
         let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let subscriptions = vec![
             cx.subscribe(&rename_input, |this, _, _: &TextInputEvent, cx| {
@@ -198,7 +197,6 @@ impl Sidebar {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = !self.search_query(cx).is_empty();
-        let store = self.store.clone();
         h_flex()
             .h(px(40.))
             .flex_none()
@@ -223,40 +221,6 @@ impl Sidebar {
                         })),
                 )
             })
-            .child(
-                PopoverMenu::new("thread-order")
-                    .menu(move |window, cx| {
-                        let store = store.clone();
-                        let current = store.read(cx).thread_order();
-                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                            let mut menu = menu.header("Sort Threads");
-                            for (order, label) in [
-                                (ThreadOrder::LastActivity, "Latest Activity"),
-                                (ThreadOrder::Created, "Newest First"),
-                            ] {
-                                let store = store.clone();
-                                menu = menu.toggleable_entry(
-                                    label,
-                                    current == order,
-                                    IconPosition::End,
-                                    None,
-                                    move |_, cx| {
-                                        store.update(cx, |store, cx| {
-                                            store.set_thread_order(order, cx)
-                                        })
-                                    },
-                                );
-                            }
-                            menu
-                        }))
-                    })
-                    .trigger_with_tooltip(
-                        IconButton::new("thread-order-trigger", IconName::Filter)
-                            .icon_size(IconSize::Small),
-                        Tooltip::text("Sort Threads"),
-                    )
-                    .anchor(gpui::Anchor::TopRight),
-            )
             .child(
                 IconButton::new("sidebar-new-thread", IconName::Plus)
                     .icon_size(IconSize::Small)

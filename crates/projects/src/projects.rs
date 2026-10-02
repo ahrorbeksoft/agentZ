@@ -84,9 +84,9 @@ pub struct Thread {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadOrder {
     /// Most recent activity first.
-    #[default]
     LastActivity,
     /// Newest thread first.
+    #[default]
     Created,
 }
 
@@ -606,6 +606,7 @@ mod tests {
         store.update(cx, |store, cx| {
             let older = store.add_thread(first, "Older", None, cx).expect("thread");
             let newer = store.add_thread(first, "Newer", None, cx).expect("thread");
+            store.set_thread_order(ThreadOrder::LastActivity, cx);
             store.set_thread_working(older, true, cx);
             let order: Vec<_> = store.threads_for(first).map(|thread| thread.id).collect();
             assert_eq!(order[0], older, "most recent activity first");
