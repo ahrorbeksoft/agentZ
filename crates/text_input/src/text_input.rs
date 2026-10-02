@@ -4,13 +4,14 @@
 //! made to emit [`TextInputEvent`]s so owners can react to edits.
 
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, size,
+    ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, relative, size,
 };
 use theme::ActiveTheme as _;
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -34,6 +35,7 @@ actions!(
     ]
 );
 
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const KEY_CONTEXT: &str = "TextInput";
 
 pub fn init(cx: &mut App) {
@@ -73,6 +75,14 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// Whether the blinking cursor is in its visible phase.
+    cursor_visible: bool,
+    is_blinking: bool,
+    /// Invalidates pending blinks when blinking restarts or stops.
+    blink_epoch: usize,
+    /// Starts blinking when focus arrives from elsewhere (registered on first render, which is
+    /// the first time a window is at hand).
+    focus_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -89,6 +99,10 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            cursor_visible: true,
+            is_blinking: false,
+            blink_epoch: 0,
+            focus_subscription: None,
         }
     }
 
@@ -111,7 +125,7 @@ impl TextInput {
         self.selection_reversed = false;
         self.marked_range = None;
         cx.emit(TextInputEvent::Changed);
-        cx.notify();
+        self.pause_blinking(cx);
     }
 
     pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
@@ -238,7 +252,42 @@ impl TextInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
-        cx.notify()
+        self.pause_blinking(cx);
+    }
+
+    /// Like Zed's editor: the cursor stays solid while it's being moved or typed with, and
+    /// blinking resumes a blink interval later.
+    fn pause_blinking(&mut self, cx: &mut Context<Self>) {
+        self.cursor_visible = true;
+        self.is_blinking = false;
+        self.blink_epoch += 1;
+        cx.notify();
+    }
+
+    fn schedule_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.is_blinking = true;
+        self.blink_epoch += 1;
+        let epoch = self.blink_epoch;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(CURSOR_BLINK_INTERVAL).await;
+            this.update_in(cx, |this, window, cx| this.blink(epoch, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn blink(&mut self, epoch: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if epoch != self.blink_epoch {
+            return;
+        }
+        if !self.focus_handle.is_focused(window) {
+            self.cursor_visible = true;
+            self.is_blinking = false;
+            return;
+        }
+        self.cursor_visible = !self.cursor_visible;
+        cx.notify();
+        self.schedule_blink(window, cx);
     }
 
     fn cursor_offset(&self) -> usize {
@@ -277,7 +326,7 @@ impl TextInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
-        cx.notify()
+        self.pause_blinking(cx);
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
@@ -392,7 +441,7 @@ impl EntityInputHandler for TextInput {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
         cx.emit(TextInputEvent::Changed);
-        cx.notify();
+        self.pause_blinking(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -424,7 +473,7 @@ impl EntityInputHandler for TextInput {
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
 
         cx.emit(TextInputEvent::Changed);
-        cx.notify();
+        self.pause_blinking(cx);
     }
 
     fn bounds_for_range(
@@ -638,6 +687,7 @@ impl Element for TextElement {
         }
 
         if focus_handle.is_focused(window)
+            && self.input.read(cx).cursor_visible
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -651,7 +701,19 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_subscription.is_none() {
+            let focus_handle = self.focus_handle.clone();
+            self.focus_subscription =
+                Some(cx.on_focus(&focus_handle, window, |this, window, cx| {
+                    this.cursor_visible = true;
+                    this.schedule_blink(window, cx);
+                    cx.notify();
+                }));
+        }
+        if self.focus_handle.is_focused(window) && !self.is_blinking {
+            self.schedule_blink(window, cx);
+        }
         div()
             .flex()
             .w_full()
