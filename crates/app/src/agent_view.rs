@@ -14,7 +14,8 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use registry::{AgentId, AgentRegistryStore};
 use text_input::TextInput;
 use ui::{
-    Callout, CommonAnimationExt as _, Disclosure, Severity, SpinnerLabel, Tooltip, prelude::*,
+    Callout, CommonAnimationExt as _, ContextMenu, Disclosure, IconPosition, PopoverMenu, Severity,
+    SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
 const KEY_CONTEXT: &str = "AgentComposer";
@@ -864,6 +865,221 @@ impl AgentView {
         )
     }
 
+    /// The agent's session settings (model, effort, mode, …) as Zed shows them: a muted
+    /// dropdown button per choice and a switch per on/off setting.
+    fn render_session_settings(&self, cx: &App) -> Vec<AnyElement> {
+        let thread = self.thread.read(cx);
+        let mut controls = Vec::new();
+        for option in thread.config_options() {
+            let config_id = option.id.clone();
+            let element_id = SharedString::from(format!("config-option-{}", option.id.0));
+            let tooltip_title: SharedString = option.name.clone().into();
+            let tooltip_description = option.description.clone().map(SharedString::from);
+            match &option.kind {
+                acp::SessionConfigKind::Select(select) => {
+                    let mut choices: Vec<(
+                        Option<SharedString>,
+                        acp::SessionConfigValueId,
+                        SharedString,
+                    )> = Vec::new();
+                    match &select.options {
+                        acp::SessionConfigSelectOptions::Ungrouped(options) => {
+                            for choice in options {
+                                choices.push((
+                                    None,
+                                    choice.value.clone(),
+                                    choice.name.clone().into(),
+                                ));
+                            }
+                        }
+                        acp::SessionConfigSelectOptions::Grouped(groups) => {
+                            for group in groups {
+                                let group_name: SharedString = group.name.clone().into();
+                                for choice in &group.options {
+                                    choices.push((
+                                        Some(group_name.clone()),
+                                        choice.value.clone(),
+                                        choice.name.clone().into(),
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    let current_value = select.current_value.clone();
+                    let current_name = choices
+                        .iter()
+                        .find(|(_, value, _)| *value == current_value)
+                        .map(|(_, _, name)| name.clone())
+                        .unwrap_or_else(|| current_value.0.to_string().into());
+                    let thread = self.thread.clone();
+                    controls.push(
+                        PopoverMenu::new(element_id.clone())
+                            .menu(move |window, cx| {
+                                let choices = choices.clone();
+                                let current_value = current_value.clone();
+                                let thread = thread.clone();
+                                let config_id = config_id.clone();
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    let mut current_group: Option<SharedString> = None;
+                                    for (group, value, name) in choices {
+                                        if group.is_some() && group != current_group {
+                                            if current_group.is_some() {
+                                                menu = menu.separator();
+                                            }
+                                            menu = menu.header(group.clone().unwrap_or_default());
+                                            current_group = group;
+                                        }
+                                        let thread = thread.clone();
+                                        let config_id = config_id.clone();
+                                        let is_current = value == current_value;
+                                        menu = menu.toggleable_entry(
+                                            name,
+                                            is_current,
+                                            IconPosition::End,
+                                            None,
+                                            move |_, cx| {
+                                                let value = value.clone();
+                                                thread.update(cx, |thread, cx| {
+                                                    thread.set_config_option(
+                                                        config_id.clone(),
+                                                        acp::SessionConfigOptionValue::value_id(
+                                                            value,
+                                                        ),
+                                                        cx,
+                                                    )
+                                                });
+                                            },
+                                        );
+                                    }
+                                    menu
+                                }))
+                            })
+                            .trigger_with_tooltip(
+                                Button::new(
+                                    SharedString::from(format!("{element_id}-trigger")),
+                                    current_name,
+                                )
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .end_icon(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                                setting_tooltip(tooltip_title, tooltip_description),
+                            )
+                            .anchor(gpui::Anchor::BottomRight)
+                            .into_any_element(),
+                    );
+                }
+                acp::SessionConfigKind::Boolean(boolean) => {
+                    let thread = self.thread.clone();
+                    controls.push(
+                        h_flex()
+                            .id(element_id.clone())
+                            .pr_1()
+                            .tooltip(setting_tooltip(tooltip_title.clone(), tooltip_description))
+                            .child(
+                                Switch::new(
+                                    SharedString::from(format!("{element_id}-switch")),
+                                    if boolean.current_value {
+                                        ToggleState::Selected
+                                    } else {
+                                        ToggleState::Unselected
+                                    },
+                                )
+                                .label(tooltip_title)
+                                .label_position(ui::SwitchLabelPosition::Start)
+                                .label_size(LabelSize::Small)
+                                .label_color(Color::Muted)
+                                .on_click(move |state, _, cx| {
+                                    let enabled = matches!(state, ToggleState::Selected);
+                                    thread.update(cx, |thread, cx| {
+                                        thread.set_config_option(
+                                            config_id.clone(),
+                                            acp::SessionConfigOptionValue::boolean(enabled),
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Agents that predate config options report modes separately.
+        let has_mode_option = thread.config_options().iter().any(|option| {
+            matches!(
+                option.category,
+                Some(acp::SessionConfigOptionCategory::Mode)
+            )
+        });
+        if let Some(modes) = thread
+            .modes()
+            .filter(|modes| !has_mode_option && modes.available_modes.len() > 1)
+        {
+            let current_mode = modes.current_mode_id.clone();
+            let current_name: SharedString = modes
+                .available_modes
+                .iter()
+                .find(|mode| mode.id == current_mode)
+                .map(|mode| mode.name.clone())
+                .unwrap_or_else(|| current_mode.0.to_string())
+                .into();
+            let available: Vec<(acp::SessionModeId, SharedString)> = modes
+                .available_modes
+                .iter()
+                .map(|mode| (mode.id.clone(), mode.name.clone().into()))
+                .collect();
+            let thread = self.thread.clone();
+            controls.insert(
+                0,
+                PopoverMenu::new("session-mode")
+                    .menu(move |window, cx| {
+                        let available = available.clone();
+                        let current_mode = current_mode.clone();
+                        let thread = thread.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for (mode_id, name) in available {
+                                let thread = thread.clone();
+                                let is_current = mode_id == current_mode;
+                                menu = menu.toggleable_entry(
+                                    name,
+                                    is_current,
+                                    IconPosition::End,
+                                    None,
+                                    move |_, cx| {
+                                        let mode_id = mode_id.clone();
+                                        thread
+                                            .update(cx, |thread, cx| thread.set_mode(mode_id, cx));
+                                    },
+                                );
+                            }
+                            menu
+                        }))
+                    })
+                    .trigger_with_tooltip(
+                        Button::new("session-mode-trigger", current_name)
+                            .label_size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .end_icon(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        Tooltip::text("Mode"),
+                    )
+                    .anchor(gpui::Anchor::BottomRight)
+                    .into_any_element(),
+            );
+        }
+        controls
+    }
+
     fn render_message_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
@@ -941,7 +1157,14 @@ impl AgentView {
                                             .color(Color::Muted),
                                     ),
                             )
-                            .child(send_button),
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(self.render_session_settings(cx))
+                                    .child(send_button),
+                            ),
                     ),
             )
     }
@@ -1119,4 +1342,23 @@ fn tool_output_style(is_terminal_tool: bool, window: &Window, cx: &App) -> Markd
     style.code_block.margin.top = Some(gpui::Length::Definite(px(0.).into()));
     style.code_block.margin.bottom = Some(gpui::Length::Definite(px(0.).into()));
     style
+}
+
+fn setting_tooltip(
+    title: SharedString,
+    description: Option<SharedString>,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    Tooltip::element(move |_, _| {
+        v_flex()
+            .gap_1()
+            .child(Label::new(title.clone()))
+            .when_some(description.clone(), |content, description| {
+                content.child(
+                    Label::new(description)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .into_any_element()
+    })
 }

@@ -9,6 +9,25 @@ import sys
 
 next_request_id = 1000
 pending = {}
+settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
+
+
+def config_options():
+    return [
+        {"id": "mode", "name": "Mode", "category": "mode", "type": "select",
+         "currentValue": settings["mode"],
+         "options": [{"value": "default", "name": "Default"},
+                     {"value": "plan", "name": "Plan", "description": "Plan before editing"}]},
+        {"id": "model", "name": "Model", "category": "model", "type": "select",
+         "currentValue": settings["model"],
+         "options": [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"},
+                     {"value": "haiku", "name": "Haiku"}]},
+        {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
+         "currentValue": settings["effort"],
+         "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"},
+                     {"value": "high", "name": "High"}]},
+        {"id": "fast", "name": "Fast", "type": "boolean", "currentValue": settings["fast"]},
+    ]
 
 
 def send(message):
@@ -46,7 +65,12 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
     elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": message["id"], "result": {"sessionId": "session-1"}})
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "result": {"sessionId": "session-1", "configOptions": config_options()}})
+    elif method == "session/set_config_option":
+        params = message["params"]
+        settings[params["configId"]] = params["value"]
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
     elif method == "session/prompt":
         params = message["params"]
         prompt_text = "".join(block.get("text", "") for block in params["prompt"])

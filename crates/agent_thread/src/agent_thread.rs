@@ -127,6 +127,8 @@ enum Incoming {
 struct Session {
     connection: ConnectionTo<Agent>,
     session_id: acp::SessionId,
+    config_options: Vec<acp::SessionConfigOption>,
+    modes: Option<acp::SessionModeState>,
 }
 
 pub struct AgentThread {
@@ -134,6 +136,10 @@ pub struct AgentThread {
     status: ConnectionStatus,
     entries: Vec<Entry>,
     plan: Vec<PlanItem>,
+    /// Settings the agent exposes for this session (model, effort, mode, …).
+    config_options: Vec<acp::SessionConfigOption>,
+    /// Session modes from agents that predate config options.
+    modes: Option<acp::SessionModeState>,
     permission_requests: Vec<PermissionRequest>,
     session: Option<Session>,
     queued_prompts: Vec<String>,
@@ -162,7 +168,9 @@ impl AgentThread {
             }
             .await;
             this.update(cx, |this, cx| match result {
-                Ok(session) => {
+                Ok(mut session) => {
+                    this.config_options = std::mem::take(&mut session.config_options);
+                    this.modes = session.modes.take();
                     this.session = Some(session);
                     this.status = ConnectionStatus::Ready;
                     for prompt in std::mem::take(&mut this.queued_prompts) {
@@ -183,6 +191,8 @@ impl AgentThread {
             status: ConnectionStatus::Connecting,
             entries: Vec::new(),
             plan: Vec::new(),
+            config_options: Vec::new(),
+            modes: None,
             permission_requests: Vec::new(),
             session: None,
             queued_prompts: Vec::new(),
@@ -201,6 +211,8 @@ impl AgentThread {
             status: ConnectionStatus::Failed(error.into()),
             entries: Vec::new(),
             plan: Vec::new(),
+            config_options: Vec::new(),
+            modes: None,
             permission_requests: Vec::new(),
             session: None,
             queued_prompts: Vec::new(),
@@ -222,6 +234,94 @@ impl AgentThread {
 
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    pub fn config_options(&self) -> &[acp::SessionConfigOption] {
+        &self.config_options
+    }
+
+    pub fn modes(&self) -> Option<&acp::SessionModeState> {
+        self.modes.as_ref()
+    }
+
+    /// Changes one of the agent's session settings. The new value shows immediately and is
+    /// reverted if the agent rejects it.
+    pub fn set_config_option(
+        &mut self,
+        config_id: acp::SessionConfigId,
+        value: acp::SessionConfigOptionValue,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let previous = self.config_options.clone();
+        if let Some(option) = self
+            .config_options
+            .iter_mut()
+            .find(|option| option.id == config_id)
+        {
+            match (&mut option.kind, &value) {
+                (
+                    acp::SessionConfigKind::Select(select),
+                    acp::SessionConfigOptionValue::ValueId { value },
+                ) => {
+                    select.current_value = value.clone();
+                }
+                (
+                    acp::SessionConfigKind::Boolean(boolean),
+                    acp::SessionConfigOptionValue::Boolean { value },
+                ) => {
+                    boolean.current_value = *value;
+                }
+                _ => {}
+            }
+        }
+        let request =
+            acp::SetSessionConfigOptionRequest::new(session.session_id.clone(), config_id, value);
+        let response = session.connection.send_request(request).block_task();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = response.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(response) => this.config_options = response.config_options,
+                    Err(error) => {
+                        log::error!("failed to change an agent setting: {error:?}");
+                        this.config_options = previous;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn set_mode(&mut self, mode_id: acp::SessionModeId, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let Some(modes) = &mut self.modes else {
+            return;
+        };
+        let previous_mode = std::mem::replace(&mut modes.current_mode_id, mode_id.clone());
+        let request = acp::SetSessionModeRequest::new(session.session_id.clone(), mode_id);
+        let response = session.connection.send_request(request).block_task();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = response.await {
+                log::error!("failed to change the agent's mode: {error:?}");
+                this.update(cx, |this, cx| {
+                    if let Some(modes) = &mut this.modes {
+                        modes.current_mode_id = previous_mode;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     pub fn plan(&self) -> &[PlanItem] {
@@ -469,6 +569,14 @@ impl AgentThread {
                     .collect();
                 if !self.entries.contains(&Entry::Plan) {
                     self.entries.push(Entry::Plan);
+                }
+            }
+            acp::SessionUpdate::ConfigOptionUpdate(update) => {
+                self.config_options = update.config_options;
+            }
+            acp::SessionUpdate::CurrentModeUpdate(update) => {
+                if let Some(modes) = &mut self.modes {
+                    modes.current_mode_id = update.current_mode_id;
                 }
             }
             _ => {}
@@ -745,6 +853,8 @@ async fn connect(
     Ok(Session {
         connection,
         session_id: new_session.session_id,
+        config_options: new_session.config_options.unwrap_or_default(),
+        modes: new_session.modes,
     })
 }
 
@@ -810,6 +920,31 @@ mod tests {
             assert!(matches!(&thread.entries()[2], Entry::ToolCall(call) if call.title == "Read README.md"));
             assert_eq!(thread.last_stop_reason(), Some(&acp::StopReason::EndTurn));
         });
+
+        thread.read_with(cx, |thread, _| {
+            let ids: Vec<_> = thread
+                .config_options()
+                .iter()
+                .map(|option| option.id.0.to_string())
+                .collect();
+            assert_eq!(ids, vec!["mode", "model", "effort", "fast"]);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_config_option(
+                acp::SessionConfigId::new("model"),
+                acp::SessionConfigOptionValue::value_id("opus"),
+                cx,
+            )
+        });
+        let model_is = |thread: &AgentThread, expected: &str| {
+            thread.config_options().iter().any(|option| {
+                option.id.0.as_ref() == "model"
+                    && matches!(&option.kind, acp::SessionConfigKind::Select(select)
+                        if select.current_value.0.as_ref() == expected)
+            })
+        };
+        thread.read_with(cx, |thread, _| assert!(model_is(thread, "opus")));
+        wait_until(cx, &|thread| model_is(thread, "opus"));
 
         thread.update(cx, |thread, cx| thread.send("permission".into(), cx));
         let tool_call_id = acp::ToolCallId::new("call-2");
