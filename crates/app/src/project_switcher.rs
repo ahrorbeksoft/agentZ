@@ -1,14 +1,19 @@
+//! The project picker behind the title bar's project button, modeled on Zed's recent-projects
+//! popover: search, "All projects", the projects with their icons, and Open Folder.
+
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, PromptLevel, Subscription, Window,
+    KeyBinding, Subscription, Window,
 };
 use projects::{ProjectId, ProjectScope, ProjectStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
-    ButtonLike, KeyBinding as KeyBindingHint, ListItem, ListItemSpacing, Tooltip, prelude::*,
+    ButtonLike, Divider, HighlightedLabel, KeyBinding as KeyBindingHint, ListItem, ListItemSpacing,
+    ListSubHeader, Tooltip, prelude::*,
 };
 
 use crate::OpenFolder;
+use crate::project_info::{ProjectInfoStore, render_project_icon};
 
 const KEY_CONTEXT: &str = "ProjectSwitcher";
 const ALL_PROJECTS_LABEL: &str = "All projects";
@@ -41,6 +46,8 @@ pub struct ProjectSwitcher {
     store: Entity<ProjectStore>,
     search: Entity<TextInput>,
     entries: Vec<Entry>,
+    /// Byte positions of the search's letters in each entry's name, for highlighting.
+    match_positions: Vec<Vec<usize>>,
     selected_index: usize,
     _subscriptions: Vec<Subscription>,
 }
@@ -61,6 +68,7 @@ impl ProjectSwitcher {
                 this.update_entries(cx)
             }),
             cx.observe(&store, |this, _, cx| this.update_entries(cx)),
+            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
         ];
         window.focus(&search.focus_handle(cx), cx);
 
@@ -68,6 +76,7 @@ impl ProjectSwitcher {
             store,
             search,
             entries: Vec::new(),
+            match_positions: Vec::new(),
             selected_index: 0,
             _subscriptions: subscriptions,
         };
@@ -87,26 +96,29 @@ impl ProjectSwitcher {
         let store = self.store.read(cx);
 
         let mut entries = Vec::new();
-        if query.is_empty() || fuzzy_matches(&query, ALL_PROJECTS_LABEL) {
+        let mut match_positions = Vec::new();
+        if let Some(positions) = fuzzy_match(&query, ALL_PROJECTS_LABEL) {
             entries.push(Entry::AllProjects);
+            match_positions.push(positions);
         }
-        entries.extend(
-            store
-                .projects()
-                .iter()
-                .filter(|project| {
-                    query.is_empty()
-                        || fuzzy_matches(&query, &project.name())
-                        || project
-                            .path
-                            .to_string_lossy()
-                            .to_lowercase()
-                            .contains(&query)
-                })
-                .map(|project| Entry::Project(project.id)),
-        );
+        for project in store.projects() {
+            let positions = fuzzy_match(&query, &project.name()).or_else(|| {
+                // A match on the path alone has nothing in the name to highlight.
+                project
+                    .path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+                    .then(Vec::new)
+            });
+            if let Some(positions) = positions {
+                entries.push(Entry::Project(project.id));
+                match_positions.push(positions);
+            }
+        }
 
         self.entries = entries;
+        self.match_positions = match_positions;
         self.selected_index = self
             .selected_index
             .min(self.entries.len().saturating_sub(1));
@@ -151,110 +163,76 @@ impl ProjectSwitcher {
         cx.emit(DismissEvent);
     }
 
-    /// Removing a project also drops its threads from the list, so it asks first.
-    fn confirm_remove_project(
-        &mut self,
-        project_id: ProjectId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(name) = self
-            .store
-            .read(cx)
-            .project(project_id)
-            .map(|project| project.name())
-        else {
-            return;
-        };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("Remove “{name}” from the list?"),
-            Some("Its threads are removed too. Nothing on disk is touched."),
-            &["Remove", "Cancel"],
-            cx,
-        );
-        let store = self.store.clone();
-        cx.spawn(async move |_, cx| {
-            if answer.await == Ok(0) {
-                store.update(cx, |store, cx| store.remove_project(project_id, cx));
-            }
-        })
-        .detach();
-    }
-
     fn render_entry(&self, index: usize, entry: Entry, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
         let is_current = store.scope() == entry.scope();
+        let positions = self.match_positions.get(index).cloned().unwrap_or_default();
+        let check = is_current.then(|| {
+            Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Accent)
+        });
+        let item = ListItem::new(("project-switcher-entry", index))
+            .inset(true)
+            .spacing(ListItemSpacing::Sparse)
+            .toggle_state(index == self.selected_index)
+            .on_click(cx.listener(move |this, _, _, cx| this.choose(entry, cx)));
 
-        let project_id = match entry {
-            Entry::AllProjects => None,
-            Entry::Project(id) => Some(id),
-        };
-        let (icon, label, detail) = match entry {
+        match entry {
             Entry::AllProjects => {
                 let count = store.projects().len();
                 let detail = match count {
                     1 => "1 project".to_string(),
                     count => format!("{count} projects"),
                 };
-                (
-                    IconName::ListTree,
-                    SharedString::from(ALL_PROJECTS_LABEL),
-                    detail,
+                item.start_slot(
+                    Icon::new(IconName::ListTree)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
                 )
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(HighlightedLabel::new(ALL_PROJECTS_LABEL, positions))
+                        .child(Label::new(detail).color(Color::Muted))
+                        .children(check),
+                )
+                .into_any_element()
             }
             Entry::Project(id) => {
                 let Some(project) = store.project(id) else {
                     return div().into_any_element();
                 };
-                (
-                    IconName::Folder,
-                    project.name(),
-                    compact_path(&project.path),
-                )
-            }
-        };
-
-        ListItem::new(("project-switcher-entry", index))
-            .inset(true)
-            .spacing(ListItemSpacing::Sparse)
-            .toggle_state(index == self.selected_index)
-            .start_slot(Icon::new(icon).color(Color::Muted).size(IconSize::Small))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap_2()
-                    .child(div().flex_none().child(Label::new(label)))
+                let info = ProjectInfoStore::global(cx).read(cx).info().get(&id);
+                let branch = info
+                    .and_then(|info| info.git_head.as_ref())
+                    .map(|git_head| git_head.branch.clone());
+                let name = project.name();
+                let path: SharedString = compact_path(&project.path).into();
+                let tooltip_title: SharedString = match &branch {
+                    Some(branch) => format!("{name}/{branch}").into(),
+                    None => name.clone(),
+                };
+                item.start_slot(render_project_icon(project, info, px(16.), cx))
                     .child(
-                        div().min_w_0().child(
-                            Label::new(detail)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        ),
-                    ),
-            )
-            .when(is_current, |item| {
-                item.end_slot(
-                    Icon::new(IconName::Check)
-                        .size(IconSize::Small)
-                        .color(Color::Accent),
-                )
-            })
-            .when_some(project_id, |item, project_id| {
-                item.end_slot_on_hover(
-                    IconButton::new(("remove-project", index), IconName::Close)
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Remove From List"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.confirm_remove_project(project_id, window, cx);
-                        })),
-                )
-            })
-            .on_click(cx.listener(move |this, _, _, cx| this.choose(entry, cx)))
-            .into_any_element()
+                        // Like Zed's popover, the path shows on hover rather than in the row.
+                        h_flex()
+                            .id(("project-switcher-row", index))
+                            .min_w_0()
+                            .gap_1()
+                            .child(HighlightedLabel::new(name, positions))
+                            .when_some(branch, |row, branch| {
+                                row.child(Label::new(branch).color(Color::Muted).truncate())
+                            })
+                            .children(check)
+                            .tooltip(move |_, cx| {
+                                Tooltip::with_meta(tooltip_title.clone(), None, path.clone(), cx)
+                            }),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 }
 
@@ -262,8 +240,25 @@ impl Render for ProjectSwitcher {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border_variant = cx.theme().colors().border_variant;
         let has_projects = !self.store.read(cx).projects().is_empty();
-        let mut rows = Vec::with_capacity(self.entries.len());
+        let mut rows = Vec::with_capacity(self.entries.len() + 1);
         for (index, entry) in self.entries.clone().into_iter().enumerate() {
+            let is_first_project = matches!(entry, Entry::Project(_))
+                && !matches!(
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| self.entries.get(previous)),
+                    Some(Entry::Project(_))
+                );
+            if is_first_project {
+                rows.push(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .when(index > 0, |this| this.mt_1().child(Divider::horizontal()))
+                        .child(ListSubHeader::new("Projects").inset(true))
+                        .into_any_element(),
+                );
+            }
             rows.push(self.render_entry(index, entry, cx));
         }
 
@@ -345,12 +340,18 @@ impl Render for ProjectSwitcher {
     }
 }
 
-/// Case-insensitive subsequence match; `query` must already be lowercase.
-fn fuzzy_matches(query: &str, candidate: &str) -> bool {
-    let mut candidate_chars = candidate.chars().flat_map(char::to_lowercase);
-    query
-        .chars()
-        .all(|query_char| candidate_chars.any(|candidate_char| candidate_char == query_char))
+/// Case-insensitive subsequence match, returning the byte positions of the matched characters;
+/// `query` must already be lowercase.
+fn fuzzy_match(query: &str, candidate: &str) -> Option<Vec<usize>> {
+    let mut positions = Vec::new();
+    let mut candidate_chars = candidate.char_indices();
+    for query_char in query.chars() {
+        let (position, _) = candidate_chars
+            .by_ref()
+            .find(|(_, candidate_char)| candidate_char.to_lowercase().eq([query_char]))?;
+        positions.push(position);
+    }
+    Some(positions)
 }
 
 pub fn compact_path(path: &std::path::Path) -> String {
@@ -364,13 +365,14 @@ pub fn compact_path(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fuzzy_matches;
+    use super::fuzzy_match;
 
     #[test]
     fn fuzzy_matching() {
-        assert!(fuzzy_matches("shp", "shop-landing"));
-        assert!(fuzzy_matches("all", "All projects"));
-        assert!(!fuzzy_matches("xyz", "shop-landing"));
-        assert!(fuzzy_matches("", "anything"));
+        assert_eq!(fuzzy_match("shp", "shop-landing"), Some(vec![0, 1, 3]));
+        assert_eq!(fuzzy_match("all", "All projects"), Some(vec![0, 1, 2]));
+        assert_eq!(fuzzy_match("xyz", "shop-landing"), None);
+        assert_eq!(fuzzy_match("", "anything"), Some(vec![]));
+        assert_eq!(fuzzy_match("é", "café"), Some(vec![3]));
     }
 }

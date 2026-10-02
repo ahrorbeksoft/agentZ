@@ -1,12 +1,10 @@
 //! The settings page, laid out like t3code's: a list of sections on the left (General,
 //! Appearance, then one entry per project) and the chosen section's rows on the right.
 
-use std::path::PathBuf;
-
 use collections::HashMap;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, Subscription, Task, Window, actions,
+    PathPromptOptions, PromptLevel, Subscription, Window, actions,
 };
 use projects::{Project, ProjectIcon, ProjectId, ProjectStore, ThreadOrder};
 use text_input::{TextInput, TextInputEvent};
@@ -15,7 +13,8 @@ use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, prelude::*};
 
 use crate::app_settings::{AppSettingsStore, ThemeMode};
 use crate::project_info::{
-    MONOGRAM_COLORS, ProjectInfo, automatic_monogram, monogram_swatch, render_project_icon,
+    MONOGRAM_COLORS, ProjectInfo, ProjectInfoStore, automatic_monogram, monogram_swatch,
+    render_project_icon,
 };
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
 
@@ -54,7 +53,6 @@ pub struct SettingsPage {
     monogram_input: Entity<TextInput>,
     /// Detected favicons, so automatic icons match the sidebar's.
     project_info: HashMap<ProjectId, ProjectInfo>,
-    _load_project_info: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -71,22 +69,13 @@ impl SettingsPage {
         let app_settings = AppSettingsStore::global(cx);
         let name_input = cx.new(|cx| TextInput::new("", cx));
         let monogram_input = cx.new(|cx| TextInput::new("", cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&store, |this, _, cx| {
                 // A removed project's page has nothing left to show.
                 if let Section::Project(id) = this.section
                     && this.store.read(cx).project(id).is_none()
                 {
                     this.section = Section::General;
-                }
-                let has_new_project = this
-                    .store
-                    .read(cx)
-                    .projects()
-                    .iter()
-                    .any(|project| !this.project_info.contains_key(&project.id));
-                if has_new_project {
-                    this._load_project_info = this.load_project_info(cx);
                 }
                 cx.notify();
             }),
@@ -106,44 +95,26 @@ impl SettingsPage {
                 }
             }),
         ];
-        let mut this = Self {
+        let project_info_store = ProjectInfoStore::global(cx);
+        let project_info = project_info_store.read(cx).info().clone();
+        subscriptions.push(cx.observe(&project_info_store, |this, store, cx| {
+            this.project_info = store.read(cx).info().clone();
+            cx.notify();
+        }));
+        Self {
             focus_handle: cx.focus_handle(),
             store,
             app_settings,
             section: Section::General,
             name_input,
             monogram_input,
-            project_info: HashMap::default(),
-            _load_project_info: Task::ready(()),
+            project_info,
             _subscriptions: subscriptions,
-        };
-        this._load_project_info = this.load_project_info(cx);
-        this
+        }
     }
 
-    fn load_project_info(&self, cx: &mut Context<Self>) -> Task<()> {
-        let roots: Vec<(ProjectId, PathBuf)> = self
-            .store
-            .read(cx)
-            .projects()
-            .iter()
-            .map(|project| (project.id, project.path.clone()))
-            .collect();
-        cx.spawn(async move |this, cx| {
-            let project_info = cx
-                .background_spawn(async move {
-                    roots
-                        .into_iter()
-                        .map(|(id, root)| (id, ProjectInfo::read(&root)))
-                        .collect::<HashMap<_, _>>()
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.project_info = project_info;
-                cx.notify();
-            })
-            .ok();
-        })
+    pub fn show_project(&mut self, id: ProjectId, cx: &mut Context<Self>) {
+        self.select(Section::Project(id), cx);
     }
 
     fn select(&mut self, section: Section, cx: &mut Context<Self>) {

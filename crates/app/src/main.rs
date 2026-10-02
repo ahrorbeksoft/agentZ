@@ -160,6 +160,7 @@ fn main() {
             sidebar::init(cx);
             settings_page::init(cx);
             projects::init(cx);
+            project_info::init(cx);
             let shell_environment_ready = load_shell_environment(cx);
             registry::init(http_client, shell_environment_ready, cx);
             init_actions(cx);

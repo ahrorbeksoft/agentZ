@@ -2,9 +2,14 @@
 //! favicon, or a colored monogram when it has none) and the checked-out git branch.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use gpui::{AnyElement, App, FontWeight, Hsla, img, rgb};
-use projects::{Project, ProjectIcon};
+use collections::HashMap;
+use gpui::{
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, Global, Hsla, Subscription,
+    Task, img, rgb,
+};
+use projects::{Project, ProjectIcon, ProjectId, ProjectStore};
 use ui::{StyledImage as _, prelude::*};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -28,6 +33,87 @@ impl ProjectInfo {
             favicon: find_favicon(root),
             git_head: read_git_head(root),
         }
+    }
+}
+
+/// How often icons and checked-out branches are re-read.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Every project's [`ProjectInfo`], kept current for the sidebar, the project switcher and
+/// settings.
+pub struct ProjectInfoStore {
+    info: HashMap<ProjectId, ProjectInfo>,
+    refresh: Task<()>,
+    _projects_subscription: Subscription,
+}
+
+struct GlobalProjectInfo(Entity<ProjectInfoStore>);
+
+impl Global for GlobalProjectInfo {}
+
+/// Call after `projects::init`.
+pub fn init(cx: &mut App) {
+    let projects = ProjectStore::global(cx);
+    let store = cx.new(|cx| {
+        let subscription = cx.observe(&projects, |this: &mut ProjectInfoStore, projects, cx| {
+            // Added or removed projects shouldn't wait for the next refresh.
+            let current = projects.read(cx).projects();
+            let is_stale = current.len() != this.info.len()
+                || current
+                    .iter()
+                    .any(|project| !this.info.contains_key(&project.id));
+            if is_stale {
+                this.refresh = ProjectInfoStore::refresh_loop(projects, cx);
+            }
+        });
+        ProjectInfoStore {
+            info: HashMap::default(),
+            refresh: ProjectInfoStore::refresh_loop(projects.clone(), cx),
+            _projects_subscription: subscription,
+        }
+    });
+    cx.set_global(GlobalProjectInfo(store));
+}
+
+impl ProjectInfoStore {
+    pub fn global(cx: &App) -> Entity<Self> {
+        cx.global::<GlobalProjectInfo>().0.clone()
+    }
+
+    pub fn info(&self) -> &HashMap<ProjectId, ProjectInfo> {
+        &self.info
+    }
+
+    fn refresh_loop(projects: Entity<ProjectStore>, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let roots: Vec<(ProjectId, PathBuf)> = projects.read_with(cx, |projects, _| {
+                    projects
+                        .projects()
+                        .iter()
+                        .map(|project| (project.id, project.path.clone()))
+                        .collect()
+                });
+                let info = cx
+                    .background_spawn(async move {
+                        roots
+                            .into_iter()
+                            .map(|(id, root)| (id, ProjectInfo::read(&root)))
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .await;
+                let updated = this.update(cx, |this, cx| {
+                    if this.info != info {
+                        this.info = info;
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(REFRESH_INTERVAL).await;
+            }
+        })
     }
 }
 

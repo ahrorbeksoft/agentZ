@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use collections::HashMap;
@@ -14,13 +13,11 @@ use ui::{
     prelude::*, right_click_menu,
 };
 
-use crate::project_info::{ProjectInfo, render_project_icon};
+use crate::project_info::{ProjectInfo, ProjectInfoStore, render_project_icon};
 use crate::{NewThread, OpenFolder, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-/// How often project icons and checked-out branches are re-read.
-const PROJECT_INFO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const CARD_HEIGHT: Pixels = px(78.);
 const DETAILS_DELAY: Duration = Duration::from_millis(500);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
@@ -40,6 +37,7 @@ pub fn init(cx: &mut App) {
 
 pub enum SidebarEvent {
     OpenThread(ThreadId),
+    OpenProjectSettings(ProjectId),
 }
 
 /// The thread list, modeled on t3code's sidebar: active threads as cards and archived threads
@@ -62,7 +60,7 @@ pub struct Sidebar {
     _rename_blur: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     _activity_refresh: Task<()>,
-    _project_info_refresh: Task<()>,
+    _project_info_subscription: Subscription,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -93,39 +91,11 @@ impl Sidebar {
                 }
             }
         });
-        let project_info_refresh = cx.spawn({
-            let store = store.clone();
-            async move |this, cx| {
-                loop {
-                    let roots: Vec<(ProjectId, PathBuf)> = store.read_with(cx, |store, _| {
-                        store
-                            .projects()
-                            .iter()
-                            .map(|project| (project.id, project.path.clone()))
-                            .collect()
-                    });
-                    let project_info = cx
-                        .background_spawn(async move {
-                            roots
-                                .into_iter()
-                                .map(|(id, root)| (id, ProjectInfo::read(&root)))
-                                .collect::<HashMap<_, _>>()
-                        })
-                        .await;
-                    let updated = this.update(cx, |this, cx| {
-                        if this.project_info != project_info {
-                            this.project_info = project_info;
-                            cx.notify();
-                        }
-                    });
-                    if updated.is_err() {
-                        break;
-                    }
-                    cx.background_executor()
-                        .timer(PROJECT_INFO_REFRESH_INTERVAL)
-                        .await;
-                }
-            }
+        let project_info_store = ProjectInfoStore::global(cx);
+        let project_info = project_info_store.read(cx).info().clone();
+        let project_info_subscription = cx.observe(&project_info_store, |this, store, cx| {
+            this.project_info = store.read(cx).info().clone();
+            cx.notify();
         });
         Self {
             store,
@@ -133,7 +103,7 @@ impl Sidebar {
             active_thread: None,
             search,
             archived_shown: ARCHIVED_INITIAL_COUNT,
-            project_info: HashMap::default(),
+            project_info,
             details_thread: None,
             details_delay: None,
             hovered_thread: None,
@@ -142,7 +112,7 @@ impl Sidebar {
             _rename_blur: None,
             _subscriptions: subscriptions,
             _activity_refresh: activity_refresh,
-            _project_info_refresh: project_info_refresh,
+            _project_info_subscription: project_info_subscription,
         }
     }
 
@@ -335,7 +305,7 @@ impl Sidebar {
         }
     }
 
-    /// Rename, Archive or Unarchive, and Delete, each with its icon.
+    /// Rename, Archive or Unarchive, Project Settings, and Delete, each with its icon.
     fn thread_menu(
         &self,
         thread_id: ThreadId,
@@ -375,6 +345,23 @@ impl Sidebar {
                             .ok();
                     }
                 };
+                let open_project_settings = {
+                    let sidebar = sidebar.clone();
+                    move |_: &mut Window, cx: &mut App| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                let project_id = sidebar
+                                    .store
+                                    .read(cx)
+                                    .thread(thread_id)
+                                    .map(|thread| thread.project_id);
+                                if let Some(project_id) = project_id {
+                                    cx.emit(SidebarEvent::OpenProjectSettings(project_id));
+                                }
+                            })
+                            .ok();
+                    }
+                };
                 let delete = {
                     let sidebar = sidebar.clone();
                     let title = title.clone();
@@ -401,6 +388,12 @@ impl Sidebar {
                         })
                         .icon_color(Color::Muted)
                         .handler(toggle_archived),
+                )
+                .item(
+                    ContextMenuEntry::new("Project Settings")
+                        .icon(IconName::Settings)
+                        .icon_color(Color::Muted)
+                        .handler(open_project_settings),
                 )
                 .separator()
                 .item(

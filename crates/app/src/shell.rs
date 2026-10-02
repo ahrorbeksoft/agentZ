@@ -12,6 +12,7 @@ use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use crate::agent_view::{AgentView, AgentViewEvent};
 use crate::app_settings::AppSettingsStore;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
+use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
@@ -91,7 +92,14 @@ impl Shell {
             }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::OpenThread(thread_id) => this.open_thread(*thread_id, window, cx),
+                SidebarEvent::OpenProjectSettings(project_id) => {
+                    this.open_settings(&OpenSettings, window, cx);
+                    if let Some((page, _)) = &this.settings_page {
+                        page.update(cx, |page, cx| page.show_project(*project_id, cx));
+                    }
+                }
             }),
+            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
             // With the theme mode set to System, the theme follows macOS's appearance.
             cx.observe_window_appearance(window, |_, _, cx| {
                 AppSettingsStore::global(cx).update(cx, |store, cx| store.reapply_theme(cx));
@@ -336,13 +344,21 @@ impl Shell {
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let store = self.store.read(cx);
-        let scope_label: SharedString = match store.scope() {
-            ProjectScope::All => "All projects".into(),
-            ProjectScope::Project(id) => store
-                .project(id)
-                .map(|project| project.name())
-                .unwrap_or_else(|| "All projects".into()),
-        };
+        let project_info = ProjectInfoStore::global(cx).read(cx).info();
+        let (scope_icon, scope_label): (AnyElement, SharedString) =
+            match store.scope().project().and_then(|id| store.project(id)) {
+                Some(project) => (
+                    render_project_icon(project, project_info.get(&project.id), px(14.), cx),
+                    project.name(),
+                ),
+                None => (
+                    Icon::new(IconName::ListTree)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                    "All projects".into(),
+                ),
+            };
         let switcher_store = self.store.clone();
 
         h_flex()
@@ -389,24 +405,18 @@ impl Shell {
                                 Some(cx.new(|cx| ProjectSwitcher::new(store, window, cx)))
                             })
                             .trigger_with_tooltip(
-                                ButtonLike::new("project-switcher-trigger")
-                                    .style(ButtonStyle::Outlined)
-                                    .child(
-                                        h_flex()
-                                            .px_1()
-                                            .gap_1p5()
-                                            .child(
-                                                Icon::new(IconName::Folder)
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(Label::new(scope_label))
-                                            .child(
-                                                Icon::new(IconName::ChevronDown)
-                                                    .size(IconSize::XSmall)
-                                                    .color(Color::Muted),
-                                            ),
-                                    ),
+                                ButtonLike::new("project-switcher-trigger").child(
+                                    h_flex()
+                                        .px_1()
+                                        .gap_1p5()
+                                        .child(scope_icon)
+                                        .child(Label::new(scope_label).size(LabelSize::Small))
+                                        .child(
+                                            Icon::new(IconName::ChevronDown)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                ),
                                 |_, cx| {
                                     Tooltip::for_action(
                                         "Switch Project",

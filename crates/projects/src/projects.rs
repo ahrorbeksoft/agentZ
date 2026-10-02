@@ -99,6 +99,16 @@ pub enum ProjectScope {
     Project(ProjectId),
 }
 
+impl ProjectScope {
+    /// The selected project, or `None` for all projects.
+    pub fn project(self) -> Option<ProjectId> {
+        match self {
+            ProjectScope::All => None,
+            ProjectScope::Project(id) => Some(id),
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
