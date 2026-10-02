@@ -134,6 +134,10 @@ From Zed's guidelines, which this code follows:
 - **`Callout` ignores `.icon()`** and always draws its severity's icon.
 - **GPUI tooltips always follow the cursor.** The sidebar's details popover is a custom anchored,
   deferred element, so it can sit beside the row.
+- **Actions need a focused element under the shell.** When the focused element disappears (for
+  example the open thread is deleted), `window.dispatch_action` starts at the window's root, above
+  `Shell`'s `on_action` handlers, and New Thread and similar actions do nothing. Move focus back to
+  the shell whenever a focused view is removed.
 - **The built-in fallback theme is also called "One Dark".** Compare themes with `Arc::ptr_eq`,
   not by name.
 - **Some npm agents ship a native binary as their `bin`** (Factory Droid). `registry::runs_with_node`

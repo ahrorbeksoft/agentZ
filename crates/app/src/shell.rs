@@ -53,7 +53,7 @@ impl Shell {
     ) -> Self {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), registry.clone(), cx));
         let subscriptions = vec![
-            cx.observe(&store, |this, store, cx| {
+            cx.observe_in(&store, window, |this, store, window, cx| {
                 // Close views (and stop their agents) for threads that were deleted or removed
                 // along with their project. Archived threads stay open, read-only.
                 let store = store.read(cx);
@@ -71,10 +71,10 @@ impl Shell {
                         ))
                     })
                     .collect();
-                if this
+                let closed_active_thread = this
                     .active_thread
-                    .is_some_and(|thread_id| !is_live(thread_id))
-                {
+                    .is_some_and(|thread_id| !is_live(thread_id));
+                if closed_active_thread {
                     this.active_thread = None;
                     // Deferred: the change may have come from the sidebar itself.
                     let sidebar = this.sidebar.clone();
@@ -87,6 +87,12 @@ impl Shell {
                         view.set_title(title, cx);
                         view.set_archived(is_archived, cx);
                     });
+                }
+                // Focus was in the closed thread's view. Without moving it here, actions such as
+                // New Thread would be dispatched from the window's root, above the shell's
+                // handlers, and do nothing.
+                if closed_active_thread {
+                    window.focus(&this.focus_handle, cx);
                 }
                 cx.notify();
             }),
