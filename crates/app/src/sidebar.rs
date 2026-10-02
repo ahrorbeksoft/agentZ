@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use collections::HashMap;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
-    KeyBinding, PromptLevel, Subscription, Task, Window, anchored, deferred,
+    KeyBinding, PromptLevel, Subscription, Task, Window, anchored, deferred, svg,
 };
 use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore};
@@ -478,14 +478,30 @@ impl Sidebar {
                 .into_any_element()
         };
         let store = self.store.clone();
-        let archive_button = Button::new(("archive-thread", thread.id.0), "Archive")
-            .label_size(LabelSize::Small)
-            .color(Color::Muted)
-            .start_icon(
-                Icon::new(IconName::Archive)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
+        // Like t3code's Settle button: muted text that brightens under the mouse, with no fill
+        // of its own over the card's hover background.
+        let muted_text = cx.theme().colors().text_muted;
+        let bright_text = cx.theme().colors().text;
+        let button_group = SharedString::from(format!("archive-button-{}", thread.id.0));
+        let archive_button = h_flex()
+            .id(("archive-thread", thread.id.0))
+            .group(button_group.clone())
+            .h_full()
+            .px_1p5()
+            .gap_1()
+            .cursor_pointer()
+            .text_ui_sm(cx)
+            .text_color(muted_text)
+            .hover(|this| this.text_color(bright_text))
+            .child(
+                svg()
+                    .path(IconName::Archive.path())
+                    .size(IconSize::XSmall.rems())
+                    .flex_none()
+                    .text_color(muted_text)
+                    .group_hover(button_group, |this| this.text_color(bright_text)),
             )
+            .child("Archive")
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
                 store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
