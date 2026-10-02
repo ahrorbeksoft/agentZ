@@ -296,17 +296,42 @@ t3code's checkpoints:
 - **Adding a project on a remote:** a path field with completion served by that machine. A
   native folder dialog can't browse another machine.
 
-**Merged projects** (t3code's repository grouping):
+**Merged projects**, exactly as t3code groups them
+(`packages/client-runtime/src/state/projectGrouping.ts`,
+`apps/server/src/project/RepositoryIdentityResolver.ts`, `normalizeGitRemoteUrl` in
+`packages/shared/src/git.ts`):
 
-- Each server reports a project's **repository identity**: its normalized `origin` URL (for
-  example `github.com/owner/repo`) and the project's path inside the repository.
-- Projects with the same identity on different machines become one entry in the projects pane,
-  named by the full repository name, `owner/repo`.
-  - The entry shows which machines it's on (t3code's `ProjectEnvironmentBadge`).
-  - Its thread list combines threads from every machine.
-- Projects without an `origin` remote are never merged.
-- Each machine's checkout keeps its own branch, which is shown per machine.
-- Project settings (name, icon) apply to the merged project.
+- **Repository identity** is resolved by each server for every project:
+  1. `git -C <path> rev-parse --show-toplevel` gives the repository root.
+  2. `git remote -v` lists the fetch remotes. The primary remote is `upstream`, then `origin`,
+     then the first by name.
+  3. Its URL is normalized into a **canonical key**: lowercased, without a trailing `/` or
+     `.git`, and turned into `host/owner/repo` for both `https://` and `git@host:owner/repo`
+     forms. Azure DevOps URLs get a special case.
+  4. The **display name** is the key without the host (`owner/repo`).
+
+  Results are cached for 15 minutes, and for 1 minute when there's no repository or remote.
+- **Grouping key.** Projects with the same key are one project in the projects pane. This works
+  across machines *and* across several checkouts on one machine (clones, worktrees). The mode
+  decides the key:
+  - **`repository`** (the default): the canonical key alone. Every checkout of the repository
+    merges, whichever subfolder was added.
+  - **`repository_path`**: the canonical key plus the project's path inside the repository, so
+    different subfolders of a monorepo stay apart.
+  - **`separate`**: never merge. The key is machine plus path.
+  - Projects with no remote are never merged.
+- **No branch or commit check.** t3code merges checkouts on different branches. Each checkout
+  keeps its own branch, shown per machine.
+- **Label.** If every member has the same name and it isn't just the repository's name, that
+  name is used. Otherwise it's the display name (`owner/repo`), then the repository name.
+- **The members stay real.** Threads are still created in one physical project (a machine plus a
+  path). The merged entry lists them and combines their threads. It shows which machines it's
+  on (`ProjectEnvironmentBadge`, only when projects span machines).
+- **Settings:**
+  - **Settings › General** has a switch, "Combine matching repositories across environments".
+    It toggles between the last-used mode and `separate`.
+  - The project's sidebar menu can override the mode for that project.
+  - Project settings (name, icon) apply to every checkout in the group.
 
 **New Thread** picks the machine too:
 

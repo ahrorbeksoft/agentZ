@@ -161,13 +161,18 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Offline machines stay visible but dimmed, with input disabled.
 - [ ] Remote projects: path field with completion from that machine.
 - [ ] Per-machine agents: install, log in, defaults.
-- [ ] Repository identity from each server: the normalized `origin` URL and the path inside the
-      repository.
+- [ ] Repository identity from each server, as t3code does:
+  - [ ] repository root, then the primary remote (`upstream`, `origin`, first by name);
+  - [ ] canonical key via `normalizeGitRemoteUrl`;
+  - [ ] display name `owner/repo`;
+  - [ ] cached for 15 minutes, or 1 minute when there's no repository or remote.
 - [ ] Merged projects:
-  - [ ] same identity means one entry named `owner/repo`;
-  - [ ] machines badge;
-  - [ ] combined threads;
-  - [ ] branch shown per machine.
+  - [ ] grouping modes `repository` (default), `repository_path`, `separate`;
+  - [ ] Settings › General switch and a per-project override;
+  - [ ] t3code's label rule;
+  - [ ] machines badge and combined threads;
+  - [ ] branch shown per checkout;
+  - [ ] project name and icon shared by the group.
 - [ ] New Thread: Project → Machine (only when the project is on several machines; defaults to
       the last used one) → Agent on that machine.
 - [ ] UI: machine icon on remote cards, machine line in the details popover, projects grouped by
@@ -192,9 +197,9 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 
 ## Open questions
 
-- **"Same state" for merged projects.** The plan merges projects with the same repository
-  (`origin` and path), whatever branch each machine has checked out. Should it also require
-  the same branch or commit?
+- **"Same state" for merged projects.** t3code merges by repository only, whatever branch or
+  commit each checkout is on. The plan copies that. Should agentZ also require the same branch
+  or commit?
 - **Agent control scope.** The plan uses t3code's rule: the caller's project only. Should agents
   also see and manage threads in other projects?
 
@@ -204,3 +209,9 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   docs. Cloned herdr into `references/herdr`.
 - 2026-10-03: Updated t3code to b4d3d51a. Added agent control (MCP and CLI), subthreads, diffs,
   terminal drawer and ACP client terminals, merged projects and the machine step in New Thread.
+- 2026-10-03: Read t3code's project grouping in full and corrected the plan:
+  - the primary remote is `upstream` before `origin`;
+  - the default mode merges the whole repository, with `repository_path` and `separate` as
+    options;
+  - checkouts on the same machine merge too;
+  - branches aren't compared.
