@@ -211,7 +211,7 @@ impl NewThreadModal {
     fn start_thread(&mut self, project_id: ProjectId, agent_id: &AgentId, cx: &mut Context<Self>) {
         let agent_id = agent_id.0.to_string();
         let thread_id = self.projects.update(cx, |projects, cx| {
-            projects.add_thread(project_id, "New thread", Some(agent_id), cx)
+            projects.add_thread(project_id, projects::NEW_THREAD_TITLE, Some(agent_id), cx)
         });
         match thread_id {
             Some(thread_id) => cx.emit(NewThreadModalEvent::ThreadCreated(thread_id)),

@@ -258,7 +258,15 @@ impl Shell {
 
         let agent_thread = cx.new(|cx| match command {
             Some(command) => {
-                let previous_session = thread.session_id.clone().map(acp::SessionId::new);
+                // Older builds saved a session for every new thread, even before its first
+                // prompt. An untitled thread never got one, so the agent has nothing to load.
+                let never_prompted =
+                    !thread.has_custom_title && thread.title == projects::NEW_THREAD_TITLE;
+                let previous_session = thread
+                    .session_id
+                    .clone()
+                    .filter(|_| !never_prompted)
+                    .map(acp::SessionId::new);
                 let mut agent_thread =
                     AgentThread::start(agent_name.clone(), command, cwd, previous_session, cx);
                 agent_thread.set_defaults(agent_settings.session_defaults());

@@ -55,6 +55,9 @@ pub enum ProjectIcon {
     Image { path: PathBuf },
 }
 
+/// A thread's title until its first prompt names it.
+pub const NEW_THREAD_TITLE: &str = "New thread";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,

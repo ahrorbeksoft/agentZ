@@ -181,7 +181,7 @@ pub enum SessionRestore {
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
     WorkingChanged(bool),
-    /// The ACP session the thread is talking to; store it to restore the thread later.
+    /// The ACP session to restore the thread from later: sent once the session has a prompt.
     SessionStarted(acp::SessionId),
     /// The first prompt of a new conversation was sent; useful as a title.
     FirstPrompt(String),
@@ -538,13 +538,16 @@ impl AgentThread {
                     this.config_options = setup.config_options;
                     this.modes = setup.modes;
                     this.session_restore = Some(setup.restore);
-                    // Later retries should restore this session rather than start another.
-                    this.previous_session = Some(setup.session_id.clone());
-                    cx.emit(AgentThreadEvent::SessionStarted(setup.session_id.clone()));
                     this.session = Some(Session {
                         connection,
                         session_id: setup.session_id,
                     });
+                    if matches!(
+                        setup.restore,
+                        SessionRestore::Loaded | SessionRestore::ResumedWithoutHistory
+                    ) {
+                        this.remember_session(cx);
+                    }
                     this.status = ConnectionStatus::Ready;
                     this.logged_in = Some(true);
                     if setup.restore == SessionRestore::New && this.opens_session {
@@ -886,7 +889,23 @@ impl AgentThread {
         cx.notify();
     }
 
+    /// Keeps the open session as the one to restore. A new session is only worth restoring once it
+    /// has a prompt: agents don't save empty sessions, so loading one later would fail.
+    fn remember_session(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if self.previous_session.as_ref() == Some(&session.session_id) {
+            return;
+        }
+        let session_id = session.session_id.clone();
+        // Later retries should restore this session rather than start another.
+        self.previous_session = Some(session_id.clone());
+        cx.emit(AgentThreadEvent::SessionStarted(session_id));
+    }
+
     fn send_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
+        self.remember_session(cx);
         let Some(session) = &self.session else {
             return;
         };
@@ -1859,13 +1878,25 @@ mod tests {
                 cx,
             )
         });
+        let saved_sessions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let saved_sessions = saved_sessions.clone();
+            cx.subscribe(&first, move |_, event, _| {
+                if let AgentThreadEvent::SessionStarted(session_id) = event {
+                    saved_sessions.borrow_mut().push(session_id.clone());
+                }
+            })
+        });
         wait_until(cx, &first, &|thread| {
             thread.status() == &ConnectionStatus::Ready
         });
+        // Agents don't keep a session without a prompt, so it isn't worth restoring yet.
+        assert!(saved_sessions.borrow().is_empty());
         first.update(cx, |thread, cx| thread.send("hello".into(), cx));
         wait_until(cx, &first, &|thread| {
             !thread.is_working() && thread.entries().len() >= 3
         });
+        assert_eq!(*saved_sessions.borrow(), [acp::SessionId::new("session-1")]);
         assert_eq!(
             first.read_with(cx, |thread, _| thread.session_restore()),
             Some(SessionRestore::New)

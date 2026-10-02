@@ -10,8 +10,8 @@ use agent_thread::{
 };
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding,
-    ScrollHandle, Subscription, Task, Window,
+    Animation, AnimationExt as _, AnyElement, App, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, Hsla, KeyBinding, ScrollHandle, Subscription, Task, Window, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use registry::{AgentId, AgentRegistryStore};
@@ -2334,6 +2334,7 @@ impl Render for AgentView {
             rows.push(generating);
         }
         let has_rows = !rows.is_empty();
+        let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
 
         v_flex()
             .size_full()
@@ -2356,7 +2357,27 @@ impl Render for AgentView {
                         rows.into_iter()
                             .map(|row| div().w_full().max_w(MAX_CONTENT_WIDTH).child(row)),
                     )
-                    .when(!has_rows, |this| {
+                    .when(!has_rows && is_connecting, |this| {
+                        // Zed's loading state: while the agent starts and the session (and its
+                        // history) loads, not the empty-thread prompt.
+                        this.child(
+                            v_flex()
+                                .flex_1()
+                                .w_full()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Label::new("Loading…").color(Color::Muted).with_animation(
+                                        "loading-agent-label",
+                                        Animation::new(Duration::from_secs(2))
+                                            .repeat()
+                                            .with_easing(pulsating_between(0.3, 0.7)),
+                                        |label, delta| label.alpha(delta),
+                                    ),
+                                ),
+                        )
+                    })
+                    .when(!has_rows && !is_connecting, |this| {
                         this.child(
                             div().w_full().max_w(MAX_CONTENT_WIDTH).px_5().py_8().child(
                                 Label::new(format!(
