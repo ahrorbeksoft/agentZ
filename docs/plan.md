@@ -5,6 +5,7 @@ The goal is a herdr-like experience in agentZ:
 - Agents keep working after the app quits, and the app reattaches to them.
 - The sidebar shows which threads need you.
 - Agents can manage other agents (threads, subthreads, archive, …) through MCP or a CLI.
+- Threads can work in their own git worktrees.
 - Diffs show what each turn changed.
 - Real terminals run agents' own CLIs.
 - Other machines are reached over SSH, all in one window. The same repository on several machines
@@ -62,6 +63,15 @@ starting a phase; both move fast.
     - `apps/server/src/checkpointing/`: per-turn checkpoints as hidden git refs, and diff
       queries.
     - `docs/user/providers-acp.md`: checkpoints with ACP agents.
+  - **Worktrees:**
+    - `docs/user/thread-sidebar.md`: New worktree, and new thread in this worktree.
+    - `docs/user/keybindings.md`: the workspace menu.
+    - `docs/user/project-settings.md`: branch naming, submodules, cleanup.
+    - `docs/user/composer.md`: file restore only in worktrees.
+    - `apps/server/src/vcs/GitVcsDriverCore.ts`: creating them.
+    - `apps/server/src/mcp/toolkits/worktree/`: `t3_worktree_status`, `t3_worktree_list`,
+      `t3_worktree_handoff`, and `t3_thread_launch`'s `workspaceStrategy`.
+    - herdr's `configuration.mdx` § Worktrees: the folder layout, and safe removal.
   - **Terminals:** `docs/user/terminal.md` (server-side scrollback limits) and
     `docs/user/providers-acp.md` (agents running commands in app terminals).
   - **Machines and merged projects:**
@@ -247,6 +257,73 @@ t3code's checkpoints:
   conversation, so t3code starts a fresh session after a rollback.
 - Projects that aren't git repositories get no checkpoints, and the panel says so.
 
+### Worktrees
+
+t3code's model, with herdr's folder layout and removal.
+
+**A thread runs in a workspace:** either the project's own checkout, or a **worktree** (a
+separate git checkout on its own branch).
+
+- The thread stores its worktree path and branch. Its ACP session's `cwd` is the workspace.
+- Worktrees stay part of their project. They are never separate projects, and t3code's grouping
+  already treats every checkout of a repository as one.
+- Projects that aren't git repositories only have their own checkout.
+
+**Choosing it.** New Thread gets a last step, **Workspace** (t3code's workspace menu):
+
+- **Current checkout**, the default;
+- **New worktree**, from a base branch (the checkout's current branch unless changed);
+- an existing worktree of this project.
+
+A thread's menu also offers **New thread in this worktree**.
+
+**Creating a worktree** happens on the thread's machine, by its server:
+
+- `git worktree add -b <branch> <folder> <base>`.
+- The folder is `<data dir>/worktrees/<repo>/<branch>` (t3code and herdr).
+- The branch is `agentz/<short id>`, following t3code's default static prefix (`t3code/`).
+  t3code can also have a model name the branch; agentZ has no app-owned text generation, so
+  that's left out.
+- Submodules are initialized recursively, as in t3code.
+- t3code's per-project setup scripts (`t3.json`) are not planned.
+
+**Showing it:**
+
+- Thread cards show the thread's own branch: the worktree's branch, or the checkout's. This
+  replaces "only the project's current branch" from the backlog.
+- The details popover shows the worktree folder.
+- **Project Settings › Checkouts** lists the project's worktrees.
+
+**Removing.** Deleting or archiving a thread never deletes its worktree.
+
+- Remove a worktree from Project Settings › Checkouts. It runs `git worktree remove`. If git
+  refuses because of changed or untracked files, agentZ asks again before forcing it.
+- Branches are kept (herdr).
+- A worktree in use by a running thread or terminal can't be removed.
+- t3code's automatic cleanup policies (inactive days, merged) come later, if wanted.
+
+**Agent control** (t3code's tools):
+
+- `agentz_worktree_status`: the thread's workspace, branch and project root.
+- `agentz_worktree_list`: the repository's branches and their checkouts.
+- `agentz_worktree_handoff`: move the calling thread into a new worktree. With an optional
+  `continuationPrompt`, the next turn starts there.
+  - The ACP session has to be reopened in the new `cwd`. agentZ uses `session/load` with the new
+    `cwd` when the agent supports it, otherwise a new session.
+- `agentz_thread_launch` and `delegate_task` take a `workspaceStrategy`, as in t3code:
+  - `root`, the default;
+  - `worktree` with `baseRef`;
+  - `existing_worktree` with a path.
+
+  So an agent can fan work out to subthreads, each in its own worktree.
+
+**Elsewhere:**
+
+- **Diffs:** checkpoints work the same in a worktree. Restoring files is only offered for a
+  thread in its own worktree, and refused when another thread or terminal uses that folder
+  (t3code).
+- **Terminals:** the thread terminal drawer opens in the thread's workspace.
+
 ### Terminals
 
 - **Server side:** a port of Zed's `terminal` crate (PTY plus `alacritty_terminal`), without
@@ -339,6 +416,7 @@ t3code's checkpoints:
 2. **Machine.** Only shown when the project is on more than one machine. The default is the
    machine last used for that project. Offline machines are listed but disabled.
 3. **Agent.** Agents installed on that machine.
+4. **Workspace.** Current checkout, new worktree, or an existing worktree (see Worktrees).
 
 **UI** (t3code):
 
@@ -374,10 +452,17 @@ Each phase ships on its own, keeps the app working, and is committed.
    - the Agents control;
    - permissions forwarded to the parent.
 5. **Diffs:** checkpoints, the diff panel, `agentz_thread_diff`.
-6. **Terminals:** server terminals, the client terminal element, terminal threads, the thread
+6. **Worktrees:**
+   - the thread workspace;
+   - the Workspace step in New Thread;
+   - creating and removing worktrees;
+   - branches on cards;
+   - Checkouts in Project Settings;
+   - the worktree tools.
+7. **Terminals:** server terminals, the client terminal element, terminal threads, the thread
    terminal drawer, ACP client terminals, `agentz_terminal_*`.
-7. **Terminal agent detection** using herdr's manifests.
-8. **Machines over SSH:**
+8. **Terminal agent detection** using herdr's manifests.
+9. **Machines over SSH:**
    - profiles and Settings › Machines;
    - install/upload and `proxy`;
    - reconnecting and Attention;
@@ -385,13 +470,13 @@ Each phase ships on its own, keeps the app working, and is committed.
    - merged projects;
    - the machine step in New Thread;
    - machine icons.
-9. **Polish:**
+10. **Polish:**
    - optional start at login (launchd/systemd user service);
    - confirmed remote server updates;
    - per-machine "Stop server".
 
-Everything after phase 1 depends on it. Phase 4 needs 3. Phase 7 needs 6. Phases 3–7 and 8 can
-otherwise go in any order.
+Everything after phase 1 depends on it. Phase 4 needs 3. Phase 8 needs 7. The worktree tools
+need phase 3. Otherwise phases 3–8 and 9 can go in any order.
 
 ## Testing
 
@@ -403,6 +488,10 @@ otherwise go in any order.
   - Test delegation, wait, cancel, archive and policy denials end to end, as t3code's
     integration test does.
 - **Diffs:** temporary git repositories with scripted edits between turns.
+- **Worktrees:** temporary repositories:
+  - create, reuse and remove worktrees;
+  - refused removals;
+  - a handoff with the mock agent.
 - **Proxy and reconnect:** run `agentz-server proxy` directly as the transport, with no SSH. Kill
   it to simulate a dropped connection.
 - **Terminals:** drive a PTY running `sh` with scripted input, and check the screen snapshots.

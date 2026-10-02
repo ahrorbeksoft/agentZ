@@ -155,8 +155,8 @@ From Zed's guidelines, which this code follows:
 
 ## State of the work
 
-**Current project:** background servers, agent control (MCP/CLI), subthreads, diffs, terminals
-and SSH machines. The design is in [`docs/plan.md`](docs/plan.md). Where it stands, and what to
+**Current project:** background servers, agent control (MCP/CLI), subthreads, diffs, worktrees,
+terminals and SSH machines. The design is in [`docs/plan.md`](docs/plan.md). Where it stands, and what to
 do next, is in [`docs/progress.md`](docs/progress.md). Keep progress.md up to date as you work.
 
 Done:
@@ -178,4 +178,5 @@ Not built yet (offered earlier, not scheduled):
 - Searching message text.
 - Deleting sessions on the agent's side.
 - t3code's pin, snooze and drag-to-reorder.
-- A git-branch line per thread (only the project's current branch is shown).
+- A git-branch line per thread (only the project's current branch is shown). Planned with
+  worktrees in `docs/plan.md`.

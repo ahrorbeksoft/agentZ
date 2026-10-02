@@ -18,10 +18,11 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 3. Agent control (MCP and CLI) | Not started |
 | 4. Subthreads | Not started |
 | 5. Diffs | Not started |
-| 6. Terminals | Not started |
-| 7. Terminal agent detection | Not started |
-| 8. Machines over SSH | Not started |
-| 9. Polish | Not started |
+| 6. Worktrees | Not started |
+| 7. Terminals | Not started |
+| 8. Terminal agent detection | Not started |
+| 9. Machines over SSH | Not started |
+| 10. Polish | Not started |
 
 ## 0. Spike
 
@@ -123,7 +124,31 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Diff panel: This turn / All changes, files and hunks, mark as viewed.
 - [ ] Tests with temporary repositories.
 
-## 6. Terminals
+## 6. Worktrees
+
+- [ ] Thread workspace in `projects`: worktree path and branch. The ACP session's `cwd` follows
+      it.
+- [ ] Server: create a worktree:
+  - [ ] `git worktree add -b agentz/<id> <data>/worktrees/<repo>/<branch> <base>`;
+  - [ ] recursive submodules;
+  - [ ] list the project's worktrees.
+- [ ] New Thread › Workspace: Current checkout / New worktree (base branch) / existing
+      worktree. Thread menu: New thread in this worktree.
+- [ ] Cards show the thread's own branch. The details popover shows the worktree folder.
+- [ ] Project Settings › Checkouts:
+  - [ ] list worktrees;
+  - [ ] remove with `git worktree remove`, asking again before forcing;
+  - [ ] keep branches;
+  - [ ] refuse while the worktree is in use.
+- [ ] Tools:
+  - [ ] `agentz_worktree_status`, `agentz_worktree_list`;
+  - [ ] `agentz_worktree_handoff`, reopening the session with `session/load` in the new `cwd`
+        or a new session;
+  - [ ] `workspaceStrategy` on `agentz_thread_launch` and `delegate_task`.
+- [ ] Diffs: restoring files only for a thread in its own, unshared worktree.
+- [ ] Tests with temporary repositories.
+
+## 7. Terminals
 
 - [ ] Server: port Zed's `terminal` (PTY plus `alacritty_terminal`) without settings, tasks or
       workspace. Keep 5,000 lines and 8 MiB of scrollback.
@@ -140,14 +165,14 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Terminals survive app restarts, keeping their screen and scrollback.
 - [ ] Tests: a scripted `sh` session and its screen snapshots.
 
-## 7. Terminal agent detection
+## 8. Terminal agent detection
 
 - [ ] Port herdr's manifest format and matcher, reading the bottom of the screen buffer. Keep
       herdr's Apache-2.0 notice.
 - [ ] Bundle herdr's manifests for the CLIs we offer.
 - [ ] Feed the result into the attention states.
 
-## 8. Machines over SSH
+## 9. Machines over SSH
 
 - [ ] Client: saved machine profiles and Settings › Machines (add, rename, disable, remove).
 - [ ] SSH transport:
@@ -182,7 +207,7 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Ask before replacing a running remote server.
 - [ ] Test against a real target from the user.
 
-## 9. Polish
+## 10. Polish
 
 - [ ] Optional start at login (launchd agent, systemd user service).
 - [ ] Remote server updates, only after the user confirms.
@@ -215,3 +240,5 @@ Note anything that changed the plan under **Findings**, and update the plan itse
     options;
   - checkouts on the same machine merge too;
   - branches aren't compared.
+- 2026-10-03: Added worktrees (phase 6), from t3code's workspace model and herdr's layout and
+  safe removal. Later phases are renumbered.
