@@ -2,6 +2,7 @@
 //! the way Zed picks it: a mode, plus one theme for light appearance and one for dark.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task, WindowAppearance};
@@ -109,7 +110,9 @@ fn apply_theme(settings: &AppSettings, cx: &mut App) {
     let registry = ThemeRegistry::global(cx);
     match registry.get(name).or_else(|_| registry.get(fallback)) {
         Ok(theme) => {
-            if cx.theme().name != theme.name {
+            // Compared by identity rather than name: at startup the active theme is the
+            // built-in fallback, which shares its name with the bundled "One Dark".
+            if !Arc::ptr_eq(cx.theme(), &theme) {
                 GlobalTheme::update_theme(cx, theme);
                 cx.refresh_windows();
             }
