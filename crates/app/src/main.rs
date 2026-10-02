@@ -1,5 +1,6 @@
 mod agent_view;
 mod new_thread_modal;
+mod project_info;
 mod project_switcher;
 mod shell;
 mod sidebar;

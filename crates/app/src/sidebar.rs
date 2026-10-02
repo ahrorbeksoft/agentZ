@@ -1,10 +1,12 @@
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use collections::HashMap;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
     KeyBinding, PromptLevel, Subscription, Task, Window,
 };
-use projects::{ProjectStore, Thread, ThreadId, ThreadOrder};
+use projects::{Project, ProjectId, ProjectStore, Thread, ThreadId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
@@ -12,10 +14,14 @@ use ui::{
     right_click_menu,
 };
 
+use crate::project_info::{ProjectInfo, render_project_icon};
 use crate::{NewThread, OpenFolder};
 
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// How often project icons and checked-out branches are re-read.
+const PROJECT_INFO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const CARD_HEIGHT: Pixels = px(78.);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 const RENAME_KEY_CONTEXT: &str = "SidebarRename";
 const ARCHIVED_ROW_HEIGHT: Pixels = px(36.);
@@ -43,11 +49,13 @@ pub struct Sidebar {
     active_thread: Option<ThreadId>,
     search: Entity<TextInput>,
     archived_shown: usize,
+    project_info: HashMap<ProjectId, ProjectInfo>,
     renaming_thread: Option<ThreadId>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     _activity_refresh: Task<()>,
+    _project_info_refresh: Task<()>,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -78,17 +86,53 @@ impl Sidebar {
                 }
             }
         });
+        let project_info_refresh = cx.spawn({
+            let store = store.clone();
+            async move |this, cx| {
+                loop {
+                    let roots: Vec<(ProjectId, PathBuf)> = store.read_with(cx, |store, _| {
+                        store
+                            .projects()
+                            .iter()
+                            .map(|project| (project.id, project.path.clone()))
+                            .collect()
+                    });
+                    let project_info = cx
+                        .background_spawn(async move {
+                            roots
+                                .into_iter()
+                                .map(|(id, root)| (id, ProjectInfo::read(&root)))
+                                .collect::<HashMap<_, _>>()
+                        })
+                        .await;
+                    let updated = this.update(cx, |this, cx| {
+                        if this.project_info != project_info {
+                            this.project_info = project_info;
+                            cx.notify();
+                        }
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(PROJECT_INFO_REFRESH_INTERVAL)
+                        .await;
+                }
+            }
+        });
         Self {
             store,
             registry,
             active_thread: None,
             search,
             archived_shown: ARCHIVED_INITIAL_COUNT,
+            project_info: HashMap::default(),
             renaming_thread: None,
             rename_input,
             _rename_blur: None,
             _subscriptions: subscriptions,
             _activity_refresh: activity_refresh,
+            _project_info_refresh: project_info_refresh,
         }
     }
 
@@ -272,12 +316,21 @@ impl Sidebar {
         })
     }
 
-    /// t3code's thread card: the project and status on top, the title below. The agent's icon
-    /// sits at the bottom right.
+    fn render_project_icon(&self, project: Option<&Project>, cx: &App) -> AnyElement {
+        match project {
+            Some(project) => {
+                render_project_icon(&project.name(), self.project_info.get(&project.id), cx)
+            }
+            None => div().size_4().flex_none().into_any_element(),
+        }
+    }
+
+    /// t3code's thread card: the project and status on top, then the title, then the branch with
+    /// the agent's icon at the bottom right.
     fn render_thread_card(
         &self,
         thread: Thread,
-        project_name: Option<SharedString>,
+        project: Option<Project>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -288,6 +341,13 @@ impl Sidebar {
         let is_working = self.store.read(cx).is_thread_working(thread.id);
         let thread_id = thread.id;
         let icon = self.agent_icon(&thread, cx);
+        let project_icon = self.render_project_icon(project.as_ref(), cx);
+        let project_name = project.as_ref().map(|project| project.name());
+        let git_head = project
+            .as_ref()
+            .and_then(|project| self.project_info.get(&project.id))
+            .and_then(|info| info.git_head.clone());
+        let faint_text = cx.theme().colors().text_muted.opacity(0.4);
         let time = thread
             .last_activity_at
             .map(|time| format_relative_time(time, SystemTime::now()));
@@ -336,9 +396,9 @@ impl Sidebar {
             .group(group_name.clone())
             .relative()
             .w_full()
+            .h(CARD_HEIGHT)
             .px_2p5()
             .py_2()
-            .gap_1()
             .rounded_md()
             .when(is_active, |card| card.bg(selected_background))
             .when(!is_renaming, |card| {
@@ -348,9 +408,11 @@ impl Sidebar {
             })
             .child(
                 h_flex()
+                    .relative()
                     .h_5()
                     .min_w_0()
                     .gap_1p5()
+                    .child(project_icon)
                     .child(div().flex_1().min_w_0().children(project_name.map(|name| {
                         Label::new(name)
                             .size(LabelSize::Small)
@@ -368,32 +430,64 @@ impl Sidebar {
                     )
                     .when(!is_renaming, |row| {
                         row.child(
-                            div()
+                            // Centered on the project line, like t3code's Settle button.
+                            h_flex()
                                 .absolute()
-                                .top_1p5()
-                                .right_1()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
                                 .visible_on_hover(group_name.clone())
                                 .child(archive_button),
                         )
                     }),
             )
+            .child(h_flex().mt_1().min_w_0().child(if is_renaming {
+                self.render_rename_input(cx)
+            } else {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        Label::new(title.clone())
+                            .weight(FontWeight::MEDIUM)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            }))
             .child(
                 h_flex()
+                    .mt_0p5()
                     .min_w_0()
                     .gap_1p5()
-                    .child(if is_renaming {
-                        self.render_rename_input(cx)
-                    } else {
-                        div()
-                            .flex_1()
-                            .min_w_0()
+                    .child(h_flex().flex_1().min_w_0().gap_1().when_some(
+                        git_head,
+                        |this, git_head| {
+                            this.when_some(git_head.worktree.clone(), |this, worktree| {
+                                let tooltip = format!(
+                                    "Worktree: {} ({})",
+                                    worktree.display(),
+                                    git_head.branch
+                                );
+                                this.child(
+                                    div()
+                                        .id(("thread-worktree", thread_id.0))
+                                        .flex_none()
+                                        .tooltip(Tooltip::text(tooltip))
+                                        .child(
+                                            Icon::new(IconName::GitWorktree)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Custom(faint_text)),
+                                        ),
+                                )
+                            })
                             .child(
-                                Label::new(title.clone())
-                                    .weight(FontWeight::MEDIUM)
-                                    .truncate(),
+                                Label::new(git_head.branch)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Custom(faint_text))
+                                    .truncate_middle(),
                             )
-                            .into_any_element()
-                    })
+                        },
+                    ))
                     .child(
                         div()
                             .flex_none()
@@ -473,7 +567,8 @@ impl Sidebar {
             .into_any_element()
     }
 
-    /// t3code's slim row for parked threads: dimmed until hovered, with a way back on hover.
+    /// t3code's slim row for parked threads: the project's icon, dimmed until hovered, and a way
+    /// back on hover.
     fn render_archived_row(&self, thread: Thread, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
         let hover_background = colors.ghost_element_hover;
@@ -481,7 +576,8 @@ impl Sidebar {
         let is_active = self.active_thread == Some(thread.id);
         let is_renaming = self.renaming_thread == Some(thread.id);
         let thread_id = thread.id;
-        let icon = self.agent_icon(&thread, cx);
+        let project = self.store.read(cx).project(thread.project_id).cloned();
+        let project_icon = self.render_project_icon(project.as_ref(), cx);
         let time = thread
             .archived_at
             .map(|time| format_relative_time(time, SystemTime::now()));
@@ -511,7 +607,7 @@ impl Sidebar {
                         this.opacity(0.4)
                             .group_hover(group_name.clone(), |this| this.opacity(1.))
                     })
-                    .child(icon.size(IconSize::Small).color(Color::Muted)),
+                    .child(project_icon),
             )
             .child(if is_renaming {
                 self.render_rename_input(cx)
@@ -666,16 +762,11 @@ impl Sidebar {
     fn render_threads(&self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.search_query(cx);
         let store = self.store.read(cx);
-        let active: Vec<(Thread, Option<SharedString>)> = store
+        let active: Vec<(Thread, Option<Project>)> = store
             .active_threads()
             .into_iter()
             .filter(|thread| matches_query(thread, &query))
-            .map(|thread| {
-                let project_name = store
-                    .project(thread.project_id)
-                    .map(|project| project.name());
-                (thread.clone(), project_name)
-            })
+            .map(|thread| (thread.clone(), store.project(thread.project_id).cloned()))
             .collect();
         let archived: Vec<Thread> = store
             .archived_threads()
@@ -687,8 +778,8 @@ impl Sidebar {
         let is_archived_expanded = store.archived_expanded() || !query.is_empty();
 
         let mut rows = Vec::with_capacity(active.len());
-        for (thread, project_name) in active {
-            rows.push(self.render_thread_card(thread, project_name, cx));
+        for (thread, project) in active {
+            rows.push(self.render_thread_card(thread, project, cx));
         }
         if rows.is_empty() {
             rows.push(
