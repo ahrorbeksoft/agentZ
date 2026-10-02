@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{
-    AgentThread, ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore,
-    ToolCall,
+    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
 };
 use collections::{HashMap, HashSet};
 use gpui::{
@@ -22,6 +21,7 @@ use ui::{
 };
 
 use crate::registry_store::AgentRegistryStore;
+use crate::thread_entity::AgentThread;
 
 const KEY_CONTEXT: &str = "AgentComposer";
 

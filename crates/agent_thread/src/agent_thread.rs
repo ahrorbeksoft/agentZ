@@ -2,10 +2,13 @@
 //! project folder, and keeps the conversation (messages, tool calls, plan, permission
 //! requests) as it streams in.
 //!
-//! The connection setup follows Zed's `agent_servers::acp`: the SDK's handlers must be `Send`,
-//! so they forward everything onto a channel that is processed on the foreground thread.
+//! The connection setup follows Zed's `agent_servers::acp`. Plain Rust on tokio, so the server
+//! can own it: the agent's process, the SDK's handlers and requests in flight report back as
+//! [`ThreadMessage`]s, which the thread's owner passes to [`AgentThread::handle`]. What the
+//! owner should hear about queues up as [`AgentThreadEvent`]s.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Instant;
@@ -15,9 +18,12 @@ use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
-use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _};
-use gpui::{AppContext as _, Context, EventEmitter, SharedString, Task};
+use futures::{FutureExt as _, StreamExt as _};
+use gpui_shared_string::SharedString;
 use registry::AgentCommand;
+pub use registry::CommandFuture;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use tokio::task::JoinSet;
 
 const STDERR_LINES_KEPT: usize = 20;
 
@@ -203,6 +209,59 @@ pub struct SessionDefaults {
     pub config_options: Vec<(acp::SessionConfigId, acp::SessionConfigOptionValue)>,
 }
 
+/// The result of background work, for [`AgentThread::handle`].
+pub struct ThreadMessage {
+    /// Which connection the message belongs to. Messages from before a reload are dropped.
+    generation: u64,
+    kind: MessageKind,
+}
+
+pub type ThreadInbox = mpsc::UnboundedReceiver<ThreadMessage>;
+
+enum MessageKind {
+    Connected(Result<(AgentCommand, Connected)>),
+    Incoming(Incoming),
+    Stderr(String),
+    Exited(String),
+    SessionOpened {
+        connection: ConnectionTo<Agent>,
+        result: std::result::Result<SessionSetup, agent_client_protocol::Error>,
+    },
+    Authenticated {
+        method_name: Option<SharedString>,
+        result: std::result::Result<(), agent_client_protocol::Error>,
+    },
+    LoggedOut(std::result::Result<(), agent_client_protocol::Error>),
+    ConfigOptionSet {
+        previous: Vec<acp::SessionConfigOption>,
+        result:
+            std::result::Result<acp::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
+    },
+    ModeSet {
+        previous_mode: acp::SessionModeId,
+        result: std::result::Result<(), agent_client_protocol::Error>,
+    },
+    PromptFinished(std::result::Result<acp::PromptResponse, agent_client_protocol::Error>),
+}
+
+#[derive(Clone)]
+struct MessageSender {
+    sender: mpsc::UnboundedSender<ThreadMessage>,
+    generation: u64,
+}
+
+impl MessageSender {
+    /// Hands the message back if the thread is gone.
+    fn send(&self, kind: MessageKind) -> std::result::Result<(), Box<MessageKind>> {
+        self.sender
+            .unbounded_send(ThreadMessage {
+                generation: self.generation,
+                kind,
+            })
+            .map_err(|error| Box::new(error.into_inner().kind))
+    }
+}
+
 enum Incoming {
     Notification(acp::SessionNotification),
     Permission(
@@ -256,234 +315,74 @@ pub struct AgentThread {
     /// ask directly, so this is the closest status there is. `None` until known.
     logged_in: Option<bool>,
     defaults: SessionDefaults,
-    _tasks: Vec<Task<()>>,
+    events: Vec<AgentThreadEvent>,
+    /// `None` for a thread that never starts.
+    runtime: Option<tokio::runtime::Handle>,
+    messages: mpsc::UnboundedSender<ThreadMessage>,
+    generation: u64,
+    /// The agent process, its connection and requests in flight. Dropping the thread (or
+    /// reloading it) aborts them, which also stops the agent.
+    tasks: JoinSet<()>,
 }
-
-impl EventEmitter<AgentThreadEvent> for AgentThread {}
 
 impl AgentThread {
     /// Starts the agent and an ACP session in `cwd`. With `previous_session`, the earlier
     /// conversation is loaded (or at least resumed) when the agent supports it. Prompts sent
     /// before the session is ready are queued.
+    ///
+    /// Pass what arrives on the returned inbox to [`Self::handle`], and drain
+    /// [`Self::take_events`] after each call.
     pub fn start(
+        runtime: tokio::runtime::Handle,
         agent_name: SharedString,
-        command: Task<Result<AgentCommand>>,
+        command: CommandFuture,
         cwd: PathBuf,
         previous_session: Option<acp::SessionId>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut this = Self::new(agent_name, ConnectionStatus::Connecting, cwd);
+    ) -> (Self, ThreadInbox) {
+        let (mut this, inbox) =
+            Self::new(Some(runtime), agent_name, ConnectionStatus::Connecting, cwd);
         this.previous_session = previous_session;
-        this.connect_agent(command, cx);
-        this
+        this.connect_agent(command);
+        (this, inbox)
     }
 
     /// Starts the agent only to log in or out of it, as from its settings. No session is opened,
     /// so the agent starts in a scratch directory.
     pub fn start_for_account(
+        runtime: tokio::runtime::Handle,
         agent_name: SharedString,
-        command: Task<Result<AgentCommand>>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut this = Self::new(
+        command: CommandFuture,
+    ) -> (Self, ThreadInbox) {
+        let (mut this, inbox) = Self::new(
+            Some(runtime),
             agent_name,
             ConnectionStatus::Connecting,
             std::env::temp_dir(),
         );
         this.opens_session = false;
-        this.connect_agent(command, cx);
-        this
-    }
-
-    fn connect_agent(&mut self, command: Task<Result<AgentCommand>>, cx: &mut Context<Self>) {
-        let connect = cx.spawn({
-            let cwd = self.cwd.clone();
-            async move |this, cx| {
-                let result = async {
-                    let command = command.await?;
-                    let connected = connect(command.clone(), cwd, this.clone(), cx).await?;
-                    anyhow::Ok((command, connected))
-                }
-                .await;
-                this.update(cx, |this, cx| match result {
-                    Ok((command, connected)) => {
-                        this.command = Some(command);
-                        this.connection = Some(connected.connection);
-                        this.capabilities = connected.capabilities;
-                        this.auth_methods = connected.auth_methods;
-                        this.agent_info = connected.agent_info;
-                        // An account connection opens an empty session too: it is how the login
-                        // status (and the agent's settings) can be learned over ACP.
-                        this.open_session(cx);
-                    }
-                    Err(error) => {
-                        log::error!("failed to start agent: {error:#}");
-                        this.fail(format!("{error:#}"), cx);
-                    }
-                })
-                .ok();
-            }
-        });
-        self._tasks.push(connect);
-    }
-
-    /// Zed's "Reload Agent": restarts the agent and reopens the session, whose history the
-    /// agent replays when it can load sessions.
-    pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let Some(command) = self.command.clone() else {
-            return;
-        };
-        // Dropping the tasks stops the agent process along with its connection.
-        self._tasks.clear();
-        self.connection = None;
-        self.session = None;
-        self.entries.clear();
-        self.plan.clear();
-        self.permission_requests.clear();
-        self.queued_prompts.clear();
-        self.auth_error = None;
-        self.turn_error = None;
-        self.status = ConnectionStatus::Connecting;
-        self.set_working(false, cx);
-        self.connect_agent(Task::ready(Ok(command)), cx);
-        cx.notify();
-    }
-
-    /// Whether the agent advertises ACP's logout method.
-    pub fn supports_logout(&self) -> bool {
-        self.capabilities.auth.logout.is_some()
-    }
-
-    /// Zed's "Reauthenticate": shows the agent's login methods again.
-    pub fn reauthenticate(&mut self, cx: &mut Context<Self>) {
-        if self.auth_methods.is_empty() || self.connection.is_none() {
-            return;
-        }
-        self.status = ConnectionStatus::AuthRequired;
-        self.auth_error = None;
-        self.account_notice = None;
-        cx.notify();
-    }
-
-    /// Logs out of the agent. A thread then asks to log in again, as in Zed.
-    pub fn logout(&mut self, cx: &mut Context<Self>) {
-        let Some(connection) = self.connection.clone() else {
-            return;
-        };
-        if !self.supports_logout() {
-            return;
-        }
-        let request = connection
-            .send_request(acp::LogoutRequest::new())
-            .block_task();
-        self.account_notice = None;
-        cx.spawn(async move |this, cx| {
-            let result = request.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(_) => {
-                        this.auth_error = None;
-                        this.logged_in = Some(false);
-                        cx.emit(AgentThreadEvent::LoggedOut);
-                        if this.opens_session {
-                            this.status = ConnectionStatus::AuthRequired;
-                        } else {
-                            this.account_notice = Some("Logged out.".into());
-                            this.session = None;
-                        }
-                    }
-                    Err(error) => {
-                        this.auth_error =
-                            Some(format!("Couldn't log out: {}", error_message(&error)).into())
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// For a connection made from settings: opens a fresh empty session (sending no prompt) to
-    /// learn again whether the agent is logged in, e.g. after logging in through a terminal.
-    pub fn check_login(&mut self, cx: &mut Context<Self>) {
-        if self.opens_session || self.connection.is_none() {
-            return;
-        }
-        self.session = None;
-        self.account_notice = None;
-        self.open_session(cx);
-    }
-
-    /// Whether the agent is logged in, as far as ACP can tell; see the field.
-    pub fn logged_in(&self) -> Option<bool> {
-        self.logged_in
-    }
-
-    /// Settings for new sessions; see [`SessionDefaults`].
-    pub fn set_defaults(&mut self, defaults: SessionDefaults) {
-        self.defaults = defaults;
-    }
-
-    pub fn agent_info(&self) -> Option<&acp::Implementation> {
-        self.agent_info.as_ref()
-    }
-
-    /// Applies the defaults the session doesn't already match. Values the agent no longer
-    /// offers are skipped.
-    fn apply_defaults(&mut self, cx: &mut Context<Self>) {
-        let defaults = self.defaults.clone();
-        if let Some(mode) = defaults.mode
-            && let Some(modes) = &self.modes
-            && modes.current_mode_id != mode
-            && modes
-                .available_modes
-                .iter()
-                .any(|available| available.id == mode)
-        {
-            self.send_mode(mode, cx);
-        }
-        for (config_id, value) in defaults.config_options {
-            let Some(option) = self
-                .config_options
-                .iter()
-                .find(|option| option.id == config_id)
-            else {
-                continue;
-            };
-            let applies = match (&option.kind, &value) {
-                (
-                    acp::SessionConfigKind::Select(select),
-                    acp::SessionConfigOptionValue::ValueId { value },
-                ) => select.current_value != *value && select_offers(select, value),
-                (
-                    acp::SessionConfigKind::Boolean(boolean),
-                    acp::SessionConfigOptionValue::Boolean { value },
-                ) => boolean.current_value != *value,
-                _ => false,
-            };
-            if applies {
-                self.send_config_option(config_id, value, cx);
-            }
-        }
-    }
-
-    /// What happened on the last log in or out of an account connection.
-    pub fn account_notice(&self) -> Option<&SharedString> {
-        self.account_notice.as_ref()
+        this.connect_agent(command);
+        (this, inbox)
     }
 
     /// A thread that cannot start, e.g. because its agent is not installed.
     pub fn failed(agent_name: SharedString, error: impl Into<SharedString>) -> Self {
-        Self::new(
+        let (this, _) = Self::new(
+            None,
             agent_name,
             ConnectionStatus::Failed(error.into()),
             PathBuf::new(),
-        )
+        );
+        this
     }
 
-    fn new(agent_name: SharedString, status: ConnectionStatus, cwd: PathBuf) -> Self {
-        Self {
+    fn new(
+        runtime: Option<tokio::runtime::Handle>,
+        agent_name: SharedString,
+        status: ConnectionStatus,
+        cwd: PathBuf,
+    ) -> (Self, ThreadInbox) {
+        let (messages, inbox) = mpsc::unbounded();
+        let this = Self {
             agent_name,
             status,
             entries: Vec::new(),
@@ -514,11 +413,289 @@ impl AgentThread {
             agent_info: None,
             logged_in: None,
             defaults: SessionDefaults::default(),
-            _tasks: Vec::new(),
+            events: Vec::new(),
+            runtime,
+            messages,
+            generation: 0,
+            tasks: JoinSet::new(),
+        };
+        (this, inbox)
+    }
+
+    /// The events since the last call, oldest first.
+    pub fn take_events(&mut self) -> Vec<AgentThreadEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn emit(&mut self, event: AgentThreadEvent) {
+        self.events.push(event);
+    }
+
+    fn sender(&self) -> MessageSender {
+        MessageSender {
+            sender: self.messages.clone(),
+            generation: self.generation,
         }
     }
 
-    fn open_session(&mut self, cx: &mut Context<Self>) {
+    /// Runs `work` in the background and passes its result back through the inbox.
+    fn spawn(&mut self, work: impl Future<Output = MessageKind> + Send + 'static) {
+        let sender = self.sender();
+        self.spawn_task(async move {
+            sender.send(work.await).ok();
+        });
+    }
+
+    fn spawn_task(&mut self, task: impl Future<Output = ()> + Send + 'static) {
+        let Some(runtime) = &self.runtime else {
+            log::error!("{} can't start background work", self.agent_name);
+            return;
+        };
+        while self.tasks.try_join_next().is_some() {}
+        self.tasks.spawn_on(task, runtime);
+    }
+
+    fn connect_agent(&mut self, command: CommandFuture) {
+        let cwd = self.cwd.clone();
+        let sender = self.sender();
+        self.spawn_task(async move {
+            // The agent's own tasks, which stop the agent when dropped.
+            let mut agent_tasks = JoinSet::new();
+            let result = async {
+                let command = command.await?;
+                let connected =
+                    connect(command.clone(), cwd, sender.clone(), &mut agent_tasks).await?;
+                anyhow::Ok((command, connected))
+            }
+            .await;
+            let connected = result.is_ok();
+            sender.send(MessageKind::Connected(result)).ok();
+            if connected {
+                while agent_tasks.join_next().await.is_some() {}
+            }
+        });
+    }
+
+    /// Applies the result of background work.
+    pub fn handle(&mut self, message: ThreadMessage) {
+        if message.generation != self.generation {
+            if let MessageKind::Incoming(Incoming::Permission(_, responder)) = message.kind {
+                cancel_permission(responder);
+            }
+            return;
+        }
+        match message.kind {
+            MessageKind::Connected(Ok((command, connected))) => {
+                self.command = Some(command);
+                self.connection = Some(connected.connection);
+                self.capabilities = connected.capabilities;
+                self.auth_methods = connected.auth_methods;
+                self.agent_info = connected.agent_info;
+                // An account connection opens an empty session too: it is how the login
+                // status (and the agent's settings) can be learned over ACP.
+                self.open_session();
+            }
+            MessageKind::Connected(Err(error)) => {
+                log::error!("failed to start agent: {error:#}");
+                self.fail(format!("{error:#}"));
+            }
+            MessageKind::Incoming(incoming) => self.handle_incoming(incoming),
+            MessageKind::Stderr(line) => self.record_stderr(line),
+            MessageKind::Exited(message) => self.fail(message),
+            MessageKind::SessionOpened { connection, result } => {
+                self.session_opened(connection, result)
+            }
+            MessageKind::Authenticated {
+                method_name,
+                result,
+            } => match result {
+                Ok(()) => {
+                    if let Some(method_name) = method_name {
+                        self.emit(AgentThreadEvent::LoggedIn(method_name));
+                    }
+                    if !self.opens_session {
+                        self.account_notice = Some("Logged in.".into());
+                        self.session = None;
+                    }
+                    self.open_session();
+                }
+                Err(error) => {
+                    self.status = ConnectionStatus::AuthRequired;
+                    self.auth_error = Some(error_message(&error).into());
+                }
+            },
+            MessageKind::LoggedOut(result) => match result {
+                Ok(()) => {
+                    self.auth_error = None;
+                    self.logged_in = Some(false);
+                    self.emit(AgentThreadEvent::LoggedOut);
+                    if self.opens_session {
+                        self.status = ConnectionStatus::AuthRequired;
+                    } else {
+                        self.account_notice = Some("Logged out.".into());
+                        self.session = None;
+                    }
+                }
+                Err(error) => {
+                    self.auth_error =
+                        Some(format!("Couldn't log out: {}", error_message(&error)).into())
+                }
+            },
+            MessageKind::ConfigOptionSet { previous, result } => match result {
+                Ok(response) => self.config_options = response.config_options,
+                Err(error) => {
+                    log::error!("failed to change an agent setting: {error:?}");
+                    self.config_options = previous;
+                }
+            },
+            MessageKind::ModeSet {
+                previous_mode,
+                result,
+            } => {
+                if let Err(error) = result {
+                    log::error!("failed to change the agent's mode: {error:?}");
+                    if let Some(modes) = &mut self.modes {
+                        modes.current_mode_id = previous_mode;
+                    }
+                }
+            }
+            MessageKind::PromptFinished(result) => {
+                match result {
+                    Ok(response) => self.last_stop_reason = Some(response.stop_reason),
+                    Err(error) => {
+                        log::error!("agent prompt failed: {error:?}");
+                        self.turn_error = Some(error_message(&error).into());
+                    }
+                }
+                // A finished turn can't still be waiting on a permission answer.
+                self.cancel_permission_requests();
+                self.set_working(false);
+            }
+        }
+    }
+
+    /// Zed's "Reload Agent": restarts the agent and reopens the session, whose history the
+    /// agent replays when it can load sessions.
+    pub fn reload(&mut self) {
+        let Some(command) = self.command.clone() else {
+            return;
+        };
+        // Aborting the tasks stops the agent process along with its connection.
+        self.tasks.abort_all();
+        self.generation += 1;
+        self.connection = None;
+        self.session = None;
+        self.entries.clear();
+        self.plan.clear();
+        self.cancel_permission_requests();
+        self.queued_prompts.clear();
+        self.auth_error = None;
+        self.turn_error = None;
+        self.status = ConnectionStatus::Connecting;
+        self.set_working(false);
+        self.connect_agent(futures::future::ready(Ok(command)).boxed());
+    }
+
+    /// Whether the agent advertises ACP's logout method.
+    pub fn supports_logout(&self) -> bool {
+        self.capabilities.auth.logout.is_some()
+    }
+
+    /// Zed's "Reauthenticate": shows the agent's login methods again.
+    pub fn reauthenticate(&mut self) {
+        if self.auth_methods.is_empty() || self.connection.is_none() {
+            return;
+        }
+        self.status = ConnectionStatus::AuthRequired;
+        self.auth_error = None;
+        self.account_notice = None;
+    }
+
+    /// Logs out of the agent. A thread then asks to log in again, as in Zed.
+    pub fn logout(&mut self) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        if !self.supports_logout() {
+            return;
+        }
+        let request = connection
+            .send_request(acp::LogoutRequest::new())
+            .block_task();
+        self.account_notice = None;
+        self.spawn(async move { MessageKind::LoggedOut(request.await.map(|_| ())) });
+    }
+
+    /// For a connection made from settings: opens a fresh empty session (sending no prompt) to
+    /// learn again whether the agent is logged in, e.g. after logging in through a terminal.
+    pub fn check_login(&mut self) {
+        if self.opens_session || self.connection.is_none() {
+            return;
+        }
+        self.session = None;
+        self.account_notice = None;
+        self.open_session();
+    }
+
+    /// Whether the agent is logged in, as far as ACP can tell; see the field.
+    pub fn logged_in(&self) -> Option<bool> {
+        self.logged_in
+    }
+
+    /// Settings for new sessions; see [`SessionDefaults`].
+    pub fn set_defaults(&mut self, defaults: SessionDefaults) {
+        self.defaults = defaults;
+    }
+
+    pub fn agent_info(&self) -> Option<&acp::Implementation> {
+        self.agent_info.as_ref()
+    }
+
+    /// Applies the defaults the session doesn't already match. Values the agent no longer
+    /// offers are skipped.
+    fn apply_defaults(&mut self) {
+        let defaults = self.defaults.clone();
+        if let Some(mode) = defaults.mode
+            && let Some(modes) = &self.modes
+            && modes.current_mode_id != mode
+            && modes
+                .available_modes
+                .iter()
+                .any(|available| available.id == mode)
+        {
+            self.send_mode(mode);
+        }
+        for (config_id, value) in defaults.config_options {
+            let Some(option) = self
+                .config_options
+                .iter()
+                .find(|option| option.id == config_id)
+            else {
+                continue;
+            };
+            let applies = match (&option.kind, &value) {
+                (
+                    acp::SessionConfigKind::Select(select),
+                    acp::SessionConfigOptionValue::ValueId { value },
+                ) => select.current_value != *value && select_offers(select, value),
+                (
+                    acp::SessionConfigKind::Boolean(boolean),
+                    acp::SessionConfigOptionValue::Boolean { value },
+                ) => boolean.current_value != *value,
+                _ => false,
+            };
+            if applies {
+                self.send_config_option(config_id, value);
+            }
+        }
+    }
+
+    /// What happened on the last log in or out of an account connection.
+    pub fn account_notice(&self) -> Option<&SharedString> {
+        self.account_notice.as_ref()
+    }
+
+    fn open_session(&mut self) {
         let Some(connection) = self.connection.clone() else {
             return;
         };
@@ -530,47 +707,50 @@ impl AgentThread {
             self.cwd.clone(),
             self.previous_session.clone(),
         );
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = opening.await;
-            this.update(cx, |this, cx| match result {
-                Ok(setup) => {
-                    this.config_options = setup.config_options;
-                    this.modes = setup.modes;
-                    this.session_restore = Some(setup.restore);
-                    this.session = Some(Session {
-                        connection,
-                        session_id: setup.session_id,
-                    });
-                    if matches!(
-                        setup.restore,
-                        SessionRestore::Loaded | SessionRestore::ResumedWithoutHistory
-                    ) {
-                        this.remember_session(cx);
-                    }
-                    this.status = ConnectionStatus::Ready;
-                    this.logged_in = Some(true);
-                    if setup.restore == SessionRestore::New && this.opens_session {
-                        this.apply_defaults(cx);
-                    }
-                    for prompt in std::mem::take(&mut this.queued_prompts) {
-                        this.send_to_agent(prompt, cx);
-                    }
-                    cx.notify();
+        self.spawn(async move {
+            MessageKind::SessionOpened {
+                connection,
+                result: opening.await,
+            }
+        });
+    }
+
+    fn session_opened(
+        &mut self,
+        connection: ConnectionTo<Agent>,
+        result: std::result::Result<SessionSetup, agent_client_protocol::Error>,
+    ) {
+        match result {
+            Ok(setup) => {
+                self.config_options = setup.config_options;
+                self.modes = setup.modes;
+                self.session_restore = Some(setup.restore);
+                self.session = Some(Session {
+                    connection,
+                    session_id: setup.session_id,
+                });
+                if matches!(
+                    setup.restore,
+                    SessionRestore::Loaded | SessionRestore::ResumedWithoutHistory
+                ) {
+                    self.remember_session();
                 }
-                Err(error) if is_auth_required(&error) => {
-                    this.status = ConnectionStatus::AuthRequired;
-                    this.logged_in = Some(false);
-                    this.set_working(false, cx);
-                    cx.notify();
+                self.status = ConnectionStatus::Ready;
+                self.logged_in = Some(true);
+                if setup.restore == SessionRestore::New && self.opens_session {
+                    self.apply_defaults();
                 }
-                Err(error) => {
-                    this.fail(format!("starting a session: {}", error_message(&error)), cx)
+                for prompt in std::mem::take(&mut self.queued_prompts) {
+                    self.send_to_agent(prompt);
                 }
-            })
-            .ok();
-        })
-        .detach();
+            }
+            Err(error) if is_auth_required(&error) => {
+                self.status = ConnectionStatus::AuthRequired;
+                self.logged_in = Some(false);
+                self.set_working(false);
+            }
+            Err(error) => self.fail(format!("starting a session: {}", error_message(&error))),
+        }
     }
 
     pub fn auth_methods(&self) -> &[acp::AuthMethod] {
@@ -582,7 +762,7 @@ impl AgentThread {
     }
 
     /// Logs in with one of the agent's own methods, then opens the session.
-    pub fn authenticate(&mut self, method_id: acp::AuthMethodId, cx: &mut Context<Self>) {
+    pub fn authenticate(&mut self, method_id: acp::AuthMethodId) {
         let Some(connection) = self.connection.clone() else {
             return;
         };
@@ -596,35 +776,18 @@ impl AgentThread {
             .block_task();
         self.account_notice = None;
         self.status = ConnectionStatus::Connecting;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = request.await;
-            this.update(cx, |this, cx| match result {
-                Ok(_) => {
-                    if let Some(method_name) = method_name {
-                        cx.emit(AgentThreadEvent::LoggedIn(method_name));
-                    }
-                    if !this.opens_session {
-                        this.account_notice = Some("Logged in.".into());
-                        this.session = None;
-                    }
-                    this.open_session(cx);
-                }
-                Err(error) => {
-                    this.status = ConnectionStatus::AuthRequired;
-                    this.auth_error = Some(error_message(&error).into());
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        self.spawn(async move {
+            MessageKind::Authenticated {
+                method_name,
+                result: request.await.map(|_| ()),
+            }
+        });
     }
 
     /// Tries to open the session again, e.g. after logging in through a terminal.
-    pub fn retry_session(&mut self, cx: &mut Context<Self>) {
+    pub fn retry_session(&mut self) {
         if self.status == ConnectionStatus::AuthRequired {
-            self.open_session(cx);
+            self.open_session();
         }
     }
 
@@ -666,9 +829,8 @@ impl AgentThread {
         self.capabilities.prompt_capabilities.image
     }
 
-    pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
+    pub fn clear_plan(&mut self) {
         self.plan.clear();
-        cx.notify();
     }
 
     pub fn agent_name(&self) -> &SharedString {
@@ -721,30 +883,28 @@ impl AgentThread {
         })
     }
 
-    /// Changes one of the agent's session settings. The new value shows immediately and is
-    /// reverted if the agent rejects it.
-    /// Changes a setting at the user's request, which also makes it the agent's default.
+    /// Changes one of the agent's session settings at the user's request, which also makes it
+    /// the agent's default. The new value shows immediately and is reverted if the agent
+    /// rejects it.
     pub fn set_config_option(
         &mut self,
         config_id: acp::SessionConfigId,
         value: acp::SessionConfigOptionValue,
-        cx: &mut Context<Self>,
     ) {
         if self.session.is_none() {
             return;
         }
-        cx.emit(AgentThreadEvent::ConfigOptionChanged(
+        self.emit(AgentThreadEvent::ConfigOptionChanged(
             config_id.clone(),
             value.clone(),
         ));
-        self.send_config_option(config_id, value, cx);
+        self.send_config_option(config_id, value);
     }
 
     fn send_config_option(
         &mut self,
         config_id: acp::SessionConfigId,
         value: acp::SessionConfigOptionValue,
-        cx: &mut Context<Self>,
     ) {
         let Some(session) = &self.session else {
             return;
@@ -774,34 +934,24 @@ impl AgentThread {
         let request =
             acp::SetSessionConfigOptionRequest::new(session.session_id.clone(), config_id, value);
         let response = session.connection.send_request(request).block_task();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = response.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(response) => this.config_options = response.config_options,
-                    Err(error) => {
-                        log::error!("failed to change an agent setting: {error:?}");
-                        this.config_options = previous;
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.spawn(async move {
+            MessageKind::ConfigOptionSet {
+                previous,
+                result: response.await,
+            }
+        });
     }
 
     /// Changes the mode at the user's request, which also makes it the agent's default.
-    pub fn set_mode(&mut self, mode_id: acp::SessionModeId, cx: &mut Context<Self>) {
+    pub fn set_mode(&mut self, mode_id: acp::SessionModeId) {
         if self.session.is_none() || self.modes.is_none() {
             return;
         }
-        cx.emit(AgentThreadEvent::ModeChanged(mode_id.clone()));
-        self.send_mode(mode_id, cx);
+        self.emit(AgentThreadEvent::ModeChanged(mode_id.clone()));
+        self.send_mode(mode_id);
     }
 
-    fn send_mode(&mut self, mode_id: acp::SessionModeId, cx: &mut Context<Self>) {
+    fn send_mode(&mut self, mode_id: acp::SessionModeId) {
         let Some(session) = &self.session else {
             return;
         };
@@ -811,20 +961,12 @@ impl AgentThread {
         let previous_mode = std::mem::replace(&mut modes.current_mode_id, mode_id.clone());
         let request = acp::SetSessionModeRequest::new(session.session_id.clone(), mode_id);
         let response = session.connection.send_request(request).block_task();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            if let Err(error) = response.await {
-                log::error!("failed to change the agent's mode: {error:?}");
-                this.update(cx, |this, cx| {
-                    if let Some(modes) = &mut this.modes {
-                        modes.current_mode_id = previous_mode;
-                    }
-                    cx.notify();
-                })
-                .ok();
+        self.spawn(async move {
+            MessageKind::ModeSet {
+                previous_mode,
+                result: response.await.map(|_| ()),
             }
-        })
-        .detach();
+        });
     }
 
     pub fn plan(&self) -> &[PlanItem] {
@@ -862,7 +1004,7 @@ impl AgentThread {
         self.last_stop_reason.as_ref()
     }
 
-    pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
+    pub fn send(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.is_working() {
             return;
@@ -872,26 +1014,25 @@ impl AgentThread {
             .iter()
             .any(|entry| matches!(entry, Entry::UserMessage(_)))
         {
-            cx.emit(AgentThreadEvent::FirstPrompt(text.clone()));
+            self.emit(AgentThreadEvent::FirstPrompt(text.clone()));
         }
         self.entries.push(Entry::UserMessage(text.clone()));
         self.turn_error = None;
         match self.status {
-            ConnectionStatus::Ready => self.send_to_agent(text, cx),
+            ConnectionStatus::Ready => self.send_to_agent(text),
             ConnectionStatus::Connecting => {
                 self.queued_prompts.push(text);
-                self.set_working(true, cx);
+                self.set_working(true);
             }
             // Sent once the user has logged in and the session opens.
             ConnectionStatus::AuthRequired => self.queued_prompts.push(text),
             ConnectionStatus::Failed(_) => {}
         }
-        cx.notify();
     }
 
     /// Keeps the open session as the one to restore. A new session is only worth restoring once it
     /// has a prompt: agents don't save empty sessions, so loading one later would fail.
-    fn remember_session(&mut self, cx: &mut Context<Self>) {
+    fn remember_session(&mut self) {
         let Some(session) = &self.session else {
             return;
         };
@@ -901,11 +1042,11 @@ impl AgentThread {
         let session_id = session.session_id.clone();
         // Later retries should restore this session rather than start another.
         self.previous_session = Some(session_id.clone());
-        cx.emit(AgentThreadEvent::SessionStarted(session_id));
+        self.emit(AgentThreadEvent::SessionStarted(session_id));
     }
 
-    fn send_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
-        self.remember_session(cx);
+    fn send_to_agent(&mut self, text: String) {
+        self.remember_session();
         let Some(session) = &self.session else {
             return;
         };
@@ -914,36 +1055,12 @@ impl AgentThread {
             vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
         );
         let response = session.connection.send_request(request).block_task();
-        self.set_working(true, cx);
-        cx.spawn(async move |this, cx| {
-            let result = response.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(response) => this.last_stop_reason = Some(response.stop_reason),
-                    Err(error) => {
-                        log::error!("agent prompt failed: {error:?}");
-                        this.turn_error = Some(error_message(&error).into());
-                    }
-                }
-                // A finished turn can't still be waiting on a permission answer.
-                for request in this.permission_requests.drain(..) {
-                    request
-                        .responder
-                        .respond(acp::RequestPermissionResponse::new(
-                            acp::RequestPermissionOutcome::Cancelled,
-                        ))
-                        .ok();
-                }
-                this.set_working(false, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.set_working(true);
+        self.spawn(async move { MessageKind::PromptFinished(response.await) });
     }
 
     /// Asks the agent to stop the current turn.
-    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+    pub fn cancel(&mut self) {
         if !self.is_working() {
             return;
         }
@@ -956,24 +1073,15 @@ impl AgentThread {
             }
         } else {
             self.queued_prompts.clear();
-            self.set_working(false, cx);
+            self.set_working(false);
         }
-        for request in self.permission_requests.drain(..) {
-            request
-                .responder
-                .respond(acp::RequestPermissionResponse::new(
-                    acp::RequestPermissionOutcome::Cancelled,
-                ))
-                .ok();
-        }
-        cx.notify();
+        self.cancel_permission_requests();
     }
 
     pub fn respond_to_permission(
         &mut self,
         tool_call_id: &acp::ToolCallId,
         option_id: acp::PermissionOptionId,
-        cx: &mut Context<Self>,
     ) {
         let Some(index) = self
             .permission_requests
@@ -993,18 +1101,23 @@ impl AgentThread {
         {
             log::error!("failed to answer the agent's permission request: {error:?}");
         }
-        cx.notify();
     }
 
-    fn set_working(&mut self, working: bool, cx: &mut Context<Self>) {
+    fn cancel_permission_requests(&mut self) {
+        for request in self.permission_requests.drain(..) {
+            cancel_permission(request.responder);
+        }
+    }
+
+    fn set_working(&mut self, working: bool) {
         if working == self.is_working() {
             return;
         }
         self.turn_started_at = working.then(Instant::now);
-        cx.emit(AgentThreadEvent::WorkingChanged(working));
+        self.emit(AgentThreadEvent::WorkingChanged(working));
     }
 
-    fn fail(&mut self, error: String, cx: &mut Context<Self>) {
+    fn fail(&mut self, error: String) {
         let mut message = error;
         if !self.stderr_lines.is_empty() {
             message.push_str("\n\n");
@@ -1013,8 +1126,7 @@ impl AgentThread {
         self.status = ConnectionStatus::Failed(message.into());
         self.session = None;
         self.queued_prompts.clear();
-        self.set_working(false, cx);
-        cx.notify();
+        self.set_working(false);
     }
 
     fn record_stderr(&mut self, line: String) {
@@ -1024,12 +1136,12 @@ impl AgentThread {
         self.stderr_lines.push_back(line);
     }
 
-    fn handle_incoming(&mut self, incoming: Incoming, cx: &mut Context<Self>) {
+    fn handle_incoming(&mut self, incoming: Incoming) {
         match incoming {
             Incoming::Notification(notification) => {
                 self.apply_update(notification.update);
                 if let Some(title) = self.pending_title.take() {
-                    cx.emit(AgentThreadEvent::TitleChanged(title));
+                    self.emit(AgentThreadEvent::TitleChanged(title));
                 }
             }
             Incoming::Permission(request, responder) => {
@@ -1053,7 +1165,6 @@ impl AgentThread {
                 });
             }
         }
-        cx.notify();
     }
 
     fn apply_update(&mut self, update: acp::SessionUpdate) {
@@ -1260,14 +1371,23 @@ fn error_message(error: &agent_client_protocol::Error) -> String {
     }
 }
 
-/// Spawns the agent, wires up the ACP connection, and creates a session.
+fn cancel_permission(responder: Responder<acp::RequestPermissionResponse>) {
+    responder
+        .respond(acp::RequestPermissionResponse::new(
+            acp::RequestPermissionOutcome::Cancelled,
+        ))
+        .ok();
+}
+
+/// Spawns the agent and wires up and initializes the ACP connection. The agent's process and
+/// transport run in `agent_tasks`, and report through `sender`.
 async fn connect(
     command: AgentCommand,
     cwd: PathBuf,
-    this: gpui::WeakEntity<AgentThread>,
-    cx: &mut gpui::AsyncApp,
+    sender: MessageSender,
+    agent_tasks: &mut JoinSet<()>,
 ) -> Result<Connected> {
-    let mut child = smol::process::Command::new(&command.path)
+    let mut child = tokio::process::Command::new(&command.path)
         .args(&command.args)
         .envs(&command.env)
         .current_dir(&cwd)
@@ -1281,9 +1401,9 @@ async fn connect(
     let stdout = child.stdout.take().context("agent has no stdout")?;
     let stderr = child.stderr.take().context("agent has no stderr")?;
 
-    let incoming_lines = futures::io::BufReader::new(stdout).lines().boxed();
+    let incoming_lines = lines(stdout).boxed();
     let outgoing_lines = Box::pin(futures::sink::unfold(
-        Box::pin(stdin),
+        stdin,
         async move |mut writer, line: String| {
             let mut bytes = line.into_bytes();
             bytes.push(b'\n');
@@ -1293,18 +1413,17 @@ async fn connect(
         },
     ));
 
-    let (incoming_sender, mut incoming_receiver) = mpsc::unbounded::<Incoming>();
     let (connection_sender, connection_receiver) = oneshot::channel();
     let connection_future = {
-        let notification_sender = incoming_sender.clone();
-        let permission_sender = incoming_sender;
+        let notification_sender = sender.clone();
+        let permission_sender = sender.clone();
         Client
             .builder()
             .name("agentZ")
             .on_receive_notification(
                 async move |notification: acp::SessionNotification, _connection| {
                     notification_sender
-                        .unbounded_send(Incoming::Notification(notification))
+                        .send(MessageKind::Incoming(Incoming::Notification(notification)))
                         .ok();
                     Ok(())
                 },
@@ -1314,12 +1433,11 @@ async fn connect(
                 async move |request: acp::RequestPermissionRequest,
                             responder: Responder<acp::RequestPermissionResponse>,
                             _connection| {
-                    if let Err(error) =
-                        permission_sender.unbounded_send(Incoming::Permission(request, responder))
+                    if let Err(message) = permission_sender.send(MessageKind::Incoming(
+                        Incoming::Permission(request, responder),
+                    )) && let MessageKind::Incoming(Incoming::Permission(_, responder)) =
+                        *message
                     {
-                        let Incoming::Permission(_, responder) = error.into_inner() else {
-                            return Ok(());
-                        };
                         responder.respond(acp::RequestPermissionResponse::new(
                             acp::RequestPermissionOutcome::Cancelled,
                         ))?;
@@ -1338,54 +1456,30 @@ async fn connect(
             )
     };
 
-    let io_task = cx.background_spawn(async move {
+    agent_tasks.spawn(async move {
         if let Err(error) = connection_future.await {
             log::error!("ACP connection error: {error:?}");
         }
     });
-    let stderr_task = cx.spawn({
-        let this = this.clone();
-        async move |cx| {
-            let mut lines = futures::io::BufReader::new(stderr).lines();
-            while let Some(Ok(line)) = lines.next().await {
+    agent_tasks.spawn({
+        let sender = sender.clone();
+        async move {
+            let mut stderr_lines = lines(stderr).boxed();
+            while let Some(Ok(line)) = stderr_lines.next().await {
                 log::warn!("agent stderr: {line}");
-                if this.update(cx, |this, _| this.record_stderr(line)).is_err() {
+                if sender.send(MessageKind::Stderr(line)).is_err() {
                     break;
                 }
             }
         }
     });
-    let incoming_task = cx.spawn({
-        let this = this.clone();
-        async move |cx| {
-            while let Some(incoming) = incoming_receiver.next().await {
-                if this
-                    .update(cx, |this, cx| this.handle_incoming(incoming, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
+    agent_tasks.spawn(async move {
+        let message = match child.wait().await {
+            Ok(status) => format!("The agent exited ({status})."),
+            Err(error) => format!("The agent stopped: {error}"),
+        };
+        sender.send(MessageKind::Exited(message)).ok();
     });
-    let exit_task = cx.spawn({
-        let this = this.clone();
-        async move |cx| {
-            let status = child.status().await;
-            this.update(cx, |this, cx| {
-                let message = match status {
-                    Ok(status) => format!("The agent exited ({status})."),
-                    Err(error) => format!("The agent stopped: {error}"),
-                };
-                this.fail(message, cx);
-            })
-            .ok();
-        }
-    });
-    this.update(cx, |this, _| {
-        this._tasks
-            .extend([io_task, stderr_task, incoming_task, exit_task]);
-    })?;
 
     let connection = connection_receiver
         .await
@@ -1412,6 +1506,20 @@ async fn connect(
         auth_methods: initialize_response.auth_methods,
         agent_info: initialize_response.agent_info,
     })
+}
+
+/// The lines of an agent's output stream.
+fn lines(
+    reader: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+) -> impl futures::Stream<Item = std::io::Result<String>> + Send + 'static {
+    futures::stream::unfold(
+        tokio::io::BufReader::new(reader).lines(),
+        async |mut lines| match lines.next_line().await {
+            Ok(Some(line)) => Some((Ok(line), lines)),
+            Ok(None) => None,
+            Err(error) => Some((Err(error), lines)),
+        },
+    )
 }
 
 fn select_offers(select: &acp::SessionConfigSelect, value: &acp::SessionConfigValueId) -> bool {
@@ -1555,94 +1663,135 @@ mod tests {
         assert_eq!(created.line_counts(), (2, 0));
     }
 
-    /// Logging in and out from settings, against `test_support/mock_agent.py`.
-    #[gpui::test]
-    fn logs_in_and_out_of_an_account(cx: &mut gpui::TestAppContext) {
+    /// A thread under test, with its inbox pumped by [`Self::wait_until`].
+    struct TestThread {
+        thread: AgentThread,
+        inbox: ThreadInbox,
+        events: Vec<AgentThreadEvent>,
+    }
+
+    impl TestThread {
+        fn new((thread, inbox): (AgentThread, ThreadInbox)) -> Self {
+            Self {
+                thread,
+                inbox,
+                events: Vec::new(),
+            }
+        }
+
+        fn update(&mut self, change: impl FnOnce(&mut AgentThread)) {
+            change(&mut self.thread);
+            self.events.extend(self.thread.take_events());
+        }
+
+        async fn wait_until(&mut self, done: impl Fn(&AgentThread) -> bool) {
+            let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !done(&self.thread) {
+                    let message = self.inbox.next().await.expect("the inbox closed");
+                    self.thread.handle(message);
+                    self.events.extend(self.thread.take_events());
+                }
+            })
+            .await;
+            if waited.is_err() {
+                panic!("timed out; status {:?}", self.thread.status());
+            }
+        }
+    }
+
+    fn mock_agent(args: &[String]) -> Option<AgentCommand> {
         let Some(python) = which_python() else {
             eprintln!("skipping: python3 not found");
+            return None;
+        };
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
+        let mut command_args = vec![script.to_string_lossy().into_owned()];
+        command_args.extend(args.iter().cloned());
+        Some(AgentCommand {
+            path: python,
+            args: command_args,
+            env: Default::default(),
+        })
+    }
+
+    fn ready(command: AgentCommand) -> CommandFuture {
+        futures::future::ready(Ok(command)).boxed()
+    }
+
+    fn start(command: AgentCommand, previous_session: Option<acp::SessionId>) -> TestThread {
+        TestThread::new(AgentThread::start(
+            tokio::runtime::Handle::current(),
+            "Mock".into(),
+            ready(command),
+            std::env::temp_dir(),
+            previous_session,
+        ))
+    }
+
+    /// Logging in and out from settings, against `test_support/mock_agent.py`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logs_in_and_out_of_an_account() {
+        let Some(command) = mock_agent(&[]) else {
             return;
         };
-        cx.executor().allow_parking();
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
-        let command = AgentCommand {
-            path: python,
-            args: vec![script.to_string_lossy().into_owned()],
-            env: Default::default(),
-        };
-        let account = cx
-            .new(|cx| AgentThread::start_for_account("Mock".into(), Task::ready(Ok(command)), cx));
-        let wait_until = |cx: &mut gpui::TestAppContext, done: &dyn Fn(&AgentThread) -> bool| {
-            for _ in 0..500 {
-                cx.run_until_parked();
-                if account.read_with(cx, |account, _| done(account)) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let status = account.read_with(cx, |account, _| account.status().clone());
-            panic!("timed out; status {status:?}");
-        };
+        let mut account = TestThread::new(AgentThread::start_for_account(
+            tokio::runtime::Handle::current(),
+            "Mock".into(),
+            ready(command),
+        ));
 
-        wait_until(cx, &|account| account.status() == &ConnectionStatus::Ready);
-        account.read_with(cx, |account, _| {
-            assert!(account.supports_logout());
-            assert_eq!(account.auth_methods().len(), 1);
-            assert_eq!(
-                account.logged_in(),
-                Some(true),
-                "the mock opens sessions freely"
-            );
-            assert_eq!(account.config_options().len(), 4);
-        });
+        account
+            .wait_until(|account| account.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(account.thread.supports_logout());
+        assert_eq!(account.thread.auth_methods().len(), 1);
+        assert_eq!(
+            account.thread.logged_in(),
+            Some(true),
+            "the mock opens sessions freely"
+        );
+        assert_eq!(account.thread.config_options().len(), 4);
 
-        account.update(cx, |account, cx| {
-            account.authenticate(acp::AuthMethodId::new("mock-login"), cx)
-        });
-        wait_until(cx, &|account| {
-            account.account_notice().is_some() && account.status() == &ConnectionStatus::Ready
-        });
-        account.read_with(cx, |account, _| {
-            assert_eq!(
-                account.account_notice().map(|n| n.as_ref()),
-                Some("Logged in.")
-            );
-            assert_eq!(account.logged_in(), Some(true));
-        });
+        account.update(|account| account.authenticate(acp::AuthMethodId::new("mock-login")));
+        account
+            .wait_until(|account| {
+                account.account_notice().is_some() && account.status() == &ConnectionStatus::Ready
+            })
+            .await;
+        assert_eq!(
+            account.thread.account_notice().map(|n| n.as_ref()),
+            Some("Logged in.")
+        );
+        assert_eq!(account.thread.logged_in(), Some(true));
+        assert!(
+            account
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentThreadEvent::LoggedIn(_)))
+        );
 
-        account.update(cx, |account, cx| account.logout(cx));
-        wait_until(cx, &|account| {
-            account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
-        });
-        account.read_with(cx, |account, _| {
-            assert_eq!(account.logged_in(), Some(false))
-        });
+        account.update(|account| account.logout());
+        account
+            .wait_until(|account| {
+                account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
+            })
+            .await;
+        assert_eq!(account.thread.logged_in(), Some(false));
 
-        account.update(cx, |account, cx| account.check_login(cx));
-        wait_until(cx, &|account| account.logged_in() == Some(true));
+        account.update(|account| account.check_login());
+        account
+            .wait_until(|account| account.logged_in() == Some(true))
+            .await;
     }
 
     /// New sessions start with the agent's saved defaults, against `test_support/mock_agent.py`.
-    #[gpui::test]
-    fn applies_defaults_to_new_sessions(cx: &mut gpui::TestAppContext) {
-        let Some(python) = which_python() else {
-            eprintln!("skipping: python3 not found");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn applies_defaults_to_new_sessions() {
+        let Some(command) = mock_agent(&[]) else {
             return;
         };
-        cx.executor().allow_parking();
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
-        let command = AgentCommand {
-            path: python,
-            args: vec![script.to_string_lossy().into_owned()],
-            env: Default::default(),
-        };
-        let thread = cx.new(|cx| {
-            let mut thread = AgentThread::start(
-                "Mock".into(),
-                Task::ready(Ok(command)),
-                std::env::temp_dir(),
-                None,
-                cx,
-            );
+        let mut thread = start(command, None);
+        thread.update(|thread| {
             thread.set_defaults(SessionDefaults {
                 mode: None,
                 config_options: vec![
@@ -1660,8 +1809,7 @@ mod tests {
                         acp::SessionConfigOptionValue::value_id("extreme"),
                     ),
                 ],
-            });
-            thread
+            })
         });
         let current = |thread: &AgentThread, id: &str| {
             thread
@@ -1674,130 +1822,81 @@ mod tests {
                     _ => String::new(),
                 })
         };
-        for _ in 0..500 {
-            cx.run_until_parked();
-            let applied = thread.read_with(cx, |thread, _| {
+        thread
+            .wait_until(|thread| {
                 thread.status() == &ConnectionStatus::Ready
                     && current(thread, "model").as_deref() == Some("opus")
                     && current(thread, "fast").as_deref() == Some("true")
-            });
-            if applied {
-                let effort = thread.read_with(cx, |thread, _| current(thread, "effort"));
-                assert_eq!(effort.as_deref(), Some("medium"));
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("defaults were not applied");
+            })
+            .await;
+        assert_eq!(current(&thread.thread, "effort").as_deref(), Some("medium"));
     }
 
     /// Zed's Log Out and Reload Agent on a thread, against `test_support/mock_agent.py`.
-    #[gpui::test]
-    fn logs_out_and_reloads_a_thread(cx: &mut gpui::TestAppContext) {
-        let Some(python) = which_python() else {
-            eprintln!("skipping: python3 not found");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logs_out_and_reloads_a_thread() {
+        let Some(command) = mock_agent(&[]) else {
             return;
         };
-        cx.executor().allow_parking();
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
-        let command = AgentCommand {
-            path: python,
-            args: vec![script.to_string_lossy().into_owned()],
-            env: Default::default(),
-        };
-        let thread = cx.new(|cx| {
-            AgentThread::start(
-                "Mock".into(),
-                Task::ready(Ok(command)),
-                std::env::temp_dir(),
-                None,
-                cx,
-            )
-        });
-        let wait_until = |cx: &mut gpui::TestAppContext, done: &dyn Fn(&AgentThread) -> bool| {
-            for _ in 0..500 {
-                cx.run_until_parked();
-                if thread.read_with(cx, |thread, _| done(thread)) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let status = thread.read_with(cx, |thread, _| thread.status().clone());
-            panic!("timed out; status {status:?}");
-        };
+        let mut thread = start(command, None);
 
-        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
-        thread.update(cx, |thread, cx| thread.logout(cx));
-        wait_until(cx, &|thread| {
-            thread.status() == &ConnectionStatus::AuthRequired
-        });
-        thread.update(cx, |thread, cx| {
-            thread.authenticate(acp::AuthMethodId::new("mock-login"), cx)
-        });
-        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.logout());
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
+            .await;
+        thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login")));
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
 
-        thread.update(cx, |thread, cx| thread.reload(cx));
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(thread.status(), &ConnectionStatus::Connecting)
-        });
-        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
+        thread.update(|thread| thread.reload());
+        assert_eq!(thread.thread.status(), &ConnectionStatus::Connecting);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
     }
 
     /// Runs the real process and protocol plumbing against `test_support/mock_agent.py`.
-    #[gpui::test]
-    fn talks_to_a_real_agent_process(cx: &mut gpui::TestAppContext) {
-        let Some(python) = which_python() else {
-            eprintln!("skipping: python3 not found");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn talks_to_a_real_agent_process() {
+        let Some(command) = mock_agent(&[]) else {
             return;
         };
-        cx.executor().allow_parking();
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
-        let command = AgentCommand {
-            path: python,
-            args: vec![script.to_string_lossy().into_owned()],
-            env: Default::default(),
-        };
-        let cwd = std::env::temp_dir();
-        let thread =
-            cx.new(|cx| AgentThread::start("Mock".into(), Task::ready(Ok(command)), cwd, None, cx));
+        let mut thread = start(command, None);
 
-        let wait_until = |cx: &mut gpui::TestAppContext, done: &dyn Fn(&AgentThread) -> bool| {
-            for _ in 0..500 {
-                cx.run_until_parked();
-                if thread.read_with(cx, |thread, _| done(thread)) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let status = thread.read_with(cx, |thread, _| thread.status().clone());
-            panic!("timed out; status {status:?}");
-        };
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("hello".into()));
+        thread
+            .wait_until(|thread| !thread.is_working() && thread.entries().len() >= 3)
+            .await;
+        let entries = thread.thread.entries();
+        assert_eq!(entries[0], Entry::UserMessage("hello".into()));
+        assert_eq!(entries[1], Entry::AgentMessage("Echo: hello".into()));
+        assert!(matches!(&entries[2], Entry::ToolCall(call) if call.title == "Read README.md"));
+        assert_eq!(
+            thread.thread.last_stop_reason(),
+            Some(&acp::StopReason::EndTurn)
+        );
+        assert!(thread.events.iter().any(
+            |event| matches!(event, AgentThreadEvent::FirstPrompt(prompt) if prompt == "hello")
+        ));
 
-        wait_until(cx, &|thread| thread.status() == &ConnectionStatus::Ready);
-        thread.update(cx, |thread, cx| thread.send("hello".into(), cx));
-        wait_until(cx, &|thread| {
-            !thread.is_working() && thread.entries().len() >= 3
-        });
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(thread.entries()[0], Entry::UserMessage("hello".into()));
-            assert_eq!(thread.entries()[1], Entry::AgentMessage("Echo: hello".into()));
-            assert!(matches!(&thread.entries()[2], Entry::ToolCall(call) if call.title == "Read README.md"));
-            assert_eq!(thread.last_stop_reason(), Some(&acp::StopReason::EndTurn));
-        });
-
-        thread.read_with(cx, |thread, _| {
-            let ids: Vec<_> = thread
-                .config_options()
-                .iter()
-                .map(|option| option.id.0.to_string())
-                .collect();
-            assert_eq!(ids, vec!["mode", "model", "effort", "fast"]);
-        });
-        thread.update(cx, |thread, cx| {
+        let ids: Vec<_> = thread
+            .thread
+            .config_options()
+            .iter()
+            .map(|option| option.id.0.to_string())
+            .collect();
+        assert_eq!(ids, vec!["mode", "model", "effort", "fast"]);
+        thread.update(|thread| {
             thread.set_config_option(
                 acp::SessionConfigId::new("model"),
                 acp::SessionConfigOptionValue::value_id("opus"),
-                cx,
             )
         });
         let model_is = |thread: &AgentThread, expected: &str| {
@@ -1807,121 +1906,88 @@ mod tests {
                         if select.current_value.0.as_ref() == expected)
             })
         };
-        thread.read_with(cx, |thread, _| assert!(model_is(thread, "opus")));
-        wait_until(cx, &|thread| model_is(thread, "opus"));
+        assert!(model_is(&thread.thread, "opus"));
+        thread.wait_until(|thread| model_is(thread, "opus")).await;
 
-        thread.update(cx, |thread, cx| thread.send("permission".into(), cx));
+        thread.update(|thread| thread.send("permission".into()));
         let tool_call_id = acp::ToolCallId::new("call-2");
-        wait_until(cx, &|thread| {
-            thread.permission_request(&tool_call_id).is_some()
-        });
-        thread.update(cx, |thread, cx| {
+        thread
+            .wait_until(|thread| thread.permission_request(&tool_call_id).is_some())
+            .await;
+        thread.update(|thread| {
             let request = thread.permission_request(&tool_call_id).expect("request");
             assert_eq!(request.options.len(), 2);
             let allow = request.options[0].id.clone();
-            thread.respond_to_permission(&tool_call_id, allow, cx);
+            thread.respond_to_permission(&tool_call_id, allow);
         });
-        wait_until(cx, &|thread| !thread.is_working());
-        thread.read_with(cx, |thread, _| {
-            let last_message = thread.entries().iter().rev().find_map(|entry| match entry {
+        thread.wait_until(|thread| !thread.is_working()).await;
+        let last_message = thread
+            .thread
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
                 Entry::AgentMessage(text) => Some(text.clone()),
                 _ => None,
             });
-            assert_eq!(
-                last_message.as_deref(),
-                Some("Echo: permission (chose allow)")
-            );
-        });
+        assert_eq!(
+            last_message.as_deref(),
+            Some("Echo: permission (chose allow)")
+        );
     }
 
     /// A second thread given the first one's session id gets the conversation replayed.
-    #[gpui::test]
-    fn reloads_previous_session(cx: &mut gpui::TestAppContext) {
-        let Some(python) = which_python() else {
-            eprintln!("skipping: python3 not found");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reloads_previous_session() {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(command) = mock_agent(&[history_file]) else {
             return;
         };
-        cx.executor().allow_parking();
-        let history_dir = tempfile::tempdir().expect("temp dir");
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
-        let command = AgentCommand {
-            path: python,
-            args: vec![
-                script.to_string_lossy().into_owned(),
-                history_dir
-                    .path()
-                    .join("history.json")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
-            env: Default::default(),
-        };
-        let wait_until = |cx: &mut gpui::TestAppContext,
-                          thread: &gpui::Entity<AgentThread>,
-                          done: &dyn Fn(&AgentThread) -> bool| {
-            for _ in 0..500 {
-                cx.run_until_parked();
-                if thread.read_with(cx, |thread, _| done(thread)) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            panic!("timed out");
+        let saved_sessions = |thread: &TestThread| -> Vec<acp::SessionId> {
+            thread
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentThreadEvent::SessionStarted(session_id) => Some(session_id.clone()),
+                    _ => None,
+                })
+                .collect()
         };
 
-        let first = cx.new(|cx| {
-            AgentThread::start(
-                "Mock".into(),
-                Task::ready(Ok(command.clone())),
-                std::env::temp_dir(),
-                None,
-                cx,
-            )
-        });
-        let saved_sessions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let _subscription = cx.update(|cx| {
-            let saved_sessions = saved_sessions.clone();
-            cx.subscribe(&first, move |_, event, _| {
-                if let AgentThreadEvent::SessionStarted(session_id) = event {
-                    saved_sessions.borrow_mut().push(session_id.clone());
-                }
-            })
-        });
-        wait_until(cx, &first, &|thread| {
-            thread.status() == &ConnectionStatus::Ready
-        });
+        let mut first = start(command.clone(), None);
+        first
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
         // Agents don't keep a session without a prompt, so it isn't worth restoring yet.
-        assert!(saved_sessions.borrow().is_empty());
-        first.update(cx, |thread, cx| thread.send("hello".into(), cx));
-        wait_until(cx, &first, &|thread| {
-            !thread.is_working() && thread.entries().len() >= 3
-        });
-        assert_eq!(*saved_sessions.borrow(), [acp::SessionId::new("session-1")]);
-        assert_eq!(
-            first.read_with(cx, |thread, _| thread.session_restore()),
-            Some(SessionRestore::New)
-        );
+        assert!(saved_sessions(&first).is_empty());
+        first.update(|thread| thread.send("hello".into()));
+        first
+            .wait_until(|thread| !thread.is_working() && thread.entries().len() >= 3)
+            .await;
+        assert_eq!(saved_sessions(&first), [acp::SessionId::new("session-1")]);
+        assert_eq!(first.thread.session_restore(), Some(SessionRestore::New));
 
-        let second = cx.new(|cx| {
-            AgentThread::start(
-                "Mock".into(),
-                Task::ready(Ok(command)),
-                std::env::temp_dir(),
-                Some(acp::SessionId::new("session-1")),
-                cx,
-            )
-        });
-        wait_until(cx, &second, &|thread| {
-            thread.status() == &ConnectionStatus::Ready
-        });
-        second.read_with(cx, |thread, _| {
-            assert_eq!(thread.session_restore(), Some(SessionRestore::Loaded));
-            assert_eq!(thread.entries()[0], Entry::UserMessage("hello".into()));
-            assert_eq!(
-                thread.entries()[1],
-                Entry::AgentMessage("Echo: hello".into())
-            );
-        });
+        let mut second = start(command, Some(acp::SessionId::new("session-1")));
+        second
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(
+            second.thread.session_restore(),
+            Some(SessionRestore::Loaded)
+        );
+        assert_eq!(
+            second.thread.entries()[0],
+            Entry::UserMessage("hello".into())
+        );
+        assert_eq!(
+            second.thread.entries()[1],
+            Entry::AgentMessage("Echo: hello".into())
+        );
     }
 
     fn which_python() -> Option<PathBuf> {
@@ -1931,38 +1997,34 @@ mod tests {
             .find(|candidate| candidate.is_file())
     }
 
-    #[gpui::test]
-    fn streams_updates_into_entries(cx: &mut gpui::TestAppContext) {
-        let thread = cx.new(|_| AgentThread::failed("Test".into(), "not started"));
-        thread.update(cx, |thread, cx| {
-            let chunk = |text: &str| {
-                acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
-            };
-            thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("Hel")));
-            thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("lo")));
-            thread.apply_update(acp::SessionUpdate::ToolCall(
-                acp::ToolCall::new("call-1", "Read src/main.rs").kind(acp::ToolKind::Read),
-            ));
-            thread.apply_update(acp::SessionUpdate::ToolCallUpdate(
-                acp::ToolCallUpdate::new(
-                    "call-1",
-                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
-                ),
-            ));
-            thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("Done")));
-            cx.notify();
-        });
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(thread.entries().len(), 3);
-            assert_eq!(thread.entries()[0], Entry::AgentMessage("Hello".into()));
-            match &thread.entries()[1] {
-                Entry::ToolCall(tool_call) => {
-                    assert_eq!(tool_call.title, "Read src/main.rs");
-                    assert_eq!(tool_call.status, acp::ToolCallStatus::Completed);
-                }
-                other => panic!("expected a tool call, got {other:?}"),
+    #[test]
+    fn streams_updates_into_entries() {
+        let mut thread = AgentThread::failed("Test".into(), "not started");
+        let chunk = |text: &str| {
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(text)))
+        };
+        thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("Hel")));
+        thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("lo")));
+        thread.apply_update(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("call-1", "Read src/main.rs").kind(acp::ToolKind::Read),
+        ));
+        thread.apply_update(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(
+                "call-1",
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            ),
+        ));
+        thread.apply_update(acp::SessionUpdate::AgentMessageChunk(chunk("Done")));
+
+        assert_eq!(thread.entries().len(), 3);
+        assert_eq!(thread.entries()[0], Entry::AgentMessage("Hello".into()));
+        match &thread.entries()[1] {
+            Entry::ToolCall(tool_call) => {
+                assert_eq!(tool_call.title, "Read src/main.rs");
+                assert_eq!(tool_call.status, acp::ToolCallStatus::Completed);
             }
-            assert_eq!(thread.entries()[2], Entry::AgentMessage("Done".into()));
-        });
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+        assert_eq!(thread.entries()[2], Entry::AgentMessage("Done".into()));
     }
 }

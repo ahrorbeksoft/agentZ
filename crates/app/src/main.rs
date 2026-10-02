@@ -8,6 +8,7 @@ mod registry_store;
 mod settings_page;
 mod shell;
 mod sidebar;
+mod thread_entity;
 
 use std::io::IsTerminal as _;
 use std::sync::Arc;

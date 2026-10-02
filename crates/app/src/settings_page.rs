@@ -14,7 +14,7 @@ use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{AgentThread, AgentThreadEvent, ConnectionStatus};
+use agent_thread::{AgentThreadEvent, ConnectionStatus};
 
 use std::collections::BTreeMap;
 
@@ -27,6 +27,7 @@ use crate::project_info::{
 use crate::registry_store::AgentRegistryStore;
 use crate::shell::with_agent_env;
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
+use crate::thread_entity::AgentThread;
 
 const KEY_CONTEXT: &str = "SettingsPage";
 const CONTENT_WIDTH: Pixels = px(720.);
@@ -742,7 +743,6 @@ impl SettingsPage {
         let command = with_agent_env(
             self.registry.read(cx).command(id),
             agent_settings.env.clone(),
-            cx,
         );
         let name = name.clone();
         let connection = cx.new(|cx| AgentThread::start_for_account(name, command, cx));

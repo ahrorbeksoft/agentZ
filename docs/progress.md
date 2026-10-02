@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 1, step 1. Rewrite `agent_thread` on tokio, with events on a channel and the app
-wrapping it in a thin GPUI entity, as `project_store` and `registry_store` do.
+**Next:** Phase 1, the server. Start `crates/agentz_protocol`: framing, the handshake, and
+request, response and subscription messages.
 
 | Phase | Status |
 |---|---|
@@ -52,9 +52,9 @@ GPUI-free core first, with the app working throughout:
 
 - [x] `projects`: plain structs, no `Global`/`Context`.
 - [x] `registry`: tokio tasks and `tokio::process`, no GPUI.
-- [ ] `agent_thread`: tokio tasks, events on a channel, `Arc<str>` for `SharedString`.
-- [ ] App: thin GPUI entities wrapping the core in-process, so the UI works as before.
-- [ ] Tests: plain async tests against the mock agent. All current tests still pass.
+- [x] `agent_thread`: tokio tasks, background results on a channel, events queued for the owner.
+- [x] App: thin GPUI entities wrapping the core in-process, so the UI works as before.
+- [x] Tests: plain async tests against the mock agent. All current tests still pass.
 
 Then the server:
 
@@ -330,6 +330,15 @@ Then the server:
     tokio runtime handle and returns an inbox. The owner passes each message to `handle()`.
     The app's `registry_store::AgentRegistryStore` pumps the inbox and notifies. The server
     will do the same from its own loop. For now the app uses `reqwest_client`'s runtime.
+  - **`agent_thread` works the same way.** `AgentThread::start` takes a runtime handle and
+    returns an inbox. The agent's process, the SDK's handlers and requests in flight all report
+    through it. Events (`WorkingChanged`, `SessionStarted`, …) queue up until the owner calls
+    `take_events()`. The app's `thread_entity::AgentThread` emits them as GPUI events.
+  - **Reloads drop stale messages.** Each connection has a generation, and messages from an
+    older one are ignored (stale permission requests are cancelled). Before, a session opened
+    by the old connection could land after a reload.
+  - **One tokio worker for now.** `reqwest_client`'s runtime has a single worker thread. That's
+    enough for the app in-process. The server will build its own runtime.
 
 ## Open questions
 
@@ -367,5 +376,5 @@ Then the server:
   user's request.
 - 2026-10-03: Finished phase 0 (8430863). The GPUI-free spike cross-builds for x86_64 musl and
   runs on `devbox1`, and the mock agent calls MCP tools. See Findings.
-- 2026-10-03: Phase 1: `projects` (86606b5) and `registry` are plain Rust, wrapped by GPUI
-  entities in the app.
+- 2026-10-03: Phase 1: `projects` (86606b5), `registry` (8b46efe) and `agent_thread` are plain
+  Rust on tokio, wrapped by GPUI entities in the app. That finishes the GPUI-free core.

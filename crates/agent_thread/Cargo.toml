@@ -16,13 +16,12 @@ workspace = true
 agent-client-protocol.workspace = true
 anyhow.workspace = true
 futures.workspace = true
-gpui.workspace = true
+gpui_shared_string.workspace = true
 log.workspace = true
 registry.workspace = true
 serde_json.workspace = true
-smol.workspace = true
-util.workspace = true
+tokio = { workspace = true, features = ["io-util", "process", "rt"] }
 
 [dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -1,7 +1,8 @@
 use crate::project_store::ProjectStore;
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{AgentThread, AgentThreadEvent};
+use agent_thread::AgentThreadEvent;
 use collections::HashMap;
+use futures::FutureExt as _;
 use gpui::{
     App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
     Subscription, Window, WindowControlArea,
@@ -18,6 +19,7 @@ use crate::project_switcher::ProjectSwitcher;
 use crate::registry_store::AgentRegistryStore;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
+use crate::thread_entity::AgentThread;
 use crate::{NewThread, OpenFolder, OpenSettings, ToggleProjectSwitcher};
 
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
@@ -255,7 +257,7 @@ impl Shell {
             let command = self
                 .registry
                 .update(cx, |registry, _| registry.command_when_loaded(agent_id));
-            with_agent_env(command, agent_settings.env.clone(), cx)
+            with_agent_env(command, agent_settings.env.clone())
         });
 
         let agent_thread = cx.new(|cx| match command {
@@ -659,13 +661,13 @@ fn render_no_thread_selected() -> impl IntoElement {
 pub(crate) fn with_agent_env(
     command: registry::CommandFuture,
     env: std::collections::BTreeMap<String, String>,
-    cx: &App,
-) -> gpui::Task<anyhow::Result<registry::AgentCommand>> {
-    cx.background_spawn(async move {
+) -> registry::CommandFuture {
+    async move {
         let mut command = command.await?;
         command.env.extend(env);
         Ok(command)
-    })
+    }
+    .boxed()
 }
 
 /// The first line of the first prompt, shortened to fit the sidebar.

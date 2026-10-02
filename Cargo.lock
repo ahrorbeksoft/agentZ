@@ -172,13 +172,12 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "futures",
- "gpui",
+ "gpui_shared_string",
  "log",
  "registry",
  "serde_json",
- "smol",
  "tempfile",
- "util",
+ "tokio",
 ]
 
 [[package]]
