@@ -1,3 +1,4 @@
+use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent};
 use collections::HashMap;
 use gpui::{
@@ -153,13 +154,21 @@ impl Shell {
         });
 
         let agent_thread = cx.new(|cx| match command {
-            Some(command) => AgentThread::start(agent_name.clone(), command, cwd, cx),
+            Some(command) => {
+                let previous_session = thread.session_id.clone().map(acp::SessionId::new);
+                AgentThread::start(agent_name.clone(), command, cwd, previous_session, cx)
+            }
             None => AgentThread::failed(agent_name.clone(), "This thread has no agent."),
         });
         let subscription = cx.subscribe(&agent_thread, move |this, _, event, cx| match event {
             AgentThreadEvent::WorkingChanged(working) => {
                 this.store.update(cx, |store, cx| {
                     store.set_thread_working(thread_id, *working, cx)
+                });
+            }
+            AgentThreadEvent::SessionStarted(session_id) => {
+                this.store.update(cx, |store, cx| {
+                    store.set_thread_session(thread_id, session_id.0.to_string(), cx)
                 });
             }
             AgentThreadEvent::FirstPrompt(prompt) => {

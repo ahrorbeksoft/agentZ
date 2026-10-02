@@ -1,9 +1,11 @@
 use std::time::{Duration, SystemTime};
 
 use gpui::{AnyElement, Context, Entity, EventEmitter, MouseButton, Subscription, Task, Window};
-use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId};
+use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore};
-use ui::{ContextMenu, Indicator, Tooltip, prelude::*, right_click_menu};
+use ui::{
+    ContextMenu, IconPosition, Indicator, PopoverMenu, Tooltip, prelude::*, right_click_menu,
+};
 
 use crate::{NewThread, OpenFolder};
 
@@ -63,6 +65,18 @@ impl Sidebar {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_all_scope = self.store.read(cx).scope() == ProjectScope::All;
+        let add_button = if is_all_scope {
+            IconButton::new("sidebar-open-folder", IconName::Plus)
+                .icon_size(IconSize::Small)
+                .tooltip(|_, cx| Tooltip::for_action("Open Folder…", &OpenFolder, cx))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx))
+        } else {
+            IconButton::new("sidebar-new-thread", IconName::Plus)
+                .icon_size(IconSize::Small)
+                .tooltip(|_, cx| Tooltip::for_action("New Thread", &NewThread, cx))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx))
+        };
+        let store = self.store.clone();
         h_flex()
             .h(px(40.))
             .flex_none()
@@ -71,27 +85,45 @@ impl Sidebar {
             .child(
                 Label::new(if is_all_scope { "Projects" } else { "Threads" }).color(Color::Muted),
             )
-            .map(|header| {
-                if is_all_scope {
-                    header.child(
-                        IconButton::new("sidebar-open-folder", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(|_, cx| Tooltip::for_action("Open Folder…", &OpenFolder, cx))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(OpenFolder), cx)
-                            }),
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        PopoverMenu::new("thread-order")
+                            .menu(move |window, cx| {
+                                let store = store.clone();
+                                let current = store.read(cx).thread_order();
+                                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                    let mut menu = menu.header("Sort Threads");
+                                    for (order, label) in [
+                                        (ThreadOrder::LastActivity, "Latest Activity"),
+                                        (ThreadOrder::Created, "Newest First"),
+                                    ] {
+                                        let store = store.clone();
+                                        menu = menu.toggleable_entry(
+                                            label,
+                                            current == order,
+                                            IconPosition::End,
+                                            None,
+                                            move |_, cx| {
+                                                store.update(cx, |store, cx| {
+                                                    store.set_thread_order(order, cx)
+                                                })
+                                            },
+                                        );
+                                    }
+                                    menu
+                                }))
+                            })
+                            .trigger_with_tooltip(
+                                IconButton::new("thread-order-trigger", IconName::Filter)
+                                    .icon_size(IconSize::Small),
+                                Tooltip::text("Sort Threads"),
+                            )
+                            .anchor(gpui::Anchor::TopRight),
                     )
-                } else {
-                    header.child(
-                        IconButton::new("sidebar-new-thread", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(|_, cx| Tooltip::for_action("New Thread", &NewThread, cx))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(NewThread), cx)
-                            }),
-                    )
-                }
-            })
+                    .child(add_button),
+            )
     }
 
     fn render_project(

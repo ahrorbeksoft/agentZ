@@ -109,9 +109,24 @@ pub struct PermissionRequest {
     responder: Responder<acp::RequestPermissionResponse>,
 }
 
+/// How the thread's ACP session was set up when the agent started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRestore {
+    /// A brand-new conversation.
+    New,
+    /// The previous session was loaded and the agent replayed its history.
+    Loaded,
+    /// The previous session continues, but the agent can't show its earlier messages.
+    ResumedWithoutHistory,
+    /// The previous session couldn't be restored, so a new one was started.
+    Unavailable,
+}
+
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
     WorkingChanged(bool),
+    /// The ACP session the thread is talking to; store it to restore the thread later.
+    SessionStarted(acp::SessionId),
     /// The first prompt of a new conversation was sent; useful as a title.
     FirstPrompt(String),
 }
@@ -129,6 +144,7 @@ struct Session {
     session_id: acp::SessionId,
     config_options: Vec<acp::SessionConfigOption>,
     modes: Option<acp::SessionModeState>,
+    restore: SessionRestore,
 }
 
 pub struct AgentThread {
@@ -140,6 +156,7 @@ pub struct AgentThread {
     config_options: Vec<acp::SessionConfigOption>,
     /// Session modes from agents that predate config options.
     modes: Option<acp::SessionModeState>,
+    session_restore: Option<SessionRestore>,
     permission_requests: Vec<PermissionRequest>,
     session: Option<Session>,
     queued_prompts: Vec<String>,
@@ -155,22 +172,27 @@ impl EventEmitter<AgentThreadEvent> for AgentThread {}
 impl AgentThread {
     /// Starts the agent and an ACP session in `cwd`. Prompts sent before the session is ready
     /// are queued.
+    /// Starts the agent. With `previous_session`, the earlier conversation is loaded (or at
+    /// least resumed) when the agent supports it.
     pub fn start(
         agent_name: SharedString,
         command: Task<Result<AgentCommand>>,
         cwd: PathBuf,
+        previous_session: Option<acp::SessionId>,
         cx: &mut Context<Self>,
     ) -> Self {
         let connect = cx.spawn(async move |this, cx| {
             let result = async {
                 let command = command.await?;
-                connect(command, cwd, this.clone(), cx).await
+                connect(command, cwd, previous_session, this.clone(), cx).await
             }
             .await;
             this.update(cx, |this, cx| match result {
                 Ok(mut session) => {
                     this.config_options = std::mem::take(&mut session.config_options);
                     this.modes = session.modes.take();
+                    this.session_restore = Some(session.restore);
+                    cx.emit(AgentThreadEvent::SessionStarted(session.session_id.clone()));
                     this.session = Some(session);
                     this.status = ConnectionStatus::Ready;
                     for prompt in std::mem::take(&mut this.queued_prompts) {
@@ -193,6 +215,7 @@ impl AgentThread {
             plan: Vec::new(),
             config_options: Vec::new(),
             modes: None,
+            session_restore: None,
             permission_requests: Vec::new(),
             session: None,
             queued_prompts: Vec::new(),
@@ -213,6 +236,7 @@ impl AgentThread {
             plan: Vec::new(),
             config_options: Vec::new(),
             modes: None,
+            session_restore: None,
             permission_requests: Vec::new(),
             session: None,
             queued_prompts: Vec::new(),
@@ -234,6 +258,10 @@ impl AgentThread {
 
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    pub fn session_restore(&self) -> Option<SessionRestore> {
+        self.session_restore
     }
 
     pub fn config_options(&self) -> &[acp::SessionConfigOption] {
@@ -701,6 +729,7 @@ fn error_message(error: &agent_client_protocol::Error) -> String {
 async fn connect(
     command: AgentCommand,
     cwd: PathBuf,
+    previous_session: Option<acp::SessionId>,
     this: gpui::WeakEntity<AgentThread>,
     cx: &mut gpui::AsyncApp,
 ) -> Result<Session> {
@@ -843,6 +872,63 @@ async fn connect(
         "the agent speaks an unsupported ACP version"
     );
 
+    let capabilities = initialize_response.agent_capabilities;
+    let had_previous_session = previous_session.is_some();
+    if let Some(session_id) = previous_session {
+        // Same order as Zed: loading replays the conversation; resuming only continues it.
+        if capabilities.load_session {
+            let response = connection
+                .send_request(acp::LoadSessionRequest::new(
+                    session_id.clone(),
+                    cwd.clone(),
+                ))
+                .block_task()
+                .await;
+            match response {
+                Ok(response) => {
+                    return Ok(Session {
+                        connection,
+                        session_id,
+                        config_options: response.config_options.unwrap_or_default(),
+                        modes: response.modes,
+                        restore: SessionRestore::Loaded,
+                    });
+                }
+                Err(error) => {
+                    log::warn!(
+                        "couldn't load session {session_id}: {}",
+                        error_message(&error)
+                    )
+                }
+            }
+        } else if capabilities.session_capabilities.resume.is_some() {
+            let response = connection
+                .send_request(acp::ResumeSessionRequest::new(
+                    session_id.clone(),
+                    cwd.clone(),
+                ))
+                .block_task()
+                .await;
+            match response {
+                Ok(response) => {
+                    return Ok(Session {
+                        connection,
+                        session_id,
+                        config_options: response.config_options.unwrap_or_default(),
+                        modes: response.modes,
+                        restore: SessionRestore::ResumedWithoutHistory,
+                    });
+                }
+                Err(error) => {
+                    log::warn!(
+                        "couldn't resume session {session_id}: {}",
+                        error_message(&error)
+                    )
+                }
+            }
+        }
+    }
+
     let new_session = connection
         .send_request(acp::NewSessionRequest::new(cwd))
         .block_task()
@@ -855,6 +941,11 @@ async fn connect(
         session_id: new_session.session_id,
         config_options: new_session.config_options.unwrap_or_default(),
         modes: new_session.modes,
+        restore: if had_previous_session {
+            SessionRestore::Unavailable
+        } else {
+            SessionRestore::New
+        },
     })
 }
 
@@ -895,7 +986,7 @@ mod tests {
         };
         let cwd = std::env::temp_dir();
         let thread =
-            cx.new(|cx| AgentThread::start("Mock".into(), Task::ready(Ok(command)), cwd, cx));
+            cx.new(|cx| AgentThread::start("Mock".into(), Task::ready(Ok(command)), cwd, None, cx));
 
         let wait_until = |cx: &mut gpui::TestAppContext, done: &dyn Fn(&AgentThread) -> bool| {
             for _ in 0..500 {
@@ -966,6 +1057,84 @@ mod tests {
             assert_eq!(
                 last_message.as_deref(),
                 Some("Echo: permission (chose allow)")
+            );
+        });
+    }
+
+    /// A second thread given the first one's session id gets the conversation replayed.
+    #[gpui::test]
+    fn reloads_previous_session(cx: &mut gpui::TestAppContext) {
+        let Some(python) = which_python() else {
+            eprintln!("skipping: python3 not found");
+            return;
+        };
+        cx.executor().allow_parking();
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
+        let command = AgentCommand {
+            path: python,
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                history_dir
+                    .path()
+                    .join("history.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            env: Default::default(),
+        };
+        let wait_until = |cx: &mut gpui::TestAppContext,
+                          thread: &gpui::Entity<AgentThread>,
+                          done: &dyn Fn(&AgentThread) -> bool| {
+            for _ in 0..500 {
+                cx.run_until_parked();
+                if thread.read_with(cx, |thread, _| done(thread)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out");
+        };
+
+        let first = cx.new(|cx| {
+            AgentThread::start(
+                "Mock".into(),
+                Task::ready(Ok(command.clone())),
+                std::env::temp_dir(),
+                None,
+                cx,
+            )
+        });
+        wait_until(cx, &first, &|thread| {
+            thread.status() == &ConnectionStatus::Ready
+        });
+        first.update(cx, |thread, cx| thread.send("hello".into(), cx));
+        wait_until(cx, &first, &|thread| {
+            !thread.is_working() && thread.entries().len() >= 3
+        });
+        assert_eq!(
+            first.read_with(cx, |thread, _| thread.session_restore()),
+            Some(SessionRestore::New)
+        );
+
+        let second = cx.new(|cx| {
+            AgentThread::start(
+                "Mock".into(),
+                Task::ready(Ok(command)),
+                std::env::temp_dir(),
+                Some(acp::SessionId::new("session-1")),
+                cx,
+            )
+        });
+        wait_until(cx, &second, &|thread| {
+            thread.status() == &ConnectionStatus::Ready
+        });
+        second.read_with(cx, |thread, _| {
+            assert_eq!(thread.session_restore(), Some(SessionRestore::Loaded));
+            assert_eq!(thread.entries()[0], Entry::UserMessage("hello".into()));
+            assert_eq!(
+                thread.entries()[1],
+                Entry::AgentMessage("Echo: hello".into())
             );
         });
     }

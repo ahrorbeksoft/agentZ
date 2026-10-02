@@ -176,6 +176,7 @@ dependencies = [
  "log",
  "registry",
  "smol",
+ "tempfile",
  "util",
 ]
 

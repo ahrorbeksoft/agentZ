@@ -5,7 +5,11 @@ It answers initialize and session/new, and replies to every prompt by streaming
 "permission" first asks the client for permission and reports the chosen option.
 """
 import json
+import os
 import sys
+
+# Optional path where conversations are recorded so `session/load` can replay them.
+HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
 
 next_request_id = 1000
 pending = {}
@@ -35,7 +39,23 @@ def send(message):
     sys.stdout.flush()
 
 
+def load_history():
+    if HISTORY_PATH and os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH) as file:
+            return json.load(file)
+    return []
+
+
+def record(payload):
+    if HISTORY_PATH:
+        history = load_history()
+        history.append(payload)
+        with open(HISTORY_PATH, "w") as file:
+            json.dump(history, file)
+
+
 def update(session_id, payload):
+    record(payload)
     send({"jsonrpc": "2.0", "method": "session/update",
           "params": {"sessionId": session_id, "update": payload}})
 
@@ -63,10 +83,18 @@ for line in sys.stdin:
         finish_prompt(request_id, session_id, prompt_text, outcome.get("optionId", "cancelled"))
     elif method == "initialize":
         send({"jsonrpc": "2.0", "id": message["id"],
-              "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
+              "result": {"protocolVersion": 1,
+                         "agentCapabilities": {"loadSession": HISTORY_PATH is not None},
+                         "authMethods": []}})
     elif method == "session/new":
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"sessionId": "session-1", "configOptions": config_options()}})
+    elif method == "session/load":
+        session_id = message["params"]["sessionId"]
+        for payload in load_history():
+            send({"jsonrpc": "2.0", "method": "session/update",
+                  "params": {"sessionId": session_id, "update": payload}})
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
     elif method == "session/set_config_option":
         params = message["params"]
         settings[params["configId"]] = params["value"]
@@ -74,6 +102,7 @@ for line in sys.stdin:
     elif method == "session/prompt":
         params = message["params"]
         prompt_text = "".join(block.get("text", "") for block in params["prompt"])
+        record(text_chunk("user_message_chunk", prompt_text))
         if prompt_text == "permission":
             next_request_id += 1
             pending[next_request_id] = (message["id"], params["sessionId"], prompt_text)

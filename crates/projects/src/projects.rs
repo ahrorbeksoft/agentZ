@@ -43,6 +43,19 @@ pub struct Thread {
     /// When the thread was created or its agent last did something.
     #[serde(default)]
     pub last_activity_at: Option<SystemTime>,
+    /// The agent's ACP session, so the conversation can be restored after a restart.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// How threads (and, in "All projects", the projects themselves) are ordered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadOrder {
+    /// Most recent activity first.
+    #[default]
+    LastActivity,
+    /// Newest thread first.
+    Created,
 }
 
 /// Which projects the sidebar shows threads for.
@@ -66,6 +79,8 @@ struct PersistedState {
     scope: ProjectScope,
     #[serde(default)]
     collapsed: Vec<ProjectId>,
+    #[serde(default)]
+    thread_order: ThreadOrder,
 }
 
 pub struct ProjectStore {
@@ -74,6 +89,7 @@ pub struct ProjectStore {
     threads: Vec<Thread>,
     scope: ProjectScope,
     collapsed: HashSet<ProjectId>,
+    thread_order: ThreadOrder,
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
@@ -111,6 +127,7 @@ impl ProjectStore {
             threads: state.threads,
             scope: state.scope,
             collapsed: state.collapsed.into_iter().collect(),
+            thread_order: state.thread_order,
             working_threads: HashSet::default(),
             state_path,
             _save_task: None,
@@ -142,10 +159,41 @@ impl ProjectStore {
         self.projects.iter().find(|project| project.id == id)
     }
 
+    /// The project's threads in the current [`ThreadOrder`].
     pub fn threads_for(&self, project_id: ProjectId) -> impl Iterator<Item = &Thread> {
+        let mut threads: Vec<&Thread> = self
+            .threads
+            .iter()
+            .filter(|thread| thread.project_id == project_id)
+            .collect();
+        match self.thread_order {
+            ThreadOrder::LastActivity => threads.sort_by(|a, b| {
+                b.last_activity_at
+                    .cmp(&a.last_activity_at)
+                    .then(b.id.cmp(&a.id))
+            }),
+            ThreadOrder::Created => threads.sort_by_key(|thread| std::cmp::Reverse(thread.id)),
+        }
+        threads.into_iter()
+    }
+
+    pub fn thread_order(&self) -> ThreadOrder {
+        self.thread_order
+    }
+
+    pub fn set_thread_order(&mut self, order: ThreadOrder, cx: &mut Context<Self>) {
+        if self.thread_order != order {
+            self.thread_order = order;
+            self.changed(cx);
+        }
+    }
+
+    fn latest_activity(&self, project_id: ProjectId) -> Option<SystemTime> {
         self.threads
             .iter()
-            .filter(move |thread| thread.project_id == project_id)
+            .filter(|thread| thread.project_id == project_id)
+            .filter_map(|thread| thread.last_activity_at)
+            .max()
     }
 
     pub fn thread_count(&self, project_id: ProjectId) -> usize {
@@ -156,13 +204,23 @@ impl ProjectStore {
         self.scope
     }
 
-    /// The projects the current scope shows, in the order they were added.
+    /// The projects the current scope shows. With [`ThreadOrder::LastActivity`] the most
+    /// recently active project comes first; otherwise projects keep the order they were added.
     pub fn visible_projects(&self) -> impl Iterator<Item = &Project> {
         let scope = self.scope;
-        self.projects.iter().filter(move |project| match scope {
-            ProjectScope::All => true,
-            ProjectScope::Project(id) => project.id == id,
-        })
+        let mut projects: Vec<&Project> = self
+            .projects
+            .iter()
+            .filter(|project| match scope {
+                ProjectScope::All => true,
+                ProjectScope::Project(id) => project.id == id,
+            })
+            .collect();
+        if self.thread_order == ThreadOrder::LastActivity {
+            // Stable sort, so projects without threads keep their added order at the end.
+            projects.sort_by_key(|project| std::cmp::Reverse(self.latest_activity(project.id)));
+        }
+        projects.into_iter()
     }
 
     pub fn set_scope(&mut self, scope: ProjectScope, cx: &mut Context<Self>) {
@@ -237,6 +295,7 @@ impl ProjectStore {
             title: title.into(),
             agent_id,
             last_activity_at: Some(SystemTime::now()),
+            session_id: None,
         });
         self.changed(cx);
         Some(id)
@@ -244,6 +303,15 @@ impl ProjectStore {
 
     pub fn thread(&self, id: ThreadId) -> Option<&Thread> {
         self.threads.iter().find(|thread| thread.id == id)
+    }
+
+    pub fn set_thread_session(&mut self, id: ThreadId, session_id: String, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.session_id.as_deref() != Some(session_id.as_str())
+        {
+            thread.session_id = Some(session_id);
+            self.changed(cx);
+        }
     }
 
     pub fn rename_thread(&mut self, id: ThreadId, title: String, cx: &mut Context<Self>) {
@@ -299,6 +367,7 @@ impl ProjectStore {
                 collapsed.sort();
                 collapsed
             },
+            thread_order: self.thread_order,
         };
         let executor = cx.background_executor().clone();
         self._save_task = Some(cx.background_spawn(async move {
@@ -382,6 +451,24 @@ mod tests {
             reloaded.project(first).map(|p| p.name()),
             Some("first".into())
         );
+
+        store.update(cx, |store, cx| {
+            let older = store.add_thread(first, "Older", None, cx).expect("thread");
+            let newer = store.add_thread(first, "Newer", None, cx).expect("thread");
+            store.set_thread_working(older, true, cx);
+            let order: Vec<_> = store.threads_for(first).map(|thread| thread.id).collect();
+            assert_eq!(order[0], older, "most recent activity first");
+            store.set_thread_order(ThreadOrder::Created, cx);
+            let order: Vec<_> = store.threads_for(first).map(|thread| thread.id).collect();
+            assert_eq!(order[0], newer, "newest thread first");
+            store.set_thread_session(newer, "session-7".into(), cx);
+            assert_eq!(
+                store
+                    .thread(newer)
+                    .and_then(|thread| thread.session_id.clone()),
+                Some("session-7".into())
+            );
+        });
 
         store.update(cx, |store, cx| store.remove_project(second, cx));
         store.read_with(cx, |store, _| {

@@ -4,7 +4,9 @@
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{AgentThread, ConnectionStatus, Entry, FileDiff, PlanItem, ToolCall};
+use agent_thread::{
+    AgentThread, ConnectionStatus, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
+};
 use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding, ScrollHandle,
@@ -721,6 +723,30 @@ impl AgentView {
         )
     }
 
+    /// Zed's notice for agents that continue a session without showing its earlier messages.
+    fn render_restore_notice(&self, cx: &App) -> Option<AnyElement> {
+        let (title, description) = match self.thread.read(cx).session_restore()? {
+            SessionRestore::ResumedWithoutHistory => (
+                "Resumed Session",
+                "This agent does not support viewing previous messages. However, your session will still continue from where you last left off.",
+            ),
+            SessionRestore::Unavailable => (
+                "New Session",
+                "This agent couldn't restore the previous conversation, so this is a new session.",
+            ),
+            SessionRestore::New | SessionRestore::Loaded => return None,
+        };
+        Some(
+            Callout::new()
+                .border_position(ui::CalloutBorderPosition::Bottom)
+                .severity(Severity::Info)
+                .icon(IconName::Info)
+                .title(title)
+                .description(description)
+                .into_any_element(),
+        )
+    }
+
     fn render_errors(&self, cx: &App) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
         let callout = if let ConnectionStatus::Failed(error) = thread.status() {
@@ -1293,6 +1319,7 @@ impl Render for AgentView {
             .size_full()
             .bg(panel_background)
             .child(self.render_toolbar(cx))
+            .children(self.render_restore_notice(cx))
             .child(
                 div()
                     .id("agent-conversation")
