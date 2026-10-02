@@ -678,6 +678,11 @@ impl Server {
         let projects = &self.projects;
         self.threads
             .retain(|thread_id, _| projects.thread(*thread_id).is_some());
+        for (thread_id, thread) in &self.threads {
+            self.projects
+                .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());
+        }
+        let projects = &self.projects;
         let accounts = &self.accounts;
         for client in self.clients.values_mut() {
             client.threads.retain(|connection, _| {

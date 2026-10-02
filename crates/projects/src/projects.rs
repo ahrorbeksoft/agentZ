@@ -85,6 +85,10 @@ pub struct Thread {
     /// The model last selected in the thread, as the agent names it.
     #[serde(default)]
     pub model: Option<String>,
+    /// When the agent last finished a turn. A client shows the thread as done until it has
+    /// displayed this completion.
+    #[serde(default)]
+    pub completed_at: Option<SystemTime>,
 }
 
 /// How threads (and, in "All projects", the projects themselves) are ordered.
@@ -126,6 +130,8 @@ pub struct ProjectsSnapshot {
     pub thread_order: ThreadOrder,
     pub archived_expanded: bool,
     pub working_threads: Vec<ThreadId>,
+    /// Threads waiting for the user to answer a permission request.
+    pub blocked_threads: Vec<ThreadId>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -155,6 +161,8 @@ pub struct ProjectStore {
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
+    /// Threads with a permission request waiting. Not persisted either.
+    blocked_threads: HashSet<ThreadId>,
     /// Counts changes, so the owner can tell whether a call changed anything.
     revision: u64,
     saver: Option<Saver>,
@@ -181,6 +189,7 @@ impl ProjectStore {
             thread_order: state.thread_order,
             archived_expanded: state.archived_expanded,
             working_threads: HashSet::default(),
+            blocked_threads: HashSet::default(),
             revision: 0,
             saver: state_path.map(Saver::new),
         };
@@ -369,6 +378,8 @@ impl ProjectStore {
         let threads = &self.threads;
         self.working_threads
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
+        self.blocked_threads
+            .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
         }
@@ -393,9 +404,15 @@ impl ProjectStore {
             archived_at: None,
             has_custom_title: false,
             model: None,
+            completed_at: None,
         });
         self.changed();
         Some(id)
+    }
+
+    /// Every thread, archived or not, in no particular order.
+    pub fn threads(&self) -> &[Thread] {
+        &self.threads
     }
 
     pub fn thread(&self, id: ThreadId) -> Option<&Thread> {
@@ -424,6 +441,7 @@ impl ProjectStore {
         {
             thread.archived_at = Some(SystemTime::now());
             self.working_threads.remove(&id);
+            self.blocked_threads.remove(&id);
             self.changed();
         }
     }
@@ -443,6 +461,7 @@ impl ProjectStore {
         self.threads.retain(|thread| thread.id != id);
         if self.threads.len() != count_before {
             self.working_threads.remove(&id);
+            self.blocked_threads.remove(&id);
             self.changed();
         }
     }
@@ -490,7 +509,8 @@ impl ProjectStore {
         self.working_threads.contains(&id)
     }
 
-    /// Marks whether the thread's agent is running; either change counts as activity.
+    /// Marks whether the thread's agent is running; either change counts as activity, and
+    /// stopping completes the turn.
     pub fn set_thread_working(&mut self, id: ThreadId, working: bool) {
         let changed = if working {
             self.working_threads.insert(id)
@@ -498,7 +518,27 @@ impl ProjectStore {
             self.working_threads.remove(&id)
         };
         if changed {
+            if !working && let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            {
+                thread.completed_at = Some(SystemTime::now());
+            }
             self.record_thread_activity(id);
+        }
+    }
+
+    pub fn is_thread_blocked(&self, id: ThreadId) -> bool {
+        self.blocked_threads.contains(&id)
+    }
+
+    /// Marks whether the thread is waiting for a permission answer.
+    pub fn set_thread_blocked(&mut self, id: ThreadId, blocked: bool) {
+        let changed = if blocked {
+            self.thread(id).is_some() && self.blocked_threads.insert(id)
+        } else {
+            self.blocked_threads.remove(&id)
+        };
+        if changed {
+            self.changed();
         }
     }
 
@@ -513,6 +553,8 @@ impl ProjectStore {
     pub fn snapshot(&self) -> ProjectsSnapshot {
         let mut working_threads: Vec<_> = self.working_threads.iter().copied().collect();
         working_threads.sort();
+        let mut blocked_threads: Vec<_> = self.blocked_threads.iter().copied().collect();
+        blocked_threads.sort();
         ProjectsSnapshot {
             projects: self.projects.clone(),
             threads: self.threads.clone(),
@@ -520,6 +562,7 @@ impl ProjectStore {
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
             working_threads,
+            blocked_threads,
         }
     }
 
@@ -537,6 +580,7 @@ impl ProjectStore {
             None,
         );
         this.working_threads = snapshot.working_threads.into_iter().collect();
+        this.blocked_threads = snapshot.blocked_threads.into_iter().collect();
         this
     }
 

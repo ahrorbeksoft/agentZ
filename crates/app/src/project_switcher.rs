@@ -17,6 +17,7 @@ use ui::{
 
 use crate::OpenFolder;
 use crate::project_info::{ProjectInfoStore, render_project_icon};
+use crate::sidebar::render_status_dot;
 
 const KEY_CONTEXT: &str = "ProjectSwitcher";
 const ALL_PROJECTS_LABEL: &str = "All projects";
@@ -235,6 +236,9 @@ impl ProjectSwitcher {
                 let path: SharedString = compact_path(&project.path).into();
                 let tooltip_title = name.clone();
                 let open_project_settings = self.open_project_settings.clone();
+                let status = store
+                    .project_status(id)
+                    .map(|status| render_status_dot(status, cx));
                 item.start_slot(render_project_icon(project, info, px(16.), cx))
                     .child(
                         // Like Zed's popover, the path shows on hover rather than in the row.
@@ -243,6 +247,7 @@ impl ProjectSwitcher {
                             .min_w_0()
                             .gap_1()
                             .child(HighlightedLabel::new(name, positions))
+                            .children(status)
                             .children(check)
                             .tooltip(move |_, cx| {
                                 Tooltip::with_meta(tooltip_title.clone(), None, path.clone(), cx)

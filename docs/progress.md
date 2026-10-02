@@ -8,14 +8,14 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 2, attention states: the server tracks each thread's state (working, blocked,
-done, idle) and sends it with the session.
+**Next:** Phase 3, agent control: `agentz-server mcp-bridge`, injected into every ACP session,
+and the first tools.
 
 | Phase | Status |
 |---|---|
 | 0. Spike | Done |
 | 1. Local server split | Done |
-| 2. Attention states and notifications | Not started |
+| 2. Attention states and notifications | Done |
 | 3. Agent control (MCP and CLI) | Not started |
 | 4. Subthreads | Not started |
 | 5. Diffs | Not started |
@@ -90,10 +90,10 @@ Then the server:
 
 ## 2. Attention states and notifications
 
-- [ ] Server: thread state (working / blocked / done / idle) and events.
-- [ ] Client: track which completions this client has viewed. "Done" until the thread is viewed.
-- [ ] Sidebar cards and the project switcher show states, rolled up to the project.
-- [ ] macOS notifications for done or blocked threads that aren't on screen.
+- [x] Server: thread state (working / blocked / done / idle) and events.
+- [x] Client: track which completions this client has viewed. "Done" until the thread is viewed.
+- [x] Sidebar cards and the project switcher show states, rolled up to the project.
+- [x] macOS notifications for done or blocked threads that aren't on screen.
 
 ## 3. Agent control (MCP and CLI)
 
@@ -243,6 +243,8 @@ Then the server:
 
 ## 10. Polish
 
+- [ ] A macOS app bundle (Info.plist, bundle id, ad-hoc signature) so system notifications show,
+      and launching with `open -g` doesn't take focus.
 - [ ] Optional start at login (launchd agent, systemd user service).
 - [ ] Remote server updates, only after the user confirms.
 - [ ] Per-machine "Stop server".
@@ -396,6 +398,21 @@ Then the server:
     `slow` turn and drops after the first words, and a new connection's copy ends with the
     whole reply, nothing lost or repeated.
 
+- 2026-10-03: Attention states (phase 2):
+  - **The server sends facts; each client decides "done".** The session's projects snapshot
+    has `working_threads`, `blocked_threads` (a permission request is waiting, recomputed after
+    every batch) and each thread's `completed_at` (when a turn last ended, saved in
+    `state.json`). The app keeps the completions it has displayed in `viewed.json`, so viewing
+    a thread in one client doesn't clear another's (herdr).
+  - **"Displayed" is Zed's `agent_status_visible`:** the window is active, settings are closed,
+    and the thread is the open one.
+  - **Labels and colors are t3code's:** Pending Approval (amber), Working (spinner, as before),
+    Completed (green). The project switcher shows each project's most pressing status as a dot.
+  - **Notifications are Zed's:** "Waiting for tool confirmation" or "Finished", for threads that
+    aren't displayed, with the dock icon bouncing when the window isn't active. Clicking one
+    opens the thread. macOS only shows notifications for an app bundle, so the plain
+    `target/debug/agentz` build logs that they're disabled. Phase 10 adds a bundle.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -441,3 +458,4 @@ Then the server:
 - 2026-10-03: Phase 1: the app is a client of the server (`agentz_client`, client-side copies
   of projects, the registry, agent settings and threads) (1f20235).
 - 2026-10-03: Finished phase 1: the reattach test, Settings › Restart Server, and `AGENTS.md`.
+- 2026-10-03: Finished phase 2: attention states, viewed completions, notifications.

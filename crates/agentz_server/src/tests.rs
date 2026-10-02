@@ -345,6 +345,12 @@ async fn threads_outlive_their_clients() {
     drop(client);
 
     let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    assert_eq!(session.projects.blocked_threads, vec![thread_id]);
+    assert_eq!(session.projects.working_threads, vec![thread_id]);
+    client.projects = Some(session.projects);
     client.subscribe_thread(connection).await;
     let thread = client.thread(connection);
     assert!(thread.is_working());
@@ -365,6 +371,18 @@ async fn threads_outlive_their_clients() {
         .wait_until(|client| {
             let thread = client.thread(connection);
             !thread.is_working() && agent_text(thread).ends_with("(chose allow)")
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client.projects.as_ref().is_some_and(|projects| {
+                projects.blocked_threads.is_empty()
+                    && projects.working_threads.is_empty()
+                    && projects
+                        .threads
+                        .iter()
+                        .any(|thread| thread.id == thread_id && thread.completed_at.is_some())
+            })
         })
         .await;
 }

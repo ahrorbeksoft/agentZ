@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime};
 
-use crate::project_store::ProjectStore;
+use crate::project_store::{ProjectStore, ThreadStatus};
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
@@ -526,7 +526,7 @@ impl Sidebar {
         let selected_background = colors.ghost_element_selected;
         let is_active = self.active_thread == Some(thread.id);
         let is_renaming = self.renaming_thread == Some(thread.id);
-        let is_working = self.store.read(cx).is_thread_working(thread.id);
+        let thread_status = self.store.read(cx).thread_status(thread.id);
         let thread_id = thread.id;
         let icon = self.agent_icon(&thread, cx);
         let details = self.thread_details(&thread, project.as_ref(), cx);
@@ -544,8 +544,8 @@ impl Sidebar {
         let group_name = SharedString::from(format!("thread-card-{}", thread.id.0));
         let title = SharedString::from(thread.title);
 
-        let status = if is_working {
-            h_flex()
+        let status = match thread_status {
+            Some(ThreadStatus::Working) => h_flex()
                 .gap_1()
                 .child(
                     Icon::new(IconName::LoadCircle)
@@ -559,12 +559,12 @@ impl Sidebar {
                         .weight(FontWeight::MEDIUM)
                         .color(Color::Accent),
                 )
-                .into_any_element()
-        } else {
-            Label::new(time.unwrap_or_default())
+                .into_any_element(),
+            Some(status) => render_status_pill(status, cx).into_any_element(),
+            None => Label::new(time.unwrap_or_default())
                 .size(LabelSize::Small)
                 .color(Color::Muted)
-                .into_any_element()
+                .into_any_element(),
         };
         let store = self.store.clone();
         // Like t3code's Settle button: muted text that brightens under the mouse, with no fill
@@ -1323,4 +1323,32 @@ mod tests {
             "now"
         );
     }
+}
+
+/// t3code's status pill: a dot and a label in the status color.
+pub(crate) fn render_status_pill(status: ThreadStatus, cx: &App) -> impl IntoElement {
+    let (label, color) = match status {
+        ThreadStatus::PendingApproval => ("Pending Approval", Color::Warning),
+        ThreadStatus::Working => ("Working", Color::Accent),
+        ThreadStatus::Completed => ("Completed", Color::Success),
+    };
+    h_flex().gap_1().child(render_status_dot(status, cx)).child(
+        Label::new(label)
+            .size(LabelSize::Small)
+            .weight(FontWeight::MEDIUM)
+            .color(color),
+    )
+}
+
+pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElement {
+    let color = match status {
+        ThreadStatus::PendingApproval => Color::Warning,
+        ThreadStatus::Working => Color::Accent,
+        ThreadStatus::Completed => Color::Success,
+    };
+    div()
+        .flex_none()
+        .size_1p5()
+        .rounded_full()
+        .bg(color.color(cx))
 }

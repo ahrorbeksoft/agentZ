@@ -1,12 +1,13 @@
-use crate::project_store::ProjectStore;
+use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
     App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
-    Subscription, Window, WindowControlArea,
+    Subscription, SystemNotification, Window, WindowControlArea,
 };
 use projects::{ProjectId, ProjectScope, ThreadId};
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
+use util::ResultExt as _;
 
 use crate::agent_view::{AgentView, AgentViewEvent};
 use crate::app_settings::AppSettingsStore;
@@ -95,7 +96,16 @@ impl Shell {
                 if closed_active_thread {
                     window.focus(&this.focus_handle, cx);
                 }
+                this.mark_active_thread_viewed(window, cx);
                 cx.notify();
+            }),
+            cx.subscribe_in(&store, window, |this, _, event, window, cx| match event {
+                ProjectStoreEvent::NeedsAttention(thread_id, status) => {
+                    this.notify_attention(*thread_id, *status, window, cx)
+                }
+            }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.mark_active_thread_viewed(window, cx)
             }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::OpenThread(thread_id) => this.open_thread(*thread_id, window, cx),
@@ -110,6 +120,24 @@ impl Shell {
                 AppSettingsStore::global(cx).update(cx, |store, cx| store.reapply_theme(cx));
             }),
         ];
+        // Clicking a notification is the user asking for that thread, so it may come forward.
+        let shell = cx.entity().downgrade();
+        let window_handle = window.window_handle();
+        cx.on_system_notification_response(move |response, cx| {
+            let Some(thread_id) = thread_from_notification_tag(&response.tag) else {
+                return;
+            };
+            let shell = shell.clone();
+            window_handle
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    shell
+                        .update(cx, |shell, cx| shell.open_thread(thread_id, window, cx))
+                        .ok();
+                })
+                .log_err();
+            cx.activate(true);
+        });
         Self {
             focus_handle: cx.focus_handle(),
             store,
@@ -214,6 +242,7 @@ impl Shell {
             Some(open_thread) => window.focus(&open_thread.view.focus_handle(cx), cx),
             None => window.focus(&self.focus_handle, cx),
         }
+        self.mark_active_thread_viewed(window, cx);
         cx.notify();
     }
 
@@ -232,7 +261,60 @@ impl Shell {
         if let Some(open_thread) = self.open_threads.get(&thread_id) {
             window.focus(&open_thread.view.focus_handle(cx), cx);
         }
+        self.mark_active_thread_viewed(window, cx);
         cx.notify();
+    }
+
+    /// Whether the user can see the thread right now, as Zed's `agent_status_visible` decides.
+    fn is_thread_visible(&self, thread_id: ThreadId, window: &Window) -> bool {
+        window.is_window_active()
+            && self.settings_page.is_none()
+            && self.active_thread == Some(thread_id)
+    }
+
+    fn mark_active_thread_viewed(&self, window: &Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.active_thread else {
+            return;
+        };
+        if self.is_thread_visible(thread_id, window) {
+            self.store
+                .update(cx, |store, cx| store.mark_viewed(thread_id, cx));
+            cx.dismiss_system_notification(&notification_tag(thread_id));
+        }
+    }
+
+    /// A macOS notification for a thread that isn't on screen, as Zed notifies.
+    fn notify_attention(
+        &self,
+        thread_id: ThreadId,
+        status: ThreadStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_thread_visible(thread_id, window) {
+            return;
+        }
+        let store = self.store.read(cx);
+        let Some(thread) = store.thread(thread_id) else {
+            return;
+        };
+        let caption = match status {
+            ThreadStatus::PendingApproval => "Waiting for tool confirmation",
+            ThreadStatus::Working | ThreadStatus::Completed => "Finished",
+        };
+        let body = match store.project(thread.project_id) {
+            Some(project) => format!("{} · {caption}", project.name()),
+            None => caption.to_string(),
+        };
+        cx.show_system_notification(SystemNotification {
+            tag: notification_tag(thread_id),
+            title: thread.title.clone().into(),
+            body: body.into(),
+            actions: Vec::new(),
+        });
+        if !window.is_window_active() {
+            window.request_attention();
+        }
     }
 
     fn start_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) -> Option<OpenThread> {
@@ -540,4 +622,13 @@ fn render_no_thread_selected() -> impl IntoElement {
                 .style(ButtonStyle::Outlined)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
         )
+}
+
+fn notification_tag(thread_id: ThreadId) -> SharedString {
+    format!("thread-{}", thread_id.0).into()
+}
+
+/// The thread a notification is about, from its tag.
+fn thread_from_notification_tag(tag: &str) -> Option<ThreadId> {
+    tag.strip_prefix("thread-")?.parse().ok().map(ThreadId)
 }
