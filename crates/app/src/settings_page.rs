@@ -127,15 +127,15 @@ impl SettingsPage {
         }
     }
 
-    pub fn show_agents(&mut self, cx: &mut Context<Self>) {
-        self.select(Section::Agents, cx);
+    pub fn show_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Section::Agents, window, cx);
     }
 
-    pub fn show_project(&mut self, id: ProjectId, cx: &mut Context<Self>) {
-        self.select(Section::Project(id), cx);
+    pub fn show_project(&mut self, id: ProjectId, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Section::Project(id), window, cx);
     }
 
-    fn select(&mut self, section: Section, cx: &mut Context<Self>) {
+    fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         if self.section != section {
             self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
@@ -143,6 +143,8 @@ impl SettingsPage {
         if section == Section::Agents {
             self.registry
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
+            // Typing on the Agents page searches it.
+            window.focus(&self.agent_search.focus_handle(cx), cx);
         }
         if let Section::Project(id) = section
             && let Some(project) = self.store.read(cx).project(id).cloned()
@@ -367,7 +369,7 @@ impl SettingsPage {
             }))
             .children(icon_element)
             .child(div().flex_1().min_w_0().child(Label::new(label).truncate()))
-            .on_click(cx.listener(move |this, _, _, cx| this.select(section, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.select(section, window, cx)))
             .into_any_element()
     }
 

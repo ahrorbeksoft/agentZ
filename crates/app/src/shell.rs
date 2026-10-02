@@ -157,7 +157,7 @@ impl Shell {
                     this.dismiss_new_thread_modal(window, cx);
                     this.open_settings(&OpenSettings, window, cx);
                     if let Some((page, _)) = &this.settings_page {
-                        page.update(cx, |page, cx| page.show_agents(cx));
+                        page.update(cx, |page, cx| page.show_agents(window, cx));
                     }
                 }
             }),
@@ -191,7 +191,7 @@ impl Shell {
     ) {
         self.open_settings(&OpenSettings, window, cx);
         if let Some((page, _)) = &self.settings_page {
-            page.update(cx, |page, cx| page.show_project(project_id, cx));
+            page.update(cx, |page, cx| page.show_project(project_id, window, cx));
         }
     }
 
