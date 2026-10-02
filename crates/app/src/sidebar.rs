@@ -1019,21 +1019,14 @@ impl Render for Sidebar {
             } else {
                 self.render_empty_state().into_any_element()
             })
-            .child(
-                h_flex()
-                    .flex_none()
-                    .p_1()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        IconButton::new("open-settings", IconName::Settings)
-                            .icon_size(IconSize::Small)
-                            .tooltip(|_, cx| Tooltip::for_action("Settings", &OpenSettings, cx))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(OpenSettings), cx)
-                            }),
-                    ),
-            )
+            .child(render_footer_item(
+                "open-settings",
+                IconName::Settings,
+                "Settings",
+                |_, cx| Tooltip::for_action("Settings", &OpenSettings, cx),
+                |_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx),
+                cx,
+            ))
     }
 }
 
@@ -1129,6 +1122,39 @@ fn render_details_popover(details: ThreadDetails, cx: &App) -> AnyElement {
                     .child(div().ml_1().child(details.render(cx))),
             )
             .with_priority(1),
+        )
+        .into_any_element()
+}
+
+/// The row at the bottom of the sidebar. Settings shows its Back row with this same layout, so
+/// the two land under the same pointer position.
+pub fn render_footer_item(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    tooltip: impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    div()
+        .flex_none()
+        .p_1()
+        .border_t_1()
+        .border_color(colors.border)
+        .child(
+            h_flex()
+                .id(id)
+                .h(px(28.))
+                .px_2()
+                .gap_2()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|item| item.bg(colors.ghost_element_hover))
+                .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                .child(Label::new(label).color(Color::Muted))
+                .tooltip(tooltip)
+                .on_click(on_click),
         )
         .into_any_element()
 }
