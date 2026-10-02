@@ -21,7 +21,7 @@ The user made these on 2026-10-03:
 |---|---|
 | Which parts of herdr? | Everything: keep the ACP thread UI, *and* add real terminal panes for agents' own CLIs. |
 | How to reach machines? | SSH only. No pairing links, no listening ports, no accounts. |
-| Remote OS in the first version | Macs and Linux (x86_64 and aarch64). |
+| Remote OS in the first version | Macs and Linux (x86_64 and aarch64). The user's machines today are both x86_64 Linux (see Machines), so that target comes first. |
 | Agent control | MCP and a CLI, so agents can see threads, agents and models, start threads, send messages, and archive or unarchive. |
 | Subagents | agentZ-owned subthreads that agents start and manage, and that the user can open and watch. |
 | Same repository on several machines | Merged into one project in the projects pane, named by its full repository name (`owner/repo`). |
@@ -436,6 +436,12 @@ Worktrees share `.git` with the project, so their branches are already there.
   - The macOS server comes from the normal build. Linux servers (x86_64/aarch64 musl) come from
     `cargo zigbuild`, as in Zed's dev path.
   - Replacing a running remote server asks first, because it stops that machine's agents.
+- **Node for npm agents.** Registry agents distributed through npm need Node, and remote
+  machines may not have it (neither of the user's does).
+  - The server downloads an official Node.js build into its data directory when an npm agent is
+    installed and no suitable Node is on `PATH`. That's Zed's `node_runtime`
+    (`references/zed/crates/node_runtime`).
+  - `uvx` agents would need the same for `uv`, if any are wanted.
 - **Offline:** a disconnected machine's projects and threads stay visible, dimmed, as cached
   data. Input to them is disabled until reconnected (herdr).
 - **Adding a project on a remote:** a path field with completion served by that machine. A
@@ -572,8 +578,11 @@ need phase 3. Otherwise phases 3–8 and 9 can go in any order.
   it to simulate a dropped connection.
 - **Terminals:** drive a PTY running `sh` with scripted input, and check the screen snapshots.
 - **Merged projects:** two servers in one test, with clones of the same repository.
-- **Real SSH:** needs a target from the user, for example a Linux VM, another Mac, or
-  `ssh localhost` with Remote Login enabled. Ask before relying on one.
+- **Real SSH:** the user's machines `t3-home` and `devbox1`, from `~/.ssh/config`. They're both
+  reachable with keys, so `BatchMode` works.
+  - Install only under `~/.agentz`.
+  - Don't touch the t3code and herdr installs already on them (`~/.t3`, `~/.herdr`).
+  - Never prompt the user's real agents there either.
 - **UI:** headless GPUI tests and PopUp screenshots, as described in `AGENTS.md`.
 
 ## Risks

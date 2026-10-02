@@ -27,12 +27,15 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 ## 0. Spike
 
 - [ ] Check `df -h ~`. Install `zig` and `cargo-zigbuild`, and add the
-      `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` targets.
+      `x86_64-unknown-linux-musl` target. That's what both of the user's machines need;
+      `aarch64-unknown-linux-musl` can wait.
 - [ ] Cross-build a minimal headless GPUI binary (`gpui_platform::headless()`) for Linux musl,
       using `agent_thread`, `projects` and `registry`. Note the size and any crates that fail.
 - [ ] Build `alacritty_terminal` (Zed's pinned version) in the workspace. Spawn a PTY running
       `sh` and read the screen.
 - [ ] Have the mock agent receive a stdio MCP server in `session/new`, start it, and call a tool.
+- [ ] Copy the Linux binary to `devbox1` under `~/.agentz/spike/`, check that it starts
+      headless, then remove it.
 - [ ] Record the disk cost of the Linux target directories.
 - [ ] Decide on anything the spike changes, and update the plan.
 
@@ -198,6 +201,7 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Offline machines stay visible but dimmed, with input disabled.
 - [ ] Remote projects: path field with completion from that machine.
 - [ ] Per-machine agents: install, log in, defaults.
+- [ ] Managed Node for npm agents when the machine has none (Zed's `node_runtime`).
 - [ ] Repository identity from each server, as t3code does:
   - [ ] repository root, then the primary remote (`upstream`, `origin`, first by name);
   - [ ] canonical key via `normalizeGitRemoteUrl`;
@@ -217,7 +221,7 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Agent control across machines: `delegate_task` and thread launch with a machine; listing
       covers every machine of a merged project.
 - [ ] Ask before replacing a running remote server.
-- [ ] Test against a real target from the user.
+- [ ] Test against `t3-home` and `devbox1`, leaving their t3code and herdr installs alone.
 
 ## 10. Polish
 
@@ -231,6 +235,27 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   what was asked for agent control and subagents (delegated tasks, thread list, read, send,
   organize). It also has a stdio bridge injected into ACP `session/new`, and a CLI fallback.
   The plan follows it.
+
+- 2026-10-03: The user's remote machines, checked read-only over SSH:
+
+  | | `t3-home` | `devbox1` |
+  |---|---|---|
+  | Address | Tailscale (`192.0.2.10`), user `ahrorbek` | `203.0.113.10`, user `root` |
+  | OS | Linux Mint 22.3, kernel 6.8, x86_64, glibc 2.39 | Ubuntu 26.04, kernel 7.0, x86_64, glibc 2.43 |
+  | Hardware | 2 CPUs, 3.7 GB RAM, 363 GB free | 4 CPUs, 7.7 GB RAM, 82 GB free |
+  | Filesystem | ext4 | ext4 |
+  | Tools | git; no node, npm, uv or cargo | git, tmux; no node, npm, uv or cargo |
+  | Agents on `PATH` | `claude` | none |
+  | Already installed | t3code (`~/.t3`), herdr (`~/.herdr`) | t3code (`~/.t3`) |
+
+  What follows from that:
+  - **Linux x86_64 musl is the first remote build.** A static musl binary avoids glibc version
+    differences.
+  - **No pastures on these machines.** ext4 has no reflinks, so they get worktrees only.
+  - **No Node.** npm registry agents can't install until the server can manage its own Node.
+    That's added to phase 9.
+  - **No Rust.** Building on the remote isn't an option, so we cross-build here.
+  - **`t3-home` is small** (2 CPUs, 3.7 GB RAM). Keep the server light.
 
 ## Open questions
 
@@ -261,3 +286,4 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   worktrees in phase 6, with cow's sync and bring-back. Renamed the worktree tools to workspace
   tools.
 - 2026-10-03: Renamed copies to pastures, cow's name for them.
+- 2026-10-03: Checked `t3-home` and `devbox1` (read-only) and recorded them under Findings.
