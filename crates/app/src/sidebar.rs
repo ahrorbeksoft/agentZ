@@ -1,11 +1,15 @@
-use gpui::{AnyElement, Context, Entity, EventEmitter, MouseButton, Subscription, Window};
+use std::time::{Duration, SystemTime};
+
+use gpui::{AnyElement, Context, Entity, EventEmitter, MouseButton, Subscription, Task, Window};
 use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread};
 use registry::{AgentId, AgentRegistryStore};
-use ui::{ContextMenu, Tooltip, prelude::*, right_click_menu};
+use ui::{ContextMenu, Indicator, Tooltip, prelude::*, right_click_menu};
 
 use crate::{NewThread, OpenFolder};
 
 const ROW_HEIGHT: Pixels = px(28.);
+/// How often relative activity times ("5m") are re-rendered.
+const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 
 pub enum SidebarEvent {
@@ -16,6 +20,7 @@ pub struct Sidebar {
     store: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
     _subscriptions: Vec<Subscription>,
+    _activity_refresh: Task<()>,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -30,10 +35,21 @@ impl Sidebar {
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.observe(&registry, |_, _, cx| cx.notify()),
         ];
+        let activity_refresh = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(ACTIVITY_REFRESH_INTERVAL)
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             store,
             registry,
             _subscriptions: subscriptions,
+            _activity_refresh: activity_refresh,
         }
     }
 
@@ -220,13 +236,23 @@ impl Sidebar {
 
     fn render_thread(&self, thread: Thread, indent: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let hover_background = cx.theme().colors().ghost_element_hover;
-        let agent_name = thread.agent_id.as_ref().map(|agent_id| {
-            self.registry
-                .read(cx)
-                .agent(&AgentId::new(agent_id.clone()))
-                .map(|agent| agent.name().clone())
-                .unwrap_or_else(|| SharedString::from(agent_id.clone()))
-        });
+        let icon = thread
+            .agent_id
+            .as_ref()
+            .and_then(|agent_id| {
+                self.registry
+                    .read(cx)
+                    .agent(&AgentId::new(agent_id.clone()))?
+                    .icon_path()
+                    .cloned()
+            })
+            .map(Icon::from_external_svg)
+            .unwrap_or_else(|| Icon::new(IconName::Terminal));
+        let is_working = self.store.read(cx).is_thread_working(thread.id);
+        let activity = (!is_working)
+            .then(|| thread.last_activity_at)
+            .flatten()
+            .map(|time| format_relative_time(time, SystemTime::now()));
         h_flex()
             .id(("thread", thread.id.0))
             .h(ROW_HEIGHT)
@@ -236,20 +262,28 @@ impl Sidebar {
             .gap_1p5()
             .cursor_pointer()
             .hover(|row| row.bg(hover_background))
-            .child(
-                Icon::new(IconName::Terminal)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(icon.size(IconSize::Small).color(Color::Muted))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .child(Label::new(thread.title).truncate()),
             )
-            .when_some(agent_name, |row, agent_name| {
+            .when(is_working, |row| {
                 row.child(
-                    Label::new(agent_name)
+                    h_flex()
+                        .gap_1()
+                        .child(Indicator::dot().color(Color::Accent))
+                        .child(
+                            Label::new("working")
+                                .size(LabelSize::Small)
+                                .color(Color::Accent),
+                        ),
+                )
+            })
+            .when_some(activity, |row, activity| {
+                row.child(
+                    Label::new(activity)
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
@@ -312,5 +346,42 @@ impl Render for Sidebar {
                     .children(groups)
                     .into_any_element()
             })
+    }
+}
+
+/// A short "time ago" label: `now`, `5m`, `3h`, `2d`, `1w`.
+fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
+    let seconds = now.duration_since(time).unwrap_or_default().as_secs();
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    match seconds {
+        seconds if seconds < MINUTE => "now".to_string(),
+        seconds if seconds < HOUR => format!("{}m", seconds / MINUTE),
+        seconds if seconds < DAY => format!("{}h", seconds / HOUR),
+        seconds if seconds < WEEK => format!("{}d", seconds / DAY),
+        seconds => format!("{}w", seconds / WEEK),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_relative_time;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn relative_times() {
+        let now = SystemTime::now();
+        let ago = |seconds| now - Duration::from_secs(seconds);
+        assert_eq!(format_relative_time(ago(5), now), "now");
+        assert_eq!(format_relative_time(ago(5 * 60), now), "5m");
+        assert_eq!(format_relative_time(ago(3 * 3600), now), "3h");
+        assert_eq!(format_relative_time(ago(2 * 86400), now), "2d");
+        assert_eq!(format_relative_time(ago(15 * 86400), now), "2w");
+        assert_eq!(
+            format_relative_time(now + Duration::from_secs(60), now),
+            "now"
+        );
     }
 }

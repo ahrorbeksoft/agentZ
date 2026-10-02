@@ -2,7 +2,7 @@
 //! window is currently showing ("All projects" or a single project).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use collections::HashSet;
@@ -40,6 +40,9 @@ pub struct Thread {
     /// The registry id of the agent the thread was started with.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// When the thread was created or its agent last did something.
+    #[serde(default)]
+    pub last_activity_at: Option<SystemTime>,
 }
 
 /// Which projects the sidebar shows threads for.
@@ -71,6 +74,9 @@ pub struct ProjectStore {
     threads: Vec<Thread>,
     scope: ProjectScope,
     collapsed: HashSet<ProjectId>,
+    /// Threads whose agent is currently running. Not persisted: nothing is running after a
+    /// restart.
+    working_threads: HashSet<ThreadId>,
     state_path: Option<PathBuf>,
     _save_task: Option<Task<()>>,
 }
@@ -105,6 +111,7 @@ impl ProjectStore {
             threads: state.threads,
             scope: state.scope,
             collapsed: state.collapsed.into_iter().collect(),
+            working_threads: HashSet::default(),
             state_path,
             _save_task: None,
         };
@@ -205,6 +212,9 @@ impl ProjectStore {
             return;
         }
         self.threads.retain(|thread| thread.project_id != id);
+        let threads = &self.threads;
+        self.working_threads
+            .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.collapsed.remove(&id);
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
@@ -226,9 +236,33 @@ impl ProjectStore {
             project_id,
             title: title.into(),
             agent_id,
+            last_activity_at: Some(SystemTime::now()),
         });
         self.changed(cx);
         Some(id)
+    }
+
+    pub fn is_thread_working(&self, id: ThreadId) -> bool {
+        self.working_threads.contains(&id)
+    }
+
+    /// Marks whether the thread's agent is running; either change counts as activity.
+    pub fn set_thread_working(&mut self, id: ThreadId, working: bool, cx: &mut Context<Self>) {
+        let changed = if working {
+            self.working_threads.insert(id)
+        } else {
+            self.working_threads.remove(&id)
+        };
+        if changed {
+            self.record_thread_activity(id, cx);
+        }
+    }
+
+    pub fn record_thread_activity(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+            thread.last_activity_at = Some(SystemTime::now());
+            self.changed(cx);
+        }
     }
 
     fn allocate_id(&mut self) -> u64 {
