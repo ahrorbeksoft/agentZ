@@ -295,25 +295,32 @@ impl SettingsPage {
                     ),
             )
             .child(
-                v_flex()
-                    .id("settings-nav")
+                // The scrollbar belongs to this non-scrolling wrapper, as in Zed, so it stays put
+                // while the list moves.
+                div()
+                    .id("settings-nav-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.nav_scroll)
-                    .p_1()
-                    .gap_px()
-                    .children(items.drain(..3))
-                    .when(!projects.is_empty(), |nav| {
-                        nav.child(
-                            div().px_2().pt_3().pb_1().child(
-                                Label::new("Projects")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                    })
-                    .children(items)
+                    .child(
+                        v_flex()
+                            .id("settings-nav")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.nav_scroll)
+                            .p_1()
+                            .gap_px()
+                            .children(items.drain(..3))
+                            .when(!projects.is_empty(), |nav| {
+                                nav.child(
+                                    div().px_2().pt_3().pb_1().child(
+                                        Label::new("Projects")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                            })
+                            .children(items),
+                    )
                     .vertical_scrollbar_for(&self.nav_scroll, window, cx),
             )
             // Where the sidebar's Settings row was, so going back needs no mouse movement.
@@ -915,23 +922,28 @@ impl Render for SettingsPage {
             .bg(colors.editor_background)
             .child(self.render_nav(window, cx))
             .child(
-                v_flex()
-                    .id("settings-content")
+                div()
+                    .id("settings-content-scroll")
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.content_scroll)
-                    .items_center()
                     .child(
                         v_flex()
-                            .w_full()
-                            .max_w(CONTENT_WIDTH)
-                            .px_8()
-                            .py_6()
-                            .gap_6()
-                            .child(Headline::new(title).size(HeadlineSize::Small))
-                            .children(sections),
+                            .id("settings-content")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.content_scroll)
+                            .items_center()
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .max_w(CONTENT_WIDTH)
+                                    .px_8()
+                                    .py_6()
+                                    .gap_6()
+                                    .child(Headline::new(title).size(HeadlineSize::Small))
+                                    .children(sections),
+                            ),
                     )
                     .vertical_scrollbar_for(&self.content_scroll, window, cx),
             )
