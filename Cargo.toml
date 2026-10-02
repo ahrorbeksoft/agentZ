@@ -46,7 +46,6 @@ members = [
     "crates/settings_macros",
     "crates/text_input",
     "crates/theme_json",
-    "crates/spike_server",
 ]
 default-members = ["crates/app"]
 

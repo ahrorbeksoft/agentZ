@@ -460,7 +460,9 @@ Worktrees share `.git` with the project, so their branches are already there.
   - Detect the remote OS and CPU with `uname -sm`. Upload the matching server to
     `~/.agentz/server/<version>/agentz-server`.
   - The macOS server comes from the normal build. Linux servers (x86_64/aarch64 musl) come from
-    `cargo zigbuild`, as in Zed's dev path.
+    `cargo zigbuild`, as in Zed's dev path, with `-C target-feature=+crt-static` and
+    `strip = "symbols"`. That makes about 7 MB, or 3 MB gzipped, which is the form to upload.
+    Without stripping, the release profile's debug info makes it about 48 MB.
   - Replacing a running remote server asks first, because it stops that machine's agents.
 - **Node for npm agents.** Registry agents distributed through npm need Node, and remote
   machines may not have it (neither of the user's does).

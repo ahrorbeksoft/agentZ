@@ -8,12 +8,12 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 0. Check that a GPUI-free binary with the server's dependencies cross-compiles to
-Linux musl with `cargo zigbuild`.
+**Next:** Phase 1, step 1. Rewrite `projects` as plain Rust (no `Global`/`Context`), with the
+app wrapping it in a thin GPUI entity.
 
 | Phase | Status |
 |---|---|
-| 0. Spike | Not started |
+| 0. Spike | Done |
 | 1. Local server split | Not started |
 | 2. Attention states and notifications | Not started |
 | 3. Agent control (MCP and CLI) | Not started |
@@ -27,20 +27,24 @@ Linux musl with `cargo zigbuild`.
 
 ## 0. Spike
 
-- [ ] Check `df -h ~`. Install `zig` and `cargo-zigbuild`, and add the
+- [x] Check `df -h ~`. Install `zig` and `cargo-zigbuild`, and add the
       `x86_64-unknown-linux-musl` target. That's what both of the user's machines need;
       `aarch64-unknown-linux-musl` can wait.
-- [ ] Cross-build a minimal GPUI-free binary for Linux musl with the server's real dependencies:
+- [x] Cross-build a minimal GPUI-free binary for Linux musl with the server's real dependencies:
       tokio, `agent-client-protocol`, `http_client`/`reqwest_client` (the C code in `ring`,
       `aws-lc-sys` and `zstd-sys`), and `alacritty_terminal`. Note the size and any crates that
       fail.
-- [ ] Build `alacritty_terminal` (Zed's pinned version) in the workspace. Spawn a PTY running
+- [x] Build `alacritty_terminal` (Zed's pinned version) in the workspace. Spawn a PTY running
       `sh` and read the screen.
-- [ ] Have the mock agent receive a stdio MCP server in `session/new`, start it, and call a tool.
-- [ ] Copy the Linux binary to `devbox1` under `~/.agentz/spike/`, check that it runs (for
+- [x] Have the mock agent receive a stdio MCP server in `session/new`, start it, and call a tool.
+- [x] Copy the Linux binary to `devbox1` under `~/.agentz/spike/`, check that it runs (for
       example, an HTTPS request and spawning a process), then remove it.
-- [ ] Record the disk cost of the Linux target directories.
-- [ ] Decide on anything the spike changes, and update the plan.
+- [x] Record the disk cost of the Linux target directories.
+- [x] Decide on anything the spike changes, and update the plan.
+
+The spike's code is in commit 8430863 (`crates/spike_server`, removed in the next commit). Read
+it with `git show 8430863:crates/spike_server/src/main.rs`. It has a tokio ACP client, a PTY
+read through `alacritty_terminal` without GPUI, and a minimal stdio MCP server.
 
 ## 1. Local server split
 
@@ -279,6 +283,43 @@ Then the server:
   rewriting `agent_thread`, `projects` and `registry` as plain Rust on tokio. `reqwest_client`
   already runs tokio.
 
+- 2026-10-03: Phase 0 spike results (commit 8430863):
+  - **Cross-building works unchanged.** A GPUI-free binary with tokio, `agent-client-protocol`,
+    `http_client` (with `github-download`, as `registry` uses it), `reqwest_client` and
+    `alacritty_terminal` builds for `x86_64-unknown-linux-musl` with:
+
+    ```sh
+    CARGO_PROFILE_RELEASE_STRIP=symbols RUSTFLAGS="-C target-feature=+crt-static" \
+      cargo zigbuild --release --target x86_64-unknown-linux-musl
+    ```
+
+    - It's 264 crates, with C code in `aws-lc-sys`, `ring` and `zstd-sys`. Nothing needed
+      patching.
+    - zig's linker warns "ignoring deprecated linker optimization setting '1'". That's harmless.
+    - Tools: Homebrew's `zig` 0.16.0 and `cargo-zigbuild` 0.23.4.
+  - **Size:** 7.2 MB stripped, 3.1 MB gzipped. The release profile keeps debug info, which makes
+    48 MB unstripped, so Linux servers must be built with `strip = "symbols"`. Neither
+    `zig objcopy` (unimplemented) nor `rust-objcopy` (needs `llvm-tools`) could strip it
+    afterwards.
+  - **It runs on `devbox1`.**
+    - An HTTPS request to the ACP Registry, using the system's certificates.
+    - `sh` in an `alacritty_terminal` PTY. The screen read back correctly.
+    - The mock agent (system Python), started over ACP. It received the binary as a stdio MCP
+      server in `session/new`, started it, and called its tool. The credential passed in the
+      MCP server's `env` arrived.
+    - Peak memory was about 3.7 MB. `~/.agentz` was removed afterwards.
+  - **Disk:** a clean cross-build takes about 2.5 minutes and about 1 GB: 644 MB in
+    `target/x86_64-unknown-linux-musl`, and 323 MB of host build scripts and proc macros in
+    `target/release`.
+  - **Headless GPUI also cross-compiled**, tried before the switch. It was 93 MB with debug info
+    (against 48 MB), and took about 4.5 minutes and 1.3 GB. It never ran on Linux. That supports
+    the GPUI-free decision.
+  - **The mock agent can now call MCP tools.** A prompt of `mcp` starts the first stdio MCP
+    server from `session/new`, calls its first tool, and replies `MCP: <result>`. Phase 3's
+    end-to-end tests can build on it.
+  - **`alacritty_terminal` needs no GPUI.** `tty::new`, `Term` and `EventLoop`, with a
+    channel-backed `EventListener`, are enough. The event loop runs on its own thread.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -313,3 +354,5 @@ Then the server:
   Pastures are offered there too, as in cow.
 - 2026-10-03: Switched the server from headless GPUI to a GPUI-free core on tokio, at the
   user's request.
+- 2026-10-03: Finished phase 0 (8430863). The GPUI-free spike cross-builds for x86_64 musl and
+  runs on `devbox1`, and the mock agent calls MCP tools. See Findings.
