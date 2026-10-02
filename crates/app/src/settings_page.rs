@@ -340,7 +340,6 @@ impl SettingsPage {
                 "settings-back",
                 IconName::ArrowLeft,
                 "Back",
-                |_, cx| Tooltip::for_action("Back", &CloseSettings, cx),
                 cx.listener(|_, _, _, cx| cx.emit(SettingsPageEvent::Close)),
                 cx,
             ))

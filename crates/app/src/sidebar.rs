@@ -1149,7 +1149,6 @@ impl Render for Sidebar {
                 "open-settings",
                 IconName::Settings,
                 "Settings",
-                |_, cx| Tooltip::for_action("Settings", &OpenSettings, cx),
                 |_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx),
                 cx,
             ))
@@ -1258,7 +1257,6 @@ pub fn render_footer_item(
     id: &'static str,
     icon: IconName,
     label: &'static str,
-    tooltip: impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
@@ -1279,7 +1277,6 @@ pub fn render_footer_item(
                 .hover(|item| item.bg(colors.ghost_element_hover))
                 .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                 .child(Label::new(label).color(Color::Muted))
-                .tooltip(tooltip)
                 .on_click(on_click),
         )
         .into_any_element()
