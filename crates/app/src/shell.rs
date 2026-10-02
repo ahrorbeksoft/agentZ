@@ -93,10 +93,7 @@ impl Shell {
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::OpenThread(thread_id) => this.open_thread(*thread_id, window, cx),
                 SidebarEvent::OpenProjectSettings(project_id) => {
-                    this.open_settings(&OpenSettings, window, cx);
-                    if let Some((page, _)) = &this.settings_page {
-                        page.update(cx, |page, cx| page.show_project(*project_id, cx));
-                    }
+                    this.open_project_settings(*project_id, window, cx)
                 }
             }),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
@@ -177,6 +174,18 @@ impl Shell {
         };
         window.focus(&page.focus_handle(cx), cx);
         cx.notify();
+    }
+
+    fn open_project_settings(
+        &mut self,
+        project_id: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(&OpenSettings, window, cx);
+        if let Some((page, _)) = &self.settings_page {
+            page.update(cx, |page, cx| page.show_project(project_id, cx));
+        }
     }
 
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -360,6 +369,7 @@ impl Shell {
                 ),
             };
         let switcher_store = self.store.clone();
+        let shell = cx.entity().downgrade();
 
         h_flex()
             .id("title-bar")
@@ -402,7 +412,18 @@ impl Shell {
                             .with_handle(self.switcher_handle.clone())
                             .menu(move |window, cx| {
                                 let store = switcher_store.clone();
-                                Some(cx.new(|cx| ProjectSwitcher::new(store, window, cx)))
+                                let shell = shell.clone();
+                                let open_project_settings =
+                                    move |project_id, window: &mut Window, cx: &mut App| {
+                                        shell
+                                            .update(cx, |shell, cx| {
+                                                shell.open_project_settings(project_id, window, cx)
+                                            })
+                                            .ok();
+                                    };
+                                Some(cx.new(|cx| {
+                                    ProjectSwitcher::new(store, open_project_settings, window, cx)
+                                }))
                             })
                             .trigger_with_tooltip(
                                 ButtonLike::new("project-switcher-trigger").child(

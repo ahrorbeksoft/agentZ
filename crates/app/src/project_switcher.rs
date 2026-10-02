@@ -1,6 +1,8 @@
 //! The project picker behind the title bar's project button, modeled on Zed's recent-projects
 //! popover: search, "All projects", the projects with their icons, and Open Folder.
 
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, Subscription, Window,
@@ -44,6 +46,7 @@ impl Entry {
 
 pub struct ProjectSwitcher {
     store: Entity<ProjectStore>,
+    open_project_settings: Rc<dyn Fn(ProjectId, &mut Window, &mut App)>,
     search: Entity<TextInput>,
     entries: Vec<Entry>,
     /// Byte positions of the search's letters in each entry's name, for highlighting.
@@ -61,7 +64,12 @@ impl Focusable for ProjectSwitcher {
 }
 
 impl ProjectSwitcher {
-    pub fn new(store: Entity<ProjectStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Entity<ProjectStore>,
+        open_project_settings: impl Fn(ProjectId, &mut Window, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| TextInput::new("Search projects…", cx));
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
@@ -74,6 +82,7 @@ impl ProjectSwitcher {
 
         let mut this = Self {
             store,
+            open_project_settings: Rc::new(open_project_settings),
             search,
             entries: Vec::new(),
             match_positions: Vec::new(),
@@ -205,15 +214,10 @@ impl ProjectSwitcher {
                     return div().into_any_element();
                 };
                 let info = ProjectInfoStore::global(cx).read(cx).info().get(&id);
-                let branch = info
-                    .and_then(|info| info.git_head.as_ref())
-                    .map(|git_head| git_head.branch.clone());
                 let name = project.name();
                 let path: SharedString = compact_path(&project.path).into();
-                let tooltip_title: SharedString = match &branch {
-                    Some(branch) => format!("{name}/{branch}").into(),
-                    None => name.clone(),
-                };
+                let tooltip_title = name.clone();
+                let open_project_settings = self.open_project_settings.clone();
                 item.start_slot(render_project_icon(project, info, px(16.), cx))
                     .child(
                         // Like Zed's popover, the path shows on hover rather than in the row.
@@ -222,13 +226,26 @@ impl ProjectSwitcher {
                             .min_w_0()
                             .gap_1()
                             .child(HighlightedLabel::new(name, positions))
-                            .when_some(branch, |row, branch| {
-                                row.child(Label::new(branch).color(Color::Muted).truncate())
-                            })
                             .children(check)
                             .tooltip(move |_, cx| {
                                 Tooltip::with_meta(tooltip_title.clone(), None, path.clone(), cx)
                             }),
+                    )
+                    .end_slot(
+                        IconButton::new(("project-settings", index), IconName::Settings)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Project Settings"))
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                cx.stop_propagation();
+                                cx.emit(DismissEvent);
+                                // After the popover has closed and given focus back, so
+                                // settings can take it.
+                                let open_project_settings = open_project_settings.clone();
+                                window.defer(cx, move |window, cx| {
+                                    open_project_settings(id, window, cx)
+                                });
+                            })),
                     )
                     .into_any_element()
             }
