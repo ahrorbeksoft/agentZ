@@ -315,6 +315,7 @@ dependencies = [
  "agent_thread",
  "anyhow",
  "assets",
+ "chrono",
  "collections",
  "dirs",
  "env_logger",

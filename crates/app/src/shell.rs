@@ -49,15 +49,25 @@ impl Shell {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), registry.clone(), cx));
         let subscriptions = vec![
             cx.observe(&store, |this, store, cx| {
-                // Drop views for threads that were removed (e.g. with their project).
+                // Close views (and stop their agents) for threads that were deleted, archived,
+                // or removed along with their project.
                 let store = store.read(cx);
-                this.open_threads
-                    .retain(|thread_id, _| store.thread(*thread_id).is_some());
+                let is_live = |thread_id: ThreadId| {
+                    store
+                        .thread(thread_id)
+                        .is_some_and(|thread| thread.archived_at.is_none())
+                };
+                this.open_threads.retain(|thread_id, _| is_live(*thread_id));
                 if this
                     .active_thread
-                    .is_some_and(|thread_id| store.thread(thread_id).is_none())
+                    .is_some_and(|thread_id| !is_live(thread_id))
                 {
                     this.active_thread = None;
+                    // Deferred: the change may have come from the sidebar itself.
+                    let sidebar = this.sidebar.clone();
+                    cx.defer(move |cx| {
+                        sidebar.update(cx, |sidebar, cx| sidebar.set_active_thread(None, cx))
+                    });
                 }
                 cx.notify();
             }),

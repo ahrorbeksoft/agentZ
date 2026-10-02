@@ -46,6 +46,9 @@ pub struct Thread {
     /// The agent's ACP session, so the conversation can be restored after a restart.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Set when the thread is archived; archived threads only show in Thread History.
+    #[serde(default)]
+    pub archived_at: Option<SystemTime>,
 }
 
 /// How threads (and, in "All projects", the projects themselves) are ordered.
@@ -164,7 +167,7 @@ impl ProjectStore {
         let mut threads: Vec<&Thread> = self
             .threads
             .iter()
-            .filter(|thread| thread.project_id == project_id)
+            .filter(|thread| thread.project_id == project_id && thread.archived_at.is_none())
             .collect();
         match self.thread_order {
             ThreadOrder::LastActivity => threads.sort_by(|a, b| {
@@ -296,6 +299,7 @@ impl ProjectStore {
             agent_id,
             last_activity_at: Some(SystemTime::now()),
             session_id: None,
+            archived_at: None,
         });
         self.changed(cx);
         Some(id)
@@ -303,6 +307,49 @@ impl ProjectStore {
 
     pub fn thread(&self, id: ThreadId) -> Option<&Thread> {
         self.threads.iter().find(|thread| thread.id == id)
+    }
+
+    /// Every thread of the visible projects, archived or not, most recent activity first.
+    pub fn thread_history(&self) -> Vec<&Thread> {
+        let mut threads: Vec<&Thread> = self
+            .threads
+            .iter()
+            .filter(|thread| match self.scope {
+                ProjectScope::All => true,
+                ProjectScope::Project(id) => thread.project_id == id,
+            })
+            .collect();
+        threads.sort_by_key(|thread| std::cmp::Reverse((thread.last_activity_at, thread.id)));
+        threads
+    }
+
+    pub fn archive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.archived_at.is_none()
+        {
+            thread.archived_at = Some(SystemTime::now());
+            self.working_threads.remove(&id);
+            self.changed(cx);
+        }
+    }
+
+    pub fn unarchive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.archived_at.is_some()
+        {
+            thread.archived_at = None;
+            self.changed(cx);
+        }
+    }
+
+    /// Removes the thread for good.
+    pub fn delete_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        let count_before = self.threads.len();
+        self.threads.retain(|thread| thread.id != id);
+        if self.threads.len() != count_before {
+            self.working_threads.remove(&id);
+            self.changed(cx);
+        }
     }
 
     pub fn set_thread_session(&mut self, id: ThreadId, session_id: String, cx: &mut Context<Self>) {
@@ -468,6 +515,20 @@ mod tests {
                     .and_then(|thread| thread.session_id.clone()),
                 Some("session-7".into())
             );
+        });
+
+        store.update(cx, |store, cx| {
+            store.set_scope(ProjectScope::All, cx);
+            let thread = store
+                .add_thread(first, "To archive", None, cx)
+                .expect("thread");
+            store.archive_thread(thread, cx);
+            assert!(store.threads_for(first).all(|t| t.id != thread));
+            assert!(store.thread_history().iter().any(|t| t.id == thread));
+            store.unarchive_thread(thread, cx);
+            assert!(store.threads_for(first).any(|t| t.id == thread));
+            store.delete_thread(thread, cx);
+            assert!(store.thread(thread).is_none());
         });
 
         store.update(cx, |store, cx| store.remove_project(second, cx));

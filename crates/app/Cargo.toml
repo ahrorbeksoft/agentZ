@@ -21,6 +21,7 @@ workspace = true
 agent-client-protocol.workspace = true
 agent_thread.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 collections.workspace = true
 assets.workspace = true
 dirs.workspace = true

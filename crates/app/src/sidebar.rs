@@ -1,8 +1,12 @@
 use std::time::{Duration, SystemTime};
 
-use gpui::{AnyElement, Context, Entity, EventEmitter, MouseButton, Subscription, Task, Window};
+use chrono::{DateTime, Datelike as _, Local, NaiveDate, TimeDelta};
+use gpui::{
+    AnyElement, Context, Entity, EventEmitter, MouseButton, PromptLevel, Subscription, Task, Window,
+};
 use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread, ThreadId, ThreadOrder};
 use registry::{AgentId, AgentRegistryStore};
+use text_input::{TextInput, TextInputEvent};
 use ui::{
     ContextMenu, IconPosition, Indicator, PopoverMenu, Tooltip, prelude::*, right_click_menu,
 };
@@ -23,6 +27,10 @@ pub struct Sidebar {
     store: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
     active_thread: Option<ThreadId>,
+    /// Zed's "Thread History": every thread, archived ones included, instead of the tree.
+    showing_history: bool,
+    history_search: Entity<TextInput>,
+    history_archived_only: bool,
     _subscriptions: Vec<Subscription>,
     _activity_refresh: Task<()>,
 }
@@ -35,9 +43,11 @@ impl Sidebar {
         registry: Entity<AgentRegistryStore>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let history_search = cx.new(|cx| TextInput::new("Search all threads…", cx));
         let subscriptions = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.observe(&registry, |_, _, cx| cx.notify()),
+            cx.subscribe(&history_search, |_, _, _: &TextInputEvent, cx| cx.notify()),
         ];
         let activity_refresh = cx.spawn(async move |this, cx| {
             loop {
@@ -53,6 +63,9 @@ impl Sidebar {
             store,
             registry,
             active_thread: None,
+            showing_history: false,
+            history_search,
+            history_archived_only: false,
             _subscriptions: subscriptions,
             _activity_refresh: activity_refresh,
         }
@@ -288,8 +301,11 @@ impl Sidebar {
             .then(|| thread.last_activity_at)
             .flatten()
             .map(|time| format_relative_time(time, SystemTime::now()));
+        let group_name = SharedString::from(format!("thread-row-{}", thread.id.0));
+        let store = self.store.clone();
         h_flex()
             .id(("thread", thread.id.0))
+            .group(group_name.clone())
             .h(ROW_HEIGHT)
             .w_full()
             .pl(indent + px(8.))
@@ -320,12 +336,334 @@ impl Sidebar {
             })
             .when_some(activity, |row, activity| {
                 row.child(
-                    Label::new(activity)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div()
+                        .group_hover(group_name.clone(), |this| this.invisible())
+                        .child(
+                            Label::new(activity)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                 )
             })
+            .child(
+                div()
+                    .absolute()
+                    .right_1()
+                    .visible_on_hover(group_name)
+                    .child(
+                        IconButton::new(("archive-thread", thread.id.0), IconName::Archive)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Archive Thread"))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
+                            }),
+                    ),
+            )
+            .relative()
             .into_any_element()
+    }
+
+    fn render_bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let showing_history = self.showing_history;
+        h_flex()
+            .p_1()
+            .gap_1()
+            .flex_none()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                IconButton::new("history", IconName::Clock)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(showing_history)
+                    .tooltip(Tooltip::text(if showing_history {
+                        "Hide Thread History"
+                    } else {
+                        "Show Thread History"
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.showing_history = !this.showing_history;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// Zed's Thread History: every thread, newest first, grouped by day, with search.
+    fn render_history(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let query = self.history_search.read(cx).text().trim().to_lowercase();
+        let store = self.store.read(cx);
+        let has_archived = store
+            .thread_history()
+            .iter()
+            .any(|thread| thread.archived_at.is_some());
+        let show_project_names = store.scope() == ProjectScope::All;
+        let threads: Vec<(Thread, Option<SharedString>)> = store
+            .thread_history()
+            .into_iter()
+            .filter(|thread| !self.history_archived_only || thread.archived_at.is_some())
+            .filter(|thread| query.is_empty() || thread.title.to_lowercase().contains(&query))
+            .map(|thread| {
+                let project_name = show_project_names
+                    .then(|| {
+                        store
+                            .project(thread.project_id)
+                            .map(|project| project.name())
+                    })
+                    .flatten();
+                (thread.clone(), project_name)
+            })
+            .collect();
+        let count = threads.len();
+
+        let search = h_flex()
+            .h(px(40.))
+            .flex_none()
+            .px_3()
+            .gap_1()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1().min_w_0().child(self.history_search.clone()))
+            .when(!query.is_empty(), |this| {
+                this.child(
+                    IconButton::new("clear-history-search", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Clear Search"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.history_search
+                                .update(cx, |search, cx| search.set_text("", cx));
+                        })),
+                )
+            });
+
+        let archived_only = self.history_archived_only;
+        let toolbar = h_flex()
+            .flex_none()
+            .pl_2p5()
+            .pr_1p5()
+            .h(px(32.))
+            .justify_between()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                Label::new(if count == 1 {
+                    "1 thread".to_string()
+                } else {
+                    format!("{count} threads")
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new("history-new-thread", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Start New Agent Thread"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(NewThread), cx)
+                            }),
+                    )
+                    .child(
+                        IconButton::new("filter-archived-only", IconName::Archive)
+                            .icon_size(IconSize::Small)
+                            .disabled(!has_archived)
+                            .toggle_state(archived_only)
+                            .tooltip(Tooltip::text(if archived_only {
+                                "Show All Threads"
+                            } else {
+                                "Show Only Archived Threads"
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.history_archived_only = !this.history_archived_only;
+                                cx.notify();
+                            })),
+                    ),
+            );
+
+        let today = Local::now().date_naive();
+        let mut rows = Vec::new();
+        let mut current_bucket = None;
+        for (thread, project_name) in threads {
+            // Threads from before activity was recorded sort last, so they belong in "Older".
+            let bucket = match thread.last_activity_at {
+                Some(time) => {
+                    TimeBucket::from_dates(today, DateTime::<Local>::from(time).date_naive())
+                }
+                None => TimeBucket::Older,
+            };
+            if current_bucket != Some(bucket) {
+                current_bucket = Some(bucket);
+                rows.push(
+                    div()
+                        .w_full()
+                        .px_2p5()
+                        .pt_3()
+                        .pb_1()
+                        .child(
+                            Label::new(bucket.label())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                );
+            }
+            rows.push(self.render_history_entry(thread, project_name, cx));
+        }
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(search)
+            .child(toolbar)
+            .child(
+                v_flex()
+                    .id("thread-history")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .pb_2()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_history_entry(
+        &self,
+        thread: Thread,
+        project_name: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover_background = cx.theme().colors().ghost_element_hover;
+        let thread_id = thread.id;
+        let is_archived = thread.archived_at.is_some();
+        let group_name = SharedString::from(format!("history-entry-{}", thread.id.0));
+        let icon = thread
+            .agent_id
+            .as_ref()
+            .and_then(|agent_id| {
+                self.registry
+                    .read(cx)
+                    .agent(&AgentId::new(agent_id.clone()))?
+                    .icon_path()
+                    .cloned()
+            })
+            .map(Icon::from_external_svg)
+            .unwrap_or_else(|| Icon::new(IconName::Terminal));
+        let icon_color = if is_archived {
+            Color::Custom(cx.theme().colors().icon_muted.opacity(0.6))
+        } else {
+            Color::Muted
+        };
+        let timestamp = thread.last_activity_at.map(history_timestamp);
+        let title = SharedString::from(thread.title.clone());
+
+        let action = if is_archived {
+            let title = title.clone();
+            IconButton::new(("delete-thread", thread.id.0), IconName::Trash)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Delete Thread"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.confirm_delete_thread(thread_id, title.clone(), window, cx);
+                }))
+        } else {
+            let store = self.store.clone();
+            IconButton::new(("archive-history-thread", thread.id.0), IconName::Archive)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Archive Thread"))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
+                })
+        };
+
+        h_flex()
+            .id(("history-entry", thread.id.0))
+            .group(group_name.clone())
+            .relative()
+            .h(ROW_HEIGHT)
+            .w_full()
+            .px_2p5()
+            .gap_1p5()
+            .cursor_pointer()
+            .hover(|row| row.bg(hover_background))
+            .child(icon.size(IconSize::Small).color(icon_color))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        Label::new(title)
+                            .truncate()
+                            .when(is_archived, |label| label.color(Color::Muted)),
+                    )
+                    .when_some(project_name, |this, project_name| {
+                        this.child(
+                            Label::new(project_name)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                    }),
+            )
+            .when_some(timestamp, |row, timestamp| {
+                row.child(
+                    div()
+                        .group_hover(group_name.clone(), |this| this.invisible())
+                        .child(
+                            Label::new(timestamp)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .absolute()
+                    .right_1()
+                    .visible_on_hover(group_name)
+                    .child(action),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Opening an archived thread restores it, as in Zed.
+                this.store
+                    .update(cx, |store, cx| store.unarchive_thread(thread_id, cx));
+                cx.emit(SidebarEvent::OpenThread(thread_id));
+            }))
+            .into_any_element()
+    }
+
+    fn confirm_delete_thread(
+        &mut self,
+        thread_id: ThreadId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete “{title}”?"),
+            Some("The thread and its conversation will be removed. This can't be undone."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let store = self.store.clone();
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                store.update(cx, |store, cx| store.delete_thread(thread_id, cx));
+            }
+        })
+        .detach();
     }
 
     fn render_empty_state(&self) -> impl IntoElement {
@@ -360,8 +698,12 @@ impl Render for Sidebar {
             .border_r_1()
             .border_color(border)
             .bg(panel_background)
-            .child(self.render_header(cx))
-            .child(if projects.is_empty() {
+            .when(!self.showing_history, |this| {
+                this.child(self.render_header(cx))
+            })
+            .child(if self.showing_history {
+                self.render_history(cx)
+            } else if projects.is_empty() {
                 self.render_empty_state().into_any_element()
             } else {
                 let mut groups = Vec::with_capacity(projects.len());
@@ -383,6 +725,67 @@ impl Render for Sidebar {
                     .children(groups)
                     .into_any_element()
             })
+            .child(self.render_bottom_bar(cx))
+    }
+}
+
+/// Zed's Thread History groups.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimeBucket {
+    Today,
+    Yesterday,
+    ThisWeek,
+    PastWeek,
+    Older,
+}
+
+impl TimeBucket {
+    fn from_dates(reference: NaiveDate, date: NaiveDate) -> Self {
+        if date == reference {
+            return TimeBucket::Today;
+        }
+        if date == reference - TimeDelta::days(1) {
+            return TimeBucket::Yesterday;
+        }
+        let week = date.iso_week();
+        if reference.iso_week() == week {
+            return TimeBucket::ThisWeek;
+        }
+        if (reference - TimeDelta::days(7)).iso_week() == week {
+            return TimeBucket::PastWeek;
+        }
+        TimeBucket::Older
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            TimeBucket::Today => "Today",
+            TimeBucket::Yesterday => "Yesterday",
+            TimeBucket::ThisWeek => "This Week",
+            TimeBucket::PastWeek => "Past Week",
+            TimeBucket::Older => "Older",
+        }
+    }
+}
+
+/// Zed's history timestamps: `5m`, `3h`, `2d`, `1w`, `2mo`.
+fn history_timestamp(time: SystemTime) -> String {
+    let duration = Local::now().signed_duration_since(DateTime::<Local>::from(time));
+    let minutes = duration.num_minutes();
+    let hours = duration.num_hours();
+    let days = duration.num_days();
+    let weeks = days / 7;
+    let months = days / 30;
+    if minutes < 60 {
+        format!("{}m", minutes.max(1))
+    } else if hours < 24 {
+        format!("{}h", hours.max(1))
+    } else if days < 7 {
+        format!("{}d", days.max(1))
+    } else if weeks < 4 {
+        format!("{}w", weeks.max(1))
+    } else {
+        format!("{}mo", months.max(1))
     }
 }
 
