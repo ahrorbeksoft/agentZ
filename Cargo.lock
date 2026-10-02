@@ -197,6 +197,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentz_server"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "agent_thread",
+ "agentz_protocol",
+ "anyhow",
+ "collections",
+ "futures",
+ "gpui_shared_string",
+ "http_client",
+ "log",
+ "nix",
+ "projects",
+ "registry",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "util",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

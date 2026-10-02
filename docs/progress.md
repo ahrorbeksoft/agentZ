@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 1, the server. Start `crates/agentz_protocol`: framing, the handshake, and
-request, response and subscription messages.
+**Next:** Phase 1, the server binary: a socket and pid file in the data directory, `proxy`, and
+starting detached. Then the app as a client.
 
 | Phase | Status |
 |---|---|
@@ -58,26 +58,26 @@ GPUI-free core first, with the app working throughout:
 
 Then the server:
 
-- [ ] `crates/agentz_protocol`:
-  - [ ] framing and handshake (versions, machine id, OS/arch, capabilities);
-  - [ ] request/response and subscription messages;
-  - [ ] serde types for projects, threads, entries, tool calls, permissions, config options and
+- [x] `crates/agentz_protocol`:
+  - [x] framing and handshake (versions, machine id, OS/arch, capabilities);
+  - [x] request/response and subscription messages;
+  - [x] serde types for projects, threads, entries, tool calls, permissions, config options and
         states.
 - [ ] `crates/agentz_server`, a GPUI-free tokio binary:
   - [ ] socket listener in the data directory, with a pid file;
-  - [ ] owns `ProjectStore`, `AgentRegistryStore`, `AppSettings` agent settings, and the
+  - [x] owns `ProjectStore`, `AgentRegistryStore`, `AppSettings` agent settings, and the
         `AgentThread`s;
   - [ ] `proxy` subcommand that starts the server if needed.
-- [ ] A thread-management service shared by every transport: the app, MCP and CLI (t3code's
+- [x] A thread-management service shared by every transport: the app, MCP and CLI (t3code's
       `ThreadManagementService`).
-- [ ] Session subscription: projects, threads, states, as a snapshot and then events.
-- [ ] Thread-detail subscription: entries, plan, permissions, config options, usage, as a
+- [x] Session subscription: projects, threads, states, as a snapshot and then events.
+- [x] Thread-detail subscription: entries, plan, permissions, config options, usage, as a
       snapshot and then events.
-- [ ] Requests:
-  - [ ] threads: create, prompt, cancel, permission answer, config/mode changes, rename,
+- [x] Requests:
+  - [x] threads: create, prompt, cancel, permission answer, config/mode changes, rename,
         archive, unarchive, delete;
-  - [ ] agents: login, logout, reload;
-  - [ ] the registry: install, update, uninstall.
+  - [x] agents: login, logout, reload;
+  - [x] the registry: install, update, uninstall.
 - [ ] App: a client connection that starts the local server detached if it isn't running, and
       reconnects.
 - [ ] App: client-side thread copies with `AgentThread`'s API. Port `agent_view`, `sidebar`,
@@ -339,6 +339,26 @@ Then the server:
     by the old connection could land after a reload.
   - **One tokio worker for now.** `reqwest_client`'s runtime has a single worker thread. That's
     enough for the app in-process. The server will build its own runtime.
+- 2026-10-03: The protocol and server library (phase 1, step 2):
+  - **Shared types live in `agentz_protocol`.** Thread, registry and agent settings types moved
+    there. `AgentThread` keeps what clients see in a `ThreadView` (read through `Deref`), and
+    its permission responders beside it. A client applies `ThreadUpdate`s to its own copy, so
+    the server and the app read threads through the same API.
+  - **Unknown variants are untagged.** `#[serde(other)]` can't hold data or work with external
+    tagging, so each enum ends in `#[serde(untagged)] Unknown(serde_json::Value)`. A malformed
+    known variant also lands there.
+  - **One task owns the server's state** (`agentz_server::server::Server`). Requests and the
+    stores' and threads' messages arrive on one channel. After each batch it sends what changed:
+    a projects snapshot when the revision moved, the registry when its snapshot differs, agent
+    settings by revision, and a `ThreadUpdate` per subscribed thread from `changes_since`.
+    `changes_since` compares every entry, which is fine for now; entry revisions would make it
+    cheaper.
+  - **Agent settings moved to the server**, in `agents/settings.json`. The first start copies
+    `agents` from the app's `settings.json`.
+  - **Accounts close with their client.** An agent opened from settings to log in or out
+    belongs to the client that opened it.
+  - **Custom agents** (`ServerConfig::custom_agents`) run a fixed command instead of a registry
+    agent. Tests use them for the mock agent.
 
 ## Open questions
 
@@ -378,3 +398,5 @@ Then the server:
   runs on `devbox1`, and the mock agent calls MCP tools. See Findings.
 - 2026-10-03: Phase 1: `projects` (86606b5), `registry` (8b46efe) and `agent_thread` are plain
   Rust on tokio, wrapped by GPUI entities in the app. That finishes the GPUI-free core.
+- 2026-10-03: Phase 1: `agentz_protocol` (9cf8256) and the `agentz_server` library, tested over
+  in-memory streams with the mock agent, including a turn that outlives its client.
