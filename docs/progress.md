@@ -136,7 +136,8 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   - [ ] recursive submodules.
 - [ ] Server, pastures (port of cow's `create`):
   - [ ] `clonefile(2)` on macOS, skipping `target`, `.build`, `DerivedData`, `.turbo`;
-  - [ ] `cp --reflink=always` on Linux, or offer only worktrees there;
+  - [ ] on Linux, `cp --reflink=always -R`, falling back to a full `cp -R` with a warning
+        (cow);
   - [ ] git fixes: drop `.git/worktrees`, `checkout.guess false`, branch;
   - [ ] cleanup: `*.pid`, `*.sock`, `*.socket`, plus `.cow.json` `post_clone`;
   - [ ] roll back on failure.
@@ -251,7 +252,9 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   What follows from that:
   - **Linux x86_64 musl is the first remote build.** A static musl binary avoids glibc version
     differences.
-  - **No pastures on these machines.** ext4 has no reflinks, so they get worktrees only.
+  - **Pastures are full copies on these machines.** ext4 has no reflinks, so cow falls back to a
+    plain `cp -R` there: it works, but costs the full size and copy time. Worktrees stay the
+    cheap option.
   - **No Node.** npm registry agents can't install until the server can manage its own Node.
     That's added to phase 9.
   - **No Rust.** Building on the remote isn't an option, so we cross-build here.
@@ -287,3 +290,5 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   tools.
 - 2026-10-03: Renamed copies to pastures, cow's name for them.
 - 2026-10-03: Checked `t3-home` and `devbox1` (read-only) and recorded them under Findings.
+- 2026-10-03: Corrected the plan: cow supports Linux (reflink, else a full copy with a warning).
+  Pastures are offered there too, as in cow.

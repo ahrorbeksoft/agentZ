@@ -315,9 +315,13 @@ A thread's menu also offers **New thread in this workspace**.
    - On macOS, `clonefile(2)` on the whole folder.
    - cow skips build-output folders (`target`, `.build`, `DerivedData`, `.turbo`) by cloning
      around them. Their copies would go stale as soon as the source rebuilt.
-   - On Linux, `cp --reflink=always` (btrfs, xfs). If the filesystem can't do that, cow falls
-     back to a full copy with a warning. agentZ instead offers only worktrees on that machine,
-     because a full copy of a large repository isn't cheap.
+   - On Linux, as cow does:
+     - `cp --reflink=always -R`, a real copy-on-write clone on btrfs or xfs;
+     - otherwise (ext4, for example) a full `cp -R` with a warning. The pasture works the same,
+       with dependencies and `.env` ready, but it costs the full disk space and copy time.
+       New Thread says so next to **New pasture** on such machines.
+     - cow skips the build-output folders and large-folder symlinks only on macOS. On Linux it
+       copies everything.
 2. **Fix git** in the pasture:
    - delete the `.git/worktrees` entries inherited from the source;
    - set `checkout.guess false`;
