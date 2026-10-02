@@ -326,6 +326,7 @@ dependencies = [
  "projects",
  "registry",
  "reqwest_client",
+ "smol",
  "text_input",
  "theme",
  "theme_json",

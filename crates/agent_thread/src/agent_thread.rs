@@ -24,8 +24,17 @@ const STDERR_LINES_KEPT: usize = 20;
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionStatus {
     Connecting,
+    /// The agent is running but needs the user to log in before a session can start.
+    AuthRequired,
     Ready,
     Failed(SharedString),
+}
+
+/// Context-window usage reported by the agent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContextUsage {
+    pub used: u64,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +138,8 @@ pub enum AgentThreadEvent {
     SessionStarted(acp::SessionId),
     /// The first prompt of a new conversation was sent; useful as a title.
     FirstPrompt(String),
+    /// The agent named the session.
+    TitleChanged(String),
 }
 
 enum Incoming {
@@ -142,9 +153,6 @@ enum Incoming {
 struct Session {
     connection: ConnectionTo<Agent>,
     session_id: acp::SessionId,
-    config_options: Vec<acp::SessionConfigOption>,
-    modes: Option<acp::SessionModeState>,
-    restore: SessionRestore,
 }
 
 pub struct AgentThread {
@@ -158,7 +166,19 @@ pub struct AgentThread {
     modes: Option<acp::SessionModeState>,
     session_restore: Option<SessionRestore>,
     permission_requests: Vec<PermissionRequest>,
+    /// Set once the agent is initialized; kept so a session can be (re)opened after logging in.
+    connection: Option<ConnectionTo<Agent>>,
+    capabilities: acp::AgentCapabilities,
+    auth_methods: Vec<acp::AuthMethod>,
+    auth_error: Option<SharedString>,
+    command: Option<AgentCommand>,
+    cwd: PathBuf,
+    previous_session: Option<acp::SessionId>,
     session: Option<Session>,
+    usage: Option<ContextUsage>,
+    cost: Option<acp::Cost>,
+    available_commands: Vec<acp::AvailableCommand>,
+    pending_title: Option<String>,
     queued_prompts: Vec<String>,
     turn_started_at: Option<Instant>,
     last_stop_reason: Option<acp::StopReason>,
@@ -170,10 +190,9 @@ pub struct AgentThread {
 impl EventEmitter<AgentThreadEvent> for AgentThread {}
 
 impl AgentThread {
-    /// Starts the agent and an ACP session in `cwd`. Prompts sent before the session is ready
-    /// are queued.
-    /// Starts the agent. With `previous_session`, the earlier conversation is loaded (or at
-    /// least resumed) when the agent supports it.
+    /// Starts the agent and an ACP session in `cwd`. With `previous_session`, the earlier
+    /// conversation is loaded (or at least resumed) when the agent supports it. Prompts sent
+    /// before the session is ready are queued.
     pub fn start(
         agent_name: SharedString,
         command: Task<Result<AgentCommand>>,
@@ -181,64 +200,69 @@ impl AgentThread {
         previous_session: Option<acp::SessionId>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let connect = cx.spawn(async move |this, cx| {
-            let result = async {
-                let command = command.await?;
-                connect(command, cwd, previous_session, this.clone(), cx).await
-            }
-            .await;
-            this.update(cx, |this, cx| match result {
-                Ok(mut session) => {
-                    this.config_options = std::mem::take(&mut session.config_options);
-                    this.modes = session.modes.take();
-                    this.session_restore = Some(session.restore);
-                    cx.emit(AgentThreadEvent::SessionStarted(session.session_id.clone()));
-                    this.session = Some(session);
-                    this.status = ConnectionStatus::Ready;
-                    for prompt in std::mem::take(&mut this.queued_prompts) {
-                        this.send_to_agent(prompt, cx);
+        let connect = cx.spawn({
+            let cwd = cwd.clone();
+            async move |this, cx| {
+                let result = async {
+                    let command = command.await?;
+                    let connected = connect(command.clone(), cwd, this.clone(), cx).await?;
+                    anyhow::Ok((command, connected))
+                }
+                .await;
+                this.update(cx, |this, cx| match result {
+                    Ok((command, connected)) => {
+                        this.command = Some(command);
+                        this.connection = Some(connected.connection);
+                        this.capabilities = connected.capabilities;
+                        this.auth_methods = connected.auth_methods;
+                        this.open_session(cx);
                     }
-                    cx.notify();
-                }
-                Err(error) => {
-                    log::error!("failed to start agent: {error:#}");
-                    this.fail(format!("{error:#}"), cx);
-                }
-            })
-            .ok();
+                    Err(error) => {
+                        log::error!("failed to start agent: {error:#}");
+                        this.fail(format!("{error:#}"), cx);
+                    }
+                })
+                .ok();
+            }
         });
 
-        Self {
-            agent_name,
-            status: ConnectionStatus::Connecting,
-            entries: Vec::new(),
-            plan: Vec::new(),
-            config_options: Vec::new(),
-            modes: None,
-            session_restore: None,
-            permission_requests: Vec::new(),
-            session: None,
-            queued_prompts: Vec::new(),
-            turn_started_at: None,
-            last_stop_reason: None,
-            turn_error: None,
-            stderr_lines: VecDeque::new(),
-            _tasks: vec![connect],
-        }
+        let mut this = Self::new(agent_name, ConnectionStatus::Connecting, cwd);
+        this.previous_session = previous_session;
+        this._tasks.push(connect);
+        this
     }
 
     /// A thread that cannot start, e.g. because its agent is not installed.
     pub fn failed(agent_name: SharedString, error: impl Into<SharedString>) -> Self {
+        Self::new(
+            agent_name,
+            ConnectionStatus::Failed(error.into()),
+            PathBuf::new(),
+        )
+    }
+
+    fn new(agent_name: SharedString, status: ConnectionStatus, cwd: PathBuf) -> Self {
         Self {
             agent_name,
-            status: ConnectionStatus::Failed(error.into()),
+            status,
             entries: Vec::new(),
             plan: Vec::new(),
             config_options: Vec::new(),
             modes: None,
             session_restore: None,
             permission_requests: Vec::new(),
+            connection: None,
+            capabilities: acp::AgentCapabilities::default(),
+            auth_methods: Vec::new(),
+            auth_error: None,
+            command: None,
+            cwd,
+            previous_session: None,
             session: None,
+            usage: None,
+            cost: None,
+            available_commands: Vec::new(),
+            pending_title: None,
             queued_prompts: Vec::new(),
             turn_started_at: None,
             last_stop_reason: None,
@@ -246,6 +270,136 @@ impl AgentThread {
             stderr_lines: VecDeque::new(),
             _tasks: Vec::new(),
         }
+    }
+
+    fn open_session(&mut self, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        self.status = ConnectionStatus::Connecting;
+        self.auth_error = None;
+        let opening = open_session(
+            connection.clone(),
+            self.capabilities.clone(),
+            self.cwd.clone(),
+            self.previous_session.clone(),
+        );
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = opening.await;
+            this.update(cx, |this, cx| match result {
+                Ok(setup) => {
+                    this.config_options = setup.config_options;
+                    this.modes = setup.modes;
+                    this.session_restore = Some(setup.restore);
+                    // Later retries should restore this session rather than start another.
+                    this.previous_session = Some(setup.session_id.clone());
+                    cx.emit(AgentThreadEvent::SessionStarted(setup.session_id.clone()));
+                    this.session = Some(Session {
+                        connection,
+                        session_id: setup.session_id,
+                    });
+                    this.status = ConnectionStatus::Ready;
+                    for prompt in std::mem::take(&mut this.queued_prompts) {
+                        this.send_to_agent(prompt, cx);
+                    }
+                    cx.notify();
+                }
+                Err(error) if is_auth_required(&error) => {
+                    this.status = ConnectionStatus::AuthRequired;
+                    this.set_working(false, cx);
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.fail(format!("starting a session: {}", error_message(&error)), cx)
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn auth_methods(&self) -> &[acp::AuthMethod] {
+        &self.auth_methods
+    }
+
+    pub fn auth_error(&self) -> Option<&SharedString> {
+        self.auth_error.as_ref()
+    }
+
+    /// Logs in with one of the agent's own methods, then opens the session.
+    pub fn authenticate(&mut self, method_id: acp::AuthMethodId, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        let request = connection
+            .send_request(acp::AuthenticateRequest::new(method_id))
+            .block_task();
+        self.status = ConnectionStatus::Connecting;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            this.update(cx, |this, cx| match result {
+                Ok(_) => this.open_session(cx),
+                Err(error) => {
+                    this.status = ConnectionStatus::AuthRequired;
+                    this.auth_error = Some(error_message(&error).into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Tries to open the session again, e.g. after logging in through a terminal.
+    pub fn retry_session(&mut self, cx: &mut Context<Self>) {
+        if self.status == ConnectionStatus::AuthRequired {
+            self.open_session(cx);
+        }
+    }
+
+    /// The command to run in a terminal for one of the agent's terminal login methods.
+    pub fn terminal_auth_command(&self, method_id: &acp::AuthMethodId) -> Option<AgentCommand> {
+        let command = self.command.as_ref()?;
+        let method = self.auth_methods.iter().find_map(|method| match method {
+            acp::AuthMethod::Terminal(terminal) if &terminal.id == method_id => Some(terminal),
+            _ => None,
+        })?;
+        let mut auth_command = command.clone();
+        auth_command.args.extend(method.args.iter().cloned());
+        auth_command.env.extend(
+            method
+                .env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Some(auth_command)
+    }
+
+    pub fn cwd(&self) -> &PathBuf {
+        &self.cwd
+    }
+
+    pub fn context_usage(&self) -> Option<ContextUsage> {
+        self.usage
+    }
+
+    pub fn cost(&self) -> Option<&acp::Cost> {
+        self.cost.as_ref()
+    }
+
+    pub fn available_commands(&self) -> &[acp::AvailableCommand] {
+        &self.available_commands
+    }
+
+    pub fn supports_images(&self) -> bool {
+        self.capabilities.prompt_capabilities.image
+    }
+
+    pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
+        self.plan.clear();
+        cx.notify();
     }
 
     pub fn agent_name(&self) -> &SharedString {
@@ -407,6 +561,8 @@ impl AgentThread {
                 self.queued_prompts.push(text);
                 self.set_working(true, cx);
             }
+            // Sent once the user has logged in and the session opens.
+            ConnectionStatus::AuthRequired => self.queued_prompts.push(text),
             ConnectionStatus::Failed(_) => {}
         }
         cx.notify();
@@ -533,7 +689,12 @@ impl AgentThread {
 
     fn handle_incoming(&mut self, incoming: Incoming, cx: &mut Context<Self>) {
         match incoming {
-            Incoming::Notification(notification) => self.apply_update(notification.update),
+            Incoming::Notification(notification) => {
+                self.apply_update(notification.update);
+                if let Some(title) = self.pending_title.take() {
+                    cx.emit(AgentThreadEvent::TitleChanged(title));
+                }
+            }
             Incoming::Permission(request, responder) => {
                 let tool_call_id = request.tool_call.tool_call_id.clone();
                 // Permission requests can describe a tool call we haven't been told about yet.
@@ -605,6 +766,23 @@ impl AgentThread {
             acp::SessionUpdate::CurrentModeUpdate(update) => {
                 if let Some(modes) = &mut self.modes {
                     modes.current_mode_id = update.current_mode_id;
+                }
+            }
+            acp::SessionUpdate::UsageUpdate(update) => {
+                self.usage = Some(ContextUsage {
+                    used: update.used,
+                    size: update.size,
+                });
+                if update.cost.is_some() {
+                    self.cost = update.cost;
+                }
+            }
+            acp::SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.available_commands = update.available_commands;
+            }
+            acp::SessionUpdate::SessionInfoUpdate(update) => {
+                if let agent_client_protocol::schema::MaybeUndefined::Value(title) = update.title {
+                    self.pending_title = Some(title);
                 }
             }
             _ => {}
@@ -729,10 +907,9 @@ fn error_message(error: &agent_client_protocol::Error) -> String {
 async fn connect(
     command: AgentCommand,
     cwd: PathBuf,
-    previous_session: Option<acp::SessionId>,
     this: gpui::WeakEntity<AgentThread>,
     cx: &mut gpui::AsyncApp,
-) -> Result<Session> {
+) -> Result<Connected> {
     let mut child = smol::process::Command::new(&command.path)
         .args(&command.args)
         .envs(&command.env)
@@ -872,28 +1049,54 @@ async fn connect(
         "the agent speaks an unsupported ACP version"
     );
 
-    let capabilities = initialize_response.agent_capabilities;
+    Ok(Connected {
+        connection,
+        capabilities: initialize_response.agent_capabilities,
+        auth_methods: initialize_response.auth_methods,
+    })
+}
+
+struct Connected {
+    connection: ConnectionTo<Agent>,
+    capabilities: acp::AgentCapabilities,
+    auth_methods: Vec<acp::AuthMethod>,
+}
+
+struct SessionSetup {
+    session_id: acp::SessionId,
+    config_options: Vec<acp::SessionConfigOption>,
+    modes: Option<acp::SessionModeState>,
+    restore: SessionRestore,
+}
+
+/// Opens the thread's session: loads or resumes `previous_session` when the agent supports it
+/// (in that order, like Zed), otherwise starts a new one.
+async fn open_session(
+    connection: ConnectionTo<Agent>,
+    capabilities: acp::AgentCapabilities,
+    cwd: PathBuf,
+    previous_session: Option<acp::SessionId>,
+) -> std::result::Result<SessionSetup, agent_client_protocol::Error> {
     let had_previous_session = previous_session.is_some();
     if let Some(session_id) = previous_session {
-        // Same order as Zed: loading replays the conversation; resuming only continues it.
         if capabilities.load_session {
-            let response = connection
+            match connection
                 .send_request(acp::LoadSessionRequest::new(
                     session_id.clone(),
                     cwd.clone(),
                 ))
                 .block_task()
-                .await;
-            match response {
+                .await
+            {
                 Ok(response) => {
-                    return Ok(Session {
-                        connection,
+                    return Ok(SessionSetup {
                         session_id,
                         config_options: response.config_options.unwrap_or_default(),
                         modes: response.modes,
                         restore: SessionRestore::Loaded,
                     });
                 }
+                Err(error) if is_auth_required(&error) => return Err(error),
                 Err(error) => {
                     log::warn!(
                         "couldn't load session {session_id}: {}",
@@ -902,23 +1105,23 @@ async fn connect(
                 }
             }
         } else if capabilities.session_capabilities.resume.is_some() {
-            let response = connection
+            match connection
                 .send_request(acp::ResumeSessionRequest::new(
                     session_id.clone(),
                     cwd.clone(),
                 ))
                 .block_task()
-                .await;
-            match response {
+                .await
+            {
                 Ok(response) => {
-                    return Ok(Session {
-                        connection,
+                    return Ok(SessionSetup {
                         session_id,
                         config_options: response.config_options.unwrap_or_default(),
                         modes: response.modes,
                         restore: SessionRestore::ResumedWithoutHistory,
                     });
                 }
+                Err(error) if is_auth_required(&error) => return Err(error),
                 Err(error) => {
                     log::warn!(
                         "couldn't resume session {session_id}: {}",
@@ -932,12 +1135,8 @@ async fn connect(
     let new_session = connection
         .send_request(acp::NewSessionRequest::new(cwd))
         .block_task()
-        .await
-        .map_err(|error| anyhow!(error_message(&error)))
-        .context("starting a session")?;
-
-    Ok(Session {
-        connection,
+        .await?;
+    Ok(SessionSetup {
         session_id: new_session.session_id,
         config_options: new_session.config_options.unwrap_or_default(),
         modes: new_session.modes,
@@ -947,6 +1146,10 @@ async fn connect(
             SessionRestore::New
         },
     })
+}
+
+fn is_auth_required(error: &agent_client_protocol::Error) -> bool {
+    error.code == acp::ErrorCode::AuthRequired
 }
 
 #[cfg(test)]

@@ -171,6 +171,17 @@ impl Shell {
                     store.set_thread_session(thread_id, session_id.0.to_string(), cx)
                 });
             }
+            AgentThreadEvent::TitleChanged(title) => {
+                let title = thread_title_from_prompt(title);
+                this.store.update(cx, |store, cx| {
+                    store.rename_thread(thread_id, title.clone(), cx)
+                });
+                if let Some(open_thread) = this.open_threads.get(&thread_id) {
+                    open_thread
+                        .view
+                        .update(cx, |view, cx| view.set_title(title.into(), cx));
+                }
+            }
             AgentThreadEvent::FirstPrompt(prompt) => {
                 let title = thread_title_from_prompt(prompt);
                 this.store.update(cx, |store, cx| {

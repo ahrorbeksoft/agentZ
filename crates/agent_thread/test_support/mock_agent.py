@@ -89,6 +89,12 @@ for line in sys.stdin:
     elif method == "session/new":
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"sessionId": "session-1", "configOptions": config_options()}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {
+            "sessionUpdate": "available_commands_update", "availableCommands": [
+                {"name": "review", "description": "Review the current changes"},
+                {"name": "init", "description": "Create an AGENTS.md for this project"},
+                {"name": "compact", "description": "Summarize the conversation to free up context",
+                 "input": {"hint": "optional focus"}}]}}})
     elif method == "session/load":
         session_id = message["params"]["sessionId"]
         for payload in load_history():
@@ -132,6 +138,9 @@ for line in sys.stdin:
             update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "run-1",
                                 "title": "npm run build", "kind": "execute", "status": "completed",
                                 "content": [{"type": "content", "content": {"type": "text", "text": "```\n> shop-landing@0.1.0 build\n> next build\n\n✓ Compiled successfully\n```"}}]})
+            update(session_id, {"sessionUpdate": "usage_update", "used": 91_200, "size": 200_000,
+                                "cost": {"amount": 0.42, "currency": "USD"}})
+            update(session_id, {"sessionUpdate": "session_info_update", "title": "Checkout page with pay button"})
             update(session_id, text_chunk("agent_message_chunk",
                 "## Checkout page\n\nThe page builds. I split the work into:\n\n"
                 "- a **cart summary** component\n- the `POST /api/orders` route\n- the pay button\n\n"

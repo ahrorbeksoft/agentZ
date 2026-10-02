@@ -34,6 +34,7 @@ menu.workspace = true
 projects.workspace = true
 registry.workspace = true
 reqwest_client.workspace = true
+smol.workspace = true
 text_input.workspace = true
 theme.workspace = true
 theme_json.workspace = true

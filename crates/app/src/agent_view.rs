@@ -14,13 +14,21 @@ use gpui::{
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use registry::{AgentId, AgentRegistryStore};
-use text_input::TextInput;
+use text_input::{TextInput, TextInputEvent};
 use ui::{
     Callout, CommonAnimationExt as _, ContextMenu, Disclosure, IconPosition, PopoverMenu, Severity,
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
 const KEY_CONTEXT: &str = "AgentComposer";
+
+gpui::actions!(
+    agent,
+    [
+        /// Completes the highlighted slash command in the message editor.
+        AcceptSlashCommand,
+    ]
+);
 /// Matches Zed's default `agent.max_content_width`.
 const MAX_CONTENT_WIDTH: Pixels = px(850.);
 const DIFF_PREVIEW_LINES: usize = 12;
@@ -29,6 +37,10 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("enter", menu::Confirm, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(KEY_CONTEXT)),
+        // Only acted on while the slash-command menu is open.
+        KeyBinding::new("up", menu::SelectPrevious, Some(KEY_CONTEXT)),
+        KeyBinding::new("down", menu::SelectNext, Some(KEY_CONTEXT)),
+        KeyBinding::new("tab", AcceptSlashCommand, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -46,6 +58,13 @@ pub struct AgentView {
     expanded_tool_calls: HashSet<acp::ToolCallId>,
     toggled_thoughts: HashSet<usize>,
     plan_expanded: bool,
+    edits_expanded: bool,
+    /// Messages typed while the agent works; sent one at a time as each turn ends, like Zed.
+    queued_messages: Vec<String>,
+    queue_expanded: bool,
+    command_menu_index: usize,
+    /// The composer text for which the user dismissed the slash-command menu.
+    command_menu_dismissed_for: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
     _elapsed_refresh: Task<()>,
 }
@@ -61,13 +80,23 @@ impl AgentView {
         let composer = cx.new(|cx| TextInput::new("Message the agent…", cx));
         let subscriptions = vec![
             cx.observe(&thread, |this, _, cx| {
+                // Only follow new output if the user hasn't scrolled up to read.
+                let follow = this.is_scrolled_to_bottom();
                 this.sync_markdowns(cx);
-                this.scroll_handle.scroll_to_bottom();
+                if follow {
+                    this.scroll_handle.scroll_to_bottom();
+                }
+                this.send_next_queued_message(cx);
                 cx.notify();
             }),
             // The agent's display name and icon come from the registry, which may load later.
             cx.observe(&registry, |_, _, cx| cx.notify()),
         ];
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.subscribe(&composer, |this, _, _: &TextInputEvent, cx| {
+            this.command_menu_index = 0;
+            cx.notify();
+        }));
         // Keeps the elapsed-time label ticking while the agent works.
         let elapsed_refresh = cx.spawn(async move |this, cx| {
             loop {
@@ -93,6 +122,11 @@ impl AgentView {
             expanded_tool_calls: HashSet::default(),
             toggled_thoughts: HashSet::default(),
             plan_expanded: false,
+            edits_expanded: false,
+            queued_messages: Vec::new(),
+            queue_expanded: false,
+            command_menu_index: 0,
+            command_menu_dismissed_for: None,
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
@@ -152,18 +186,195 @@ impl AgentView {
             .map(|markdown| MarkdownElement::new(markdown.clone(), style))
     }
 
+    /// Agent commands matching a `/name` being typed at the start of the message.
+    fn matching_commands(&self, cx: &App) -> Vec<acp::AvailableCommand> {
+        let text = self.composer.read(cx).text();
+        if self.command_menu_dismissed_for.as_ref() == Some(text) {
+            return Vec::new();
+        }
+        let Some(query) = text.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if query.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let query = query.to_lowercase();
+        self.thread
+            .read(cx)
+            .available_commands()
+            .iter()
+            .filter(|command| command.name.to_lowercase().starts_with(&query))
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    fn select_next_command(
+        &mut self,
+        _: &menu::SelectNext,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.matching_commands(cx).len();
+        if count == 0 {
+            cx.propagate();
+            return;
+        }
+        self.command_menu_index = (self.command_menu_index + 1) % count;
+        cx.notify();
+    }
+
+    fn select_previous_command(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.matching_commands(cx).len();
+        if count == 0 {
+            cx.propagate();
+            return;
+        }
+        self.command_menu_index = self.command_menu_index.checked_sub(1).unwrap_or(count - 1);
+        cx.notify();
+    }
+
+    fn accept_slash_command(
+        &mut self,
+        _: &AcceptSlashCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let commands = self.matching_commands(cx);
+        match commands.get(
+            self.command_menu_index
+                .min(commands.len().saturating_sub(1)),
+        ) {
+            Some(command) => {
+                let name = command.name.clone();
+                self.accept_command(&name, cx);
+            }
+            None => cx.propagate(),
+        }
+    }
+
+    fn accept_command(&mut self, name: &str, cx: &mut Context<Self>) {
+        let text = format!("/{name} ");
+        self.composer
+            .update(cx, |composer, cx| composer.set_text(text, cx));
+        cx.notify();
+    }
+
     fn send(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        let commands = self.matching_commands(cx);
+        if let Some(command) = commands.get(
+            self.command_menu_index
+                .min(commands.len().saturating_sub(1)),
+        ) {
+            let name = command.name.clone();
+            self.accept_command(&name, cx);
+            return;
+        }
         let text = self.composer.read(cx).text().to_string();
-        if text.trim().is_empty() || self.thread.read(cx).is_working() {
+        if text.trim().is_empty() {
             return;
         }
         self.composer
             .update(cx, |composer, cx| composer.set_text("", cx));
+        if self.thread.read(cx).is_working() || !self.queued_messages.is_empty() {
+            self.queued_messages.push(text);
+            cx.notify();
+            return;
+        }
+        self.scroll_handle.scroll_to_bottom();
         self.thread.update(cx, |thread, cx| thread.send(text, cx));
     }
 
+    fn send_next_queued_message(&mut self, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        if self.queued_messages.is_empty()
+            || thread.is_working()
+            || thread.status() != &ConnectionStatus::Ready
+        {
+            return;
+        }
+        let text = self.queued_messages.remove(0);
+        self.scroll_handle.scroll_to_bottom();
+        // Deferred: this runs while the thread is notifying observers.
+        let thread = self.thread.clone();
+        cx.defer(move |cx| thread.update(cx, |thread, cx| thread.send(text, cx)));
+    }
+
+    fn is_scrolled_to_bottom(&self) -> bool {
+        let offset = self.scroll_handle.offset();
+        let max_offset = self.scroll_handle.max_offset();
+        -offset.y >= max_offset.y - px(40.)
+    }
+
     fn stop(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.matching_commands(cx).is_empty() {
+            self.command_menu_dismissed_for = Some(self.composer.read(cx).text().clone());
+            cx.notify();
+            return;
+        }
         self.thread.update(cx, |thread, cx| thread.cancel(cx));
+    }
+
+    fn render_command_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let commands = self.matching_commands(cx);
+        if commands.is_empty() {
+            return None;
+        }
+        let selected = self.command_menu_index.min(commands.len() - 1);
+        let mut items = Vec::new();
+        for (index, command) in commands.into_iter().enumerate() {
+            let name = command.name.clone();
+            let hint = match &command.input {
+                Some(acp::AvailableCommandInput::Unstructured(input)) => Some(input.hint.clone()),
+                _ => None,
+            };
+            items.push(
+                ui::ListItem::new(("slash-command", index))
+                    .inset(true)
+                    .spacing(ui::ListItemSpacing::Sparse)
+                    .toggle_state(index == selected)
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Label::new(format!("/{}", command.name)).buffer_font(cx))
+                                    .when_some(hint, |this, hint| {
+                                        this.child(
+                                            Label::new(hint)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Placeholder),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                Label::new(command.description)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.accept_command(&name, cx))),
+            );
+        }
+        Some(
+            v_flex()
+                .absolute()
+                .bottom_full()
+                .left_0()
+                .mb_1()
+                .w(rems(26.))
+                .p_1()
+                .elevation_2(cx)
+                .children(items)
+                .into_any_element(),
+        )
     }
 
     fn agent_icon(&self, cx: &App) -> Icon {
@@ -263,13 +474,26 @@ impl AgentView {
             }
             Entry::AgentMessage(_) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                let show_controls = !self.thread.read(cx).is_working()
+                    && self.thread.read(cx).entries()[index + 1..]
+                        .iter()
+                        .all(|entry| {
+                            !matches!(entry, Entry::AgentMessage(_) | Entry::UserMessage(_))
+                        });
                 v_flex()
-                    .px_5()
-                    .py_1p5()
-                    .when(is_last, |this| this.pb_4())
                     .w_full()
-                    .text_ui(cx)
-                    .children(self.markdown((index, 0), style))
+                    .child(
+                        v_flex()
+                            .px_5()
+                            .py_1p5()
+                            .when(is_last && !show_controls, |this| this.pb_4())
+                            .w_full()
+                            .text_ui(cx)
+                            .children(self.markdown((index, 0), style)),
+                    )
+                    .when(show_controls, |this| {
+                        this.child(self.render_thread_controls(index, cx))
+                    })
                     .into_any_element()
             }
             Entry::AgentThought(_) => self.render_thinking_block(index, is_last, window, cx),
@@ -277,6 +501,57 @@ impl AgentView {
             // In Zed the plan lives in the activity bar above the message editor.
             Entry::Plan => div().into_any_element(),
         }
+    }
+
+    /// Zed's controls under a finished reply: copy it, jump to the prompt, jump to the top.
+    fn render_thread_controls(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let user_message_index = self.thread.read(cx).entries()[..index]
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::UserMessage(_)));
+        h_flex()
+            .w_full()
+            .py_1p5()
+            .px_4()
+            .gap_1()
+            .justify_end()
+            .opacity(0.4)
+            .hover(|this| this.opacity(1.))
+            .child(
+                IconButton::new(("copy-agent-response", index), IconName::Copy)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Copy This Agent Response"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(Entry::AgentMessage(text)) =
+                            this.thread.read(cx).entries().get(index)
+                        {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                        }
+                    })),
+            )
+            .when_some(user_message_index, |this, user_message_index| {
+                this.child(
+                    IconButton::new(("scroll-to-user-message", index), IconName::ForwardArrowUp)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Scroll to User Message"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scroll_handle.scroll_to_top_of_item(user_message_index);
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                IconButton::new(("scroll-to-top", index), IconName::ArrowUp)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Scroll to Top"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.scroll_handle.set_offset(gpui::point(px(0.), px(0.)));
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_thinking_block(
@@ -747,6 +1022,105 @@ impl AgentView {
         )
     }
 
+    /// Zed's "Authenticate to …" callout, with a button per login method the agent offers.
+    fn render_auth_required(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        if thread.status() != &ConnectionStatus::AuthRequired {
+            return None;
+        }
+        let agent_name = self.agent_name(cx);
+        let methods = thread.auth_methods().to_vec();
+        let auth_error = thread.auth_error().cloned();
+        let has_terminal_method = methods
+            .iter()
+            .any(|method| matches!(method, acp::AuthMethod::Terminal(_)));
+
+        let mut buttons = Vec::new();
+        for (index, method) in methods.iter().enumerate().rev() {
+            let (method_id, name, description, is_terminal) = match method {
+                acp::AuthMethod::Agent(method) => (
+                    method.id.clone(),
+                    method.name.clone(),
+                    method.description.clone(),
+                    false,
+                ),
+                acp::AuthMethod::Terminal(method) => (
+                    method.id.clone(),
+                    method.name.clone(),
+                    method.description.clone(),
+                    true,
+                ),
+                _ => continue,
+            };
+            buttons.push(
+                Button::new(SharedString::from(format!("auth-{}", method_id.0)), name)
+                    .label_size(LabelSize::Small)
+                    .style(if index == 0 {
+                        ButtonStyle::Tinted(ui::TintColor::Accent)
+                    } else {
+                        ButtonStyle::Outlined
+                    })
+                    .when_some(description, |button, description| {
+                        button.tooltip(Tooltip::text(description))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if is_terminal {
+                            let command = this.thread.read(cx).terminal_auth_command(&method_id);
+                            let cwd = this.thread.read(cx).cwd().clone();
+                            if let Some(command) = command {
+                                cx.background_spawn(async move {
+                                    if let Err(error) = open_in_terminal(&command, &cwd).await {
+                                        log::error!(
+                                            "couldn't open a terminal to log in: {error:#}"
+                                        );
+                                    }
+                                })
+                                .detach();
+                            }
+                        } else {
+                            let method_id = method_id.clone();
+                            this.thread
+                                .update(cx, |thread, cx| thread.authenticate(method_id, cx));
+                        }
+                    })),
+            );
+        }
+        if has_terminal_method {
+            buttons.push(
+                Button::new("auth-retry", "I've Logged In")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Outlined)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.thread
+                            .update(cx, |thread, cx| thread.retry_session(cx));
+                    })),
+            );
+        }
+
+        let description = auth_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| {
+                if methods.len() > 1 {
+                    "Choose one of the following authentication options:".to_string()
+                } else {
+                    format!("{agent_name} needs you to log in before it can start.")
+                }
+            });
+        Some(
+            div()
+                .px_2()
+                .pb_2()
+                .child(
+                    Callout::new()
+                        .icon(IconName::Info)
+                        .title(format!("Authenticate to {agent_name}"))
+                        .description(description)
+                        .actions_slot(h_flex().justify_end().flex_wrap().gap_1().children(buttons)),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_errors(&self, cx: &App) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
         let callout = if let ConnectionStatus::Failed(error) = thread.status() {
@@ -767,7 +1141,7 @@ impl AgentView {
         Some(div().px_2().pb_2().child(callout).into_any_element())
     }
 
-    fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_plan_section(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let plan = self.thread.read(cx).plan().to_vec();
         if plan.is_empty() {
             return None;
@@ -859,11 +1233,240 @@ impl AgentView {
             })
             .child(Disclosure::new("plan-disclosure", plan_expanded))
             .child(title.flex_1())
+            .child(
+                IconButton::new("dismiss-plan", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .shape(ui::IconButtonShape::Square)
+                    .tooltip(Tooltip::text("Clear Plan"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.thread.update(cx, |thread, cx| thread.clear_plan(cx));
+                        cx.stop_propagation();
+                    })),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
                 this.plan_expanded = !this.plan_expanded;
                 cx.notify();
             }));
 
+        Some(
+            v_flex()
+                .child(summary)
+                .when(plan_expanded, |this| {
+                    this.child(render_plan_entries(&plan, window, cx))
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// Files the agent changed in this thread, with line counts, like Zed's edits summary.
+    fn render_edits_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let mut files: Vec<(String, usize, usize)> = Vec::new();
+        for entry in self.thread.read(cx).entries() {
+            let Entry::ToolCall(tool_call) = entry else {
+                continue;
+            };
+            for diff in &tool_call.diffs {
+                let path = diff.path.to_string_lossy().into_owned();
+                let (added, removed) = diff.line_counts();
+                match files.iter_mut().find(|(existing, _, _)| *existing == path) {
+                    Some(file) => {
+                        file.1 += added;
+                        file.2 += removed;
+                    }
+                    None => files.push((path, added, removed)),
+                }
+            }
+        }
+        if files.is_empty() {
+            return None;
+        }
+        let cwd = self.thread.read(cx).cwd().clone();
+        let colors = cx.theme().colors();
+        let total_added: usize = files.iter().map(|(_, added, _)| added).sum();
+        let total_removed: usize = files.iter().map(|(_, _, removed)| removed).sum();
+        let expanded = self.edits_expanded;
+        let file_count = files.len();
+
+        let summary = h_flex()
+            .id("edits-summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .cursor_pointer()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(colors.border)
+            })
+            .child(Disclosure::new("edits-disclosure", expanded))
+            .child(
+                Label::new("Edits")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(if file_count == 1 {
+                    "1 file".to_string()
+                } else {
+                    format!("{file_count} files")
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(diff_stat(total_added, total_removed))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.edits_expanded = !this.edits_expanded;
+                cx.notify();
+            }));
+
+        Some(
+            v_flex()
+                .child(summary)
+                .when(expanded, |this| {
+                    this.child(
+                        v_flex()
+                            .id("edited-files")
+                            .max_h_40()
+                            .overflow_y_scroll()
+                            .children(files.into_iter().enumerate().map(
+                                |(index, (path, added, removed))| {
+                                    let display_path = std::path::Path::new(&path)
+                                        .strip_prefix(&cwd)
+                                        .map(|relative| relative.to_string_lossy().into_owned())
+                                        .unwrap_or(path);
+                                    h_flex()
+                                        .py_1()
+                                        .px_2()
+                                        .gap_2()
+                                        .bg(colors.editor_background)
+                                        .when(index + 1 < file_count, |this| {
+                                            this.border_b_1().border_color(colors.border)
+                                        })
+                                        .child(
+                                            Icon::new(IconName::File)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_xs()
+                                                .text_color(colors.text_muted)
+                                                .child(display_path),
+                                        )
+                                        .child(diff_stat(added, removed))
+                                },
+                            )),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_queue_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.queued_messages.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let count = self.queued_messages.len();
+        let expanded = self.queue_expanded;
+        let summary = h_flex()
+            .id("queue-summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .cursor_pointer()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(colors.border)
+            })
+            .child(Disclosure::new("queue-disclosure", expanded))
+            .child(
+                Label::new(if count == 1 {
+                    "1 Queued Message".to_string()
+                } else {
+                    format!("{count} Queued Messages")
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("send-queued-now", "Send Now")
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(
+                        "Stop the current turn and send the next queued message",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.thread.update(cx, |thread, cx| thread.cancel(cx));
+                        cx.stop_propagation();
+                    })),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.queue_expanded = !this.queue_expanded;
+                cx.notify();
+            }));
+        let mut rows = Vec::new();
+        for (index, message) in self.queued_messages.iter().enumerate() {
+            rows.push(
+                h_flex()
+                    .py_1()
+                    .px_2()
+                    .gap_2()
+                    .bg(colors.editor_background)
+                    .when(index + 1 < count, |this| {
+                        this.border_b_1().border_color(colors.border)
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(colors.text_muted)
+                            .child(message.lines().next().unwrap_or_default().to_string()),
+                    )
+                    .child(
+                        IconButton::new(("remove-queued", index), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Remove From Queue"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if index < this.queued_messages.len() {
+                                    this.queued_messages.remove(index);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        Some(
+            v_flex()
+                .child(summary)
+                .when(expanded, |this| this.children(rows))
+                .into_any_element(),
+        )
+    }
+
+    /// The bar above the message editor: plan, edited files and queued messages.
+    fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sections: Vec<AnyElement> = [
+            self.render_plan_section(window, cx),
+            self.render_edits_section(cx),
+            self.render_queue_section(cx),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if sections.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let section_count = sections.len();
+        let mut children = Vec::new();
+        for (index, section) in sections.into_iter().enumerate() {
+            children.push(section);
+            if index + 1 < section_count {
+                children.push(ui::Divider::horizontal().into_any_element());
+            }
+        }
         Some(
             h_flex()
                 .w_full()
@@ -873,7 +1476,7 @@ impl AgentView {
                     v_flex()
                         .w_full()
                         .max_w(MAX_CONTENT_WIDTH)
-                        .bg(activity_bg)
+                        .bg(Self::activity_bar_bg(cx))
                         .border_1()
                         .border_b_0()
                         .border_color(colors.border)
@@ -882,10 +1485,7 @@ impl AgentView {
                             gpui::BoxShadow::new(px(1.), px(-1.), gpui::black().opacity(0.12))
                                 .blur_radius(px(2.)),
                         ])
-                        .child(summary)
-                        .when(plan_expanded, |this| {
-                            this.child(render_plan_entries(&plan, window, cx))
-                        }),
+                        .children(children),
                 )
                 .into_any_element(),
         )
@@ -1106,6 +1706,88 @@ impl AgentView {
         controls
     }
 
+    /// Zed's context ring: how full the agent's context window is, with details on hover.
+    fn render_context_usage(&self, cx: &App) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let usage = thread.context_usage()?;
+        let ratio = if usage.size > 0 {
+            usage.used as f32 / usage.size as f32
+        } else {
+            0.
+        };
+        let percentage = SharedString::from(format!("{}%", (ratio * 100.).round() as u32));
+        let used = SharedString::from(humanize_token_count(usage.used));
+        let size = SharedString::from(humanize_token_count(usage.size));
+        let cost_label: Option<SharedString> = thread.cost().map(|cost| {
+            let precision = if cost.amount > 0. && cost.amount < 0.01 {
+                4
+            } else {
+                2
+            };
+            format!("{:.precision$} {}", cost.amount, cost.currency).into()
+        });
+        let progress_color = if ratio >= 0.85 {
+            cx.theme().status().warning
+        } else {
+            cx.theme().colors().text_muted
+        };
+        Some(
+            h_flex()
+                .id("context-usage")
+                .mt_px()
+                .mr_1()
+                .child(
+                    ui::CircularProgress::new(usage.used as f32, usage.size as f32, px(16.), cx)
+                        .stroke_width(px(2.))
+                        .progress_color(progress_color),
+                )
+                .tooltip(move |window, cx| {
+                    let percentage = percentage.clone();
+                    let used = used.clone();
+                    let size = size.clone();
+                    let cost_label = cost_label.clone();
+                    Tooltip::element(move |_, cx| {
+                        let separator =
+                            Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
+                        v_flex()
+                            .min_w_40()
+                            .child(
+                                Label::new("Context")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(Label::new(percentage.clone()))
+                                    .child(Label::new("\u{2022}").color(separator).mx_1())
+                                    .child(Label::new(used.clone()))
+                                    .child(Label::new("/").color(separator))
+                                    .child(Label::new(size.clone()).color(Color::Muted)),
+                            )
+                            .when_some(cost_label.clone(), |this, cost_label| {
+                                this.child(
+                                    v_flex()
+                                        .mt_1p5()
+                                        .pt_1p5()
+                                        .gap_0p5()
+                                        .border_t_1()
+                                        .border_color(cx.theme().colors().border_variant)
+                                        .child(
+                                            Label::new("Cost")
+                                                .color(Color::Muted)
+                                                .size(LabelSize::Small),
+                                        )
+                                        .child(Label::new(cost_label)),
+                                )
+                            })
+                            .into_any_element()
+                    })(window, cx)
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_message_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
@@ -1122,28 +1804,40 @@ impl AgentView {
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Cancel), cx))
                 .into_any_element()
         } else {
-            IconButton::new("send-message", IconName::Send)
-                .style(ButtonStyle::Filled)
-                .map(|this| {
-                    if is_editor_empty || is_generating || has_failed {
-                        this.disabled(true).icon_color(Color::Muted)
-                    } else {
-                        this.icon_color(Color::Accent)
-                    }
-                })
-                .tooltip(Tooltip::text(if is_editor_empty {
-                    "Type to Send"
+            IconButton::new(
+                "send-message",
+                if is_generating {
+                    IconName::QueueMessage
                 } else {
-                    "Send Message"
-                }))
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Confirm), cx))
-                .into_any_element()
+                    IconName::Send
+                },
+            )
+            .style(ButtonStyle::Filled)
+            .map(|this| {
+                if is_editor_empty || has_failed {
+                    this.disabled(true).icon_color(Color::Muted)
+                } else {
+                    this.icon_color(Color::Accent)
+                }
+            })
+            .tooltip(Tooltip::text(if is_editor_empty {
+                "Type to Send"
+            } else if is_generating {
+                "Queue and Send"
+            } else {
+                "Send Message"
+            }))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Confirm), cx))
+            .into_any_element()
         };
 
         h_flex()
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::send))
             .on_action(cx.listener(Self::stop))
+            .on_action(cx.listener(Self::select_next_command))
+            .on_action(cx.listener(Self::accept_slash_command))
+            .on_action(cx.listener(Self::select_previous_command))
             .py_2()
             .bg(colors.editor_background)
             .justify_center()
@@ -1158,11 +1852,13 @@ impl AgentView {
                     .gap_2()
                     .child(
                         v_flex()
+                            .relative()
                             .w_full()
                             .pt_1()
                             .pr_2p5()
                             .text_ui(cx)
-                            .child(self.composer.clone()),
+                            .child(self.composer.clone())
+                            .children(self.render_command_menu(cx)),
                     )
                     .child(
                         h_flex()
@@ -1188,6 +1884,7 @@ impl AgentView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_1()
+                                    .children(self.render_context_usage(cx))
                                     .children(self.render_session_settings(cx))
                                     .child(send_button),
                             ),
@@ -1321,34 +2018,34 @@ impl Render for AgentView {
             .child(self.render_toolbar(cx))
             .children(self.render_restore_notice(cx))
             .child(
-                div()
+                // Each row is a direct child of the scrolled element, so rows can be scrolled to
+                // by index (entries come first, in order).
+                v_flex()
                     .id("agent-conversation")
                     .flex_1()
                     .min_h_0()
+                    .pt_2()
+                    .pb_4()
+                    .items_center()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    .child(
-                        h_flex().w_full().justify_center().child(
-                            v_flex()
-                                .w_full()
-                                .max_w(MAX_CONTENT_WIDTH)
-                                .pt_2()
-                                .pb_4()
-                                .children(rows)
-                                .when(!has_rows, |this| {
-                                    this.child(
-                                        div().px_5().py_8().child(
-                                            Label::new(format!(
-                                                "Start a conversation with {}.",
-                                                self.agent_name(cx)
-                                            ))
-                                            .color(Color::Muted),
-                                        ),
-                                    )
-                                }),
-                        ),
-                    ),
+                    .children(
+                        rows.into_iter()
+                            .map(|row| div().w_full().max_w(MAX_CONTENT_WIDTH).child(row)),
+                    )
+                    .when(!has_rows, |this| {
+                        this.child(
+                            div().w_full().max_w(MAX_CONTENT_WIDTH).px_5().py_8().child(
+                                Label::new(format!(
+                                    "Start a conversation with {}.",
+                                    self.agent_name(cx)
+                                ))
+                                .color(Color::Muted),
+                            ),
+                        )
+                    }),
             )
+            .children(self.render_auth_required(cx))
             .children(self.render_errors(cx))
             .children(self.render_activity_bar(window, cx))
             .child(self.render_message_editor(cx))
@@ -1388,4 +2085,105 @@ fn setting_tooltip(
             })
             .into_any_element()
     })
+}
+
+/// Like Zed: `950`, `1.2k`, `45k`, `1.5M`.
+fn humanize_token_count(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=9_999 => {
+            let thousands = count / 1_000;
+            let hundreds = (count % 1_000 + 50) / 100;
+            match hundreds {
+                0 => format!("{thousands}k"),
+                10 => format!("{}k", thousands + 1),
+                _ => format!("{thousands}.{hundreds}k"),
+            }
+        }
+        10_000..=999_999 => format!("{}k", (count + 500) / 1_000),
+        _ => {
+            let millions = count / 1_000_000;
+            let hundred_thousands = (count % 1_000_000 + 50_000) / 100_000;
+            match hundred_thousands {
+                0 => format!("{millions}M"),
+                10 => format!("{}M", millions + 1),
+                _ => format!("{millions}.{hundred_thousands}M"),
+            }
+        }
+    }
+}
+
+fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
+    h_flex()
+        .gap_1()
+        .child(
+            Label::new(format!("+{added}"))
+                .size(LabelSize::Small)
+                .color(Color::Created),
+        )
+        .child(
+            Label::new(format!("−{removed}"))
+                .size(LabelSize::Small)
+                .color(Color::Deleted),
+        )
+}
+
+/// Opens the system terminal running `command` in `cwd`, for agents that log in interactively.
+async fn open_in_terminal(
+    command: &registry::AgentCommand,
+    cwd: &std::path::Path,
+) -> anyhow::Result<()> {
+    fn shell_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+    let mut script = format!("cd {}", shell_quote(&cwd.to_string_lossy()));
+    script.push_str(" && env");
+    for (key, value) in &command.env {
+        script.push_str(&format!(" {}={}", key, shell_quote(value)));
+    }
+    script.push(' ');
+    script.push_str(&shell_quote(&command.path.to_string_lossy()));
+    for argument in &command.args {
+        script.push(' ');
+        script.push_str(&shell_quote(argument));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let apple_script_string = script.replace('\\', "\\\\").replace('"', "\\\"");
+        let status = smol::process::Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"Terminal\" to activate",
+                "-e",
+                &format!("tell application \"Terminal\" to do script \"{apple_script_string}\""),
+            ])
+            .status()
+            .await?;
+        anyhow::ensure!(status.success(), "osascript exited with {status}");
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let status = smol::process::Command::new("x-terminal-emulator")
+            .args(["-e", "sh", "-c", &script])
+            .status()
+            .await?;
+        anyhow::ensure!(status.success(), "the terminal exited with {status}");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::humanize_token_count;
+
+    #[test]
+    fn token_counts() {
+        assert_eq!(humanize_token_count(950), "950");
+        assert_eq!(humanize_token_count(1_234), "1.2k");
+        assert_eq!(humanize_token_count(45_400), "45k");
+        assert_eq!(humanize_token_count(200_000), "200k");
+        assert_eq!(humanize_token_count(1_500_000), "1.5M");
+    }
 }
