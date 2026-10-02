@@ -15,10 +15,13 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 0. Spike | Not started |
 | 1. Local server split | Not started |
 | 2. Attention states and notifications | Not started |
-| 3. Terminal threads | Not started |
-| 4. Terminal agent detection | Not started |
-| 5. Machines over SSH | Not started |
-| 6. Polish | Not started |
+| 3. Agent control (MCP and CLI) | Not started |
+| 4. Subthreads | Not started |
+| 5. Diffs | Not started |
+| 6. Terminals | Not started |
+| 7. Terminal agent detection | Not started |
+| 8. Machines over SSH | Not started |
+| 9. Polish | Not started |
 
 ## 0. Spike
 
@@ -28,6 +31,7 @@ Note anything that changed the plan under **Findings**, and update the plan itse
       using `agent_thread`, `projects` and `registry`. Note the size and any crates that fail.
 - [ ] Build `alacritty_terminal` (Zed's pinned version) in the workspace. Spawn a PTY running
       `sh` and read the screen.
+- [ ] Have the mock agent receive a stdio MCP server in `session/new`, start it, and call a tool.
 - [ ] Record the disk cost of the Linux target directories.
 - [ ] Decide on anything the spike changes, and update the plan.
 
@@ -43,12 +47,14 @@ Note anything that changed the plan under **Findings**, and update the plan itse
   - [ ] owns `ProjectStore`, `AgentRegistryStore`, `AppSettings` agent settings, and the
         `AgentThread`s;
   - [ ] `proxy` subcommand that starts the server if needed.
+- [ ] A thread-management service shared by every transport: the app, MCP and CLI (t3code's
+      `ThreadManagementService`).
 - [ ] Session subscription: projects, threads, states, as a snapshot and then events.
 - [ ] Thread-detail subscription: entries, plan, permissions, config options, usage, as a
       snapshot and then events.
 - [ ] Requests:
   - [ ] threads: create, prompt, cancel, permission answer, config/mode changes, rename,
-        archive, delete;
+        archive, unarchive, delete;
   - [ ] agents: login, logout, reload;
   - [ ] the registry: install, update, uninstall.
 - [ ] App: a client connection that starts the local server detached if it isn't running, and
@@ -68,27 +74,80 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Sidebar cards and the project switcher show states, rolled up to the project.
 - [ ] macOS notifications for done or blocked threads that aren't on screen.
 
-## 3. Terminal threads
+## 3. Agent control (MCP and CLI)
+
+- [ ] `agentz-server mcp-bridge`: a stdio MCP server that talks to the server socket, with a
+      per-session credential in its environment.
+- [ ] Inject it into every ACP `session/new` and `session/load`. Revoke the credential when the
+      session closes.
+- [ ] Tools:
+  - [ ] `orchestrator_capabilities`: agents, models, modes, login state, machines;
+  - [ ] `agentz_thread_list` and `agentz_thread_read` (messages and activity views,
+        incremental);
+  - [ ] `agentz_thread_launch` and `create_threads`;
+  - [ ] `agentz_thread_send` (auto/queue/restart), `agentz_thread_wait`,
+        `agentz_thread_interrupt`;
+  - [ ] `agentz_thread_update` (rename) and `agentz_thread_organize` (archive, unarchive).
+- [ ] Policy:
+  - [ ] project scope;
+  - [ ] no permission escalation;
+  - [ ] no delete, and no answering permissions;
+  - [ ] `clientRequestId` idempotency;
+  - [ ] typed failures.
+- [ ] Threads and messages created by agents are marked `createdBy: agent`, and the UI shows it.
+- [ ] `agentz` CLI with `--json`, covering the same operations. Put `AGENTZ_SOCKET` and
+      `AGENTZ_THREAD_ID` in agentZ terminals.
+- [ ] Mock agent: scripted MCP tool calls. End-to-end tests.
+- [ ] Document the tools for agents, like t3code's orchestration instructions.
+
+## 4. Subthreads
+
+- [ ] Thread lineage in `projects`: parent, kind `subagent`, created by.
+- [ ] `delegate_task` (async/wait, agent/model/machine/role/title, timeout), `task_status`,
+      `task_cancel`.
+- [ ] Finalization from the child's events, idempotent and surviving restarts. The result is the
+      last agent message, or the error.
+- [ ] The child gets the task prompt only; permissions are inherited and never broader.
+- [ ] UI:
+  - [ ] the Agents control on the parent (card and thread view);
+  - [ ] opening a subthread read-only;
+  - [ ] subthreads hidden from the main list.
+- [ ] A subthread's permission requests show on the parent, which becomes blocked.
+- [ ] Tests: delegation, wait, cancel, nesting, restart during a subthread.
+
+## 5. Diffs
+
+- [ ] Server: checkpoints as hidden git refs before and after each turn. Skip projects that
+      aren't git repositories.
+- [ ] Turn diff and thread diff queries. `agentz_thread_diff`.
+- [ ] Diff panel: This turn / All changes, files and hunks, mark as viewed.
+- [ ] Tests with temporary repositories.
+
+## 6. Terminals
 
 - [ ] Server: port Zed's `terminal` (PTY plus `alacritty_terminal`) without settings, tasks or
-      workspace.
+      workspace. Keep 5,000 lines and 8 MiB of scrollback.
 - [ ] Protocol: terminal content snapshot and changes, streamed only for viewed terminals and
       throttled. Input, paste, resize, scroll and selection go back.
 - [ ] App: port `terminal_element.rs` and `mappings/` without the editor and workspace
       dependencies.
-- [ ] Thread kind "terminal" in `projects`. New Thread › Terminal: a login shell, or an agent CLI
-      found on that machine's `PATH`.
+- [ ] Terminal threads: thread kind "terminal". New Thread › Terminal: a login shell, or an
+      agent CLI found on that machine's `PATH`.
+- [ ] Thread terminal drawer under ACP threads.
+- [ ] ACP client `terminal` capability backed by server terminals. Tool calls link to their live
+      terminal.
+- [ ] `agentz_terminal_*` tools and CLI commands.
 - [ ] Terminals survive app restarts, keeping their screen and scrollback.
 - [ ] Tests: a scripted `sh` session and its screen snapshots.
 
-## 4. Terminal agent detection
+## 7. Terminal agent detection
 
 - [ ] Port herdr's manifest format and matcher, reading the bottom of the screen buffer. Keep
       herdr's Apache-2.0 notice.
 - [ ] Bundle herdr's manifests for the CLIs we offer.
 - [ ] Feed the result into the attention states.
 
-## 5. Machines over SSH
+## 8. Machines over SSH
 
 - [ ] Client: saved machine profiles and Settings › Machines (add, rename, disable, remove).
 - [ ] SSH transport:
@@ -102,12 +161,23 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 - [ ] Offline machines stay visible but dimmed, with input disabled.
 - [ ] Remote projects: path field with completion from that machine.
 - [ ] Per-machine agents: install, log in, defaults.
+- [ ] Repository identity from each server: the normalized `origin` URL and the path inside the
+      repository.
+- [ ] Merged projects:
+  - [ ] same identity means one entry named `owner/repo`;
+  - [ ] machines badge;
+  - [ ] combined threads;
+  - [ ] branch shown per machine.
+- [ ] New Thread: Project → Machine (only when the project is on several machines; defaults to
+      the last used one) → Agent on that machine.
 - [ ] UI: machine icon on remote cards, machine line in the details popover, projects grouped by
       machine in the switcher.
+- [ ] Agent control across machines: `delegate_task` and thread launch with a machine; listing
+      covers every machine of a merged project.
 - [ ] Ask before replacing a running remote server.
 - [ ] Test against a real target from the user.
 
-## 6. Polish
+## 9. Polish
 
 - [ ] Optional start at login (launchd agent, systemd user service).
 - [ ] Remote server updates, only after the user confirms.
@@ -115,9 +185,22 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 
 ## Findings
 
-(None yet.)
+- 2026-10-03: The latest t3code (b4d3d51a) has an orchestrator MCP that already does most of
+  what was asked for agent control and subagents (delegated tasks, thread list, read, send,
+  organize). It also has a stdio bridge injected into ACP `session/new`, and a CLI fallback.
+  The plan follows it.
+
+## Open questions
+
+- **"Same state" for merged projects.** The plan merges projects with the same repository
+  (`origin` and path), whatever branch each machine has checked out. Should it also require
+  the same branch or commit?
+- **Agent control scope.** The plan uses t3code's rule: the caller's project only. Should agents
+  also see and manage threads in other projects?
 
 ## Log
 
 - 2026-10-03: Wrote the plan, after reading herdr, Zed's remote server and t3code's machine
   docs. Cloned herdr into `references/herdr`.
+- 2026-10-03: Updated t3code to b4d3d51a. Added agent control (MCP and CLI), subthreads, diffs,
+  terminal drawer and ACP client terminals, merged projects and the machine step in New Thread.
