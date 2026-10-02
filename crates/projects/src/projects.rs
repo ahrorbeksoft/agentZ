@@ -351,10 +351,12 @@ impl ProjectStore {
     }
 
     /// Every thread of the visible projects, archived or not, most recent activity first.
-    pub fn thread_history(&self) -> Vec<&Thread> {
+    /// Archived threads in the current scope, most recently active first.
+    pub fn archived_threads(&self) -> Vec<&Thread> {
         let mut threads: Vec<&Thread> = self
             .threads
             .iter()
+            .filter(|thread| thread.archived_at.is_some())
             .filter(|thread| match self.scope {
                 ProjectScope::All => true,
                 ProjectScope::Project(id) => thread.project_id == id,
@@ -578,7 +580,7 @@ mod tests {
                 .expect("thread");
             store.archive_thread(thread, cx);
             assert!(store.threads_for(first).all(|t| t.id != thread));
-            assert!(store.thread_history().iter().any(|t| t.id == thread));
+            assert!(store.archived_threads().iter().any(|t| t.id == thread));
             store.unarchive_thread(thread, cx);
             assert!(store.threads_for(first).any(|t| t.id == thread));
             store.set_custom_title(thread, "Mine".into(), cx);

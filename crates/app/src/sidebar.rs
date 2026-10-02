@@ -37,10 +37,9 @@ pub struct Sidebar {
     registry: Entity<AgentRegistryStore>,
     active_thread: Option<ThreadId>,
     search: Entity<TextInput>,
-    /// Zed's "Thread History": every thread, archived ones included, instead of the list.
+    /// Zed's "Thread History", showing only archived threads, in place of the list.
     showing_history: bool,
     history_search: Entity<TextInput>,
-    history_archived_only: bool,
     renaming_thread: Option<ThreadId>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
@@ -57,7 +56,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| TextInput::new("Search threads…", cx));
-        let history_search = cx.new(|cx| TextInput::new("Search all threads…", cx));
+        let history_search = cx.new(|cx| TextInput::new("Search archived threads…", cx));
         let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let subscriptions = vec![
             cx.subscribe(&rename_input, |this, _, _: &TextInputEvent, cx| {
@@ -85,7 +84,6 @@ impl Sidebar {
             search,
             showing_history: false,
             history_search,
-            history_archived_only: false,
             renaming_thread: None,
             rename_input,
             _rename_blur: None,
@@ -630,13 +628,13 @@ impl Sidebar {
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .child(
-                IconButton::new("history", IconName::Clock)
+                IconButton::new("history", IconName::Archive)
                     .icon_size(IconSize::Small)
                     .toggle_state(showing_history)
                     .tooltip(Tooltip::text(if showing_history {
-                        "Hide Thread History"
+                        "Hide Archived Threads"
                     } else {
-                        "Show Thread History"
+                        "Show Archived Threads"
                     }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.showing_history = !this.showing_history;
@@ -645,20 +643,15 @@ impl Sidebar {
             )
     }
 
-    /// Zed's Thread History: every thread, newest first, grouped by day, with search.
+    /// Zed's Thread History for archived threads: newest first, grouped by day, with search.
     fn render_history(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
         let query = self.history_search.read(cx).text().trim().to_lowercase();
         let store = self.store.read(cx);
-        let has_archived = store
-            .thread_history()
-            .iter()
-            .any(|thread| thread.archived_at.is_some());
         let show_project_names = store.scope() == ProjectScope::All;
         let threads: Vec<(Thread, Option<SharedString>)> = store
-            .thread_history()
+            .archived_threads()
             .into_iter()
-            .filter(|thread| !self.history_archived_only || thread.archived_at.is_some())
             .filter(|thread| query.is_empty() || thread.title.to_lowercase().contains(&query))
             .map(|thread| {
                 let project_name = show_project_names
@@ -698,7 +691,6 @@ impl Sidebar {
                 )
             });
 
-        let archived_only = self.history_archived_only;
         let toolbar = h_flex()
             .flex_none()
             .pl_2p5()
@@ -709,39 +701,18 @@ impl Sidebar {
             .border_color(colors.border)
             .child(
                 Label::new(if count == 1 {
-                    "1 thread".to_string()
+                    "1 archived thread".to_string()
                 } else {
-                    format!("{count} threads")
+                    format!("{count} archived threads")
                 })
                 .size(LabelSize::Small)
                 .color(Color::Muted),
             )
             .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        IconButton::new("history-new-thread", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Start New Agent Thread"))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(NewThread), cx)
-                            }),
-                    )
-                    .child(
-                        IconButton::new("filter-archived-only", IconName::Archive)
-                            .icon_size(IconSize::Small)
-                            .disabled(!has_archived)
-                            .toggle_state(archived_only)
-                            .tooltip(Tooltip::text(if archived_only {
-                                "Show All Threads"
-                            } else {
-                                "Show Only Archived Threads"
-                            }))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.history_archived_only = !this.history_archived_only;
-                                cx.notify();
-                            })),
-                    ),
+                IconButton::new("history-new-thread", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Start New Agent Thread"))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
             );
 
         let today = Local::now().date_naive();
@@ -799,7 +770,6 @@ impl Sidebar {
     ) -> AnyElement {
         let hover_background = cx.theme().colors().ghost_element_hover;
         let thread_id = thread.id;
-        let is_archived = thread.archived_at.is_some();
         let group_name = SharedString::from(format!("history-entry-{}", thread.id.0));
         let icon = thread
             .agent_id
@@ -813,35 +783,21 @@ impl Sidebar {
             })
             .map(Icon::from_external_svg)
             .unwrap_or_else(|| Icon::new(IconName::Terminal));
-        let icon_color = if is_archived {
-            Color::Custom(cx.theme().colors().icon_muted.opacity(0.6))
-        } else {
-            Color::Muted
-        };
+        let icon_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
         let timestamp = thread.last_activity_at.map(history_timestamp);
         let title = SharedString::from(thread.title.clone());
 
-        let action = if is_archived {
-            let title = title.clone();
-            IconButton::new(("delete-thread", thread.id.0), IconName::Trash)
-                .icon_size(IconSize::Small)
-                .icon_color(Color::Muted)
-                .tooltip(Tooltip::text("Delete Thread"))
-                .on_click(cx.listener(move |this, _, window, cx| {
+        let action = IconButton::new(("delete-thread", thread.id.0), IconName::Trash)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text("Delete Thread"))
+            .on_click({
+                let title = title.clone();
+                cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.confirm_delete_thread(thread_id, title.clone(), window, cx);
-                }))
-        } else {
-            let store = self.store.clone();
-            IconButton::new(("archive-history-thread", thread.id.0), IconName::Archive)
-                .icon_size(IconSize::Small)
-                .icon_color(Color::Muted)
-                .tooltip(Tooltip::text("Archive Thread"))
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
                 })
-        };
+            });
 
         h_flex()
             .id(("history-entry", thread.id.0))
@@ -859,11 +815,7 @@ impl Sidebar {
                     .flex_1()
                     .min_w_0()
                     .gap_1p5()
-                    .child(
-                        Label::new(title)
-                            .truncate()
-                            .when(is_archived, |label| label.color(Color::Muted)),
-                    )
+                    .child(Label::new(title).truncate().color(Color::Muted))
                     .when_some(project_name, |this, project_name| {
                         this.child(
                             Label::new(project_name)
