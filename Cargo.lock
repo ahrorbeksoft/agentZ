@@ -175,6 +175,7 @@ dependencies = [
  "gpui",
  "log",
  "registry",
+ "serde_json",
  "smol",
  "tempfile",
  "util",

@@ -11,6 +11,8 @@ import sys
 # Optional path where conversations are recorded so `session/load` can replay them.
 HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
 
+LONG_BUILD_OUTPUT = "".join(f"   Compiling page {n}/60\n" for n in range(1, 61))
+
 next_request_id = 1000
 pending = {}
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
@@ -129,6 +131,7 @@ for line in sys.stdin:
                 {"content": "End-to-end tests", "priority": "low", "status": "pending"}]})
             update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "read-1",
                                 "title": "Read src/app/cart/page.tsx", "kind": "read", "status": "completed",
+                                "rawInput": {"path": "src/app/cart/page.tsx", "limit": 200},
                                 "content": [{"type": "content", "content": {"type": "text", "text": "export default function Cart() {}"}}]})
             update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "edit-1",
                                 "title": "Edit src/app/checkout/page.tsx", "kind": "edit", "status": "completed",
@@ -137,7 +140,7 @@ for line in sys.stdin:
                                              "newText": "export default function Checkout() {\n  const cart = useCart()\n  return <CheckoutLayout cart={cart} />\n}\n"}]})
             update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "run-1",
                                 "title": "npm run build", "kind": "execute", "status": "completed",
-                                "content": [{"type": "content", "content": {"type": "text", "text": "```\n> shop-landing@0.1.0 build\n> next build\n\n✓ Compiled successfully\n```"}}]})
+                                "content": [{"type": "content", "content": {"type": "text", "text": "```\n> shop-landing@0.1.0 build\n> next build\n\n" + LONG_BUILD_OUTPUT + "✓ Compiled successfully\n```"}}]})
             update(session_id, {"sessionUpdate": "usage_update", "used": 91_200, "size": 200_000,
                                 "cost": {"amount": 0.42, "currency": "USD"}})
             update(session_id, {"sessionUpdate": "session_info_update", "title": "Checkout page with pay button"})

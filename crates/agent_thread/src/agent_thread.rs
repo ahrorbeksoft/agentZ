@@ -56,6 +56,8 @@ pub struct ToolCall {
     pub text: Vec<String>,
     pub diffs: Vec<FileDiff>,
     pub locations: Vec<PathBuf>,
+    /// The tool's input as markdown (JSON in a code block), for Zed's "Raw Input" view.
+    pub raw_input: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,11 +93,56 @@ impl FileDiff {
         )
     }
 
+    /// The changed region with up to `context` unchanged lines on each side, as a diff editor
+    /// would show it.
+    pub fn hunk(&self, context: usize) -> Vec<(DiffLineKind, &str)> {
+        let new_lines: Vec<&str> = self.new_text.lines().collect();
+        let old_lines: Vec<&str> = self
+            .old_text
+            .as_deref()
+            .map(|text| text.lines().collect())
+            .unwrap_or_default();
+        let common_prefix = old_lines
+            .iter()
+            .zip(&new_lines)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let common_suffix = old_lines[common_prefix..]
+            .iter()
+            .rev()
+            .zip(new_lines[common_prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+
+        let mut lines = Vec::new();
+        for line in &new_lines[common_prefix.saturating_sub(context)..common_prefix] {
+            lines.push((DiffLineKind::Context, *line));
+        }
+        for line in &old_lines[common_prefix..old_lines.len() - common_suffix] {
+            lines.push((DiffLineKind::Removed, *line));
+        }
+        for line in &new_lines[common_prefix..new_lines.len() - common_suffix] {
+            lines.push((DiffLineKind::Added, *line));
+        }
+        let suffix_start = new_lines.len() - common_suffix;
+        for line in &new_lines[suffix_start..(suffix_start + context).min(new_lines.len())] {
+            lines.push((DiffLineKind::Context, *line));
+        }
+        lines
+    }
+
     /// Line counts added and removed, for the "+84 −12" summary.
     pub fn line_counts(&self) -> (usize, usize) {
         let (removed, added) = self.changed_lines();
         (added.len(), removed.len())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Context,
+    Removed,
+    Added,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -818,6 +865,7 @@ impl AgentThread {
                 .into_iter()
                 .map(|location| location.path)
                 .collect(),
+            raw_input: tool_call.raw_input.as_ref().and_then(raw_input_text),
         };
         set_tool_call_content(&mut entry, tool_call.content);
         if let Some(existing) = self.tool_call_mut(&entry.id) {
@@ -843,6 +891,7 @@ impl AgentThread {
                     .into_iter()
                     .map(|location| location.path)
                     .collect(),
+                raw_input: fields.raw_input.as_ref().and_then(raw_input_text),
             };
             set_tool_call_content(&mut entry, fields.content.unwrap_or_default());
             self.entries.push(Entry::ToolCall(entry));
@@ -866,6 +915,9 @@ impl AgentThread {
         if let Some(content) = fields.content {
             set_tool_call_content(existing, content);
         }
+        if let Some(raw_input) = fields.raw_input.as_ref() {
+            existing.raw_input = raw_input_text(raw_input);
+        }
     }
 
     fn tool_call_mut(&mut self, id: &acp::ToolCallId) -> Option<&mut ToolCall> {
@@ -873,6 +925,21 @@ impl AgentThread {
             Entry::ToolCall(tool_call) if &tool_call.id == id => Some(tool_call),
             _ => None,
         })
+    }
+}
+
+/// Formats a tool's raw input the way Zed does: plain values as text, anything else as a
+/// pretty-printed JSON code block.
+fn raw_input_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::String(value) => Some(value.clone()),
+        value => {
+            let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            Some(format!("```json\n{pretty}\n```"))
+        }
     }
 }
 
@@ -1165,6 +1232,16 @@ mod tests {
         };
         assert_eq!(diff.line_counts(), (2, 1));
         assert_eq!(diff.changed_lines(), (vec!["b"], vec!["B", "B2"]));
+        assert_eq!(
+            diff.hunk(1),
+            vec![
+                (DiffLineKind::Context, "a"),
+                (DiffLineKind::Removed, "b"),
+                (DiffLineKind::Added, "B"),
+                (DiffLineKind::Added, "B2"),
+                (DiffLineKind::Context, "c"),
+            ]
+        );
         let created = FileDiff {
             path: PathBuf::from("b.rs"),
             old_text: None,

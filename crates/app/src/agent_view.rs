@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{
-    AgentThread, ConnectionStatus, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
+    AgentThread, ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore,
+    ToolCall,
 };
 use collections::{HashMap, HashSet};
 use gpui::{
@@ -31,7 +32,8 @@ gpui::actions!(
 );
 /// Matches Zed's default `agent.max_content_width`.
 const MAX_CONTENT_WIDTH: Pixels = px(850.);
-const DIFF_PREVIEW_LINES: usize = 12;
+/// Unchanged lines shown around an edit, like a diff editor's context.
+const DIFF_CONTEXT_LINES: usize = 3;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -46,6 +48,8 @@ pub fn init(cx: &mut App) {
 
 /// Identifies one rendered piece of markdown: an entry, and which part of it.
 type MarkdownKey = (usize, usize);
+/// The [`MarkdownKey`] part holding a tool call's raw input.
+const RAW_INPUT_PART: usize = usize::MAX;
 
 pub struct AgentView {
     thread: Entity<AgentThread>,
@@ -55,7 +59,11 @@ pub struct AgentView {
     composer: Entity<TextInput>,
     scroll_handle: ScrollHandle,
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
-    expanded_tool_calls: HashSet<acp::ToolCallId>,
+    /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
+    toggled_tool_calls: HashSet<acp::ToolCallId>,
+    expanded_raw_inputs: HashSet<acp::ToolCallId>,
+    /// Keeps a streaming thought scrolled to its newest text while it's height-limited.
+    thought_scroll_handles: HashMap<usize, ScrollHandle>,
     toggled_thoughts: HashSet<usize>,
     plan_expanded: bool,
     edits_expanded: bool,
@@ -119,7 +127,9 @@ impl AgentView {
             composer,
             scroll_handle: ScrollHandle::new(),
             markdowns: HashMap::default(),
-            expanded_tool_calls: HashSet::default(),
+            toggled_tool_calls: HashSet::default(),
+            expanded_raw_inputs: HashSet::default(),
+            thought_scroll_handles: HashMap::default(),
             toggled_thoughts: HashSet::default(),
             plan_expanded: false,
             edits_expanded: false,
@@ -144,14 +154,19 @@ impl AgentView {
         let entries = self.thread.read(cx).entries().to_vec();
         for (index, entry) in entries.iter().enumerate() {
             match entry {
-                Entry::UserMessage(text)
-                | Entry::AgentMessage(text)
-                | Entry::AgentThought(text) => {
+                Entry::UserMessage(text) | Entry::AgentMessage(text) => {
                     self.sync_markdown((index, 0), text, cx);
+                }
+                Entry::AgentThought(text) => {
+                    self.sync_markdown((index, 0), text, cx);
+                    self.thought_scroll_handles.entry(index).or_default();
                 }
                 Entry::ToolCall(tool_call) => {
                     for (part, text) in tool_call.text.iter().enumerate() {
                         self.sync_markdown((index, part + 1), text, cx);
+                    }
+                    if let Some(raw_input) = &tool_call.raw_input {
+                        self.sync_markdown((index, RAW_INPUT_PART), raw_input, cx);
                     }
                 }
                 Entry::Plan => {}
@@ -561,9 +576,17 @@ impl AgentView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // A thought that is still streaming starts open; clicking flips the default.
+        // Like Zed: a thought that is still streaming is open but height-limited and follows
+        // the newest text; once done it collapses. Clicking flips the default.
         let open_by_default = is_last && self.thread.read(cx).is_working();
-        let is_open = open_by_default != self.toggled_thoughts.contains(&index);
+        let is_toggled = self.toggled_thoughts.contains(&index);
+        let is_open = open_by_default != is_toggled;
+        let is_constrained = open_by_default && !is_toggled;
+        let scroll_handle = self.thought_scroll_handles.get(&index).cloned();
+        if is_constrained && let Some(scroll_handle) = &scroll_handle {
+            scroll_handle.scroll_to_bottom();
+        }
+        let panel_background = cx.theme().colors().panel_background;
         let header_group = SharedString::from(format!("thinking-header-{index}"));
         let line_height = window.line_height();
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx);
@@ -615,11 +638,41 @@ impl AgentView {
                     .when(is_open, |this| {
                         this.child(
                             div()
-                                .ml_1p5()
-                                .pl_3p5()
-                                .border_l_1()
-                                .border_color(Self::tool_card_border_color(cx))
-                                .children(self.markdown((index, 0), style)),
+                                .when(is_constrained, |this| this.relative())
+                                .child(
+                                    div()
+                                        .id(("thinking-content", index))
+                                        .ml_1p5()
+                                        .pl_3p5()
+                                        .border_l_1()
+                                        .border_color(Self::tool_card_border_color(cx))
+                                        .when(is_constrained, |this| this.max_h_64())
+                                        .when_some(scroll_handle, |this, scroll_handle| {
+                                            this.track_scroll(&scroll_handle)
+                                        })
+                                        .overflow_hidden()
+                                        .children(self.markdown((index, 0), style)),
+                                )
+                                .when(is_constrained, |this| {
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .size_full()
+                                            .bg(gpui::linear_gradient(
+                                                180.,
+                                                gpui::linear_color_stop(
+                                                    panel_background.opacity(0.8),
+                                                    0.,
+                                                ),
+                                                gpui::linear_color_stop(
+                                                    panel_background.opacity(0.),
+                                                    0.1,
+                                                ),
+                                            ))
+                                            .block_mouse_except_scroll(),
+                                    )
+                                }),
                         )
                     }),
             )
@@ -643,15 +696,32 @@ impl AgentView {
         let is_terminal_tool = matches!(tool_call.kind, acp::ToolKind::Execute);
         let is_edit = matches!(tool_call.kind, acp::ToolKind::Edit) || !tool_call.diffs.is_empty();
         let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
-        let has_text = !tool_call.text.is_empty();
-        let is_collapsible = has_text && !needs_confirmation && !is_terminal_tool;
+        let should_show_raw_input = !is_terminal_tool && !is_edit;
+        let has_content = !tool_call.text.is_empty()
+            || !tool_call.diffs.is_empty()
+            || (should_show_raw_input && tool_call.raw_input.is_some());
+        let is_collapsible = has_content && !needs_confirmation;
+        // Like Zed (with its default `expand_edit_card`), edits start open and everything else
+        // starts collapsed; clicking flips that.
+        let open_by_default = is_edit;
         let is_open = needs_confirmation
-            || is_terminal_tool
-            || is_edit
-            || self.expanded_tool_calls.contains(&tool_call.id);
+            || open_by_default != self.toggled_tool_calls.contains(&tool_call.id);
         let header_group = SharedString::from(format!("tool-call-header-{index}"));
 
         let label = self.render_tool_call_label(tool_call, use_card_layout, window, cx);
+        let toggle = {
+            let view = cx.entity().downgrade();
+            let tool_call_id = tool_call.id.clone();
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                view.update(cx, |this, cx| {
+                    if !this.toggled_tool_calls.remove(&tool_call_id) {
+                        this.toggled_tool_calls.insert(tool_call_id.clone());
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        };
         let header = h_flex()
             .group(&header_group)
             .relative()
@@ -680,18 +750,12 @@ impl AgentView {
                         },
                     )
                     .when(is_collapsible, |this| {
-                        let tool_call_id = tool_call.id.clone();
                         this.child(
                             Disclosure::new(("tool-call-disclosure", index), is_open)
                                 .opened_icon(IconName::ChevronUp)
                                 .closed_icon(IconName::ChevronDown)
                                 .visible_on_hover(&header_group)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if !this.expanded_tool_calls.remove(&tool_call_id) {
-                                        this.expanded_tool_calls.insert(tool_call_id.clone());
-                                    }
-                                    cx.notify();
-                                })),
+                                .on_click(toggle.clone()),
                         )
                     })
                     .when(failed, |this| {
@@ -703,21 +767,101 @@ impl AgentView {
                     }),
             );
 
-        let output = is_open.then(|| {
-            let mut parts = Vec::new();
+        let input_output_header = |label: &'static str| {
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .buffer_font(cx)
+        };
+
+        let mut output = Vec::new();
+        if is_open {
+            if needs_confirmation {
+                // Zed tucks the raw input behind "View Raw Input" while awaiting permission.
+                if should_show_raw_input && tool_call.raw_input.is_some() {
+                    let is_raw_input_expanded = self.expanded_raw_inputs.contains(&tool_call.id);
+                    let tool_call_id = tool_call.id.clone();
+                    output.push(
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(Self::tool_card_border_color(cx))
+                            .child(
+                                h_flex()
+                                    .id(("raw-input-toggle", index))
+                                    .pl_0p5()
+                                    .gap_1()
+                                    .justify_between()
+                                    .rounded_xs()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
+                                    .child(input_output_header(if is_raw_input_expanded {
+                                        "Raw Input:"
+                                    } else {
+                                        "View Raw Input"
+                                    }))
+                                    .child(
+                                        Disclosure::new(
+                                            ("raw-input-disclosure", index),
+                                            is_raw_input_expanded,
+                                        )
+                                        .opened_icon(IconName::ChevronUp)
+                                        .closed_icon(IconName::ChevronDown),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.expanded_raw_inputs.remove(&tool_call_id) {
+                                            this.expanded_raw_inputs.insert(tool_call_id.clone());
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(is_raw_input_expanded, |this| {
+                                this.children(self.markdown(
+                                    (index, RAW_INPUT_PART),
+                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                ))
+                            })
+                            .into_any_element(),
+                    );
+                }
+            } else if should_show_raw_input && tool_call.raw_input.is_some() {
+                output.push(
+                    v_flex()
+                        .mt_1p5()
+                        .w_full()
+                        .ml(rems(0.4))
+                        .px_3p5()
+                        .pb_1()
+                        .gap_1()
+                        .border_l_1()
+                        .border_color(Self::tool_card_border_color(cx))
+                        .child(input_output_header("Raw Input:"))
+                        .children(self.markdown(
+                            (index, RAW_INPUT_PART),
+                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                        ))
+                        .child(input_output_header("Output:"))
+                        .into_any_element(),
+                );
+            }
             for diff in &tool_call.diffs {
-                parts.push(render_diff(diff, cx));
+                output.push(render_diff(diff, cx));
             }
             for part in 0..tool_call.text.len() {
                 let style = tool_output_style(is_terminal_tool, window, cx);
                 if let Some(markdown) = self.markdown((index, part + 1), style) {
-                    parts.push(
+                    output.push(
                         div()
+                            .id(SharedString::from(format!("tool-output-{index}-{part}")))
                             .when(use_card_layout, |this| {
                                 this.p_2()
                                     .border_t_1()
                                     .border_color(Self::tool_card_border_color(cx))
                             })
+                            // Long command output scrolls inside the card, like Zed's terminal
+                            // card (`h_72`).
+                            .when(is_terminal_tool, |this| this.max_h_72().overflow_y_scroll())
                             .when(!use_card_layout, |this| {
                                 this.mt_1p5()
                                     .ml(rems(0.4))
@@ -731,8 +875,25 @@ impl AgentView {
                     );
                 }
             }
-            parts
-        });
+            if !use_card_layout && is_collapsible {
+                output.push(
+                    div()
+                        .ml(rems(0.4))
+                        .px_3p5()
+                        .pt_2()
+                        .border_l_1()
+                        .border_color(Self::tool_card_border_color(cx))
+                        .child(
+                            IconButton::new(("tool-call-collapse", index), IconName::ChevronUp)
+                                .full_width()
+                                .style(ButtonStyle::Outlined)
+                                .icon_color(Color::Muted)
+                                .on_click(toggle),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
 
         let permission_buttons = self.render_permission_buttons(index, &tool_call.id, cx);
 
@@ -759,7 +920,7 @@ impl AgentView {
             })
             .mr_5()
             .child(header)
-            .children(output.into_iter().flatten())
+            .children(output)
             .children(permission_buttons)
             .into_any_element()
     }
@@ -922,6 +1083,7 @@ impl AgentView {
             text: Vec::new(),
             diffs: Vec::new(),
             locations: Vec::new(),
+            raw_input: None,
         };
         Some(
             v_flex()
@@ -1370,79 +1532,147 @@ impl AgentView {
         let colors = cx.theme().colors();
         let count = self.queued_messages.len();
         let expanded = self.queue_expanded;
+        let title = if count == 1 {
+            "1 Queued Message".to_string()
+        } else {
+            format!("{count} Queued Messages")
+        };
         let summary = h_flex()
-            .id("queue-summary")
             .p_1()
             .w_full()
             .gap_1()
-            .cursor_pointer()
+            .justify_between()
             .when(expanded, |this| {
                 this.border_b_1().border_color(colors.border)
             })
-            .child(Disclosure::new("queue-disclosure", expanded))
             .child(
-                Label::new(if count == 1 {
-                    "1 Queued Message".to_string()
-                } else {
-                    format!("{count} Queued Messages")
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("send-queued-now", "Send Now")
-                    .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::text(
-                        "Stop the current turn and send the next queued message",
-                    ))
+                h_flex()
+                    .id("queue-summary")
+                    .gap_1()
+                    .cursor_pointer()
+                    .child(Disclosure::new("queue-disclosure", expanded))
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.thread.update(cx, |thread, cx| thread.cancel(cx));
-                        cx.stop_propagation();
+                        this.queue_expanded = !this.queue_expanded;
+                        cx.notify();
                     })),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.queue_expanded = !this.queue_expanded;
-                cx.notify();
-            }));
+            .child(
+                Button::new("clear-queue", "Clear All")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.queued_messages.clear();
+                        cx.notify();
+                    })),
+            );
+
         let mut rows = Vec::new();
         for (index, message) in self.queued_messages.iter().enumerate() {
+            let is_next = index == 0;
             rows.push(
                 h_flex()
-                    .py_1()
-                    .px_2()
-                    .gap_2()
+                    .group("queue-entry")
+                    .w_full()
+                    .p_1p5()
+                    .gap_1()
                     .bg(colors.editor_background)
                     .when(index + 1 < count, |this| {
-                        this.border_b_1().border_color(colors.border)
+                        this.border_b_1().border_color(colors.border_variant)
                     })
+                    .child(
+                        div()
+                            .id(("queue-entry-dot", index))
+                            .child(
+                                Icon::new(IconName::Circle)
+                                    .size(IconSize::Small)
+                                    .color(if is_next { Color::Accent } else { Color::Muted }),
+                            )
+                            .tooltip(Tooltip::text(if is_next {
+                                "Next in Queue"
+                            } else {
+                                "In Queue"
+                            })),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_xs()
-                            .text_color(colors.text_muted)
                             .child(message.lines().next().unwrap_or_default().to_string()),
                     )
                     .child(
-                        IconButton::new(("remove-queued", index), IconName::Close)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Remove From Queue"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if index < this.queued_messages.len() {
-                                    this.queued_messages.remove(index);
-                                }
-                                cx.notify();
-                            })),
+                        h_flex()
+                            .when(!is_next, |this| this.visible_on_hover("queue-entry"))
+                            .gap_1()
+                            .min_w(rems_from_px(160_f32))
+                            .justify_end()
+                            .child(
+                                IconButton::new(("delete-queued", index), IconName::Trash)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Remove Message from Queue"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if index < this.queued_messages.len() {
+                                            this.queued_messages.remove(index);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                IconButton::new(("edit-queued", index), IconName::Pencil)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Edit"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if index < this.queued_messages.len() {
+                                            let text = this.queued_messages.remove(index);
+                                            this.composer.update(cx, |composer, cx| {
+                                                composer.set_text(text, cx)
+                                            });
+                                            window.focus(&this.composer.focus_handle(cx), cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(("send-queued-now", index), "Send Now")
+                                    .label_size(LabelSize::Small)
+                                    .when(is_next, |this| this.style(ButtonStyle::Outlined))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_queued_message_now(index, cx);
+                                    })),
+                            ),
                     ),
             );
         }
         Some(
             v_flex()
                 .child(summary)
-                .when(expanded, |this| this.children(rows))
+                .when(expanded, |this| {
+                    this.child(
+                        v_flex()
+                            .id("queued-messages")
+                            .max_h_40()
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
+                })
                 .into_any_element(),
         )
+    }
+
+    /// Moves a queued message to the front and sends it as soon as possible, stopping the
+    /// current turn if the agent is working.
+    fn send_queued_message_now(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.queued_messages.len() {
+            return;
+        }
+        let message = self.queued_messages.remove(index);
+        self.queued_messages.insert(0, message);
+        if self.thread.read(cx).is_working() {
+            self.thread.update(cx, |thread, cx| thread.cancel(cx));
+        } else {
+            self.send_next_queued_message(cx);
+        }
+        cx.notify();
     }
 
     /// The bar above the message editor: plan, edited files and queued messages.
@@ -1937,12 +2167,6 @@ fn render_plan_entries(plan: &[PlanItem], _window: &Window, cx: &App) -> AnyElem
 fn render_diff(diff: &FileDiff, cx: &App) -> AnyElement {
     let colors = cx.theme().colors();
     let status = cx.theme().status();
-    let (removed, added) = diff.changed_lines();
-    let mut lines: Vec<(bool, &str)> = removed.iter().map(|line| (false, *line)).collect();
-    lines.extend(added.iter().map(|line| (true, *line)));
-    let hidden = lines.len().saturating_sub(DIFF_PREVIEW_LINES);
-    lines.truncate(DIFF_PREVIEW_LINES);
-
     v_flex()
         .w_full()
         .border_t_1()
@@ -1950,32 +2174,25 @@ fn render_diff(diff: &FileDiff, cx: &App) -> AnyElement {
         .font_buffer(cx)
         .text_size(rems_from_px(12_f32))
         .line_height(rems_from_px(18_f32))
-        .children(lines.into_iter().map(|(is_added, line)| {
-            let background = if is_added {
-                status.created_background
-            } else {
-                status.deleted_background
-            };
-            h_flex()
-                .px_2()
-                .bg(background)
-                .child(
-                    div()
-                        .w(px(14.))
-                        .text_color(colors.text_muted)
-                        .child(if is_added { "+" } else { "-" }),
-                )
-                .child(line.to_string())
-        }))
-        .when(hidden > 0, |this| {
-            this.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_color(colors.text_muted)
-                    .child(format!("… {hidden} more lines")),
-            )
-        })
+        .children(
+            diff.hunk(DIFF_CONTEXT_LINES)
+                .into_iter()
+                .map(|(kind, line)| {
+                    let (marker, background) = match kind {
+                        DiffLineKind::Context => (" ", None),
+                        DiffLineKind::Removed => ("-", Some(status.deleted_background)),
+                        DiffLineKind::Added => ("+", Some(status.created_background)),
+                    };
+                    h_flex()
+                        .px_2()
+                        .when_some(background, |this, background| this.bg(background))
+                        .when(kind == DiffLineKind::Context, |this| {
+                            this.text_color(colors.text_muted)
+                        })
+                        .child(div().w(px(14.)).text_color(colors.text_muted).child(marker))
+                        .child(line.to_string())
+                }),
+        )
         .into_any_element()
 }
 
