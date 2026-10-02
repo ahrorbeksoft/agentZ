@@ -17,6 +17,7 @@ members = [
     "crates/gpui_wgpu",
     "crates/gpui_windows",
     "crates/http_client",
+    "crates/http_client_tls",
     "crates/icons",
     "crates/menu",
     "crates/path",
@@ -35,7 +36,10 @@ members = [
     "crates/ztracing_macro",
     "tooling/perf",
     "crates/app",
+    "crates/paths",
     "crates/projects",
+    "crates/registry",
+    "crates/reqwest_client",
     "crates/settings_macros",
     "crates/text_input",
     "crates/theme_json",
@@ -70,6 +74,7 @@ gpui_web = { path = "crates/gpui_web" }
 gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 http_client = { path = "crates/http_client" }
+http_client_tls = { path = "crates/http_client_tls" }
 icons = { path = "crates/icons" }
 menu = { path = "crates/menu" }
 path = { path = "crates/path" }
@@ -79,7 +84,10 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
 scheduler = { path = "crates/scheduler" }
 sum_tree = { path = "crates/sum_tree" }
 syntax_theme = { path = "crates/syntax_theme" }
+paths = { path = "crates/paths" }
 projects = { path = "crates/projects" }
+registry = { path = "crates/registry" }
+reqwest_client = { path = "crates/reqwest_client" }
 settings_macros = { path = "crates/settings_macros" }
 text_input = { path = "crates/text_input" }
 theme = { path = "crates/theme" }

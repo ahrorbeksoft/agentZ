@@ -10,8 +10,6 @@ use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
 
-const STATE_FILE_NAME: &str = "state.json";
-const DATA_DIR_ENV_VAR: &str = "AGENTZ_DATA_DIR";
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -39,6 +37,9 @@ pub struct Thread {
     pub id: ThreadId,
     pub project_id: ProjectId,
     pub title: String,
+    /// The registry id of the agent the thread was started with.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// Which projects the sidebar shows threads for.
@@ -79,8 +80,7 @@ struct GlobalProjectStore(Entity<ProjectStore>);
 impl Global for GlobalProjectStore {}
 
 pub fn init(cx: &mut App) {
-    let state_path = data_dir().map(|dir| dir.join(STATE_FILE_NAME));
-    let store = cx.new(|_| ProjectStore::load(state_path));
+    let store = cx.new(|_| ProjectStore::load(Some(paths::state_file())));
     cx.set_global(GlobalProjectStore(store));
 }
 
@@ -216,6 +216,7 @@ impl ProjectStore {
         &mut self,
         project_id: ProjectId,
         title: impl Into<String>,
+        agent_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<ThreadId> {
         self.project(project_id)?;
@@ -224,6 +225,7 @@ impl ProjectStore {
             id,
             project_id,
             title: title.into(),
+            agent_id,
         });
         self.changed(cx);
         Some(id)
@@ -266,17 +268,6 @@ fn project_name(path: &Path) -> SharedString {
         .into()
 }
 
-fn data_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os(DATA_DIR_ENV_VAR) {
-        return Some(PathBuf::from(dir));
-    }
-    let dir = dirs::data_dir().map(|dir| dir.join("agentZ"));
-    if dir.is_none() {
-        log::warn!("no data directory available; projects will not be saved");
-    }
-    dir
-}
-
 fn read_state(path: &Path) -> Result<Option<PersistedState>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -312,7 +303,7 @@ mod tests {
     #[gpui::test]
     async fn adding_removing_and_scoping_projects(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let state_path = dir.path().join(STATE_FILE_NAME);
+        let state_path = dir.path().join("state.json");
         let first_folder = dir.path().join("first");
         let second_folder = dir.path().join("second");
         std::fs::create_dir_all(&first_folder).expect("create first");
@@ -323,7 +314,7 @@ mod tests {
             let first = store.add_project(first_folder.clone(), cx);
             let second = store.add_project(second_folder.clone(), cx);
             assert_eq!(store.add_project(first_folder.clone(), cx), first);
-            store.add_thread(first, "Fix login bug", cx);
+            store.add_thread(first, "Fix login bug", None, cx);
             store.set_scope(ProjectScope::Project(second), cx);
             (first, second)
         });

@@ -22,12 +22,16 @@ anyhow.workspace = true
 assets.workspace = true
 dirs.workspace = true
 env_logger.workspace = true
+futures.workspace = true
 gpui.workspace = true
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 log.workspace = true
 menu.workspace = true
 projects.workspace = true
+registry.workspace = true
+reqwest_client.workspace = true
 text_input.workspace = true
 theme.workspace = true
 theme_json.workspace = true
 ui.workspace = true
+util.workspace = true

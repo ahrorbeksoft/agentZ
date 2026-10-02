@@ -1,13 +1,20 @@
+mod new_thread_modal;
 mod project_switcher;
 mod shell;
 mod sidebar;
 
+use std::io::IsTerminal as _;
+use std::sync::Arc;
+
 use assets::Assets;
+use futures::FutureExt as _;
 use gpui::{
     App, Bounds, Focusable as _, Font, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions,
     WindowBounds, WindowOptions, actions, point, px, size,
 };
 use projects::ProjectStore;
+use registry::AgentRegistryStore;
+use reqwest_client::ReqwestClient;
 use theme::{
     DEFAULT_DARK_THEME, GlobalTheme, LoadThemes, ThemeRegistry, ThemeSettingsProvider, UiDensity,
 };
@@ -24,6 +31,8 @@ actions!(
         OpenFolder,
         /// Opens the project switcher in the title bar.
         ToggleProjectSwitcher,
+        /// Starts a new thread in the selected project.
+        NewThread,
     ]
 );
 
@@ -80,10 +89,12 @@ fn init_actions(cx: &mut App) {
         KeyBinding::new("secondary-q", Quit, None),
         KeyBinding::new("secondary-o", OpenFolder, None),
         KeyBinding::new("secondary-alt-o", ToggleProjectSwitcher, None),
+        KeyBinding::new("secondary-n", NewThread, None),
     ]);
     cx.set_menus([
         Menu::new("agentZ").items([MenuItem::action("Quit agentZ", Quit)]),
         Menu::new("File").items([
+            MenuItem::action("New Thread…", NewThread),
             MenuItem::action("Open Folder…", OpenFolder),
             MenuItem::action("Switch Project…", ToggleProjectSwitcher),
         ]),
@@ -96,22 +107,56 @@ fn init_actions(cx: &mut App) {
     .detach();
 }
 
+/// Loads the login shell's environment (notably `PATH`) when the app was not started from a
+/// terminal, so agents and `npm` resolve the same way they do in the user's shell.
+fn load_shell_environment(cx: &App) -> registry::ShellEnvironmentReady {
+    let started_from_terminal = std::io::stdout().is_terminal();
+    cx.background_executor()
+        .spawn(async move {
+            #[cfg(unix)]
+            if !started_from_terminal && let Err(error) = util::load_login_shell_environment().await
+            {
+                log::error!("failed to load the login shell environment: {error:#}");
+            }
+        })
+        .shared()
+}
+
 fn main() {
+    // The login-shell environment capture re-runs this binary with `--printenv`.
+    if std::env::args().any(|argument| argument == "--printenv") {
+        util::shell_env::print_env();
+        return;
+    }
     env_logger::init();
+
+    let http_client = match ReqwestClient::user_agent(concat!("agentZ/", env!("CARGO_PKG_VERSION")))
+    {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            log::error!("failed to create the HTTP client: {error:#}");
+            Arc::new(ReqwestClient::new())
+        }
+    };
 
     gpui_platform::application()
         .with_assets(Assets)
-        .run(|cx: &mut App| {
+        .with_http_client(http_client.clone())
+        .run(move |cx: &mut App| {
             if let Err(error) = Assets.load_fonts(cx) {
                 log::error!("failed to load fonts: {error:#}");
             }
             init_theme(cx);
             text_input::init(cx);
             project_switcher::init(cx);
+            new_thread_modal::init(cx);
             projects::init(cx);
+            let shell_environment_ready = load_shell_environment(cx);
+            registry::init(http_client, shell_environment_ready, cx);
             init_actions(cx);
 
             let store = ProjectStore::global(cx);
+            let registry = AgentRegistryStore::global(cx);
             let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
             let window = cx.open_window(
                 WindowOptions {
@@ -124,7 +169,7 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let shell = cx.new(|cx| Shell::new(store, cx));
+                    let shell = cx.new(|cx| Shell::new(store, registry, window, cx));
                     window.focus(&shell.focus_handle(cx), cx);
                     shell
                 },

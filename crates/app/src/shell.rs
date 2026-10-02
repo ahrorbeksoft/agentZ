@@ -1,13 +1,15 @@
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions, Subscription,
-    Window, WindowControlArea,
+    App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
+    Subscription, Window, WindowControlArea,
 };
-use projects::{ProjectScope, ProjectStore};
+use projects::{ProjectId, ProjectScope, ProjectStore};
+use registry::AgentRegistryStore;
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 
+use crate::new_thread_modal::NewThreadModal;
 use crate::project_switcher::ProjectSwitcher;
-use crate::sidebar::{SIDEBAR_WIDTH, Sidebar};
-use crate::{OpenFolder, ToggleProjectSwitcher};
+use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
+use crate::{NewThread, OpenFolder, ToggleProjectSwitcher};
 
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 /// Leaves room for the macOS traffic lights.
@@ -16,23 +18,75 @@ const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 pub struct Shell {
     focus_handle: FocusHandle,
     store: Entity<ProjectStore>,
+    registry: Entity<AgentRegistryStore>,
     sidebar: Entity<Sidebar>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
+    new_thread_modal: Option<(Entity<NewThreadModal>, Subscription)>,
     should_move_window: bool,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Shell {
-    pub fn new(store: Entity<ProjectStore>, cx: &mut Context<Self>) -> Self {
-        let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
-        let subscription = cx.observe(&store, |_, _, cx| cx.notify());
+    pub fn new(
+        store: Entity<ProjectStore>,
+        registry: Entity<AgentRegistryStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let sidebar = cx.new(|cx| Sidebar::new(store.clone(), registry.clone(), cx));
+        let subscriptions = vec![
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
+                SidebarEvent::NewThread(project_id) => {
+                    this.open_new_thread_modal(*project_id, window, cx)
+                }
+            }),
+        ];
         Self {
             focus_handle: cx.focus_handle(),
             store,
+            registry,
             sidebar,
             switcher_handle: PopoverMenuHandle::default(),
+            new_thread_modal: None,
             should_move_window: false,
-            _subscription: subscription,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let project_id = match store.scope() {
+            ProjectScope::Project(id) => Some(id),
+            ProjectScope::All => store.projects().first().map(|project| project.id),
+        };
+        match project_id {
+            Some(project_id) => self.open_new_thread_modal(project_id, window, cx),
+            None => window.dispatch_action(Box::new(OpenFolder), cx),
+        }
+    }
+
+    fn open_new_thread_modal(
+        &mut self,
+        project_id: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let registry = self.registry.clone();
+        let modal = cx.new(|cx| NewThreadModal::new(project_id, store, registry, window, cx));
+        let subscription =
+            cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_new_thread_modal(window, cx);
+            });
+        self.new_thread_modal = Some((modal, subscription));
+        cx.notify();
+    }
+
+    fn dismiss_new_thread_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_thread_modal.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
         }
     }
 
@@ -185,6 +239,8 @@ impl Render for Shell {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_project_switcher))
+            .on_action(cx.listener(Self::new_thread))
+            .relative()
             .size_full()
             .bg(background)
             .text_color(text_color)
@@ -203,6 +259,33 @@ impl Render for Shell {
                             .h_full()
                             .bg(main_background),
                     ),
+            )
+            .when_some(
+                self.new_thread_modal
+                    .as_ref()
+                    .map(|(modal, _)| modal.clone()),
+                |shell, modal| {
+                    shell.child(
+                        div()
+                            .id("modal-backdrop")
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .justify_center()
+                            .pt(px(96.))
+                            .bg(gpui::black().opacity(0.25))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss_new_thread_modal(window, cx)
+                            }))
+                            .child(
+                                // Clicks inside the modal must not reach the backdrop.
+                                div()
+                                    .id("modal-container")
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    .child(modal),
+                            ),
+                    )
+                },
             )
     }
 }

@@ -1,23 +1,39 @@
-use gpui::{AnyElement, Context, Entity, Subscription, Window};
-use projects::{Project, ProjectScope, ProjectStore, Thread};
+use gpui::{AnyElement, Context, Entity, EventEmitter, MouseButton, Subscription, Window};
+use projects::{Project, ProjectId, ProjectScope, ProjectStore, Thread};
+use registry::{AgentId, AgentRegistryStore};
 use ui::{ContextMenu, Tooltip, prelude::*, right_click_menu};
 
-use crate::OpenFolder;
+use crate::{NewThread, OpenFolder};
 
 const ROW_HEIGHT: Pixels = px(28.);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 
-pub struct Sidebar {
-    store: Entity<ProjectStore>,
-    _subscription: Subscription,
+pub enum SidebarEvent {
+    NewThread(ProjectId),
 }
 
+pub struct Sidebar {
+    store: Entity<ProjectStore>,
+    registry: Entity<AgentRegistryStore>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<SidebarEvent> for Sidebar {}
+
 impl Sidebar {
-    pub fn new(store: Entity<ProjectStore>, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.observe(&store, |_, _, cx| cx.notify());
+    pub fn new(
+        store: Entity<ProjectStore>,
+        registry: Entity<AgentRegistryStore>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscriptions = vec![
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&registry, |_, _, cx| cx.notify()),
+        ];
         Self {
             store,
-            _subscription: subscription,
+            registry,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -31,13 +47,26 @@ impl Sidebar {
             .child(
                 Label::new(if is_all_scope { "Projects" } else { "Threads" }).color(Color::Muted),
             )
-            .when(is_all_scope, |header| {
-                header.child(
-                    IconButton::new("sidebar-open-folder", IconName::Plus)
-                        .icon_size(IconSize::Small)
-                        .tooltip(|_, cx| Tooltip::for_action("Open Folder…", &OpenFolder, cx))
-                        .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx)),
-                )
+            .map(|header| {
+                if is_all_scope {
+                    header.child(
+                        IconButton::new("sidebar-open-folder", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(|_, cx| Tooltip::for_action("Open Folder…", &OpenFolder, cx))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenFolder), cx)
+                            }),
+                    )
+                } else {
+                    header.child(
+                        IconButton::new("sidebar-new-thread", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(|_, cx| Tooltip::for_action("New Thread", &NewThread, cx))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(NewThread), cx)
+                            }),
+                    )
+                }
             })
     }
 
@@ -87,13 +116,16 @@ impl Sidebar {
         let project_id = project.id;
         let name = project.name();
         let store = self.store.clone();
+        let sidebar = cx.entity().downgrade();
         let hover_background = cx.theme().colors().ghost_element_hover;
         let menu_open_background = cx.theme().colors().ghost_element_selected;
+        let group_name = SharedString::from(format!("project-header-{}", project_id.0));
 
         right_click_menu(("project-menu", project_id.0))
             .trigger(move |is_menu_open, _, _| {
                 h_flex()
                     .id(("project-header", project_id.0))
+                    .group(group_name.clone())
                     .h(ROW_HEIGHT)
                     .w_full()
                     .px_2()
@@ -123,6 +155,28 @@ impl Sidebar {
                                 .color(Color::Muted),
                         )
                     })
+                    .child(
+                        // Stops the press from also toggling the group.
+                        div()
+                            .visible_on_hover(group_name)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                IconButton::new(
+                                    ("project-new-thread", project_id.0),
+                                    IconName::Plus,
+                                )
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("New Thread"))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    sidebar
+                                        .update(cx, |_, cx| {
+                                            cx.emit(SidebarEvent::NewThread(project_id))
+                                        })
+                                        .ok();
+                                }),
+                            ),
+                    )
                     .on_click({
                         let store = store.clone();
                         move |_, _, cx| {
@@ -166,6 +220,13 @@ impl Sidebar {
 
     fn render_thread(&self, thread: Thread, indent: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let hover_background = cx.theme().colors().ghost_element_hover;
+        let agent_name = thread.agent_id.as_ref().map(|agent_id| {
+            self.registry
+                .read(cx)
+                .agent(&AgentId::new(agent_id.clone()))
+                .map(|agent| agent.name().clone())
+                .unwrap_or_else(|| SharedString::from(agent_id.clone()))
+        });
         h_flex()
             .id(("thread", thread.id.0))
             .h(ROW_HEIGHT)
@@ -186,6 +247,13 @@ impl Sidebar {
                     .min_w_0()
                     .child(Label::new(thread.title).truncate()),
             )
+            .when_some(agent_name, |row, agent_name| {
+                row.child(
+                    Label::new(agent_name)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
             .into_any_element()
     }
 
