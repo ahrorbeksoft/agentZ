@@ -119,25 +119,25 @@ impl Shell {
 
     fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        // Without a project scope, a new thread goes where the open thread is, or else to the
-        // project with the latest activity.
+        if store.projects().is_empty() {
+            window.dispatch_action(Box::new(OpenFolder), cx);
+            return;
+        }
+        // With all projects shown, the modal asks for the project first, unless there's only
+        // one to choose.
         let project_id = match store.scope() {
             ProjectScope::Project(id) => Some(id),
-            ProjectScope::All => self
-                .active_thread
-                .and_then(|thread_id| store.thread(thread_id))
-                .map(|thread| thread.project_id)
-                .or_else(|| store.visible_projects().next().map(|project| project.id)),
+            ProjectScope::All => match store.projects() {
+                [project] => Some(project.id),
+                _ => None,
+            },
         };
-        match project_id {
-            Some(project_id) => self.open_new_thread_modal(project_id, window, cx),
-            None => window.dispatch_action(Box::new(OpenFolder), cx),
-        }
+        self.open_new_thread_modal(project_id, window, cx);
     }
 
     fn open_new_thread_modal(
         &mut self,
-        project_id: ProjectId,
+        project_id: Option<ProjectId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -152,6 +152,13 @@ impl Shell {
                 NewThreadModalEvent::ThreadCreated(thread_id) => {
                     this.dismiss_new_thread_modal(window, cx);
                     this.open_thread(*thread_id, window, cx);
+                }
+                NewThreadModalEvent::OpenAgentSettings => {
+                    this.dismiss_new_thread_modal(window, cx);
+                    this.open_settings(&OpenSettings, window, cx);
+                    if let Some((page, _)) = &this.settings_page {
+                        page.update(cx, |page, cx| page.show_agents(cx));
+                    }
                 }
             }),
         ];

@@ -7,6 +7,7 @@ use gpui::{
     PathPromptOptions, PromptLevel, Subscription, Window, actions,
 };
 use projects::{Project, ProjectIcon, ProjectId, ProjectStore, ThreadOrder};
+use registry::{AgentId, AgentRegistryStore, InstallState};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, prelude::*};
@@ -41,6 +42,7 @@ pub enum SettingsPageEvent {
 enum Section {
     General,
     Appearance,
+    Agents,
     Project(ProjectId),
 }
 
@@ -51,6 +53,8 @@ pub struct SettingsPage {
     section: Section,
     name_input: Entity<TextInput>,
     monogram_input: Entity<TextInput>,
+    registry: Entity<AgentRegistryStore>,
+    agent_search: Entity<TextInput>,
     /// Detected favicons, so automatic icons match the sidebar's.
     project_info: HashMap<ProjectId, ProjectInfo>,
     _subscriptions: Vec<Subscription>,
@@ -95,6 +99,10 @@ impl SettingsPage {
                 }
             }),
         ];
+        let registry = AgentRegistryStore::global(cx);
+        let agent_search = cx.new(|cx| TextInput::new("Search agents…", cx));
+        subscriptions.push(cx.observe(&registry, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(&agent_search, |_, _, _: &TextInputEvent, cx| cx.notify()));
         let project_info_store = ProjectInfoStore::global(cx);
         let project_info = project_info_store.read(cx).info().clone();
         subscriptions.push(cx.observe(&project_info_store, |this, store, cx| {
@@ -108,9 +116,15 @@ impl SettingsPage {
             section: Section::General,
             name_input,
             monogram_input,
+            registry,
+            agent_search,
             project_info,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn show_agents(&mut self, cx: &mut Context<Self>) {
+        self.select(Section::Agents, cx);
     }
 
     pub fn show_project(&mut self, id: ProjectId, cx: &mut Context<Self>) {
@@ -119,6 +133,10 @@ impl SettingsPage {
 
     fn select(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
+        if section == Section::Agents {
+            self.registry
+                .update(cx, |registry, cx| registry.refresh_if_stale(cx));
+        }
         if let Section::Project(id) = section
             && let Some(project) = self.store.read(cx).project(id).cloned()
         {
@@ -230,6 +248,7 @@ impl SettingsPage {
                 Section::Appearance,
                 cx,
             ),
+            self.render_nav_item("Agents", Some(IconName::Sparkle), None, Section::Agents, cx),
         ];
         let mut project_items = Vec::with_capacity(projects.len());
         for project in &projects {
@@ -276,7 +295,7 @@ impl SettingsPage {
                     .overflow_y_scroll()
                     .p_1()
                     .gap_px()
-                    .children(items.drain(..2))
+                    .children(items.drain(..3))
                     .when(!projects.is_empty(), |nav| {
                         nav.child(
                             div().px_2().pt_3().pb_1().child(
@@ -312,6 +331,7 @@ impl SettingsPage {
         let id = match section {
             Section::General => SharedString::from("settings-nav-general"),
             Section::Appearance => "settings-nav-appearance".into(),
+            Section::Agents => "settings-nav-agents".into(),
             Section::Project(id) => format!("settings-nav-project-{}", id.0).into(),
         };
         h_flex()
@@ -468,6 +488,211 @@ impl SettingsPage {
             ],
             cx,
         )]
+    }
+
+    /// The agents from the ACP Registry: the installed ones to update or uninstall, then the
+    /// rest to install.
+    fn render_agents(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let colors = cx.theme().colors().clone();
+        let query = self.agent_search.read(cx).text().trim().to_lowercase();
+        let registry = self.registry.read(cx);
+        let is_fetching = registry.is_fetching();
+        let fetch_error = registry.fetch_error();
+        let has_agents = !registry.agents().is_empty();
+        let mut installed = Vec::new();
+        let mut available = Vec::new();
+        for agent in registry.agents() {
+            let matches = query.is_empty()
+                || agent.name().to_lowercase().contains(&query)
+                || agent.id().0.to_lowercase().contains(&query);
+            if !agent.supports_current_platform() || !matches {
+                continue;
+            }
+            match registry.install_state(agent.id()) {
+                InstallState::Installed { .. } => installed.push(agent.id().clone()),
+                _ => available.push(agent.id().clone()),
+            }
+        }
+
+        let search = h_flex()
+            .h(px(32.))
+            .px_3()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1().min_w_0().child(self.agent_search.clone()))
+            .into_any_element();
+        let mut sections = vec![search];
+        if !installed.is_empty() {
+            let rows = installed
+                .iter()
+                .map(|id| self.render_agent_row(id, cx))
+                .collect();
+            sections.push(render_section("Installed", rows, cx));
+        }
+        if !available.is_empty() {
+            let rows = available
+                .iter()
+                .map(|id| self.render_agent_row(id, cx))
+                .collect();
+            sections.push(render_section("From the ACP Registry", rows, cx));
+        }
+        if installed.is_empty() && available.is_empty() {
+            let message = if is_fetching && !has_agents {
+                "Loading agents from the ACP Registry…".to_string()
+            } else if let Some(error) = fetch_error.as_ref().filter(|_| !has_agents) {
+                format!("Couldn't load the ACP Registry: {error}")
+            } else {
+                "No matching agents".to_string()
+            };
+            sections.push(
+                v_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(Label::new(message).color(Color::Muted))
+                    .when(fetch_error.is_some() && !has_agents, |column| {
+                        column.child(
+                            Button::new("retry-registry", "Retry")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.registry
+                                        .update(cx, |registry, cx| registry.refresh(cx))
+                                })),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+        sections
+    }
+
+    fn render_agent_row(&self, id: &AgentId, cx: &mut Context<Self>) -> AnyElement {
+        let registry = self.registry.read(cx);
+        let Some(agent) = registry.agent(id) else {
+            return div().into_any_element();
+        };
+        let name = agent.name().clone();
+        let icon = match agent.icon_path() {
+            Some(path) => Icon::from_external_svg(path.clone()),
+            None => Icon::new(IconName::Terminal),
+        };
+        let element_id = |action: &str| SharedString::from(format!("agent-{action}-{}", id.0));
+        let install = {
+            let id = id.clone();
+            cx.listener(move |this, _, _, cx| {
+                this.registry
+                    .update(cx, |registry, cx| registry.install(&id, cx))
+            })
+        };
+        let (detail, controls): (SharedString, AnyElement) = match registry.install_state(id) {
+            InstallState::Installed {
+                version,
+                update_available,
+            } => {
+                let uninstall = {
+                    let id = id.clone();
+                    let name = name.clone();
+                    cx.listener(move |this, _, window, cx| {
+                        this.confirm_uninstall(&id, &name, window, cx)
+                    })
+                };
+                (
+                    if update_available {
+                        format!("v{version} · v{} available", agent.version()).into()
+                    } else {
+                        format!("v{version}").into()
+                    },
+                    h_flex()
+                        .gap_2()
+                        .when(update_available, |controls| {
+                            controls.child(
+                                Button::new(element_id("update"), "Update")
+                                    .style(ButtonStyle::Outlined)
+                                    .on_click(install),
+                            )
+                        })
+                        .child(
+                            Button::new(element_id("uninstall"), "Uninstall")
+                                .style(ButtonStyle::Subtle)
+                                .on_click(uninstall),
+                        )
+                        .into_any_element(),
+                )
+            }
+            InstallState::Installing => (
+                agent.description().clone(),
+                Label::new("Installing…")
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ),
+            InstallState::NotInstalled => (
+                agent.description().clone(),
+                Button::new(element_id("install"), "Install")
+                    .style(ButtonStyle::Outlined)
+                    .on_click(install)
+                    .into_any_element(),
+            ),
+            InstallState::Failed(error) => (
+                agent.description().clone(),
+                Button::new(element_id("retry"), "Retry")
+                    .style(ButtonStyle::Outlined)
+                    .color(Color::Error)
+                    .tooltip(Tooltip::text(error))
+                    .on_click(install)
+                    .into_any_element(),
+            ),
+        };
+        h_flex()
+            .px_4()
+            .py_3()
+            .gap_3()
+            .child(icon.size(IconSize::Medium).color(Color::Muted))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(Label::new(name))
+                    .child(
+                        Label::new(detail)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+            )
+            .child(div().flex_none().child(controls))
+            .into_any_element()
+    }
+
+    fn confirm_uninstall(
+        &mut self,
+        id: &AgentId,
+        name: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Uninstall {name}?"),
+            Some("Threads that use it can't continue until it's installed again."),
+            &["Uninstall", "Cancel"],
+            cx,
+        );
+        let registry = self.registry.clone();
+        let id = id.clone();
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                registry.update(cx, |registry, cx| registry.uninstall(&id, cx));
+            }
+        })
+        .detach();
     }
 
     fn render_project(&self, project: Project, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -664,6 +889,7 @@ impl Render for SettingsPage {
         let (title, sections) = match self.section {
             Section::General => ("General".into(), self.render_general(window, cx)),
             Section::Appearance => ("Appearance".into(), self.render_appearance(window, cx)),
+            Section::Agents => ("Agents".into(), self.render_agents(cx)),
             Section::Project(id) => match self.store.read(cx).project(id).cloned() {
                 Some(project) => (project.name(), self.render_project(project, cx)),
                 None => (

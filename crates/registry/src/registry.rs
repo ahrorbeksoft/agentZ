@@ -367,6 +367,40 @@ impl AgentRegistryStore {
         cx.notify();
     }
 
+    /// Deletes an installed agent's files.
+    pub fn uninstall(&mut self, id: &AgentId, cx: &mut Context<Self>) {
+        if self.installing.contains_key(id) || !self.installed_versions.contains_key(id) {
+            return;
+        }
+        let registry_dir = self.registry_dir.clone();
+        let executor = cx.background_executor().clone();
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let installed_versions = executor
+                .spawn(async move {
+                    // Binary agents live in `<id>/<version>`, npx agents in `npx/<id>`.
+                    for dir in [
+                        registry_dir.join(&*id.0),
+                        registry_dir.join(NPX_DIR_NAME).join(&*id.0),
+                    ] {
+                        if dir.exists() {
+                            std::fs::remove_dir_all(&dir)
+                                .with_context(|| format!("removing {}", dir.display()))
+                                .log_err();
+                        }
+                    }
+                    scan_installed_versions(&registry_dir)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_installed_versions(installed_versions);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Builds the command that starts an installed agent.
     pub fn command(&self, id: &AgentId, cx: &App) -> Task<Result<AgentCommand>> {
         let Some(agent) = self.agent(id).cloned() else {
