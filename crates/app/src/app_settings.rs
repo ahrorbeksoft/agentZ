@@ -1,9 +1,12 @@
 //! App-wide preferences, saved as JSON in the data directory. For now that's the theme, picked
 //! the way Zed picks it: a mode, plus one theme for light appearance and one for dark.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_client_protocol::schema::v1 as acp;
+use agent_thread::SessionDefaults;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task, WindowAppearance};
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,35 @@ pub struct AppSettings {
     pub theme_mode: ThemeMode,
     pub light_theme: String,
     pub dark_theme: String,
+    /// Per-agent settings, keyed by registry id.
+    pub agents: BTreeMap<String, AgentSettings>,
+}
+
+/// What Zed keeps for each external agent: its environment and the defaults for new sessions,
+/// which follow the user's last choices in a thread.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    pub env: BTreeMap<String, String>,
+    pub default_mode: Option<acp::SessionModeId>,
+    pub default_config_options: BTreeMap<String, acp::SessionConfigOptionValue>,
+    /// The settings and modes the agent last offered, so its settings page can list them
+    /// without starting a session.
+    pub known_config_options: Vec<acp::SessionConfigOption>,
+    pub known_modes: Option<acp::SessionModeState>,
+}
+
+impl AgentSettings {
+    pub fn session_defaults(&self) -> SessionDefaults {
+        SessionDefaults {
+            mode: self.default_mode.clone(),
+            config_options: self
+                .default_config_options
+                .iter()
+                .map(|(id, value)| (acp::SessionConfigId::new(id.clone()), value.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -36,6 +68,7 @@ impl Default for AppSettings {
             theme_mode: ThemeMode::default(),
             light_theme: DEFAULT_LIGHT_THEME.to_string(),
             dark_theme: DEFAULT_DARK_THEME.to_string(),
+            agents: BTreeMap::new(),
         }
     }
 }
@@ -85,6 +118,26 @@ impl AppSettingsStore {
             write_settings(&path, &settings).log_err();
         }));
         cx.notify();
+    }
+
+    pub fn agent(&self, agent_id: &str) -> AgentSettings {
+        self.settings
+            .agents
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn update_agent(
+        &mut self,
+        agent_id: &str,
+        change: impl FnOnce(&mut AgentSettings),
+        cx: &mut Context<Self>,
+    ) {
+        self.update(
+            |settings| change(settings.agents.entry(agent_id.to_string()).or_default()),
+            cx,
+        );
     }
 
     /// Re-applies the theme, for when macOS switches between light and dark.

@@ -187,6 +187,17 @@ pub enum AgentThreadEvent {
     FirstPrompt(String),
     /// The agent named the session.
     TitleChanged(String),
+    /// The user changed one of the session's settings; Zed keeps it as the agent's default.
+    ConfigOptionChanged(acp::SessionConfigId, acp::SessionConfigOptionValue),
+    /// The user changed the session's mode; Zed keeps it as the agent's default.
+    ModeChanged(acp::SessionModeId),
+}
+
+/// Settings applied to new sessions (not to loaded ones), as Zed's per-agent defaults are.
+#[derive(Clone, Debug, Default)]
+pub struct SessionDefaults {
+    pub mode: Option<acp::SessionModeId>,
+    pub config_options: Vec<(acp::SessionConfigId, acp::SessionConfigOptionValue)>,
 }
 
 enum Incoming {
@@ -236,6 +247,9 @@ pub struct AgentThread {
     opens_session: bool,
     /// The outcome of the last log in or out on such a connection.
     account_notice: Option<SharedString>,
+    /// What the agent says about itself when it starts.
+    agent_info: Option<acp::Implementation>,
+    defaults: SessionDefaults,
     _tasks: Vec<Task<()>>,
 }
 
@@ -291,6 +305,7 @@ impl AgentThread {
                         this.connection = Some(connected.connection);
                         this.capabilities = connected.capabilities;
                         this.auth_methods = connected.auth_methods;
+                        this.agent_info = connected.agent_info;
                         if this.opens_session {
                             this.open_session(cx);
                         } else {
@@ -383,6 +398,54 @@ impl AgentThread {
         .detach();
     }
 
+    /// Settings for new sessions; see [`SessionDefaults`].
+    pub fn set_defaults(&mut self, defaults: SessionDefaults) {
+        self.defaults = defaults;
+    }
+
+    pub fn agent_info(&self) -> Option<&acp::Implementation> {
+        self.agent_info.as_ref()
+    }
+
+    /// Applies the defaults the session doesn't already match. Values the agent no longer
+    /// offers are skipped.
+    fn apply_defaults(&mut self, cx: &mut Context<Self>) {
+        let defaults = self.defaults.clone();
+        if let Some(mode) = defaults.mode
+            && let Some(modes) = &self.modes
+            && modes.current_mode_id != mode
+            && modes
+                .available_modes
+                .iter()
+                .any(|available| available.id == mode)
+        {
+            self.send_mode(mode, cx);
+        }
+        for (config_id, value) in defaults.config_options {
+            let Some(option) = self
+                .config_options
+                .iter()
+                .find(|option| option.id == config_id)
+            else {
+                continue;
+            };
+            let applies = match (&option.kind, &value) {
+                (
+                    acp::SessionConfigKind::Select(select),
+                    acp::SessionConfigOptionValue::ValueId { value },
+                ) => select.current_value != *value && select_offers(select, value),
+                (
+                    acp::SessionConfigKind::Boolean(boolean),
+                    acp::SessionConfigOptionValue::Boolean { value },
+                ) => boolean.current_value != *value,
+                _ => false,
+            };
+            if applies {
+                self.send_config_option(config_id, value, cx);
+            }
+        }
+    }
+
     /// What happened on the last log in or out of an account connection.
     pub fn account_notice(&self) -> Option<&SharedString> {
         self.account_notice.as_ref()
@@ -426,6 +489,8 @@ impl AgentThread {
             stderr_lines: VecDeque::new(),
             opens_session: true,
             account_notice: None,
+            agent_info: None,
+            defaults: SessionDefaults::default(),
             _tasks: Vec::new(),
         }
     }
@@ -458,6 +523,9 @@ impl AgentThread {
                         session_id: setup.session_id,
                     });
                     this.status = ConnectionStatus::Ready;
+                    if setup.restore == SessionRestore::New {
+                        this.apply_defaults(cx);
+                    }
                     for prompt in std::mem::take(&mut this.queued_prompts) {
                         this.send_to_agent(prompt, cx);
                     }
@@ -619,7 +687,24 @@ impl AgentThread {
 
     /// Changes one of the agent's session settings. The new value shows immediately and is
     /// reverted if the agent rejects it.
+    /// Changes a setting at the user's request, which also makes it the agent's default.
     pub fn set_config_option(
+        &mut self,
+        config_id: acp::SessionConfigId,
+        value: acp::SessionConfigOptionValue,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.is_none() {
+            return;
+        }
+        cx.emit(AgentThreadEvent::ConfigOptionChanged(
+            config_id.clone(),
+            value.clone(),
+        ));
+        self.send_config_option(config_id, value, cx);
+    }
+
+    fn send_config_option(
         &mut self,
         config_id: acp::SessionConfigId,
         value: acp::SessionConfigOptionValue,
@@ -671,7 +756,16 @@ impl AgentThread {
         .detach();
     }
 
+    /// Changes the mode at the user's request, which also makes it the agent's default.
     pub fn set_mode(&mut self, mode_id: acp::SessionModeId, cx: &mut Context<Self>) {
+        if self.session.is_none() || self.modes.is_none() {
+            return;
+        }
+        cx.emit(AgentThreadEvent::ModeChanged(mode_id.clone()));
+        self.send_mode(mode_id, cx);
+    }
+
+    fn send_mode(&mut self, mode_id: acp::SessionModeId, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
         };
@@ -1264,13 +1358,28 @@ async fn connect(
         connection,
         capabilities: initialize_response.agent_capabilities,
         auth_methods: initialize_response.auth_methods,
+        agent_info: initialize_response.agent_info,
     })
+}
+
+fn select_offers(select: &acp::SessionConfigSelect, value: &acp::SessionConfigValueId) -> bool {
+    match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(options) => {
+            options.iter().any(|option| option.value == *value)
+        }
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| &group.options)
+            .any(|option| option.value == *value),
+        _ => false,
+    }
 }
 
 struct Connected {
     connection: ConnectionTo<Agent>,
     capabilities: acp::AgentCapabilities,
     auth_methods: Vec<acp::AuthMethod>,
+    agent_info: Option<acp::Implementation>,
 }
 
 struct SessionSetup {
@@ -1448,6 +1557,76 @@ mod tests {
         wait_until(cx, &|account| {
             account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
         });
+    }
+
+    /// New sessions start with the agent's saved defaults, against `test_support/mock_agent.py`.
+    #[gpui::test]
+    fn applies_defaults_to_new_sessions(cx: &mut gpui::TestAppContext) {
+        let Some(python) = which_python() else {
+            eprintln!("skipping: python3 not found");
+            return;
+        };
+        cx.executor().allow_parking();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_support/mock_agent.py");
+        let command = AgentCommand {
+            path: python,
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+        };
+        let thread = cx.new(|cx| {
+            let mut thread = AgentThread::start(
+                "Mock".into(),
+                Task::ready(Ok(command)),
+                std::env::temp_dir(),
+                None,
+                cx,
+            );
+            thread.set_defaults(SessionDefaults {
+                mode: None,
+                config_options: vec![
+                    (
+                        acp::SessionConfigId::new("model"),
+                        acp::SessionConfigOptionValue::value_id("opus"),
+                    ),
+                    (
+                        acp::SessionConfigId::new("fast"),
+                        acp::SessionConfigOptionValue::boolean(true),
+                    ),
+                    // No longer offered by the agent, so it's skipped.
+                    (
+                        acp::SessionConfigId::new("effort"),
+                        acp::SessionConfigOptionValue::value_id("extreme"),
+                    ),
+                ],
+            });
+            thread
+        });
+        let current = |thread: &AgentThread, id: &str| {
+            thread
+                .config_options()
+                .iter()
+                .find(|option| option.id.0.as_ref() == id)
+                .map(|option| match &option.kind {
+                    acp::SessionConfigKind::Select(select) => select.current_value.0.to_string(),
+                    acp::SessionConfigKind::Boolean(boolean) => boolean.current_value.to_string(),
+                    _ => String::new(),
+                })
+        };
+        for _ in 0..500 {
+            cx.run_until_parked();
+            let applied = thread.read_with(cx, |thread, _| {
+                thread.status() == &ConnectionStatus::Ready
+                    && current(thread, "model").as_deref() == Some("opus")
+                    && current(thread, "fast").as_deref() == Some("true")
+            });
+            if applied {
+                let effort = thread.read_with(cx, |thread, _| current(thread, "effort"));
+                assert_eq!(effort.as_deref(), Some("medium"));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("defaults were not applied");
     }
 
     /// Zed's Log Out and Reload Agent on a thread, against `test_support/mock_agent.py`.

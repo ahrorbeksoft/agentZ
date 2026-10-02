@@ -239,19 +239,28 @@ impl Shell {
             .map(|agent| agent.name().clone())
             .or_else(|| agent_id.as_ref().map(|agent_id| agent_id.0.clone()))
             .unwrap_or_else(|| "Agent".into());
+        let agent_settings = agent_id
+            .as_ref()
+            .map(|agent_id| AppSettingsStore::global(cx).read(cx).agent(&agent_id.0))
+            .unwrap_or_default();
         let command = agent_id.as_ref().map(|agent_id| {
-            self.registry.update(cx, |registry, cx| {
+            let command = self.registry.update(cx, |registry, cx| {
                 registry.command_when_loaded(agent_id, cx)
-            })
+            });
+            with_agent_env(command, agent_settings.env.clone(), cx)
         });
 
         let agent_thread = cx.new(|cx| match command {
             Some(command) => {
                 let previous_session = thread.session_id.clone().map(acp::SessionId::new);
-                AgentThread::start(agent_name.clone(), command, cwd, previous_session, cx)
+                let mut agent_thread =
+                    AgentThread::start(agent_name.clone(), command, cwd, previous_session, cx);
+                agent_thread.set_defaults(agent_settings.session_defaults());
+                agent_thread
             }
             None => AgentThread::failed(agent_name.clone(), "This thread has no agent."),
         });
+        let settings_agent_id = agent_id.clone();
         let thread_subscription =
             cx.subscribe(&agent_thread, move |this, _, event, cx| match event {
                 AgentThreadEvent::WorkingChanged(working) => {
@@ -274,14 +283,65 @@ impl Shell {
                     this.store
                         .update(cx, |store, cx| store.rename_thread(thread_id, title, cx));
                 }
+                // As in Zed, the user's last choice becomes the agent's default.
+                AgentThreadEvent::ConfigOptionChanged(config_id, value) => {
+                    if let Some(agent_id) = &settings_agent_id {
+                        let (config_id, value) = (config_id.0.to_string(), value.clone());
+                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
+                            settings.update_agent(
+                                &agent_id.0,
+                                |agent| {
+                                    agent.default_config_options.insert(config_id, value);
+                                },
+                                cx,
+                            )
+                        });
+                    }
+                }
+                AgentThreadEvent::ModeChanged(mode) => {
+                    if let Some(agent_id) = &settings_agent_id {
+                        let mode = mode.clone();
+                        AppSettingsStore::global(cx).update(cx, |settings, cx| {
+                            settings.update_agent(
+                                &agent_id.0,
+                                |agent| agent.default_mode = Some(mode),
+                                cx,
+                            )
+                        });
+                    }
+                }
             });
         let title = SharedString::from(thread.title);
         let registry = self.registry.clone();
-        // Remembered so the sidebar can name the model of threads that aren't open.
+        let known_agent_id = agent_id.clone();
         let model_subscription = cx.observe(&agent_thread, move |this, agent_thread, cx| {
-            if let Some(model) = agent_thread.read(cx).model_name() {
+            let (model, options, modes) = {
+                let agent_thread = agent_thread.read(cx);
+                (
+                    agent_thread.model_name(),
+                    agent_thread.config_options().to_vec(),
+                    agent_thread.modes().cloned(),
+                )
+            };
+            // Remembered so the sidebar can name the model of threads that aren't open.
+            if let Some(model) = model {
                 this.store
                     .update(cx, |store, cx| store.set_thread_model(thread_id, model, cx));
+            }
+            // And so the agent's settings can list its options without starting it.
+            if let Some(agent_id) = &known_agent_id
+                && (!options.is_empty() || modes.is_some())
+            {
+                AppSettingsStore::global(cx).update(cx, |settings, cx| {
+                    settings.update_agent(
+                        &agent_id.0,
+                        |agent| {
+                            agent.known_config_options = options;
+                            agent.known_modes = modes;
+                        },
+                        cx,
+                    )
+                });
             }
         });
         let is_archived = thread.archived_at.is_some();
@@ -557,6 +617,19 @@ fn render_no_thread_selected() -> impl IntoElement {
 }
 
 /// The first line of the first prompt, shortened to fit the sidebar.
+/// Adds the agent's environment variables from its settings to its command.
+pub(crate) fn with_agent_env(
+    command: gpui::Task<anyhow::Result<registry::AgentCommand>>,
+    env: std::collections::BTreeMap<String, String>,
+    cx: &App,
+) -> gpui::Task<anyhow::Result<registry::AgentCommand>> {
+    cx.background_spawn(async move {
+        let mut command = command.await?;
+        command.env.extend(env);
+        Ok(command)
+    })
+}
+
 fn thread_title_from_prompt(prompt: &str) -> String {
     let first_line = prompt.lines().next().unwrap_or_default().trim();
     if first_line.chars().count() <= MAX_THREAD_TITLE_CHARS {

@@ -15,12 +15,15 @@ use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, p
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, ConnectionStatus};
 
+use std::collections::BTreeMap;
+
 use crate::agent_view::open_in_terminal;
 use crate::app_settings::{AppSettingsStore, ThemeMode};
 use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfo, ProjectInfoStore, automatic_monogram, monogram_swatch,
     render_project_icon,
 };
+use crate::shell::with_agent_env;
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
 
 const KEY_CONTEXT: &str = "SettingsPage";
@@ -517,7 +520,7 @@ impl SettingsPage {
 
     /// The agents from the ACP Registry: the installed ones to update or uninstall, then the
     /// rest to install.
-    fn render_agents(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_agents(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
         let query = self.agent_search.read(cx).text().trim().to_lowercase();
         let registry = self.registry.read(cx);
@@ -558,14 +561,14 @@ impl SettingsPage {
         if !installed.is_empty() {
             let rows = installed
                 .iter()
-                .map(|id| self.render_agent_row(id, cx))
+                .map(|id| self.render_agent_row(id, window, cx))
                 .collect();
             sections.push(render_section("Installed", rows, cx));
         }
         if !available.is_empty() {
             let rows = available
                 .iter()
-                .map(|id| self.render_agent_row(id, cx))
+                .map(|id| self.render_agent_row(id, window, cx))
                 .collect();
             sections.push(render_section("From the ACP Registry", rows, cx));
         }
@@ -598,7 +601,12 @@ impl SettingsPage {
         sections
     }
 
-    fn render_agent_row(&self, id: &AgentId, cx: &mut Context<Self>) -> AnyElement {
+    fn render_agent_row(
+        &self,
+        id: &AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let registry = self.registry.read(cx);
         let Some(agent) = registry.agent(id) else {
             return div().into_any_element();
@@ -641,7 +649,7 @@ impl SettingsPage {
                     h_flex()
                         .gap_2()
                         .child(
-                            Button::new(element_id("account"), "Account")
+                            Button::new(element_id("settings"), "Settings")
                                 .style(ButtonStyle::Outlined)
                                 .toggle_state(is_account_open)
                                 .on_click({
@@ -690,7 +698,7 @@ impl SettingsPage {
                     .into_any_element(),
             ),
         };
-        let account_panel = is_account_open.then(|| self.render_account_panel(cx));
+        let account_panel = is_account_open.then(|| self.render_agent_settings(window, cx));
         v_flex()
             .child(
                 h_flex()
@@ -729,17 +737,361 @@ impl SettingsPage {
             cx.notify();
             return;
         }
-        let command = self.registry.read(cx).command(id, cx);
+        let agent_settings = self.app_settings.read(cx).agent(&id.0);
+        let command = with_agent_env(
+            self.registry.read(cx).command(id, cx),
+            agent_settings.env.clone(),
+            cx,
+        );
         let name = name.clone();
         let connection = cx.new(|cx| AgentThread::start_for_account(name, command, cx));
         let subscription = cx.observe(&connection, |_, _, cx| cx.notify());
+        let env_rows = agent_settings
+            .env
+            .iter()
+            .map(|(key, value)| self.new_env_row(key, value, cx))
+            .collect();
         self.account = Some(AccountPanel {
             agent_id: id.clone(),
             connection,
             terminal_hint: None,
+            env_rows,
             _subscription: subscription,
         });
         cx.notify();
+    }
+
+    fn new_env_row(&self, key: &str, value: &str, cx: &mut Context<Self>) -> EnvRow {
+        let key_input = cx.new(|cx| {
+            let mut input = TextInput::new("NAME", cx);
+            input.set_text(key.to_string(), cx);
+            input
+        });
+        let value_input = cx.new(|cx| {
+            let mut input = TextInput::new("value", cx);
+            input.set_text(value.to_string(), cx);
+            input
+        });
+        let subscriptions = [
+            cx.subscribe(&key_input, |this, _, _: &TextInputEvent, cx| {
+                this.save_env(cx)
+            }),
+            cx.subscribe(&value_input, |this, _, _: &TextInputEvent, cx| {
+                this.save_env(cx)
+            }),
+        ];
+        EnvRow {
+            key: key_input,
+            value: value_input,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Writes the panel's variables to the agent's settings; rows without a name are skipped.
+    fn save_env(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = &self.account else {
+            return;
+        };
+        let env: BTreeMap<String, String> = panel
+            .env_rows
+            .iter()
+            .filter_map(|row| {
+                let key = row.key.read(cx).text().trim().to_string();
+                (!key.is_empty()).then(|| (key, row.value.read(cx).text().to_string()))
+            })
+            .collect();
+        let agent_id = panel.agent_id.0.clone();
+        self.app_settings.update(cx, |settings, cx| {
+            settings.update_agent(&agent_id, |agent| agent.env = env, cx)
+        });
+    }
+
+    /// The agent's settings: its account, the defaults new threads start with, and its
+    /// environment.
+    fn render_agent_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let heading = |title: &'static str| {
+            Label::new(title)
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::MEDIUM)
+        };
+        v_flex()
+            .mx_4()
+            .mb_3()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .child(heading("Account"))
+                    .child(self.render_account_panel(cx)),
+            )
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .child(heading("Defaults for New Threads"))
+                    .child(self.render_agent_defaults(window, cx)),
+            )
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .child(heading("Environment Variables"))
+                    .child(self.render_agent_env(cx)),
+            )
+            .child(
+                h_flex()
+                    .p_2()
+                    .justify_end()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .child(
+                        Button::new("agent-settings-done", "Done")
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.account = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Zed's per-agent defaults: what a new session starts with. Choosing a setting in a thread
+    /// changes these too.
+    fn render_agent_defaults(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel) = &self.account else {
+            return div().into_any_element();
+        };
+        let agent_id = panel.agent_id.0.to_string();
+        let agent_name = panel.connection.read(cx).agent_name().clone();
+        let agent = self.app_settings.read(cx).agent(&agent_id);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for option in &agent.known_config_options {
+            let config_id = option.id.0.to_string();
+            let current = agent.default_config_options.get(&config_id).cloned();
+            let choices: Vec<(SharedString, acp::SessionConfigOptionValue)> = match &option.kind {
+                acp::SessionConfigKind::Select(select) => select_choices(select)
+                    .into_iter()
+                    .map(|(name, value)| (name, acp::SessionConfigOptionValue::value_id(value)))
+                    .collect(),
+                acp::SessionConfigKind::Boolean(_) => vec![
+                    ("On".into(), acp::SessionConfigOptionValue::boolean(true)),
+                    ("Off".into(), acp::SessionConfigOptionValue::boolean(false)),
+                ],
+                _ => continue,
+            };
+            let label = current
+                .as_ref()
+                .and_then(|current| {
+                    choices
+                        .iter()
+                        .find(|(_, value)| value == current)
+                        .map(|(name, _)| name.clone())
+                })
+                .unwrap_or_else(|| "Agent's choice".into());
+            let app_settings = self.app_settings.clone();
+            let menu_agent_id = agent_id.clone();
+            let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                let entries = std::iter::once((SharedString::from("Agent's choice"), None))
+                    .chain(choices.into_iter().map(|(name, value)| (name, Some(value))));
+                for (name, value) in entries {
+                    let is_current = value == current;
+                    let app_settings = app_settings.clone();
+                    let agent_id = menu_agent_id.clone();
+                    let config_id = config_id.clone();
+                    menu = menu.toggleable_entry(
+                        name,
+                        is_current,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            let value = value.clone();
+                            let config_id = config_id.clone();
+                            app_settings.update(cx, |settings, cx| {
+                                settings.update_agent(
+                                    &agent_id,
+                                    |agent| match value {
+                                        Some(value) => {
+                                            agent.default_config_options.insert(config_id, value);
+                                        }
+                                        None => {
+                                            agent.default_config_options.remove(&config_id);
+                                        }
+                                    },
+                                    cx,
+                                )
+                            });
+                        },
+                    );
+                }
+                menu
+            });
+            rows.push(render_default_row(
+                option.name.clone().into(),
+                DropdownMenu::new(
+                    SharedString::from(format!("agent-default-{}", option.id.0)),
+                    label,
+                    menu,
+                )
+                .into_any_element(),
+            ));
+        }
+        // Agents that predate config options offer modes instead.
+        let has_mode_option = agent
+            .known_config_options
+            .iter()
+            .any(|option| option.category == Some(acp::SessionConfigOptionCategory::Mode));
+        if let Some(modes) = agent.known_modes.as_ref().filter(|_| !has_mode_option) {
+            let current = agent.default_mode.clone();
+            let label = current
+                .as_ref()
+                .and_then(|current| {
+                    modes
+                        .available_modes
+                        .iter()
+                        .find(|mode| mode.id == *current)
+                        .map(|mode| SharedString::from(mode.name.clone()))
+                })
+                .unwrap_or_else(|| "Agent's choice".into());
+            let modes: Vec<(SharedString, Option<acp::SessionModeId>)> =
+                std::iter::once((SharedString::from("Agent's choice"), None))
+                    .chain(
+                        modes
+                            .available_modes
+                            .iter()
+                            .map(|mode| (mode.name.clone().into(), Some(mode.id.clone()))),
+                    )
+                    .collect();
+            let app_settings = self.app_settings.clone();
+            let menu_agent_id = agent_id;
+            let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for (name, mode) in modes {
+                    let is_current = mode == current;
+                    let app_settings = app_settings.clone();
+                    let agent_id = menu_agent_id.clone();
+                    menu = menu.toggleable_entry(
+                        name,
+                        is_current,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            let mode = mode.clone();
+                            app_settings.update(cx, |settings, cx| {
+                                settings.update_agent(
+                                    &agent_id,
+                                    |agent| agent.default_mode = mode,
+                                    cx,
+                                )
+                            });
+                        },
+                    );
+                }
+                menu
+            });
+            rows.push(render_default_row(
+                "Mode".into(),
+                DropdownMenu::new("agent-default-mode", label, menu).into_any_element(),
+            ));
+        }
+        if rows.is_empty() {
+            return Label::new(format!(
+                "Start a thread with {agent_name} to see its settings here."
+            ))
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element();
+        }
+        v_flex()
+            .gap_1()
+            .child(
+                Label::new("Choosing one in a thread also makes it the default, as in Zed.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_agent_env(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel) = &self.account else {
+            return div().into_any_element();
+        };
+        let colors = cx.theme().colors().clone();
+        let agent_name = panel.connection.read(cx).agent_name().clone();
+        let input_box = |input: Entity<TextInput>| {
+            div()
+                .h(px(28.))
+                .px_2()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.panel_background)
+                .child(input)
+        };
+        let rows: Vec<AnyElement> = panel
+            .env_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                h_flex()
+                    .gap_2()
+                    .child(div().w(px(180.)).child(input_box(row.key.clone())))
+                    .child(Label::new("=").color(Color::Muted))
+                    .child(div().flex_1().min_w_0().child(input_box(row.value.clone())))
+                    .child(
+                        IconButton::new(("remove-env", index), IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Remove Variable"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(panel) = &mut this.account
+                                    && index < panel.env_rows.len()
+                                {
+                                    panel.env_rows.remove(index);
+                                }
+                                this.save_env(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .gap_2()
+            .child(
+                Label::new(format!(
+                    "Passed to {agent_name} when it starts. Running threads pick them up after Reload Agent."
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .children(rows)
+            .child(
+                h_flex().child(
+                    Button::new("add-env", "Add Variable")
+                        .style(ButtonStyle::Subtle)
+                        .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let row = this.new_env_row("", "", cx);
+                            if let Some(panel) = &mut this.account {
+                                panel.env_rows.push(row);
+                            }
+                            cx.notify();
+                        })),
+                ),
+            )
+            .into_any_element()
     }
 
     /// The agent's own ways to log in (the same ones a thread offers when it needs a login), and
@@ -748,7 +1100,6 @@ impl SettingsPage {
         let Some(account) = &self.account else {
             return div().into_any_element();
         };
-        let colors = cx.theme().colors().clone();
         let connection = account.connection.read(cx);
         let agent_name = connection.agent_name().clone();
         let status = connection.status().clone();
@@ -827,31 +1178,23 @@ impl SettingsPage {
                 }
             }
         };
-        v_flex()
-            .mx_4()
-            .mb_3()
-            .p_3()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
-            .child(Label::new(message).size(LabelSize::Small).color(color))
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(buttons)
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("account-done", "Done")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.account = None;
-                                cx.notify();
-                            })),
-                    ),
+        // ACP has no way to ask who is logged in; the agent only says what it is.
+        let agent_info = connection.agent_info().map(|info| {
+            let name = info.title.clone().unwrap_or_else(|| info.name.clone());
+            format!(
+                "Running {name} {}. Agents don't share which account they're logged in with.",
+                info.version
             )
+        });
+        v_flex()
+            .gap_2()
+            .children(
+                agent_info.map(|info| Label::new(info).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .child(Label::new(message).size(LabelSize::Small).color(color))
+            .when(!buttons.is_empty(), |panel| {
+                panel.child(h_flex().flex_wrap().gap_2().children(buttons))
+            })
             .into_any_element()
     }
 
@@ -1050,7 +1393,42 @@ struct AccountPanel {
     /// A session-less connection to the agent, alive only while the panel is open.
     connection: Entity<AgentThread>,
     terminal_hint: Option<SharedString>,
+    env_rows: Vec<EnvRow>,
     _subscription: Subscription,
+}
+
+struct EnvRow {
+    key: Entity<TextInput>,
+    value: Entity<TextInput>,
+    _subscriptions: [Subscription; 2],
+}
+
+fn render_default_row(name: SharedString, control: AnyElement) -> AnyElement {
+    h_flex()
+        .py_0p5()
+        .gap_3()
+        .justify_between()
+        .child(Label::new(name))
+        .child(control)
+        .into_any_element()
+}
+
+/// A select option's choices, flattening groups.
+fn select_choices(
+    select: &acp::SessionConfigSelect,
+) -> Vec<(SharedString, acp::SessionConfigValueId)> {
+    match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|option| (option.name.clone().into(), option.value.clone()))
+            .collect(),
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| &group.options)
+            .map(|option| (option.name.clone().into(), option.value.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// t3code's settings section: a small heading over a bordered group of rows.
@@ -1111,7 +1489,7 @@ impl Render for SettingsPage {
         let (title, sections) = match self.section {
             Section::General => ("General".into(), self.render_general(window, cx)),
             Section::Appearance => ("Appearance".into(), self.render_appearance(window, cx)),
-            Section::Agents => ("Agents".into(), self.render_agents(cx)),
+            Section::Agents => ("Agents".into(), self.render_agents(window, cx)),
             Section::Project(id) => match self.store.read(cx).project(id).cloned() {
                 Some(project) => (project.name(), self.render_project(project, cx)),
                 None => (
