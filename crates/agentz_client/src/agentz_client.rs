@@ -225,7 +225,109 @@ pub async fn start_local_server(runtime: &tokio::runtime::Handle, binary: &Path)
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use agentz_protocol::ConnectionId;
+    use agentz_protocol::agents::AgentId;
+    use agentz_protocol::thread::{Entry, ThreadView};
+
     use super::*;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn start_server(
+        data_dir: &Path,
+        custom_agents: BTreeMap<AgentId, agentz_server::CustomAgent>,
+    ) -> agentz_server::ServerHandle {
+        agentz_server::start(
+            tokio::runtime::Handle::current(),
+            agentz_server::ServerConfig {
+                data_dir: data_dir.to_path_buf(),
+                version: "0.0.0-test".into(),
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                shell_environment_ready: futures::future::ready(()).boxed().shared(),
+                custom_agents,
+            },
+        )
+        .expect("server starts")
+    }
+
+    async fn connect(server: &agentz_server::ServerHandle) -> (Connection, Events) {
+        let (client_stream, server_stream) = tokio::io::duplex(1 << 16);
+        server.serve(server_stream);
+        Connection::new(
+            &tokio::runtime::Handle::current(),
+            client_stream,
+            ClientKind::App,
+            "0.0.0-test".into(),
+        )
+        .await
+        .expect("connects")
+    }
+
+    /// `None` without python3 to run the mock agent.
+    fn mock_agent() -> Option<agentz_server::CustomAgent> {
+        let path = std::env::var_os("PATH")?;
+        let Some(python) = std::env::split_paths(&path)
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+        else {
+            eprintln!("skipping: python3 not found");
+            return None;
+        };
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent_thread/test_support/mock_agent.py");
+        Some(agentz_server::CustomAgent {
+            name: "Mock".into(),
+            command: registry::AgentCommand {
+                path: python,
+                args: vec![script.to_string_lossy().into_owned()],
+                env: Default::default(),
+            },
+        })
+    }
+
+    fn agent_text(view: &ThreadView) -> String {
+        view.entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::AgentMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn apply(view: &mut ThreadView, connection: ConnectionId, events: Vec<Event>) {
+        for event in events {
+            if let Event::Thread {
+                connection: updated,
+                update,
+            } = event
+                && updated == connection
+            {
+                view.apply(update);
+            }
+        }
+    }
+
+    /// Applies the thread's updates until `done` holds.
+    async fn follow(
+        events: &mut Events,
+        view: &mut ThreadView,
+        connection: ConnectionId,
+        done: impl Fn(&ThreadView) -> bool,
+    ) {
+        tokio::time::timeout(TIMEOUT, async {
+            while !done(view) {
+                let event = events.next().await.expect("the connection stays open");
+                apply(view, connection, vec![event]);
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out; thread {view:#?}"));
+    }
 
     /// Waits for the answer, keeping the events that come first.
     async fn request(
@@ -251,27 +353,8 @@ mod tests {
     async fn requests_and_events() {
         let data_dir = tempfile::tempdir().expect("temp dir");
         let project_dir = tempfile::tempdir().expect("temp dir");
-        let server = agentz_server::start(
-            tokio::runtime::Handle::current(),
-            agentz_server::ServerConfig {
-                data_dir: data_dir.path().to_path_buf(),
-                version: "0.0.0-test".into(),
-                http_client: Arc::new(http_client::BlockedHttpClient),
-                shell_environment_ready: futures::future::ready(()).boxed().shared(),
-                custom_agents: Default::default(),
-            },
-        )
-        .expect("server starts");
-        let (client_stream, server_stream) = tokio::io::duplex(1 << 16);
-        server.serve(server_stream);
-        let (connection, mut events) = Connection::new(
-            &tokio::runtime::Handle::current(),
-            client_stream,
-            ClientKind::App,
-            "0.0.0-test".into(),
-        )
-        .await
-        .expect("connects");
+        let server = start_server(data_dir.path(), BTreeMap::new());
+        let (connection, mut events) = connect(&server).await;
         assert_eq!(connection.welcome().pid, std::process::id());
         let mut received = Vec::new();
 
@@ -315,5 +398,98 @@ mod tests {
         assert!(events.next().await.is_none());
         assert!(connection.request(Request::SubscribeSession).await.is_err());
         assert!(connection.is_closed());
+    }
+
+    /// What the app goes through when it restarts mid-turn: the turn keeps going, and the new
+    /// connection's copy of the thread catches up without losing or repeating any text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattaches_to_a_turn_in_progress() {
+        let Some(mock_agent) = mock_agent() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = tempfile::tempdir().expect("temp dir");
+        let server = start_server(
+            data_dir.path(),
+            BTreeMap::from_iter([(AgentId::new("mock"), mock_agent)]),
+        );
+
+        let (connection, mut events) = connect(&server).await;
+        let mut received = Vec::new();
+        let Ok(Response::ProjectAdded(project_id)) = request(
+            &connection,
+            &mut events,
+            &mut received,
+            Request::AddProject {
+                path: project_dir.path().to_path_buf(),
+            },
+        )
+        .await
+        else {
+            panic!("expected a project");
+        };
+        let Ok(Response::ThreadCreated(thread_id)) = request(
+            &connection,
+            &mut events,
+            &mut received,
+            Request::CreateThread {
+                project_id,
+                agent_id: AgentId::new("mock"),
+            },
+        )
+        .await
+        else {
+            panic!("expected a thread");
+        };
+        let thread = ConnectionId::Thread(thread_id);
+        let Ok(Response::Thread(mut view)) = request(
+            &connection,
+            &mut events,
+            &mut received,
+            Request::SubscribeThread(thread),
+        )
+        .await
+        else {
+            panic!("expected the thread's snapshot");
+        };
+        received.clear();
+        request(
+            &connection,
+            &mut events,
+            &mut received,
+            Request::Prompt {
+                connection: thread,
+                text: "slow".into(),
+            },
+        )
+        .await
+        .expect("prompts");
+        apply(&mut view, thread, std::mem::take(&mut received));
+        follow(&mut events, &mut view, thread, |view| {
+            !agent_text(view).is_empty()
+        })
+        .await;
+        drop((connection, events));
+
+        let (connection, mut events) = connect(&server).await;
+        let Ok(Response::Thread(mut view)) = request(
+            &connection,
+            &mut events,
+            &mut received,
+            Request::SubscribeThread(thread),
+        )
+        .await
+        else {
+            panic!("expected the thread's snapshot");
+        };
+        assert!(view.is_working());
+        let partial = agent_text(&view);
+        assert!(
+            !partial.is_empty() && partial != "One two three four five",
+            "{partial:?}"
+        );
+        apply(&mut view, thread, std::mem::take(&mut received));
+        follow(&mut events, &mut view, thread, |view| !view.is_working()).await;
+        assert_eq!(agent_text(&view), "One two three four five");
     }
 }

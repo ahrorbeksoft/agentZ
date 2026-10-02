@@ -4,12 +4,14 @@ It answers initialize and session/new, and replies to every prompt by streaming
 "Echo: <prompt>" and a completed tool call, then ending the turn. A prompt of
 "permission" first asks the client for permission and reports the chosen option.
 A prompt of "mcp" starts the first stdio MCP server given in session/new, calls
-its first tool, and replies "MCP: <tool result>".
+its first tool, and replies "MCP: <tool result>". A prompt of "slow" streams
+"One two three four five" a word at a time, 200 ms apart.
 """
 import json
 import os
 import subprocess
 import sys
+import time
 
 # Optional path where conversations are recorded so `session/load` can replay them.
 HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
@@ -161,6 +163,11 @@ for line in sys.stdin:
         elif prompt_text == "mcp":
             update(params["sessionId"], text_chunk("agent_message_chunk",
                                                    "MCP: " + call_first_mcp_tool()))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "slow":
+            for word in ["One", " two", " three", " four", " five"]:
+                update(params["sessionId"], text_chunk("agent_message_chunk", word))
+                time.sleep(0.2)
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "demo":
             session_id = params["sessionId"]

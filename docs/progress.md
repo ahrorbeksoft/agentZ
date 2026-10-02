@@ -8,13 +8,13 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 1, the rest: a reattach test (the app restarts mid-prompt, the turn continues and
-the view catches up), Settings "Stop server", and `AGENTS.md`'s layout.
+**Next:** Phase 2, attention states: the server tracks each thread's state (working, blocked,
+done, idle) and sends it with the session.
 
 | Phase | Status |
 |---|---|
 | 0. Spike | Done |
-| 1. Local server split | In progress |
+| 1. Local server split | Done |
 | 2. Attention states and notifications | Not started |
 | 3. Agent control (MCP and CLI) | Not started |
 | 4. Subthreads | Not started |
@@ -82,11 +82,11 @@ Then the server:
       reconnects.
 - [x] App: client-side thread copies with `AgentThread`'s API. Port `agent_view`, `sidebar`,
       `settings_page` and `shell` to them.
-- [ ] Reattach after an app restart mid-prompt: the turn continues, and the view catches up.
-- [ ] Settings: "Stop server".
-- [ ] Tests: protocol round-trips, server driven over a socket pair with the mock agent, and
+- [x] Reattach after an app restart mid-prompt: the turn continues, and the view catches up.
+- [x] Settings: "Stop server" (built as "Restart Server"; see Findings).
+- [x] Tests: protocol round-trips, server driven over a socket pair with the mock agent, and
       reattach.
-- [ ] Update `AGENTS.md`: layout, how to run and test the server.
+- [x] Update `AGENTS.md`: layout, how to run and test the server.
 
 ## 2. Attention states and notifications
 
@@ -389,6 +389,12 @@ Then the server:
   - **Checked by hand** in a scratch data directory: the app started the server, a throwaway
     protocol client created a project and a mock thread and disconnected, the turn finished on
     the server, and the app showed the thread and its messages.
+  - **"Stop server" became "Restart Server".** The app reconnects and starts a server whenever
+    none is running, so stopping it from the app is a restart anyway. The button asks first,
+    because agents that are working stop. `agentz-server stop` still stops it for good.
+  - **Reattaching mid-turn is tested** through `agentz_client`: one connection starts the mock's
+    `slow` turn and drops after the first words, and a new connection's copy ends with the
+    whole reply, nothing lost or repeated.
 
 ## Open questions
 
@@ -433,4 +439,5 @@ Then the server:
 - 2026-10-03: Phase 1: the `agentz-server` binary, with `start`, `proxy` and `stop`, tested as
   processes against a scratch data directory.
 - 2026-10-03: Phase 1: the app is a client of the server (`agentz_client`, client-side copies
-  of projects, the registry, agent settings and threads).
+  of projects, the registry, agent settings and threads) (1f20235).
+- 2026-10-03: Finished phase 1: the reattach test, Settings › Restart Server, and `AGENTS.md`.

@@ -194,6 +194,7 @@ dependencies = [
  "log",
  "parking_lot",
  "projects",
+ "registry",
  "tempfile",
  "tokio",
 ]

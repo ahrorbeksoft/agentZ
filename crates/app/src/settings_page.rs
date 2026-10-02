@@ -14,6 +14,7 @@ use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
 
 use agent_client_protocol::schema::v1 as acp;
+use agentz_protocol::Request;
 use agentz_protocol::thread::ConnectionStatus;
 
 use std::collections::BTreeMap;
@@ -25,6 +26,7 @@ use crate::project_info::{
     render_project_icon,
 };
 use crate::registry_store::AgentRegistryStore;
+use crate::server_client::{ServerClient, ServerStatus};
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
 use crate::thread_entity::AgentThread;
 
@@ -97,6 +99,7 @@ impl SettingsPage {
                 cx.notify();
             }),
             cx.observe(&app_settings, |_, _, cx| cx.notify()),
+            cx.observe(&ServerClient::global(cx), |_, _, cx| cx.notify()),
             cx.subscribe(&name_input, |this, input, _: &TextInputEvent, cx| {
                 let Section::Project(id) = this.section else {
                     return;
@@ -407,16 +410,75 @@ impl SettingsPage {
             ThreadOrder::LastActivity => "Latest activity",
             ThreadOrder::Created => "Newest first",
         };
-        vec![render_section(
-            "Threads",
-            vec![render_row(
-                "Thread order",
-                "How threads are sorted in the sidebar.",
-                DropdownMenu::new("thread-order", label, menu).into_any_element(),
+        let server_client = ServerClient::global(cx).read(cx);
+        let (server_description, is_connected): (SharedString, bool) =
+            match (server_client.status(), server_client.connection()) {
+                (ServerStatus::Connected, Some(connection)) => {
+                    let welcome = connection.welcome();
+                    (
+                        format!(
+                            "agentz-server {}, pid {}. It runs your agents, so they keep working \
+                             after agentZ quits.",
+                            welcome.server_version, welcome.pid
+                        )
+                        .into(),
+                        true,
+                    )
+                }
+                (ServerStatus::Disconnected(error), _) => {
+                    (format!("Not connected: {error}").into(), false)
+                }
+                _ => ("Connecting…".into(), false),
+            };
+        vec![
+            render_section(
+                "Threads",
+                vec![render_row(
+                    "Thread order",
+                    "How threads are sorted in the sidebar.",
+                    DropdownMenu::new("thread-order", label, menu).into_any_element(),
+                    cx,
+                )],
                 cx,
-            )],
+            ),
+            render_section(
+                "Server",
+                vec![render_row(
+                    "Background server",
+                    server_description,
+                    Button::new("restart-server", "Restart Server")
+                        .style(ButtonStyle::Outlined)
+                        .disabled(!is_connected)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_restart_server(window, cx)
+                        }))
+                        .into_any_element(),
+                    cx,
+                )],
+                cx,
+            ),
+        ]
+    }
+
+    fn confirm_restart_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Restart the background server?",
+            Some("Agents that are working now will stop."),
+            &["Restart", "Cancel"],
             cx,
-        )]
+        );
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                // The app starts the server again when the connection drops.
+                cx.update(|cx| {
+                    ServerClient::global(cx)
+                        .read(cx)
+                        .send(Request::Shutdown, cx)
+                });
+            }
+        })
+        .detach();
     }
 
     fn render_appearance(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {

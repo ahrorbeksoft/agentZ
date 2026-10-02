@@ -156,7 +156,8 @@ the SSH session, a dropped connection never stops agents. That's Zed's design.
 **Lifetimes:**
 
 - The app starts the local server on demand, detached. Quitting the app leaves it running.
-- "Stop server" (Settings) ends it and its agents and terminals.
+- "Restart Server" (Settings › General) ends it and its agents and terminals. The app then
+  starts a new one, since a running app always needs it. `agentz-server stop` stops it for good.
 - Starting at login (launchd/systemd) is optional and comes later.
 
 ### Protocol (`agentz_protocol`)

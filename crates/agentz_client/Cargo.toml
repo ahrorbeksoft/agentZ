@@ -26,5 +26,6 @@ agentz_server.workspace = true
 futures.workspace = true
 http_client.workspace = true
 projects.workspace = true
+registry.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

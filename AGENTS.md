@@ -32,8 +32,11 @@ agentZ's own crates (everything else in `crates/` is copied from Zed):
 
 | Crate | What it is |
 |---|---|
-| `crates/app` | The application (`agentz` binary). See the modules below. |
-| `crates/agent_thread` | One ACP connection and session: process, protocol, entries, permissions, config options, login/logout, reload. `test_support/mock_agent.py` is a scripted ACP agent for tests. |
+| `crates/app` | The application (`agentz` binary), a GPUI client of the server. See the modules below. |
+| `crates/agentz_server` | The background server (`agentz-server` binary, GPUI-free, tokio). One task (`server.rs`) owns the projects, the registry, agent settings and the running threads, so agents keep working when the app quits. `main.rs` has `run`, `start`, `proxy` and `stop`. |
+| `crates/agentz_protocol` | The wire format (length-prefixed JSON) and the types the server and clients share: requests, responses, events, thread views and updates, registry and agent settings. |
+| `crates/agentz_client` | A connection to the server: requests answered through futures, events in order, and starting a local server. |
+| `crates/agent_thread` | One ACP connection and session, run by the server: process, protocol, entries, permissions, config options, login/logout, reload. `test_support/mock_agent.py` is a scripted ACP agent for tests. |
 | `crates/projects` | `ProjectStore`: projects (custom name and icon), threads (title, agent, session id, model, archived), scope, thread order. Saved to `state.json`. |
 | `crates/registry` | `AgentRegistryStore`: fetches the ACP Registry, installs, updates and uninstalls agents (binary archives, or npm via the system `npm`), and builds the command to start one. |
 | `crates/paths` | Data locations. `AGENTZ_DATA_DIR` overrides the data directory. |
@@ -45,16 +48,24 @@ agentZ's own crates (everything else in `crates/` is copied from Zed):
 | Module | What it is |
 |---|---|
 | `main.rs` | Startup, actions, key bindings, menus, theme fonts. |
-| `shell.rs` | The window: title bar with the project switcher, sidebar, main area (thread or settings), New Thread modal. Starts threads with each agent's environment and defaults. |
+| `shell.rs` | The window: title bar with the project switcher and the disconnected icon, sidebar, main area (thread or settings), New Thread modal. |
+| `server_client.rs` | The global connection to the server: starts it if needed, reconnects with backoff, and feeds events to the copies below. |
+| `project_store.rs`, `registry_store.rs`, `thread_entity.rs` | GPUI copies of the server's projects, registry and threads, with the same names and methods as the core types. Changes go to the server as requests and come back as events. |
 | `sidebar.rs` | t3code-style thread cards, the Archived shelf, search mode, rename, context menu, details popover, Settings footer. |
 | `agent_view.rs` | The thread view, after Zed's: messages, tool calls, diffs, plan, permissions, composer with config selectors, context usage, queue, slash commands, the "…" agent menu. |
-| `settings_page.rs` | Settings: General, Appearance, Agents (registry plus each agent's Settings panel), one page per project. |
-| `app_settings.rs` | `settings.json`: theme mode and themes, and per-agent settings (env, defaults, known options). |
+| `settings_page.rs` | Settings: General (with Restart Server), Appearance, Agents (registry plus each agent's Settings panel), one page per project. |
+| `app_settings.rs` | `settings.json`: theme mode and themes. Also the server's per-agent settings (env, defaults, known options), changed through requests. |
 | `project_info.rs` | Project favicons, monograms and git branches, kept current by a global `ProjectInfoStore`. |
 | `project_switcher.rs`, `new_thread_modal.rs` | The title bar's project picker, and the New Thread flow (project, then agent). |
 
-Data lives in `~/Library/Application Support/agentZ/`: `state.json` (projects and threads),
-`settings.json`, and `agents/registry/` (registry cache, icons, installed agents).
+Data lives in `~/Library/Application Support/agentZ/`:
+
+- `state.json` (projects and threads) and `settings.json` (the app's appearance settings);
+- `agents/settings.json` (per-agent settings, owned by the server), `agents/registry/` (registry
+  cache, icons, installed agents), and optionally `agents/custom.json` (agents run from a fixed
+  command, shown as installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3",
+  "args": ["…/mock_agent.py"], "env": {}}}}`);
+- `server.sock`, `server.pid`, `machine-id` and `logs/server.log`, for the server.
 
 ## Build, run, test
 
@@ -113,7 +124,14 @@ From Zed's guidelines, which this code follows:
 
 - **Unit and integration:** `agent_thread` tests drive the real mock agent process (login, logout,
   reload, defaults, history replay). Extend the mock when you need a protocol feature; it speaks
-  JSON-RPC over stdio in a few lines of Python.
+  JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp`, `slow` and
+  `demo` script different turns (see its docstring).
+- **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
+  mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
+  directory. `agentz_client` tests reattach to a turn in progress.
+- **The app against a scratch server:** set `AGENTZ_DATA_DIR` to a temporary directory and put
+  the mock agent in its `agents/custom.json`. The app starts a server for that directory. Stop it
+  afterwards with `AGENTZ_DATA_DIR=<dir> ./target/debug/agentz-server stop`.
 - **UI behavior (hover, layout, focus, timing):** write a temporary headless GPUI test in the
   crate:
   - Add `[dev-dependencies]` for `gpui` and `http_client` with the `test-support` feature.
@@ -129,8 +147,9 @@ From Zed's guidelines, which this code follows:
     primary display.
   - Drive the app with temporary code (open settings, select a section), using demo data via
     `AGENTZ_DATA_DIR=<scratch>/data`.
-  - Find the window id through `CGWindowListCopyWindowInfo` by pid. Don't filter on layer 0,
-    because PopUp windows sit higher.
+  - Find the window id through `CGWindowListCopyWindowInfo` by the scratch app's pid (not the
+    user's app, which may be running too). Don't filter on layer 0, because PopUp windows sit
+    higher.
   - Capture with `screencapture -x -o -l <id>`, then restore every patched file.
   - A plain background window never draws, so its screenshot is blank or stale.
 
@@ -180,6 +199,7 @@ Done:
 - Settings: General, Appearance, Agents with per-agent login, defaults and environment, and
   per-project pages.
 - Zed's Reauthenticate, Log Out and Reload Agent.
+- The local background server: agents keep working after the app quits, and the app reattaches.
 
 Not built yet (offered earlier, not scheduled):
 - A multi-line composer.
