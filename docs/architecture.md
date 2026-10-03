@@ -239,7 +239,8 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
 - **Updates**: an older server keeps running beside the new binary (over SSH told by the
   installed SHA-256, on this Mac by the binary's modification time); the title bar shows it and
   Settings › Machines offers Update Server (Restart Server… for servers without the
-  `hand_off` capability).
+  `hand_off` capability). When handing off fails, the app restarts the server instead and
+  says so: what ran there stops, but the new server still takes over.
 - **Machines settings** (`settings_page.rs`, `machine_modal.rs`, `machine_icon_picker.rs`,
   t3code's `ConnectionsSettings.tsx` and `EnvironmentRow`): one row per machine with its icon,
   name, and one line of transport, status and (when an update is installed) the server's

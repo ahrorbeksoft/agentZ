@@ -80,7 +80,8 @@ pub struct SettingsPage {
     /// The machine whose agents Settings › Agents shows.
     agents_machine: MachineId,
     agent_search: Entity<TextInput>,
-    /// The saved machine the form edits, rather than adding one.
+    /// Machines whose server is being updated, so a second click doesn't restart it midway.
+    updating: std::collections::HashSet<MachineId>,
     /// Whether this Mac's server has a launch agent, so it starts at login.
     starts_at_login: bool,
     /// The agent whose account panel is open, with the connection made to log in or out.
@@ -162,6 +163,7 @@ impl SettingsPage {
             monogram_input,
             agents_machine: MachineId::Local,
             agent_search,
+            updating: Default::default(),
             starts_at_login: crate::login_item::is_enabled(),
             account: None,
             nav_scroll: ScrollHandle::new(),
@@ -856,8 +858,12 @@ impl SettingsPage {
             self.restart_to_update(client, window, cx);
             return;
         }
+        let machine = client.read(cx).machine();
+        if !self.updating.insert(machine) {
+            return;
+        }
         let update = client.read(cx).update_server(false, cx);
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = match update.await {
                 Ok(ServerUpdate::TurnsRunning(threads)) => {
                     let detail = format!(
@@ -881,6 +887,8 @@ impl SettingsPage {
                         return;
                     };
                     if answer.await != Ok(0) {
+                        this.update(cx, |this, _| this.updating.remove(&machine))
+                            .ok();
                         return;
                     }
                     let update = client.read_with(cx, |client, cx| client.update_server(true, cx));
@@ -888,12 +896,19 @@ impl SettingsPage {
                 }
                 result => result,
             };
+            this.update(cx, |this, _| this.updating.remove(&machine))
+                .ok();
+            // What runs there can't carry over, but restarting still brings in the new server.
             if let Err(error) = result {
-                let detail = format!("{error:#}");
+                cx.update(|_, cx| client.read(cx).restart_server(cx)).ok();
+                let detail = format!(
+                    "Its terminals and agents couldn't be handed over, so they stopped. Agents \
+                     load their sessions again when their threads open.\n\n{error:#}"
+                );
                 let answer = cx.update(|window, cx| {
                     window.prompt(
-                        PromptLevel::Critical,
-                        "Couldn't update the server",
+                        PromptLevel::Warning,
+                        "The server restarted to update",
                         Some(&detail),
                         &["OK"],
                         cx,
