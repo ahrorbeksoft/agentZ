@@ -86,6 +86,9 @@ pub struct HandedOver {
 /// The new server's side of the handoff, to say when it's ready.
 pub struct Takeover {
     connection: UnixStream,
+    /// What to answer: [`READY_WITH_AGENTS`] only to a server that sent agents, since one from
+    /// before agents were handed off accepts nothing but [`READY`].
+    ready: u8,
 }
 
 /// The old server's side, once the new one is ready.
@@ -115,6 +118,7 @@ pub fn receive(connection: UnixStream) -> Result<(UnixListener, HandedOver, Take
         .iter()
         .map(|_| receive_fd(&connection).context("receiving a terminal"))
         .collect::<Result<Vec<_>>>()?;
+    let ready = ready_answer(&manifest);
     let agent_pipes = manifest
         .agents
         .iter()
@@ -133,7 +137,7 @@ pub fn receive(connection: UnixStream) -> Result<(UnixListener, HandedOver, Take
             ptys,
             agent_pipes,
         },
-        Takeover { connection },
+        Takeover { connection, ready },
     ))
 }
 
@@ -142,7 +146,7 @@ impl Takeover {
     /// them go.
     pub fn ready(self) -> Result<()> {
         (&self.connection)
-            .write_all(&[READY_WITH_AGENTS])
+            .write_all(&[self.ready])
             .context("telling the old server")?;
         self.connection
             .set_read_timeout(Some(COMMIT_TIMEOUT))
@@ -164,6 +168,14 @@ impl Handover {
         (&self.connection)
             .write_all(&[COMMIT])
             .context("telling the new server to take over")
+    }
+}
+
+fn ready_answer(manifest: &Manifest) -> u8 {
+    if manifest.agents.is_empty() {
+        READY
+    } else {
+        READY_WITH_AGENTS
     }
 }
 
@@ -272,4 +284,17 @@ fn receive_fd(connection: &UnixStream) -> Result<OwnedFd> {
         return Err(std::io::Error::last_os_error()).context("receiving a file descriptor");
     }
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server from before agents were handed off sends none, and takes no other answer.
+    #[test]
+    fn answers_older_servers_as_they_expect() {
+        let older: Manifest =
+            serde_json::from_str(r#"{"terminals": [], "palette": null}"#).expect("parses");
+        assert_eq!(ready_answer(&older), READY);
+    }
 }
