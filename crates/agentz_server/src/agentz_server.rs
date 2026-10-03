@@ -6,6 +6,7 @@
 //! its channel; after each batch it sends subscribers what changed.
 
 mod agent_settings;
+mod checkpoints;
 mod connection;
 mod server;
 
@@ -87,7 +88,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
         server_version: config.version.clone(),
         machine,
         pid: std::process::id(),
-        capabilities: Vec::new(),
+        capabilities: vec![agentz_protocol::CAPABILITY_THREAD_DIFF.to_string()],
         error: None,
     };
     let (inputs, inbox) = mpsc::unbounded();

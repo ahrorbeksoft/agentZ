@@ -17,13 +17,13 @@ const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
 const INSTRUCTIONS: &str = "Tools for managing the threads of this agentZ project: list and read \
-threads, start new ones, message, wait for, interrupt, rename and archive them, and delegate \
-tasks to child agents. A delegated task is child work owned by this thread: use delegate_task \
-(see orchestrator_capabilities for agents and models), keep each taskId, and use task_status or \
-task_cancel to manage it. An async task's end is announced to this thread, so end the turn \
-instead of polling. agentz_thread_launch and create_threads make ordinary top-level threads: use \
-them only when the user asks for separate or new threads, never merely because they said \
-subagent.";
+threads, start new ones, message, wait for, interrupt, rename and archive them, read the changes \
+each thread made (agentz_thread_diff), and delegate tasks to child agents. A delegated task is \
+child work owned by this thread: use delegate_task (see orchestrator_capabilities for agents and \
+models), keep each taskId, and use task_status or task_cancel to manage it. An async task's end is \
+announced to this thread, so end the turn instead of polling. agentz_thread_launch and \
+create_threads make ordinary top-level threads: use them only when the user asks for separate or \
+new threads, never merely because they said subagent.";
 
 pub(crate) async fn run(version: &str) -> Result<()> {
     let token = std::env::var("AGENTZ_MCP_TOKEN").context("AGENTZ_MCP_TOKEN isn't set")?;

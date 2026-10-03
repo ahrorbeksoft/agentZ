@@ -1,6 +1,6 @@
 //! The agent-control tools, after t3code's orchestrator MCP server: agents list, read, start,
-//! message, wait for, interrupt, rename and archive the threads of their own project, and
-//! delegate tasks to subthreads. The MCP bridge and the CLI both call them with
+//! message, wait for, interrupt, rename and archive the threads of their own project, read
+//! their changes, and delegate tasks to subthreads. The MCP bridge and the CLI both call them with
 //! [`Request::CallTool`](agentz_protocol::Request).
 //!
 //! A delegated task runs in a subthread that gets only the task as its prompt. It ends once
@@ -19,9 +19,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange};
 use agentz_protocol::thread::{ConnectionStatus, Entry};
 use agentz_protocol::{ConnectionId, ServerMessage, ToolCaller, ToolResult};
 use collections::HashMap;
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
 use projects::{ProjectId, ProjectStore, Task, TaskEnd, TaskOutcome, ThreadCreator, ThreadId};
 use serde_json::{Map, Value, json};
 use util::ResultExt as _;
@@ -41,6 +44,8 @@ const DEFAULT_CHARS_PER_ITEM: u64 = 4_000;
 const MAX_CHARS_PER_ITEM: u64 = 50_000;
 const MAX_LAST_MESSAGE_CHARS: usize = 8_000;
 const MAX_TOOL_RESULTS_KEPT: usize = 1_000;
+const DEFAULT_PATCH_CHARS: u64 = 50_000;
+const MAX_PATCH_CHARS: u64 = 1_000_000;
 const TASK_ROLES: [&str; 6] = [
     "implementation",
     "research",
@@ -127,6 +132,8 @@ enum Step {
     Wait(Duration),
     /// Answer once the delegated task ends, or with `waitTimedOut` after this long.
     WaitForTask(ThreadId, Duration),
+    /// Answer with this work's result, done off the server's task.
+    Background(BoxFuture<'static, Result<Value, Failure>>),
 }
 
 type Outcome = Result<Step, Failure>;
@@ -147,7 +154,7 @@ impl Server {
                     let (task, timeout) = match step {
                         Step::WaitForTask(task, timeout) => (Some(task), timeout),
                         Step::Wait(timeout) => (None, timeout),
-                        Step::Done(_) => (None, Duration::ZERO),
+                        Step::Done(_) | Step::Background(_) => (None, Duration::ZERO),
                     };
                     let deadline = Instant::now() + timeout;
                     self.pending_tool_calls.push(PendingToolCall {
@@ -163,6 +170,10 @@ impl Server {
                     Ok(None)
                 }
                 Ok(Step::Done(value)) => Ok(Some(value)),
+                Ok(Step::Background(work)) => {
+                    self.answer_in_background(client, id, work);
+                    Ok(None)
+                }
                 Err(failure) => Err(failure),
             }
         });
@@ -206,6 +217,7 @@ impl Server {
                 Ok(Step::Done(value)) => {
                     answers.push((call.client, call.id, tool_result(Ok(value))))
                 }
+                Ok(Step::Background(work)) => self.answer_in_background(call.client, call.id, work),
                 Err(failure) => answers.push((call.client, call.id, tool_result(Err(failure)))),
             }
         }
@@ -365,6 +377,25 @@ impl Server {
         }
     }
 
+    fn answer_in_background(
+        &self,
+        client: ClientId,
+        id: u64,
+        work: BoxFuture<'static, Result<Value, Failure>>,
+    ) {
+        let inputs = self.inputs.clone();
+        self.runtime.spawn(async move {
+            let result = tool_result(work.await);
+            inputs
+                .unbounded_send(Input::Respond {
+                    client,
+                    id,
+                    result: Ok(agentz_protocol::Response::ToolResult(result)),
+                })
+                .ok();
+        });
+    }
+
     fn wake_at(&self, deadline: Instant) {
         let inputs = self.inputs.clone();
         self.runtime.spawn(async move {
@@ -465,6 +496,7 @@ impl Server {
                 Ok(Step::Done(self.task_result(task, false, true)))
             }
             "task_cancel" => self.task_cancel(caller, &arguments),
+            "agentz_thread_diff" => self.thread_diff_tool(caller, &arguments),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
         if let (Some(key), Step::Done(value)) = (request_key, &step) {
@@ -1325,6 +1357,79 @@ impl Server {
         })))
     }
 
+    fn thread_diff_tool(&mut self, caller: Caller, arguments: &Arguments) -> Outcome {
+        let thread_id = self.target(
+            caller,
+            arguments.thread_id("threadId")?.or(caller.thread_id),
+        )?;
+        let scope = match arguments.string("scope", 16)? {
+            None | Some("all") => DiffScope::All,
+            Some("latest_turn") => DiffScope::LatestTurn,
+            Some(scope) => return Err(invalid(format!("Unknown scope {scope}."))),
+        };
+        let include_patch = match arguments.string("format", 16)? {
+            None | Some("patch") => true,
+            Some("files") => false,
+            Some(format) => return Err(invalid(format!("Unknown format {format}."))),
+        };
+        let max_chars = arguments
+            .number("maxChars")?
+            .unwrap_or(DEFAULT_PATCH_CHARS)
+            .clamp(1, MAX_PATCH_CHARS) as usize;
+        let checkpoints = self
+            .checkpoints(thread_id)
+            .ok_or_else(|| failure("thread_not_found", "The thread was deleted."))?;
+        Ok(Step::Background(
+            async move {
+                let diff = checkpoints
+                    .diff(scope)
+                    .await
+                    .map_err(|error| failure("orchestration_error", format!("{error:#}")))?;
+                let files: Vec<Value> = agentz_protocol::diff::parse_patch(&diff.patch)
+                    .into_iter()
+                    .map(|file| {
+                        json!({
+                            "path": file.path,
+                            "oldPath": file.old_path,
+                            "change": match file.change {
+                                FileChange::Added => "added",
+                                FileChange::Deleted => "deleted",
+                                FileChange::Modified => "modified",
+                                FileChange::Renamed => "renamed",
+                            },
+                            "binary": file.binary,
+                            "additions": file.additions,
+                            "deletions": file.deletions,
+                        })
+                    })
+                    .collect();
+                let status = match diff.status {
+                    DiffStatus::Ready => "ready",
+                    DiffStatus::NotRepository => "not_repository",
+                    DiffStatus::NoTurns | DiffStatus::Unknown(_) => "no_turns",
+                };
+                let mut result = json!({
+                    "threadId": thread_id.0,
+                    "status": status,
+                    "scope": match scope {
+                        DiffScope::All => "all",
+                        DiffScope::LatestTurn => "latest_turn",
+                    },
+                    "turns": diff.turns,
+                    "files": files,
+                    "truncated": diff.truncated,
+                });
+                if include_patch {
+                    let (patch, cut) = truncate(&diff.patch, max_chars);
+                    result["patch"] = json!(patch);
+                    result["truncated"] = json!(diff.truncated || cut);
+                }
+                Ok(result)
+            }
+            .boxed(),
+        ))
+    }
+
     /// A thread the caller may manage: one in its project.
     fn target(&self, caller: Caller, thread_id: Option<ThreadId>) -> Result<ThreadId, Failure> {
         let thread_id = thread_id.ok_or_else(|| invalid("threadId is required."))?;
@@ -1774,6 +1879,22 @@ pub(super) fn definitions() -> Value {
                 "additionalProperties": false,
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+        },
+        {
+            "name": "agentz_thread_diff",
+            "title": "Read an agentZ thread's changes",
+            "description": "Read the file changes a thread in the calling project made, from the git checkpoints agentZ takes before its first turn and after each turn. Omit threadId for this thread. scope='all' (the default) covers every finished turn; latest_turn only the last one. Changes are those of the thread's folder, so they include edits by anyone else working there at the same time. A turn still running isn't included yet. format='files' returns only the changed files with line counts; the default patch also returns the unified diff, cut at maxChars. status is not_repository outside git and no_turns before a turn has finished.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "threadId": thread_id,
+                    "scope": {"type": "string", "enum": ["all", "latest_turn"]},
+                    "format": {"type": "string", "enum": ["patch", "files"]},
+                    "maxChars": {"type": "integer", "minimum": 1, "maximum": MAX_PATCH_CHARS},
+                },
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
         },
         {
             "name": "delegate_task",

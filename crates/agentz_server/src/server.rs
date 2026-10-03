@@ -4,12 +4,14 @@ mod tools;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, ThreadMessage, ThreadView};
 use agentz_protocol::agents::{
     AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
+use agentz_protocol::diff::{DiffScope, ThreadDiff};
 use agentz_protocol::{
     AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineInfo, Request, Response,
     ServerMessage, SessionSnapshot,
@@ -22,8 +24,10 @@ use gpui_shared_string::SharedString;
 use projects::{ProjectStore, ThreadCreator, ThreadId};
 use registry::{AgentRegistryStore, CommandFuture, RegistryMessage};
 use tokio::task::JoinSet;
+use util::ResultExt as _;
 
 use crate::agent_settings::AgentSettingsStore;
+use crate::checkpoints::Checkpoints;
 use crate::{AgentControl, CustomAgent, ServerConfig};
 use tools::{PendingToolCall, ToolResults};
 
@@ -46,6 +50,12 @@ pub(crate) enum Input {
     Thread(ConnectionId, ThreadMessage),
     /// A waiting tool call's timeout has passed.
     ToolDeadline,
+    /// The answer to a request that needed background work.
+    Respond {
+        client: ClientId,
+        id: u64,
+        result: Result<Response, ErrorResponse>,
+    },
     Shutdown,
 }
 
@@ -212,6 +222,14 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::ThreadDiff { thread_id, scope },
+            } => self.thread_diff(client, id, thread_id, scope),
+            Input::Respond { client, id, result } => {
+                self.send(client, ServerMessage::Response { id, result })
+            }
+            Input::Request {
+                client,
+                id,
                 request,
             } => {
                 let result = self
@@ -289,6 +307,14 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::RemoveProject(project_id) => {
+                let threads = self
+                    .projects
+                    .threads()
+                    .iter()
+                    .filter(|thread| thread.project_id == project_id)
+                    .map(|thread| thread.id)
+                    .collect();
+                self.delete_checkpoints(threads);
                 self.projects.remove_project(project_id);
                 Ok(Response::Ok)
             }
@@ -338,6 +364,7 @@ impl Server {
             }
             Request::DeleteThread(thread_id) => {
                 self.existing_thread(thread_id)?;
+                self.delete_checkpoints(self.projects.thread_and_subthreads(thread_id));
                 self.projects.delete_thread(thread_id);
                 Ok(Response::Ok)
             }
@@ -501,8 +528,9 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::ListTools => Ok(Response::Tools(tools::definitions())),
-            // Handled by `call_tool`, since it may answer later.
+            // Handled by `call_tool` and `thread_diff`, since they may answer later.
             Request::CallTool { .. } => Err(anyhow!("tool calls are handled separately")),
+            Request::ThreadDiff { .. } => Err(anyhow!("diffs are handled separately")),
             Request::Unknown(request) => Err(anyhow!("unsupported request: {request}")),
         }
     }
@@ -511,6 +539,57 @@ impl Server {
         self.clients
             .get_mut(&client)
             .context("the client disconnected")
+    }
+
+    /// The thread's checkpoints, in its project's folder.
+    fn checkpoints(&self, thread_id: ThreadId) -> Option<Checkpoints> {
+        let thread = self.projects.thread(thread_id)?;
+        let project = self.projects.project(thread.project_id)?;
+        Some(Checkpoints::new(
+            project.path.clone(),
+            &self.machine.id,
+            thread_id,
+        ))
+    }
+
+    fn delete_checkpoints(&self, threads: Vec<ThreadId>) {
+        let checkpoints: Vec<Checkpoints> = threads
+            .into_iter()
+            .filter_map(|thread_id| self.checkpoints(thread_id))
+            .collect();
+        self.runtime.spawn(async move {
+            for checkpoints in checkpoints {
+                checkpoints.delete().await.log_err();
+            }
+        });
+    }
+
+    fn thread_diff(&mut self, client: ClientId, id: u64, thread_id: ThreadId, scope: DiffScope) {
+        let Some(checkpoints) = self.checkpoints(thread_id) else {
+            let error = ErrorResponse {
+                message: "no such thread".into(),
+            };
+            self.send(
+                client,
+                ServerMessage::Response {
+                    id,
+                    result: Err(error),
+                },
+            );
+            return;
+        };
+        let inputs = self.inputs.clone();
+        self.runtime.spawn(async move {
+            let result = thread_diff(&checkpoints, scope)
+                .await
+                .map(Response::ThreadDiff)
+                .map_err(|error| ErrorResponse {
+                    message: format!("{error:#}"),
+                });
+            inputs
+                .unbounded_send(Input::Respond { client, id, result })
+                .ok();
+        });
     }
 
     fn existing_thread(&self, thread_id: ThreadId) -> Result<()> {
@@ -604,6 +683,7 @@ impl Server {
             }
             .boxed();
         }
+        let checkpoints = Checkpoints::new(cwd.clone(), &self.machine.id, thread_id);
         let (mut agent_thread, inbox) = AgentThread::start(
             self.runtime.clone(),
             self.agent_name(&agent_id),
@@ -612,6 +692,10 @@ impl Server {
             previous_session,
         );
         agent_thread.set_mcp_servers(mcp_servers);
+        agent_thread.set_turn_hook(Arc::new(move |point| {
+            let checkpoints = checkpoints.clone();
+            async move { checkpoints.on_turn(point).await }.boxed()
+        }));
         agent_thread.set_defaults(self.agent_settings.get(&agent_id).session_defaults());
         let connection = ConnectionId::Thread(thread_id);
         self.forward(inbox, move |message| Input::Thread(connection, message));
@@ -868,6 +952,17 @@ impl Server {
 /// Fails only once the client has disconnected, which the server hears about separately.
 fn send_to(outgoing: &mpsc::UnboundedSender<ServerMessage>, message: ServerMessage) {
     outgoing.unbounded_send(message).ok();
+}
+
+/// The thread's changes in the scope, with the patch parsed into files.
+async fn thread_diff(checkpoints: &Checkpoints, scope: DiffScope) -> Result<ThreadDiff> {
+    let diff = checkpoints.diff(scope).await?;
+    Ok(ThreadDiff {
+        status: diff.status,
+        turns: diff.turns,
+        files: agentz_protocol::diff::parse_patch(&diff.patch),
+        truncated: diff.truncated,
+    })
 }
 
 fn registry_dir(data_dir: &std::path::Path) -> PathBuf {

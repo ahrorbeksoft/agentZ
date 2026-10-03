@@ -6,7 +6,9 @@ It answers initialize and session/new, and replies to every prompt by streaming
 A prompt of "mcp" starts the first stdio MCP server given in session/new (or
 session/load), calls its first tool, and replies "MCP: <tool result>"; "mcp <tool>
 <json arguments>" calls that tool instead. A prompt of "slow" streams
-"One two three four five" a word at a time, 200 ms apart.
+"One two three four five" a word at a time, 200 ms apart. "write <path> <text>"
+writes the text and a newline to the file, relative to the session's folder, and
+"delete <path>" removes it.
 """
 import json
 import os
@@ -22,6 +24,7 @@ LONG_BUILD_OUTPUT = "".join(f"   Compiling page {n}/60\n" for n in range(1, 61))
 next_request_id = 1000
 pending = {}
 mcp_servers = []
+session_cwd = os.getcwd()
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
 
 
@@ -131,6 +134,7 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
     elif method == "session/new":
         mcp_servers = message["params"].get("mcpServers", [])
+        session_cwd = message["params"].get("cwd", session_cwd)
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"sessionId": "session-1", "configOptions": config_options()}})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {
@@ -141,6 +145,7 @@ for line in sys.stdin:
                  "input": {"hint": "optional focus"}}]}}})
     elif method == "session/load":
         mcp_servers = message["params"].get("mcpServers", [])
+        session_cwd = message["params"].get("cwd", session_cwd)
         session_id = message["params"]["sessionId"]
         for payload in load_history():
             send({"jsonrpc": "2.0", "method": "session/update",
@@ -169,6 +174,17 @@ for line in sys.stdin:
             arguments = json.loads(parts[2]) if len(parts) > 2 else None
             update(params["sessionId"], text_chunk("agent_message_chunk",
                                                    "MCP: " + call_mcp_tool(name, arguments)))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text.startswith("write ") or prompt_text.startswith("delete "):
+            parts = prompt_text.split(" ", 2)
+            path = os.path.join(session_cwd, parts[1])
+            if parts[0] == "write":
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as file:
+                    file.write((parts[2] if len(parts) > 2 else "") + "\n")
+            else:
+                os.remove(path)
+            update(params["sessionId"], text_chunk("agent_message_chunk", f"Done: {parts[0]} {parts[1]}"))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "slow":
             for word in ["One", " two", " three", " four", " five"]:

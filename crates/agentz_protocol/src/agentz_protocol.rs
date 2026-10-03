@@ -13,6 +13,7 @@
 //!   rule).
 
 pub mod agents;
+pub mod diff;
 pub mod thread;
 
 use std::collections::BTreeMap;
@@ -26,10 +27,14 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::agents::{AgentId, AgentSettings, RegistrySnapshot};
+use crate::diff::{DiffScope, ThreadDiff};
 use crate::thread::{ThreadUpdate, ThreadView};
 
 /// Bumped when a change can't be made compatibly.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// [`ServerWelcome::capabilities`]: the server answers [`Request::ThreadDiff`].
+pub const CAPABILITY_THREAD_DIFF: &str = "thread_diff";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -154,6 +159,11 @@ pub enum Request {
     ArchiveThread(ThreadId),
     UnarchiveThread(ThreadId),
     DeleteThread(ThreadId),
+    /// The thread's changes from its checkpoints: [`Response::ThreadDiff`].
+    ThreadDiff {
+        thread_id: ThreadId,
+        scope: DiffScope,
+    },
 
     Prompt {
         connection: ConnectionId,
@@ -263,6 +273,7 @@ pub enum Response {
     AccountOpened(u64),
     Tools(serde_json::Value),
     ToolResult(ToolResult),
+    ThreadDiff(ThreadDiff),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),

@@ -11,6 +11,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -23,6 +25,7 @@ pub use agentz_protocol::thread::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
+use futures::future::BoxFuture;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui_shared_string::SharedString;
 use registry::AgentCommand;
@@ -48,6 +51,17 @@ pub enum AgentThreadEvent {
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
     LoggedOut,
+}
+
+/// Work the owner does around every turn, such as taking checkpoints. The turn waits for it:
+/// the prompt goes to the agent once [`TurnPoint::Starting`] is done, and the thread stops
+/// working once [`TurnPoint::Ended`] is.
+pub type TurnHook = Arc<dyn Fn(TurnPoint) -> BoxFuture<'static, ()> + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnPoint {
+    Starting,
+    Ended,
 }
 
 /// The result of background work, for [`AgentThread::handle`].
@@ -129,6 +143,9 @@ pub struct AgentThread {
     queued_prompts: Vec<String>,
     /// Given to the agent with every session it opens.
     mcp_servers: Vec<acp::McpServer>,
+    turn_hook: Option<TurnHook>,
+    /// Set by [`Self::cancel`] for the turn in flight, in case its prompt hasn't gone out yet.
+    turn_cancelled: Option<Arc<AtomicBool>>,
     stderr_lines: VecDeque<String>,
     /// False for a connection made only to log in or out (from settings), which never opens a
     /// session.
@@ -226,6 +243,8 @@ impl AgentThread {
             pending_title: None,
             queued_prompts: Vec::new(),
             mcp_servers: Vec::new(),
+            turn_hook: None,
+            turn_cancelled: None,
             stderr_lines: VecDeque::new(),
             opens_session: true,
             defaults: SessionDefaults::default(),
@@ -242,6 +261,11 @@ impl AgentThread {
     /// session opens once the agent has connected.
     pub fn set_mcp_servers(&mut self, mcp_servers: Vec<acp::McpServer>) {
         self.mcp_servers = mcp_servers;
+    }
+
+    /// Work to do around each turn. Set it right after starting.
+    pub fn set_turn_hook(&mut self, hook: TurnHook) {
+        self.turn_hook = Some(hook);
     }
 
     /// The events since the last call, oldest first.
@@ -382,6 +406,7 @@ impl AgentThread {
                 }
             }
             MessageKind::PromptFinished(result) => {
+                self.turn_cancelled = None;
                 match result {
                     Ok(response) => self.view.state.last_stop_reason = Some(response.stop_reason),
                     Err(error) => {
@@ -744,15 +769,34 @@ impl AgentThread {
             session.session_id.clone(),
             vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
         );
-        let response = session.connection.send_request(request).block_task();
+        let connection = session.connection.clone();
         self.set_working(true);
-        self.spawn(async move { MessageKind::PromptFinished(response.await) });
+        let Some(hook) = self.turn_hook.clone() else {
+            let response = connection.send_request(request).block_task();
+            self.spawn(async move { MessageKind::PromptFinished(response.await) });
+            return;
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.turn_cancelled = Some(cancelled.clone());
+        self.spawn(async move {
+            hook(TurnPoint::Starting).await;
+            let response = if cancelled.load(Ordering::SeqCst) {
+                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+            } else {
+                connection.send_request(request).block_task().await
+            };
+            hook(TurnPoint::Ended).await;
+            MessageKind::PromptFinished(response)
+        });
     }
 
     /// Asks the agent to stop the current turn.
     pub fn cancel(&mut self) {
         if !self.is_working() {
             return;
+        }
+        if let Some(cancelled) = &self.turn_cancelled {
+            cancelled.store(true, Ordering::SeqCst);
         }
         if let Some(session) = &self.session {
             if let Err(error) = session

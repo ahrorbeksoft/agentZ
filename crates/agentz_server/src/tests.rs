@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, ThreadDiff};
 use agentz_protocol::thread::{Entry, ThreadView};
 use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, PROTOCOL_VERSION,
@@ -1246,4 +1247,172 @@ async fn tasks_running_when_the_server_stops_end_as_interrupted() {
         .tool(parent, "task_status", json!({"taskId": child.0}))
         .await;
     assert_eq!(status["status"], json!("interrupted"));
+}
+
+impl TestClient {
+    /// Sends a prompt and waits for the turn, checkpoints included, to end.
+    async fn prompt_and_wait(&mut self, thread_id: ThreadId, text: &str) {
+        let connection = ConnectionId::Thread(thread_id);
+        let before = self.user_messages(thread_id).len();
+        self.ok(Request::Prompt {
+            connection,
+            text: text.into(),
+        })
+        .await;
+        self.wait_until(|client| {
+            client.user_messages(thread_id).len() > before
+                && !client.thread(connection).is_working()
+        })
+        .await;
+    }
+
+    async fn thread_diff(&mut self, thread_id: ThreadId, scope: DiffScope) -> ThreadDiff {
+        match self.ok(Request::ThreadDiff { thread_id, scope }).await {
+            Response::ThreadDiff(diff) => diff,
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+}
+
+async fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .await
+        .expect("git runs");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn diff_files(diff: &ThreadDiff) -> Vec<(&str, FileChange, u32, u32)> {
+    diff.files
+        .iter()
+        .map(|file| {
+            (
+                file.path.as_str(),
+                file.change,
+                file.additions,
+                file.deletions,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turns_are_checkpointed_for_diffs() {
+    if tokio::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let repository = server.project_dir.path();
+    git(repository, &["init", "-q", "-b", "main"]).await;
+    git(repository, &["config", "user.name", "Test"]).await;
+    git(repository, &["config", "user.email", "test@example.com"]).await;
+    std::fs::write(repository.join("README.md"), "one\n").expect("a file");
+    git(repository, &["add", "."]).await;
+    git(repository, &["commit", "-q", "-m", "first"]).await;
+
+    let mut client = server.connect().await;
+    assert!(
+        client
+            .welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == agentz_protocol::CAPABILITY_THREAD_DIFF)
+    );
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(repository).await;
+    let thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread).await;
+    let diff = client.thread_diff(thread, DiffScope::All).await;
+    assert_eq!((diff.status, diff.turns), (DiffStatus::NoTurns, 0));
+
+    client
+        .prompt_and_wait(thread, "write src/a.txt hello")
+        .await;
+    let diff = client.thread_diff(thread, DiffScope::All).await;
+    assert_eq!((diff.status.clone(), diff.turns), (DiffStatus::Ready, 1));
+    assert_eq!(
+        diff_files(&diff),
+        vec![("src/a.txt", FileChange::Added, 1, 0)]
+    );
+
+    client.prompt_and_wait(thread, "write README.md two").await;
+    let latest = client.thread_diff(thread, DiffScope::LatestTurn).await;
+    assert_eq!(latest.turns, 2);
+    assert_eq!(
+        diff_files(&latest),
+        vec![("README.md", FileChange::Modified, 1, 1)]
+    );
+    let all = client.thread_diff(thread, DiffScope::All).await;
+    assert_eq!(
+        diff_files(&all),
+        vec![
+            ("README.md", FileChange::Modified, 1, 1),
+            ("src/a.txt", FileChange::Added, 1, 0),
+        ]
+    );
+    // The user's branch has no new commits.
+    assert_eq!(
+        git(repository, &["rev-list", "--count", "HEAD"])
+            .await
+            .trim(),
+        "1"
+    );
+
+    // Agents read diffs too.
+    let files = client
+        .tool(
+            thread,
+            "agentz_thread_diff",
+            json!({"scope": "latest_turn", "format": "files"}),
+        )
+        .await;
+    assert_eq!(files["status"], json!("ready"));
+    assert_eq!(files["files"][0]["path"], json!("README.md"));
+    assert_eq!(files["files"][0]["change"], json!("modified"));
+    assert!(files.get("patch").is_none());
+    let patch = client
+        .tool(thread, "agentz_thread_diff", json!({"threadId": thread.0}))
+        .await;
+    let text = patch["patch"].as_str().unwrap_or_default();
+    assert!(text.contains("+two") && text.contains("+hello"), "{text}");
+
+    // A folder outside git has no checkpoints.
+    let plain = tempfile::tempdir().expect("temp dir");
+    let plain_project = client.add_project(plain.path()).await;
+    let plain_thread = client.create_thread_in(plain_project).await;
+    client.wait_until_ready(plain_thread).await;
+    client.prompt_and_wait(plain_thread, "write a.txt hi").await;
+    let diff = client.thread_diff(plain_thread, DiffScope::All).await;
+    assert_eq!(diff.status, DiffStatus::NotRepository);
+
+    // Deleting the thread removes its checkpoints.
+    assert!(
+        !git(repository, &["for-each-ref", "refs/agentz/"])
+            .await
+            .is_empty()
+    );
+    client.ok(Request::DeleteThread(thread)).await;
+    tokio::time::timeout(TIMEOUT, async {
+        while !git(repository, &["for-each-ref", "refs/agentz/"])
+            .await
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the checkpoints are removed");
 }
