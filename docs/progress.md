@@ -727,3 +727,5 @@ Then the server:
 - 2026-10-03: Machine icons, as t3code: detected per server, chosen in Settings › Machines,
   shown on cards, in details popovers (now for every thread when there are several machines,
   shells included) and wherever machines are listed. A shell's details follow its folder.
+- 2026-10-03: Fixed an agent CLI that exits while idle staying detected (its terminal thread
+  stayed a "Claude Code" card, a pane kept its agent): leaving is now always reported.

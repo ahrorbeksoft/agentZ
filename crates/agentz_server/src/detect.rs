@@ -571,13 +571,15 @@ impl AgentTracker {
     }
 
     fn agent_gone(&mut self) -> Option<AgentState> {
-        self.agent = None;
+        let had_agent = self.agent.take().is_some();
         self.misses = 0;
         self.grace_until = None;
         self.grace_ending = false;
         self.pending_idle = None;
         self.scanned_content = None;
+        // An agent that was idle already still has to be reported gone, or its name stays.
         self.publish(AgentState::Idle)
+            .or(had_agent.then_some(AgentState::Idle))
     }
 
     /// Whether the screen needs reading on this tick. `content` counts the terminal's screen
@@ -822,6 +824,30 @@ mod tests {
             Some(AgentState::Idle)
         );
         assert_eq!(tracker.agent(), None);
+    }
+
+    #[test]
+    fn an_idle_agent_leaving_is_reported() {
+        let start = Instant::now();
+        let mut tracker = AgentTracker::default();
+        tracker.observe_process(start, observation(Some(Agent::Claude), false));
+        let after_grace = start + AGENT_STARTUP_GRACE_WINDOW;
+        while !tracker.should_scan(after_grace, 1) {}
+        assert_eq!(
+            tracker.observe_screen(after_grace, 1, detection(AgentState::Idle, true)),
+            Some(AgentState::Idle)
+        );
+        assert_eq!(
+            tracker.observe_process(after_grace, observation(None, true)),
+            Some(AgentState::Idle)
+        );
+        assert_eq!(tracker.agent(), None);
+        // Gone once is enough.
+        assert_eq!(
+            tracker.observe_process(after_grace, observation(None, true)),
+            None
+        );
+        assert_eq!(tracker.exited(), None);
     }
 
     #[test]
