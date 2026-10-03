@@ -29,7 +29,7 @@ use ui::{
 };
 
 use crate::OpenSettings;
-use crate::agent_view::{AgentView, AgentViewEvent};
+use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
@@ -1087,8 +1087,8 @@ impl SpacesView {
                     this.search.update(cx, |search, cx| search.set_text("", cx));
                 }
             }))
-            // Level with the tab bar beside it.
-            .h(TabItem::container_height(cx))
+            // Level with the tab bar beside it, and with the Agents view's search.
+            .h(TOOLBAR_HEIGHT)
             .flex_none()
             .pl_3()
             .pr_2()

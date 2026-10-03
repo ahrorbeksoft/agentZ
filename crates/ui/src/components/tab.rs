@@ -80,10 +80,11 @@ impl Tab {
         Self::container_height(cx) - px(1.)
     }
 
-    /// agentZ: 4px taller than Zed's, to match the 36px thread toolbar, so the
-    /// headers of the Agents and Workspaces views are the same height.
-    pub fn container_height(cx: &App) -> Pixels {
-        DynamicSpacing::Base32.px(cx) + px(4.)
+    /// agentZ: fixed at the thread toolbar's height (`TOOLBAR_HEIGHT` in the app)
+    /// instead of Zed's `DynamicSpacing::Base32`, which shrinks to 28px with the
+    /// app's 14px UI font, so the Agents and Workspaces views' headers match.
+    pub fn container_height(_cx: &App) -> Pixels {
+        px(36.)
     }
 }
 
