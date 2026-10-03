@@ -2101,7 +2101,7 @@ impl SettingsPage {
         let mut rows = vec![
             render_row(
                 "SSH target",
-                "What you'd give ssh. Your keys, agent and ~/.ssh/config are used; password                  prompts aren't.",
+                "What you'd give ssh. Your keys, agent and ~/.ssh/config are used; password prompts aren't.",
                 input_box(self.machine_target_input.clone()),
                 cx,
             ),
@@ -2121,8 +2121,10 @@ impl SettingsPage {
                     div().flex_1().min_w_0().child(
                         Label::new(match &self.machine_form_error {
                             Some(error) => error.clone(),
-                            None => "agentZ installs its server in ~/.agentz there, and                                      nothing else."
-                                .into(),
+                            None => {
+                                "agentZ installs its server in ~/.agentz there, and nothing else."
+                                    .into()
+                            }
                         })
                         .size(LabelSize::Small)
                         .color(if self.machine_form_error.is_some() {
@@ -2246,7 +2248,7 @@ impl SettingsPage {
             PromptLevel::Warning,
             &format!("Remove {name}?"),
             Some(
-                "agentZ stops connecting to it. Its server keeps running there, with its agents                  and threads; add it again to see them.",
+                "agentZ stops connecting to it. Its server keeps running there, with its agents and threads; add it again to see them.",
             ),
             &["Remove", "Cancel"],
             cx,
