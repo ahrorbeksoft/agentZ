@@ -316,6 +316,10 @@ pub struct TerminalFolder {
     pub branch: Option<String>,
     #[serde(default)]
     pub is_repository: bool,
+    /// The path as its machine's user would write it, `~` for home, since a client can't
+    /// tell another machine's home.
+    #[serde(default)]
+    pub display_path: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]

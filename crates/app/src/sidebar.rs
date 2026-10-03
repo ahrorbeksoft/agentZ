@@ -908,14 +908,16 @@ impl Sidebar {
                 store.update(cx, |store, cx| store.archive_thread(thread_id.thread, cx));
             });
 
+        // Terminals aren't archived: a shell or an agent CLI is deleted when done with.
+        let is_archivable = !is_renaming && thread.terminal.is_none();
         // The status yields to the Archive button on hover.
         let status_slot = div()
             .flex_none()
-            .when(!is_renaming, |this| {
+            .when(is_archivable, |this| {
                 this.group_hover(group_name.clone(), |this| this.invisible())
             })
             .child(status);
-        let archive_slot = (!is_renaming).then(|| {
+        let archive_slot = is_archivable.then(|| {
             // Centered on its line, like t3code's Settle button.
             h_flex()
                 .absolute()
@@ -2025,12 +2027,17 @@ pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElem
         .bg(color.color(cx))
 }
 
-/// The branch a terminal's folder is on, or that it's outside git.
+/// The branch a terminal's folder is on, or outside git, where the folder is.
 fn folder_branch_label(folder: &projects::TerminalFolder) -> Option<String> {
     if folder.is_repository {
         folder.branch.clone()
     } else {
-        Some("No git".to_string())
+        Some(
+            folder
+                .display_path
+                .clone()
+                .unwrap_or_else(|| folder.path.display().to_string()),
+        )
     }
 }
 

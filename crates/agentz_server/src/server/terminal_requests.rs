@@ -507,6 +507,7 @@ impl Server {
                     server.projects.set_terminal_folder(
                         thread_id,
                         Some(TerminalFolder {
+                            display_path: Some(home_relative(&path)),
                             path,
                             is_repository: git.is_some(),
                             branch: git.and_then(|git| git.branch),
@@ -777,7 +778,17 @@ fn truncate_start(text: String, limit: Option<usize>) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_start;
+    use std::path::Path;
+
+    use super::{home_relative, truncate_start};
+
+    #[test]
+    fn paths_under_home_start_with_a_tilde() {
+        let home = util::paths::home_dir();
+        assert_eq!(home_relative(home.as_path()), "~");
+        assert_eq!(home_relative(&home.join("projects/api")), "~/projects/api");
+        assert_eq!(home_relative(Path::new("/tmp")), "/tmp");
+    }
 
     #[test]
     fn output_is_cut_from_the_start() {
@@ -807,4 +818,14 @@ fn folder_title(folder: &Path) -> String {
         || folder.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// The path with home written as `~`.
+fn home_relative(path: &Path) -> String {
+    let home = util::paths::home_dir();
+    match path.strip_prefix(home.as_path()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
 }

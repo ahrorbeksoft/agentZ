@@ -734,3 +734,5 @@ Then the server:
 - 2026-10-03: Terminal threads are listed under their current folder's project (all projects
   only, outside every project); their menu is Rename, Add Project, Delete; closing a terminal
   ends its whole session, `nohup` included (6e2eb64).
+- 2026-10-03: Outside git, a terminal's second line shows its folder's path (`~` for home,
+  sent by its server). Terminal cards have no Archive button: terminals aren't archived.
