@@ -314,7 +314,8 @@ pub enum Request {
         #[serde(default)]
         branch: Option<String>,
     },
-    /// The user's own title, which automatic titles no longer replace.
+    /// The user's own title, which shows instead of the automatic one. An empty title shows
+    /// the automatic one again.
     RenameThread {
         thread_id: ThreadId,
         title: String,

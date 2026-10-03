@@ -167,6 +167,11 @@ pub struct Thread {
     /// The user renamed the thread, so automatic titles no longer replace it.
     #[serde(default)]
     pub has_custom_title: bool,
+    /// The latest automatic title (from the first prompt, the agent, a shell's folder), kept
+    /// while the user's own shows, so clearing that brings it back. Missing on threads from
+    /// before it was kept.
+    #[serde(default)]
+    pub automatic_title: Option<String>,
     /// The model last selected in the thread, as the agent names it.
     #[serde(default)]
     pub model: Option<String>,
@@ -625,10 +630,12 @@ impl ProjectStore {
         self.project(project_id)?;
         let id = ThreadId(self.allocate_id());
         let now = SystemTime::now();
+        let title = title.into();
         self.threads.push(Thread {
             id,
             project_id,
-            title: title.into(),
+            automatic_title: Some(title.clone()),
+            title,
             agent_id,
             last_activity_at: Some(now),
             created_at: Some(now),
@@ -899,25 +906,53 @@ impl ProjectStore {
         }
     }
 
-    /// Sets an automatic title (from the first prompt or the agent), unless the user renamed
-    /// the thread.
+    /// Sets an automatic title (from the first prompt, the agent, or a shell's folder). It
+    /// shows unless the user renamed the thread, and is kept for when they clear their title.
     pub fn rename_thread(&mut self, id: ThreadId, title: String) {
-        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
-            && !thread.has_custom_title
-            && thread.title != title
-        {
+        let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) else {
+            return;
+        };
+        let mut changed = false;
+        if thread.automatic_title.as_ref() != Some(&title) {
+            thread.automatic_title = Some(title.clone());
+            changed = true;
+        }
+        if !thread.has_custom_title && thread.title != title {
             thread.title = title;
+            changed = true;
+        }
+        if changed {
             self.changed();
         }
     }
 
-    /// Sets a title chosen by the user.
+    /// Sets a title chosen by the user. An empty one goes back to the automatic title.
     pub fn set_custom_title(&mut self, id: ThreadId, title: String) {
-        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
-            thread.title = title;
+        let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) else {
+            return;
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            if !thread.has_custom_title {
+                return;
+            }
+            thread.has_custom_title = false;
+            thread.title = thread
+                .automatic_title
+                .clone()
+                .unwrap_or_else(|| NEW_THREAD_TITLE.to_string());
+        } else {
+            if thread.has_custom_title && thread.title == title {
+                return;
+            }
+            // A thread from before automatic titles were kept: its title was the automatic one.
+            if thread.automatic_title.is_none() && !thread.has_custom_title {
+                thread.automatic_title = Some(thread.title.clone());
+            }
+            thread.title = title.to_string();
             thread.has_custom_title = true;
-            self.changed();
         }
+        self.changed();
     }
 
     pub fn is_thread_working(&self, id: ThreadId) -> bool {
@@ -1290,6 +1325,19 @@ mod tests {
         store.set_custom_title(thread, "Mine".into());
         store.rename_thread(thread, "Automatic".into());
         assert_eq!(store.thread(thread).map(|t| t.title.as_str()), Some("Mine"));
+        // Automatic titles keep coming in underneath, and clearing the user's shows the latest.
+        store.rename_thread(thread, "Later".into());
+        store.set_custom_title(thread, " ".into());
+        let renamed = store.thread(thread).expect("thread");
+        assert_eq!(
+            (renamed.title.as_str(), renamed.has_custom_title),
+            ("Later", false)
+        );
+        store.rename_thread(thread, "Latest".into());
+        assert_eq!(
+            store.thread(thread).map(|t| t.title.as_str()),
+            Some("Latest")
+        );
         store.delete_thread(thread);
         assert!(store.thread(thread).is_none());
 

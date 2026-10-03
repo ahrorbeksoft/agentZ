@@ -109,7 +109,9 @@ Each entry: what it does, where it lives, and where it comes from.
 - **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons, the thread's own
   branch with a worktree or pasture marker, attention state, details popover (a custom anchored
   element, since GPUI tooltips follow the cursor), rename, delete, archive with an Archived
-  shelf, title search, context menu.
+  shelf, title search, context menu. Automatic titles (the first prompt, the agent, a shell's
+  folder, a terminal's agent CLI) keep updating under the user's own (`Thread::automatic_title`),
+  which shows while set; clearing it shows the automatic one again, as with workspaces.
 - **Shells shelf** (`sidebar.rs`): terminal threads, named after their current folder, under the
   project that folder is in; one becomes a thread card while an agent CLI runs in it.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Restart Server, start at login,

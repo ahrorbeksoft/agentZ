@@ -203,7 +203,7 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Renames as you type; an empty title is ignored.
+    /// Renames as you type; an empty title goes back to the automatic one.
     fn apply_rename(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.renaming_thread else {
             return;
@@ -216,7 +216,7 @@ impl Sidebar {
             .read(cx)
             .thread(key.thread)
             .is_none_or(|thread| thread.title == title);
-        if title.is_empty() || is_unchanged {
+        if is_unchanged {
             return;
         }
         store.update(cx, |store, cx| {
