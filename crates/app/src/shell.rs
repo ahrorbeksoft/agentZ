@@ -1081,6 +1081,7 @@ impl Render for Shell {
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
+        let is_dialog = self.machine_modal.is_some();
         // Beside the thread, or filling its area when full screen.
         let diff_panel = self.diff_panel.clone();
         let is_diff_full_screen = self.diff_full_screen && diff_panel.is_some();
@@ -1211,7 +1212,15 @@ impl Render for Shell {
                             .inset_0()
                             .flex()
                             .justify_center()
-                            .pt(px(96.))
+                            // Pickers sit near the top as Zed's; a dialog is centered, as
+                            // t3code's.
+                            .map(|backdrop| {
+                                if is_dialog {
+                                    backdrop.items_center()
+                                } else {
+                                    backdrop.pt(px(96.))
+                                }
+                            })
                             .bg(gpui::black().opacity(0.25))
                             // As Zed's modal layer: nothing under the backdrop gets the mouse
                             // (the title bar would start a window drag and swallow the click),

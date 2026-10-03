@@ -854,6 +854,10 @@ impl SettingsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !client.read(cx).can_update_server() {
+            self.restart_to_update(client, window, cx);
+            return;
+        }
         let update = client.read(cx).update_server(false, cx);
         cx.spawn_in(window, async move |_, cx| {
             let result = match update.await {
@@ -905,18 +909,29 @@ impl SettingsPage {
         .detach();
     }
 
-    fn confirm_restart_remote_server(
+    /// A server too old to hand its terminals over updates by restarting, which stops what
+    /// runs there; it asks first only when something does.
+    fn restart_to_update(
         &mut self,
         client: Entity<ServerClient>,
-        name: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let running = client.read(cx).running(cx);
+        if running.is_empty() {
+            client.read(cx).restart_server(cx);
+            return;
+        }
+        let detail = format!(
+            "Updating restarts agentz-server on {}, which stops {}.",
+            client.read(cx).label(),
+            running.join(", ")
+        );
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Restart agentz-server on {name}?"),
-            Some("Agents and terminals running there will stop."),
-            &["Restart", "Cancel"],
+            "Stop what's running and update?",
+            Some(&detail),
+            &["Update", "Cancel"],
             cx,
         );
         cx.spawn(async move |_, cx| {
@@ -1922,16 +1937,13 @@ impl SettingsPage {
                 .iter()
                 .map(|profile| self.render_machine_row(Some(profile), cx)),
         );
-        // t3code's header: Update All for the servers that can update in place, and Add.
+        // t3code's header: Update All for the outdated servers, and Add.
         let updatable: Vec<Entity<ServerClient>> = self
             .machines
             .read(cx)
             .clients()
             .into_iter()
-            .filter(|client| {
-                let client = client.read(cx);
-                client.is_outdated() && client.can_update_server()
-            })
+            .filter(|client| client.read(cx).is_outdated())
             .cloned()
             .collect();
         let actions = h_flex()
@@ -2023,10 +2035,9 @@ impl SettingsPage {
         let is_online = client
             .as_ref()
             .is_some_and(|client| client.read(cx).is_online());
-        let (is_outdated, can_update) = client.as_ref().map_or((false, false), |client| {
-            let client = client.read(cx);
-            (client.is_outdated(), client.can_update_server())
-        });
+        let is_outdated = client
+            .as_ref()
+            .is_some_and(|client| client.read(cx).is_outdated());
         let status_tooltip: SharedString = if is_outdated {
             format!("{status}\nA newer agentz-server is installed there.").into()
         } else {
@@ -2036,34 +2047,18 @@ impl SettingsPage {
         let element_id = |action: &str| SharedString::from(format!("machine-{action}-{id_suffix}"));
         let current_icon = self.machines.read(cx).machine_icon(machine, cx);
 
-        // An older server updates without ending its terminals, or, when it can't, restarts.
+        // Updating hands the terminals to the new server, or restarts an older one; either
+        // asks first only when something running would stop.
         let update_button = client
             .clone()
             .filter(|_| is_online && is_outdated)
             .map(|client| {
-                let name = label.clone();
-                let tooltip = if can_update {
-                    "Update Server"
-                } else {
-                    "Restart Server to Update…"
-                };
                 IconButton::new(element_id("update"), IconName::CircleArrowUp)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text(tooltip))
+                    .tooltip(Tooltip::text("Update Server"))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if can_update {
-                            this.update_server(client.clone(), window, cx)
-                        } else if machine == MachineId::Local {
-                            this.confirm_restart_server(window, cx)
-                        } else {
-                            this.confirm_restart_remote_server(
-                                client.clone(),
-                                name.clone(),
-                                window,
-                                cx,
-                            )
-                        }
+                        this.update_server(client.clone(), window, cx)
                     }))
             });
         // Another machine's switch connects to it or not; Remove… is in the menu.

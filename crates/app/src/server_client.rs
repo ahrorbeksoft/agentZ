@@ -194,6 +194,29 @@ impl ServerClient {
         self.is_outdated && self.is_online()
     }
 
+    /// What restarting the machine's server would stop: turns in progress, programs running in
+    /// front of a terminal's shell, and agent CLIs in workspace panes. Idle shells come back.
+    pub fn running(&self, cx: &App) -> Vec<String> {
+        let store = self.projects.read(cx);
+        let mut running = Vec::new();
+        for thread in store.threads() {
+            if store.is_thread_working(thread.id) {
+                running.push(format!("the turn in {}", thread.title));
+            }
+            running.extend(store.terminal_command(thread.id).map(str::to_string));
+            running.extend(
+                store
+                    .drawer_commands(thread.id)
+                    .map(|(_, command)| command.to_string()),
+            );
+        }
+        running.extend(
+            panes(&self.spaces)
+                .filter_map(|pane| pane.agent.as_ref().map(|agent| agent.name.clone())),
+        );
+        running
+    }
+
     /// Stops the machine's server. The connection drops, and reconnecting starts the server
     /// installed now.
     pub fn restart_server(&self, cx: &App) {
