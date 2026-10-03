@@ -14,6 +14,7 @@
 
 pub mod agents;
 pub mod diff;
+pub mod layout;
 pub mod terminal;
 pub mod terminal_keys;
 pub mod thread;

@@ -349,8 +349,11 @@ Then the server:
   - [ ] Cmd-Shift-N new workspace.
 
   None may clash with keys terminal panes need.
-- [ ] Tests: the pane tree (split, close, resize, swap), save and restore, and a headless UI
-      test of the layout.
+- [ ] Tests:
+  - [x] the pane tree (split, close, resize, swap): herdr's `TileLayout` ported to
+        `agentz_protocol::layout` with its tests;
+  - [ ] save and restore;
+  - [ ] a headless UI test of the layout.
 
 ## Findings
 
