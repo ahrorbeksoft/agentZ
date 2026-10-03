@@ -6,7 +6,8 @@ use agentz_protocol::terminal::{
     TerminalSelectionUpdate,
 };
 use agentz_protocol::{Request, Response};
-use gpui::{App, AppContext as _, ClipboardItem, Context, Entity, SharedString, Task};
+use collections::HashMap;
+use gpui::{App, AppContext as _, ClipboardItem, Context, Entity, EntityId, SharedString, Task};
 
 use crate::server_client::ServerClient;
 use crate::terminal_element::terminal_palette;
@@ -32,6 +33,11 @@ pub struct Terminal {
     error: Option<SharedString>,
     /// The size last sent, so a view that lays out the same grid again sends nothing.
     size: Option<TerminalSize>,
+    /// Each view's grid when it last drew.
+    view_sizes: HashMap<EntityId, TerminalSize>,
+    /// The view the user last interacted with. A terminal shown in several places takes its
+    /// size, as herdr sizes a terminal several clients show.
+    sizing_view: Option<EntityId>,
     /// Kept to unsubscribe on drop, when there's no context to look it up.
     server: Option<agentz_client::Connection>,
     _subscribe: Task<()>,
@@ -61,6 +67,8 @@ impl Terminal {
                 queued_frames: None,
                 error: None,
                 size: None,
+                view_sizes: HashMap::default(),
+                sizing_view: None,
                 server: None,
                 _subscribe: Task::ready(()),
             };
@@ -169,7 +177,40 @@ impl Terminal {
         }
     }
 
-    pub fn resize(&mut self, size: TerminalSize, cx: &mut Context<Self>) {
+    /// A view drew the terminal at this size. Only the view sizing it resizes it.
+    pub fn resize(&mut self, view: EntityId, size: TerminalSize, cx: &mut Context<Self>) {
+        self.view_sizes.insert(view, size);
+        if self.sizing_view.is_none() {
+            self.sizing_view = Some(view);
+        }
+        if self.sizing_view == Some(view) {
+            self.send_size(size, cx);
+        }
+    }
+
+    /// The user interacted with the view, so the terminal takes its size.
+    pub fn set_sizing_view(&mut self, view: EntityId, cx: &mut Context<Self>) {
+        self.sizing_view = Some(view);
+        // Another client may have resized it since.
+        self.size = None;
+        if let Some(size) = self.view_sizes.get(&view).copied() {
+            self.send_size(size, cx);
+        }
+    }
+
+    pub fn is_sized_by(&self, view: EntityId) -> bool {
+        self.sizing_view == Some(view)
+    }
+
+    /// The view is gone. The next view to draw sizes the terminal, if it was this one.
+    pub fn remove_view(&mut self, view: EntityId) {
+        self.view_sizes.remove(&view);
+        if self.sizing_view == Some(view) {
+            self.sizing_view = None;
+        }
+    }
+
+    fn send_size(&mut self, size: TerminalSize, cx: &mut Context<Self>) {
         if self.size == Some(size) || self.frame.is_none() {
             return;
         }

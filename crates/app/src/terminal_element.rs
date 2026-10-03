@@ -1244,8 +1244,9 @@ impl Element for TerminalElement {
                     cell_width: f32::from(cell_width).round() as u16,
                     cell_height: f32::from(line_height).round() as u16,
                 };
+                let view = self.view.entity_id();
                 self.terminal
-                    .update(cx, |terminal, cx| terminal.resize(terminal_size, cx));
+                    .update(cx, |terminal, cx| terminal.resize(view, terminal_size, cx));
                 self.view.update(cx, |view, _| {
                     view.set_grid_layout(GridLayout {
                         bounds: dimensions,

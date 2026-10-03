@@ -133,7 +133,16 @@ impl Focusable for TerminalView {
 impl TerminalView {
     pub fn new(terminal: Entity<Terminal>, mode: TerminalMode, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let subscriptions = vec![cx.observe(&terminal, |_, _, cx| cx.notify())];
+        let view = cx.entity_id();
+        let weak_terminal = terminal.downgrade();
+        let subscriptions = vec![
+            cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.on_release(move |_, cx| {
+                weak_terminal
+                    .update(cx, |terminal, _| terminal.remove_view(view))
+                    .ok();
+            }),
+        ];
         Self {
             terminal,
             focus_handle,
@@ -547,6 +556,13 @@ impl Render for TerminalView {
         let focused = self.focus_handle.is_focused(window);
         if focused != self.was_focused {
             self.focus_changed(focused, window, cx);
+        }
+        // The focused view is the one the user is using, also when it comes back on screen
+        // still focused after another view of the terminal was used.
+        let view = cx.entity_id();
+        if focused && !self.terminal.read(cx).is_sized_by(view) {
+            self.terminal
+                .update(cx, |terminal, cx| terminal.set_sizing_view(view, cx));
         }
         let terminal = self.terminal.read(cx);
         let status = match (terminal.frame(), terminal.error()) {
