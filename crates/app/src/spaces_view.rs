@@ -11,7 +11,7 @@ use agentz_protocol::layout::{
     Direction, NavDirection, Node, PaneId, Rect, TileLayout, find_in_direction,
 };
 use agentz_protocol::spaces::{
-    Pane, PaneAgentState, PaneContent, PaneTerminal, Space, SpaceId, SpaceRequest, Tab, TabId,
+    Pane, PaneContent, PaneTerminal, Space, SpaceId, SpaceRequest, Tab, TabId,
 };
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
@@ -130,6 +130,8 @@ impl PaneKey {
 pub enum SpacesViewEvent {
     /// Show the thread in Agents.
     OpenThread(ThreadKey),
+    /// Show the pane's agent CLI full screen in Agents.
+    OpenPane(PaneKey),
     /// New Thread, to be shown in the pane once it's made.
     NewThreadInPane {
         pane: PaneKey,
@@ -219,20 +221,12 @@ struct DraggedPane {
 
 /// A row of the sidebar's agents list.
 struct AgentEntry {
-    machine: MachineId,
-    target: AgentTarget,
+    pane: PaneKey,
     icon: Icon,
     title: SharedString,
     status: Option<ThreadStatus>,
-    /// The workspace and tab of its pane.
-    location: Option<(SharedString, SharedString)>,
-}
-
-#[derive(Clone, Copy)]
-enum AgentTarget {
-    Pane(PaneKey),
-    /// A thread in no pane, which opens in Agents.
-    Thread(ThreadKey),
+    space: SharedString,
+    tab: SharedString,
 }
 
 pub struct SpacesView {
@@ -248,10 +242,6 @@ pub struct SpacesView {
     layouts: HashMap<TabKey, TileLayout>,
     zoomed: HashSet<TabKey>,
     panes: HashMap<PaneKey, OpenPane>,
-    /// Each terminal pane's agent state when last seen, to notice one finishing.
-    agent_states: HashMap<PaneKey, PaneAgentState>,
-    /// Agents that finished while their pane wasn't on screen (herdr's unseen idle).
-    unseen: HashSet<PaneKey>,
     /// A pane the server is making, focused once it arrives.
     pending_focus: Option<PaneKey>,
     split_override: Option<SplitOverride>,
@@ -296,8 +286,6 @@ impl SpacesView {
             layouts: HashMap::default(),
             zoomed: HashSet::default(),
             panes: HashMap::default(),
-            agent_states: HashMap::default(),
-            unseen: HashSet::default(),
             pending_focus: None,
             split_override: None,
             renaming: None,
@@ -414,22 +402,6 @@ impl SpacesView {
                 .is_some_and(|pane| pane.content == open.content)
         });
 
-        let mut agent_states = HashMap::default();
-        for (key, pane) in &live_panes {
-            let Some(agent) = &pane.agent else {
-                continue;
-            };
-            let was_working = self.agent_states.get(key) == Some(&PaneAgentState::Working);
-            if agent.state != PaneAgentState::Idle {
-                self.unseen.remove(key);
-            } else if was_working && !self.is_pane_seen(*key, window, cx) {
-                self.unseen.insert(*key);
-            }
-            agent_states.insert(*key, agent.state);
-        }
-        self.agent_states = agent_states;
-        self.unseen.retain(|key| live_panes.contains_key(key));
-
         if !self
             .active_space
             .is_some_and(|key| live_spaces.contains(&key))
@@ -476,20 +448,6 @@ impl SpacesView {
         cx.notify();
     }
 
-    /// Whether the pane is on screen, in front of the user.
-    fn is_pane_seen(&self, key: PaneKey, window: &Window, cx: &App) -> bool {
-        self.is_visible
-            && window.is_window_active()
-            && self.visible_tab(cx).is_some_and(|(_, space, tab)| {
-                tab.machine == key.machine
-                    && space
-                        .tabs
-                        .iter()
-                        .find(|candidate| candidate.id == tab.tab)
-                        .is_some_and(|tab| tab.pane(key.pane).is_some())
-            })
-    }
-
     /// Agents on screen have been seen, as have threads.
     fn mark_visible_seen(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.is_visible || !window.is_window_active() {
@@ -501,13 +459,13 @@ impl SpacesView {
         let Some(tab) = space.tabs.iter().find(|tab| tab.id == tab_key.tab) else {
             return;
         };
-        let store = self.machines.read(cx).projects(tab_key.machine, cx);
+        let Some(client) = self.machines.read(cx).client(tab_key.machine, cx) else {
+            return;
+        };
+        let store = client.read(cx).projects().clone();
         for pane in &tab.panes {
-            self.unseen.remove(&PaneKey {
-                machine: tab_key.machine,
-                pane: pane.id,
-            });
-            if let (PaneContent::Thread(thread_id), Some(store)) = (&pane.content, &store) {
+            client.update(cx, |client, cx| client.mark_pane_seen(pane.id, cx));
+            if let PaneContent::Thread(thread_id) = &pane.content {
                 store.update(cx, |store, cx| store.mark_viewed(*thread_id, cx));
             }
         }
@@ -1311,9 +1269,10 @@ impl SpacesView {
             .into_any_element()
     }
 
-    /// Every agent on every machine: those in panes first, in workspace and tab order as herdr
-    /// lists them, then threads in no pane, in the Agents sidebar's order.
+    /// The agents in panes on every machine, in workspace and tab order as herdr lists them:
+    /// agent CLIs found in terminal panes, and agent threads. A terminal thread is no agent.
     fn agent_entries(&self, cx: &App) -> Vec<AgentEntry> {
+        let machines = self.machines.read(cx);
         let mut entries = Vec::new();
         let mut threads_in_panes = HashSet::default();
         for (machine, space) in self.all_spaces(cx) {
@@ -1322,10 +1281,17 @@ impl SpacesView {
                 for pane in &tab.panes {
                     let is_agent = match &pane.content {
                         // A thread in several panes is listed at the first.
-                        PaneContent::Thread(thread) => threads_in_panes.insert(ThreadKey {
-                            machine,
-                            thread: *thread,
-                        }),
+                        PaneContent::Thread(thread) => {
+                            let is_agent = machines
+                                .projects(machine, cx)
+                                .and_then(|store| store.read(cx).thread(*thread).cloned())
+                                .is_some_and(|thread| thread.terminal.is_none());
+                            is_agent
+                                && threads_in_panes.insert(ThreadKey {
+                                    machine,
+                                    thread: *thread,
+                                })
+                        }
                         PaneContent::Terminal(_) => pane.agent.is_some(),
                         PaneContent::Unknown(_) => false,
                     };
@@ -1338,35 +1304,15 @@ impl SpacesView {
                     };
                     let (icon, title, _) = self.pane_title(key, pane, cx);
                     entries.push(AgentEntry {
-                        machine,
-                        target: AgentTarget::Pane(key),
+                        pane: key,
                         icon,
                         title,
                         status: self.pane_status(machine, pane, cx),
-                        location: Some((space_label.clone(), tab_label(tab, index).into())),
+                        space: space_label.clone(),
+                        tab: tab_label(tab, index).into(),
                     });
                 }
             }
-        }
-        let machines = self.machines.read(cx);
-        for (machine, thread) in machines.unarchived_threads(cx) {
-            let key = ThreadKey {
-                machine,
-                thread: thread.id,
-            };
-            if threads_in_panes.contains(&key) {
-                continue;
-            }
-            entries.push(AgentEntry {
-                machine,
-                target: AgentTarget::Thread(key),
-                icon: thread_agent_icon(machines, machine, &thread, cx),
-                title: thread.title.clone().into(),
-                status: machines
-                    .projects(machine, cx)
-                    .and_then(|store| store.read(cx).thread_status(thread.id)),
-                location: None,
-            });
         }
         entries
     }
@@ -1443,17 +1389,13 @@ impl SpacesView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let is_active =
-            matches!(entry.target, AgentTarget::Pane(pane) if Some(pane) == focused_pane);
-        let is_offline = !self.machines.read(cx).is_online(entry.machine, cx);
-        let machine_label = has_remotes.then(|| self.machines.read(cx).label(entry.machine, cx));
-        let location = match (machine_label, entry.location) {
-            (Some(machine), Some((space, tab))) => Some(format!("{machine} · {space} › {tab}")),
-            (None, Some((space, tab))) => Some(format!("{space} › {tab}")),
-            (Some(machine), None) => Some(machine.to_string()),
-            (None, None) => None,
+        let pane = entry.pane;
+        let is_active = Some(pane) == focused_pane;
+        let is_offline = !self.machines.read(cx).is_online(pane.machine, cx);
+        let location = match has_remotes.then(|| self.machines.read(cx).label(pane.machine, cx)) {
+            Some(machine) => format!("{machine} · {} › {}", entry.space, entry.tab),
+            None => format!("{} › {}", entry.space, entry.tab),
         };
-        let target = entry.target;
 
         h_flex()
             .id(ElementId::Name(format!("workspace-agent-{index}").into()))
@@ -1483,18 +1425,15 @@ impl SpacesView {
                         .truncate(),
                 ),
             )
-            .children(location.map(|location| {
+            .child(
                 div().min_w_0().max_w(px(120.)).child(
                     Label::new(location)
                         .size(LabelSize::XSmall)
                         .color(Color::Muted)
                         .truncate(),
-                )
-            }))
-            .on_click(cx.listener(move |this, _, window, cx| match target {
-                AgentTarget::Pane(pane) => this.focus_pane(pane, window, cx),
-                AgentTarget::Thread(thread) => cx.emit(SpacesViewEvent::OpenThread(thread)),
-            }))
+                ),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.focus_pane(pane, window, cx)))
             .into_any_element()
     }
 
@@ -1507,20 +1446,12 @@ impl SpacesView {
                 .projects(machine, cx)?
                 .read(cx)
                 .thread_status(*thread_id),
-            PaneContent::Terminal(_) | PaneContent::Unknown(_) => {
-                match pane.agent.as_ref()?.state {
-                    PaneAgentState::Blocked => Some(ThreadStatus::PendingApproval),
-                    PaneAgentState::Working => Some(ThreadStatus::Working),
-                    PaneAgentState::Idle => self
-                        .unseen
-                        .contains(&PaneKey {
-                            machine,
-                            pane: pane.id,
-                        })
-                        .then_some(ThreadStatus::Completed),
-                    PaneAgentState::Unknown => None,
-                }
-            }
+            PaneContent::Terminal(_) | PaneContent::Unknown(_) => self
+                .machines
+                .read(cx)
+                .client(machine, cx)?
+                .read(cx)
+                .pane_agent_status(pane),
         }
     }
 
@@ -2125,6 +2056,8 @@ impl SpacesView {
             PaneContent::Thread(thread) => Some(*thread),
             PaneContent::Terminal(_) | PaneContent::Unknown(_) => None,
         };
+        // Agents lists the agent CLIs found in panes.
+        let has_agent = matches!(pane.content, PaneContent::Terminal(_)) && pane.agent.is_some();
         move |window, cx| {
             let this = this.clone();
             let machines = Machines::global(cx);
@@ -2219,6 +2152,13 @@ impl SpacesView {
                             }))
                         })
                         .ok();
+                    })
+                })
+                .when(has_agent, |menu| {
+                    let this = this.clone();
+                    menu.entry("Open in Agents", None, move |_, cx| {
+                        this.update(cx, |_, cx| cx.emit(SpacesViewEvent::OpenPane(key)))
+                            .ok();
                     })
                 })
                 .separator()
@@ -2403,7 +2343,7 @@ fn first_pane(node: &Node) -> PaneId {
 
 #[cfg(test)]
 mod tests {
-    use agentz_protocol::spaces::{PaneAgent, SpacesSnapshot};
+    use agentz_protocol::spaces::{PaneAgent, PaneAgentState, SpacesSnapshot};
     use gpui::TestAppContext;
 
     use super::*;

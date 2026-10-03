@@ -1,8 +1,8 @@
-//! A terminal thread (herdr's panes): a toolbar like an agent thread's over its terminal.
+//! A terminal thread, or the agent CLI in a Workspaces pane shown full screen in Agents: a
+//! toolbar like an agent thread's over its terminal.
 
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window};
-use projects::ThreadId;
 use ui::{Tooltip, prelude::*};
 
 use crate::ToggleDiff;
@@ -14,6 +14,8 @@ use crate::terminal_view::TerminalView;
 pub struct TerminalThreadView {
     title: SharedString,
     command: TerminalCommand,
+    /// A thread's terminal can restart and has changes; a pane's ends with its pane.
+    is_thread: bool,
     is_diff_open: bool,
     terminal: Entity<Terminal>,
     view: Entity<TerminalView>,
@@ -23,17 +25,19 @@ pub struct TerminalThreadView {
 impl TerminalThreadView {
     pub fn new(
         client: &Entity<ServerClient>,
-        thread_id: ThreadId,
+        key: TerminalKey,
         title: SharedString,
         command: TerminalCommand,
         cx: &mut Context<Self>,
     ) -> Self {
-        let terminal = Terminal::shared(client, TerminalKey::Thread(thread_id), cx);
+        let is_thread = matches!(key, TerminalKey::Thread(_));
+        let terminal = Terminal::shared(client, key, cx);
         let view = cx.new(|cx| TerminalView::new(terminal.clone(), TerminalMode::Scrollable, cx));
         let subscriptions = vec![cx.observe(&terminal, |_, _, cx| cx.notify())];
         Self {
             title,
             command,
+            is_thread,
             is_diff_open: false,
             terminal,
             view,
@@ -74,6 +78,7 @@ impl TerminalThreadView {
             (None, None) => "Exited".to_string(),
         });
         let has_exited = status.is_some();
+        let is_thread = self.is_thread;
         h_flex()
             .h(px(36.))
             .flex_none()
@@ -103,26 +108,31 @@ impl TerminalThreadView {
                     .size(LabelSize::Small)
                     .color(Color::Muted)
             }))
-            .child(
-                Button::new("restart-terminal", "Restart")
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
-                    .when(!has_exited, |button| button.style(ButtonStyle::Subtle))
-                    .when(has_exited, |button| button.style(ButtonStyle::Outlined))
-                    .tooltip(Tooltip::text("Run the command again"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.terminal
-                            .update(cx, |terminal, cx| terminal.restart(cx));
-                        window.focus(&this.view.focus_handle(cx), cx);
-                    })),
-            )
-            .child(
-                IconButton::new("toggle-diff", IconName::Diff)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.is_diff_open)
-                    .tooltip(|_, cx| Tooltip::for_action("Show Changes", &ToggleDiff, cx))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx)),
-            )
+            .when(is_thread, |toolbar| {
+                toolbar
+                    .child(
+                        Button::new("restart-terminal", "Restart")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
+                            .when(!has_exited, |button| button.style(ButtonStyle::Subtle))
+                            .when(has_exited, |button| button.style(ButtonStyle::Outlined))
+                            .tooltip(Tooltip::text("Run the command again"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.terminal
+                                    .update(cx, |terminal, cx| terminal.restart(cx));
+                                window.focus(&this.view.focus_handle(cx), cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new("toggle-diff", IconName::Diff)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(self.is_diff_open)
+                            .tooltip(|_, cx| Tooltip::for_action("Show Changes", &ToggleDiff, cx))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleDiff), cx)
+                            }),
+                    )
+            })
     }
 }
 

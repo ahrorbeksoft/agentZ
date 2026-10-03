@@ -337,11 +337,11 @@ Then the server:
   - [x] rows with rolled-up state (herdr's order: blocked, unseen finished, working), name,
         branch and ahead/behind. Double-click renames, drag reorders, right-click menu.
 - [x] Agents list at the bottom of the sidebar:
-  - [x] every agent on every machine: agents in panes first, in workspace and tab order
-        (herdr), then every unarchived top-level thread in no pane, in the Agents order;
+  - [x] the agents in panes on every machine, in workspace and tab order (herdr): agent
+        CLIs in terminal panes and ACP threads (narrowed by the user from every thread);
   - [x] slim rows like the Archived shelf;
   - [x] state, machine, workspace, tab, agent;
-  - [x] clicking a row focuses its pane, or opens it in Agents when it isn't in one.
+  - [x] clicking a row focuses its pane.
 - [x] Tabs: new, rename, close, reorder, next/previous.
 - [x] Panes:
   - [x] split right/down (Zed's split menu in the pane header, and its right-click menu);
@@ -697,3 +697,12 @@ Then the server:
 - 2026-10-03: Added the unscheduled ideas (multi-line composer, @-mentions, pasting images, …)
   to the plan under "Later". The git-branch line per thread was dropped from that list: phase 6
   built it.
+- 2026-10-03: The user narrowed the agents in each view:
+  - Workspaces' agents list shows only agents in panes (terminal agent CLIs and ACP threads),
+    not every thread;
+  - Agents shows the agent CLIs running in workspace panes as cards, which open the pane's
+    terminal full screen (Show in Workspaces goes back; a pane's menu has Open in Agents);
+  - agent CLIs are detected only in workspace panes, not in terminal threads or drawers;
+  - New Thread offers a plain terminal but no agent CLIs from `PATH`.
+  Whether a pane agent's finish has been seen now lives in the app's `ServerClient`, shared by
+  both views. Checked on screen against a scratch server with a fake `codex` in a pane.

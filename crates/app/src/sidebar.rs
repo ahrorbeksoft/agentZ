@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 use crate::machines::{MachineId, Machines, ProjectKey, Scope, ThreadKey};
 use crate::project_store::{ProjectStore, ThreadStatus};
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::spaces::PaneContent;
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, Focusable as _,
     FontWeight, Hsla, KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored,
@@ -20,6 +21,7 @@ use crate::project_info::{
     GitHead, ProjectInfo, ProjectInfoStore, render_project_icon, workspace_icon,
 };
 use crate::project_switcher::compact_path;
+use crate::spaces_view::PaneKey;
 use crate::{NewThread, OpenFolder, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
@@ -48,6 +50,10 @@ pub fn init(cx: &mut App) {
 
 pub enum SidebarEvent {
     OpenThread(ThreadKey),
+    /// Show a Workspaces pane's agent CLI full screen.
+    OpenPane(PaneKey),
+    /// Show the pane where it is, in Workspaces.
+    ShowPaneInWorkspaces(PaneKey),
     OpenProjectSettings(ProjectKey),
     /// New Thread, working in this folder: a project's own, or one of its workspaces.
     NewThreadIn(ProjectKey, PathBuf),
@@ -86,6 +92,8 @@ pub struct Sidebar {
     machines: Entity<Machines>,
     project_info: Entity<ProjectInfoStore>,
     active_thread: Option<ThreadKey>,
+    /// A Workspaces pane's agent shown full screen, in place of a thread.
+    active_pane: Option<PaneKey>,
     search: Entity<TextInput>,
     /// The highlighted search result, which Enter opens.
     search_index: usize,
@@ -138,6 +146,7 @@ impl Sidebar {
             machines,
             project_info,
             active_thread: None,
+            active_pane: None,
             search,
             search_index: 0,
             search_scroll: ScrollHandle::new(),
@@ -155,7 +164,201 @@ impl Sidebar {
 
     pub fn set_active_thread(&mut self, thread: Option<ThreadKey>, cx: &mut Context<Self>) {
         self.active_thread = thread;
+        self.active_pane = None;
         cx.notify();
+    }
+
+    pub fn set_active_pane(&mut self, pane: Option<PaneKey>, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        self.active_thread = None;
+        cx.notify();
+    }
+
+    /// Agent CLIs running in Workspaces panes of the visible projects, in workspace and tab
+    /// order. A workspace outside every project shows with all projects.
+    fn pane_agents(&self, cx: &App) -> Vec<PaneAgentCard> {
+        let machines = self.machines.read(cx);
+        let groups = machines.visible_groups(cx);
+        let shows_all = machines.scope(cx) == Scope::All;
+        let mut cards = Vec::new();
+        for client in machines.clients() {
+            let client = client.read(cx);
+            let machine = client.machine();
+            for space in &client.spaces().spaces {
+                let is_visible = match space.project_id {
+                    Some(project_id) => groups
+                        .iter()
+                        .any(|group| group.contains(machine, project_id)),
+                    None => shows_all,
+                };
+                if !is_visible {
+                    continue;
+                }
+                let project = space
+                    .project_id
+                    .and_then(|project_id| client.projects().read(cx).project(project_id).cloned());
+                for (index, tab) in space.tabs.iter().enumerate() {
+                    for pane in &tab.panes {
+                        let (PaneContent::Terminal(_), Some(agent)) = (&pane.content, &pane.agent)
+                        else {
+                            continue;
+                        };
+                        cards.push(PaneAgentCard {
+                            pane: PaneKey {
+                                machine,
+                                pane: pane.id,
+                            },
+                            name: agent.name.clone().into(),
+                            status: client.pane_agent_status(pane),
+                            project: project.clone(),
+                            location: format!(
+                                "{} › {}",
+                                space.label(),
+                                tab.name.clone().unwrap_or_else(|| (index + 1).to_string())
+                            )
+                            .into(),
+                            branch: space
+                                .git
+                                .as_ref()
+                                .and_then(|git| git.branch.clone())
+                                .map(Into::into),
+                        });
+                    }
+                }
+            }
+        }
+        cards
+    }
+
+    /// A thread card's shape for an agent CLI in a Workspaces pane: its project and state, the
+    /// agent's name, then where its pane is.
+    fn render_pane_agent_card(&self, card: PaneAgentCard, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let pane = card.pane;
+        let is_active = self.active_pane == Some(pane);
+        let machines = self.machines.read(cx);
+        let shows_all_projects = machines.scope(cx) == Scope::All;
+        let is_offline = !machines.is_online(pane.machine, cx);
+        let machine_label =
+            (pane.machine != MachineId::Local).then(|| machines.label(pane.machine, cx));
+        let faint_text = colors.text_muted.opacity(0.4);
+        let id = format!("pane-agent-{}-{}", pane.machine.slug(), pane.pane.0);
+        let status = match card.status {
+            Some(ThreadStatus::Working) => Some(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::LoadCircle)
+                            .size(IconSize::Small)
+                            .color(Color::Accent)
+                            .with_rotate_animation(2),
+                    )
+                    .child(
+                        Label::new("Working")
+                            .size(LabelSize::Small)
+                            .weight(FontWeight::MEDIUM)
+                            .color(Color::Accent),
+                    )
+                    .into_any_element(),
+            ),
+            Some(status) => Some(render_status_pill(status, cx).into_any_element()),
+            None => None,
+        };
+        let status_slot = status.map(|status| div().flex_none().child(status));
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .child(Label::new(card.name).weight(FontWeight::MEDIUM).truncate());
+        let (project_line, title_line) = if shows_all_projects {
+            let project_line = h_flex()
+                .h_5()
+                .min_w_0()
+                .gap_1p5()
+                .child(self.render_project_icon(pane.machine, card.project.as_ref(), cx))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .children(card.project.as_ref().map(|project| {
+                            Label::new(project.name())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate()
+                        }))
+                        .children(machine_label.map(|label| render_machine_tag(label, is_offline))),
+                )
+                .children(status_slot);
+            (Some(project_line), h_flex().mt_1().min_w_0().child(title))
+        } else {
+            let title_line = h_flex()
+                .min_w_0()
+                .gap_1p5()
+                .child(title)
+                .children(machine_label.map(|label| render_machine_tag(label, is_offline)))
+                .children(status_slot);
+            (None, title_line)
+        };
+        let card_element = v_flex()
+            .id(ElementId::Name(id.clone().into()))
+            .w_full()
+            .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
+            .px_2p5()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_active, |card| card.bg(colors.ghost_element_selected))
+            .hover(|card| card.bg(colors.ghost_element_hover))
+            .when(is_offline, |card| card.opacity(0.5))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::OpenPane(pane))))
+            .children(project_line)
+            .child(title_line)
+            .child(
+                h_flex()
+                    .mt_0p5()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                Label::new(card.location)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Custom(faint_text))
+                                    .truncate(),
+                            )
+                            .children(card.branch.map(|branch| {
+                                Label::new(format!("· {branch}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Custom(faint_text))
+                                    .truncate_middle()
+                            })),
+                    )
+                    .child(
+                        div().flex_none().opacity(0.6).child(
+                            Icon::new(IconName::Terminal)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    ),
+            );
+        let this = cx.entity().downgrade();
+        right_click_menu(ElementId::Name(format!("{id}-menu").into()))
+            .trigger(move |_, _, _| div().py_0p5().child(card_element))
+            .menu(move |window, cx| {
+                let this = this.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("Show in Workspaces", None, move |_, cx| {
+                        this.update(cx, |_, cx| {
+                            cx.emit(SidebarEvent::ShowPaneInWorkspaces(pane))
+                        })
+                        .ok();
+                    })
+                })
+            })
+            .into_any_element()
     }
 
     fn store(&self, machine: MachineId, cx: &App) -> Option<Entity<ProjectStore>> {
@@ -1332,7 +1535,13 @@ impl Sidebar {
         let archived = machines.archived_threads(cx);
         let is_archived_expanded = machines.archived_expanded(cx);
 
-        let mut rows = Vec::with_capacity(active.len());
+        // Agent CLIs in Workspaces panes come first: they have no activity time to sort by,
+        // and they're running.
+        let mut rows: Vec<AnyElement> = self
+            .pane_agents(cx)
+            .into_iter()
+            .map(|card| self.render_pane_agent_card(card, cx))
+            .collect();
         for (machine, thread) in active {
             let Some(store) = self.store(machine, cx) else {
                 continue;
@@ -1421,6 +1630,17 @@ impl Render for Sidebar {
                 cx,
             ))
     }
+}
+
+/// An agent CLI running in a Workspaces pane, listed among the threads.
+struct PaneAgentCard {
+    pane: PaneKey,
+    name: SharedString,
+    status: Option<ThreadStatus>,
+    project: Option<Project>,
+    /// The workspace and tab.
+    location: SharedString,
+    branch: Option<SharedString>,
 }
 
 /// t3code's thread popover: the title, then the project, branch, and model with agent.

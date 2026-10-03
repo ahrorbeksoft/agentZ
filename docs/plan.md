@@ -539,9 +539,13 @@ The user asked for this on 2026-10-03. The app gets two views, chosen by tabs in
 **Agents** is the current app: the t3code sidebar, with one thread **full screen** in the main
 area. Every agent shows up here:
 
-- ACP threads;
-- terminal threads, including terminal agents like `claude`;
-- agents that are open in a workspace pane.
+- ACP threads, including those shown in workspace panes;
+- agent CLIs like `claude` running in workspace panes, as cards that open the pane's terminal
+  full screen (the same terminal; it takes the size of the view last used).
+
+Agent CLIs are only detected in workspace panes (the user, 2026-10-03): one started in a
+terminal thread or a thread's drawer is just a terminal. New Thread offers no agent CLIs from
+`PATH`, only a plain terminal, for now.
 
 **Workspaces** is herdr's model (`references/herdr`: `concepts.mdx`, `keyboard.mdx`,
 `configuration.mdx` § Sidebar row layouts, `session-state.mdx`, `src/layout.rs`,
@@ -549,10 +553,10 @@ area. Every agent shows up here:
 
 - **Sidebar, top: workspaces.** Search, and a **+** button. Rows follow herdr's space rows:
   rolled-up state icon and name, then branch and ahead/behind.
-- **Sidebar, bottom: agents.** Every agent on every machine (the user's choice; herdr lists only
-  agents in panes), in the slim one-line style of the Archived shelf.
-  Rows follow herdr's agent rows: state icon, machine (only with several machines), workspace,
-  tab, agent. Clicking one focuses its pane. An agent that isn't in any pane opens in Agents.
+- **Sidebar, bottom: agents.** The agents in panes on every machine, as herdr lists them:
+  agent CLIs found in terminal panes, and ACP threads (the user, 2026-10-03, replacing "every
+  agent"). Slim rows like the Archived shelf, with herdr's agent tokens: state icon, machine
+  (only with several machines), workspace, tab, agent. Clicking one focuses its pane.
 - **The + picker** creates a workspace rooted at one of:
   - a project (one of its checkouts, worktrees or pastures, on any machine);
   - a machine's home folder (`~` on Local, `t3-home`, `devbox1`, …).

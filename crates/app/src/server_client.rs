@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError};
 use agentz_protocol::agents::{AgentId, AgentSettings};
-use agentz_protocol::spaces::SpacesSnapshot;
+use agentz_protocol::layout::PaneId;
+use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{
     AgentSettingsChange, CAPABILITY_RELAY, ClientKind, ConnectionId, DirectoryListing, Event,
@@ -25,7 +26,7 @@ use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, 
 use ui::SharedString;
 
 use crate::machines::MachineId;
-use crate::project_store::ProjectStore;
+use crate::project_store::{ProjectStore, ThreadStatus};
 use crate::registry_store::AgentRegistryStore;
 use crate::terminal_entity::Terminal;
 use crate::thread_entity::AgentThread;
@@ -89,6 +90,9 @@ pub struct ServerClient {
     agent_settings: BTreeMap<AgentId, AgentSettings>,
     /// The Workspaces view's spaces on this machine.
     spaces: SpacesSnapshot,
+    /// Pane agents that finished working since this window last showed them (herdr's unseen
+    /// idle), as `viewed.json` does for threads.
+    unseen_panes: BTreeSet<PaneId>,
     /// Open threads and account connections, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
@@ -128,6 +132,7 @@ impl ServerClient {
                 registry,
                 agent_settings: BTreeMap::new(),
                 spaces: SpacesSnapshot::default(),
+                unseen_panes: BTreeSet::new(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
@@ -322,8 +327,48 @@ impl ServerClient {
     }
 
     fn set_spaces(&mut self, spaces: SpacesSnapshot, cx: &mut Context<Self>) {
-        if spaces != self.spaces {
-            self.spaces = spaces;
+        if spaces == self.spaces {
+            return;
+        }
+        let was_working: BTreeSet<PaneId> = panes(&self.spaces)
+            .filter(|pane| pane_agent_state(pane) == Some(PaneAgentState::Working))
+            .map(|pane| pane.id)
+            .collect();
+        let mut live = BTreeSet::new();
+        for pane in panes(&spaces) {
+            live.insert(pane.id);
+            match pane_agent_state(pane) {
+                Some(PaneAgentState::Idle) if was_working.contains(&pane.id) => {
+                    self.unseen_panes.insert(pane.id);
+                }
+                Some(PaneAgentState::Idle) => {}
+                _ => {
+                    self.unseen_panes.remove(&pane.id);
+                }
+            }
+        }
+        self.unseen_panes.retain(|pane| live.contains(pane));
+        self.spaces = spaces;
+        cx.notify();
+    }
+
+    /// A terminal pane's agent's state, as a thread's: blocked, working, or finished and not yet
+    /// shown.
+    pub fn pane_agent_status(&self, pane: &Pane) -> Option<ThreadStatus> {
+        match pane_agent_state(pane)? {
+            PaneAgentState::Blocked => Some(ThreadStatus::PendingApproval),
+            PaneAgentState::Working => Some(ThreadStatus::Working),
+            PaneAgentState::Idle => self
+                .unseen_panes
+                .contains(&pane.id)
+                .then_some(ThreadStatus::Completed),
+            PaneAgentState::Unknown => None,
+        }
+    }
+
+    /// A view showed the pane, so its agent's finish has been seen.
+    pub fn mark_pane_seen(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.unseen_panes.remove(&pane) {
             cx.notify();
         }
     }
@@ -739,4 +784,88 @@ fn request_name(request: &Request) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+fn panes(spaces: &SpacesSnapshot) -> impl Iterator<Item = &Pane> {
+    spaces
+        .spaces
+        .iter()
+        .flat_map(|space| &space.tabs)
+        .flat_map(|tab| &tab.panes)
+}
+
+/// The state of the agent CLI a terminal pane runs, if any.
+fn pane_agent_state(pane: &Pane) -> Option<PaneAgentState> {
+    match &pane.content {
+        PaneContent::Terminal(_) => Some(pane.agent.as_ref()?.state),
+        PaneContent::Thread(_) | PaneContent::Unknown(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agentz_protocol::layout::Node;
+    use agentz_protocol::spaces::{PaneAgent, PaneTerminal, Space, SpaceId, Tab, TabId};
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    fn spaces(state: Option<PaneAgentState>) -> SpacesSnapshot {
+        SpacesSnapshot {
+            spaces: vec![Space {
+                id: SpaceId(1),
+                name: None,
+                folder: PathBuf::from("/tmp/demo"),
+                project_id: None,
+                tabs: vec![Tab {
+                    id: TabId(2),
+                    name: None,
+                    root: Node::Pane(PaneId(3)),
+                    panes: vec![Pane {
+                        id: PaneId(3),
+                        content: PaneContent::Terminal(PaneTerminal {
+                            folder: PathBuf::from("/tmp/demo"),
+                            command: None,
+                        }),
+                        agent: state.map(|state| PaneAgent {
+                            name: "Codex".to_string(),
+                            state,
+                        }),
+                    }],
+                }],
+                git: None,
+            }],
+        }
+    }
+
+    #[gpui::test]
+    fn a_pane_agent_that_finishes_is_unseen_until_shown(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(None), cx)
+        });
+        let status = |cx: &mut TestAppContext| {
+            client.read_with(cx, |client, _| {
+                let (_, _, pane) = client.spaces().pane(PaneId(3)).expect("the pane");
+                client.pane_agent_status(pane)
+            })
+        };
+        let set = |state, cx: &mut TestAppContext| {
+            client.update(cx, |client, cx| client.set_spaces(spaces(Some(state)), cx))
+        };
+
+        // Idle from the start isn't a finish.
+        set(PaneAgentState::Idle, cx);
+        assert_eq!(status(cx), None);
+        set(PaneAgentState::Working, cx);
+        assert_eq!(status(cx), Some(ThreadStatus::Working));
+        set(PaneAgentState::Blocked, cx);
+        assert_eq!(status(cx), Some(ThreadStatus::PendingApproval));
+        set(PaneAgentState::Working, cx);
+        set(PaneAgentState::Idle, cx);
+        assert_eq!(status(cx), Some(ThreadStatus::Completed));
+
+        client.update(cx, |client, cx| client.mark_pane_seen(PaneId(3), cx));
+        assert_eq!(status(cx), None);
+    }
 }
