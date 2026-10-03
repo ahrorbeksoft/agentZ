@@ -2046,7 +2046,7 @@ impl SettingsPage {
                 }
             }
         };
-        let subtitle: SharedString = [Some(transport), Some(status.clone()), server_version]
+        let subtitle: SharedString = [Some(transport), Some(status), server_version]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -2058,11 +2058,6 @@ impl SettingsPage {
         let is_outdated = client
             .as_ref()
             .is_some_and(|client| client.read(cx).is_outdated());
-        let status_tooltip: SharedString = if is_outdated {
-            format!("{status}\nA newer agentz-server is installed there.").into()
-        } else {
-            status.into()
-        };
         let id_suffix = machine.slug();
         let element_id = |action: &str| SharedString::from(format!("machine-{action}-{id_suffix}"));
         let current_icon = self.machines.read(cx).machine_icon(machine, cx);
@@ -2166,15 +2161,10 @@ impl SettingsPage {
                     .min_w_0()
                     .child(Label::new(label).truncate())
                     .child(
-                        div()
-                            .id(element_id("status"))
-                            .tooltip(Tooltip::text(status_tooltip))
-                            .child(
-                                Label::new(subtitle)
-                                    .size(LabelSize::Small)
-                                    .color(if is_error { Color::Error } else { Color::Muted })
-                                    .truncate(),
-                            ),
+                        Label::new(subtitle)
+                            .size(LabelSize::Small)
+                            .color(if is_error { Color::Error } else { Color::Muted })
+                            .truncate(),
                     )
                     .children(
                         hint.map(|hint| {
