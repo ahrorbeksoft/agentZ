@@ -1,6 +1,6 @@
 //! Starting a thread: pick the project (only when all projects are shown), then which of its
 //! checkouts when it's combined from several (t3code's environment picker), then one of the
-//! installed agents or a terminal (a login shell, or an agent CLI found on the server's `PATH`),
+//! installed agents or a terminal (a login shell),
 //! then for a git repository where it works (t3code's workspace menu): the
 //! checkout, a new pasture or worktree, or one of the project's existing ones. Installing
 //! agents lives in Settings › Agents.
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use crate::machines::{GroupKey, MachineId, Machines, ProjectKey, ThreadKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
-use agentz_protocol::terminal::{TerminalCommand, TerminalProgram};
+use agentz_protocol::terminal::TerminalCommand;
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -88,8 +88,6 @@ pub struct NewThreadModal {
     /// Set by "New thread in this workspace", which skips the workspace step.
     preset_workspace: Option<PathBuf>,
     agent: Option<Starter>,
-    /// Agent CLIs New Thread offers to run in a terminal.
-    terminal_programs: Vec<TerminalProgram>,
     /// The project's repository, loaded when its agent step opens.
     git: Option<(ProjectId, ProjectGit)>,
     /// What a new worktree or pasture starts from, when not the checkout's branch.
@@ -159,7 +157,6 @@ impl NewThreadModal {
             base_branch: None,
             creating: None,
             error: None,
-            terminal_programs: Vec::new(),
             _load_git: Task::ready(()),
             _subscriptions: subscriptions,
         };
@@ -211,17 +208,15 @@ impl NewThreadModal {
     fn choose_project(&mut self, project: ProjectKey, cx: &mut Context<Self>) {
         let client = self.machines.read(cx).client(project.machine, cx);
         if let Some(client) = client
-            && (client.read(cx).machine() != self.machine || self.terminal_programs.is_empty())
+            && client.read(cx).machine() != self.machine
         {
             self.machine = client.read(cx).machine();
             self.projects = client.read(cx).projects().clone();
             self.registry = client.read(cx).registry().clone();
             self.git = None;
-            self.terminal_programs.clear();
-            self.registry
-                .update(cx, |registry, cx| registry.refresh_if_stale(cx));
-            self.load_terminal_programs(cx);
         }
+        self.registry
+            .update(cx, |registry, cx| registry.refresh_if_stale(cx));
         self.go_to(Step::Agent(project.project), cx);
     }
 
@@ -316,18 +311,7 @@ impl NewThreadModal {
                     .map(|agent| Starter::Agent(agent.id().clone()));
                 let shell = matches("terminal shell")
                     .then(|| Starter::Terminal(TerminalCommand::default()));
-                let programs = self
-                    .terminal_programs
-                    .iter()
-                    .filter(|program| {
-                        matches(&program.label) || matches(&program.command) || matches("terminal")
-                    })
-                    .map(|program| {
-                        Starter::Terminal(TerminalCommand {
-                            command: Some(program.command.clone()),
-                        })
-                    });
-                self.agent_rows = agents.chain(shell).chain(programs).collect();
+                self.agent_rows = agents.chain(shell).collect();
             }
             Step::Workspace(project_id) => {
                 let store = self.projects.read(cx);
@@ -491,20 +475,6 @@ impl NewThreadModal {
             })
             .ok();
         });
-    }
-
-    fn load_terminal_programs(&mut self, cx: &mut Context<Self>) {
-        let programs = self.projects.read(cx).terminal_programs(cx);
-        cx.spawn(async move |this, cx| {
-            // An older server runs no terminals, and offers none.
-            let programs = programs.await.unwrap_or_default();
-            this.update(cx, |this, cx| {
-                this.terminal_programs = programs;
-                this.update_rows(cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// Asks where the thread works, unless that's settled: by "New thread in this workspace",
@@ -768,14 +738,7 @@ impl NewThreadModal {
     ) -> AnyElement {
         let (label, detail): (SharedString, SharedString) = match &command.command {
             None => ("Terminal".into(), "A login shell".into()),
-            Some(name) => {
-                let label = self
-                    .terminal_programs
-                    .iter()
-                    .find(|program| &program.command == name)
-                    .map_or_else(|| name.clone(), |program| program.label.clone());
-                (label.into(), format!("{name}, in a terminal").into())
-            }
+            Some(name) => (name.clone().into(), "In a terminal".into()),
         };
         let id = SharedString::from(format!(
             "new-thread-terminal-{}",

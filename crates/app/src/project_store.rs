@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use agentz_protocol::agents::AgentId;
-use agentz_protocol::terminal::{TerminalCommand, TerminalProgram};
+use agentz_protocol::terminal::TerminalCommand;
 use agentz_protocol::workspace::{ProjectGit, WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{Request, Response};
 use anyhow::{Context as _, Result, anyhow};
@@ -296,18 +296,6 @@ impl ProjectStore {
             },
             |response| match response {
                 Response::ThreadCreated(thread_id) => Some(thread_id),
-                _ => None,
-            },
-            cx,
-        )
-    }
-
-    /// Agent CLIs on the server's `PATH`, which New Thread offers to run in a terminal.
-    pub fn terminal_programs(&self, cx: &App) -> Task<Result<Vec<TerminalProgram>>> {
-        self.request(
-            Request::TerminalPrograms,
-            |response| match response {
-                Response::TerminalPrograms(programs) => Some(programs),
                 _ => None,
             },
             cx,
