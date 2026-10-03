@@ -124,7 +124,8 @@ Each entry: what it does, where it lives, and where it comes from.
   installed agents as rows, each opening the agent's own page (its registry links, Update,
   Uninstall, login, defaults for new threads, environment). Add Agent opens the ACP Registry
   page, which has search, an All / Installed / Not Installed filter, and a card for each agent.
-  A sub-page has Zed's back button and breadcrumb. With more than one machine, a machine
+  As in Zed, the cards are a `uniform_list` below a pinned search bar: scrolling re-renders the
+  page every frame, and laying out every card held it to about 6 fps. A sub-page has Zed's back button and breadcrumb. With more than one machine, a machine
   picker sits in the header. Registry icons are single-color (`currentColor`), so they are
   drawn in the text color on a neutral tile.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.

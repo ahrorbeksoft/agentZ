@@ -2,6 +2,7 @@
 //! Appearance, Agents, Machines, then one entry per project) and the chosen section's rows on
 //! the right.
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
@@ -10,15 +11,16 @@ use agentz_protocol::agents::{AgentId, AgentListing, InstallState};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Window, actions,
+    PathPromptOptions, PromptLevel, ScrollHandle, Subscription, UniformListScrollHandle, Window,
+    actions, uniform_list,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, DropdownMenu, IconButtonShape, IconPosition, PopoverMenu, Switch, TintColor,
-    ToggleButtonGroup, ToggleButtonGroupSize, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip,
-    WithScrollbar as _, prelude::*,
+    ContextMenu, DropdownMenu, IconButtonShape, IconPosition, PopoverMenu, ScrollableHandle as _,
+    Switch, TintColor, ToggleButtonGroup, ToggleButtonGroupSize, ToggleButtonGroupStyle,
+    ToggleButtonSimple, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -106,6 +108,7 @@ pub struct SettingsPage {
     registry_filter: RegistryFilter,
     nav_scroll: ScrollHandle,
     content_scroll: ScrollHandle,
+    registry_scroll: UniformListScrollHandle,
     /// Detected favicons, so automatic icons match the sidebar's.
     project_info: Entity<ProjectInfoStore>,
     _subscriptions: Vec<Subscription>,
@@ -169,7 +172,12 @@ impl SettingsPage {
             }),
         ];
         let agent_search = cx.new(|cx| TextInput::new("Search agents…", cx));
-        subscriptions.push(cx.subscribe(&agent_search, |_, _, _: &TextInputEvent, cx| cx.notify()));
+        subscriptions.push(
+            cx.subscribe(&agent_search, |this, _, _: &TextInputEvent, cx| {
+                this.registry_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                cx.notify();
+            }),
+        );
         let project_info = ProjectInfoStore::global(cx);
         subscriptions.push(cx.observe(&project_info, |_, _, cx| cx.notify()));
         Self {
@@ -187,6 +195,7 @@ impl SettingsPage {
             registry_filter: RegistryFilter::All,
             nav_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
+            registry_scroll: UniformListScrollHandle::new(),
             project_info,
             _subscriptions: subscriptions,
         }
@@ -1080,7 +1089,8 @@ impl SettingsPage {
     fn render_agents(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         match &self.agents_page {
             AgentsPage::Installed => self.render_installed_agents(cx),
-            AgentsPage::Registry => self.render_registry(cx),
+            // Laid out by `render_registry` instead, as its list scrolls on its own.
+            AgentsPage::Registry => Vec::new(),
             AgentsPage::Agent(_) => self.render_agent_page(window, cx),
         }
     }
@@ -1265,16 +1275,24 @@ impl SettingsPage {
 
     /// Zed's ACP Registry page: a search, the All / Installed / Not Installed filter, and a
     /// card for each agent that runs on the machine.
-    fn render_registry(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The whole content area: the header and search stay put above Zed's `uniform_list` of
+    /// cards. Scrolling re-renders the page every frame, so only the visible cards are built.
+    fn render_registry(
+        &self,
+        header: AnyElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let query = self.agent_search.read(cx).text().trim().to_lowercase();
         let filter = self.registry_filter;
         let registry = self.registry(cx);
-        let mut agents: Vec<AgentListing> = registry
+        let mut matches: Vec<(usize, &AgentListing)> = registry
             .read(cx)
             .agents()
             .iter()
-            .filter(|agent| {
+            .enumerate()
+            .filter(|(_, agent)| {
                 let matches_query = query.is_empty()
                     || agent.name().to_lowercase().contains(&query)
                     || agent.id().0.to_lowercase().contains(&query)
@@ -1287,9 +1305,9 @@ impl SettingsPage {
                 };
                 agent.supports_current_platform() && matches_query && matches_filter
             })
-            .cloned()
             .collect();
-        agents.sort_by_key(|agent| agent.name().to_lowercase());
+        matches.sort_by_cached_key(|(_, agent)| agent.name().to_lowercase());
+        let matches: Vec<usize> = matches.into_iter().map(|(index, _)| index).collect();
 
         let search = h_flex()
             .flex_1()
@@ -1338,7 +1356,8 @@ impl SettingsPage {
             RegistryFilter::NotInstalled => 2,
         });
 
-        let list = if agents.is_empty() {
+        let column = || div().w_full().max_w(CONTENT_WIDTH).px_8();
+        let list = if matches.is_empty() {
             let has_query = !query.is_empty();
             let empty = match (filter, has_query) {
                 (RegistryFilter::All, true) => "No agents match your search.",
@@ -1348,37 +1367,89 @@ impl SettingsPage {
                 (RegistryFilter::NotInstalled, true) => "No uninstalled agents match your search.",
                 (RegistryFilter::NotInstalled, false) => "No uninstalled agents.",
             };
-            div()
-                .rounded_md()
-                .border_1()
-                .border_dashed()
-                .border_color(colors.border)
-                .child(self.render_agents_message(empty, cx))
+            h_flex()
+                .flex_1()
+                .min_h_0()
+                .items_start()
+                .justify_center()
+                .child(
+                    column().child(
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_dashed()
+                            .border_color(colors.border)
+                            .child(self.render_agents_message(empty, cx)),
+                    ),
+                )
                 .into_any_element()
         } else {
-            let cards: Vec<AnyElement> = agents
-                .iter()
-                .map(|agent| self.render_registry_card(agent, cx))
-                .collect();
-            v_flex().gap_2().children(cards).into_any_element()
-        };
-        vec![
-            v_flex()
-                .gap_3()
+            let count = matches.len();
+            let render_cards = move |this: &mut Self,
+                                     range: Range<usize>,
+                                     _: &mut Window,
+                                     cx: &mut Context<Self>| {
+                let registry = this.registry(cx);
+                let agents: Vec<AgentListing> = matches
+                    .get(range)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|index| registry.read(cx).agents().get(*index).cloned())
+                    .collect();
+                agents
+                    .iter()
+                    .map(|agent| {
+                        // Each row spans the list, so its scrollbar sits at the window's edge
+                        // as on the other pages.
+                        h_flex()
+                            .w_full()
+                            .justify_center()
+                            .child(column().pb_2().child(this.render_registry_card(agent, cx)))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            div()
+                .id("registry-cards-scroll")
+                .flex_1()
+                .min_h_0()
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .child(search)
-                        .child(div().flex_none().child(filter_buttons)),
+                    uniform_list("registry-cards", count, cx.processor(render_cards))
+                        .size_full()
+                        .pb_4()
+                        .track_scroll(&self.registry_scroll),
                 )
-                .child(list)
-                .into_any_element(),
-        ]
+                .vertical_scrollbar_for(&self.registry_scroll, window, cx)
+                .into_any_element()
+        };
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                h_flex().flex_none().w_full().justify_center().child(
+                    column()
+                        .flex()
+                        .flex_col()
+                        .pt_6()
+                        .pb_3()
+                        .gap_6()
+                        .child(header)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(search)
+                                .child(div().flex_none().child(filter_buttons)),
+                        ),
+                ),
+            )
+            .child(list)
+            .into_any_element()
     }
 
     fn set_registry_filter(&mut self, filter: RegistryFilter, cx: &mut Context<Self>) {
         self.registry_filter = filter;
-        self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.registry_scroll.set_offset(gpui::point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -1655,6 +1726,7 @@ impl SettingsPage {
             window.focus(&self.focus_handle, cx);
         }
         self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.registry_scroll.set_offset(gpui::point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -3169,32 +3241,39 @@ impl Render for SettingsPage {
             .size_full()
             .bg(colors.editor_background)
             .child(self.render_nav(window, cx))
-            .child(
-                div()
-                    .id("settings-content-scroll")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(
-                        v_flex()
-                            .id("settings-content")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.content_scroll)
-                            .items_center()
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .max_w(CONTENT_WIDTH)
-                                    .px_8()
-                                    .py_6()
-                                    .gap_6()
-                                    .child(header)
-                                    .children(sections),
-                            ),
-                    )
-                    .vertical_scrollbar_for(&self.content_scroll, window, cx),
-            )
+            .map(|page| {
+                if self.section == Section::Agents
+                    && let AgentsPage::Registry = self.agents_page
+                {
+                    return page.child(self.render_registry(header, window, cx));
+                }
+                page.child(
+                    div()
+                        .id("settings-content-scroll")
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(
+                            v_flex()
+                                .id("settings-content")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.content_scroll)
+                                .items_center()
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .max_w(CONTENT_WIDTH)
+                                        .px_8()
+                                        .py_6()
+                                        .gap_6()
+                                        .child(header)
+                                        .children(sections),
+                                ),
+                        )
+                        .vertical_scrollbar_for(&self.content_scroll, window, cx),
+                )
+            })
     }
 }
 
@@ -3333,6 +3412,50 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("agent-row-claude").is_some());
+    }
+
+    #[gpui::test]
+    fn the_registry_builds_only_the_cards_in_view(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: (100..300)
+                            .map(|number| {
+                                listing(
+                                    &format!("agent-{number}"),
+                                    &format!("Agent {number}"),
+                                    InstallState::NotInstalled,
+                                )
+                            })
+                            .collect(),
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.show_agents(window, cx);
+            page.show_agents_page(AgentsPage::Registry, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Scrolling re-renders the page every frame, so building all 200 cards made it lag.
+        assert!(cx.debug_bounds("registry-card-agent-100").is_some());
+        assert!(cx.debug_bounds("registry-card-agent-299").is_none());
     }
 
     #[test]
