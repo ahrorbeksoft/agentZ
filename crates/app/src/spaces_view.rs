@@ -253,6 +253,8 @@ pub struct SpacesView {
     details_space: Option<SpaceKey>,
     details_delay: Option<(SpaceKey, Task<()>)>,
     hovered_space: Option<SpaceKey>,
+    /// The row whose counts are under the mouse, which show a tooltip instead of the details.
+    hovered_contents: Option<SpaceKey>,
     is_visible: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -300,6 +302,7 @@ impl SpacesView {
             details_space: None,
             details_delay: None,
             hovered_space: None,
+            hovered_contents: None,
             is_visible: false,
             _subscriptions: subscriptions,
         };
@@ -1242,6 +1245,20 @@ impl SpacesView {
                         .flex_none()
                         .gap_1p5()
                         .tooltip(Tooltip::text(contents))
+                        // The tooltip says it already, so the details give way to it.
+                        .debug_selector({
+                            let id = format!("{id}-contents");
+                            move || id
+                        })
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            this.hovered_contents = hovered.then_some(key);
+                            if *hovered {
+                                this.hide_details(cx);
+                            } else if this.hovered_space == Some(key) {
+                                // Back on the row rather than off it.
+                                this.space_hovered(key, true, cx);
+                            }
+                        }))
                         .when(terminals > 0, |this| {
                             this.child(count_badge(IconName::Terminal, terminals))
                         })
@@ -1385,7 +1402,7 @@ impl SpacesView {
             return;
         }
         self.hovered_space = Some(key);
-        if self.details_space == Some(key) {
+        if self.details_space == Some(key) || self.hovered_contents == Some(key) {
             return;
         }
         let delay = cx.spawn(async move |this, cx| {
@@ -2689,6 +2706,19 @@ mod tests {
             .expect("the workspace row is drawn");
         cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
         assert_eq!(view.read_with(cx, |view, _| view.details_space), None);
+        cx.executor().advance_clock(DETAILS_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.details_space), Some(key));
+
+        // Over the counts, their tooltip shows instead.
+        let counts = cx
+            .debug_bounds("workspace-local-1-contents")
+            .expect("the counts are drawn");
+        cx.simulate_mouse_move(counts.center(), None, gpui::Modifiers::none());
+        cx.executor().advance_clock(DETAILS_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.details_space), None);
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
         cx.executor().advance_clock(DETAILS_DELAY * 2);
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.details_space), Some(key));
