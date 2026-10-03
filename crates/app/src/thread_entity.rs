@@ -7,9 +7,11 @@ use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::thread::{ConnectionStatus, ThreadState, ThreadUpdate, ThreadView};
 use agentz_protocol::{ConnectionId, Request, Response};
-use gpui::{App, Context, SharedString, Task};
+use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
 use projects::ThreadId;
 
+use crate::project_store::ProjectStore;
+use crate::registry_store::AgentRegistryStore;
 use crate::server_client::ServerClient;
 
 pub struct AgentThread {
@@ -66,6 +68,33 @@ impl AgentThread {
         let mut this = Self::new(agent_name);
         this.attach(ConnectionId::Thread(thread_id), cx);
         this
+    }
+
+    /// The app's one copy of the thread, shared by every view showing it: the server sends a
+    /// client each thread's updates once.
+    pub fn shared(thread_id: ThreadId, cx: &mut App) -> Entity<Self> {
+        if let Some(thread) = ServerClient::global(cx)
+            .read(cx)
+            .thread(ConnectionId::Thread(thread_id))
+        {
+            return thread;
+        }
+        let agent_id = ProjectStore::global(cx)
+            .read(cx)
+            .thread(thread_id)
+            .and_then(|thread| thread.agent_id.clone())
+            .map(AgentId::new);
+        let agent_name = agent_id
+            .as_ref()
+            .and_then(|agent_id| {
+                AgentRegistryStore::global(cx)
+                    .read(cx)
+                    .agent(agent_id)
+                    .map(|agent| agent.name().clone())
+            })
+            .or_else(|| agent_id.as_ref().map(|agent_id| agent_id.0.clone()))
+            .unwrap_or_else(|| "Agent".into());
+        cx.new(|cx| Self::open(thread_id, agent_name, cx))
     }
 
     /// Starts the agent only to log in or out. It stops when this is dropped.

@@ -14,6 +14,7 @@ use gpui::{
     Focusable, Hsla, KeyBinding, ScrollHandle, Subscription, Task, Window, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use projects::{TaskEnd, ThreadId};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     Callout, CommonAnimationExt as _, ContextMenu, Disclosure, IconPosition, PopoverMenu, Severity,
@@ -56,9 +57,17 @@ const RAW_INPUT_PART: usize = usize::MAX;
 
 pub enum AgentViewEvent {
     Unarchive,
+    /// Show another thread: a subthread from the Agents control, or a subthread's parent.
+    OpenThread(ThreadId),
 }
 
+/// The most subthreads the Agents control lists before it scrolls.
+const MAX_AGENT_ROWS_SHOWN: usize = 6;
+
 pub struct AgentView {
+    thread_id: ThreadId,
+    /// Focused instead of the message editor on a subthread, which has none.
+    focus_handle: FocusHandle,
     /// Archived threads stay readable but take no new messages until they're unarchived.
     is_archived: bool,
     thread: Entity<AgentThread>,
@@ -82,12 +91,16 @@ pub struct AgentView {
     command_menu_index: usize,
     /// The composer text for which the user dismissed the slash-command menu.
     command_menu_dismissed_for: Option<SharedString>,
+    agents_expanded: bool,
+    /// Subthreads at any depth waiting for a permission answer, which is given here (t3code).
+    blocked_subthreads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
     _subscriptions: Vec<Subscription>,
     _elapsed_refresh: Task<()>,
 }
 
 impl AgentView {
     pub fn new(
+        thread_id: ThreadId,
         thread: Entity<AgentThread>,
         title: SharedString,
         registry: Entity<AgentRegistryStore>,
@@ -108,6 +121,10 @@ impl AgentView {
             }),
             // The agent's display name and icon come from the registry, which may load later.
             cx.observe(&registry, |_, _, cx| cx.notify()),
+            cx.observe(&ProjectStore::global(cx), |this, _, cx| {
+                this.sync_blocked_subthreads(cx);
+                cx.notify();
+            }),
         ];
         let mut subscriptions = subscriptions;
         subscriptions.push(cx.subscribe(&composer, |this, _, _: &TextInputEvent, cx| {
@@ -129,6 +146,8 @@ impl AgentView {
             }
         });
         let mut this = Self {
+            thread_id,
+            focus_handle: cx.focus_handle(),
             thread,
             title,
             is_archived: false,
@@ -147,11 +166,347 @@ impl AgentView {
             queue_expanded: false,
             command_menu_index: 0,
             command_menu_dismissed_for: None,
+            agents_expanded: true,
+            blocked_subthreads: HashMap::default(),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
         this.sync_markdowns(cx);
+        this.sync_blocked_subthreads(cx);
         this
+    }
+
+    /// Follows the subthreads that wait for a permission answer, and stops following those
+    /// that no longer do.
+    fn sync_blocked_subthreads(&mut self, cx: &mut Context<Self>) {
+        let store = ProjectStore::global(cx);
+        let blocked: Vec<ThreadId> = store
+            .read(cx)
+            .thread_and_subthreads(self.thread_id)
+            .into_iter()
+            .skip(1)
+            .filter(|thread_id| store.read(cx).is_thread_blocked(*thread_id))
+            .collect();
+        self.blocked_subthreads
+            .retain(|thread_id, _| blocked.contains(thread_id));
+        for thread_id in blocked {
+            if self.blocked_subthreads.contains_key(&thread_id) {
+                continue;
+            }
+            let thread = AgentThread::shared(thread_id, cx);
+            let subscription = cx.observe(&thread, |_, _, cx| cx.notify());
+            self.blocked_subthreads
+                .insert(thread_id, (thread, subscription));
+        }
+    }
+
+    /// The thread that delegated this one, for a subthread.
+    fn parent(&self, cx: &App) -> Option<ThreadId> {
+        ProjectStore::global(cx)
+            .read(cx)
+            .thread(self.thread_id)?
+            .parent()
+    }
+
+    /// t3code's Agents control: the thread's subthreads, each with its state, title and agent.
+    fn render_agents_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let store = ProjectStore::global(cx);
+        let store = store.read(cx);
+        let subthreads: Vec<projects::Thread> = store
+            .subthreads(self.thread_id)
+            .into_iter()
+            .cloned()
+            .collect();
+        if subthreads.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let count = subthreads.len();
+        let running = subthreads
+            .iter()
+            .filter(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.outcome.is_none())
+            })
+            .count();
+        let expanded = self.agents_expanded;
+        let title = if count == 1 {
+            "1 Agent".to_string()
+        } else {
+            format!("{count} Agents")
+        };
+        let summary = h_flex()
+            .id("agents-summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .cursor_pointer()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(colors.border)
+            })
+            .child(Disclosure::new("agents-disclosure", expanded))
+            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+            .when(running > 0, |this| {
+                this.child(
+                    Label::new(format!("· {running} running"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.agents_expanded = !this.agents_expanded;
+                cx.notify();
+            }));
+
+        let registry = self.registry.read(cx);
+        let rows: Vec<AnyElement> = subthreads
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| {
+                let thread_id = thread.id;
+                let outcome = thread.task.as_ref().and_then(|task| task.outcome.as_ref());
+                let (icon, label, color) = match outcome.map(|outcome| outcome.end) {
+                    Some(TaskEnd::Completed) => (IconName::Check, "Done", Color::Success),
+                    Some(TaskEnd::Failed) => (IconName::XCircle, "Failed", Color::Error),
+                    Some(TaskEnd::Cancelled) => (IconName::Stop, "Cancelled", Color::Muted),
+                    Some(TaskEnd::Interrupted) => (IconName::Stop, "Stopped", Color::Muted),
+                    None if store.is_thread_or_subthread_blocked(thread_id) => {
+                        (IconName::Warning, "Needs approval", Color::Warning)
+                    }
+                    None if store.is_thread_working(thread_id) => {
+                        (IconName::LoadCircle, "Working", Color::Accent)
+                    }
+                    None => (IconName::Clock, "Waiting", Color::Muted),
+                };
+                let icon = Icon::new(icon).size(IconSize::Small).color(color);
+                let icon = if outcome.is_none() && label == "Working" {
+                    icon.with_rotate_animation(2).into_any_element()
+                } else {
+                    icon.into_any_element()
+                };
+                let agent_name = thread
+                    .agent_id
+                    .as_ref()
+                    .map(|agent_id| {
+                        let agent_id = AgentId::new(agent_id.clone());
+                        registry
+                            .agent(&agent_id)
+                            .map(|agent| agent.name().clone())
+                            .unwrap_or(agent_id.0)
+                    })
+                    .unwrap_or_else(|| "Agent".into());
+                let role = thread.task.as_ref().and_then(|task| task.role.clone());
+                let details = match role {
+                    Some(role) => format!("{agent_name} · {role}"),
+                    None => agent_name.to_string(),
+                };
+                h_flex()
+                    .id(("agent-row", thread_id.0))
+                    .w_full()
+                    .p_1p5()
+                    .gap_1p5()
+                    .bg(colors.editor_background)
+                    .cursor_pointer()
+                    .hover(|this| this.bg(colors.element_hover))
+                    .when(index + 1 < count, |this| {
+                        this.border_b_1().border_color(colors.border_variant)
+                    })
+                    .child(icon)
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(thread.title.clone())
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        Label::new(details)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .child(Label::new(label).size(LabelSize::Small).color(color))
+                    .tooltip(Tooltip::text("Open this agent's thread"))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(AgentViewEvent::OpenThread(thread_id))
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            v_flex()
+                .child(summary)
+                .when(expanded, |this| {
+                    this.child(
+                        v_flex()
+                            .id("agent-rows")
+                            .max_h(rems_from_px(31. * MAX_AGENT_ROWS_SHOWN as f32))
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The permission requests of subthreads, answered here for them.
+    fn render_subthread_permissions(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let store = ProjectStore::global(cx);
+        let mut subthreads: Vec<(&ThreadId, &(Entity<AgentThread>, Subscription))> =
+            self.blocked_subthreads.iter().collect();
+        subthreads.sort_by_key(|(thread_id, _)| **thread_id);
+        let mut cards = Vec::new();
+        for (thread_id, (thread, _)) in subthreads {
+            let thread_id = *thread_id;
+            let title = store
+                .read(cx)
+                .thread(thread_id)
+                .map(|thread| thread.title.clone())
+                .unwrap_or_default();
+            let agent_name = thread.read(cx).state.agent_name.clone();
+            for (request_index, request) in
+                thread.read(cx).state.permission_requests.iter().enumerate()
+            {
+                let mut buttons = Vec::new();
+                for (option_index, option) in request.options.iter().enumerate() {
+                    let icon = match option.kind {
+                        acp::PermissionOptionKind::AllowOnce => Icon::new(IconName::Check)
+                            .size(IconSize::XSmall)
+                            .color(Color::Success),
+                        acp::PermissionOptionKind::AllowAlways => Icon::new(IconName::CheckDouble)
+                            .size(IconSize::XSmall)
+                            .color(Color::Success),
+                        _ => Icon::new(IconName::Close)
+                            .size(IconSize::XSmall)
+                            .color(Color::Error),
+                    };
+                    let thread = thread.clone();
+                    let tool_call_id = request.tool_call_id.clone();
+                    let option_id = option.id.clone();
+                    buttons.push(
+                        Button::new(
+                            SharedString::from(format!(
+                                "subthread-permission-{}-{request_index}-{option_index}",
+                                thread_id.0
+                            )),
+                            option.name.clone(),
+                        )
+                        .start_icon(icon)
+                        .label_size(LabelSize::Small)
+                        .on_click(move |_, _, cx| {
+                            let option_id = option_id.clone();
+                            thread.update(cx, |thread, cx| {
+                                thread.respond_to_permission(&tool_call_id, option_id, cx)
+                            });
+                        }),
+                    );
+                }
+                cards.push(
+                    v_flex()
+                        .my_1p5()
+                        .mx_5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(Self::tool_card_border_color(cx))
+                        .bg(cx.theme().colors().editor_background)
+                        .overflow_hidden()
+                        .child(
+                            h_flex()
+                                .id(("subthread-permission", thread_id.0))
+                                .px_2()
+                                .py_1()
+                                .gap_1p5()
+                                .bg(Self::tool_card_header_bg(cx))
+                                .cursor_pointer()
+                                .child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    Label::new(format!("{agent_name} in “{title}” wants to:"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(request.title.clone())
+                                        .size(LabelSize::Small)
+                                        .truncate(),
+                                )
+                                .tooltip(Tooltip::text("Open the subagent's thread"))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(AgentViewEvent::OpenThread(thread_id))
+                                })),
+                        )
+                        .child(
+                            v_flex()
+                                .p_1()
+                                .border_t_1()
+                                .border_color(Self::tool_card_border_color(cx))
+                                .gap_0p5()
+                                .children(buttons),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        cards
+    }
+
+    /// Stands in for the message editor on a subthread, as t3code's subagent bar does: its
+    /// messages come from its parent.
+    fn render_subthread_bar(&self, parent: ThreadId, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let store = ProjectStore::global(cx);
+        let parent_title = store
+            .read(cx)
+            .thread(parent)
+            .map(|thread| thread.title.clone())
+            .unwrap_or_default();
+        let is_working = self.thread.read(cx).is_working();
+        h_flex()
+            .py_2()
+            .px_4()
+            .gap_2()
+            .bg(colors.editor_background)
+            .border_t_1()
+            .border_color(colors.border)
+            .child(
+                self.agent_icon(cx)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(format!(
+                        "A subagent of “{parent_title}”. It runs on its own; message its parent instead."
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+                ),
+            )
+            .when(is_working, |this| {
+                this.child(
+                    Button::new("stop-subthread", "Stop")
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Stop).size(IconSize::XSmall).color(Color::Error))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.thread.update(cx, |thread, cx| thread.cancel(cx))
+                        })),
+                )
+            })
+            .child(
+                Button::new("open-parent", "Open Parent")
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(AgentViewEvent::OpenThread(parent))
+                    })),
+            )
+            .into_any_element()
     }
 
     pub fn set_archived(&mut self, is_archived: bool, cx: &mut Context<Self>) {
@@ -1808,9 +2163,10 @@ impl AgentView {
         cx.notify();
     }
 
-    /// The bar above the message editor: plan, edited files and queued messages.
+    /// The bar above the message editor: agents, plan, edited files and queued messages.
     fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let sections: Vec<AnyElement> = [
+            self.render_agents_section(cx),
             self.render_plan_section(window, cx),
             self.render_edits_section(cx),
             self.render_queue_section(cx),
@@ -2331,7 +2687,11 @@ fn render_diff(diff: &FileDiff, cx: &App) -> AnyElement {
 
 impl Focusable for AgentView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.composer.focus_handle(cx)
+        if self.parent(cx).is_some() {
+            self.focus_handle.clone()
+        } else {
+            self.composer.focus_handle(cx)
+        }
     }
 }
 
@@ -2359,13 +2719,18 @@ impl Render for AgentView {
                 rows.push(element);
             }
         }
+        rows.extend(self.render_subthread_permissions(cx));
         if let Some(generating) = self.render_generating(cx) {
             rows.push(generating);
         }
         let has_rows = !rows.is_empty();
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
 
+        let is_subthread = self.parent(cx).is_some();
+
         v_flex()
+            // Otherwise clicking the conversation would take focus from the message editor.
+            .when(is_subthread, |this| this.track_focus(&self.focus_handle))
             .size_full()
             .bg(panel_background)
             .child(self.render_toolbar(cx))
@@ -2422,7 +2787,9 @@ impl Render for AgentView {
             .children(self.render_errors(cx))
             .children(self.render_activity_bar(window, cx))
             .map(|this| {
-                if self.is_archived {
+                if let Some(parent) = self.parent(cx) {
+                    this.child(self.render_subthread_bar(parent, cx))
+                } else if self.is_archived {
                     this.child(self.render_archived_notice(cx))
                 } else {
                     this.child(self.render_message_editor(cx))

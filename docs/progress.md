@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 4, subthreads: `delegate_task`, `task_status` and `task_cancel`, lineage, and
-the Agents control.
+**Next:** Phase 5, diffs: checkpoints as hidden git refs around each turn, turn and thread
+diffs, `agentz_thread_diff`, and the diff panel.
 
 | Phase | Status |
 |---|---|
@@ -17,7 +17,7 @@ the Agents control.
 | 1. Local server split | Done |
 | 2. Attention states and notifications | Done |
 | 3. Agent control (MCP and CLI) | Done |
-| 4. Subthreads | Not started |
+| 4. Subthreads | Done |
 | 5. Diffs | Not started |
 | 6. Worktrees and pastures | Not started |
 | 7. Terminals | Not started |
@@ -127,18 +127,19 @@ Then the server:
 
 ## 4. Subthreads
 
-- [ ] Thread lineage in `projects`: parent, kind `subagent`, created by.
-- [ ] `delegate_task` (async/wait, agent/model/machine/role/title, timeout), `task_status`,
-      `task_cancel`.
-- [ ] Finalization from the child's events, idempotent and surviving restarts. The result is the
+- [x] Thread lineage in `projects`: parent, kind `subagent`, created by. (A subthread is a
+      thread with a `task`; its parent is the creator.)
+- [x] `delegate_task` (async/wait, agent/model/role/title, timeout), `task_status`,
+      `task_cancel`. The machine argument waits for phase 9.
+- [x] Finalization from the child's events, idempotent and surviving restarts. The result is the
       last agent message, or the error.
-- [ ] The child gets the task prompt only; permissions are inherited and never broader.
-- [ ] UI:
-  - [ ] the Agents control on the parent (card and thread view);
-  - [ ] opening a subthread read-only;
-  - [ ] subthreads hidden from the main list.
-- [ ] A subthread's permission requests show on the parent, which becomes blocked.
-- [ ] Tests: delegation, wait, cancel, nesting, restart during a subthread.
+- [x] The child gets the task prompt only; permissions are inherited and never broader.
+- [x] UI:
+  - [x] the Agents control on the parent (card and thread view);
+  - [x] opening a subthread read-only;
+  - [x] subthreads hidden from the main list.
+- [x] A subthread's permission requests show on the parent, which becomes blocked.
+- [x] Tests: delegation, wait, cancel, nesting, restart during a subthread.
 
 ## 5. Diffs
 
@@ -417,6 +418,26 @@ Then the server:
     opens the thread. macOS only shows notifications for an app bundle, so the plain
     `target/debug/agentz` build logs that they're disabled. Phase 10 adds a bundle.
 
+- 2026-10-03: Subthreads (phase 4):
+  - **A subthread is a thread with a `task`.** `projects::Task` keeps the parent, the prompt, the
+    role, the `clientRequestId`, the outcome (completed, failed, cancelled, interrupted, with the
+    summary) and whether the parent has heard. Lists skip subthreads; deleting a thread deletes
+    its subthreads.
+  - **Finalization runs after every batch** on the server: a task ends when its child is idle
+    with nothing queued and no unannounced tasks of its own. The summary is the last agent
+    message, or the error. Tasks unfinished when the server stops end as Interrupted at the next
+    start, and the parent is told then.
+  - **The parent hears with t3code's message**, "Delegated task N reached a terminal state…",
+    sent as a follow-up from the task, batched when several end together. `task_status` and
+    waiting count as hearing, so the message is dropped if it hasn't gone out yet. Cancelled
+    tasks aren't announced.
+  - **No permission modes yet**, so a child inherits the caller's ACP mode and Mode-category
+    config option, which is never broader than the parent's.
+  - **The app keeps one entity per thread** (`AgentThread::shared`), so the parent's Agents
+    section and the subthread's own view share one subscription. A subthread opens in the main
+    view with Stop and Open Parent in place of the composer. Its permission requests show as
+    cards on the parent, and the parent's card shows Pending Approval.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -465,3 +486,6 @@ Then the server:
 - 2026-10-03: Finished phase 2: attention states, viewed completions, notifications.
 - 2026-10-03: Finished phase 3: the MCP bridge in every session, the thread tools with t3code's
   policy, `agentz-server call`, and "Started by" / "Sent by" marks in the sidebar and thread.
+- 2026-10-03: Finished phase 4: `delegate_task`, `task_status` and `task_cancel`, finalization
+  that survives restarts, the Agents section, read-only subthreads and their permissions on the
+  parent.

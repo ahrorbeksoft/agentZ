@@ -92,6 +92,68 @@ pub struct Thread {
     /// Who started the thread, when it wasn't the user.
     #[serde(default)]
     pub created_by: Option<ThreadCreator>,
+    /// Set on a subthread: a task another thread's agent delegated (t3code's `subagent`
+    /// lineage). Subthreads show in their parent rather than in the thread list.
+    #[serde(default)]
+    pub task: Option<Task>,
+}
+
+impl Thread {
+    /// The thread that delegated this one, for a subthread.
+    pub fn parent(&self) -> Option<ThreadId> {
+        self.task.as_ref().map(|task| task.parent)
+    }
+}
+
+/// A task delegated to a subthread, and its result once it ends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Task {
+    pub parent: ThreadId,
+    /// What the task's agent was asked to do, its only prompt from the parent.
+    pub prompt: String,
+    /// The kind of work, as the parent described it: implementation, research, review…
+    #[serde(default)]
+    pub role: Option<String>,
+    /// The parent's idempotency key, so a retried delegation finds this task.
+    #[serde(default)]
+    pub client_request_id: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
+    /// The parent has the outcome: it waited for it, read it, cancelled the task, or was sent
+    /// word that it ended.
+    #[serde(default)]
+    pub delivered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskOutcome {
+    pub end: TaskEnd,
+    /// The task's result: the agent's last message, or the error.
+    pub summary: Option<String>,
+    pub ended_at: SystemTime,
+}
+
+/// How a delegated task ended, with t3code's terminal task statuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEnd {
+    Completed,
+    Failed,
+    /// Stopped by the parent.
+    Cancelled,
+    /// Stopped some other way: by the user, or because the server stopped.
+    Interrupted,
+}
+
+impl TaskEnd {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskEnd::Completed => "completed",
+            TaskEnd::Failed => "failed",
+            TaskEnd::Cancelled => "cancelled",
+            TaskEnd::Interrupted => "interrupted",
+        }
+    }
 }
 
 /// An agent that started a thread or sent it a message, as opposed to the user (t3code's
@@ -243,7 +305,11 @@ impl ProjectStore {
         let mut threads: Vec<&Thread> = self
             .threads
             .iter()
-            .filter(|thread| thread.project_id == project_id && thread.archived_at.is_none())
+            .filter(|thread| {
+                thread.project_id == project_id
+                    && thread.archived_at.is_none()
+                    && thread.task.is_none()
+            })
             .collect();
         match self.thread_order {
             ThreadOrder::LastActivity => threads.sort_by(|a, b| {
@@ -419,9 +485,79 @@ impl ProjectStore {
             model: None,
             completed_at: None,
             created_by: None,
+            task: None,
         });
         self.changed();
         Some(id)
+    }
+
+    /// Adds a subthread of `task.parent`, in the parent's project.
+    pub fn add_subthread(&mut self, task: Task, agent_id: Option<String>) -> Option<ThreadId> {
+        let project_id = self.thread(task.parent)?.project_id;
+        let parent = task.parent;
+        let id = self.add_thread(project_id, NEW_THREAD_TITLE, agent_id)?;
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+            thread.created_by = Some(ThreadCreator::Thread(parent));
+            thread.task = Some(task);
+        }
+        self.changed();
+        Some(id)
+    }
+
+    /// The thread's subthreads, newest first.
+    pub fn subthreads(&self, parent: ThreadId) -> Vec<&Thread> {
+        let mut threads: Vec<&Thread> = self
+            .threads
+            .iter()
+            .filter(|thread| thread.parent() == Some(parent))
+            .collect();
+        threads.sort_by_key(|thread| std::cmp::Reverse(thread.id));
+        threads
+    }
+
+    /// The thread itself, its subthreads, theirs, and so on.
+    pub fn thread_and_subthreads(&self, id: ThreadId) -> Vec<ThreadId> {
+        let mut ids = vec![id];
+        let mut index = 0;
+        while let Some(&parent) = ids.get(index) {
+            ids.extend(
+                self.threads
+                    .iter()
+                    .filter(|thread| thread.parent() == Some(parent))
+                    .map(|thread| thread.id),
+            );
+            index += 1;
+        }
+        ids
+    }
+
+    /// The top-level thread a subthread belongs to, or the thread itself.
+    pub fn root_thread(&self, id: ThreadId) -> ThreadId {
+        let mut id = id;
+        // Bounded, in case a broken state file has a cycle.
+        for _ in 0..self.threads.len() {
+            match self.thread(id).and_then(Thread::parent) {
+                Some(parent) => id = parent,
+                None => break,
+            }
+        }
+        id
+    }
+
+    pub fn update_task(&mut self, id: ThreadId, update: impl FnOnce(&mut Task)) {
+        let Some(task) = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+            .and_then(|thread| thread.task.as_mut())
+        else {
+            return;
+        };
+        let before = task.clone();
+        update(task);
+        if *task != before {
+            self.changed();
+        }
     }
 
     /// Every thread, archived or not, in no particular order.
@@ -439,7 +575,7 @@ impl ProjectStore {
         let mut threads: Vec<&Thread> = self
             .threads
             .iter()
-            .filter(|thread| thread.archived_at.is_some())
+            .filter(|thread| thread.archived_at.is_some() && thread.task.is_none())
             .filter(|thread| match self.scope {
                 ProjectScope::All => true,
                 ProjectScope::Project(id) => thread.project_id == id,
@@ -469,13 +605,16 @@ impl ProjectStore {
         }
     }
 
-    /// Removes the thread for good.
+    /// Removes the thread for good, with its subthreads.
     pub fn delete_thread(&mut self, id: ThreadId) {
+        let ids = self.thread_and_subthreads(id);
         let count_before = self.threads.len();
-        self.threads.retain(|thread| thread.id != id);
+        self.threads.retain(|thread| !ids.contains(&thread.id));
         if self.threads.len() != count_before {
-            self.working_threads.remove(&id);
-            self.blocked_threads.remove(&id);
+            for id in ids {
+                self.working_threads.remove(&id);
+                self.blocked_threads.remove(&id);
+            }
             self.changed();
         }
     }
@@ -551,6 +690,14 @@ impl ProjectStore {
 
     pub fn is_thread_blocked(&self, id: ThreadId) -> bool {
         self.blocked_threads.contains(&id)
+    }
+
+    /// The thread, or a subthread of it at any depth, is waiting for a permission answer. A
+    /// subthread's requests are answered from its parent.
+    pub fn is_thread_or_subthread_blocked(&self, id: ThreadId) -> bool {
+        self.thread_and_subthreads(id)
+            .into_iter()
+            .any(|id| self.blocked_threads.contains(&id))
     }
 
     /// Marks whether the thread is waiting for a permission answer.
@@ -804,6 +951,40 @@ mod tests {
         store.remove_project(second);
         assert_eq!(store.scope(), ProjectScope::All);
         assert_eq!(store.projects().len(), 1);
+    }
+
+    #[test]
+    fn subthreads_belong_to_their_parent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let parent = store.add_thread(project, "Parent", None).expect("thread");
+        let task = |parent| Task {
+            parent,
+            prompt: "Look into it".into(),
+            role: None,
+            client_request_id: None,
+            outcome: None,
+            delivered: false,
+        };
+        let child = store.add_subthread(task(parent), None).expect("subthread");
+        let grandchild = store.add_subthread(task(child), None).expect("subthread");
+
+        let listed: Vec<_> = store.threads_for(project).map(|thread| thread.id).collect();
+        assert_eq!(listed, vec![parent]);
+        assert_eq!(store.thread(child).and_then(Thread::parent), Some(parent));
+        assert_eq!(store.root_thread(grandchild), parent);
+        assert_eq!(
+            store.thread_and_subthreads(parent),
+            vec![parent, child, grandchild]
+        );
+        store.set_thread_blocked(grandchild, true);
+        assert!(store.is_thread_or_subthread_blocked(parent));
+        assert!(!store.is_thread_blocked(parent));
+
+        store.delete_thread(parent);
+        assert!(store.threads().is_empty());
+        assert!(!store.is_thread_blocked(grandchild));
     }
 
     #[test]

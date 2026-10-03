@@ -543,6 +543,20 @@ impl Sidebar {
             .map(|time| format_relative_time(time, SystemTime::now()));
         let group_name = SharedString::from(format!("thread-card-{}", thread.id.0));
         let title = SharedString::from(thread.title);
+        let subthreads = {
+            let store = self.store.read(cx);
+            let subthreads = store.subthreads(thread.id);
+            let running = subthreads
+                .iter()
+                .filter(|thread| {
+                    thread
+                        .task
+                        .as_ref()
+                        .is_some_and(|task| task.outcome.is_none())
+                })
+                .count();
+            (subthreads.len(), running)
+        };
         let started_by = thread.created_by.map(|creator| {
             format!(
                 "Started by {}",
@@ -730,6 +744,36 @@ impl Sidebar {
                                 )
                             },
                         ))
+                        .when(subthreads.0 > 0, |this| {
+                            let (count, running) = subthreads;
+                            let tooltip = match (count, running) {
+                                (1, 0) => "1 agent".to_string(),
+                                (count, 0) => format!("{count} agents"),
+                                (count, running) => format!("{count} agents, {running} running"),
+                            };
+                            let color = if running > 0 {
+                                Color::Accent
+                            } else {
+                                Color::Custom(faint_text)
+                            };
+                            this.child(
+                                h_flex()
+                                    .id(("thread-agents", thread_id.0))
+                                    .flex_none()
+                                    .gap_0p5()
+                                    .tooltip(Tooltip::text(tooltip))
+                                    .child(
+                                        Icon::new(IconName::UserGroup)
+                                            .size(IconSize::XSmall)
+                                            .color(color),
+                                    )
+                                    .child(
+                                        Label::new(count.to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(color),
+                                    ),
+                            )
+                        })
                         .when_some(started_by, |this, started_by| {
                             this.child(
                                 div()

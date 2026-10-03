@@ -249,14 +249,16 @@ impl Shell {
     fn open_thread(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page = None;
         if !self.open_threads.contains_key(&thread_id) {
-            let Some(open_thread) = self.start_thread(thread_id, cx) else {
+            let Some(open_thread) = self.start_thread(thread_id, window, cx) else {
                 return;
             };
             self.open_threads.insert(thread_id, open_thread);
         }
         self.active_thread = Some(thread_id);
+        // A subthread isn't in the sidebar, so its top-level thread is highlighted.
+        let sidebar_thread = self.store.read(cx).root_thread(thread_id);
         self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_active_thread(Some(thread_id), cx)
+            sidebar.set_active_thread(Some(sidebar_thread), cx)
         });
         if let Some(open_thread) = self.open_threads.get(&thread_id) {
             window.focus(&open_thread.view.focus_handle(cx), cx);
@@ -317,29 +319,33 @@ impl Shell {
         }
     }
 
-    fn start_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) -> Option<OpenThread> {
+    fn start_thread(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<OpenThread> {
         let thread = self.store.read(cx).thread(thread_id)?.clone();
         let agent_id = thread.agent_id.clone().map(AgentId::new);
-        let agent_name = agent_id
-            .as_ref()
-            .and_then(|agent_id| self.registry.read(cx).agent(agent_id))
-            .map(|agent| agent.name().clone())
-            .or_else(|| agent_id.as_ref().map(|agent_id| agent_id.0.clone()))
-            .unwrap_or_else(|| "Agent".into());
-        let agent_thread = cx.new(|cx| AgentThread::open(thread_id, agent_name, cx));
+        let agent_thread = AgentThread::shared(thread_id, cx);
         let title = SharedString::from(thread.title);
         let registry = self.registry.clone();
         let is_archived = thread.archived_at.is_some();
         let view = cx.new(|cx| {
-            let mut view = AgentView::new(agent_thread, title, registry, agent_id, cx);
+            let mut view = AgentView::new(thread_id, agent_thread, title, registry, agent_id, cx);
             view.set_archived(is_archived, cx);
             view
         });
-        let view_subscription = cx.subscribe(&view, move |this, _, event, cx| match event {
-            AgentViewEvent::Unarchive => this
-                .store
-                .update(cx, |store, cx| store.unarchive_thread(thread_id, cx)),
-        });
+        let view_subscription = cx.subscribe_in(
+            &view,
+            window,
+            move |this, _, event, window, cx| match event {
+                AgentViewEvent::Unarchive => this
+                    .store
+                    .update(cx, |store, cx| store.unarchive_thread(thread_id, cx)),
+                AgentViewEvent::OpenThread(other) => this.open_thread(*other, window, cx),
+            },
+        );
         Some(OpenThread {
             view,
             _subscriptions: [view_subscription],

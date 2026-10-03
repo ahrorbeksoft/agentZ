@@ -90,6 +90,11 @@ impl ServerClient {
         .detach();
     }
 
+    /// The thread's copy, if a view still holds it.
+    pub(crate) fn thread(&self, connection: ConnectionId) -> Option<Entity<AgentThread>> {
+        self.threads.get(&connection)?.upgrade()
+    }
+
     pub(crate) fn register_thread(
         &mut self,
         connection: ConnectionId,

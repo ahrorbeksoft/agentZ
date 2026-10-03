@@ -82,6 +82,17 @@ impl ProjectStore {
             for thread in store.threads() {
                 let became_blocked =
                     store.is_thread_blocked(thread.id) && !self.store.is_thread_blocked(thread.id);
+                // A subthread's requests are answered in its top-level thread, and its
+                // completion is the parent's business.
+                if thread.task.is_some() {
+                    if became_blocked {
+                        cx.emit(ProjectStoreEvent::NeedsAttention(
+                            store.root_thread(thread.id),
+                            ThreadStatus::PendingApproval,
+                        ));
+                    }
+                    continue;
+                }
                 let completed = !store.is_thread_working(thread.id)
                     && thread.completed_at.is_some()
                     && thread.completed_at
@@ -106,11 +117,18 @@ impl ProjectStore {
         cx.notify();
     }
 
+    /// A thread's status counts its subthreads': it's where their requests are answered, and
+    /// it works while they do.
     pub fn thread_status(&self, id: ThreadId) -> Option<ThreadStatus> {
-        if self.store.is_thread_blocked(id) {
+        if self.store.is_thread_or_subthread_blocked(id) {
             return Some(ThreadStatus::PendingApproval);
         }
-        if self.store.is_thread_working(id) {
+        if self
+            .store
+            .thread_and_subthreads(id)
+            .into_iter()
+            .any(|id| self.store.is_thread_working(id))
+        {
             return Some(ThreadStatus::Working);
         }
         let completed_at = self.store.thread(id)?.completed_at?;
@@ -138,7 +156,9 @@ impl ProjectStore {
         self.store
             .threads()
             .iter()
-            .filter(|thread| thread.project_id == id && thread.archived_at.is_none())
+            .filter(|thread| {
+                thread.project_id == id && thread.archived_at.is_none() && thread.task.is_none()
+            })
             .filter_map(|thread| self.thread_status(thread.id))
             .max()
     }

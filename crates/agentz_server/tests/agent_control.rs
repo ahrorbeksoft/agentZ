@@ -171,6 +171,17 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
     assert_eq!(launched["createdByThreadId"], json!(thread_id.0));
     let worker = launched["threadId"].as_u64().expect("a thread id");
 
+    let delegated = mcp_call(
+        &connection,
+        &mut events,
+        thread,
+        &mut view,
+        r#"mcp delegate_task {"task": "delegated", "mode": "wait"}"#,
+    )
+    .await;
+    assert_eq!(delegated["status"], json!("completed"));
+    assert_eq!(delegated["summary"], json!("Echo: delegated"));
+
     // A thread's agent can run the CLI from its shell with the environment it was given.
     let output = tokio::process::Command::new(BRIDGE)
         .args([

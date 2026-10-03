@@ -49,10 +49,13 @@ pub(crate) enum Input {
     Shutdown,
 }
 
-/// A message an agent sent to a thread that was busy, sent once its turn ends.
+/// A message for a thread that was busy, sent once its turn ends: from an agent, or word that
+/// a task it delegated has ended.
 struct FollowUp {
     text: String,
     from: ThreadCreator,
+    /// The subthread whose end this announces.
+    task: Option<ThreadId>,
 }
 
 struct Client {
@@ -107,7 +110,8 @@ impl Server {
         inputs: mpsc::UnboundedSender<Input>,
     ) -> Self {
         let data_dir = config.data_dir;
-        let projects = ProjectStore::load(Some(data_dir.join("state.json")));
+        let mut projects = ProjectStore::load(Some(data_dir.join("state.json")));
+        tools::interrupt_unfinished_tasks(&mut projects);
         let agent_settings = AgentSettingsStore::load(
             Some(data_dir.join("agents").join("settings.json")),
             Some(&data_dir.join("settings.json")),
@@ -339,6 +343,16 @@ impl Server {
             }
 
             Request::Prompt { connection, text } => {
+                if let ConnectionId::Thread(thread_id) = connection
+                    && self
+                        .projects
+                        .thread(thread_id)
+                        .is_some_and(|thread| thread.task.is_some())
+                {
+                    return Err(anyhow!(
+                        "a subthread only takes its task; message its parent instead"
+                    ));
+                }
                 self.update_thread(connection, |thread| thread.send(text))?;
                 Ok(Response::Ok)
             }
@@ -757,8 +771,10 @@ impl Server {
         let threads = &self.threads;
         self.tool_sessions
             .retain(|_, thread_id| threads.contains_key(thread_id));
-        self.send_follow_ups();
+        self.finish_tasks();
         let answers = self.answer_waiting_tool_calls();
+        self.announce_finished_tasks();
+        self.send_follow_ups();
         for (thread_id, thread) in &self.threads {
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());

@@ -1,6 +1,13 @@
 //! The agent-control tools, after t3code's orchestrator MCP server: agents list, read, start,
-//! message, wait for, interrupt, rename and archive the threads of their own project. The MCP
-//! bridge and the CLI both call them with [`Request::CallTool`](agentz_protocol::Request).
+//! message, wait for, interrupt, rename and archive the threads of their own project, and
+//! delegate tasks to subthreads. The MCP bridge and the CLI both call them with
+//! [`Request::CallTool`](agentz_protocol::Request).
+//!
+//! A delegated task runs in a subthread that gets only the task as its prompt. It ends once
+//! its agent is idle and its own tasks have ended and been announced to it; the result is the
+//! agent's last message, or the error. The parent hears of the end through `delegate_task`'s
+//! wait, `task_status`, or a message sent to it once it's idle. Both the outcome and whether
+//! the parent has it are saved, so a restart loses neither.
 //!
 //! The policy is t3code's: a caller only reaches threads in its own project, can't message,
 //! wait for or interrupt itself, and can't delete threads or answer permission requests, which
@@ -15,8 +22,9 @@ use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::thread::{ConnectionStatus, Entry};
 use agentz_protocol::{ConnectionId, ServerMessage, ToolCaller, ToolResult};
 use collections::HashMap;
-use projects::{ProjectId, ThreadCreator, ThreadId};
+use projects::{ProjectId, ProjectStore, Task, TaskEnd, TaskOutcome, ThreadCreator, ThreadId};
 use serde_json::{Map, Value, json};
+use util::ResultExt as _;
 
 use super::{ClientId, FollowUp, Input, Server};
 
@@ -33,6 +41,14 @@ const DEFAULT_CHARS_PER_ITEM: u64 = 4_000;
 const MAX_CHARS_PER_ITEM: u64 = 50_000;
 const MAX_LAST_MESSAGE_CHARS: usize = 8_000;
 const MAX_TOOL_RESULTS_KEPT: usize = 1_000;
+const TASK_ROLES: [&str; 6] = [
+    "implementation",
+    "research",
+    "review",
+    "design",
+    "test",
+    "general",
+];
 
 /// A call waiting for a thread, retried after every change until it's done or its time is up.
 pub(super) struct PendingToolCall {
@@ -41,6 +57,8 @@ pub(super) struct PendingToolCall {
     caller: Caller,
     name: String,
     arguments: Value,
+    /// Set once `delegate_task` has created the task it waits for, so it isn't created again.
+    task: Option<ThreadId>,
     deadline: Instant,
 }
 
@@ -107,6 +125,8 @@ enum Step {
     Done(Value),
     /// Try again once something changes, for at most this long.
     Wait(Duration),
+    /// Answer once the delegated task ends, or with `waitTimedOut` after this long.
+    WaitForTask(ThreadId, Duration),
 }
 
 type Outcome = Result<Step, Failure>;
@@ -123,7 +143,12 @@ impl Server {
     ) {
         let outcome = self.resolve_caller(&caller).and_then(|caller| {
             match self.run_tool(caller, &name, &arguments, false) {
-                Ok(Step::Wait(timeout)) => {
+                Ok(step @ (Step::Wait(_) | Step::WaitForTask(..))) => {
+                    let (task, timeout) = match step {
+                        Step::WaitForTask(task, timeout) => (Some(task), timeout),
+                        Step::Wait(timeout) => (None, timeout),
+                        Step::Done(_) => (None, Duration::ZERO),
+                    };
                     let deadline = Instant::now() + timeout;
                     self.pending_tool_calls.push(PendingToolCall {
                         client,
@@ -131,6 +156,7 @@ impl Server {
                         caller,
                         name,
                         arguments,
+                        task,
                         deadline,
                     });
                     self.wake_at(deadline);
@@ -164,9 +190,15 @@ impl Server {
                 continue;
             }
             let timed_out = now >= call.deadline;
-            match self.run_tool(call.caller, &call.name, &call.arguments, timed_out) {
-                Ok(Step::Wait(_)) if !timed_out => self.pending_tool_calls.push(call),
-                Ok(Step::Wait(_)) => answers.push((
+            let outcome = match call.task {
+                Some(task) => self.wait_for_task(call.caller, task, timed_out),
+                None => self.run_tool(call.caller, &call.name, &call.arguments, timed_out),
+            };
+            match outcome {
+                Ok(Step::Wait(_) | Step::WaitForTask(..)) if !timed_out => {
+                    self.pending_tool_calls.push(call)
+                }
+                Ok(Step::Wait(_) | Step::WaitForTask(..)) => answers.push((
                     call.client,
                     call.id,
                     tool_result(Err(failure("orchestration_error", "timed out"))),
@@ -196,17 +228,141 @@ impl Server {
                 ConnectionStatus::Ready if !thread.is_working() => {}
                 _ => continue,
             }
-            let Some(follow_up) = self
-                .follow_ups
-                .get_mut(&thread_id)
-                .and_then(|queue| queue.pop_front())
-            else {
+            let Some(queue) = self.follow_ups.get_mut(&thread_id) else {
                 continue;
             };
-            thread.send_from(follow_up.text, follow_up.from);
+            let Some(follow_up) = queue.pop_front() else {
+                continue;
+            };
+            let (text, from, ended_tasks) = match follow_up.task {
+                None => (follow_up.text, follow_up.from, Vec::new()),
+                // Every task that has ended goes in one message, as in t3code.
+                Some(task) => {
+                    let mut tasks = vec![task];
+                    queue.retain(|other| match other.task {
+                        Some(task) => {
+                            tasks.push(task);
+                            false
+                        }
+                        None => true,
+                    });
+                    let text = task_ended_message(&tasks);
+                    let from = match tasks.as_slice() {
+                        [task] => ThreadCreator::Thread(*task),
+                        _ => follow_up.from,
+                    };
+                    (text, from, tasks)
+                }
+            };
+            thread.send_from(text, from);
+            for task in ended_tasks {
+                self.projects
+                    .update_task(task, |task| task.delivered = true);
+            }
             self.thread_changed(ConnectionId::Thread(thread_id));
         }
         self.follow_ups.retain(|_, queue| !queue.is_empty());
+    }
+
+    /// Ends the tasks whose subthread is done, as its state shows: idle, with its own tasks
+    /// ended and announced to it.
+    pub(super) fn finish_tasks(&mut self) {
+        let unfinished: Vec<ThreadId> = self
+            .projects
+            .threads()
+            .iter()
+            .filter(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.outcome.is_none())
+            })
+            .map(|thread| thread.id)
+            .collect();
+        for task in unfinished {
+            let outcome = match self.threads.get(&task) {
+                None => Some((
+                    TaskEnd::Interrupted,
+                    Some("The task's agent stopped.".to_string()),
+                )),
+                Some(thread) => match thread.status() {
+                    ConnectionStatus::Failed(error) => {
+                        Some((TaskEnd::Failed, Some(error.to_string())))
+                    }
+                    ConnectionStatus::Ready
+                        if !self.is_busy(task) && !self.has_unannounced_tasks(task) =>
+                    {
+                        Some(if let Some(error) = thread.turn_error() {
+                            (TaskEnd::Failed, Some(error.to_string()))
+                        } else if thread.last_stop_reason() == Some(&acp::StopReason::Cancelled) {
+                            (
+                                TaskEnd::Interrupted,
+                                Some("The task's turn was stopped.".to_string()),
+                            )
+                        } else {
+                            (
+                                TaskEnd::Completed,
+                                last_agent_message(thread.entries())
+                                    .map(|message| truncate(message, MAX_LAST_MESSAGE_CHARS).0),
+                            )
+                        })
+                    }
+                    _ => None,
+                },
+            };
+            if let Some((end, summary)) = outcome {
+                self.projects.update_task(task, |task| {
+                    task.outcome = Some(TaskOutcome {
+                        end,
+                        summary,
+                        ended_at: SystemTime::now(),
+                    });
+                });
+            }
+        }
+    }
+
+    /// Queues word of each ended task the parent doesn't have yet, starting the parent's agent
+    /// if needed.
+    pub(super) fn announce_finished_tasks(&mut self) {
+        let ended: Vec<(ThreadId, ThreadId)> = self
+            .projects
+            .threads()
+            .iter()
+            .filter_map(|thread| {
+                let task = thread.task.as_ref()?;
+                (task.outcome.is_some() && !task.delivered).then_some((thread.id, task.parent))
+            })
+            .collect();
+        for (task, parent) in ended {
+            let queued = self
+                .follow_ups
+                .get(&parent)
+                .is_some_and(|queue| queue.iter().any(|follow_up| follow_up.task == Some(task)));
+            if queued {
+                continue;
+            }
+            // A parent that has itself ended, or is gone, has nobody left to tell.
+            let parent_ended = self.projects.thread(parent).is_none_or(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.outcome.is_some())
+            });
+            if parent_ended || self.start(parent).is_err() {
+                self.projects
+                    .update_task(task, |task| task.delivered = true);
+                continue;
+            }
+            self.follow_ups
+                .entry(parent)
+                .or_default()
+                .push_back(FollowUp {
+                    text: String::new(),
+                    from: ThreadCreator::Thread(task),
+                    task: Some(task),
+                });
+        }
     }
 
     fn wake_at(&self, deadline: Instant) {
@@ -282,6 +438,8 @@ impl Server {
                 caller.thread_id.map(|thread_id| thread_id.0)
             )
         });
+        // A delegation finds its own earlier task, whose status may have changed since.
+        let request_key = request_key.filter(|_| name != "delegate_task");
         if let Some(key) = &request_key
             && let Some(value) = self.tool_results.get(key)
         {
@@ -292,7 +450,7 @@ impl Server {
             "agentz_thread_list" => self.thread_list(caller, &arguments),
             "agentz_thread_read" => self.thread_read(caller, &arguments, timed_out),
             "agentz_thread_launch" => {
-                let spec = self.launch_spec(caller, &arguments)?;
+                let spec = self.launch_spec(caller, &arguments, "prompt")?;
                 Ok(Step::Done(self.launch(caller, spec)))
             }
             "create_threads" => self.create_threads(caller, &arguments),
@@ -301,6 +459,12 @@ impl Server {
             "agentz_thread_interrupt" => self.thread_interrupt(caller, &arguments),
             "agentz_thread_update" => self.thread_update(caller, &arguments),
             "agentz_thread_organize" => self.thread_organize(caller, &arguments),
+            "delegate_task" => self.delegate_task(caller, &arguments),
+            "task_status" => {
+                let task = self.task(caller, arguments.thread_id("taskId")?)?;
+                Ok(Step::Done(self.task_result(task, false, true)))
+            }
+            "task_cancel" => self.task_cancel(caller, &arguments),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
         if let (Some(key), Step::Done(value)) = (request_key, &step) {
@@ -352,7 +516,7 @@ impl Server {
                     "name": agent.name().as_ref(),
                     "models": models,
                     "modes": modes,
-                    "canRunChildTask": false,
+                    "canRunChildTask": true,
                 })
             })
             .collect();
@@ -377,7 +541,7 @@ impl Server {
                 "batchThreadCreation": true,
                 "maxBatchThreads": MAX_BATCH_THREADS,
                 "incrementalThreadRead": true,
-                "appOwnedSubagents": false,
+                "appOwnedSubagents": true,
                 "diffs": false,
                 "terminals": false,
             },
@@ -412,7 +576,7 @@ impl Server {
             .projects
             .threads()
             .iter()
-            .filter(|thread| thread.project_id == caller.project_id)
+            .filter(|thread| thread.project_id == caller.project_id && thread.task.is_none())
             .filter(|thread| thread.archived_at.is_some() == archived)
             .filter(|thread| {
                 title_contains
@@ -556,7 +720,7 @@ impl Server {
         let specs = requests
             .iter()
             .map(|request| match request {
-                Value::Object(request) => self.launch_spec(caller, &Arguments(request)),
+                Value::Object(request) => self.launch_spec(caller, &Arguments(request), "prompt"),
                 _ => Err(invalid("Each thread must be an object.")),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -567,9 +731,14 @@ impl Server {
         Ok(Step::Done(json!({ "threads": threads })))
     }
 
-    fn launch_spec(&self, caller: Caller, arguments: &Arguments) -> Result<LaunchSpec, Failure> {
+    fn launch_spec(
+        &self,
+        caller: Caller,
+        arguments: &Arguments,
+        prompt_key: &str,
+    ) -> Result<LaunchSpec, Failure> {
         let prompt = arguments
-            .string("prompt", MAX_PROMPT_CHARS)?
+            .string(prompt_key, MAX_PROMPT_CHARS)?
             .map(String::from);
         let title = arguments
             .string("title", MAX_TITLE_CHARS)?
@@ -607,12 +776,19 @@ impl Server {
 
         let same_agent_as_caller = caller_thread
             .is_some_and(|thread| thread.agent_id.as_deref() == Some(agent_id.0.as_ref()));
-        let caller_options = caller
+        let caller_agent_thread = caller
             .thread_id
             .and_then(|thread_id| self.threads.get(&thread_id))
+            .filter(|_| same_agent_as_caller);
+        let caller_options = caller_agent_thread
             .map(|thread| thread.config_options().to_vec())
-            .filter(|_| same_agent_as_caller)
             .unwrap_or_default();
+        let mode = caller_agent_thread
+            .and_then(|thread| thread.modes())
+            .map(|modes| modes.current_mode_id.clone());
+        // Agents that put their permission mode in a setting rather than an ACP mode.
+        let mode_option = select_choices(&caller_options, acp::SessionConfigOptionCategory::Mode)
+            .map(|(config_id, _, current)| (config_id, current));
         let known_options = if caller_options.is_empty() {
             self.agent_settings.get(&agent_id).known_config_options
         } else {
@@ -655,6 +831,8 @@ impl Server {
             title,
             agent_id,
             model,
+            mode,
+            mode_option,
         })
     }
 
@@ -668,18 +846,35 @@ impl Server {
         };
         self.projects
             .set_thread_creator(thread_id, caller.creator());
+        let model = spec.model.as_ref().map(|(_, value)| value.clone());
+        self.start_launched(thread_id, caller.creator(), spec);
+        let mut summary = self
+            .projects
+            .thread(thread_id)
+            .map(|thread| self.thread_summary(caller, thread))
+            .unwrap_or_default();
+        if let Some(model) = model {
+            summary["model"] = json!(model);
+        }
+        summary
+    }
+
+    /// Starts a new thread's agent with the spec's title, settings and prompt.
+    fn start_launched(&mut self, thread_id: ThreadId, creator: ThreadCreator, spec: LaunchSpec) {
         if let Some(title) = spec.title {
             self.projects.set_custom_title(thread_id, title);
         }
         let mut defaults = self.agent_settings.get(&spec.agent_id).session_defaults();
-        if let Some((config_id, value)) = &spec.model {
+        for (config_id, value) in spec.model.iter().chain(&spec.mode_option) {
             defaults.config_options.retain(|(id, _)| id != config_id);
             defaults.config_options.push((
                 config_id.clone(),
                 acp::SessionConfigOptionValue::value_id(value.clone()),
             ));
         }
-        let creator = caller.creator();
+        if spec.mode.is_some() {
+            defaults.mode = spec.mode;
+        }
         if let Err(error) = self.update_thread(ConnectionId::Thread(thread_id), |thread| {
             thread.set_defaults(defaults);
             if let Some(prompt) = spec.prompt {
@@ -688,15 +883,260 @@ impl Server {
         }) {
             log::error!("failed to start a launched thread: {error:#}");
         }
-        let mut summary = self
+    }
+
+    fn delegate_task(&mut self, caller: Caller, arguments: &Arguments) -> Outcome {
+        let Some(parent) = caller.thread_id else {
+            return Err(failure(
+                "capability_denied",
+                "Only a thread's agent can delegate tasks. From a shell, pass --thread.",
+            ));
+        };
+        if self
             .projects
-            .thread(thread_id)
-            .map(|thread| self.thread_summary(caller, thread))
-            .unwrap_or_default();
-        if let Some((_, value)) = spec.model {
-            summary["model"] = json!(value);
+            .thread(parent)
+            .and_then(|thread| thread.task.as_ref())
+            .is_some_and(|task| task.outcome.is_some())
+        {
+            return Err(failure(
+                "parent_not_active",
+                "This task has ended, so it can't delegate more.",
+            ));
         }
-        summary
+        let wait = match arguments.string("mode", 16)? {
+            None | Some("async") => false,
+            Some("wait") => true,
+            Some(mode) => return Err(invalid(format!("Unknown mode {mode}."))),
+        };
+        let timeout = arguments
+            .number("timeoutMs")?
+            .map_or(DEFAULT_WAIT, Duration::from_millis)
+            .min(MAX_WAIT);
+        let role = match arguments.string("role", 32)? {
+            Some(role) if TASK_ROLES.contains(&role) => Some(role.to_string()),
+            Some(role) => {
+                return Err(invalid(format!(
+                    "Unknown role {role}. Roles: {}.",
+                    TASK_ROLES.join(", ")
+                )));
+            }
+            None => None,
+        };
+        let client_request_id = arguments.string("clientRequestId", 256)?.map(String::from);
+        let existing = client_request_id.as_ref().and_then(|request_id| {
+            self.projects
+                .subthreads(parent)
+                .into_iter()
+                .find(|thread| {
+                    thread
+                        .task
+                        .as_ref()
+                        .and_then(|task| task.client_request_id.as_ref())
+                        == Some(request_id)
+                })
+                .map(|thread| thread.id)
+        });
+        let task = match existing {
+            Some(task) => task,
+            None => {
+                let spec = self.launch_spec(caller, arguments, "task")?;
+                let Some(prompt) = spec.prompt.clone() else {
+                    return Err(invalid("task is required."));
+                };
+                let agent_id = spec.agent_id.0.to_string();
+                let task = self
+                    .projects
+                    .add_subthread(
+                        Task {
+                            parent,
+                            prompt,
+                            role,
+                            client_request_id,
+                            outcome: None,
+                            delivered: false,
+                        },
+                        Some(agent_id),
+                    )
+                    .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+                self.start_launched(task, ThreadCreator::Thread(parent), spec);
+                task
+            }
+        };
+        if wait {
+            self.wait_for_task(caller, task, false)
+                .map(|step| match step {
+                    Step::Wait(_) => Step::WaitForTask(task, timeout),
+                    step => step,
+                })
+        } else {
+            Ok(Step::Done(self.task_result(task, false, false)))
+        }
+    }
+
+    /// `delegate_task`'s wait: the result once the task ends, or `waitTimedOut`.
+    fn wait_for_task(&mut self, caller: Caller, task: ThreadId, timed_out: bool) -> Outcome {
+        let task = self.task(caller, Some(task))?;
+        let ended = self
+            .projects
+            .thread(task)
+            .and_then(|thread| thread.task.as_ref())
+            .is_some_and(|task| task.outcome.is_some());
+        if !ended && !timed_out {
+            return Ok(Step::Wait(MAX_WAIT));
+        }
+        Ok(Step::Done(self.task_result(task, !ended, true)))
+    }
+
+    fn task_cancel(&mut self, caller: Caller, arguments: &Arguments) -> Outcome {
+        let task = self.task(caller, arguments.thread_id("taskId")?)?;
+        let reason = arguments.string("reason", 2_000)?.map(String::from);
+        if let Some(outcome) = self
+            .projects
+            .thread(task)
+            .and_then(|thread| thread.task.as_ref())
+            .and_then(|task| task.outcome.as_ref())
+        {
+            return Ok(Step::Done(json!({
+                "taskId": task.0,
+                "status": outcome.end.as_str(),
+            })));
+        }
+        self.cancel_task(task, reason);
+        Ok(Step::Done(json!({
+            "taskId": task.0,
+            "status": "cancel_requested",
+        })))
+    }
+
+    /// Ends the task as cancelled, stops its agent's turn, and cancels its own tasks.
+    fn cancel_task(&mut self, task: ThreadId, reason: Option<String>) {
+        for thread_id in self.projects.thread_and_subthreads(task) {
+            let ended = self
+                .projects
+                .thread(thread_id)
+                .and_then(|thread| thread.task.as_ref())
+                .is_none_or(|task| task.outcome.is_some());
+            if ended {
+                continue;
+            }
+            let summary = match (&reason, thread_id == task) {
+                (Some(reason), true) => reason.clone(),
+                (None, true) => "Cancelled by the parent.".to_string(),
+                (_, false) => "Cancelled with the task that delegated it.".to_string(),
+            };
+            self.projects.update_task(thread_id, |task| {
+                task.outcome = Some(TaskOutcome {
+                    end: TaskEnd::Cancelled,
+                    summary: Some(summary),
+                    ended_at: SystemTime::now(),
+                });
+                // The parent asked, so it isn't told again.
+                task.delivered = true;
+            });
+            self.follow_ups.remove(&thread_id);
+            if self
+                .threads
+                .get(&thread_id)
+                .is_some_and(|thread| thread.is_working())
+            {
+                self.update_thread(ConnectionId::Thread(thread_id), |thread| thread.cancel())
+                    .log_err();
+            }
+        }
+    }
+
+    /// A task the caller delegated.
+    fn task(&self, caller: Caller, task: Option<ThreadId>) -> Result<ThreadId, Failure> {
+        let task = task.ok_or_else(|| invalid("taskId is required."))?;
+        match self
+            .projects
+            .thread(task)
+            .and_then(|thread| thread.task.as_ref())
+        {
+            Some(delegated) if caller.thread_id == Some(delegated.parent) => Ok(task),
+            _ => Err(failure(
+                "task_not_found",
+                format!("This thread has no task {}.", task.0),
+            )),
+        }
+    }
+
+    /// The task as `delegate_task` and `task_status` describe it. With `acknowledge`, an
+    /// ended task's result counts as delivered to the parent.
+    fn task_result(&mut self, task: ThreadId, wait_timed_out: bool, acknowledge: bool) -> Value {
+        let (status, work_state) = self.task_status(task);
+        let Some(thread) = self.projects.thread(task) else {
+            return json!({"taskId": task.0, "status": "cancelled"});
+        };
+        let Some(delegated) = thread.task.as_ref() else {
+            return json!({"taskId": task.0});
+        };
+        let has_pending_tasks = self.projects.subthreads(task).iter().any(|thread| {
+            thread
+                .task
+                .as_ref()
+                .is_some_and(|task| task.outcome.is_none())
+        });
+        let result = json!({
+            "taskId": task.0,
+            "childThreadId": task.0,
+            "title": thread.title,
+            "role": delegated.role,
+            "status": status,
+            "workState": work_state,
+            "hasPendingChildTasks": has_pending_tasks,
+            "agentId": thread.agent_id,
+            "agentName": thread
+                .agent_id
+                .as_ref()
+                .map(|id| self.agent_name(&AgentId::new(id.clone())).to_string()),
+            "model": thread.model,
+            "summary": delegated.outcome.as_ref().and_then(|outcome| outcome.summary.clone()),
+            "endedAt": delegated.outcome.as_ref().map(|outcome| timestamp(outcome.ended_at)),
+            "waitTimedOut": wait_timed_out,
+        });
+        let parent = delegated.parent;
+        if acknowledge && delegated.outcome.is_some() && !delegated.delivered {
+            self.projects
+                .update_task(task, |task| task.delivered = true);
+            if let Some(queue) = self.follow_ups.get_mut(&parent) {
+                queue.retain(|follow_up| follow_up.task != Some(task));
+            }
+        }
+        result
+    }
+
+    /// t3code's delegated task status and work state.
+    fn task_status(&self, task: ThreadId) -> (&'static str, &'static str) {
+        if let Some(outcome) = self
+            .projects
+            .thread(task)
+            .and_then(|thread| thread.task.as_ref())
+            .and_then(|task| task.outcome.as_ref())
+        {
+            return (outcome.end.as_str(), "result_available");
+        }
+        let status = match self.thread_status(task) {
+            "starting" => "queued",
+            "waiting_for_approval" | "needs_login" => "waiting",
+            _ => "running",
+        };
+        let work_state = if !self.is_busy(task) && self.has_unannounced_tasks(task) {
+            "waiting_for_children"
+        } else {
+            "working"
+        };
+        (status, work_state)
+    }
+
+    /// The thread has delegated tasks that are running, or have ended without it hearing.
+    fn has_unannounced_tasks(&self, thread_id: ThreadId) -> bool {
+        self.projects.subthreads(thread_id).iter().any(|thread| {
+            thread
+                .task
+                .as_ref()
+                .is_some_and(|task| task.outcome.is_none() || !task.delivered)
+        })
     }
 
     fn thread_send(&mut self, caller: Caller, arguments: &Arguments) -> Outcome {
@@ -714,6 +1154,16 @@ impl Server {
             return Err(failure(
                 "thread_not_sendable",
                 "A thread can't send messages to itself.",
+            ));
+        }
+        if self
+            .projects
+            .thread(thread_id)
+            .is_some_and(|thread| thread.task.is_some())
+        {
+            return Err(failure(
+                "thread_not_sendable",
+                "The thread is a delegated task. Use task_status or task_cancel.",
             ));
         }
         self.start(thread_id)?;
@@ -748,6 +1198,7 @@ impl Server {
                 .push_front(FollowUp {
                     text: message,
                     from,
+                    task: None,
                 });
             self.update_thread(ConnectionId::Thread(thread_id), |thread| thread.cancel())
                 .map_err(|error| failure("orchestration_error", format!("{error:#}")))?;
@@ -759,6 +1210,7 @@ impl Server {
                 .push_back(FollowUp {
                     text: message,
                     from,
+                    task: None,
                 });
             "queued"
         };
@@ -936,6 +1388,7 @@ impl Server {
                 Some(ThreadCreator::Thread(thread_id)) => Some(thread_id.0),
                 _ => None,
             },
+            "parentThreadId": thread.parent().map(|parent| parent.0),
             "isCaller": caller.thread_id == Some(thread.id),
             "lastActivityAt": thread.last_activity_at.map(timestamp),
             "completedAt": thread.completed_at.map(timestamp),
@@ -948,6 +1401,48 @@ struct LaunchSpec {
     title: Option<String>,
     agent_id: AgentId,
     model: Option<(acp::SessionConfigId, String)>,
+    /// The caller's mode, for a thread of the same agent: a delegated task never gets more
+    /// room than its parent.
+    mode: Option<acp::SessionModeId>,
+    mode_option: Option<(acp::SessionConfigId, String)>,
+}
+
+/// Ends the tasks that were running when the server last stopped. Their parents are told once
+/// it's running again.
+pub(super) fn interrupt_unfinished_tasks(projects: &mut ProjectStore) {
+    let unfinished: Vec<ThreadId> = projects
+        .threads()
+        .iter()
+        .filter(|thread| {
+            thread
+                .task
+                .as_ref()
+                .is_some_and(|task| task.outcome.is_none())
+        })
+        .map(|thread| thread.id)
+        .collect();
+    for task in unfinished {
+        projects.update_task(task, |task| {
+            task.outcome = Some(TaskOutcome {
+                end: TaskEnd::Interrupted,
+                summary: Some("agentZ's server stopped while the task was running.".to_string()),
+                ended_at: SystemTime::now(),
+            });
+        });
+    }
+}
+
+fn task_ended_message(tasks: &[ThreadId]) -> String {
+    let ids: Vec<String> = tasks.iter().map(|task| task.0.to_string()).collect();
+    match ids.as_slice() {
+        [id] => format!(
+            "Delegated task {id} reached a terminal state. Use task_status with taskId {id} to read the result."
+        ),
+        _ => format!(
+            "Delegated tasks {} reached terminal states. Use task_status with each taskId to read the results.",
+            ids.join(", ")
+        ),
+    }
 }
 
 struct Arguments<'a>(&'a Map<String, Value>);
@@ -1036,8 +1531,16 @@ fn tool_result(result: Result<Value, Failure>) -> ToolResult {
 fn model_choices(
     options: &[acp::SessionConfigOption],
 ) -> Option<(acp::SessionConfigId, Vec<(String, String)>, String)> {
+    select_choices(options, acp::SessionConfigOptionCategory::Model)
+}
+
+/// The first selector of the category among the options, as for [`model_choices`].
+fn select_choices(
+    options: &[acp::SessionConfigOption],
+    category: acp::SessionConfigOptionCategory,
+) -> Option<(acp::SessionConfigId, Vec<(String, String)>, String)> {
     options.iter().find_map(|option| {
-        if option.category != Some(acp::SessionConfigOptionCategory::Model) {
+        if option.category.as_ref() != Some(&category) {
             return None;
         }
         let acp::SessionConfigKind::Select(select) = &option.kind else {
@@ -1271,6 +1774,55 @@ pub(super) fn definitions() -> Value {
                 "additionalProperties": false,
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+        },
+        {
+            "name": "delegate_task",
+            "title": "Delegate a child task",
+            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows in this thread's Agents control. Prefer mode='async' for long work: when the task ends, this thread gets a message saying so, queued until its turn ends, so end the turn instead of polling. mode='wait' blocks until the task ends or timeoutMs (default 10 minutes) passes; a timeout returns waitTimedOut=true and doesn't cancel the task. Keep the taskId for task_status and task_cancel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "maxLength": MAX_PROMPT_CHARS, "description": "A self-contained task for one delegated child agent."},
+                    "title": {"type": "string", "maxLength": MAX_TITLE_CHARS},
+                    "role": {"type": "string", "enum": TASK_ROLES},
+                    "agentId": {"type": "string", "description": "An installed agent from orchestrator_capabilities. Defaults to this thread's agent."},
+                    "model": {"type": "string", "description": "A model id or name the agent advertises. Defaults to this thread's model for the same agent, or the agent's default."},
+                    "mode": {"type": "string", "enum": ["async", "wait"], "description": "Defaults to async. Use wait only when this turn needs the result before it can continue."},
+                    "timeoutMs": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT.as_millis() as u64, "description": "How long mode=wait waits. It doesn't cancel the task."},
+                    "clientRequestId": client_request_id,
+                },
+                "required": ["task"],
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
+        },
+        {
+            "name": "task_status",
+            "title": "Get delegated task status",
+            "description": "Read a task this thread delegated. status is queued, running, waiting (for the user's approval or login), completed, failed, cancelled or interrupted. workState tells working, waiting_for_children (its turn ended but its own tasks are still running) and result_available apart. summary is the task's result once it has ended: the child's last message, or the error. Reading an ended task's result means this thread isn't sent a message about it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"taskId": {"type": "integer", "description": "The taskId from delegate_task."}},
+                "required": ["taskId"],
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+        },
+        {
+            "name": "task_cancel",
+            "title": "Cancel delegated task",
+            "description": "Stop a task this thread delegated, and the tasks it delegated in turn. This thread isn't sent a message about it. An ended task's result stays available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "taskId": {"type": "integer"},
+                    "reason": {"type": "string", "maxLength": 2000},
+                    "clientRequestId": client_request_id,
+                },
+                "required": ["taskId"],
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": true},
         },
     ])
 }

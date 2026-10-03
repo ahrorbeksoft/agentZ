@@ -25,16 +25,21 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct TestServer {
     handle: ServerHandle,
-    _data_dir: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
     project_dir: tempfile::TempDir,
 }
 
 impl TestServer {
     /// `None` without python3 to run the mock agent.
     fn start() -> Option<Self> {
+        Self::start_with(
+            tempfile::tempdir().expect("temp dir"),
+            tempfile::tempdir().expect("temp dir"),
+        )
+    }
+
+    fn start_with(data_dir: tempfile::TempDir, project_dir: tempfile::TempDir) -> Option<Self> {
         let command = mock_agent()?;
-        let data_dir = tempfile::tempdir().expect("temp dir");
-        let project_dir = tempfile::tempdir().expect("temp dir");
         let custom_agents = BTreeMap::from_iter([(
             AgentId::new("mock"),
             CustomAgent {
@@ -56,7 +61,7 @@ impl TestServer {
         .expect("server starts");
         Some(Self {
             handle,
-            _data_dir: data_dir,
+            data_dir,
             project_dir,
         })
     }
@@ -862,4 +867,383 @@ async fn agents_queue_restart_and_interrupt_turns() {
         )
         .await;
     assert_eq!(interrupted["status"], json!("no_active_run"));
+}
+
+impl TestClient {
+    /// Waits for the thread's agent to report its settings, so it's ready for prompts.
+    async fn wait_until_ready(&mut self, thread_id: ThreadId) {
+        let connection = ConnectionId::Thread(thread_id);
+        if !self.threads.contains_key(&connection) {
+            self.subscribe_thread(connection).await;
+        }
+        self.wait_until(|client| !client.thread(connection).config_options().is_empty())
+            .await;
+    }
+
+    fn task(&self, thread_id: ThreadId) -> Option<&projects::Task> {
+        self.project_thread(thread_id)?.task.as_ref()
+    }
+
+    fn user_messages(&self, thread_id: ThreadId) -> Vec<String> {
+        self.thread(ConnectionId::Thread(thread_id))
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::UserMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn task_id(result: &Value) -> ThreadId {
+    ThreadId(result["taskId"].as_u64().expect("a task id"))
+}
+
+fn config_value(view: &ThreadView, config_id: &str) -> Option<String> {
+    view.config_options().iter().find_map(|option| {
+        let acp::SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        (option.id.0.as_ref() == config_id).then(|| select.current_value.0.to_string())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_delegate_tasks_to_subthreads() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    client.wait_until_ready(parent).await;
+    client
+        .ok(Request::SetConfigOption {
+            connection: ConnectionId::Thread(parent),
+            config_id: acp::SessionConfigId::new("mode"),
+            value: acp::SessionConfigOptionValue::value_id("plan"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            config_value(client.thread(ConnectionId::Thread(parent)), "mode").as_deref()
+                == Some("plan")
+        })
+        .await;
+
+    // Waiting returns the result, and the parent isn't told again.
+    let waited = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "hello", "mode": "wait", "title": "Helper", "role": "research"}),
+        )
+        .await;
+    let helper = task_id(&waited);
+    assert_eq!(waited["status"], json!("completed"));
+    assert_eq!(waited["workState"], json!("result_available"));
+    assert_eq!(waited["summary"], json!("Echo: hello"));
+    assert_eq!(waited["title"], json!("Helper"));
+    assert_eq!(waited["waitTimedOut"], json!(false));
+    client
+        .wait_until(|client| client.task(helper).is_some_and(|task| task.delivered))
+        .await;
+    let helper_thread = client.project_thread(helper).expect("the subthread");
+    assert_eq!(
+        helper_thread.created_by,
+        Some(ThreadCreator::Thread(parent))
+    );
+    assert_eq!(
+        helper_thread.task.as_ref().map(|task| task.prompt.as_str()),
+        Some("hello")
+    );
+    // The child keeps the parent's mode.
+    client.subscribe_thread(ConnectionId::Thread(helper)).await;
+    assert_eq!(
+        config_value(client.thread(ConnectionId::Thread(helper)), "mode").as_deref(),
+        Some("plan")
+    );
+    // Subthreads aren't in the thread list, and only take their task.
+    let list = client.tool(parent, "agentz_thread_list", json!({})).await;
+    assert_eq!(thread_ids(&list), vec![parent.0]);
+    let refused = client
+        .request(Request::Prompt {
+            connection: ConnectionId::Thread(helper),
+            text: "more".into(),
+        })
+        .await;
+    assert!(refused.is_err());
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(parent),
+            "agentz_thread_send",
+            json!({"threadId": helper.0, "message": "more"}),
+        )
+        .await;
+    assert_eq!(code, "thread_not_sendable");
+
+    // An async task's end is announced to the parent, as sent by the task.
+    let started = client
+        .tool(parent, "delegate_task", json!({"task": "slow"}))
+        .await;
+    let slow = task_id(&started);
+    assert!(
+        matches!(started["status"].as_str(), Some("queued" | "running")),
+        "{started}"
+    );
+    let retried = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "slow", "clientRequestId": "once"}),
+        )
+        .await;
+    let again = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "slow", "clientRequestId": "once"}),
+        )
+        .await;
+    assert_eq!(retried["taskId"], again["taskId"]);
+    let once = task_id(&retried);
+    client
+        .wait_until(|client| {
+            client
+                .user_messages(parent)
+                .iter()
+                .any(|message| message.contains(&slow.0.to_string()))
+        })
+        .await;
+    let announced = client
+        .user_messages(parent)
+        .into_iter()
+        .find(|message| message.contains(&slow.0.to_string()))
+        .expect("an announcement");
+    assert!(announced.starts_with("Delegated task"), "{announced}");
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": slow.0}))
+        .await;
+    assert_eq!(status["status"], json!("completed"));
+    assert_eq!(status["summary"], json!("One two three four five"));
+    client
+        .wait_until(|client| client.task(once).is_some_and(|task| task.delivered))
+        .await;
+
+    // Cancelling ends the task without telling the parent.
+    let cancelled = task_id(
+        &client
+            .tool(parent, "delegate_task", json!({"task": "slow"}))
+            .await,
+    );
+    let cancel = client
+        .tool(
+            parent,
+            "task_cancel",
+            json!({"taskId": cancelled.0, "reason": "Not needed"}),
+        )
+        .await;
+    assert_eq!(cancel["status"], json!("cancel_requested"));
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": cancelled.0}))
+        .await;
+    assert_eq!(status["status"], json!("cancelled"));
+    assert_eq!(status["summary"], json!("Not needed"));
+    let cancel = client
+        .tool(parent, "task_cancel", json!({"taskId": cancelled.0}))
+        .await;
+    assert_eq!(cancel["status"], json!("cancelled"));
+
+    // A task that delegates ends only once its own task has ended and it has heard.
+    let outer = task_id(
+        &client
+            .tool(parent, "delegate_task", json!({"task": "slow"}))
+            .await,
+    );
+    client.wait_until_ready(outer).await;
+    let inner = task_id(
+        &client
+            .tool(outer, "delegate_task", json!({"task": "hello"}))
+            .await,
+    );
+    client
+        .wait_until(|client| {
+            client
+                .task(outer)
+                .is_some_and(|task| task.outcome.is_some())
+        })
+        .await;
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": outer.0}))
+        .await;
+    assert_eq!(status["status"], json!("completed"));
+    assert_eq!(
+        status["summary"],
+        json!(format!(
+            "Echo: Delegated task {} reached a terminal state. Use task_status with taskId {} to read the result.",
+            inner.0, inner.0
+        ))
+    );
+    assert_eq!(client.task(inner).map(|task| task.delivered), Some(true));
+
+    // The policy.
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(parent),
+            "task_status",
+            json!({"taskId": inner.0}),
+        )
+        .await;
+    assert_eq!(code, "task_not_found");
+    let code = client
+        .tool_failure(
+            ToolCaller::Directory(server.project_dir.path().into()),
+            "delegate_task",
+            json!({"task": "hello"}),
+        )
+        .await;
+    assert_eq!(code, "capability_denied");
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(parent),
+            "delegate_task",
+            json!({"task": "hello", "role": "boss"}),
+        )
+        .await;
+    assert_eq!(code, "invalid_request");
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(helper),
+            "delegate_task",
+            json!({"task": "hello"}),
+        )
+        .await;
+    assert_eq!(code, "parent_not_active");
+
+    // Deleting the parent deletes its subthreads.
+    client.ok(Request::DeleteThread(parent)).await;
+    client
+        .wait_until(|client| client.project_thread(helper).is_none())
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subthread_permission_requests_block_the_parent() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    let child = task_id(
+        &client
+            .tool(parent, "delegate_task", json!({"task": "permission"}))
+            .await,
+    );
+    let connection = ConnectionId::Thread(child);
+    client.subscribe_thread(connection).await;
+    client
+        .wait_until(|client| {
+            !client
+                .thread(connection)
+                .state
+                .permission_requests
+                .is_empty()
+                && client.projects.as_ref().is_some_and(|projects| {
+                    ProjectStoreSnapshot(projects).is_thread_or_subthread_blocked(parent)
+                })
+        })
+        .await;
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": child.0}))
+        .await;
+    assert_eq!(status["status"], json!("waiting"));
+    let tool_call_id = client.thread(connection).state.permission_requests[0]
+        .tool_call_id
+        .clone();
+    client
+        .ok(Request::RespondToPermission {
+            connection,
+            tool_call_id,
+            option_id: acp::PermissionOptionId::new("allow"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client
+                .task(child)
+                .is_some_and(|task| task.outcome.is_some())
+        })
+        .await;
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": child.0}))
+        .await;
+    assert_eq!(status["status"], json!("completed"));
+}
+
+/// The app's view of a snapshot, for the questions it asks of one.
+struct ProjectStoreSnapshot<'a>(&'a ProjectsSnapshot);
+
+impl ProjectStoreSnapshot<'_> {
+    fn is_thread_or_subthread_blocked(&self, thread_id: ThreadId) -> bool {
+        projects::ProjectStore::from_snapshot(self.0.clone())
+            .is_thread_or_subthread_blocked(thread_id)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tasks_running_when_the_server_stops_end_as_interrupted() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    let child = task_id(
+        &client
+            .tool(parent, "delegate_task", json!({"task": "slow"}))
+            .await,
+    );
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+
+    let Some(server) = TestServer::start_with(server.data_dir, server.project_dir) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let outcome = client
+        .task(child)
+        .and_then(|task| task.outcome.clone())
+        .expect("the task ended");
+    assert_eq!(outcome.end, projects::TaskEnd::Interrupted);
+    // The parent is told once the server is back.
+    client.subscribe_thread(ConnectionId::Thread(parent)).await;
+    client
+        .wait_until(|client| {
+            client
+                .user_messages(parent)
+                .iter()
+                .any(|message| message.starts_with("Delegated task"))
+        })
+        .await;
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": child.0}))
+        .await;
+    assert_eq!(status["status"], json!("interrupted"));
 }
