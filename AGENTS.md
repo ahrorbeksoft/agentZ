@@ -109,8 +109,8 @@ Data lives in `~/Library/Application Support/agentZ/`:
   or sending `initialize` is fine. Logging the user out of a real agent is not.
 - **Never steal focus or the mouse.** Don't bring windows to the front while the user is working.
   See Testing for how to take screenshots.
-- **Commit after each finished change** with a clear, imperative message that explains why. Don't
-  push.
+- **Commit after each finished change** with a clear, imperative message that explains why, and
+  push it (`git push origin main`) right after.
 - Answer briefly and plainly. Say what you couldn't verify.
 
 ## Code conventions
