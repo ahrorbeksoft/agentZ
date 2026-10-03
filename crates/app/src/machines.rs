@@ -210,6 +210,24 @@ pub fn init(cx: &mut App) {
     cx.set_global(GlobalMachines(machines));
 }
 
+/// Machines of the given clients only, for the views' tests.
+#[cfg(test)]
+pub fn init_for_test(clients: Vec<Entity<ServerClient>>, cx: &mut App) {
+    let settings = AppSettingsStore::global(cx);
+    let machines = cx.new(|cx| {
+        let mut this = Machines {
+            clients: Vec::new(),
+            subscriptions: HashMap::default(),
+            _settings_subscription: cx.observe(&settings, |_: &mut Machines, _, _| {}),
+        };
+        for client in clients {
+            this.add(client, cx);
+        }
+        this
+    });
+    cx.set_global(GlobalMachines(machines));
+}
+
 impl Machines {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalMachines>().0.clone()

@@ -138,15 +138,15 @@ From Zed's guidelines, which this code follows:
 - **The app against a scratch server:** set `AGENTZ_DATA_DIR` to a temporary directory and put
   the mock agent in its `agents/custom.json`. The app starts a server for that directory. Stop it
   afterwards with `AGENTZ_DATA_DIR=<dir> ./target/debug/agentz-server stop`.
-- **UI behavior (hover, layout, focus, timing):** write a temporary headless GPUI test in the
-  crate:
-  - Add `[dev-dependencies]` for `gpui` and `http_client` with the `test-support` feature.
-  - Build the real view: `crate::init_theme`, `projects::init`, and
-    `registry::init(FakeHttpClient::with_404_response(), Task::ready(()).shared(), cx)`, then
+- **UI behavior (hover, layout, focus, timing):** headless GPUI tests in `crates/app`
+  (`gpui` with `test-support` is a dev-dependency). `spaces_view::tests` is the example:
+  - `crate::init_for_test` sets up themes and key bindings without the user's settings;
+    `ServerClient::new_for_test` is a client that never connects, holding given state (add what
+    a test needs), and `machines::init_for_test` makes it the machines' only client. Then
     `cx.add_window_view`.
-  - Probe with `.debug_selector(|| "name".into())` and `cx.debug_bounds("name")`. Drive it with
+  - Probe with `.debug_selector(..)` (a no-op outside tests) and `cx.debug_bounds("name")`. Drive
+    it with `simulate_click`, `simulate_keystrokes` (which also checks key bindings),
     `simulate_mouse_move` and `executor().advance_clock(..)`.
-  - Restore the files afterwards. These tests were never committed.
 - **Screenshots without bothering the user:**
   - Temporarily remove `cx.activate(true)`, and set `focus: false` and
     `kind: gpui::WindowKind::PopUp` in `main.rs`, with bounds about 1160×740 in a corner of the

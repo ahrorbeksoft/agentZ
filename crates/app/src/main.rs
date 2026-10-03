@@ -100,6 +100,24 @@ fn init_theme(cx: &mut App) {
     app_settings::init(cx);
 }
 
+/// What the views need in a headless test, without the user's settings or servers.
+#[cfg(test)]
+fn init_for_test(cx: &mut App) {
+    theme::init(LoadThemes::All(Box::new(Assets)), cx);
+    theme_json::load_bundled_themes(&ThemeRegistry::global(cx));
+    theme::set_theme_settings_provider(
+        Box::new(AppThemeSettings {
+            ui_font: gpui::font(UI_FONT_FAMILY),
+            buffer_font: gpui::font(MONO_FONT_FAMILY),
+        }),
+        cx,
+    );
+    app_settings::init_for_test(cx);
+    text_input::init(cx);
+    terminal_view::init(cx);
+    spaces_view::init(cx);
+}
+
 fn init_actions(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.bind_keys([

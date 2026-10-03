@@ -8,7 +8,7 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 11: the headless layout test, and trying the shortcuts by hand.
+**Next:** Nothing scheduled. Every phase of the plan is done; ask the user what's next.
 
 | Phase | Status |
 |---|---|
@@ -23,7 +23,7 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 8. Terminal agent detection | Done |
 | 9. Machines over SSH | Done |
 | 10. Polish | Done |
-| 11. Workspaces view | In progress |
+| 11. Workspaces view | Done |
 
 ## 0. Spike
 
@@ -342,7 +342,7 @@ Then the server:
   - [x] state, machine, workspace, tab, agent;
   - [x] clicking a row focuses its pane, or opens it in Agents when it isn't in one.
 - [x] Tabs: new, rename, close, reorder, next/previous.
-- [ ] Panes:
+- [x] Panes:
   - [x] split right/down (Zed's split menu in the pane header, and its right-click menu);
   - [x] drag to resize (`SetSplitRatio` on drop);
   - [x] zoom, swap (drag a pane's header onto another), close;
@@ -359,15 +359,15 @@ Then the server:
   - [x] Cmd-Option-arrows move between panes;
   - [x] Cmd-Shift-N new workspace.
 
-  All hold Cmd, which terminals never receive. Not yet pressed by hand: screenshots can't
-  send keys without focusing the window.
-- [ ] Tests:
+  All hold Cmd, which terminals never receive. The headless test presses Cmd-Shift-Enter
+  and Cmd-Option-Left with a terminal pane focused.
+- [x] Tests:
   - [x] the pane tree (split, close, resize, swap): herdr's `TileLayout` ported to
         `agentz_protocol::layout` with its tests;
   - [x] save and restore (`spaces_are_saved_restored_and_streamed`, and the store's tests);
-  - [ ] a headless UI test of the layout. The view now needs a server client, so it needs a
-        scratch server or a fake `ServerClient`. Checked with PopUp screenshots instead
-        (two workspaces, split panes, blocked, working and finished mock threads).
+  - [x] a headless UI test of the layout (`panes_are_laid_out_as_their_tree_says`): split
+        ratios, the agents list and clicking a row, and zoom and pane focus through their keys
+        while a terminal pane has focus. It uses a `ServerClient` that never connects.
 
 ## Findings
 
@@ -689,3 +689,7 @@ Then the server:
 - 2026-10-03: Phase 11, step 4: the agents list, the shortcuts (with Enter and Escape for the
   Workspaces rename and search fields, which had none), terminal sizing by the last-used view.
   Checked on screen against a scratch server.
+- 2026-10-03: Moved the Agents | Workspaces tabs to the right end of the title bar, at the
+  user's request.
+- 2026-10-03: Finished phase 11: the headless layout test, with test-only clients and
+  settings so the app's views can be tested without a server.

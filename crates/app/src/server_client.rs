@@ -353,6 +353,22 @@ impl ServerClient {
         self.terminals.insert(key, terminal);
     }
 
+    /// A client that never connects, holding the given spaces, for the views' tests.
+    #[cfg(test)]
+    pub fn new_for_test(
+        machine: MachineId,
+        label: SharedString,
+        spaces: SpacesSnapshot,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let client = Self::new(machine, label, Transport::Local, cx);
+        client.update(cx, |client, _| {
+            client._maintain_connection = Task::ready(());
+            client.spaces = spaces;
+        });
+        client
+    }
+
     fn connected(&mut self, connection: Connection, is_outdated: bool, cx: &mut Context<Self>) {
         log::info!(
             "connected to agentz-server {} on {} (pid {})",

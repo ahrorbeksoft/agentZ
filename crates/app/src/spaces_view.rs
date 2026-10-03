@@ -14,7 +14,7 @@ use agentz_protocol::spaces::{
     Pane, PaneAgentState, PaneContent, PaneTerminal, Space, SpaceId, SpaceRequest, Tab, TabId,
 };
 use agentz_protocol::terminal::TerminalKey;
-use agentz_protocol::{CAPABILITY_SPACES, Request, Response};
+use agentz_protocol::{Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
@@ -314,10 +314,8 @@ impl SpacesView {
     fn all_spaces(&self, cx: &App) -> Vec<(MachineId, Space)> {
         let mut spaces = Vec::new();
         for client in self.machines.read(cx).clients() {
+            // An older server without spaces sends none.
             let client = client.read(cx);
-            if !client.has_capability(CAPABILITY_SPACES) {
-                continue;
-            }
             for space in &client.spaces().spaces {
                 spaces.push((client.machine(), space.clone()));
             }
@@ -1459,6 +1457,7 @@ impl SpacesView {
 
         h_flex()
             .id(ElementId::Name(format!("workspace-agent-{index}").into()))
+            .debug_selector(|| format!("agent-row-{index}"))
             .h(ARCHIVED_ROW_HEIGHT)
             .w_full()
             .px_2()
@@ -2075,6 +2074,7 @@ impl SpacesView {
 
         v_flex()
             .id(key.element_id("pane"))
+            .debug_selector(|| format!("pane-{}", key.pane.0))
             .size_full()
             .when(shows_focus, |pane| {
                 pane.border_1().border_color(if is_focused {
@@ -2403,7 +2403,127 @@ fn first_pane(node: &Node) -> PaneId {
 
 #[cfg(test)]
 mod tests {
+    use agentz_protocol::spaces::{PaneAgent, SpacesSnapshot};
+    use gpui::TestAppContext;
+
     use super::*;
+    use crate::server_client::ServerClient;
+
+    fn pane(id: u64, agent: Option<PaneAgent>) -> Pane {
+        Pane {
+            id: PaneId(id),
+            content: PaneContent::Unknown(serde_json::Value::Null),
+            agent,
+        }
+    }
+
+    /// A tab of three panes: a quarter on the left, and the rest split in half, top and
+    /// bottom. The bottom pane runs an agent.
+    fn spaces() -> SpacesSnapshot {
+        let root = Node::Split {
+            direction: Direction::Horizontal,
+            ratio: 0.25,
+            first: Box::new(Node::Pane(PaneId(3))),
+            second: Box::new(Node::Split {
+                direction: Direction::Vertical,
+                ratio: 0.5,
+                first: Box::new(Node::Pane(PaneId(4))),
+                second: Box::new(Node::Pane(PaneId(5))),
+            }),
+        };
+        let mut agent_pane = pane(
+            5,
+            Some(PaneAgent {
+                name: "Claude Code".to_string(),
+                state: PaneAgentState::Working,
+            }),
+        );
+        agent_pane.content = PaneContent::Terminal(PaneTerminal {
+            folder: PathBuf::from("/tmp/demo"),
+            command: Some("claude".to_string()),
+        });
+        SpacesSnapshot {
+            spaces: vec![Space {
+                id: SpaceId(1),
+                name: None,
+                folder: PathBuf::from("/tmp/demo"),
+                project_id: None,
+                tabs: vec![Tab {
+                    id: TabId(2),
+                    name: None,
+                    root,
+                    panes: vec![pane(3, None), pane(4, None), agent_pane],
+                }],
+                git: None,
+            }],
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.02,
+            "expected about {expected}, got {actual}"
+        );
+    }
+
+    #[gpui::test]
+    fn panes_are_laid_out_as_their_tree_says(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client =
+                ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(), cx);
+            crate::machines::init_for_test(vec![client], cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+
+        let bounds = |cx: &mut gpui::VisualTestContext, name: &'static str| cx.debug_bounds(name);
+        let left = bounds(cx, "pane-3").expect("the left pane is drawn");
+        let top = bounds(cx, "pane-4").expect("the top pane is drawn");
+        let bottom = bounds(cx, "pane-5").expect("the bottom pane is drawn");
+        let width = f32::from(top.right() - left.left());
+        assert_close(f32::from(left.size.width) / width, 0.25);
+        assert!(top.left() > left.right());
+        assert_eq!(top.left(), bottom.left());
+        assert_eq!(top.size.width, bottom.size.width);
+        assert!(bottom.top() > top.bottom());
+        let height = f32::from(bottom.bottom() - top.top());
+        assert_close(f32::from(top.size.height) / height, 0.5);
+        assert_eq!(left.top(), top.top());
+        assert_eq!(left.bottom(), bottom.bottom());
+
+        // The agent in the bottom pane is listed, and clicking it focuses its pane.
+        let row = bounds(cx, "agent-row-0").expect("the agent is listed");
+        assert!(bounds(cx, "agent-row-1").is_none());
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
+        assert_eq!(
+            focused,
+            Some(PaneKey {
+                machine: MachineId::Local,
+                pane: PaneId(5),
+            })
+        );
+
+        // Zoomed, the focused pane fills the tab alone. The keys reach the view past the
+        // focused terminal.
+        cx.simulate_keystrokes("cmd-shift-enter");
+        cx.run_until_parked();
+        assert!(bounds(cx, "pane-3").is_none());
+        assert!(bounds(cx, "pane-4").is_none());
+        let zoomed = bounds(cx, "pane-5").expect("the zoomed pane is drawn");
+        assert_eq!(zoomed.left(), left.left());
+        assert_eq!(zoomed.top(), left.top());
+        assert_eq!(zoomed.right(), top.right());
+        assert_eq!(zoomed.bottom(), bottom.bottom());
+
+        // Back from zoom, the left pane is to the left of the focused one.
+        cx.simulate_keystrokes("cmd-shift-enter cmd-alt-left");
+        cx.run_until_parked();
+        let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
+        assert_eq!(focused.map(|pane| pane.pane), Some(PaneId(3)));
+    }
 
     #[test]
     fn rolled_up_state_follows_herdr() {

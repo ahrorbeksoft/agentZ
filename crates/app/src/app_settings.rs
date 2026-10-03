@@ -129,6 +129,19 @@ pub fn init(cx: &mut App) {
     cx.set_global(GlobalAppSettings(store));
 }
 
+/// Default settings, never read from or saved to the user's file.
+#[cfg(test)]
+pub fn init_for_test(cx: &mut App) {
+    let settings = AppSettings::default();
+    apply_theme(&settings, cx);
+    let store = cx.new(|_| AppSettingsStore {
+        settings,
+        path: std::env::temp_dir().join("agentz-test-settings.json"),
+        _save: None,
+    });
+    cx.set_global(GlobalAppSettings(store));
+}
+
 impl AppSettingsStore {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalAppSettings>().0.clone()
