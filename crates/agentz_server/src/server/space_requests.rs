@@ -11,6 +11,7 @@ use agentz_protocol::spaces::{
 };
 use agentz_protocol::terminal::TerminalKey;
 use anyhow::{Context as _, Result, anyhow};
+use projects::ThreadId;
 use util::ResultExt as _;
 
 use super::{Input, Server};
@@ -238,10 +239,20 @@ impl Server {
         self.end_panes(closed);
     }
 
+    /// Also the branches of the folders terminal threads are in, which change without the
+    /// terminal noticing (a checkout in another window).
     fn refresh_spaces_git(&mut self) {
         let spaces: Vec<SpaceId> = self.spaces.spaces().iter().map(|space| space.id).collect();
         for space in spaces {
             self.refresh_space_git(space);
+        }
+        let folders: Vec<(ThreadId, PathBuf)> = self
+            .projects
+            .terminal_folders()
+            .map(|(thread_id, folder)| (thread_id, folder.path.clone()))
+            .collect();
+        for (thread_id, path) in folders {
+            self.refresh_terminal_folder(thread_id, path);
         }
     }
 

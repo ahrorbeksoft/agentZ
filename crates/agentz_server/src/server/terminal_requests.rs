@@ -21,6 +21,7 @@ use super::{ClientId, Input, Server, send_to};
 use crate::detect::{self, Agent, AgentState, AgentTracker, DetectionInput, ProcessObservation};
 use crate::terminal_programs;
 use crate::terminals::{Terminal, TerminalSize, TerminalSpawn, frame_changes};
+use projects::TerminalFolder;
 
 /// Screens are sent at most this often, however fast the output.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -276,6 +277,7 @@ impl Server {
             TerminalKey::Thread(thread_id) => {
                 self.publish_terminal_agent(*thread_id, None, AgentState::Unknown);
                 self.projects.set_terminal_command(*thread_id, None);
+                self.projects.set_terminal_folder(*thread_id, None);
             }
             TerminalKey::Pane(pane) => self.spaces.set_pane_agent(*pane, None),
             TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
@@ -440,6 +442,7 @@ impl Server {
                 .set_terminal_command(thread_id, command.or(program));
         }
         for (thread_id, folder) in folders {
+            self.refresh_terminal_folder(thread_id, folder.clone());
             // A shell is named after where it is; one started with a command keeps its name.
             let is_shell = self
                 .projects
@@ -486,6 +489,32 @@ impl Server {
         );
         self.projects
             .set_thread_blocked(thread_id, state == AgentState::Blocked);
+    }
+
+    /// Looks up the branch of the folder a terminal thread is in, and shows the folder with it
+    /// once known. A folder that's been left by then is dropped.
+    pub(super) fn refresh_terminal_folder(&mut self, thread_id: ThreadId, path: PathBuf) {
+        let lookup = path.clone();
+        self.spawn_then(
+            async move { crate::spaces::space_git(&lookup).await },
+            move |server, git| {
+                let is_current = server
+                    .terminals
+                    .running
+                    .get(&TerminalKey::Thread(thread_id))
+                    .is_some_and(|running| running.folder.as_ref() == Some(&path));
+                if is_current {
+                    server.projects.set_terminal_folder(
+                        thread_id,
+                        Some(TerminalFolder {
+                            path,
+                            is_repository: git.is_some(),
+                            branch: git.and_then(|git| git.branch),
+                        }),
+                    );
+                }
+            },
+        );
     }
 
     pub(super) fn terminal_changed(&mut self, key: TerminalKey) {

@@ -454,6 +454,8 @@ impl Sidebar {
         machine: MachineId,
         thread: &Thread,
         is_archived: bool,
+        // A shell only renames and deletes: it isn't archived, nor tied to its project.
+        is_shell: bool,
         cx: &mut Context<Self>,
     ) -> impl Fn(&mut Window, &mut App) -> Entity<ContextMenu> + 'static {
         let sidebar = cx.entity().downgrade();
@@ -548,13 +550,21 @@ impl Sidebar {
                             .ok();
                     }
                 };
-                menu.item(
+                let menu = menu.item(
                     ContextMenuEntry::new("Rename")
                         .icon(IconName::Pencil)
                         .icon_color(Color::Muted)
                         .handler(rename),
-                )
-                .item(
+                );
+                if is_shell {
+                    return menu.separator().item(
+                        ContextMenuEntry::new("Delete…")
+                            .icon(IconName::Trash)
+                            .icon_color(Color::Muted)
+                            .handler(delete),
+                    );
+                }
+                menu.item(
                     ContextMenuEntry::new(if is_archived { "Unarchive" } else { "Archive" })
                         .icon(if is_archived {
                             IconName::Undo
@@ -982,7 +992,7 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(machine, &thread, false, cx);
+        let menu = self.thread_menu(machine, &thread, false, false, cx);
         right_click_menu(thread_element_id("thread-menu", thread_id))
             .trigger(move |is_menu_open, _, _| {
                 div()
@@ -1057,7 +1067,28 @@ impl Sidebar {
         let is_renaming = self.renaming_thread == Some(thread_id);
         let is_offline = !self.machines.read(cx).is_online(machine, cx);
         let project = store.read(cx).project(thread.project_id).cloned();
-        let project_icon = self.render_project_icon(machine, project.as_ref(), cx);
+        // Where a shell is now, once its server has said.
+        let folder = (!is_archived)
+            .then(|| store.read(cx).terminal_folder(thread.id).cloned())
+            .flatten();
+        let project_icon = match &folder {
+            // The project the shell is in, or a plain folder outside every project.
+            Some(folder) => match project_at(store.read(cx).projects(), &folder.path) {
+                Some(project) => self.render_project_icon(machine, Some(project), cx),
+                // In a slot as wide as a project's icon, so titles line up.
+                None => h_flex()
+                    .size_4()
+                    .flex_none()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            },
+            None => self.render_project_icon(machine, project.as_ref(), cx),
+        };
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let time = if is_archived {
             thread.archived_at
@@ -1075,12 +1106,22 @@ impl Sidebar {
             })
             .flatten();
         let faint_text = colors.text_muted.opacity(0.4);
+        let checkout = (!is_archived)
+            .then(|| self.thread_checkout(machine, &thread, cx))
+            .flatten();
+        // The branch where the shell is, and the worktree or pasture marker while it's in its
+        // own. Before its server says where it is, the checkout it started in.
+        let (branch, checkout) = match &folder {
+            Some(folder) => (
+                folder.branch.clone(),
+                checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
+            ),
+            None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
+        };
+        let is_repository = folder.as_ref().is_none_or(|folder| folder.is_repository);
+        // Outside a repository there's nothing to say under the title, unless something runs.
         let detail_line =
-            (!is_archived).then(|| {
-                // The title names the folder the shell is in; this is the checkout it
-                // started in.
-                let checkout = self.thread_checkout(machine, &thread, cx);
-                let branch = checkout.as_ref().and_then(ThreadCheckout::branch);
+            (!is_archived && (is_repository || running.is_some())).then(|| {
                 // Under the title, past the icon and the gap.
                 h_flex()
                     .pl(px(26.))
@@ -1210,7 +1251,7 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(machine, &thread, is_archived, cx);
+        let menu = self.thread_menu(machine, &thread, is_archived, !is_archived, cx);
         right_click_menu(thread_element_id(
             &format!("{prefix}-thread-menu"),
             thread_id,
@@ -1773,8 +1814,45 @@ fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_relative_time;
+    use super::{format_relative_time, project_at};
+    use projects::{Project, ProjectId, Workspace, WorkspaceKind};
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
+
+    fn project(id: u64, path: &str, workspaces: &[&str]) -> Project {
+        Project {
+            id: ProjectId(id),
+            path: PathBuf::from(path),
+            custom_name: None,
+            icon: None,
+            workspaces: workspaces
+                .iter()
+                .map(|path| Workspace {
+                    kind: WorkspaceKind::Worktree,
+                    path: PathBuf::from(path),
+                    branch: None,
+                    base: None,
+                    created_at: SystemTime::UNIX_EPOCH,
+                })
+                .collect(),
+            repository: None,
+        }
+    }
+
+    #[test]
+    fn a_folder_belongs_to_the_deepest_project_holding_it() {
+        let projects = [
+            project(1, "/code", &[]),
+            project(2, "/code/api", &["/worktrees/api-fix"]),
+        ];
+        let id = |folder: &str| project_at(&projects, Path::new(folder)).map(|project| project.id);
+        assert_eq!(id("/code/api/src"), Some(ProjectId(2)));
+        assert_eq!(id("/code/web"), Some(ProjectId(1)));
+        assert_eq!(id("/worktrees/api-fix/src"), Some(ProjectId(2)));
+        // A sibling whose name only starts the same isn't inside.
+        assert_eq!(id("/code/api-old"), Some(ProjectId(1)));
+        assert_eq!(id("/tmp"), None);
+    }
 
     #[test]
     fn relative_times() {
@@ -1843,4 +1921,18 @@ pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElem
         .size_1p5()
         .rounded_full()
         .bg(color.color(cx))
+}
+
+/// The project a folder is in: the deepest whose folder, worktree or pasture holds it.
+fn project_at<'a>(projects: &'a [Project], folder: &Path) -> Option<&'a Project> {
+    projects
+        .iter()
+        .flat_map(|project| {
+            std::iter::once(&project.path)
+                .chain(project.workspaces.iter().map(|workspace| &workspace.path))
+                .filter(|root| folder.starts_with(root))
+                .map(move |root| (root.components().count(), project))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, project)| project)
 }

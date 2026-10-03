@@ -721,3 +721,6 @@ Then the server:
 - 2026-10-03: Shell rows: named after the shell's current folder (read from the foreground
   process's working directory, as herdr does), with the checkout's branch, last activity, and
   Running with the program in front. Terminal output counts as activity.
+- 2026-10-03: Shell rows follow the current folder: its project's icon (else a folder), its
+  branch (refreshed with the workspaces' every 5 s; no line outside git). Their menu is Rename
+  and Delete.

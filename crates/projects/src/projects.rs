@@ -303,6 +303,19 @@ pub struct ProjectsSnapshot {
     pub terminal_agents: Vec<(ThreadId, String)>,
     /// Terminal threads running a program in front of their shell, with its name.
     pub terminal_commands: Vec<(ThreadId, String)>,
+    /// Where each terminal thread's foreground process is.
+    pub terminal_folders: Vec<(ThreadId, TerminalFolder)>,
+}
+
+/// The folder a terminal's foreground process works in, and its git branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalFolder {
+    pub path: PathBuf,
+    /// `None` outside a git repository, or on a detached head.
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub is_repository: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -338,6 +351,8 @@ pub struct ProjectStore {
     terminal_agents: BTreeMap<ThreadId, String>,
     /// Terminal threads running a program in front of their shell. Not persisted either.
     terminal_commands: BTreeMap<ThreadId, String>,
+    /// Where terminal threads' foreground processes are. Not persisted either.
+    terminal_folders: BTreeMap<ThreadId, TerminalFolder>,
     /// Counts changes, so the owner can tell whether a call changed anything.
     revision: u64,
     saver: Option<Saver<PersistedState>>,
@@ -367,6 +382,7 @@ impl ProjectStore {
             blocked_threads: HashSet::default(),
             terminal_agents: BTreeMap::new(),
             terminal_commands: BTreeMap::new(),
+            terminal_folders: BTreeMap::new(),
             revision: 0,
             saver: state_path.map(|path| Saver::new(path, "projects-saver")),
         };
@@ -580,6 +596,8 @@ impl ProjectStore {
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_commands
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
+        self.terminal_folders
+            .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
         }
@@ -758,6 +776,7 @@ impl ProjectStore {
                 self.blocked_threads.remove(&id);
                 self.terminal_agents.remove(&id);
                 self.terminal_commands.remove(&id);
+                self.terminal_folders.remove(&id);
             }
             self.changed();
         }
@@ -970,6 +989,30 @@ impl ProjectStore {
         }
     }
 
+    /// Where a terminal thread's foreground process is, if known.
+    pub fn terminal_folder(&self, id: ThreadId) -> Option<&TerminalFolder> {
+        self.terminal_folders.get(&id)
+    }
+
+    pub fn terminal_folders(&self) -> impl Iterator<Item = (ThreadId, &TerminalFolder)> {
+        self.terminal_folders
+            .iter()
+            .map(|(id, folder)| (*id, folder))
+    }
+
+    pub fn set_terminal_folder(&mut self, id: ThreadId, folder: Option<TerminalFolder>) {
+        let changed = match folder {
+            Some(folder) if self.thread(id).is_some() => {
+                self.terminal_folders.insert(id, folder.clone()) != Some(folder)
+            }
+            Some(_) => false,
+            None => self.terminal_folders.remove(&id).is_some(),
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
     pub fn record_thread_activity(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.last_activity_at = Some(SystemTime::now());
@@ -1001,6 +1044,11 @@ impl ProjectStore {
                 .iter()
                 .map(|(id, command)| (*id, command.clone()))
                 .collect(),
+            terminal_folders: self
+                .terminal_folders
+                .iter()
+                .map(|(id, folder)| (*id, folder.clone()))
+                .collect(),
         }
     }
 
@@ -1021,6 +1069,7 @@ impl ProjectStore {
         this.blocked_threads = snapshot.blocked_threads.into_iter().collect();
         this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
         this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
+        this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
         this
     }
 

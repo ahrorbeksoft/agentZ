@@ -1996,10 +1996,35 @@ async fn terminal_threads_show_where_they_are_and_what_runs() {
     client
         .wait_until(move |client| title(client).as_deref() == Some(project_name.as_str()))
         .await;
-    std::fs::create_dir(server.project_dir.path().join("inner")).expect("folder");
+    // A repository of its own, so its branch shows the shell follows the folder.
+    let inner = server.project_dir.path().join("inner");
+    std::fs::create_dir(&inner).expect("folder");
+    crate::git::git(
+        &inner,
+        &["init", "--quiet", "--initial-branch", "elsewhere"],
+        &[],
+    )
+    .await
+    .expect("git");
     client.type_into(&key, "cd inner\n").await;
     client
         .wait_until(move |client| title(client).as_deref() == Some("inner"))
+        .await;
+    let folder = move |client: &TestClient| {
+        snapshot(client)
+            .terminal_folders
+            .iter()
+            .find(|(id, _)| *id == thread_id)
+            .map(|(_, folder)| folder.clone())
+    };
+    client
+        .wait_until(move |client| {
+            folder(client).is_some_and(|folder| {
+                folder.path.ends_with("inner")
+                    && folder.is_repository
+                    && folder.branch.as_deref() == Some("elsewhere")
+            })
+        })
         .await;
 
     // A program in front of the shell is running there, until it ends.
