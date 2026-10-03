@@ -531,6 +531,67 @@ Worktrees share `.git` with the project, so their branches are already there.
 - Settings gains a **Machines** page. Each machine's agents (install, log in, defaults) are
   managed from its own Settings.
 
+### Workspaces view (herdr's layout)
+
+The user asked for this on 2026-10-03. The app gets two views, chosen by tabs in the title bar:
+**Agents | Workspaces**.
+
+**Agents** is the current app: the t3code sidebar, with one thread **full screen** in the main
+area. Every agent shows up here:
+
+- ACP threads;
+- terminal threads, including terminal agents like `claude`;
+- agents that are open in a workspace pane.
+
+**Workspaces** is herdr's model (`references/herdr`: `concepts.mdx`, `keyboard.mdx`,
+`configuration.mdx` § Sidebar row layouts, `session-state.mdx`, `src/layout.rs`,
+`src/workspace/`):
+
+- **Sidebar, top: workspaces.** Search, and a **+** button. Rows follow herdr's space rows:
+  rolled-up state icon and name, then branch and ahead/behind.
+- **Sidebar, bottom: agents.** Every agent, in the slim one-line style of the Archived shelf.
+  Rows follow herdr's agent rows: state icon, machine (only with several machines), workspace,
+  tab, agent. Clicking one focuses its pane.
+- **The + picker** creates a workspace rooted at one of:
+  - a project (one of its checkouts, worktrees or pastures, on any machine);
+  - a machine's home folder (`~` on Local, `t3-home`, `devbox1`, …).
+  - It opens with one terminal pane there.
+- **Each workspace has tabs**, shown in a tab bar above the panes.
+- **Each tab is a tree of split panes**, herdr's `TileLayout`:
+  - split right or down;
+  - drag borders to resize;
+  - zoom, swap, close.
+- **A pane holds a terminal or an agent:**
+  - a shell;
+  - an agent CLI like `claude` (a terminal thread);
+  - an ACP agent thread, new or existing.
+
+  An ACP thread in a pane is the same thread as in Agents, shown at the pane's size there and
+  full screen there. Any size or shape works in a pane.
+- **Mouse first**, as herdr is: click to focus, drag borders, right-click menus. Keyboard
+  bindings cover herdr's actions (new tab, split right/down, move between panes, zoom, close,
+  next/previous tab, new workspace, goto picker). As a GUI app, agentZ uses direct chords
+  instead of herdr's terminal prefix. See the open question on which chords.
+
+**Where the state lives** follows herdr's runtime/client rule: workspaces, tabs and the pane
+tree are shared session state.
+
+- They live in the server of the workspace's machine, are saved, and come back after a server
+  restart. herdr's "snapshot restore": terminal panes come back as new shells in their saved
+  folders, and agent threads reattach.
+- A workspace belongs to one machine, the one its folder is on.
+- Which tab is shown, sidebar sizes and the focused pane are client-only presentation state.
+
+**Sizes.** A terminal open both in a pane and full screen in Agents follows the view the user
+last interacted with. That's herdr's rule for one terminal viewed by several clients.
+
+**Building blocks:**
+
+- The split tree, resizing and borders are a port of herdr's `TileLayout`, or Zed's
+  `workspace::pane_group` (GPL, so it's fine in the app).
+- Panes reuse phase 7's terminal view and the thread view.
+- A pane thread view is the existing `agent_view` with a compact header.
+
 ## Phases
 
 Each phase ships on its own, keeps the app working, and is committed.
@@ -583,6 +644,13 @@ Each phase ships on its own, keeps the app working, and is committed.
    - optional start at login (launchd/systemd user service);
    - confirmed remote server updates;
    - per-machine "Stop server".
+
+11. **Workspaces view:**
+    - the Agents | Workspaces tabs;
+    - server-side workspaces, tabs and pane trees, saved and restored;
+    - the workspaces sidebar with search, **+** and the agents list;
+    - split panes holding terminals and agent threads;
+    - mouse and keyboard actions.
 
 Everything after phase 1 depends on it. Phase 4 needs 3. Phase 8 needs 7. The workspace tools
 need phase 3. Otherwise phases 3–8 and 9 can go in any order.

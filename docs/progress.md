@@ -23,6 +23,7 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 8. Terminal agent detection | Done |
 | 9. Machines over SSH | In progress |
 | 10. Polish | Not started |
+| 11. Workspaces view | Not started |
 
 ## 0. Spike
 
@@ -287,6 +288,35 @@ Then the server:
 - [ ] Remote server updates, only after the user confirms.
 - [ ] Per-machine "Stop server".
 
+## 11. Workspaces view
+
+- [ ] Title bar tabs: **Agents** (the current app, a thread full screen) | **Workspaces**.
+- [ ] Server: workspaces (machine plus folder), tabs, and pane trees (herdr's `TileLayout`):
+  - [ ] saved;
+  - [ ] restored after a restart, terminals as new shells in their folders, threads
+        reattached;
+  - [ ] streamed to clients.
+- [ ] Workspaces sidebar:
+  - [ ] search;
+  - [ ] **+** picker: a project checkout, worktree or pasture, or a machine's home folder;
+  - [ ] rows with rolled-up state, name, branch and ahead/behind.
+- [ ] Agents list at the bottom of the sidebar:
+  - [ ] slim rows like the Archived shelf;
+  - [ ] state, machine, workspace, tab, agent;
+  - [ ] clicking a row focuses its pane.
+- [ ] Tabs: new, rename, close, reorder, next/previous.
+- [ ] Panes:
+  - [ ] split right/down;
+  - [ ] drag to resize;
+  - [ ] zoom, swap, close;
+  - [ ] focus by click and keyboard.
+- [ ] A pane can hold a shell, an agent CLI, or an ACP thread (new or existing). The thread is
+      the same one shown in Agents.
+- [ ] A terminal shown in two places follows the size of the view last interacted with.
+- [ ] Keyboard chords for herdr's actions (see open questions).
+- [ ] Tests: the pane tree (split, close, resize, swap), save and restore, and a headless UI
+      test of the layout.
+
 ## Findings
 
 - 2026-10-03: The latest t3code (b4d3d51a) has an orchestrator MCP that already does most of
@@ -525,6 +555,14 @@ Then the server:
 
 ## Open questions
 
+- **Workspaces view details.** The user's wishes, as written in the plan, rest on some
+  assumptions. Confirm or correct them before phase 11:
+  - **Keyboard chords:** iTerm/Zed-style direct chords (for example Cmd-T new tab, Cmd-D split
+    right, Cmd-Shift-D split down, Cmd-W close pane), or herdr's Ctrl-B prefix?
+  - **Agents list scope:** every agent on every machine, or only those in workspaces? herdr
+    lists the agents in panes.
+  - **Server-side workspaces:** shared and restored after restarts, as herdr does them?
+
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
   argument: instant, dependencies ready) or a worktree (t3code and herdr) when both are
   possible? The plan offers both, with the current checkout as the default.
@@ -589,3 +627,5 @@ Then the server:
 - 2026-10-03: Phase 9: an older server left running on a machine is detected and replaced
   only after the user confirms. Fixed `agentz-server proxy` lingering after its server quit.
 - 2026-10-03: Phase 9: each server resolves its projects' repository identity.
+- 2026-10-03: Added phase 11, the Workspaces view (herdr's workspaces, tabs and panes) next to
+  the Agents view, at the user's request.
