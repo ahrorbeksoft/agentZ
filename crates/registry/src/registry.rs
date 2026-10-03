@@ -3,10 +3,12 @@
 //!
 //! Ported from Zed's `project::agent_registry_store` and the registry parts of
 //! `project::agent_server_store`, without Zed's settings and fs layers. npx agents run with
-//! the system's `node`/`npm`.
+//! the system's Node.js, or one downloaded for them ([`node_runtime`]).
 //!
 //! Plain Rust on tokio, so the server can own it. Background work reports back as
 //! [`RegistryMessage`]s, which the store's owner passes to [`AgentRegistryStore::handle`].
+
+mod node_runtime;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,8 @@ use serde::Deserialize;
 use tokio::task::JoinSet;
 use url::Url;
 use util::ResultExt as _;
+
+use crate::node_runtime::NodeRuntime;
 
 pub use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
@@ -135,6 +139,7 @@ pub struct AgentRegistryStore {
     http_client: Arc<dyn HttpClient>,
     shell_environment_ready: ShellEnvironmentReady,
     registry_dir: PathBuf,
+    node_runtime: NodeRuntime,
     agents: Vec<RegistryAgent>,
     installed_versions: HashMap<AgentId, SharedString>,
     installing: HashSet<AgentId>,
@@ -152,19 +157,23 @@ pub struct AgentRegistryStore {
 
 impl AgentRegistryStore {
     /// Creates the store and starts loading the cached registry. Pass what arrives on the
-    /// returned inbox to [`Self::handle`].
+    /// returned inbox to [`Self::handle`]. Node.js is downloaded into `node_dir` when an npm
+    /// agent needs it and the machine has none.
     pub fn new(
         runtime: tokio::runtime::Handle,
         http_client: Arc<dyn HttpClient>,
         shell_environment_ready: ShellEnvironmentReady,
         registry_dir: PathBuf,
+        node_dir: PathBuf,
     ) -> (Self, RegistryInbox) {
         let (messages, inbox) = mpsc::unbounded();
+        let node_runtime = NodeRuntime::new(node_dir, http_client.clone());
         let mut store = Self {
             runtime,
             http_client,
             shell_environment_ready,
             registry_dir,
+            node_runtime,
             agents: Vec::new(),
             installed_versions: HashMap::default(),
             installing: HashSet::default(),
@@ -294,10 +303,12 @@ impl AgentRegistryStore {
         let http_client = self.http_client.clone();
         let registry_dir = self.registry_dir.clone();
         let shell_environment_ready = self.shell_environment_ready.clone();
+        let node_runtime = self.node_runtime.clone();
         let id = id.clone();
         self.spawn(async move {
             shell_environment_ready.await;
-            let result = install_agent(&agent, &registry_dir, http_client.as_ref()).await;
+            let result =
+                install_agent(&agent, &registry_dir, http_client.as_ref(), &node_runtime).await;
             let installed_versions = scan_installed_versions_in_background(registry_dir).await;
             MessageKind::Installed {
                 id,
@@ -346,9 +357,10 @@ impl AgentRegistryStore {
         };
         let registry_dir = self.registry_dir.clone();
         let shell_environment_ready = self.shell_environment_ready.clone();
+        let node_runtime = self.node_runtime.clone();
         async move {
             shell_environment_ready.await;
-            agent_command(&agent, &installed_version, &registry_dir)
+            agent_command(&agent, &installed_version, &registry_dir, &node_runtime).await
         }
         .boxed()
     }
@@ -806,12 +818,13 @@ async fn install_agent(
     agent: &RegistryAgent,
     registry_dir: &Path,
     http_client: &dyn HttpClient,
+    node_runtime: &NodeRuntime,
 ) -> Result<()> {
     match agent {
         RegistryAgent::Binary(agent) => {
             install_binary_agent(agent, registry_dir, http_client).await
         }
-        RegistryAgent::Npx(agent) => install_npx_agent(agent, registry_dir).await,
+        RegistryAgent::Npx(agent) => install_npx_agent(agent, registry_dir, node_runtime).await,
     }
 }
 
@@ -900,7 +913,12 @@ fn remove_other_versions(agent_dir: &Path, current_version_dir: &Path) -> Result
     Ok(())
 }
 
-async fn install_npx_agent(agent: &RegistryNpxAgent, registry_dir: &Path) -> Result<()> {
+async fn install_npx_agent(
+    agent: &RegistryNpxAgent,
+    registry_dir: &Path,
+    node_runtime: &NodeRuntime,
+) -> Result<()> {
+    let node = node_runtime.node().await?;
     let install_dir = npx_agent_dir(registry_dir, &agent.metadata.id);
     std::fs::create_dir_all(&install_dir)
         .with_context(|| format!("creating {}", install_dir.display()))?;
@@ -911,14 +929,16 @@ async fn install_npx_agent(agent: &RegistryNpxAgent, registry_dir: &Path) -> Res
     }
 
     let (_, package_spec) = bounded_npm_package_spec(&agent.package);
-    let output = tokio::process::Command::new(find_program("npm")?)
-        .args([
+    let output = node
+        .npm(
             "install",
-            package_spec.as_str(),
-            "--save-exact",
-            "--no-fund",
-            "--no-audit",
-        ])
+            &[
+                package_spec.as_str(),
+                "--save-exact",
+                "--no-fund",
+                "--no-audit",
+            ],
+        )
         .current_dir(&install_dir)
         .output()
         .await
@@ -933,10 +953,11 @@ async fn install_npx_agent(agent: &RegistryNpxAgent, registry_dir: &Path) -> Res
     Ok(())
 }
 
-fn agent_command(
+async fn agent_command(
     agent: &RegistryAgent,
     installed_version: &str,
     registry_dir: &Path,
+    node_runtime: &NodeRuntime,
 ) -> Result<AgentCommand> {
     match agent {
         RegistryAgent::Binary(agent) => {
@@ -955,20 +976,23 @@ fn agent_command(
                 .join("node_modules")
                 .join(package_name);
             let executable = read_package_executable(&package_dir)?;
+            let node = node_runtime.node().await?;
+            let mut env = node.env();
+            env.extend(agent.env.clone());
             // Like npx, run the bin as what it is: some packages ship a native binary there.
             if !runs_with_node(&executable) {
                 return Ok(AgentCommand {
                     path: executable,
                     args: agent.args.clone(),
-                    env: agent.env.clone(),
+                    env,
                 });
             }
             let mut args = vec![executable.to_string_lossy().into_owned()];
             args.extend(agent.args.iter().cloned());
             Ok(AgentCommand {
-                path: find_program("node")?,
+                path: node.node_path(),
                 args,
-                env: agent.env.clone(),
+                env,
             })
         }
     }
@@ -1017,16 +1041,6 @@ fn read_package_executable(package_dir: &Path) -> Result<PathBuf> {
         _ => bail!("package at {} has no executable", package_dir.display()),
     };
     Ok(package_dir.join(relative))
-}
-
-fn find_program(name: &str) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-        .with_context(|| {
-            format!("could not find `{name}` on PATH; install Node.js to use this agent")
-        })
 }
 
 /// Uses an npm range (`0.0.0 - <version>`) instead of an exact pin so npm can fall back to an
@@ -1271,14 +1285,20 @@ mod tests {
         assert!(binary_command_path(Path::new("/x"), "agent").is_err());
     }
 
-    #[test]
-    fn builds_launch_commands() {
+    #[tokio::test]
+    async fn builds_launch_commands() {
         let dir = tempfile::tempdir().expect("temp dir");
         let index: RegistryIndex = serde_json::from_str(SAMPLE_INDEX).expect("valid index");
         let agents = registry_agents_from_index(index, vec![None; 3]);
+        let node_runtime = NodeRuntime::new(
+            dir.path().join("node"),
+            Arc::new(http_client::BlockedHttpClient),
+        );
 
         let binary = &agents[1];
-        let command = agent_command(binary, "0.9.0", dir.path()).expect("binary command");
+        let command = agent_command(binary, "0.9.0", dir.path(), &node_runtime)
+            .await
+            .expect("binary command");
         let expected_name = if cfg!(windows) { "agent.exe" } else { "agent" };
         assert_eq!(
             command.path,
@@ -1322,6 +1342,7 @@ mod tests {
             Arc::new(http_client::BlockedHttpClient),
             futures::future::ready(()).boxed().shared(),
             dir.path().to_path_buf(),
+            dir.path().join("node"),
         );
         let binary_agent = AgentId::new("binary-agent");
         let command = store.command_when_loaded(&binary_agent);

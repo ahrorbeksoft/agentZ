@@ -161,6 +161,7 @@ impl Server {
             config.http_client,
             config.shell_environment_ready,
             registry_dir(&data_dir),
+            data_dir.join("node"),
         );
         registry.refresh_if_stale();
         let mut server = Self {

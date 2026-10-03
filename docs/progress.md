@@ -246,7 +246,13 @@ Then the server:
       the folder picker), then a path field completed from that machine's folders (t3code's
       `filesystem.browse`). Settings › Machines has Add Project… per connected machine.
 - [x] Per-machine agents: install, log in, defaults (Settings › Agents has a machine picker).
-- [ ] Managed Node for npm agents when the machine has none (Zed's `node_runtime`).
+- [x] Managed Node for npm agents when the machine has none (Zed's `node_runtime`):
+      `registry::node_runtime` uses the system Node.js when it's 22 or newer, otherwise
+      downloads Node.js v24.11.0 from nodejs.org (checked against `SHASUMS256.txt`) into
+      `<data>/node`, with its own npm cache and blank npm configs, as Zed does. Agents run on
+      that Node get its `bin` folder first on `PATH`. The official Linux builds need glibc.
+      `cargo test -p registry managed_node_downloads_and_runs -- --ignored` downloads it and
+      installs a package (16 s here).
 - [x] Repository identity from each server, as t3code does (`agentz_server::repositories`,
       sent as `Project::repository`):
   - [x] repository root, then the primary remote (`upstream`, `origin`, first by name);
@@ -633,5 +639,6 @@ Then the server:
 - 2026-10-03: Phase 9: each server resolves its projects' repository identity.
 - 2026-10-03: Phase 9: agents can start, message and list threads on the project's other
   machines, through the app.
+- 2026-10-03: Phase 9: npm agents install on machines without Node.js.
 - 2026-10-03: Added phase 11, the Workspaces view (herdr's workspaces, tabs and panes) next to
   the Agents view, at the user's request.

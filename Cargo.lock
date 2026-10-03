@@ -6185,6 +6185,7 @@ dependencies = [
  "http_client",
  "log",
  "percent-encoding",
+ "reqwest_client",
  "semver",
  "serde",
  "serde_json",
