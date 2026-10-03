@@ -544,9 +544,11 @@ area. Every agent shows up here:
 Agent CLIs running in workspace panes stay in Workspaces (the user, 2026-10-03): Agents is
 threads only, so its cards keep what threads have (rename, archive, changes, activity order).
 
-Agent CLIs are only detected in workspace panes (the user, 2026-10-03): one started in a
-terminal thread or a thread's drawer is just a terminal. New Thread offers no agent CLIs from
-`PATH`, only a plain terminal, for now.
+Terminal threads (New Thread › Terminal) are shells, grouped in a collapsible **Shells** shelf
+above Archived (the user, 2026-10-03). While an agent CLI runs in one, it's a thread card,
+named after the agent unless renamed, with the agent's state; when the agent ends it goes back
+to Shells. Agent CLIs are watched for in workspace panes and terminal threads, not in a
+thread's drawer. New Thread offers no agent CLIs from `PATH`, only a plain terminal, for now.
 
 **Workspaces** is herdr's model (`references/herdr`: `concepts.mdx`, `keyboard.mdx`,
 `configuration.mdx` § Sidebar row layouts, `session-state.mdx`, `src/layout.rs`,

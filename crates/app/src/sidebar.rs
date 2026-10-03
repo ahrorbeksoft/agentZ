@@ -91,6 +91,8 @@ pub struct Sidebar {
     search_index: usize,
     search_scroll: ScrollHandle,
     archived_shown: usize,
+    /// Whether the Shells shelf is open. This window's alone.
+    shells_expanded: bool,
     /// The thread whose details popover is showing, after hovering it for a moment.
     details_thread: Option<ThreadKey>,
     /// A popover waiting out the hover delay, and the thread it's for.
@@ -142,6 +144,7 @@ impl Sidebar {
             search_index: 0,
             search_scroll: ScrollHandle::new(),
             archived_shown: ARCHIVED_INITIAL_COUNT,
+            shells_expanded: true,
             details_thread: None,
             details_delay: None,
             hovered_thread: None,
@@ -249,13 +252,15 @@ impl Sidebar {
         self.search.read(cx).text().trim().to_lowercase()
     }
 
-    /// t3code's search results: every matching thread, active then archived, in one list.
+    /// t3code's search results: every matching thread, active, then shells, then archived, in
+    /// one list.
     fn search_results(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let query = self.search_query(cx);
         let machines = self.machines.read(cx);
         machines
             .active_threads(cx)
             .into_iter()
+            .chain(machines.shell_threads(cx))
             .chain(machines.archived_threads(cx))
             .filter(|(_, thread)| matches_query(thread, &query))
             .collect()
@@ -725,6 +730,14 @@ impl Sidebar {
         let group_name =
             SharedString::from(format!("thread-card-{}-{}", machine.slug(), thread.id.0));
         let title = SharedString::from(thread.title.clone());
+        // A terminal thread is a card while an agent CLI runs in it, named after the agent
+        // unless the user renamed it.
+        let display_title = store
+            .read(cx)
+            .terminal_agent(thread.id)
+            .filter(|_| !thread.has_custom_title)
+            .map(SharedString::from)
+            .unwrap_or_else(|| title.clone());
         let subthreads = {
             let store = store.read(cx);
             let subthreads = store.subthreads(thread.id);
@@ -829,7 +842,7 @@ impl Sidebar {
                 .flex_1()
                 .min_w_0()
                 .child(
-                    Label::new(title.clone())
+                    Label::new(display_title)
                         .weight(FontWeight::MEDIUM)
                         .truncate(),
                 )
@@ -982,15 +995,17 @@ impl Sidebar {
     }
 
     /// t3code's shelf header: a label, a rule, and a chevron.
-    fn render_archived_header(
-        &self,
+    fn render_shelf_header(
+        id: &'static str,
+        label: &'static str,
         count: usize,
         is_expanded: bool,
+        on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule_color = cx.theme().colors().border_variant;
         h_flex()
-            .id("archived-shelf-toggle")
+            .id(id)
             .h_8()
             .mx_0p5()
             .px_2()
@@ -998,9 +1013,9 @@ impl Sidebar {
             .cursor_pointer()
             .child(
                 Label::new(if is_expanded {
-                    "Archived".to_string()
+                    label.to_string()
                 } else {
-                    format!("Archived ({count})")
+                    format!("{label} ({count})")
                 })
                 .size(LabelSize::Small)
                 .weight(FontWeight::MEDIUM)
@@ -1016,21 +1031,17 @@ impl Sidebar {
                 .size(IconSize::XSmall)
                 .color(Color::Muted),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                // Kept by this Mac's server, like the thread order.
-                if let Some(store) = this.store(MachineId::Local, cx) {
-                    store.update(cx, |store, cx| store.toggle_archived_expanded(cx));
-                }
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| on_toggle(this, cx)))
             .into_any_element()
     }
 
-    /// t3code's slim row for parked threads: the project's icon, dimmed until hovered, and a way
-    /// back on hover.
-    fn render_archived_row(
+    /// t3code's slim row for parked threads: the project's icon, dimmed until hovered, and for
+    /// an archived thread a way back on hover. Shells use it too.
+    fn render_slim_row(
         &self,
         store: &Entity<ProjectStore>,
         thread: Thread,
+        is_archived: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -1047,17 +1058,21 @@ impl Sidebar {
         let project = store.read(cx).project(thread.project_id).cloned();
         let project_icon = self.render_project_icon(machine, project.as_ref(), cx);
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
-        let time = thread
-            .archived_at
-            .map(|time| format_relative_time(time, SystemTime::now()));
+        let time = if is_archived {
+            thread.archived_at
+        } else {
+            thread.last_activity_at.or(thread.created_at)
+        }
+        .map(|time| format_relative_time(time, SystemTime::now()));
+        let prefix = if is_archived { "archived" } else { "shell" };
         let group_name =
-            SharedString::from(format!("archived-row-{}-{}", machine.slug(), thread.id.0));
+            SharedString::from(format!("{prefix}-row-{}-{}", machine.slug(), thread.id.0));
         let title = SharedString::from(thread.title.clone());
         let store = store.clone();
 
         let row =
             h_flex()
-                .id(thread_element_id("archived-thread", thread_id))
+                .id(thread_element_id(&format!("{prefix}-thread"), thread_id))
                 .group(group_name.clone())
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
@@ -1098,11 +1113,13 @@ impl Sidebar {
                     row.child(
                         div()
                             .flex_none()
-                            .group_hover(group_name.clone(), |this| this.invisible())
+                            .when(is_archived, |this| {
+                                this.group_hover(group_name.clone(), |this| this.invisible())
+                            })
                             .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
                     )
                 })
-                .when(!is_renaming, |row| {
+                .when(is_archived && !is_renaming, |row| {
                     row.child(
                         div()
                             .absolute()
@@ -1129,16 +1146,19 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(machine, &thread, true, cx);
-        right_click_menu(thread_element_id("archived-thread-menu", thread_id))
-            .trigger(move |is_menu_open, _, _| {
-                div()
-                    .relative()
-                    .child(row)
-                    .when(!is_menu_open, |this| this.children(details_popover))
-            })
-            .menu(menu)
-            .into_any_element()
+        let menu = self.thread_menu(machine, &thread, is_archived, cx);
+        right_click_menu(thread_element_id(
+            &format!("{prefix}-thread-menu"),
+            thread_id,
+        ))
+        .trigger(move |is_menu_open, _, _| {
+            div()
+                .relative()
+                .child(row)
+                .when(!is_menu_open, |this| this.children(details_popover))
+        })
+        .menu(menu)
+        .into_any_element()
     }
 
     fn render_show_more_archived(&self, hidden_count: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1354,15 +1374,50 @@ impl Sidebar {
             );
         }
 
-        let archived_count = archived.len();
         let mut shelf = Vec::new();
+        // Terminal threads running no agent CLI. One that starts an agent becomes a thread
+        // card, and comes back here when it ends.
+        let shells = self.machines.read(cx).shell_threads(cx);
+        if !shells.is_empty() {
+            shelf.push(Self::render_shelf_header(
+                "shells-shelf-toggle",
+                "Shells",
+                shells.len(),
+                self.shells_expanded,
+                |this, cx| {
+                    this.shells_expanded = !this.shells_expanded;
+                    cx.notify();
+                },
+                cx,
+            ));
+            if self.shells_expanded {
+                for (machine, thread) in shells {
+                    if let Some(store) = self.store(machine, cx) {
+                        shelf.push(self.render_slim_row(&store, thread, false, cx));
+                    }
+                }
+            }
+        }
+        let archived_count = archived.len();
         if archived_count > 0 {
-            shelf.push(self.render_archived_header(archived_count, is_archived_expanded, cx));
+            shelf.push(Self::render_shelf_header(
+                "archived-shelf-toggle",
+                "Archived",
+                archived_count,
+                is_archived_expanded,
+                |this, cx| {
+                    // Kept by this Mac's server, like the thread order.
+                    if let Some(store) = this.store(MachineId::Local, cx) {
+                        store.update(cx, |store, cx| store.toggle_archived_expanded(cx));
+                    }
+                },
+                cx,
+            ));
             if is_archived_expanded {
                 let hidden_count = archived_count.saturating_sub(self.archived_shown);
                 for (machine, thread) in archived.into_iter().take(self.archived_shown) {
                     if let Some(store) = self.store(machine, cx) {
-                        shelf.push(self.render_archived_row(&store, thread, cx));
+                        shelf.push(self.render_slim_row(&store, thread, true, cx));
                     }
                 }
                 if hidden_count > 0 {

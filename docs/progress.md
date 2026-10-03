@@ -715,3 +715,6 @@ Then the server:
 - 2026-10-03: Fixed agent detection for agent CLIs started from a pane's shell on macOS.
 - 2026-10-03: Took workspace agent CLIs back out of Agents at the user's request: Agents is
   threads only, terminal agents live in Workspaces.
+- 2026-10-03: Terminal threads are shells in a Shells shelf in the Agents sidebar, and become
+  thread cards while an agent CLI runs in them (the server watches terminal threads again and
+  sends `terminal_agents` in the projects snapshot). Checked on screen with a fake `codex`.

@@ -597,11 +597,13 @@ impl Machines {
     }
 
     /// Unarchived top-level threads of the visible projects, newest or latest active first.
+    /// Shells aren't threads until an agent CLI runs in them.
     pub fn active_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let groups = self.visible_groups(cx);
         let mut threads = self.threads_where(cx, |machine, thread| {
             thread.archived_at.is_none()
                 && thread.task.is_none()
+                && !self.is_shell(machine, thread, cx)
                 && groups
                     .iter()
                     .any(|group| group.contains(machine, thread.project_id))
@@ -618,6 +620,32 @@ impl Machines {
                 .then(b.id.cmp(&a.id))
         });
         threads
+    }
+
+    /// Unarchived terminal threads of the visible projects running no agent CLI, latest active
+    /// first, for the sidebar's Shells shelf.
+    pub fn shell_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
+        let groups = self.visible_groups(cx);
+        let mut threads = self.threads_where(cx, |machine, thread| {
+            thread.archived_at.is_none()
+                && thread.task.is_none()
+                && self.is_shell(machine, thread, cx)
+                && groups
+                    .iter()
+                    .any(|group| group.contains(machine, thread.project_id))
+        });
+        threads.sort_by_key(|(_, thread)| {
+            std::cmp::Reverse(thread.last_activity_at.or(thread.created_at))
+        });
+        threads
+    }
+
+    /// A terminal thread with no agent CLI running in it.
+    pub fn is_shell(&self, machine: MachineId, thread: &Thread, cx: &App) -> bool {
+        thread.terminal.is_some()
+            && self
+                .projects(machine, cx)
+                .is_none_or(|store| store.read(cx).terminal_agent(thread.id).is_none())
     }
 
     /// Archived top-level threads of every project, most recently archived first.
