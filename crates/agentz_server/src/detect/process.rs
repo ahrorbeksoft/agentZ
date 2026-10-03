@@ -113,6 +113,43 @@ mod platform {
         (end > 0).then(|| std::ffi::OsStr::from_bytes(&path[..end]).into())
     }
 
+    /// Every process in the session (herdr's `session_processes`).
+    pub(crate) fn session_processes(session_id: u32) -> Vec<u32> {
+        // SAFETY: a null buffer asks for the count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let mut capacity = if count > 0 {
+            count as usize + 128
+        } else {
+            4096
+        };
+        for _ in 0..8 {
+            let mut pids = vec![0 as libc::pid_t; capacity];
+            // SAFETY: the buffer holds `capacity` pids, and is told its size in bytes.
+            let count = unsafe {
+                libc::proc_listallpids(
+                    pids.as_mut_ptr() as *mut libc::c_void,
+                    (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+                )
+            };
+            if count <= 0 {
+                return Vec::new();
+            }
+            let count = count as usize;
+            if count < capacity {
+                return pids
+                    .into_iter()
+                    .take(count)
+                    .filter(|pid| *pid > 0)
+                    // SAFETY: `getsid` only reads.
+                    .filter(|pid| unsafe { libc::getsid(*pid) } == session_id as libc::pid_t)
+                    .map(|pid| pid as u32)
+                    .collect();
+            }
+            capacity = capacity.saturating_mul(2);
+        }
+        Vec::new()
+    }
+
     fn kern_procargs2(pid: u32) -> Option<Vec<u8>> {
         let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
         let mut size: libc::size_t = 0;
@@ -227,6 +264,21 @@ mod platform {
     pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
+
+    /// Every process in the session (herdr's `session_processes`).
+    pub(crate) fn session_processes(session_id: u32) -> Vec<u32> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                stat_fields(*pid).and_then(|(_, fields)| fields.get(3)?.parse::<u32>().ok())
+                    == Some(session_id)
+            })
+            .collect()
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -244,6 +296,41 @@ mod platform {
     pub(crate) fn process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
         None
     }
+
+    pub(crate) fn session_processes(_session_id: u32) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
-pub(crate) use platform::{foreground_process_group_id, group_leader, process_cwd};
+pub(crate) use platform::{
+    foreground_process_group_id, group_leader, process_cwd, session_processes,
+};
+
+/// Ends processes as herdr ends a closed pane's: hang up, then terminate, then kill, giving
+/// each a moment, until none is left. Blocks for up to three quarters of a second.
+#[cfg(unix)]
+pub(crate) fn end_processes(pids: Vec<u32>) {
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+    let is_alive = |pid: u32| {
+        // SAFETY: signal 0 only checks that the process exists and may be signalled.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    };
+    for signal in [libc::SIGHUP, libc::SIGTERM, libc::SIGKILL] {
+        let alive: Vec<u32> = pids.iter().copied().filter(|pid| is_alive(*pid)).collect();
+        if alive.is_empty() {
+            return;
+        }
+        for pid in &alive {
+            // SAFETY: sends a signal; a process that's gone or not ours just refuses it.
+            unsafe { libc::kill(*pid as libc::pid_t, signal) };
+        }
+        let deadline = std::time::Instant::now() + GRACE;
+        while std::time::Instant::now() < deadline && alive.iter().any(|pid| is_alive(*pid)) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let left: Vec<u32> = pids.into_iter().filter(|pid| is_alive(*pid)).collect();
+    if !left.is_empty() {
+        log::warn!("processes still running after their terminal closed: {left:?}");
+    }
+}

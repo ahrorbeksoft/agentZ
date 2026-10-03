@@ -2774,3 +2774,56 @@ async fn the_machine_icon_is_chosen_and_kept() {
     };
     assert_eq!(session.machine_icon.chosen, Some(MachineKind::MacStudio));
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_terminal_thread_ends_everything_it_started() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = match client
+        .ok(Request::CreateTerminalThread {
+            project_id,
+            command: TerminalCommand { command: None },
+            workspace: Default::default(),
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => thread_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let key = TerminalKey::Thread(thread_id);
+    client.subscribe_terminal(key.clone()).await;
+    // Ignores the hangup the closing terminal sends.
+    client
+        .type_into(&key, "nohup sleep 300 >/dev/null 2>&1 & echo started=$!\n")
+        .await;
+    client.wait_for_screen(&key, "started=").await;
+    let screen = client.screen(&key);
+    let pid: libc::pid_t = screen
+        .split("started=")
+        .filter_map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .last()
+        .expect("the pid");
+    // SAFETY: signal 0 only checks the process exists.
+    let is_alive = move || unsafe { libc::kill(pid, 0) == 0 };
+    assert!(is_alive());
+
+    client.ok(Request::DeleteThread(thread_id)).await;
+    let ended = tokio::time::timeout(TIMEOUT, async {
+        while is_alive() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "process {pid} outlived its terminal");
+}

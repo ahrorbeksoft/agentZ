@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use util::ResultExt as _;
 
 use agentz_protocol::terminal::{
     TerminalColor, TerminalCursor, TerminalCursorShape, TerminalExit, TerminalFrame, TerminalInput,
@@ -427,10 +428,45 @@ impl Terminal {
         }
     }
 
-    /// Ends the process, keeping the screen (ACP's `terminal/kill`).
+    /// Ends the process, keeping the screen (ACP's `terminal/kill`), and everything else it
+    /// started, as herdr ends a closed pane's: a program that ignores the hangup, or one
+    /// started with `nohup`, would otherwise outlive its terminal.
     pub(crate) fn kill(&self) {
-        // The event loop drops the PTY, which hangs up on the process.
+        let session = self.session_processes();
+        // The event loop drops the PTY, which hangs up on the session.
         self.sender.send(Msg::Shutdown).ok();
+        #[cfg(unix)]
+        if !session.is_empty() {
+            std::thread::Builder::new()
+                .name("terminal-shutdown".into())
+                .spawn(move || crate::detect::process::end_processes(session))
+                .log_err();
+        }
+    }
+
+    /// The processes in the terminal's session: everything started in it that didn't leave.
+    fn session_processes(&self) -> Vec<u32> {
+        #[cfg(unix)]
+        {
+            // SAFETY: the descriptor is the PTY's, open while the terminal runs.
+            let from_terminal = (self.exit.is_none())
+                .then(|| unsafe { libc::tcgetsid(self.pty_fd) })
+                .filter(|session| *session > 0);
+            // SAFETY: `getsid` only reads.
+            let session = from_terminal.or_else(|| {
+                let pid = self.child_pid? as libc::pid_t;
+                Some(unsafe { libc::getsid(pid) }).filter(|session| *session > 0)
+            });
+            // Never the server's own session.
+            // SAFETY: as above.
+            let own_session = unsafe { libc::getsid(0) };
+            match session.filter(|session| *session != own_session) {
+                Some(session) => crate::detect::process::session_processes(session as u32),
+                None => Vec::new(),
+            }
+        }
+        #[cfg(not(unix))]
+        Vec::new()
     }
 
     pub(crate) fn selection_text(&self) -> Option<String> {
