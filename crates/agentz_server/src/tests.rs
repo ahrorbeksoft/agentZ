@@ -2489,6 +2489,56 @@ async fn spaces_are_saved_restored_and_streamed() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
+async fn agents_started_from_a_panes_shell_are_found() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let bin = tempfile::tempdir().expect("temp dir");
+    let codex = bin.path().join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\necho codex ready\nwhile read line; do :; done\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("permissions");
+
+    // A shell pane, as the user opens one, with the agent typed at its prompt. On macOS the
+    // pane's own process is `login`, which can't be inspected.
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let location = client
+        .space_pane(SpaceRequest::CreateSpace {
+            folder: server.project_dir.path().to_path_buf(),
+            project_id: None,
+            content: PaneContent::Terminal(PaneTerminal {
+                folder: server.project_dir.path().to_path_buf(),
+                command: None,
+            }),
+        })
+        .await;
+    let key = TerminalKey::Pane(location.pane);
+    client.subscribe_terminal(key.clone()).await;
+    let agent = move |client: &TestClient| {
+        client
+            .space_snapshot()
+            .pane(location.pane)
+            .and_then(|(_, _, pane)| pane.agent.clone())
+    };
+    client
+        .type_into(&key, &format!("{}\n", codex.display()))
+        .await;
+    client.wait_for_screen(&key, "codex ready").await;
+    client.wait_until(|client| agent(client).is_some()).await;
+    assert_eq!(agent(&client).expect("an agent").name, "Codex");
+
+    // Back at the shell, the agent is gone.
+    client.type_into(&key, "\x04").await;
+    client.wait_until(|client| agent(client).is_none()).await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
 async fn terminal_panes_show_their_agents() {
     let Some(server) = TestServer::start() else {
         return;

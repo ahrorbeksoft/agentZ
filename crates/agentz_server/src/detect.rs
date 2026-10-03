@@ -387,6 +387,15 @@ fn path_basename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Whether the process is an interactive shell, such as the one a terminal starts.
+pub(crate) fn is_shell(process: &ForegroundProcess) -> bool {
+    let name = process.argv0.as_deref().unwrap_or(&process.name);
+    matches!(
+        normalized_agent_lookup_name(path_basename(name)).as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "tcsh" | "csh"
+    )
+}
+
 fn is_generic_runtime_or_shell(name: &str) -> bool {
     let name = normalized_agent_lookup_name(path_basename(name));
     is_python_runtime(&name)

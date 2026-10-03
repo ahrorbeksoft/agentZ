@@ -322,20 +322,20 @@ impl Server {
                 }
                 continue;
             }
-            let Some(shell) = running.terminal.child_pid() else {
-                continue;
-            };
             let mut update = None;
-            let process_group_id = detect::process::foreground_process_group_id(shell);
+            let process_group_id = running.terminal.foreground_process_group_id();
             if tracker.should_probe(now, process_group_id) {
-                let agent = process_group_id
-                    .and_then(detect::process::group_leader)
-                    .and_then(|process| Agent::of_process(&process));
+                let leader = process_group_id.and_then(detect::process::group_leader);
+                let agent = leader.as_ref().and_then(Agent::of_process);
+                // The shell may not be the terminal's own process (`login` starts it on
+                // macOS), so it's known by name.
+                let shell_in_foreground =
+                    agent.is_none() && leader.as_ref().is_some_and(detect::is_shell);
                 update = tracker.observe_process(
                     now,
                     ProcessObservation {
                         process_group_id,
-                        shell_in_foreground: agent.is_none() && process_group_id == Some(shell),
+                        shell_in_foreground,
                         agent,
                     },
                 );

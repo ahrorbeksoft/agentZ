@@ -116,8 +116,12 @@ pub(crate) struct Terminal {
     /// The client's theme colors, to answer programs that ask for a color.
     palette: Option<Vec<[u8; 3]>>,
     exit_waiters: Vec<oneshot::Sender<TerminalExit>>,
-    /// The process the terminal started, usually a shell.
+    /// The process the terminal started: the shell, or on macOS `login` running it.
     child_pid: Option<u32>,
+    /// The PTY's controlling side, kept to ask which process group is in front (Zed's
+    /// `ProcessIdGetter`). Valid while the terminal runs.
+    #[cfg(unix)]
+    pty_fd: std::os::fd::RawFd,
 }
 
 impl Terminal {
@@ -157,6 +161,8 @@ impl Terminal {
         let child_pid = Some(pty.child().id());
         #[cfg(not(unix))]
         let child_pid = None;
+        #[cfg(unix)]
+        let pty_fd = std::os::fd::AsRawFd::as_raw_fd(pty.file());
 
         let wakeup_pending = Arc::new(AtomicBool::new(false));
         let listener = Listener {
@@ -184,6 +190,8 @@ impl Terminal {
             palette,
             exit_waiters: Vec::new(),
             child_pid,
+            #[cfg(unix)]
+            pty_fd,
         })
     }
 
@@ -449,8 +457,19 @@ impl Terminal {
         self.frame().text()
     }
 
-    pub(crate) fn child_pid(&self) -> Option<u32> {
-        self.child_pid
+    /// The process group in front, which gets the keyboard. Asked of the terminal itself, as
+    /// Zed does: on macOS the child is `login`, which runs as root, so its own process
+    /// information can't be read.
+    pub(crate) fn foreground_process_group_id(&self) -> Option<u32> {
+        #[cfg(unix)]
+        if self.exit.is_none() {
+            // SAFETY: the descriptor is the PTY's, open while the terminal runs.
+            let group = unsafe { libc::tcgetpgrp(self.pty_fd) };
+            if group > 0 {
+                return Some(group as u32);
+            }
+        }
+        crate::detect::process::foreground_process_group_id(self.child_pid?)
     }
 
     /// The bottom of the screen as agent detection reads it (herdr's `detection_text`): the

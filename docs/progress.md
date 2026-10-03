@@ -606,6 +606,12 @@ Then the server:
     and dropping the runtime waits for it, so the SSH session stayed open after the server
     quit and the app never saw the disconnect. It now ends with `shutdown_background`.
 
+- **Agent CLIs typed at a pane's shell weren't detected on macOS** (2026-10-03). The pane's
+  process is `/usr/bin/login`, which runs as root, so its process information (and with it the
+  terminal's foreground group) couldn't be read. The server now asks the PTY with `tcgetpgrp`,
+  as Zed does, and knows "back at the shell" by the process's name. The earlier test started
+  the agent as the pane's command, which skips `login`, so it never caught this.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -706,3 +712,4 @@ Then the server:
   - New Thread offers a plain terminal but no agent CLIs from `PATH`.
   Whether a pane agent's finish has been seen now lives in the app's `ServerClient`, shared by
   both views. Checked on screen against a scratch server with a fake `codex` in a pane.
+- 2026-10-03: Fixed agent detection for agent CLIs started from a pane's shell on macOS.
