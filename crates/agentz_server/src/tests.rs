@@ -8,6 +8,10 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
+use agentz_protocol::terminal::{
+    TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalPoint,
+    TerminalSelectionKind, TerminalSelectionUpdate,
+};
 use agentz_protocol::thread::{Entry, ThreadView};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -58,6 +62,7 @@ impl TestServer {
                 shell_environment_ready: futures::future::ready(()).boxed().shared(),
                 custom_agents,
                 agent_control: None,
+                terminal_shell: Some("/bin/sh".into()),
             },
         )
         .expect("server starts");
@@ -80,6 +85,7 @@ struct TestClient {
     next_id: u64,
     projects: Option<ProjectsSnapshot>,
     threads: BTreeMap<ConnectionId, ThreadView>,
+    terminals: BTreeMap<TerminalKey, TerminalFrame>,
     events: Vec<Event>,
 }
 
@@ -109,6 +115,7 @@ impl TestClient {
             next_id: 1,
             projects: None,
             threads: BTreeMap::new(),
+            terminals: BTreeMap::new(),
             events: Vec::new(),
         }
     }
@@ -166,6 +173,14 @@ impl TestClient {
                 if let Some(view) = self.threads.get_mut(connection) {
                     view.apply(update.clone());
                 }
+            }
+            Event::TerminalFrame { terminal, frame } => {
+                if let Some(screen) = self.terminals.get_mut(terminal) {
+                    screen.apply(frame.clone());
+                }
+            }
+            Event::TerminalClosed(terminal) => {
+                self.terminals.remove(terminal);
             }
             _ => {}
         }
@@ -1669,4 +1684,363 @@ async fn threads_work_in_worktrees_and_pastures() {
                 .contains("grazing")
         );
     }
+}
+
+impl TestClient {
+    async fn subscribe_terminal(&mut self, key: TerminalKey) {
+        match self.ok(Request::SubscribeTerminal(key.clone())).await {
+            Response::TerminalFrame(frame) => {
+                assert!(frame.full);
+                self.terminals.insert(key, frame);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+
+    async fn type_into(&mut self, key: &TerminalKey, text: &str) {
+        self.ok(Request::TerminalInput {
+            terminal: key.clone(),
+            input: TerminalInput::Bytes(text.as_bytes().to_vec()),
+        })
+        .await;
+    }
+
+    fn screen(&self, key: &TerminalKey) -> String {
+        self.terminals
+            .get(key)
+            .map(TerminalFrame::text)
+            .unwrap_or_default()
+    }
+
+    /// Reads frames until the terminal's screen contains `text`.
+    async fn wait_for_screen(&mut self, key: &TerminalKey, text: &str) {
+        let waited = tokio::time::timeout(TIMEOUT, async {
+            while !self.screen(key).contains(text) {
+                match self.next_message().await {
+                    ServerMessage::Event(event) => self.apply(event),
+                    message => panic!("unexpected message: {message:?}"),
+                }
+            }
+        })
+        .await;
+        if waited.is_err() {
+            panic!(
+                "timed out waiting for {text:?}; the screen is:\n{}",
+                self.screen(key)
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_threads_stream_their_screens_to_watchers() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    assert!(
+        client
+            .welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == agentz_protocol::CAPABILITY_TERMINALS)
+    );
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = match client
+        .ok(Request::CreateTerminalThread {
+            project_id,
+            command: TerminalCommand {
+                command: Some("printf 'ready in %s\\n' \"$PWD\"; PS1='$ ' exec /bin/sh".into()),
+            },
+            workspace: Default::default(),
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => thread_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let thread = client
+        .projects
+        .as_ref()
+        .and_then(|projects| {
+            projects
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+        })
+        .expect("the thread")
+        .clone();
+    assert_eq!(thread.agent_id, None);
+    assert!(thread.terminal.is_some());
+
+    // The terminal started with the thread, so its first output is already on the screen.
+    let key = TerminalKey::Thread(thread_id);
+    client.subscribe_terminal(key.clone()).await;
+    let folder = std::fs::canonicalize(server.project_dir.path()).expect("canonical path");
+    client
+        .wait_for_screen(&key, &format!("ready in {}", folder.display()))
+        .await;
+    client.type_into(&key, "echo sum=$((40 + 2))\n").await;
+    client.wait_for_screen(&key, "sum=42").await;
+
+    client
+        .ok(Request::TerminalInput {
+            terminal: key.clone(),
+            input: TerminalInput::Resize {
+                columns: 50,
+                screen_lines: 12,
+                cell_width: 8,
+                cell_height: 16,
+            },
+        })
+        .await;
+    client.type_into(&key, "stty size\n").await;
+    client.wait_for_screen(&key, "12 50").await;
+    assert_eq!(client.terminals[&key].columns, 50);
+
+    // A second client starts from a full frame of the same screen.
+    let mut watcher = server.connect().await;
+    watcher.subscribe_terminal(key.clone()).await;
+    assert!(watcher.screen(&key).contains("sum=42"));
+
+    client.type_into(&key, "echo selected-word\n").await;
+    client.wait_for_screen(&key, "\nselected-word").await;
+    let row = client.terminals[&key]
+        .lines
+        .iter()
+        .find(|(_, line)| line.text() == "selected-word")
+        .map(|(row, _)| *row)
+        .expect("the output row");
+    client
+        .ok(Request::TerminalInput {
+            terminal: key.clone(),
+            input: TerminalInput::Select(Some(TerminalSelectionUpdate {
+                point: TerminalPoint {
+                    line: row as i32,
+                    column: 3,
+                },
+                right_half: false,
+                start: Some(TerminalSelectionKind::Semantic),
+            })),
+        })
+        .await;
+    assert_eq!(
+        client.ok(Request::TerminalSelectionText(key.clone())).await,
+        Response::Message("selected-word".into())
+    );
+
+    // The drawer under a thread is a shell in the thread's folder.
+    let drawer = TerminalKey::Drawer(thread_id);
+    client.subscribe_terminal(drawer.clone()).await;
+    client.type_into(&drawer, "echo in-$PWD\n").await;
+    client
+        .wait_for_screen(&drawer, &format!("in-{}", folder.display()))
+        .await;
+    client.ok(Request::CloseTerminal(drawer.clone())).await;
+    client
+        .wait_until(|client| !client.terminals.contains_key(&drawer))
+        .await;
+
+    // Exiting leaves the screen, marked; restarting runs the command again.
+    client.type_into(&key, "exit 7\n").await;
+    client
+        .wait_until(|client| {
+            client.terminals[&key]
+                .exited
+                .as_ref()
+                .is_some_and(|exit| exit.code == Some(7))
+        })
+        .await;
+    client.ok(Request::RestartTerminal(key.clone())).await;
+    client
+        .wait_until(|client| client.terminals[&key].exited.is_none())
+        .await;
+    client.wait_for_screen(&key, "ready in").await;
+
+    // Deleting the thread closes its terminal for everyone watching.
+    client.ok(Request::DeleteThread(thread_id)).await;
+    client
+        .wait_until(|client| !client.terminals.contains_key(&key))
+        .await;
+    watcher
+        .wait_until(|watcher| !watcher.terminals.contains_key(&key))
+        .await;
+    assert!(
+        client
+            .request(Request::SubscribeTerminal(key.clone()))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_run_commands_in_server_terminals() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            text: "terminal printf 'built %s\\n' \"$PAGER-$GIT_PAGER\"; exit 4".into(),
+        })
+        .await;
+    client
+        .wait_until(|client| agent_text(client.thread(connection)).starts_with("Terminal"))
+        .await;
+    assert_eq!(
+        agent_text(client.thread(connection)),
+        "Terminal 4: built -cat"
+    );
+
+    // The tool call names its terminal, which the user can still open after the agent
+    // released it.
+    let terminal_id = client
+        .thread(connection)
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::ToolCall(tool_call) => tool_call.terminals.first().cloned(),
+            _ => None,
+        })
+        .expect("a tool call with a terminal");
+    let key = TerminalKey::Agent {
+        thread_id,
+        terminal_id,
+    };
+    client.subscribe_terminal(key.clone()).await;
+    assert!(client.screen(&key).contains("built -cat"));
+    assert_eq!(
+        client.terminals[&key]
+            .exited
+            .as_ref()
+            .and_then(|exit| exit.code),
+        Some(4)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_drive_terminals_through_tools() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+
+    // A terminal thread the agent starts, which the user sees in the project.
+    let started = client
+        .tool(thread_id, "agentz_terminal_start", json!({}))
+        .await;
+    assert_eq!(started["kind"], "terminal_thread");
+    assert_eq!(started["status"], "running");
+    let terminal = ThreadId(started["threadId"].as_u64().expect("a thread id"));
+    client
+        .wait_until(|client| {
+            client
+                .project_thread(terminal)
+                .is_some_and(|thread| thread.terminal.is_some())
+        })
+        .await;
+
+    client
+        .tool(
+            thread_id,
+            "agentz_terminal_send",
+            json!({"threadId": terminal.0, "text": "echo sum-$((40+2))", "submit": true}),
+        )
+        .await;
+    let waited = client
+        .tool(
+            thread_id,
+            "agentz_terminal_wait",
+            json!({"threadId": terminal.0, "match": "sum-42", "timeoutMs": 10_000}),
+        )
+        .await;
+    assert_eq!(waited["matched"], true, "{waited}");
+    let read = client
+        .tool(
+            thread_id,
+            "agentz_terminal_read",
+            json!({"threadId": terminal.0, "source": "visible"}),
+        )
+        .await;
+    assert!(
+        read["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("sum-42"))
+    );
+
+    assert_eq!(
+        client
+            .tool_failure(
+                ToolCaller::Thread(thread_id),
+                "agentz_terminal_send",
+                json!({"threadId": terminal.0, "keys": ["hyper-x"]}),
+            )
+            .await,
+        "invalid_request"
+    );
+
+    // Keys end the shell; a wait without a match returns once it has exited.
+    client
+        .tool(
+            thread_id,
+            "agentz_terminal_send",
+            json!({"threadId": terminal.0, "text": "exit 3", "keys": ["enter"]}),
+        )
+        .await;
+    let waited = client
+        .tool(
+            thread_id,
+            "agentz_terminal_wait",
+            json!({"threadId": terminal.0, "timeoutMs": 10_000}),
+        )
+        .await;
+    assert_eq!(waited["status"], "exited", "{waited}");
+    assert_eq!(waited["exitCode"], 3);
+    assert_eq!(
+        client
+            .tool_failure(
+                ToolCaller::Thread(thread_id),
+                "agentz_terminal_send",
+                json!({"threadId": terminal.0, "keys": ["enter"]}),
+            )
+            .await,
+        "terminal_exited"
+    );
+
+    // Without a thread id, an agent thread's own drawer.
+    client
+        .tool(
+            thread_id,
+            "agentz_terminal_send",
+            json!({"text": "echo drawer-ok", "submit": true}),
+        )
+        .await;
+    let waited = client
+        .tool(
+            thread_id,
+            "agentz_terminal_wait",
+            json!({"match": "drawer-ok\n", "timeoutMs": 10_000}),
+        )
+        .await;
+    assert_eq!(waited["kind"], "drawer");
+    assert_eq!(waited["matched"], true, "{waited}");
+
+    let listed = client
+        .tool(thread_id, "agentz_terminal_list", json!({}))
+        .await;
+    let kinds: Vec<&str> = listed["terminals"]
+        .as_array()
+        .expect("terminals")
+        .iter()
+        .filter_map(|terminal| terminal["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, ["drawer", "terminal_thread"]);
 }

@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{ConnectionId, Request, Response};
 use anyhow::{Context as _, Result, anyhow};
@@ -13,6 +14,12 @@ use projects::{ProjectId, ThreadId, Workspace, WorkspaceKind};
 
 use super::{ClientId, Server};
 use crate::workspaces::{self, NewWorkspace};
+
+/// What a new thread runs.
+pub(super) enum NewThread {
+    Agent(AgentId),
+    Terminal(TerminalCommand),
+}
 
 /// Where a new thread will work, once any new workspace is made.
 pub(super) enum PreparedWorkspace {
@@ -28,22 +35,24 @@ impl Server {
                 project_id,
                 agent_id,
                 workspace,
-            } => match self.prepare_workspace(project_id, workspace) {
-                Ok(PreparedWorkspace::Ready(folder)) => {
-                    let result = self.create_thread_in(project_id, agent_id, folder);
-                    self.respond(client, id, result.map(Response::ThreadCreated));
-                }
-                Ok(PreparedWorkspace::Create(work)) => {
-                    self.spawn_then(work, move |server, workspace| {
-                        let result = workspace.and_then(|workspace| {
-                            let folder = server.adopt_workspace(project_id, workspace);
-                            server.create_thread_in(project_id, agent_id, Some(folder))
-                        });
-                        server.respond(client, id, result.map(Response::ThreadCreated));
-                    });
-                }
-                Err(error) => self.respond(client, id, Err(error)),
-            },
+            } => self.create_thread(
+                client,
+                id,
+                project_id,
+                NewThread::Agent(agent_id),
+                workspace,
+            ),
+            Request::CreateTerminalThread {
+                project_id,
+                command,
+                workspace,
+            } => self.create_thread(
+                client,
+                id,
+                project_id,
+                NewThread::Terminal(command),
+                workspace,
+            ),
             Request::ProjectGit(project_id) => {
                 let repo = match self.project_path(project_id) {
                     Ok(repo) => repo,
@@ -82,6 +91,32 @@ impl Server {
                 id,
                 Err(anyhow!("not a workspace request: {request:?}")),
             ),
+        }
+    }
+
+    fn create_thread(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        project_id: ProjectId,
+        new: NewThread,
+        workspace: WorkspaceChoice,
+    ) {
+        match self.prepare_workspace(project_id, workspace) {
+            Ok(PreparedWorkspace::Ready(folder)) => {
+                let result = self.create_thread_in(project_id, new, folder);
+                self.respond(client, id, result.map(Response::ThreadCreated));
+            }
+            Ok(PreparedWorkspace::Create(work)) => {
+                self.spawn_then(work, move |server, workspace| {
+                    let result = workspace.and_then(|workspace| {
+                        let folder = server.adopt_workspace(project_id, workspace);
+                        server.create_thread_in(project_id, new, Some(folder))
+                    });
+                    server.respond(client, id, result.map(Response::ThreadCreated));
+                });
+            }
+            Err(error) => self.respond(client, id, Err(error)),
         }
     }
 
@@ -128,24 +163,34 @@ impl Server {
         path
     }
 
-    /// Adds a thread working in `folder` (the project's own with `None`) and starts its agent,
-    /// so it's ready by the time the user has typed a prompt.
+    /// Adds a thread working in `folder` (the project's own with `None`) and starts its agent
+    /// or terminal, so it's ready by the time the user has typed something.
     pub(super) fn create_thread_in(
         &mut self,
         project_id: ProjectId,
-        agent_id: AgentId,
+        new: NewThread,
         folder: Option<PathBuf>,
     ) -> Result<ThreadId> {
-        let thread_id = self
-            .projects
-            .add_thread(
+        let thread_id = match &new {
+            NewThread::Agent(agent_id) => self.projects.add_thread(
                 project_id,
                 projects::NEW_THREAD_TITLE,
                 Some(agent_id.0.to_string()),
-            )
-            .context("no such project")?;
+            ),
+            NewThread::Terminal(command) => self
+                .projects
+                .add_terminal_thread(project_id, command.clone()),
+        }
+        .context("no such project")?;
         self.projects.set_thread_workspace(thread_id, folder);
-        self.update_thread(ConnectionId::Thread(thread_id), |_| {})?;
+        match new {
+            NewThread::Agent(_) => {
+                self.update_thread(ConnectionId::Thread(thread_id), |_| {})?;
+            }
+            NewThread::Terminal(_) => {
+                self.ensure_terminal(&TerminalKey::Thread(thread_id))?;
+            }
+        }
         Ok(thread_id)
     }
 

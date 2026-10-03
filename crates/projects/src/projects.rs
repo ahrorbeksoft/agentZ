@@ -100,6 +100,25 @@ pub enum ProjectIcon {
 /// A thread's title until its first prompt names it.
 pub const NEW_THREAD_TITLE: &str = "New thread";
 
+/// What a terminal thread runs (herdr's panes).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TerminalCommand {
+    /// A command line for the user's login shell to run, such as `claude`. `None` is the login
+    /// shell itself.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+impl TerminalCommand {
+    /// What the thread is called until the user renames it.
+    pub fn title(&self) -> String {
+        match &self.command {
+            Some(command) => command.clone(),
+            None => "Terminal".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
@@ -138,6 +157,9 @@ pub struct Thread {
     /// is the project's own folder.
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    /// Set on a terminal thread, which runs this instead of an ACP agent.
+    #[serde(default)]
+    pub terminal: Option<TerminalCommand>,
 }
 
 impl Thread {
@@ -530,7 +552,22 @@ impl ProjectStore {
             created_by: None,
             task: None,
             workspace: None,
+            terminal: None,
         });
+        self.changed();
+        Some(id)
+    }
+
+    /// Adds a terminal thread, titled after its command.
+    pub fn add_terminal_thread(
+        &mut self,
+        project_id: ProjectId,
+        command: TerminalCommand,
+    ) -> Option<ThreadId> {
+        let id = self.add_thread(project_id, command.title(), None)?;
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+            thread.terminal = Some(command);
+        }
         self.changed();
         Some(id)
     }

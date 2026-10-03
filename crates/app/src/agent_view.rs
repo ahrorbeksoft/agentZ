@@ -1572,6 +1572,7 @@ impl AgentView {
             diffs: Vec::new(),
             locations: Vec::new(),
             raw_input: None,
+            terminals: Vec::new(),
         };
         Some(
             v_flex()

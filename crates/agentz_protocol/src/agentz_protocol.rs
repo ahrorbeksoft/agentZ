@@ -14,6 +14,8 @@
 
 pub mod agents;
 pub mod diff;
+pub mod terminal;
+pub mod terminal_keys;
 pub mod thread;
 pub mod workspace;
 
@@ -29,6 +31,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use crate::diff::{DiffScope, ThreadDiff};
+use crate::terminal::{
+    TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalProgram,
+};
 use crate::thread::{ThreadUpdate, ThreadView};
 use crate::workspace::{ProjectGit, WorkspaceChoice, WorkspaceRemoval};
 
@@ -40,6 +45,9 @@ pub const CAPABILITY_THREAD_DIFF: &str = "thread_diff";
 /// [`ServerWelcome::capabilities`]: threads can work in worktrees and pastures
 /// ([`Request::ProjectGit`], [`Request::RemoveWorkspace`] and the rest).
 pub const CAPABILITY_WORKSPACES: &str = "workspaces";
+/// [`ServerWelcome::capabilities`]: the server runs terminals ([`Request::SubscribeTerminal`]
+/// and the rest), and terminal threads.
+pub const CAPABILITY_TERMINALS: &str = "terminals";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -158,6 +166,29 @@ pub enum Request {
         #[serde(default)]
         workspace: WorkspaceChoice,
     },
+    /// A thread that runs a terminal instead of an agent: [`Response::ThreadCreated`].
+    CreateTerminalThread {
+        project_id: ProjectId,
+        command: TerminalCommand,
+        #[serde(default)]
+        workspace: WorkspaceChoice,
+    },
+    /// Agent CLIs on the server's `PATH`: [`Response::TerminalPrograms`].
+    TerminalPrograms,
+    /// A terminal's screen: a full [`Response::TerminalFrame`], then [`Event::TerminalFrame`]s
+    /// while it changes. A thread's terminal or drawer starts if it isn't running.
+    SubscribeTerminal(TerminalKey),
+    UnsubscribeTerminal(TerminalKey),
+    TerminalInput {
+        terminal: TerminalKey,
+        input: TerminalInput,
+    },
+    /// The selected text: [`Response::Message`], empty without a selection.
+    TerminalSelectionText(TerminalKey),
+    /// Starts the terminal's command again, after it exited or to replace it.
+    RestartTerminal(TerminalKey),
+    /// Ends the terminal's process and forgets it.
+    CloseTerminal(TerminalKey),
     /// The project's branches and whether pastures work there: [`Response::ProjectGit`].
     ProjectGit(ProjectId),
     /// Deletes a worktree or pasture from disk, keeping its branch:
@@ -318,6 +349,8 @@ pub enum Response {
     ThreadDiff(ThreadDiff),
     ProjectGit(ProjectGit),
     WorkspaceRemoval(WorkspaceRemoval),
+    TerminalPrograms(Vec<TerminalProgram>),
+    TerminalFrame(TerminalFrame),
     /// What a finished action did, to show the user.
     Message(String),
     /// From a newer version.
@@ -343,6 +376,13 @@ pub enum Event {
     },
     /// The connection is gone (its thread was deleted, or its account closed).
     ConnectionClosed(ConnectionId),
+    /// What changed on a subscribed terminal's screen.
+    TerminalFrame {
+        terminal: TerminalKey,
+        frame: TerminalFrame,
+    },
+    /// The terminal is gone (closed, or its thread deleted).
+    TerminalClosed(TerminalKey),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),

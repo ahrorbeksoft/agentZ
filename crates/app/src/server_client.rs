@@ -199,6 +199,7 @@ impl ServerClient {
                     thread.update(cx, |thread, cx| thread.closed(cx));
                 }
             }
+            Event::TerminalFrame { .. } | Event::TerminalClosed(_) => {}
             Event::Unknown(event) => log::warn!("unknown event from the server: {event}"),
         }
     }

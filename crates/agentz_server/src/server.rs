@@ -1,5 +1,6 @@
 //! The state the server owns, and how requests and background results change it.
 
+mod terminal_requests;
 mod tools;
 mod workspace_requests;
 
@@ -14,6 +15,7 @@ use agentz_protocol::agents::{
     AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
+use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::{
     AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineInfo, Request, Response,
     ServerMessage, SessionSnapshot,
@@ -31,6 +33,7 @@ use util::ResultExt as _;
 use crate::agent_settings::AgentSettingsStore;
 use crate::checkpoints::Checkpoints;
 use crate::{AgentControl, CustomAgent, ServerConfig};
+use terminal_requests::Terminals;
 use tools::{PendingToolCall, ToolResults};
 
 const MAX_THREAD_TITLE_CHARS: usize = 48;
@@ -52,6 +55,14 @@ pub(crate) enum Input {
     Thread(ConnectionId, ThreadMessage),
     /// A waiting tool call's timeout has passed.
     ToolDeadline,
+    /// A thread's agent asked for one of its terminals.
+    AgentTerminal(ThreadId, agent_thread::TerminalRequest),
+    /// An event from a terminal's run (`serial`).
+    Terminal {
+        key: TerminalKey,
+        serial: u64,
+        event: alacritty_terminal::event::Event,
+    },
     /// The answer to a request that needed background work.
     Respond {
         client: ClientId,
@@ -77,6 +88,8 @@ struct Client {
     subscribed_to_session: bool,
     /// What the client has been sent of each thread it subscribed to.
     threads: HashMap<ConnectionId, ThreadView>,
+    /// And of each terminal it watches.
+    terminals: HashMap<TerminalKey, TerminalFrame>,
 }
 
 /// An agent started only to log in or out, from its settings.
@@ -93,6 +106,7 @@ pub(crate) struct Server {
     data_dir: PathBuf,
     custom_agents: BTreeMap<AgentId, CustomAgent>,
     agent_control: Option<AgentControl>,
+    terminal_shell: Option<String>,
     /// The MCP bridges' credentials, each given to one thread's agent. Dropped with the agent.
     tool_sessions: HashMap<String, ThreadId>,
     follow_ups: HashMap<ThreadId, VecDeque<FollowUp>>,
@@ -108,6 +122,7 @@ pub(crate) struct Server {
     threads: HashMap<ThreadId, AgentThread>,
     accounts: HashMap<u64, Account>,
     next_account_id: u64,
+    terminals: Terminals,
     clients: HashMap<ClientId, Client>,
     // What session subscribers were last sent.
     projects_revision_sent: u64,
@@ -148,6 +163,7 @@ impl Server {
             data_dir,
             custom_agents: config.custom_agents,
             agent_control: config.agent_control,
+            terminal_shell: config.terminal_shell,
             tool_sessions: HashMap::default(),
             follow_ups: HashMap::default(),
             moving_threads: HashMap::default(),
@@ -162,6 +178,7 @@ impl Server {
             threads: HashMap::default(),
             accounts: HashMap::default(),
             next_account_id: 1,
+            terminals: Terminals::default(),
             clients: HashMap::default(),
             registry_changed: false,
             changed_connections: HashSet::default(),
@@ -216,6 +233,7 @@ impl Server {
                         outgoing,
                         subscribed_to_session: false,
                         threads: HashMap::default(),
+                        terminals: HashMap::default(),
                     },
                 );
             }
@@ -248,6 +266,7 @@ impl Server {
                 id,
                 request:
                     request @ (Request::CreateThread { .. }
+                    | Request::CreateTerminalThread { .. }
                     | Request::ProjectGit(_)
                     | Request::RemoveWorkspace { .. }
                     | Request::SyncWorkspace { .. }
@@ -280,6 +299,10 @@ impl Server {
             Input::Shutdown => self.stopping = true,
             // The waiting calls are checked once this batch is handled.
             Input::ToolDeadline => {}
+            Input::Terminal { key, serial, event } => self.terminal_event(key, serial, event),
+            Input::AgentTerminal(thread_id, request) => {
+                self.agent_terminal_request(thread_id, request)
+            }
             Input::Thread(connection, message) => {
                 let thread = match connection {
                     ConnectionId::Thread(id) => self.threads.get_mut(&id),
@@ -544,7 +567,15 @@ impl Server {
             Request::ThreadDiff { .. } | Request::RestoreCheckpoint { .. } => {
                 Err(anyhow!("diffs are handled separately"))
             }
+            request @ (Request::TerminalPrograms
+            | Request::SubscribeTerminal(_)
+            | Request::UnsubscribeTerminal(_)
+            | Request::TerminalInput { .. }
+            | Request::TerminalSelectionText(_)
+            | Request::RestartTerminal(_)
+            | Request::CloseTerminal(_)) => self.terminal_request(client, request),
             Request::CreateThread { .. }
+            | Request::CreateTerminalThread { .. }
             | Request::ProjectGit(_)
             | Request::RemoveWorkspace { .. }
             | Request::SyncWorkspace { .. }
@@ -750,6 +781,12 @@ impl Server {
             .clone()
             .filter(|_| !never_prompted)
             .map(acp::SessionId::new);
+        if thread.terminal.is_some() {
+            return Ok(AgentThread::failed(
+                "Terminal".into(),
+                "This thread runs a terminal, not an agent.",
+            ));
+        }
         let Some(agent_id) = thread.agent_id.clone().map(AgentId::new) else {
             return Ok(AgentThread::failed(
                 "Agent".into(),
@@ -792,12 +829,19 @@ impl Server {
             .boxed();
         }
         let checkpoints = Checkpoints::new(cwd.clone(), &self.machine.id, thread_id);
+        let inputs = self.inputs.clone();
+        let terminal_host: agent_thread::TerminalHost = Arc::new(move |request| {
+            inputs
+                .unbounded_send(Input::AgentTerminal(thread_id, request))
+                .ok();
+        });
         let (mut agent_thread, inbox) = AgentThread::start(
             self.runtime.clone(),
             self.agent_name(&agent_id),
             command,
             cwd,
             previous_session,
+            Some(terminal_host),
         );
         agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_turn_hook(Arc::new(move |point| {
@@ -963,6 +1007,7 @@ impl Server {
         let threads = &self.threads;
         self.tool_sessions
             .retain(|_, thread_id| threads.contains_key(thread_id));
+        self.close_orphaned_terminals();
         self.move_threads();
         self.finish_tasks();
         let answers = self.answer_waiting_tool_calls();
@@ -1030,6 +1075,8 @@ impl Server {
                 }
             }
         }
+
+        self.send_terminal_frames();
 
         // After the changes, as for any other response.
         for (client, id, result) in answers {

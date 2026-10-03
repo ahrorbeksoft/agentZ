@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 7, terminals: port Zed's `terminal` into the server, stream screens to the app,
-terminal threads and the thread terminal drawer.
+**Next:** Phase 7, terminals, in the app: port Zed's terminal element, then terminal threads,
+the thread terminal drawer and links from tool calls to their terminals.
 
 | Phase | Status |
 |---|---|
@@ -20,7 +20,7 @@ terminal threads and the thread terminal drawer.
 | 4. Subthreads | Done |
 | 5. Diffs | Done |
 | 6. Worktrees and pastures | Done |
-| 7. Terminals | Not started |
+| 7. Terminals | In progress |
 | 8. Terminal agent detection | Not started |
 | 9. Machines over SSH | Not started |
 | 10. Polish | Not started |
@@ -189,20 +189,29 @@ Then the server:
 
 ## 7. Terminals
 
-- [ ] Server: port Zed's `terminal` (PTY plus `alacritty_terminal`) without settings, tasks or
-      workspace. Keep 5,000 lines and 8 MiB of scrollback.
-- [ ] Protocol: terminal content snapshot and changes, streamed only for viewed terminals and
-      throttled. Input, paste, resize, scroll and selection go back.
-- [ ] App: port `terminal_element.rs` and `mappings/` without the editor and workspace
+- [x] Server: port Zed's `terminal` (PTY plus `alacritty_terminal`) without settings, tasks or
+      workspace. Keep 5,000 lines of scrollback. Programs get `TERM=xterm-256color`,
+      `TERM_PROGRAM=agentZ` and `AGENTZ_*`; color queries are answered from the client's theme.
+- [x] Protocol: terminal frames (lines of styled runs, cursor, modes, selection), only the
+      changed lines after the first, streamed only to subscribed clients and at most every 16 ms.
+      Input, paste, resize, scroll, selection, focus and the palette go back. Terminals are keyed
+      by what owns them (terminal thread, drawer, agent command) and start on demand.
+- [x] Zed's key mappings (`mappings/keys.rs`) in `agentz_protocol::terminal_keys`, shared by the
+      app and the terminal tools.
+- [ ] App: port `terminal_element.rs` and `mappings/mouse.rs` without the editor and workspace
       dependencies.
 - [ ] Terminal threads: thread kind "terminal". New Thread › Terminal: a login shell, or an
-      agent CLI found on that machine's `PATH`.
-- [ ] Thread terminal drawer under ACP threads.
-- [ ] ACP client `terminal` capability backed by server terminals. Tool calls link to their live
-      terminal.
-- [ ] `agentz_terminal_*` tools and CLI commands.
-- [ ] Terminals survive app restarts, keeping their screen and scrollback.
-- [ ] Tests: a scripted `sh` session and its screen snapshots.
+      agent CLI found on that machine's `PATH` (the server side and `TerminalPrograms` are done).
+- [ ] Thread terminal drawer under ACP threads (the server side is done).
+- [x] ACP client `terminal` capability backed by server terminals (Zed's non-interactive shell,
+      no pagers, output cut from the start). Tool calls name their terminals.
+- [ ] Tool calls link to their live terminal in the app.
+- [x] `agentz_terminal_list`, `_start`, `_send` (text, keys, submit), `_read` (recent or
+      visible) and `_wait` (for text or exit), after herdr's `pane` commands. The CLI reaches
+      them through `agentz-server call`.
+- [x] Terminals survive app restarts, keeping their screen and scrollback: the server owns them.
+- [x] Tests: scripted `sh` sessions and their screens, terminal threads streamed to watchers, an
+      agent's `terminal/*` requests, and the terminal tools.
 
 ## 8. Terminal agent detection
 

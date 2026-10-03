@@ -156,6 +156,7 @@ async fn serve(socket: &Path) -> Result<()> {
                 executable: std::env::current_exe().context("finding this executable")?,
                 socket: socket.to_path_buf(),
             }),
+            terminal_shell: None,
         },
     )?;
     log::info!(

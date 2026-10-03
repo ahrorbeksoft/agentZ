@@ -8,7 +8,9 @@ session/load), calls its first tool, and replies "MCP: <tool result>"; "mcp <too
 <json arguments>" calls that tool instead. A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart. "write <path> <text>"
 writes the text and a newline to the file, relative to the session's folder, and
-"delete <path>" removes it.
+"delete <path>" removes it. "terminal <command>" runs the command in a client
+terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
+and replies "Terminal <exit code>: <output>", then releases it.
 """
 import json
 import os
@@ -84,6 +86,36 @@ def finish_prompt(request_id, session_id, prompt_text, chosen=None):
     if chosen is not None:
         update(session_id, text_chunk("agent_message_chunk", f" (chose {chosen})"))
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+
+
+def client_request(method, params):
+    """Sends a request to the client and reads stdin until its answer arrives."""
+    global next_request_id
+    next_request_id += 1
+    request_id = next_request_id
+    send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+    while True:
+        reply = json.loads(sys.stdin.readline())
+        if reply.get("id") == request_id and "method" not in reply:
+            if "error" in reply:
+                raise RuntimeError(reply["error"].get("message", "error"))
+            return reply["result"]
+
+
+def run_in_terminal(session_id, command):
+    created = client_request("terminal/create", {"sessionId": session_id, "command": command,
+                                                 "outputByteLimit": 10000})
+    terminal_id = created["terminalId"]
+    update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "terminal-1",
+                        "title": command, "kind": "execute", "status": "in_progress",
+                        "content": [{"type": "terminal", "terminalId": terminal_id}]})
+    exited = client_request("terminal/wait_for_exit",
+                            {"sessionId": session_id, "terminalId": terminal_id})
+    output = client_request("terminal/output", {"sessionId": session_id, "terminalId": terminal_id})
+    client_request("terminal/release", {"sessionId": session_id, "terminalId": terminal_id})
+    update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "terminal-1",
+                        "status": "completed"})
+    return f"Terminal {exited.get('exitCode')}: {output['output'].strip()}"
 
 
 def call_mcp_tool(name=None, arguments=None):
@@ -185,6 +217,13 @@ for line in sys.stdin:
             else:
                 os.remove(path)
             update(params["sessionId"], text_chunk("agent_message_chunk", f"Done: {parts[0]} {parts[1]}"))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text.startswith("terminal "):
+            try:
+                reply = run_in_terminal(params["sessionId"], prompt_text[len("terminal "):])
+            except RuntimeError as error:
+                reply = f"Terminal failed: {error}"
+            update(params["sessionId"], text_chunk("agent_message_chunk", reply))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "slow":
             for word in ["One", " two", " three", " four", " five"]:

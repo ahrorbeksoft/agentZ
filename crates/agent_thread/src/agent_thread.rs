@@ -64,6 +64,34 @@ pub enum TurnPoint {
     Ended,
 }
 
+/// A `terminal/*` request from the agent, with its answer to give (ACP's client terminals).
+pub enum TerminalRequest {
+    Create(
+        acp::CreateTerminalRequest,
+        Responder<acp::CreateTerminalResponse>,
+    ),
+    Output(
+        acp::TerminalOutputRequest,
+        Responder<acp::TerminalOutputResponse>,
+    ),
+    WaitForExit(
+        acp::WaitForTerminalExitRequest,
+        Responder<acp::WaitForTerminalExitResponse>,
+    ),
+    Kill(
+        acp::KillTerminalRequest,
+        Responder<acp::KillTerminalResponse>,
+    ),
+    Release(
+        acp::ReleaseTerminalRequest,
+        Responder<acp::ReleaseTerminalResponse>,
+    ),
+}
+
+/// Runs the terminals the agent asks for. With one, the client advertises ACP's `terminal`
+/// capability. It must answer without blocking: waiting for an exit answers later.
+pub type TerminalHost = Arc<dyn Fn(TerminalRequest) + Send + Sync>;
+
 /// The result of background work, for [`AgentThread::handle`].
 pub struct ThreadMessage {
     /// Which connection the message belongs to. Messages from before a reload are dropped.
@@ -143,6 +171,7 @@ pub struct AgentThread {
     queued_prompts: Vec<String>,
     /// Given to the agent with every session it opens.
     mcp_servers: Vec<acp::McpServer>,
+    terminal_host: Option<TerminalHost>,
     turn_hook: Option<TurnHook>,
     /// Set by [`Self::cancel`] for the turn in flight, in case its prompt hasn't gone out yet.
     turn_cancelled: Option<Arc<AtomicBool>>,
@@ -182,10 +211,12 @@ impl AgentThread {
         command: CommandFuture,
         cwd: PathBuf,
         previous_session: Option<acp::SessionId>,
+        terminal_host: Option<TerminalHost>,
     ) -> (Self, ThreadInbox) {
         let (mut this, inbox) =
             Self::new(Some(runtime), agent_name, ConnectionStatus::Connecting, cwd);
         this.previous_session = previous_session;
+        this.terminal_host = terminal_host;
         this.connect_agent(command);
         (this, inbox)
     }
@@ -243,6 +274,7 @@ impl AgentThread {
             pending_title: None,
             queued_prompts: Vec::new(),
             mcp_servers: Vec::new(),
+            terminal_host: None,
             turn_hook: None,
             turn_cancelled: None,
             stderr_lines: VecDeque::new(),
@@ -304,13 +336,20 @@ impl AgentThread {
     fn connect_agent(&mut self, command: CommandFuture) {
         let cwd = self.view.state.cwd.clone();
         let sender = self.sender();
+        let terminal_host = self.terminal_host.clone();
         self.spawn_task(async move {
             // The agent's own tasks, which stop the agent when dropped.
             let mut agent_tasks = JoinSet::new();
             let result = async {
                 let command = command.await?;
-                let connected =
-                    connect(command.clone(), cwd, sender.clone(), &mut agent_tasks).await?;
+                let connected = connect(
+                    command.clone(),
+                    cwd,
+                    sender.clone(),
+                    terminal_host,
+                    &mut agent_tasks,
+                )
+                .await?;
                 anyhow::Ok((command, connected))
             }
             .await;
@@ -1002,6 +1041,7 @@ impl AgentThread {
                 .map(|location| location.path)
                 .collect(),
             raw_input: tool_call.raw_input.as_ref().and_then(raw_input_text),
+            terminals: Vec::new(),
         };
         set_tool_call_content(&mut entry, tool_call.content);
         if let Some(existing) = self.tool_call_mut(&entry.id) {
@@ -1028,6 +1068,7 @@ impl AgentThread {
                     .map(|location| location.path)
                     .collect(),
                 raw_input: fields.raw_input.as_ref().and_then(raw_input_text),
+                terminals: Vec::new(),
             };
             set_tool_call_content(&mut entry, fields.content.unwrap_or_default());
             self.view.entries.push(Entry::ToolCall(entry));
@@ -1086,6 +1127,7 @@ fn raw_input_text(value: &serde_json::Value) -> Option<String> {
 fn set_tool_call_content(tool_call: &mut ToolCall, content: Vec<acp::ToolCallContent>) {
     tool_call.text.clear();
     tool_call.diffs.clear();
+    tool_call.terminals.clear();
     for item in content {
         match item {
             acp::ToolCallContent::Content(content) => {
@@ -1098,6 +1140,9 @@ fn set_tool_call_content(tool_call: &mut ToolCall, content: Vec<acp::ToolCallCon
                 old_text: diff.old_text,
                 new_text: diff.new_text,
             }),
+            acp::ToolCallContent::Terminal(terminal) => {
+                tool_call.terminals.push(terminal.terminal_id.0.to_string())
+            }
             _ => {}
         }
     }
@@ -1107,6 +1152,23 @@ fn error_message(error: &agent_client_protocol::Error) -> String {
     match &error.data {
         Some(data) => format!("{} ({data})", error.message),
         None => error.message.clone(),
+    }
+}
+
+/// Answers a terminal request from an agent that wasn't offered terminals.
+fn refuse_terminal_request(request: TerminalRequest) {
+    let message = "agentZ doesn't run terminals for this agent";
+    let result = match request {
+        TerminalRequest::Create(_, responder) => responder.respond_with_internal_error(message),
+        TerminalRequest::Output(_, responder) => responder.respond_with_internal_error(message),
+        TerminalRequest::WaitForExit(_, responder) => {
+            responder.respond_with_internal_error(message)
+        }
+        TerminalRequest::Kill(_, responder) => responder.respond_with_internal_error(message),
+        TerminalRequest::Release(_, responder) => responder.respond_with_internal_error(message),
+    };
+    if let Err(error) = result {
+        log::error!("failed to refuse a terminal request: {error:?}");
     }
 }
 
@@ -1124,6 +1186,7 @@ async fn connect(
     command: AgentCommand,
     cwd: PathBuf,
     sender: MessageSender,
+    terminal_host: Option<TerminalHost>,
     agent_tasks: &mut JoinSet<()>,
 ) -> Result<Connected> {
     let mut child = tokio::process::Command::new(&command.path)
@@ -1153,9 +1216,22 @@ async fn connect(
     ));
 
     let (connection_sender, connection_receiver) = oneshot::channel();
+    let supports_terminals = terminal_host.is_some();
+    let host = move |request: TerminalRequest| match &terminal_host {
+        Some(host) => host(request),
+        None => refuse_terminal_request(request),
+    };
+    let host = Arc::new(host);
     let connection_future = {
         let notification_sender = sender.clone();
         let permission_sender = sender.clone();
+        let (create_host, output_host, wait_host, kill_host, release_host) = (
+            host.clone(),
+            host.clone(),
+            host.clone(),
+            host.clone(),
+            host.clone(),
+        );
         Client
             .builder()
             .name("agentZ")
@@ -1181,6 +1257,41 @@ async fn connect(
                             acp::RequestPermissionOutcome::Cancelled,
                         ))?;
                     }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: acp::CreateTerminalRequest, responder, _connection| {
+                    create_host(TerminalRequest::Create(request, responder));
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: acp::TerminalOutputRequest, responder, _connection| {
+                    output_host(TerminalRequest::Output(request, responder));
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: acp::WaitForTerminalExitRequest, responder, _connection| {
+                    wait_host(TerminalRequest::WaitForExit(request, responder));
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: acp::KillTerminalRequest, responder, _connection| {
+                    kill_host(TerminalRequest::Kill(request, responder));
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: acp::ReleaseTerminalRequest, responder, _connection| {
+                    release_host(TerminalRequest::Release(request, responder));
                     Ok(())
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1228,7 +1339,7 @@ async fn connect(
     let initialize = connection
         .send_request(
             acp::InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(acp::ClientCapabilities::new())
+                .client_capabilities(acp::ClientCapabilities::new().terminal(supports_terminals))
                 .client_info(acp::Implementation::new("agentZ", version)),
         )
         .block_task()
@@ -1465,6 +1576,7 @@ mod tests {
             ready(command),
             std::env::temp_dir(),
             previous_session,
+            None,
         ))
     }
 

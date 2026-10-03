@@ -21,6 +21,7 @@ agent-client-protocol.workspace = true
 agent_thread.workspace = true
 agentz_client.workspace = true
 agentz_protocol.workspace = true
+alacritty_terminal.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -45,7 +46,7 @@ uuid.workspace = true
 libc.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["hostname"] }
+nix = { workspace = true, features = ["hostname", "signal"] }
 
 [dev-dependencies]
 tempfile.workspace = true

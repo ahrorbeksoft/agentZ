@@ -14,6 +14,7 @@
 //! stay with the user. Mutations take an optional `clientRequestId`, so a retry returns the
 //! first answer instead of doing the work again.
 
+mod terminals;
 mod workspaces;
 
 use std::collections::VecDeque;
@@ -566,6 +567,11 @@ impl Server {
             "agentz_workspace_handoff" => self.workspace_handoff(caller, &arguments),
             "agentz_workspace_sync" => self.workspace_sync(caller, &arguments),
             "agentz_workspace_bring_back" => self.workspace_bring_back(caller, &arguments),
+            "agentz_terminal_list" => self.terminal_list(caller),
+            "agentz_terminal_start" => self.terminal_start(caller, &arguments),
+            "agentz_terminal_send" => self.terminal_send(caller, &arguments),
+            "agentz_terminal_read" => self.terminal_read(caller, &arguments),
+            "agentz_terminal_wait" => self.terminal_wait(caller, &arguments, timed_out),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
         Ok(match (request_key, step) {
@@ -662,7 +668,7 @@ impl Server {
                 "appOwnedSubagents": true,
                 "diffs": true,
                 "workspaces": true,
-                "terminals": false,
+                "terminals": true,
             },
         })))
     }
@@ -1857,7 +1863,7 @@ pub(super) fn definitions() -> Value {
     });
     let mut launch_with_request_id = launch.clone();
     launch_with_request_id["properties"]["clientRequestId"] = client_request_id.clone();
-    json!([
+    let mut tools = json!([
         {
             "name": "orchestrator_capabilities",
             "title": "Get orchestration capabilities",
@@ -2133,5 +2139,9 @@ pub(super) fn definitions() -> Value {
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": true},
         },
-    ])
+    ]);
+    if let Value::Array(tools) = &mut tools {
+        tools.extend(terminals::definitions());
+    }
+    tools
 }

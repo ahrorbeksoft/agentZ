@@ -250,6 +250,7 @@ mod tests {
                 shell_environment_ready: futures::future::ready(()).boxed().shared(),
                 custom_agents,
                 agent_control: None,
+                terminal_shell: None,
             },
         )
         .expect("server starts")

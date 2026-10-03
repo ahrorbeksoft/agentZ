@@ -48,6 +48,10 @@ pub struct ToolCall {
     pub locations: Vec<PathBuf>,
     /// The tool's input as markdown (JSON in a code block), for Zed's "Raw Input" view.
     pub raw_input: Option<String>,
+    /// Terminals the agent runs the tool in (ACP's `terminal/create`), by the ids it got:
+    /// [`crate::terminal::TerminalKey::Agent`].
+    #[serde(default)]
+    pub terminals: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
