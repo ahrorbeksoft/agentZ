@@ -767,12 +767,6 @@ impl Shell {
                     window.titlebar_double_click();
                 }
             })
-            .child(
-                // Keeps a press on the tabs from starting a window drag.
-                div()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(view_tabs),
-            )
             .when(shows_switcher, |title_bar| {
                 title_bar.child(
                     // Keeps a press on the switcher from starting a window drag.
@@ -830,6 +824,12 @@ impl Shell {
             })
             .child(div().flex_1())
             .children(self.render_connection_status(cx))
+            .child(
+                // Keeps a press on the tabs from starting a window drag.
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(view_tabs),
+            )
     }
 
     /// An icon for each machine that can't be reached or runs an older server, which opens
