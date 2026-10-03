@@ -45,6 +45,16 @@ impl SpaceStore {
         for space in &mut this.spaces {
             space.git = None;
             space.current = None;
+            // Ending a rename unchanged once saved the folder's own name as the user's, which
+            // stopped the name from following the workspace. It reads the same either way.
+            if space.name.as_deref().is_some_and(|name| {
+                space
+                    .folder
+                    .file_name()
+                    .is_some_and(|folder| folder == name)
+            }) {
+                space.name = None;
+            }
             space.tabs.retain_mut(|tab| {
                 for pane in &mut tab.panes {
                     pane.agent = None;
@@ -639,6 +649,30 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
         let store = SpaceStore::load(Some(path));
         assert!(store.spaces().is_empty());
+    }
+
+    #[test]
+    fn a_saved_name_equal_to_the_folders_is_automatic() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("spaces.json");
+        {
+            let mut store = SpaceStore::load(Some(path.clone()));
+            let first = store.create_space("/work/app".into(), None, shell("/work/app"));
+            let second = store.create_space("/work/lib".into(), None, shell("/work/lib"));
+            store
+                .rename_space(first.space, Some("app".into()))
+                .expect("rename");
+            store
+                .rename_space(second.space, Some("Library".into()))
+                .expect("rename");
+        }
+        let store = SpaceStore::load(Some(path));
+        let names: Vec<Option<&str>> = store
+            .spaces()
+            .iter()
+            .map(|space| space.name.as_deref())
+            .collect();
+        assert_eq!(names, [None, Some("Library")]);
     }
 
     #[test]
