@@ -2150,7 +2150,6 @@ impl SpacesView {
                         .ok();
                     })
                 })
-
                 .separator()
                 .entry(
                     "Close Pane",

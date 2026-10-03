@@ -4,6 +4,7 @@
 //! Plain Rust with no UI framework, so the server can own it. Whoever owns the store learns of
 //! changes through [`ProjectStore::revision`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
@@ -298,6 +299,8 @@ pub struct ProjectsSnapshot {
     pub working_threads: Vec<ThreadId>,
     /// Threads waiting for the user to answer a permission request.
     pub blocked_threads: Vec<ThreadId>,
+    /// Terminal threads running an agent CLI, with its name. The rest are plain shells.
+    pub terminal_agents: Vec<(ThreadId, String)>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -329,6 +332,8 @@ pub struct ProjectStore {
     working_threads: HashSet<ThreadId>,
     /// Threads with a permission request waiting. Not persisted either.
     blocked_threads: HashSet<ThreadId>,
+    /// Terminal threads running an agent CLI, by its name. Not persisted either.
+    terminal_agents: BTreeMap<ThreadId, String>,
     /// Counts changes, so the owner can tell whether a call changed anything.
     revision: u64,
     saver: Option<Saver<PersistedState>>,
@@ -356,6 +361,7 @@ impl ProjectStore {
             archived_expanded: state.archived_expanded,
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
+            terminal_agents: BTreeMap::new(),
             revision: 0,
             saver: state_path.map(|path| Saver::new(path, "projects-saver")),
         };
@@ -565,6 +571,8 @@ impl ProjectStore {
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.blocked_threads
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
+        self.terminal_agents
+            .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
         }
@@ -741,6 +749,7 @@ impl ProjectStore {
             for id in ids {
                 self.working_threads.remove(&id);
                 self.blocked_threads.remove(&id);
+                self.terminal_agents.remove(&id);
             }
             self.changed();
         }
@@ -915,6 +924,25 @@ impl ProjectStore {
         }
     }
 
+    /// The agent CLI a terminal thread runs, if any.
+    pub fn terminal_agent(&self, id: ThreadId) -> Option<&str> {
+        self.terminal_agents.get(&id).map(String::as_str)
+    }
+
+    /// Records the agent CLI a terminal thread runs, or that it's back to a plain shell.
+    pub fn set_terminal_agent(&mut self, id: ThreadId, agent: Option<String>) {
+        let changed = match agent {
+            Some(agent) if self.thread(id).is_some() => {
+                self.terminal_agents.insert(id, agent.clone()) != Some(agent)
+            }
+            Some(_) => false,
+            None => self.terminal_agents.remove(&id).is_some(),
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
     pub fn record_thread_activity(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.last_activity_at = Some(SystemTime::now());
@@ -936,6 +964,11 @@ impl ProjectStore {
             archived_expanded: self.archived_expanded,
             working_threads,
             blocked_threads,
+            terminal_agents: self
+                .terminal_agents
+                .iter()
+                .map(|(id, agent)| (*id, agent.clone()))
+                .collect(),
         }
     }
 
@@ -954,6 +987,7 @@ impl ProjectStore {
         );
         this.working_threads = snapshot.working_threads.into_iter().collect();
         this.blocked_threads = snapshot.blocked_threads.into_iter().collect();
+        this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
         this
     }
 
