@@ -33,7 +33,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::agents::{AgentId, AgentSettings, RegistrySnapshot};
+use crate::agents::{AgentIcon, AgentId, AgentSettings, IconId, RegistrySnapshot};
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
 use crate::terminal::{
@@ -403,6 +403,9 @@ pub enum Request {
     },
     InstallAgent(AgentId),
     UninstallAgent(AgentId),
+    /// The registry's icons by id, answered with [`Response::AgentIcons`], leaving out those
+    /// this machine doesn't have.
+    AgentIcons(Vec<IconId>),
     UpdateAgentSettings {
         agent_id: AgentId,
         change: AgentSettingsChange,
@@ -558,6 +561,7 @@ pub enum Response {
     TerminalFrame(TerminalFrame),
     Directories(DirectoryListing),
     SpacePane(PaneLocation),
+    AgentIcons(Vec<AgentIcon>),
     /// The titles of the threads whose turns are running.
     TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.

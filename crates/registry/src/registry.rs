@@ -25,6 +25,7 @@ use http_client::github::AssetKind;
 use http_client::{AsyncBody, HttpClient, StatusCode};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use tokio::task::JoinSet;
 use url::Url;
 use util::ResultExt as _;
@@ -32,7 +33,8 @@ use util::ResultExt as _;
 use crate::node_runtime::NodeRuntime;
 
 pub use agentz_protocol::agents::{
-    AgentCommand, AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
+    AgentCommand, AgentIcon, AgentId, AgentListing, IconId, InstallState, RegistryAgentMetadata,
+    RegistrySnapshot,
 };
 
 const REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
@@ -45,6 +47,7 @@ const NPX_DIR_NAME: &str = "npx";
 #[derive(Clone, Debug)]
 pub struct RegistryBinaryAgent {
     pub metadata: RegistryAgentMetadata,
+    pub icon: Option<AgentIcon>,
     pub targets: HashMap<String, RegistryTargetConfig>,
     pub supports_current_platform: bool,
 }
@@ -52,6 +55,7 @@ pub struct RegistryBinaryAgent {
 #[derive(Clone, Debug)]
 pub struct RegistryNpxAgent {
     pub metadata: RegistryAgentMetadata,
+    pub icon: Option<AgentIcon>,
     pub package: SharedString,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
@@ -87,8 +91,11 @@ impl RegistryAgent {
         &self.metadata().version
     }
 
-    pub fn icon_path(&self) -> Option<&SharedString> {
-        self.metadata().icon_path.as_ref()
+    pub fn icon(&self) -> Option<&AgentIcon> {
+        match self {
+            RegistryAgent::Binary(agent) => agent.icon.as_ref(),
+            RegistryAgent::Npx(agent) => agent.icon.as_ref(),
+        }
     }
 
     pub fn supports_current_platform(&self) -> bool {
@@ -200,6 +207,13 @@ impl AgentRegistryStore {
 
     pub fn is_fetching(&self) -> bool {
         self.is_fetching
+    }
+
+    pub fn icon(&self, id: &IconId) -> Option<&AgentIcon> {
+        self.agents
+            .iter()
+            .filter_map(RegistryAgent::icon)
+            .find(|icon| &icon.id == id)
     }
 
     pub fn fetch_error(&self) -> Option<SharedString> {
@@ -553,11 +567,11 @@ async fn build_registry_agents(
         .await??;
     }
 
-    let icon_paths = join_all(index.agents.iter().map(|entry| {
+    let icons = join_all(index.agents.iter().map(|entry| {
         let http_client = http_client.clone();
         let icons_dir = icons_dir.clone();
         async move {
-            resolve_icon_path(entry, &icons_dir, update_cache, http_client)
+            resolve_icon(entry, &icons_dir, update_cache, http_client)
                 .await
                 .log_err()
                 .flatten()
@@ -565,16 +579,16 @@ async fn build_registry_agents(
     }))
     .await;
 
-    Ok(registry_agents_from_index(index, icon_paths))
+    Ok(registry_agents_from_index(index, icons))
 }
 
 fn registry_agents_from_index(
     index: RegistryIndex,
-    icon_paths: Vec<Option<SharedString>>,
+    icons: Vec<Option<AgentIcon>>,
 ) -> Vec<RegistryAgent> {
     let current_platform = current_platform_key();
     let mut agents = Vec::new();
-    for (entry, icon_path) in index.agents.into_iter().zip(icon_paths) {
+    for (entry, icon) in index.agents.into_iter().zip(icons) {
         let metadata = RegistryAgentMetadata {
             id: AgentId::new(entry.id),
             name: entry.name.into(),
@@ -583,7 +597,7 @@ fn registry_agents_from_index(
             repository: entry.repository.map(Into::into),
             website: entry.website.map(Into::into),
             license_url: entry.license_url.map(Into::into),
-            icon_path,
+            icon: icon.as_ref().map(|icon| icon.id.clone()),
         };
 
         let binary_agent = entry.distribution.binary.as_ref().and_then(|binary| {
@@ -610,6 +624,7 @@ fn registry_agents_from_index(
 
             Some(RegistryBinaryAgent {
                 metadata: metadata.clone(),
+                icon: icon.clone(),
                 targets,
                 supports_current_platform,
             })
@@ -617,6 +632,7 @@ fn registry_agents_from_index(
 
         let npx_agent = entry.distribution.npx.as_ref().map(|npx| RegistryNpxAgent {
             metadata: metadata.clone(),
+            icon: icon.clone(),
             package: npx.package.clone().into(),
             args: npx.args.clone(),
             env: npx.env.clone(),
@@ -640,12 +656,13 @@ fn registry_agents_from_index(
     agents
 }
 
-async fn resolve_icon_path(
+/// The agent's icon, downloaded into `icons_dir` once.
+async fn resolve_icon(
     entry: &RegistryEntry,
     icons_dir: &Path,
     update_cache: bool,
     http_client: Arc<dyn HttpClient>,
-) -> Result<Option<SharedString>> {
+) -> Result<Option<AgentIcon>> {
     let Some(icon_url) = resolve_icon_url(entry) else {
         return Ok(None);
     };
@@ -669,9 +686,12 @@ async fn resolve_icon_path(
         }
     }
 
-    Ok(icon_path
-        .is_file()
-        .then(|| SharedString::from(icon_path.to_string_lossy().into_owned())))
+    if !icon_path.is_file() {
+        return Ok(None);
+    }
+    let svg = std::fs::read_to_string(&icon_path)
+        .with_context(|| format!("reading {}", icon_path.display()))?;
+    Ok(Some(agent_icon(svg)))
 }
 
 async fn fetch_url_body(
@@ -701,6 +721,15 @@ async fn fetch_url_body(
             timeout.as_secs()
         )
     })?
+}
+
+/// The icon with its id, a hash of the SVG, so machines that have the same icon name it alike.
+pub fn agent_icon(svg: String) -> AgentIcon {
+    let hash = Sha256::digest(svg.as_bytes());
+    AgentIcon {
+        id: IconId(hex::encode(hash).into()),
+        svg: svg.into(),
+    }
 }
 
 fn resolve_icon_url(entry: &RegistryEntry) -> Option<String> {
@@ -1193,7 +1222,7 @@ mod tests {
         "agents": [
             {
                 "id": "npx-agent", "name": "Npx Agent", "version": "1.2.3",
-                "description": "runs with npx",
+                "description": "runs with npx", "icon": "./npx-agent/icon.svg",
                 "distribution": { "npx": { "package": "npx-agent@1.2.3", "args": ["--acp"] } }
             },
             {
@@ -1240,8 +1269,8 @@ mod tests {
     #[test]
     fn parses_registry_index() {
         let index: RegistryIndex = serde_json::from_str(SAMPLE_INDEX).expect("valid index");
-        let icon_paths = vec![None; index.agents.len()];
-        let agents = registry_agents_from_index(index, icon_paths);
+        let icons = vec![None; index.agents.len()];
+        let agents = registry_agents_from_index(index, icons);
         let ids: Vec<_> = agents
             .iter()
             .map(|agent| agent.id().0.to_string())
@@ -1336,6 +1365,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("registry.json"), SAMPLE_INDEX).expect("write");
         std::fs::create_dir_all(dir.path().join("binary-agent").join("0.9.0")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("icons")).expect("mkdir");
+        let svg = r#"<svg fill="currentColor"/>"#;
+        std::fs::write(dir.path().join("icons").join("npx-agent.svg"), svg).expect("write");
 
         let (mut store, mut inbox) = AgentRegistryStore::new(
             tokio::runtime::Handle::current(),
@@ -1354,6 +1386,22 @@ mod tests {
         let message = inbox.next().await.expect("cache message");
         store.handle(message);
         assert_eq!(store.agents().len(), 2);
+
+        // Clients get the icon by a hash of its SVG, the same on every machine that has it.
+        let listing = store.snapshot();
+        let npx_agent = listing
+            .agent(&AgentId::new("npx-agent"))
+            .expect("npx agent");
+        let icon_id = npx_agent.icon().expect("icon id").clone();
+        assert_eq!(icon_id, agent_icon(svg.to_string()).id);
+        assert_eq!(
+            store.icon(&icon_id).map(|icon| icon.svg.clone()),
+            Some(svg.into())
+        );
+        assert_eq!(
+            listing.agent(&binary_agent).and_then(AgentListing::icon),
+            None
+        );
         assert_eq!(
             store.install_state(&binary_agent),
             InstallState::Installed {

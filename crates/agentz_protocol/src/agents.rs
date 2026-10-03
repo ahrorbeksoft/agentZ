@@ -47,9 +47,23 @@ pub struct RegistryAgentMetadata {
     pub website: Option<SharedString>,
     #[serde(default)]
     pub license_url: Option<SharedString>,
-    /// Absolute path of the cached SVG icon.
+    /// The agent's icon, which [`crate::Request::AgentIcons`] fetches. Every machine reads the
+    /// same registry, so a client fetches it once for all of them.
     #[serde(default)]
-    pub icon_path: Option<SharedString>,
+    pub icon: Option<IconId>,
+}
+
+/// An icon, by a hash of its SVG: the same on every machine that has it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IconId(pub SharedString);
+
+/// An icon's SVG markup, which clients draw in the text color (the ACP Registry's icons use
+/// `currentColor`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentIcon {
+    pub id: IconId,
+    pub svg: SharedString,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -88,8 +102,8 @@ impl AgentListing {
         &self.metadata.version
     }
 
-    pub fn icon_path(&self) -> Option<&SharedString> {
-        self.metadata.icon_path.as_ref()
+    pub fn icon(&self) -> Option<&IconId> {
+        self.metadata.icon.as_ref()
     }
 
     pub fn supports_current_platform(&self) -> bool {

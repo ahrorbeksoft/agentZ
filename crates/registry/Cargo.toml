@@ -17,6 +17,7 @@ agentz_protocol.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
+hex.workspace = true
 gpui_shared_string.workspace = true
 http_client = { workspace = true, features = ["github-download"] }
 log.workspace = true
@@ -24,6 +25,7 @@ percent-encoding.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["process", "rt", "sync", "time"] }
 url.workspace = true
 util.workspace = true

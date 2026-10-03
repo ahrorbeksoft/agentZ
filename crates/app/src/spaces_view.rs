@@ -1780,7 +1780,7 @@ impl SpacesView {
                 match thread {
                     // Like the thread's toolbar in the Agents view: its title, then its agent.
                     Some(thread) => (
-                        thread_agent_icon(machines, key.machine, &thread, cx),
+                        thread_agent_icon(&thread, cx),
                         thread.title.clone().into(),
                         self.panes.get(&key).and_then(|open| match &open.view {
                             PaneView::Agent(view) => Some(view.read(cx).agent_name(cx)),

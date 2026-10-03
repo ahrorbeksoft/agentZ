@@ -139,6 +139,8 @@ enum IconSource {
     External(Arc<Path>),
     /// An SVG not embedded in the Zed binary.
     ExternalSvg(SharedString),
+    /// SVG markup held in memory, such as an icon received from another machine.
+    SvgMarkup(SharedString),
 }
 
 #[derive(Clone, IntoElement, RegisterComponent)]
@@ -186,6 +188,17 @@ impl Icon {
         }
     }
 
+    /// An icon drawn from SVG markup rather than a file. Like an embedded icon, it takes the
+    /// icon's color.
+    pub fn from_svg_markup(markup: SharedString) -> Self {
+        Self {
+            source: IconSource::SvgMarkup(markup),
+            color: Color::default(),
+            size: IconSize::default().rems(),
+            transformation: Transformation::default(),
+        }
+    }
+
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
         self
@@ -224,6 +237,13 @@ impl RenderOnce for Icon {
                 .into_any_element(),
             IconSource::ExternalSvg(path) => svg()
                 .external_path(path)
+                .with_transformation(self.transformation)
+                .size(self.size)
+                .flex_none()
+                .text_color(self.color.color(cx))
+                .into_any_element(),
+            IconSource::SvgMarkup(markup) => svg()
+                .data(markup.as_bytes())
                 .with_transformation(self.transformation)
                 .size(self.size)
                 .flex_none()

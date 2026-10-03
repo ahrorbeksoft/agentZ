@@ -25,6 +25,7 @@ use ui::{
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
+use crate::agent_icons::agent_icon;
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
@@ -1022,12 +1023,12 @@ impl AgentView {
     }
 
     fn agent_icon(&self, cx: &App) -> Icon {
-        let icon_path = self
+        let icon = self
             .agent_id
             .as_ref()
-            .and_then(|agent_id| self.registry.read(cx).agent(agent_id)?.icon_path().cloned());
-        match icon_path {
-            Some(path) => Icon::from_external_svg(path),
+            .and_then(|agent_id| agent_icon(agent_id, cx));
+        match icon {
+            Some(markup) => Icon::from_svg_markup(markup),
             None => Icon::new(IconName::Terminal),
         }
     }

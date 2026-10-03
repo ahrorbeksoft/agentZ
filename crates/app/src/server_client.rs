@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
-use agentz_protocol::agents::{AgentId, AgentSettings};
+use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
 use agentz_protocol::terminal::TerminalKey;
@@ -25,6 +25,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use ui::SharedString;
 
+use crate::agent_icons::AgentIconStore;
 use crate::machines::MachineId;
 use crate::project_store::{ProjectStore, ThreadStatus};
 use crate::registry_store::AgentRegistryStore;
@@ -542,15 +543,21 @@ impl ServerClient {
         };
         self.projects
             .update(cx, |store, cx| store.set_snapshot(session.projects, cx));
-        self.registry.update(cx, |registry, cx| {
-            registry.set_snapshot(session.registry, cx)
-        });
+        self.set_registry(session.registry, cx);
         self.set_agent_settings(session.agent_settings, cx);
         self.set_spaces(session.spaces, cx);
         self.set_machine_icon_state(session.machine_icon, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }
+    }
+
+    fn set_registry(&mut self, registry: RegistrySnapshot, cx: &mut Context<Self>) {
+        AgentIconStore::global(cx).update(cx, |icons, cx| {
+            icons.learn(&registry, |request| self.request(request), cx)
+        });
+        self.registry
+            .update(cx, |store, cx| store.set_snapshot(registry, cx));
     }
 
     fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
@@ -571,9 +578,7 @@ impl ServerClient {
             Event::Projects(projects) => self
                 .projects
                 .update(cx, |store, cx| store.set_snapshot(projects, cx)),
-            Event::Registry(registry) => self
-                .registry
-                .update(cx, |store, cx| store.set_snapshot(registry, cx)),
+            Event::Registry(registry) => self.set_registry(registry, cx),
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),

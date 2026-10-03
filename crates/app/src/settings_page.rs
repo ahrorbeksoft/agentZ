@@ -5,6 +5,7 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
+use crate::agent_icons::agent_icon;
 use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, AgentListing, InstallState};
@@ -1234,7 +1235,7 @@ impl SettingsPage {
             // So the hover fills the row up to the group's rounded border.
             .when(is_first, |row| row.rounded_t_lg())
             .when(is_last, |row| row.rounded_b_lg())
-            .child(render_agent_tile(agent.icon_path(), px(32.), cx))
+            .child(render_agent_tile(agent.id(), px(32.), cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -1521,7 +1522,7 @@ impl SettingsPage {
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.elevated_surface_background.opacity(0.5))
-            .child(render_agent_tile(agent.icon_path(), px(32.), cx))
+            .child(render_agent_tile(agent.id(), px(32.), cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -1649,7 +1650,7 @@ impl SettingsPage {
             .border_1()
             .border_color(colors.border)
             .bg(colors.panel_background)
-            .child(render_agent_tile(agent.icon_path(), px(40.), cx))
+            .child(render_agent_tile(agent.id(), px(40.), cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -3036,10 +3037,10 @@ fn counts_as_installed(state: &InstallState) -> bool {
 
 /// An agent's icon at full contrast on a neutral tile. The ACP Registry's icons are drawn in
 /// `currentColor`, so they take the text color.
-fn render_agent_tile(icon_path: Option<&SharedString>, size: Pixels, cx: &App) -> AnyElement {
+fn render_agent_tile(agent: &AgentId, size: Pixels, cx: &App) -> AnyElement {
     let colors = cx.theme().colors();
-    let icon = match icon_path {
-        Some(path) => Icon::from_external_svg(path.clone()),
+    let icon = match agent_icon(agent, cx) {
+        Some(markup) => Icon::from_svg_markup(markup),
         None => Icon::new(IconName::Sparkle),
     };
     div()
@@ -3296,7 +3297,7 @@ mod tests {
                 repository: None,
                 website: None,
                 license_url: None,
-                icon_path: None,
+                icon: None,
             },
             supports_current_platform: true,
             install_state,

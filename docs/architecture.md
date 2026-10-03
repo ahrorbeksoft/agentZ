@@ -137,6 +137,13 @@ Each entry: what it does, where it lives, and where it comes from.
   commands, the "…" menu with Zed's Reauthenticate, Log Out and Reload Agent.
 - **Agent registry** (`registry`, `registry_store.rs`): install, update, uninstall from the ACP
   Registry, binary archives or npm.
+- **Agent icons** (`agent_icons.rs`, `registry`): each server downloads the registry's icons,
+  and its listings name each one by a SHA-256 of its SVG. Every machine reads the same
+  registry, so the app keeps one cache for all of them. It fetches an icon once
+  (`Request::AgentIcons`) from the first machine to list it, usually this Mac, and shows it
+  for that agent on every machine, even one that couldn't download it. Icons travel as markup
+  rather than server paths, so any client (a browser too) can draw them
+  (`Icon::from_svg_markup`).
 - **Login state** comes from ACP only, through an empty session (see Pitfalls in `AGENTS.md`).
 - **Background turns** (`agentz_server`, herdr): agents keep working when the app quits; the app
   reattaches with a snapshot, then live events.

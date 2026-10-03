@@ -674,6 +674,11 @@ impl Server {
                 self.registry_changed = true;
                 Ok(Response::Ok)
             }
+            Request::AgentIcons(ids) => Ok(Response::AgentIcons(
+                ids.iter()
+                    .filter_map(|id| self.registry.icon(id).cloned())
+                    .collect(),
+            )),
             Request::UpdateAgentSettings { agent_id, change } => {
                 match change {
                     AgentSettingsChange::SetEnv(env) => self
@@ -1053,7 +1058,7 @@ impl Server {
                     repository: None,
                     website: None,
                     license_url: None,
-                    icon_path: None,
+                    icon: None,
                 },
                 supports_current_platform: true,
                 install_state: InstallState::Installed {

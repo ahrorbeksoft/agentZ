@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use crate::agent_icons::agent_icon;
 use crate::machines::{GroupKey, MachineId, Machines, ProjectKey, ThreadKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
@@ -781,8 +782,8 @@ impl NewThreadModal {
         let Some(agent) = registry.agent(&agent_id) else {
             return div().into_any_element();
         };
-        let icon = match agent.icon_path() {
-            Some(path) => Icon::from_external_svg(path.clone()),
+        let icon = match agent_icon(&agent_id, cx) {
+            Some(markup) => Icon::from_svg_markup(markup),
             None => Icon::new(IconName::Terminal),
         };
         let version = match registry.install_state(&agent_id) {

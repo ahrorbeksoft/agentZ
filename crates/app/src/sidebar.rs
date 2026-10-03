@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::agent_icons::agent_icon;
 use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::machines::{MachineId, Machines, ProjectKey, Scope, ThreadKey, project_at};
 use crate::project_store::{ProjectStore, ThreadStatus};
@@ -702,8 +703,7 @@ impl Sidebar {
                 Some(model) => format!("{model} · {agent_name}").into(),
                 None => agent_name,
             };
-            let icon_path = registry_agent.and_then(|agent| agent.icon_path().cloned());
-            (icon_path, label)
+            (agent_icon(&agent_id, cx), label)
         });
         let store = machines.projects(machine, cx);
         let store = store.as_ref().map(|store| store.read(cx));
@@ -778,7 +778,7 @@ impl Sidebar {
         let is_active = self.active_thread == Some(thread_id);
         let is_renaming = self.renaming_thread == Some(thread_id);
         let thread_status = store.read(cx).thread_status(thread.id);
-        let icon = thread_agent_icon(self.machines.read(cx), machine, &thread, cx);
+        let icon = thread_agent_icon(&thread, cx);
         // Which machine it runs on, just before the agent.
         let machine_icon = Icon::new(self.machines.read(cx).machine_icon(machine, cx));
         // A terminal thread is described by where it is now, which may not be where it
@@ -1693,6 +1693,7 @@ pub(crate) struct ThreadDetails {
     pub(crate) path: Option<SharedString>,
     /// The worktree or pasture it works in, described.
     pub(crate) workspace: Option<(WorkspaceKind, SharedString)>,
+    /// The agent's icon (SVG markup) and its label.
     pub(crate) agent: Option<(Option<SharedString>, SharedString)>,
     /// What a Workspaces view workspace holds, such as "2 terminals · 1 agent".
     pub(crate) contents: Option<SharedString>,
@@ -1748,10 +1749,10 @@ impl ThreadDetails {
                 Label::new(description.clone()).truncate_middle(),
             ));
         }
-        if let Some((icon_path, label)) = &self.agent {
-            let icon = icon_path
+        if let Some((icon, label)) = &self.agent {
+            let icon = icon
                 .clone()
-                .map(Icon::from_external_svg)
+                .map(Icon::from_svg_markup)
                 .unwrap_or_else(|| Icon::new(IconName::Terminal));
             rows.push(detail_row(
                 div()
@@ -1999,28 +2000,13 @@ mod tests {
     }
 }
 
-/// The icon of the agent a thread runs, from its machine's registry. A terminal thread's is a
-/// terminal.
-pub(crate) fn thread_agent_icon(
-    machines: &Machines,
-    machine: MachineId,
-    thread: &Thread,
-    cx: &App,
-) -> Icon {
-    let registry = machines
-        .client(machine, cx)
-        .map(|client| client.read(cx).registry().clone());
+/// The icon of the agent a thread runs. A terminal thread's is a terminal.
+pub(crate) fn thread_agent_icon(thread: &Thread, cx: &App) -> Icon {
     thread
         .agent_id
         .as_ref()
-        .and_then(|agent_id| {
-            registry?
-                .read(cx)
-                .agent(&AgentId::new(agent_id.clone()))?
-                .icon_path()
-                .cloned()
-        })
-        .map(Icon::from_external_svg)
+        .and_then(|agent_id| agent_icon(&AgentId::new(agent_id.clone()), cx))
+        .map(Icon::from_svg_markup)
         .unwrap_or_else(|| Icon::new(IconName::Terminal))
 }
 

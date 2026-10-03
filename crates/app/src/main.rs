@@ -1,4 +1,5 @@
 mod add_project_modal;
+mod agent_icons;
 mod agent_view;
 mod app_settings;
 mod diff_panel;
@@ -119,6 +120,7 @@ fn init_for_test(cx: &mut App) {
         cx,
     );
     app_settings::init_for_test(cx);
+    agent_icons::init(cx);
     text_input::init(cx);
     terminal_view::init(cx);
     spaces_view::init(cx);
@@ -194,6 +196,7 @@ fn main() {
             sidebar::init(cx);
             terminal_view::init(cx);
             settings_page::init(cx);
+            agent_icons::init(cx);
             machines::init(cx);
             project_info::init(cx);
             init_actions(cx);
