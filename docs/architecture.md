@@ -1,0 +1,295 @@
+# How agentZ is built
+
+What agentZ does, where each feature lives, and which reference it was taken from. The
+references are read-only clones in `references/` (gitignored); when changing a feature, read its
+source there first and keep agentZ's behavior and wording the same.
+
+| Reference | License | Taken from it |
+|---|---|---|
+| Zed (`references/zed`) | GPL/Apache | GPUI, `ui`, themes, the agent thread view, terminals, the SSH remote server, Node.js for npm agents |
+| t3code (`references/t3code`) | MIT | Sidebar, thread cards, settings, agent control (orchestrator MCP), subthreads, checkpoints and diffs, worktrees, terminal drawer, machines and merged projects |
+| herdr (`references/herdr`) | Apache-2.0 | Background server, attention states, terminal agent detection, SSH machines, the Workspaces view (spaces, tabs, split panes) |
+| cow (`references/cow`) | MIT | Pastures: copy-on-write project copies, their sync and bring-back |
+
+Code or data ported from herdr keeps its Apache-2.0 notice (`crates/agentz_server/src/detect/`).
+
+## Architecture
+
+```
+agentz (GPUI app, a client)
+  ├─ unix socket ─────────────────────────────────────► agentz-server  (this Mac)
+  └─ ssh <host> ~/.agentz/server/<ver>/agentz-server proxy
+                    └─ stdio ⇄ unix socket ───────────► agentz-server  (remote Mac/Linux)
+
+agent (ACP) ─stdio MCP─► agentz-server mcp-bridge ─unix socket─► agentz-server  (same machine)
+script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─► agentz-server
+```
+
+- **Each machine runs one `agentz-server`**, the only owner of that machine's work: agent
+  processes and sessions, terminals, projects and threads, checkpoints, workspaces (spaces),
+  installed agents and their settings. Clients never substitute their own files, credentials
+  or agents for the server's (t3code's rule).
+- **The server doesn't link GPUI.** Headless GPUI on Linux pulls in about 450 crates; the core
+  crates (`agent_thread`, `projects`, `registry`) are plain Rust on tokio instead. The app wraps
+  copies of their state in GPUI entities with the same names and methods.
+- **One task owns the server's state** (`server.rs`). Requests and background results arrive on
+  one channel; after each batch the server sends what changed. Slow work (git, cloning,
+  checkpoints) runs off that task and comes back as an input.
+- **The app is a client of every enabled machine** at once. It keeps a copy of each server's
+  projects, threads and states, and streams full contents (messages, terminal screens, diffs)
+  only for what's on screen. Client-only state stays in the app: theme, layout, which
+  completions were seen, saved machines.
+- **Lifetimes.** The app starts this Mac's server on demand, detached; quitting the app leaves it
+  running. Settings › General › Restart Server ends it (and its agents); `agentz-server stop`
+  stops it for good. `proxy` starts a remote server detached, so a dropped SSH connection never
+  stops agents (Zed's design).
+
+### Protocol (`crates/agentz_protocol`)
+
+- Length-prefixed JSON over any byte stream. The handshake carries protocol and server versions,
+  machine id, OS/arch, the build hash, and a capability list. Clients disable only the feature a
+  capability is missing for, never the connection: remote servers outlive client releases.
+- Requests have ids; the server sends a request's changes before its response, so after
+  `CreateThread` returns, the client already has the thread (`agentz_client`).
+- The session subscription (projects, threads, states, spaces) is always on; thread details and
+  terminal screens are subscribed to only while viewed.
+- Every enum ends in `#[serde(untagged)] Unknown(serde_json::Value)`, so newer variants don't
+  break older clients.
+
+## Crates
+
+agentZ's own crates. Everything else in `crates/` is copied from Zed at the same relative path.
+
+| Crate | What it is |
+|---|---|
+| `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
+| `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`). |
+| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
+| `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
+| `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, config options, login/logout, reload, the per-turn hook. `test_support/mock_agent.py` is the scripted test agent. |
+| `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order; `state.json`. |
+| `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
+| `paths` | Data locations (`AGENTZ_DATA_DIR` overrides). |
+| `text_input` | The single-line text field. |
+| `theme_json` | The bundled JSON themes in `assets/themes`. |
+
+`tooling/bundle-mac.sh` makes `target/bundle/agentZ.app`; `tooling/build-remote-servers.sh`
+cross-builds the Linux servers.
+
+### Data
+
+In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
+
+| File | Owner | What |
+|---|---|---|
+| `state.json` | server | Projects, threads, workspaces |
+| `spaces.json` | server | Workspaces view: spaces, tabs, pane trees |
+| `agents/settings.json` | server | Per-agent env, defaults and known options |
+| `agents/registry/` | server | Registry cache, icons, installed agents |
+| `agents/custom.json` | user | Agents run from a fixed command (the mock agent for tests) |
+| `machine.json` | server | The machine icon chosen in Settings › Machines |
+| `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
+| `node/` | server | Downloaded Node.js, when the machine has none new enough |
+| `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
+| `settings.json` | app | Theme, saved machines, sidebar and terminal preferences |
+| `viewed.json` | app | Completions this client has displayed |
+
+## Features
+
+Each entry: what it does, where it lives, and where it comes from.
+
+### Window, sidebar and settings
+
+- **Window** (`shell.rs`): title bar with the sidebar toggle (Cmd-B), project switcher,
+  disconnected icon, and Agents | Workspaces tabs; the sidebar; the open thread or settings; the
+  diff panel; modals, which close on a press outside them.
+- **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
+  `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
+  favicons or monograms, git branches. The switcher is Zed's recent-projects popover.
+- **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons, the thread's own
+  branch with a worktree or pasture marker, attention state, details popover (a custom anchored
+  element, since GPUI tooltips follow the cursor), rename, delete, archive with an Archived
+  shelf, title search, context menu.
+- **Shells shelf** (`sidebar.rs`): terminal threads, named after their current folder, under the
+  project that folder is in; one becomes a thread card while an agent CLI runs in it.
+- **Settings** (`settings_page.rs`, t3code's layout): General (Restart Server, start at login,
+  combining repositories), Appearance (Zed's theme modes), Agents (registry, per-agent login,
+  defaults, environment, a machine picker), Machines, and a page per project (with Checkouts).
+- **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
+
+### Agent threads
+
+- **Thread view** (`agent_view.rs`, Zed's `agent_ui` thread view): messages, tool calls, diffs,
+  plan, permissions, composer with config selectors, context usage, queued messages, slash
+  commands, the "…" menu with Zed's Reauthenticate, Log Out and Reload Agent.
+- **Agent registry** (`registry`, `registry_store.rs`): install, update, uninstall from the ACP
+  Registry, binary archives or npm.
+- **Login state** comes from ACP only, through an empty session (see Pitfalls in `AGENTS.md`).
+- **Background turns** (`agentz_server`, herdr): agents keep working when the app quits; the app
+  reattaches with a snapshot, then live events.
+
+### Attention states and notifications
+
+herdr's states, t3code's labels and colors, Zed's notifications.
+
+- The server sends facts: `working_threads`, `blocked_threads` (a permission waiting, its own
+  or a subthread's), and each thread's `completed_at`. Each client decides "done" against the
+  completions it has displayed (`viewed.json`), so viewing in one client doesn't clear another.
+- "Displayed" is Zed's `agent_status_visible`: window active, settings closed, thread open.
+- Notifications ("Waiting for tool confirmation", "Finished") for threads not displayed. macOS
+  only shows them for an app bundle (`tooling/bundle-mac.sh`).
+
+### Agent control (MCP and CLI)
+
+t3code's orchestrator MCP (`docs/orchestration-v2/`, `apps/server/src/mcp/`), with `agentz_`
+for `t3_`.
+
+- **Delivery** (`mcp_bridge.rs`): every ACP session gets `agentz-server mcp-bridge` as a stdio MCP
+  server, with a per-session credential in its environment, so the server knows the calling
+  thread. Agents and terminals also get `AGENTZ_SOCKET`, `AGENTZ_THREAD_ID` and `AGENTZ_BIN_PATH`,
+  for `agentz-server call <tool> [json]` (t3code's `acp-mcp-call`).
+- **Tools** (`server/tools.rs`): `orchestrator_capabilities`, `agentz_thread_list`/`_read`/
+  `_launch`/`_send`/`_wait`/`_interrupt`/`_update`/`_organize`/`_diff`, `create_threads`,
+  `delegate_task`, `task_status`, `task_cancel`; workspace tools (`tools/workspaces.rs`); terminal
+  tools after herdr's `pane` commands (`tools/terminals.rs`).
+- **Policy**: the caller's project only; no broader permissions than the caller; agents can't
+  delete threads or answer permissions; `clientRequestId` idempotency; agent-created threads and
+  messages are marked `createdBy: agent` and shown as such.
+- **Across machines** (`tools/relay.rs`): calls naming another machine go through the app, which
+  reaches every machine, so they work only while the app is open.
+
+### Subthreads
+
+t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSubagentBar.tsx`).
+
+- A subthread is a thread with a `task` (`projects::Task`): parent, prompt, role, outcome. It
+  gets the task prompt only, and the parent's mode, never broader.
+- Finalization runs after every batch: a task ends when its child is idle with nothing queued.
+  The parent hears with t3code's message; tasks unfinished at shutdown end as Interrupted.
+- In the app: the parent's Agents control lists them; a subthread opens read-only; its
+  permission requests show on the parent, which becomes blocked.
+
+### Diffs
+
+t3code's checkpoints (`apps/server/src/checkpointing/`).
+
+- **Checkpoints** (`checkpoints.rs`): a commit of the whole tree with a private index, under
+  `refs/agentz/checkpoints/<machine>/<thread>/<turn>`. Turn 0 when the first turn starts, turn N
+  when it ends, through `agent_thread`'s turn hook. Never touches branches or the user's index.
+  Folders outside git get none.
+- **Diff panel** (`diff_panel.rs`, Cmd-D): latest turn or all, files and hunks, Viewed (a file
+  reopens when it changes). Revert puts files back, only for a thread alone in its worktree or
+  pasture; ACP can't rewind a conversation, so only files go back.
+- The diff button shows a dot while the panel is hidden and the thread has changed files.
+- Diffs are parsed on the server (`agentz_protocol::diff`), capped at 10 MB of patch.
+
+### Worktrees and pastures
+
+t3code's workspace model, herdr's folder layout and safe removal, cow's pastures.
+
+- A thread works in its project's checkout, a **worktree** (`git worktree add -b agentz/<id>`,
+  submodules recursive), or a **pasture**: cow's `create` (`clonefile(2)` on macOS skipping build
+  folders, `cp --reflink` or a full copy on Linux, git fixes, runtime-file cleanup, `.cow.json`
+  `post_clone`, rollback on failure).
+- `workspaces.rs` makes, removes and syncs them; `server/workspace_requests.rs` handles the
+  requests. Paths are canonicalized (`/private/tmp`).
+- **Pastures** sync from the project (temporary remote, rebase or merge, abort on conflict) and
+  bring their branch back (cow's `sync` and `extract`).
+- **Handoff** (`agentz_workspace_handoff`) moves a thread after its turn: the agent restarts in the
+  new folder, with `session/load` when it can.
+- **UI**: New Thread's Workspace step (`new_thread_modal.rs`), card markers, thread menu (New
+  Thread Here, Sync, Bring Branch), Project Settings › Checkouts. Removing asks again when work
+  would be lost; branches are kept; a workspace in use can't be removed.
+- Left out of cow: symlinked dependency folders, jj, orientation files.
+
+### Terminals
+
+Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
+
+- **Server** (`terminals.rs`, `server/terminal_requests.rs`): a PTY with `alacritty_terminal`, as
+  Zed's `alacritty.rs` without GPUI. 5,000 lines of scrollback, kept while nobody watches.
+  Screens stream as lines of styled runs, only changed lines, at most every 16 ms, only to
+  subscribed clients. Closing a terminal ends its whole session (herdr's pane shutdown).
+- **App** (`terminal_entity.rs`, `terminal_view.rs`, `terminal_element.rs`, `terminal_mouse.rs`):
+  Zed's element, key mappings (`agentz_protocol::terminal_keys`), IME, mouse, selection. Font
+  size with Cmd-+, Cmd-- and Cmd-0.
+- **Where they appear**: terminal threads (`terminal_thread_view.rs`, a login shell from New
+  Thread); the thread's terminal drawer (`terminal_drawer.rs`, t3code's: Cmd-J, groups of up to
+  four split terminals, a dot on its button while something runs with the drawer hidden); ACP
+  client terminals, shown live in tool calls.
+- **Agent detection** (`detect.rs`, `detect/`): herdr's manifests read the bottom of the screen;
+  the foreground process (via `tcgetpgrp`, since a pane's `/usr/bin/login` runs as root) names
+  the agent. Runs in workspace panes and terminal threads.
+
+### Machines over SSH
+
+herdr's connection model, Zed's remote server mechanics, t3code's UI.
+
+- **Connecting** (`agentz_client/src/ssh.rs`, `machines.rs`, `server_client.rs`): OpenSSH with
+  `BatchMode` and a shared ControlMaster; `uname -sm`; the server uploaded to
+  `~/.agentz/server/<version>/` (skipped when the SHA-256 matches); `proxy` over stdio. States:
+  Online, Reconnecting (backoff to 2 minutes), Attention (the error and the command to run).
+- **Linux servers**: static musl from `cargo zigbuild`, stripped (about 7 MB; 48 MB unstripped).
+- **Updates**: an older server keeps running beside the new binary; the title bar shows it and
+  Settings › Machines offers Restart Server…. Per-machine Stop Server.
+- **Offline machines** stay visible, dimmed, with input disabled.
+- **Remote projects**: a path field completed from that machine (`directories.rs`, t3code's
+  `filesystem.browse`).
+- **Node.js** (`registry/src/node_runtime.rs`, Zed's `node_runtime`): the system's when 22+,
+  else v24 downloaded into `node/`.
+- **Merged projects** (`repositories.rs`, `machines::build_project_groups`, t3code's
+  `projectGrouping.ts` and `normalizeGitRemoteUrl` with their tests): checkouts with the same
+  primary remote are one project; modes `repository`, `repository_path`, `separate`. New Thread
+  then asks which checkout.
+- **Machine icons** (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`): detected from
+  the hardware, or chosen in Settings › Machines.
+- **Start at login** (`login_item.rs`): a launch agent that runs `agentz-server start` once.
+
+### Workspaces view
+
+herdr's model (`concepts.mdx`, `src/layout.rs`, `src/workspace/`). Called *spaces* in code,
+since a thread's workspace is its checkout.
+
+- **Server** (`spaces.rs`, `server/space_requests.rs`): spaces rooted at a folder on one machine,
+  with tabs of split-pane trees (`agentz_protocol::layout`, herdr's `TileLayout` with its tests).
+  Saved in `spaces.json` and restored after a restart: terminals as new shells in their folders,
+  threads reattached. Branch and ahead/behind every 5 seconds.
+- **App** (`spaces_view.rs`, `new_space_picker.rs`): the sidebar of spaces (search, **+**,
+  rename, reorder) with the agents in panes below; tab bar; panes holding a shell, an agent CLI,
+  or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
+- **Keys** (Mac-style, in the `Workspaces` context, all with Cmd so terminals never get them):
+  Cmd-T, Cmd-}/Cmd-{, Cmd-D/Cmd-Shift-D, Cmd-W, Cmd-Shift-Enter, Cmd-Option-arrows, Cmd-Shift-N.
+- A terminal shown in two places takes the size of the view last interacted with (herdr).
+
+## Testing against real machines
+
+- **SSH**: `AGENTZ_SSH_TEST_TARGET=<host> cargo test -p agentz_server --test ssh -- --ignored`.
+  `AGENTZ_SSH_TEST_RESTART=1` replaces an older running server;
+  `AGENTZ_SSH_TEST_INSTALL_AGENT=<id>` installs an agent there. The user's machines are `t3-home`
+  and `devbox1` (both x86_64 Linux, ext4, so pastures there are full copies). Install only under
+  `~/.agentz`, and leave their t3code and herdr installs alone.
+- **Node.js download**: `cargo test -p registry managed_node_downloads_and_runs -- --ignored`.
+- Cross-builds need about 1 GB more disk; check `df -h ~` first.
+
+## Future plans
+
+Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
+
+- **A multi-line composer**, Zed's message editor: Shift-Enter for a new line, Enter to send,
+  pasted text keeps its line breaks, the box grows a few lines then scrolls, Up/Down move between
+  lines.
+- **@-mentions and adding context** (files, symbols, threads) to a message.
+- **Pasting images** into a message.
+- **Opening files** from tool calls.
+- **Searching message text**, not only titles.
+- **Deleting sessions on the agent's side** when a thread is deleted.
+- **t3code's pin, snooze and drag-to-reorder** for threads.
+- **Automatic workspace cleanup**: t3code's inactive-days and merged rules, cow's `gc`.
+- **An app icon** for the bundle.
+
+Open questions for the user:
+
+- Should New Thread suggest a pasture (cow) or a worktree (t3code, herdr) by default? Today the
+  current checkout is the default.
+- Should merged projects also require the same branch or commit? t3code doesn't.
+- Should agents see and manage threads in other projects? Today, the caller's project only.
