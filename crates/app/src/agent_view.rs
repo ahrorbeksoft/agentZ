@@ -26,6 +26,7 @@ use ui::{
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
+use crate::terminal_drawer::{TerminalDrawer, TerminalDrawerEvent};
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
@@ -119,8 +120,9 @@ pub struct AgentView {
     agents_expanded: bool,
     /// Subthreads at any depth waiting for a permission answer, which is given here (t3code).
     blocked_subthreads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
-    /// The terminal under the thread, while it's open (t3code's drawer).
-    drawer: Option<Entity<TerminalView>>,
+    /// The thread's terminals (t3code's drawer). Kept while hidden, so its layout stays.
+    drawer: Option<(Entity<TerminalDrawer>, Subscription)>,
+    is_drawer_open: bool,
     /// The drawer's height, as its top edge was last dragged.
     drawer_height: Pixels,
     /// The drawer fills the thread's area.
@@ -210,6 +212,7 @@ impl AgentView {
             agents_expanded: true,
             blocked_subthreads: HashMap::default(),
             drawer: None,
+            is_drawer_open: false,
             drawer_height: DRAWER_HEIGHT,
             drawer_full_screen: false,
             tool_terminals: HashMap::default(),
@@ -572,91 +575,54 @@ impl AgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.drawer.take().is_some() {
+        if self.is_drawer_open {
+            self.is_drawer_open = false;
             self.drawer_full_screen = false;
             window.focus(&self.focus_handle(cx), cx);
         } else {
-            let terminal = Terminal::shared(&self.client, TerminalKey::Drawer(self.thread_id), cx);
-            let drawer = cx.new(|cx| TerminalView::new(terminal, TerminalMode::Scrollable, cx));
+            let drawer = match &self.drawer {
+                Some((drawer, _)) => drawer.clone(),
+                None => {
+                    let client = self.client.clone();
+                    let thread_id = self.thread_id;
+                    let drawer = cx.new(|cx| TerminalDrawer::new(client, thread_id, cx));
+                    let events = cx.subscribe(&drawer, |this, drawer, event, cx| match event {
+                        TerminalDrawerEvent::ToggleFullScreen => {
+                            this.drawer_full_screen = !this.drawer_full_screen;
+                            let is_full_screen = this.drawer_full_screen;
+                            drawer.update(cx, |drawer, cx| {
+                                drawer.set_full_screen(is_full_screen, cx)
+                            });
+                            cx.notify();
+                        }
+                        // Its last terminal closed, so the drawer does too.
+                        TerminalDrawerEvent::Empty => {
+                            this.drawer = None;
+                            this.is_drawer_open = false;
+                            this.drawer_full_screen = false;
+                            cx.notify();
+                        }
+                    });
+                    self.drawer = Some((drawer.clone(), events));
+                    drawer
+                }
+            };
+            self.is_drawer_open = true;
             window.focus(&drawer.focus_handle(cx), cx);
-            self.drawer = Some(drawer);
+        }
+        let is_full_screen = self.drawer_full_screen;
+        if let Some((drawer, _)) = &self.drawer {
+            drawer.update(cx, |drawer, cx| drawer.set_full_screen(is_full_screen, cx));
         }
         cx.notify();
     }
 
     /// The drawer under the conversation, or filling the thread's area.
     fn render_drawer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let drawer = self.drawer.clone()?;
-        let terminal = drawer.read(cx).terminal().clone();
-        let exit = terminal
-            .read(cx)
-            .frame()
-            .and_then(|frame| frame.exited.clone());
+        let (drawer, _) = self.drawer.as_ref().filter(|_| self.is_drawer_open)?;
         let colors = cx.theme().colors();
         let is_full_screen = self.drawer_full_screen;
-        let header = h_flex()
-            .h(px(28.))
-            .flex_none()
-            .px_2()
-            .gap_1p5()
-            .child(
-                Icon::new(IconName::Terminal)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new("Terminal")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .children(exit.map(|exit| {
-                Label::new(match exit.code {
-                    Some(code) if code != 0 => format!("Exited with code {code}"),
-                    _ => "Exited".to_string(),
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-            }))
-            .child(div().flex_1())
-            .child(
-                IconButton::new("restart-drawer", IconName::RotateCw)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("Restart Terminal"))
-                    .on_click(move |_, _, cx| {
-                        terminal.update(cx, |terminal, cx| terminal.restart(cx))
-                    }),
-            )
-            .child(
-                IconButton::new(
-                    "full-screen-drawer",
-                    if is_full_screen {
-                        IconName::Minimize
-                    } else {
-                        IconName::Maximize
-                    },
-                )
-                .icon_size(IconSize::XSmall)
-                .tooltip(Tooltip::text(if is_full_screen {
-                    "Exit Full Screen"
-                } else {
-                    "Full Screen"
-                }))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.drawer_full_screen = !this.drawer_full_screen;
-                    cx.notify();
-                })),
-            )
-            .child(
-                IconButton::new("close-drawer", IconName::Close)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action("Close Terminal", &ToggleTerminalDrawer, cx)
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
-                    })),
-            );
-        // The top edge drags to resize, as Zed's docks do.
+        // The top edge drags to resize, as t3code's does.
         let resize_edge = div()
             .id("drawer-resize-edge")
             .absolute()
@@ -668,7 +634,7 @@ impl AgentView {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_drag(DraggedDrawerEdge, |_, _, _, cx| cx.new(|_| gpui::Empty));
         Some(
-            v_flex()
+            div()
                 .relative()
                 .map(|this| {
                     if is_full_screen {
@@ -679,10 +645,8 @@ impl AgentView {
                 })
                 .border_t_1()
                 .border_color(colors.border)
-                .bg(colors.terminal_background)
+                .child(drawer.clone())
                 .when(!is_full_screen, |this| this.child(resize_edge))
-                .child(header)
-                .child(div().flex_1().min_h_0().pb_1().child(drawer))
                 .into_any_element(),
         )
     }
@@ -1048,7 +1012,7 @@ impl AgentView {
             .child(
                 IconButton::new("toggle-terminal-drawer", IconName::Terminal)
                     .icon_size(IconSize::Small)
-                    .toggle_state(self.drawer.is_some())
+                    .toggle_state(self.is_drawer_open)
                     .tooltip(|_, cx| {
                         Tooltip::for_action("Toggle Terminal", &ToggleTerminalDrawer, cx)
                     })
@@ -2984,7 +2948,8 @@ impl Render for AgentView {
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
 
         let is_subthread = self.parent(cx).is_some();
-        let is_drawer_full_screen = self.drawer_full_screen && self.drawer.is_some();
+        let is_drawer_full_screen =
+            self.drawer_full_screen && self.is_drawer_open && self.drawer.is_some();
 
         v_flex()
             // Otherwise clicking the conversation would take focus from the message editor.

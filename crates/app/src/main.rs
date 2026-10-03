@@ -15,6 +15,7 @@ mod settings_page;
 mod shell;
 mod sidebar;
 mod spaces_view;
+mod terminal_drawer;
 mod terminal_element;
 mod terminal_entity;
 mod terminal_mouse;

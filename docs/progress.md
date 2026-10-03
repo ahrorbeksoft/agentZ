@@ -744,3 +744,8 @@ Then the server:
 - 2026-10-03: A thread's terminal drawer and Changes panel resize by dragging their edge and
   go full screen over the thread. (Detaching them into windows was built and then dropped at
   the user's request.) Cmd-J and the terminal button now work whatever has focus (ccd21d9).
+- 2026-10-03: A thread's drawer holds several terminals, as t3code's: split side by side or
+  stacked (up to 4 in a group), new terminals in groups of their own, a list of groups on the
+  right once there are two, close by the trash button or the row's X, a shell that exits
+  closes its terminal. Terminals still running are found again after an app restart.
+  (Docking the panels by drag was started and dropped at the user's request.)
