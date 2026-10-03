@@ -49,6 +49,8 @@ struct Session {
     is_outdated: bool,
     /// Ends when the server closes the session.
     events_drained: tokio::task::JoinHandle<()>,
+    /// Whether the server was uploaded first.
+    uploaded: bool,
 }
 
 async fn connect(
@@ -71,6 +73,7 @@ async fn connect(
     .expect("connects");
     // An upload, when there was one, is reported from the start to the whole binary.
     let progress = progress.into_inner().expect("not poisoned");
+    let uploaded = !progress.is_empty();
     if let (Some(first), Some(last)) = (progress.first(), progress.last()) {
         assert_eq!(first.sent, 0);
         assert_eq!(last.sent, last.total);
@@ -82,6 +85,7 @@ async fn connect(
         connection,
         is_outdated,
         events_drained,
+        uploaded,
     }
 }
 
@@ -104,6 +108,43 @@ fn server_binary(platform: RemotePlatform) -> anyhow::Result<PathBuf> {
         "no agentz-server for {platform}"
     );
     Ok(PathBuf::from(env!("CARGO_BIN_EXE_agentz-server")))
+}
+
+/// An install an older client left cut short, recorded with the whole binary's hash, is
+/// uploaded again rather than run.
+#[tokio::test(flavor = "multi_thread")]
+async fn replaces_an_install_cut_short() {
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let home = scratch.path().join("home");
+    let data_dir = tempfile::Builder::new()
+        .prefix("azssh")
+        .tempdir_in("/tmp")
+        .expect("data dir");
+    let installed = home.join(".agentz/server").join(VERSION);
+    std::fs::create_dir_all(&installed).expect("install dir");
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_agentz-server")).expect("reads the server");
+    std::fs::write(installed.join("agentz-server"), &binary[..binary.len() / 2])
+        .expect("writes half");
+    let hash = std::process::Command::new("shasum")
+        .args(["-a", "256", env!("CARGO_BIN_EXE_agentz-server")])
+        .output()
+        .expect("hashes the server");
+    let hash = String::from_utf8(hash.stdout).expect("UTF-8");
+    let hash = hash.split_whitespace().next().expect("a hash");
+    std::fs::write(installed.join("agentz-server.sha256"), format!("{hash}\n"))
+        .expect("writes the hash");
+    let program = fake_ssh(scratch.path(), &home, data_dir.path());
+    let ssh = Ssh::with_program(program, "devbox").expect("valid target");
+
+    let connected = connect(&ssh, server_binary).await;
+    assert!(connected.uploaded);
+    assert_eq!(
+        std::fs::metadata(installed.join("agentz-server"))
+            .expect("installed")
+            .len(),
+        binary.len() as u64
+    );
+    shut_down(connected).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -252,6 +293,7 @@ async fn connects_to_a_real_machine() {
             connection,
             is_outdated,
             events_drained,
+            uploaded: false,
         }
     };
     let mut session = connect().await;

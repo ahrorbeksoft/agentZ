@@ -321,22 +321,23 @@ impl Ssh {
 
     /// The machine's platform, and the hash of the server already installed for `version`, in
     /// one round trip.
-    async fn probe(&self, version: &str) -> Result<(RemotePlatform, Option<String>)> {
+    /// The machine's platform, and the hash and size of the server installed there.
+    async fn probe(&self, version: &str) -> Result<(RemotePlatform, Option<(String, u64)>)> {
+        let directory = install_directory(version);
         let output = self
             .run(&format!(
-                "uname -s; uname -m; cat {}/agentz-server.sha256 2>/dev/null || true",
-                install_directory(version)
+                "uname -s; uname -m\n\
+                 cat {directory}/agentz-server.sha256 2>/dev/null || echo\n\
+                 wc -c 2>/dev/null < {directory}/agentz-server || echo"
             ))
             .await?;
         let mut lines = output.lines();
         let os = lines.next().unwrap_or_default();
         let arch = lines.next().unwrap_or_default();
         let platform = RemotePlatform::from_uname(os, arch)?;
-        let installed = lines
-            .next()
-            .map(str::trim)
-            .filter(|hash| !hash.is_empty())
-            .map(str::to_string);
+        let hash = lines.next().map(str::trim).filter(|hash| !hash.is_empty());
+        let size = lines.next().and_then(|size| size.trim().parse().ok());
+        let installed = hash.zip(size).map(|(hash, size)| (hash.to_string(), size));
         Ok((platform, installed))
     }
 
@@ -351,16 +352,37 @@ impl Ssh {
         on_progress: &(dyn Fn(UploadProgress) + Send + Sync),
     ) -> Result<()> {
         let directory = install_directory(version);
+        // `cat` ends the same way when ssh is cut off as when the upload is done, so what
+        // arrived is checked before it's put in place.
         let script = format!(
             "set -eu\n\
              dir={directory}\n\
              mkdir -p \"$dir\"\n\
              tmp=\"$dir/agentz-server.tmp.$$\"\n\
              cat > \"$tmp\"\n\
+             size=$(wc -c < \"$tmp\" | tr -d ' ')\n\
+             if [ \"$size\" != {size} ]; then\n\
+               rm -f \"$tmp\"\n\
+               echo \"the upload was cut short ($size of {size} bytes)\" >&2\n\
+               exit 1\n\
+             fi\n\
+             if command -v sha256sum >/dev/null 2>&1; then\n\
+               sum=$(sha256sum \"$tmp\" | cut -d ' ' -f 1)\n\
+             elif command -v shasum >/dev/null 2>&1; then\n\
+               sum=$(shasum -a 256 \"$tmp\" | cut -d ' ' -f 1)\n\
+             else\n\
+               sum={hash}\n\
+             fi\n\
+             if [ \"$sum\" != {hash} ]; then\n\
+               rm -f \"$tmp\"\n\
+               echo \"the upload arrived damaged\" >&2\n\
+               exit 1\n\
+             fi\n\
              chmod 755 \"$tmp\"\n\
              mv \"$tmp\" \"$dir/agentz-server\"\n\
              printf '%s\\n' {hash} > \"$dir/agentz-server.sha256\"\n",
             hash = shell_quote(hash),
+            size = binary.len(),
         );
         let mut child = self
             .command(&remote_script(&script))
@@ -521,7 +543,8 @@ async fn connect_inner(
         .await
         .with_context(|| format!("reading {}", path.display()))?;
     let hash = sha256_hex(&binary);
-    if installed.as_deref() != Some(hash.as_str()) {
+    // The size too: an upload cut short by an older client was kept with the whole one's hash.
+    if installed != Some((hash.clone(), binary.len() as u64)) {
         log::info!(
             "installing agentz-server {version} for {platform} on {}",
             ssh.target()
