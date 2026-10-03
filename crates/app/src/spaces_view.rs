@@ -36,7 +36,8 @@ use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_store::ThreadStatus;
 use crate::sidebar::{
     ARCHIVED_ROW_HEIGHT, DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover,
-    render_folder_icon, render_footer_item, render_status_dot, thread_agent_icon,
+    render_folder_icon, render_footer_item, render_status_dot, render_status_pill,
+    thread_agent_icon,
 };
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -1149,7 +1150,7 @@ impl SpacesView {
         let details = ThreadDetails {
             title: label.clone(),
             project: project.map(|project| (project, project_info)),
-            machine: (machine_icon, machine_label.clone()),
+            machine: (machine_icon, machine_label),
             branch: git.as_ref().map(|git| {
                 git.branch
                     .clone()
@@ -1165,83 +1166,97 @@ impl SpacesView {
             (self.details_space == Some(key)).then(|| render_details_popover(details, cx));
         let id = format!("workspace-{}-{}", machine.slug(), space.id.0);
 
-        let name_line = h_flex()
-            .gap_2()
-            .min_w_0()
-            .child(render_state_slot(status, cx))
-            .child(icon)
+        let faint_text = colors.text_muted.opacity(0.4);
+        let group_name = SharedString::from(format!("{id}-group"));
+        // The sidebar's shell row: the icon and name, then the branch with what's inside and
+        // the machine below.
+        let main_line = h_flex()
+            .relative()
+            .h_6()
+            .gap_2p5()
+            .child(
+                div()
+                    .flex_none()
+                    .when(!is_active, |this| {
+                        this.opacity(0.4)
+                            .group_hover(group_name.clone(), |this| this.opacity(1.))
+                    })
+                    .child(icon),
+            )
             .child(if is_renaming {
                 self.render_rename_input(cx)
             } else {
-                Label::new(label.clone())
-                    .size(LabelSize::Small)
-                    .color(if is_active {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    })
-                    .truncate()
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(label.clone()).color(Color::Muted).truncate())
                     .into_any_element()
             })
-            .child(div().flex_1())
-            .child(
-                h_flex()
-                    .flex_none()
-                    .gap_0p5()
-                    .child(
-                        Icon::new(machine_icon)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(machine_label)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate(),
-                    ),
-            );
-        let has_git = git.is_some();
-        // The branch inside a repository, and the folder outside one.
-        let git_line = Some(git.unwrap_or_default()).map(|git| {
+            .when_some(status.filter(|_| !is_renaming), |line, status| {
+                line.child(div().flex_none().child(render_status_pill(status, cx)))
+            });
+        let faint_label = |text: String| {
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(Color::Custom(faint_text))
+        };
+        let count_badge = |icon: IconName, count: usize| {
             h_flex()
-                .pl(px(38.))
-                .gap_1()
-                .min_w_0()
+                .flex_none()
+                .gap_0p5()
                 .child(
-                    Icon::new(if has_git {
-                        IconName::GitBranch
-                    } else {
-                        IconName::Folder
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
+                    Icon::new(icon)
+                        .size(IconSize::XSmall)
+                        .color(Color::Custom(faint_text)),
                 )
-                .child(if has_git {
-                    Label::new(git.branch.unwrap_or_else(|| "detached".to_string()))
+                .child(
+                    Label::new(count.to_string())
                         .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate()
-                } else {
-                    Label::new(path)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
+                        .color(Color::Custom(faint_text)),
+                )
+        };
+        // The branch inside a repository, and where it is outside one.
+        let detail_line = h_flex()
+            // Under the title, past the icon and the gap.
+            .pl(px(26.))
+            .min_w_0()
+            .gap_1()
+            .child(match &git {
+                Some(git) => {
+                    faint_label(git.branch.clone().unwrap_or_else(|| "detached".to_string()))
                         .truncate_middle()
-                })
-                .when(git.ahead > 0, |line| {
-                    line.child(
-                        Label::new(format!("↑{}", git.ahead))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                })
-                .when(git.behind > 0, |line| {
-                    line.child(
-                        Label::new(format!("↓{}", git.behind))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                })
-        });
+                }
+                None => faint_label(path.to_string()).truncate_middle(),
+            })
+            .when_some(git.as_ref().filter(|git| git.ahead > 0), |line, git| {
+                line.child(faint_label(format!("↑{}", git.ahead)))
+            })
+            .when_some(git.as_ref().filter(|git| git.behind > 0), |line, git| {
+                line.child(faint_label(format!("↓{}", git.behind)))
+            })
+            .child(div().flex_1())
+            .when_some(contents, |line, contents| {
+                line.child(
+                    h_flex()
+                        .id(ElementId::Name(format!("{id}-contents").into()))
+                        .flex_none()
+                        .gap_1p5()
+                        .tooltip(Tooltip::text(contents))
+                        .when(terminals > 0, |this| {
+                            this.child(count_badge(IconName::Terminal, terminals))
+                        })
+                        .when(agents > 0, |this| {
+                            this.child(count_badge(IconName::UserGroup, agents))
+                        }),
+                )
+            })
+            .child(
+                div().flex_none().opacity(0.6).child(
+                    Icon::new(machine_icon)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                ),
+            );
 
         let row =
             v_flex()
@@ -1250,26 +1265,16 @@ impl SpacesView {
                     let id = id.clone();
                     move || id
                 })
+                .group(group_name)
                 .mx_1()
-                .px_2()
-                .py_1()
-                .gap_0p5()
+                .px_2p5()
+                .py_1p5()
                 .rounded_md()
                 .cursor_pointer()
-                .when(is_active, |row| row.bg(colors.element_selected))
-                .when(!is_active, |row| {
-                    row.hover(|row| row.bg(colors.ghost_element_hover))
-                })
-                .child(name_line)
-                .children(git_line)
-                .children(contents.map(|contents| {
-                    h_flex().pl(px(38.)).child(
-                        Label::new(contents)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate(),
-                    )
-                }))
+                .when(is_active, |row| row.bg(colors.ghost_element_selected))
+                .hover(|row| row.bg(colors.ghost_element_hover))
+                .child(main_line)
+                .child(detail_line)
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     this.space_hovered(key, *hovered, cx)
                 }))

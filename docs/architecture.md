@@ -260,8 +260,8 @@ since a thread's workspace is its checkout.
   5 seconds and whenever a pane `cd`s or tabs change (`Space::current`, not saved).
 - **App** (`spaces_view.rs`, `new_space_picker.rs`): the sidebar of spaces (search, **+**,
   rename, reorder) with the agents in panes below; each row shows the icon of the project the folder is in (a folder icon outside every
-  project), the folder's name, the machine,
-  the branch (or the path outside git) and "2 terminals · 1 agent", with the thread cards'
+  project) and the folder's name, then the branch (or the path outside git), terminal and agent
+  counts and the machine's icon, laid out as the sidebar's shell rows, with the thread cards'
   details popover on hover (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
 - **Keys** (Mac-style, in the `Workspaces` context, all with Cmd so terminals never get them):
