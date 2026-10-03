@@ -1886,6 +1886,79 @@ async fn terminal_threads_stream_their_screens_to_watchers() {
     );
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_threads_show_their_agents_state() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    // Named like an agent CLI, so the thread's foreground process reads as Codex. It sets
+    // the terminal's title to each line it reads, as Codex shows its state in the title.
+    let bin = tempfile::tempdir().expect("temp dir");
+    let codex = bin.path().join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\necho codex ready\nwhile read line; do printf '\\033]0;%s\\007' \"$line\"; done\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("permissions");
+
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = match client
+        .ok(Request::CreateTerminalThread {
+            project_id,
+            command: TerminalCommand {
+                command: Some(codex.display().to_string()),
+            },
+            workspace: Default::default(),
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => thread_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let key = TerminalKey::Thread(thread_id);
+    client.subscribe_terminal(key.clone()).await;
+    client.wait_for_screen(&key, "codex ready").await;
+
+    let snapshot = |client: &TestClient| client.projects.clone().expect("projects");
+    let is_working =
+        move |client: &TestClient| snapshot(client).working_threads.contains(&thread_id);
+    let is_blocked =
+        move |client: &TestClient| snapshot(client).blocked_threads.contains(&thread_id);
+    let completed_at = move |client: &TestClient| {
+        snapshot(client)
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .and_then(|thread| thread.completed_at)
+    };
+
+    // After the agent's startup grace, its title spinner says it's working.
+    client.type_into(&key, "⠋ project\n").await;
+    client.wait_until(is_working).await;
+    assert!(!is_blocked(&client));
+
+    client.type_into(&key, "Action Required\n").await;
+    client.wait_until(is_blocked).await;
+    assert!(is_working(&client));
+
+    client.type_into(&key, "project\n").await;
+    client.wait_until(move |client| !is_working(client)).await;
+    assert!(!is_blocked(&client));
+    let first_completion = completed_at(&client).expect("a completion");
+
+    // Exiting while working completes the thread too.
+    client.type_into(&key, "⠙ project\n").await;
+    client.wait_until(is_working).await;
+    client.type_into(&key, "\x04").await;
+    client.wait_until(move |client| !is_working(client)).await;
+    assert!(completed_at(&client).expect("a completion") > first_completion);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_run_commands_in_server_terminals() {
     let Some(server) = TestServer::start() else {

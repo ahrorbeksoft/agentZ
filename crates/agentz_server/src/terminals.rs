@@ -116,6 +116,8 @@ pub(crate) struct Terminal {
     /// The client's theme colors, to answer programs that ask for a color.
     palette: Option<Vec<[u8; 3]>>,
     exit_waiters: Vec<oneshot::Sender<TerminalExit>>,
+    /// The process the terminal started, usually a shell.
+    child_pid: Option<u32>,
 }
 
 impl Terminal {
@@ -151,6 +153,10 @@ impl Terminal {
         };
         let pty = tty::new(&options, size.window_size(), 0)
             .with_context(|| format!("starting a terminal in {}", spawn.cwd.display()))?;
+        #[cfg(unix)]
+        let child_pid = Some(pty.child().id());
+        #[cfg(not(unix))]
+        let child_pid = None;
 
         let wakeup_pending = Arc::new(AtomicBool::new(false));
         let listener = Listener {
@@ -177,6 +183,7 @@ impl Terminal {
             exit: None,
             palette,
             exit_waiters: Vec::new(),
+            child_pid,
         })
     }
 
@@ -440,6 +447,59 @@ impl Terminal {
     /// The visible screen's text, as herdr's `pane read --source visible` gives it.
     pub(crate) fn screen_text(&self) -> String {
         self.frame().text()
+    }
+
+    pub(crate) fn child_pid(&self) -> Option<u32> {
+        self.child_pid
+    }
+
+    /// The bottom of the screen as agent detection reads it (herdr's `detection_text`): the
+    /// screen's height of rows ending at the last non-blank row or the cursor, whichever is
+    /// lower, wherever the view is scrolled. Each row is trimmed; blank rows at the end are
+    /// dropped.
+    pub(crate) fn detection_text(&self) -> String {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let screen_lines = term.screen_lines() as i32;
+        let last = screen_lines - 1;
+        let row_text = |line: i32| -> String {
+            let row = &grid[Line(line)];
+            let mut text = String::new();
+            for column in 0..term.columns() {
+                let cell = &row[Column(column)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(cell.c);
+                if let Some(zerowidth) = cell.zerowidth() {
+                    text.extend(zerowidth);
+                }
+            }
+            text.trim_end().to_string()
+        };
+        let end = if term.mode().contains(TermMode::ALT_SCREEN) {
+            last
+        } else {
+            let last_non_blank = (0..screen_lines)
+                .rev()
+                .find(|line| !row_text(*line).is_empty())
+                .unwrap_or(last);
+            last_non_blank.max(grid.cursor.point.line.0)
+        };
+        let start = (end + 1 - screen_lines).max(-(grid.history_size() as i32));
+        let mut rows: Vec<String> = (start..=end).map(row_text).collect();
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        if rows.is_empty() {
+            return String::new();
+        }
+        let mut text = rows.join("\n");
+        text.push('\n');
+        text
     }
 
     /// The last `lines` lines of [`Self::text`].

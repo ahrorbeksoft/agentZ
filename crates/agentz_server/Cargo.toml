@@ -35,9 +35,11 @@ log.workspace = true
 paths.workspace = true
 projects.workspace = true
 registry.workspace = true
+regex.workspace = true
 reqwest_client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 util.workspace = true
 uuid.workspace = true

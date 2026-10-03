@@ -8,6 +8,7 @@
 mod agent_settings;
 mod checkpoints;
 mod connection;
+mod detect;
 mod git;
 mod server;
 mod terminal_programs;

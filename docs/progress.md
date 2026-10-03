@@ -8,7 +8,7 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 8, terminal agent detection: port herdr's manifests and matcher.
+**Next:** Phase 9, machines over SSH: saved machine profiles, then the SSH transport.
 
 | Phase | Status |
 |---|---|
@@ -20,8 +20,8 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 5. Diffs | Done |
 | 6. Worktrees and pastures | Done |
 | 7. Terminals | Done |
-| 8. Terminal agent detection | In progress |
-| 9. Machines over SSH | Not started |
+| 8. Terminal agent detection | Done |
+| 9. Machines over SSH | In progress |
 | 10. Polish | Not started |
 
 ## 0. Spike
@@ -217,10 +217,15 @@ Then the server:
 
 ## 8. Terminal agent detection
 
-- [ ] Port herdr's manifest format and matcher, reading the bottom of the screen buffer. Keep
-      herdr's Apache-2.0 notice.
-- [ ] Bundle herdr's manifests for the CLIs we offer.
-- [ ] Feed the result into the attention states.
+- [x] Port herdr's manifest format and matcher, reading the bottom of the screen buffer. Keep
+      herdr's Apache-2.0 notice. Remote manifest updates and local overrides are left out.
+- [x] Bundle herdr's manifests for the CLIs we offer (all 22, unchanged, with a `NOTICE`).
+- [x] Feed the result into the attention states. The agent is the terminal's foreground
+      process group leader (herdr's process probe, macOS and Linux), and the state follows
+      herdr's loop: startup grace, a working-to-idle hold, six misses before an agent counts as
+      gone, and only changed screens reread. Working and blocked show as the thread's own;
+      returning to idle, or the agent exiting, completes it. OSC 9 progress isn't captured,
+      since `alacritty_terminal` drops it; the title is.
 
 ## 9. Machines over SSH
 
