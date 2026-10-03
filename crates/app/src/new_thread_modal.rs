@@ -682,10 +682,7 @@ impl NewThreadModal {
         } else {
             path
         };
-        let icon = match key.machine {
-            MachineId::Local => IconName::Screen,
-            MachineId::Remote(_) => IconName::Server,
-        };
+        let icon = self.machines.read(cx).machine_icon(key.machine, cx);
         ListItem::new(("new-thread-machine", index))
             .inset(true)
             .spacing(ListItemSpacing::Sparse)

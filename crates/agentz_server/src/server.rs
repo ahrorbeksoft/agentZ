@@ -19,8 +19,8 @@ use agentz_protocol::agents::{
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::{
-    AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineInfo, Request, Response,
-    ServerMessage, SessionSnapshot,
+    AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, Request,
+    Response, ServerMessage, SessionSnapshot,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
@@ -34,6 +34,7 @@ use util::ResultExt as _;
 
 use crate::agent_settings::AgentSettingsStore;
 use crate::checkpoints::Checkpoints;
+use crate::machine_kind;
 use crate::repositories::{self, RepositoryChecks};
 use crate::spaces::SpaceStore;
 use crate::{AgentControl, CustomAgent, ServerConfig};
@@ -133,12 +134,15 @@ pub(crate) struct Server {
     next_account_id: u64,
     terminals: Terminals,
     spaces: SpaceStore,
+    /// The kind of machine this is, as detected and as chosen.
+    machine_icon: MachineIcon,
     clients: HashMap<ClientId, Client>,
     // What session subscribers were last sent.
     projects_revision_sent: u64,
     spaces_revision_sent: u64,
     registry_sent: RegistrySnapshot,
     agent_settings_revision_sent: u64,
+    machine_icon_sent: MachineIcon,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
     stopping: bool,
@@ -169,6 +173,10 @@ impl Server {
         );
         registry.refresh_if_stale();
         let spaces = SpaceStore::load(Some(data_dir.join("spaces.json")));
+        let machine_icon = MachineIcon {
+            detected: None,
+            chosen: machine_kind::load_choice(&data_dir.join("machine.json")),
+        };
         let mut server = Self {
             runtime,
             inputs,
@@ -196,6 +204,8 @@ impl Server {
             terminals: Terminals::default(),
             spaces_revision_sent: spaces.revision(),
             spaces,
+            machine_icon_sent: machine_icon.clone(),
+            machine_icon,
             clients: HashMap::default(),
             registry_changed: false,
             changed_connections: HashSet::default(),
@@ -206,6 +216,9 @@ impl Server {
         server.registry_sent = server.registry_snapshot();
         server.refresh_repositories();
         server.restore_spaces();
+        server.spawn_then(machine_kind::detect(), |server, detected| {
+            server.machine_icon.detected = detected;
+        });
         let inputs = server.inputs.clone();
         server.runtime.spawn(async move {
             loop {
@@ -403,6 +416,7 @@ impl Server {
                     registry: self.registry_snapshot(),
                     agent_settings: self.agent_settings.all().clone(),
                     spaces: self.spaces.snapshot(),
+                    machine_icon: self.machine_icon.clone(),
                 }))
             }
             Request::SubscribeThread(connection) => {
@@ -645,6 +659,11 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::ListTools => Ok(Response::Tools(tools::definitions())),
+            Request::SetMachineIcon(icon) => {
+                machine_kind::save_choice(&self.data_dir.join("machine.json"), icon.clone())?;
+                self.machine_icon.chosen = icon;
+                Ok(Response::Ok)
+            }
             Request::SetPeers(peers) => {
                 self.client(client)?;
                 self.relays.set_peers(client, peers);
@@ -1149,6 +1168,10 @@ impl Server {
         if self.agent_settings.revision() != self.agent_settings_revision_sent {
             self.agent_settings_revision_sent = self.agent_settings.revision();
             self.broadcast(Event::AgentSettings(self.agent_settings.all().clone()));
+        }
+        if self.machine_icon != self.machine_icon_sent {
+            self.machine_icon_sent = self.machine_icon.clone();
+            self.broadcast(Event::MachineIcon(self.machine_icon.clone()));
         }
 
         for connection in std::mem::take(&mut self.changed_connections) {

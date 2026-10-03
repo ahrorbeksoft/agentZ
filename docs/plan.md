@@ -526,7 +526,11 @@ Worktrees share `.git` with the project, so their branches are already there.
 
 - With only Local, nothing changes.
 - Remote threads get a machine icon on their card. The details popover gets its machine line
-  back.
+  back, for every thread once there are several machines.
+- Machine icons are t3code's (`EnvironmentMachineIcon`): server, cloud VM, Linux/WSL, desktop,
+  laptop, Mac mini, Mac Studio. Each server detects its kind from the hardware
+  (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`) and keeps the kind chosen in
+  Settings › Machines in `machine.json`; choosing the detected kind clears the choice.
 - The project switcher groups projects by machine, except merged ones.
 - Settings gains a **Machines** page. Each machine's agents (install, log in, defaults) are
   managed from its own Settings.

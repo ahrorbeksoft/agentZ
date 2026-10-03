@@ -373,12 +373,9 @@ impl AddProjectModal {
             .toggle_state(index == self.selected_index)
             .disabled(is_disabled)
             .start_slot(
-                Icon::new(match machine {
-                    MachineId::Local => IconName::Screen,
-                    MachineId::Remote(_) => IconName::Server,
-                })
-                .size(IconSize::Small)
-                .color(Color::Muted),
+                Icon::new(Machines::global(cx).read(cx).machine_icon(machine, cx))
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
             )
             .child(
                 h_flex()
@@ -463,12 +460,9 @@ impl AddProjectModal {
                     )
                 })
                 .child(
-                    Icon::new(match machine {
-                        MachineId::Local => IconName::Screen,
-                        MachineId::Remote(_) => IconName::Server,
-                    })
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
+                    Icon::new(Machines::global(cx).read(cx).machine_icon(machine, cx))
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
                 )
                 .child(
                     Label::new(format!(

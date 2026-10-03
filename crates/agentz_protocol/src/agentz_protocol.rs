@@ -60,6 +60,9 @@ pub const CAPABILITY_RELAY: &str = "relay";
 /// [`ServerWelcome::capabilities`]: the server keeps the Workspaces view's spaces
 /// ([`Request::Spaces`], [`SessionSnapshot::spaces`]) and runs their pane terminals.
 pub const CAPABILITY_SPACES: &str = "spaces";
+/// [`ServerWelcome::capabilities`]: the server detects its machine's kind and keeps the icon
+/// chosen for it ([`SessionSnapshot::machine_icon`], [`Request::SetMachineIcon`]).
+pub const CAPABILITY_MACHINE_ICON: &str = "machine_icon";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -112,6 +115,71 @@ pub struct MachineInfo {
     pub hostname: String,
     pub os: String,
     pub arch: String,
+}
+
+/// What a machine is, drawn as its icon (t3code's `EnvironmentMachineKind`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineKind {
+    Server,
+    Cloud,
+    Linux,
+    Desktop,
+    Laptop,
+    MacMini,
+    MacStudio,
+    /// From a newer version.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
+}
+
+impl MachineKind {
+    /// Every kind, in t3code's order.
+    pub const ALL: [MachineKind; 7] = [
+        MachineKind::Server,
+        MachineKind::Cloud,
+        MachineKind::Linux,
+        MachineKind::Desktop,
+        MachineKind::Laptop,
+        MachineKind::MacMini,
+        MachineKind::MacStudio,
+    ];
+
+    /// t3code's names for them.
+    pub fn label(&self) -> &'static str {
+        match self {
+            MachineKind::Server | MachineKind::Unknown(_) => "Server",
+            MachineKind::Cloud => "Cloud VM",
+            MachineKind::Linux => "Linux/WSL",
+            MachineKind::Desktop => "Desktop",
+            MachineKind::Laptop => "Laptop",
+            MachineKind::MacMini => "Mini PC",
+            MachineKind::MacStudio => "Workstation",
+        }
+    }
+}
+
+/// A machine's icon: the kind its server detected, and the one chosen for it, if any.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineIcon {
+    #[serde(default)]
+    pub detected: Option<MachineKind>,
+    #[serde(default)]
+    pub chosen: Option<MachineKind>,
+}
+
+impl MachineIcon {
+    /// The chosen kind, else the detected one, else a server (t3code's
+    /// `resolveEnvironmentMachineKind`). A kind from a newer version counts as none.
+    pub fn kind(&self) -> MachineKind {
+        let known = |kind: &Option<MachineKind>| {
+            kind.clone()
+                .filter(|kind| !matches!(kind, MachineKind::Unknown(_)))
+        };
+        known(&self.chosen)
+            .or_else(|| known(&self.detected))
+            .unwrap_or(MachineKind::Server)
+    }
 }
 
 /// A live agent connection on the server: a thread's, or one opened from an agent's settings
@@ -325,6 +393,9 @@ pub enum Request {
     /// so agents here can work there: their tool calls naming a machine are relayed through
     /// this client ([`Event::RelayToolCall`]). Replaces what the client sent before.
     SetPeers(Peers),
+    /// The machine's icon, or `None` for the detected one. Reaches session subscribers as
+    /// [`Event::MachineIcon`].
+    SetMachineIcon(Option<MachineKind>),
     /// The answer to an [`Event::RelayToolCall`].
     RelayToolResult {
         relay_id: u64,
@@ -458,6 +529,8 @@ pub struct SessionSnapshot {
     pub agent_settings: BTreeMap<AgentId, AgentSettings>,
     #[serde(default)]
     pub spaces: SpacesSnapshot,
+    #[serde(default)]
+    pub machine_icon: MachineIcon,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -466,6 +539,7 @@ pub enum Event {
     Registry(RegistrySnapshot),
     AgentSettings(BTreeMap<AgentId, AgentSettings>),
     Spaces(SpacesSnapshot),
+    MachineIcon(MachineIcon),
     Thread {
         connection: ConnectionId,
         update: ThreadUpdate,

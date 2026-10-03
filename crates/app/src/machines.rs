@@ -11,14 +11,14 @@ use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription};
 use projects::{Project, ProjectId, Thread, ThreadId, ThreadOrder};
 use serde::{Deserialize, Serialize};
-use ui::SharedString;
+use ui::{IconName, SharedString};
 
 use crate::app_settings::{AppSettingsStore, MachineProfile};
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use crate::server_client::{ServerClient, ServerClientEvent, Transport};
 use agentz_protocol::{
-    PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response, ToolCaller,
-    ToolResult,
+    MachineKind, PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response,
+    ToolCaller, ToolResult,
 };
 use futures::FutureExt as _;
 
@@ -254,6 +254,16 @@ impl Machines {
     }
 
     /// Whether any saved machine is enabled. With only this Mac, nothing mentions machines.
+    /// The machine's icon: its kind as its server detected it, or as chosen (t3code).
+    pub fn machine_icon(&self, machine: MachineId, cx: &App) -> IconName {
+        let kind = self
+            .client(machine, cx)
+            .map_or(MachineKind::Server, |client| {
+                client.read(cx).machine_icon().kind()
+            });
+        machine_kind_icon(&kind)
+    }
+
     pub fn has_remotes(&self) -> bool {
         self.clients.len() > 1
     }
@@ -1047,5 +1057,18 @@ mod tests {
             &BTreeMap::new(),
         );
         assert_eq!(groups.len(), 2);
+    }
+}
+
+/// t3code's icon for each kind of machine.
+pub fn machine_kind_icon(kind: &MachineKind) -> IconName {
+    match kind {
+        MachineKind::Server | MachineKind::Unknown(_) => IconName::Server,
+        MachineKind::Cloud => IconName::Cloud,
+        MachineKind::Linux => IconName::Linux,
+        MachineKind::Desktop => IconName::Screen,
+        MachineKind::Laptop => IconName::Laptop,
+        MachineKind::MacMini => IconName::MacMini,
+        MachineKind::MacStudio => IconName::MacStudio,
     }
 }

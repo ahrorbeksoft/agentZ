@@ -15,7 +15,7 @@ use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot}
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{
     AgentSettingsChange, CAPABILITY_RELAY, ClientKind, ConnectionId, DirectoryListing, Event,
-    Peers, RelayToolCall, Request, Response,
+    MachineIcon, MachineKind, Peers, RelayToolCall, Request, Response,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
@@ -93,6 +93,8 @@ pub struct ServerClient {
     /// Pane agents that finished working since this window last showed them (herdr's unseen
     /// idle), as `viewed.json` does for threads.
     unseen_panes: BTreeSet<PaneId>,
+    /// What kind of machine the server says it's on, and the kind chosen for it.
+    machine_icon: MachineIcon,
     /// Open threads and account connections, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
@@ -133,6 +135,7 @@ impl ServerClient {
                 agent_settings: BTreeMap::new(),
                 spaces: SpacesSnapshot::default(),
                 unseen_panes: BTreeSet::new(),
+                machine_icon: MachineIcon::default(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
@@ -322,6 +325,29 @@ impl ServerClient {
         }
     }
 
+    pub fn machine_icon(&self) -> &MachineIcon {
+        &self.machine_icon
+    }
+
+    fn set_machine_icon_state(&mut self, icon: MachineIcon, cx: &mut Context<Self>) {
+        if icon != self.machine_icon {
+            self.machine_icon = icon;
+            cx.notify();
+        }
+    }
+
+    /// Chooses the machine's icon, for every client of its server. Choosing what was
+    /// detected clears the choice, as t3code's picker does, so detection keeps deciding.
+    pub fn choose_machine_icon(&self, kind: MachineKind, cx: &App) {
+        let detected = self
+            .machine_icon
+            .detected
+            .clone()
+            .unwrap_or(MachineKind::Server);
+        let choice = (kind != detected).then_some(kind);
+        self.send(Request::SetMachineIcon(choice), cx);
+    }
+
     pub fn spaces(&self) -> &SpacesSnapshot {
         &self.spaces
     }
@@ -474,6 +500,7 @@ impl ServerClient {
         });
         self.set_agent_settings(session.agent_settings, cx);
         self.set_spaces(session.spaces, cx);
+        self.set_machine_icon_state(session.machine_icon, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }
@@ -487,6 +514,7 @@ impl ServerClient {
                     | Event::Registry(_)
                     | Event::AgentSettings(_)
                     | Event::Spaces(_)
+                    | Event::MachineIcon(_)
             )
         {
             queued.push(event);
@@ -501,6 +529,7 @@ impl ServerClient {
                 .update(cx, |store, cx| store.set_snapshot(registry, cx)),
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
+            Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::Thread { connection, update } => {
                 if let Some(thread) = self.threads.get(&connection).and_then(|t| t.upgrade()) {
                     thread.update(cx, |thread, cx| thread.apply_update(update, cx));

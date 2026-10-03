@@ -19,9 +19,9 @@ use agentz_protocol::terminal::{
 use agentz_protocol::thread::{Entry, ThreadView};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
-    ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, PROTOCOL_VERSION,
-    PeerCheckout, PeerCheckouts, PeerMachine, Peers, Request, Response, ServerMessage,
-    ServerWelcome, ToolCaller, ToolResult, read_message, write_message,
+    ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, MachineKind,
+    PROTOCOL_VERSION, PeerCheckout, PeerCheckouts, PeerMachine, Peers, Request, Response,
+    ServerMessage, ServerWelcome, ToolCaller, ToolResult, read_message, write_message,
 };
 use futures::FutureExt as _;
 use projects::{ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, WorkspaceKind};
@@ -2729,4 +2729,48 @@ async fn terminal_panes_show_their_agents() {
     client
         .wait_until(|client| agent(client).is_some_and(|agent| agent.state == PaneAgentState::Idle))
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_machine_icon_is_chosen_and_kept() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    assert!(
+        client
+            .welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == agentz_protocol::CAPABILITY_MACHINE_ICON)
+    );
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected the session");
+    };
+    assert_eq!(session.machine_icon.chosen, None);
+
+    client
+        .ok(Request::SetMachineIcon(Some(MachineKind::MacStudio)))
+        .await;
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| {
+                matches!(event, Event::MachineIcon(icon) if icon.kind() == MachineKind::MacStudio)
+            })
+        })
+        .await;
+
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+    let Some(server) = TestServer::start_with(server.data_dir, server.project_dir) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected the session");
+    };
+    assert_eq!(session.machine_icon.chosen, Some(MachineKind::MacStudio));
 }

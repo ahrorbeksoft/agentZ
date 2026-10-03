@@ -4,7 +4,9 @@
 
 use std::path::PathBuf;
 
-use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
+use crate::machines::{
+    GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey, machine_kind_icon,
+};
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::workspace::WorkspaceRemoval;
@@ -16,13 +18,14 @@ use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, DropdownMenu, IconPosition, Switch, Tooltip, WithScrollbar as _, prelude::*,
+    ContextMenu, ContextMenuEntry, DropdownMenu, IconPosition, Switch, Tooltip, WithScrollbar as _,
+    prelude::*,
 };
 use util::ResultExt as _;
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::Request;
 use agentz_protocol::thread::ConnectionStatus;
+use agentz_protocol::{CAPABILITY_MACHINE_ICON, MachineKind, Request};
 
 use std::collections::BTreeMap;
 
@@ -1942,13 +1945,13 @@ impl SettingsPage {
 
     /// Settings › Machines: this Mac, the saved machines with how their connections are doing,
     /// and the form that adds or edits one (herdr's endpoints).
-    fn render_machines(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_machines(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let profiles = self.app_settings.read(cx).settings().machines.clone();
-        let mut rows = vec![self.render_machine_row(None, cx)];
+        let mut rows = vec![self.render_machine_row(None, window, cx)];
         rows.extend(
             profiles
                 .iter()
-                .map(|profile| self.render_machine_row(Some(profile), cx)),
+                .map(|profile| self.render_machine_row(Some(profile), window, cx)),
         );
         vec![
             render_section("Machines", rows, cx),
@@ -1959,6 +1962,7 @@ impl SettingsPage {
     fn render_machine_row(
         &self,
         profile: Option<&MachineProfile>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let machine = profile.map_or(MachineId::Local, |profile| MachineId::Remote(profile.id));
@@ -2018,8 +2022,46 @@ impl SettingsPage {
             .is_some_and(|client| *client.read(cx).status() == MachineStatus::Stopped);
         let id_suffix = machine.slug();
         let element_id = |action: &str| SharedString::from(format!("machine-{action}-{id_suffix}"));
+        // t3code's icon picker: the kinds, with the one detected marked. Its server keeps the
+        // choice, so it waits for a server that can.
+        let icon_picker = client
+            .clone()
+            .filter(|client| {
+                let client = client.read(cx);
+                client.is_online() && client.has_capability(CAPABILITY_MACHINE_ICON)
+            })
+            .map(|client| {
+                let icon = client.read(cx).machine_icon().clone();
+                let current = icon.kind();
+                let current_label = current.label();
+                let detected = icon.detected.unwrap_or(MachineKind::Server);
+                let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for kind in MachineKind::ALL {
+                        let label = if kind == detected {
+                            format!("{} (detected)", kind.label())
+                        } else {
+                            kind.label().to_string()
+                        };
+                        let client = client.clone();
+                        let chosen = kind.clone();
+                        menu = menu.item(
+                            ContextMenuEntry::new(label)
+                                .icon(machine_kind_icon(&kind))
+                                .icon_color(Color::Muted)
+                                .toggleable(IconPosition::End, kind == current)
+                                .handler(move |_, cx| {
+                                    client.read(cx).choose_machine_icon(chosen.clone(), cx)
+                                }),
+                        );
+                    }
+                    menu
+                });
+                DropdownMenu::new(element_id("icon"), current_label, menu)
+                    .trigger_tooltip(Tooltip::text("Icon"))
+            });
         let controls = h_flex()
             .gap_2()
+            .children(icon_picker)
             .when_some(client.clone().filter(|_| !is_online), |controls, client| {
                 controls.child(
                     Button::new(
@@ -2104,12 +2146,9 @@ impl SettingsPage {
             .py_3()
             .gap_3()
             .child(
-                Icon::new(match machine {
-                    MachineId::Local => IconName::Screen,
-                    MachineId::Remote(_) => IconName::Server,
-                })
-                .size(IconSize::Small)
-                .color(Color::Muted),
+                Icon::new(self.machines.read(cx).machine_icon(machine, cx))
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
             )
             .child(
                 v_flex()
@@ -2759,7 +2798,7 @@ impl Render for SettingsPage {
             Section::General => ("General".into(), self.render_general(window, cx)),
             Section::Appearance => ("Appearance".into(), self.render_appearance(window, cx)),
             Section::Agents => ("Agents".into(), self.render_agents(window, cx)),
-            Section::Machines => ("Machines".into(), self.render_machines(cx)),
+            Section::Machines => ("Machines".into(), self.render_machines(window, cx)),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
                     project.name(),

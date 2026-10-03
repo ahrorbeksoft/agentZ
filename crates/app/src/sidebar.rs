@@ -688,7 +688,12 @@ impl Sidebar {
                     self.project_info(machine, project, cx).cloned(),
                 )
             }),
-            machine: (machine != MachineId::Local).then(|| machines.label(machine, cx)),
+            machine: machines.has_remotes().then(|| {
+                (
+                    machines.machine_icon(machine, cx),
+                    machines.label(machine, cx),
+                )
+            }),
             branch: checkout
                 .as_ref()
                 .and_then(|checkout| checkout.branch())
@@ -731,7 +736,12 @@ impl Sidebar {
         // the status moves next to the title.
         let shows_all_projects = machines.scope(cx) == Scope::All;
         let is_offline = !machines.is_online(machine, cx);
-        let machine_label = (machine != MachineId::Local).then(|| machines.label(machine, cx));
+        let machine_label = (machine != MachineId::Local).then(|| {
+            (
+                machines.machine_icon(machine, cx),
+                machines.label(machine, cx),
+            )
+        });
         let checkout = self.thread_checkout(machine, &thread, cx);
         let faint_text = cx.theme().colors().text_muted.opacity(0.4);
         let time = thread
@@ -876,7 +886,10 @@ impl Sidebar {
                                 .color(Color::Muted)
                                 .truncate()
                         }))
-                        .children(machine_label.map(|label| render_machine_tag(label, is_offline))),
+                        .children(
+                            machine_label
+                                .map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
+                        ),
                 )
                 .child(status_slot)
                 .children(archive_slot);
@@ -889,7 +902,9 @@ impl Sidebar {
                 .min_w_0()
                 .gap_1p5()
                 .child(title_element)
-                .children(machine_label.map(|label| render_machine_tag(label, is_offline)))
+                .children(
+                    machine_label.map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
+                )
                 .child(status_slot)
                 .children(archive_slot);
             (None, title_line)
@@ -1089,7 +1104,25 @@ impl Sidebar {
             },
             None => self.render_project_icon(machine, project.as_ref(), cx),
         };
-        let details = self.thread_details(machine, &thread, project.as_ref(), cx);
+        let mut details = self.thread_details(machine, &thread, project.as_ref(), cx);
+        // A shell's details follow where it is: that folder's project and branch.
+        if let Some(folder) = &folder {
+            let store = store.read(cx);
+            details.project = project_at(store.projects(), &folder.path).map(|project| {
+                (
+                    project.clone(),
+                    self.project_info(machine, project, cx).cloned(),
+                )
+            });
+            details.branch = folder.branch.clone().map(SharedString::from);
+            // The worktree or pasture line, only while it's still in there.
+            let is_in_checkout = self
+                .thread_checkout(machine, &thread, cx)
+                .is_some_and(|checkout| folder.path.starts_with(&checkout.folder));
+            if !is_in_checkout {
+                details.workspace = None;
+            }
+        }
         let time = if is_archived {
             thread.archived_at
         } else {
@@ -1587,8 +1620,8 @@ impl Render for Sidebar {
 struct ThreadDetails {
     title: SharedString,
     project: Option<(Project, Option<ProjectInfo>)>,
-    /// Another machine's name, for its threads.
-    machine: Option<SharedString>,
+    /// The machine's icon and name, once there are several.
+    machine: Option<(IconName, SharedString)>,
     branch: Option<SharedString>,
     /// The worktree or pasture it works in, described.
     workspace: Option<(WorkspaceKind, SharedString)>,
@@ -1622,9 +1655,9 @@ impl ThreadDetails {
                 Label::new(project.name()).truncate(),
             ));
         }
-        if let Some(machine) = &self.machine {
+        if let Some((icon, machine)) = &self.machine {
             rows.push(detail_row(
-                small_icon(IconName::Server),
+                small_icon(*icon),
                 Label::new(machine.clone()).truncate(),
             ));
         }
@@ -1717,7 +1750,7 @@ fn render_checkout_marker(
 }
 
 /// Which machine a thread is on, after its project's name, when it isn't this Mac.
-fn render_machine_tag(label: SharedString, is_offline: bool) -> AnyElement {
+fn render_machine_tag(icon: IconName, label: SharedString, is_offline: bool) -> AnyElement {
     h_flex()
         .flex_none()
         .gap_0p5()
@@ -1725,7 +1758,7 @@ fn render_machine_tag(label: SharedString, is_offline: bool) -> AnyElement {
             Icon::new(if is_offline {
                 IconName::Disconnected
             } else {
-                IconName::Server
+                icon
             })
             .size(IconSize::XSmall)
             .color(Color::Muted),

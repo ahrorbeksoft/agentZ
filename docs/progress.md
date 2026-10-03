@@ -724,3 +724,6 @@ Then the server:
 - 2026-10-03: Shell rows follow the current folder: its project's icon (else a folder), its
   branch (refreshed with the workspaces' every 5 s; no line outside git). Their menu is Rename
   and Delete.
+- 2026-10-03: Machine icons, as t3code: detected per server, chosen in Settings › Machines,
+  shown on cards, in details popovers (now for every thread when there are several machines,
+  shells included) and wherever machines are listed. A shell's details follow its folder.
