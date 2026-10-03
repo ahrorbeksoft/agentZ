@@ -46,6 +46,8 @@ gpui::actions!(
 );
 /// Matches Zed's default `agent.max_content_width`.
 const MAX_CONTENT_WIDTH: Pixels = px(850.);
+/// The thread's toolbar; the sidebar's search row shares it so their borders line up.
+pub(crate) const TOOLBAR_HEIGHT: Pixels = px(36.);
 /// Unchanged lines shown around an edit, like a diff editor's context.
 const DIFF_CONTEXT_LINES: usize = 3;
 /// t3code's default drawer height.
@@ -1049,7 +1051,7 @@ impl AgentView {
         let agent_name = self.agent_name(cx);
         let thread = self.thread.clone();
         h_flex()
-            .h(px(36.))
+            .h(TOOLBAR_HEIGHT)
             .flex_none()
             .px_2()
             .gap_1p5()

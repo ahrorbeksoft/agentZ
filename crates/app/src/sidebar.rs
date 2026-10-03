@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::machines::{MachineId, Machines, ProjectKey, Scope, ThreadKey, project_at};
 use crate::project_store::{ProjectStore, ThreadStatus};
 use agentz_protocol::agents::AgentId;
@@ -315,7 +316,7 @@ impl Sidebar {
                     this.search.update(cx, |search, cx| search.set_text("", cx));
                 }
             }))
-            .h(px(40.))
+            .h(TOOLBAR_HEIGHT)
             .flex_none()
             .pl_3()
             .pr_2()

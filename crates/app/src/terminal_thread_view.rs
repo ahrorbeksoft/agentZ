@@ -6,6 +6,7 @@ use projects::ThreadId;
 use ui::{Tooltip, prelude::*};
 
 use crate::ToggleDiff;
+use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::server_client::ServerClient;
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -85,7 +86,7 @@ impl TerminalThreadView {
         });
         let has_exited = status.is_some();
         h_flex()
-            .h(px(36.))
+            .h(TOOLBAR_HEIGHT)
             .flex_none()
             .px_2()
             .gap_1p5()

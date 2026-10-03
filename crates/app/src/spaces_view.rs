@@ -1087,7 +1087,8 @@ impl SpacesView {
                     this.search.update(cx, |search, cx| search.set_text("", cx));
                 }
             }))
-            .h(px(40.))
+            // Level with the tab bar beside it.
+            .h(TabItem::container_height(cx))
             .flex_none()
             .pl_3()
             .pr_2()
