@@ -740,6 +740,15 @@ impl Shell {
                     Color::Muted,
                 ),
                 MachineStatus::Online => continue,
+                MachineStatus::Stopped => {
+                    let tooltip = match client.machine() {
+                        MachineId::Local => "agentz-server is stopped".to_string(),
+                        MachineId::Remote(_) => {
+                            format!("agentz-server on {} is stopped", client.label())
+                        }
+                    };
+                    (IconName::Disconnected, tooltip.into(), Color::Muted)
+                }
                 MachineStatus::Reconnecting(error) | MachineStatus::Attention { error, .. } => {
                     let color = match client.status() {
                         MachineStatus::Attention { .. } => Color::Warning,

@@ -300,8 +300,11 @@ Then the server:
 - [ ] A macOS app bundle (Info.plist, bundle id, ad-hoc signature) so system notifications show,
       and launching with `open -g` doesn't take focus.
 - [ ] Optional start at login (launchd agent, systemd user service).
-- [ ] Remote server updates, only after the user confirms.
-- [ ] Per-machine "Stop server".
+- [x] Remote server updates, only after the user confirms: done in phase 9 (an older server
+      keeps running, with Restart Server… in Settings › Machines).
+- [x] Per-machine "Stop Server…" in Settings › Machines, This Mac included. The machine shows
+      "Server stopped" (and the title bar's disconnected icon) and isn't reconnected, since
+      that would start the server again, until Start Server, or the app's next launch.
 
 ## 11. Workspaces view
 

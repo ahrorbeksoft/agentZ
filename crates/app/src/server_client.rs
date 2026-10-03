@@ -61,6 +61,9 @@ pub enum MachineStatus {
         error: SharedString,
         hint: Option<SharedString>,
     },
+    /// The user stopped the server. Connecting would start it again, so that waits until
+    /// they ask.
+    Stopped,
 }
 
 pub enum ServerClientEvent {
@@ -77,6 +80,8 @@ pub struct ServerClient {
     /// The machine's server is older than the one installed there now, and keeps running
     /// until the user restarts it.
     is_outdated: bool,
+    /// The server was asked to stop; when the connection closes, don't reconnect.
+    stopping: bool,
     /// The copies of the server's session.
     projects: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
@@ -115,6 +120,7 @@ impl ServerClient {
                 connection: None,
                 status: MachineStatus::Connecting,
                 is_outdated: false,
+                stopping: false,
                 projects,
                 registry,
                 agent_settings: BTreeMap::new(),
@@ -179,8 +185,17 @@ impl ServerClient {
         self.send(Request::Shutdown, cx);
     }
 
+    /// Stops the machine's server, and its agents and terminals, until [`Self::retry`].
+    pub fn stop_server(&mut self, cx: &mut Context<Self>) {
+        if self.connection.is_none() {
+            return;
+        }
+        self.stopping = true;
+        self.send(Request::Shutdown, cx);
+    }
+
     /// Tries again now instead of waiting out the backoff, as after fixing what needed
-    /// attention.
+    /// attention. A stopped server starts again.
     pub fn retry(&mut self) {
         if let Some(retry_now) = self.retry_now.take() {
             retry_now.send(()).ok();
@@ -489,23 +504,36 @@ async fn maintain_connection(
                 }
             }
         };
-        let wait = match &status {
-            MachineStatus::Attention { .. } => ATTENTION_RETRY_DELAY,
-            _ => delay,
-        };
-        log::warn!("{status:?}; retrying in {wait:?}");
         let (retry_now, retry_requested) = oneshot::channel();
-        let disconnected = this.update(cx, |this, cx| {
+        let Ok(status) = this.update(cx, |this, cx| {
+            let status = if std::mem::take(&mut this.stopping) {
+                MachineStatus::Stopped
+            } else {
+                status
+            };
             this.retry_now = Some(retry_now);
-            this.disconnected(status, cx)
-        });
-        if disconnected.is_err() {
+            this.disconnected(status.clone(), cx);
+            status
+        }) else {
             return;
-        }
-        futures::select_biased! {
-            _ = retry_requested.fuse() => delay = min_delay,
-            _ = cx.background_executor().timer(wait).fuse() => {
-                delay = (delay * 2).min(max_delay);
+        };
+        if status == MachineStatus::Stopped {
+            log::info!("agentz-server stopped; waiting to be started");
+            if retry_requested.await.is_err() {
+                return;
+            }
+            delay = min_delay;
+        } else {
+            let wait = match &status {
+                MachineStatus::Attention { .. } => ATTENTION_RETRY_DELAY,
+                _ => delay,
+            };
+            log::warn!("{status:?}; retrying in {wait:?}");
+            futures::select_biased! {
+                _ = retry_requested.fuse() => delay = min_delay,
+                _ = cx.background_executor().timer(wait).fuse() => {
+                    delay = (delay * 2).min(max_delay);
+                }
             }
         }
         if this

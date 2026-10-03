@@ -746,8 +746,26 @@ impl SettingsPage {
                     MachineStatus::Reconnecting(error) | MachineStatus::Attention { error, .. },
                     _,
                 ) => (format!("Not connected: {error}").into(), false),
+                (MachineStatus::Stopped, _) => (
+                    "Stopped. Agents on this Mac can't run until it starts again.".into(),
+                    false,
+                ),
                 _ => ("Connecting…".into(), false),
             };
+        let is_stopped = *server_client.status() == MachineStatus::Stopped;
+        let server_button = if is_stopped {
+            let local = local.clone();
+            Button::new("start-server", "Start Server")
+                .style(ButtonStyle::Outlined)
+                .on_click(move |_, _, cx| local.update(cx, |client, _| client.retry()))
+        } else {
+            Button::new("restart-server", "Restart Server")
+                .style(ButtonStyle::Outlined)
+                .disabled(!is_connected)
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.confirm_restart_server(window, cx)),
+                )
+        };
         vec![
             render_section(
                 "Threads",
@@ -765,13 +783,7 @@ impl SettingsPage {
                 vec![render_row(
                     "Background server",
                     server_description,
-                    Button::new("restart-server", "Restart Server")
-                        .style(ButtonStyle::Outlined)
-                        .disabled(!is_connected)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_restart_server(window, cx)
-                        }))
-                        .into_any_element(),
+                    server_button.into_any_element(),
                     cx,
                 )],
                 cx,
@@ -888,6 +900,35 @@ impl SettingsPage {
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(0) {
                 cx.update(|cx| client.read(cx).restart_server(cx));
+            }
+        })
+        .detach();
+    }
+
+    fn confirm_stop_server(
+        &mut self,
+        client: Entity<ServerClient>,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match client.read(cx).machine() {
+            MachineId::Local => "Stop the background server?".to_string(),
+            MachineId::Remote(_) => format!("Stop agentz-server on {name}?"),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(
+                "Agents and terminals running there will stop. It stays stopped until you \
+                 choose Start Server.",
+            ),
+            &["Stop Server", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                cx.update(|cx| client.update(cx, |client, cx| client.stop_server(cx)));
             }
         })
         .detach();
@@ -1944,25 +1985,34 @@ impl SettingsPage {
                         hint = help.clone();
                         (error.clone(), Color::Error)
                     }
+                    MachineStatus::Stopped => ("Server stopped".into(), Color::Muted),
                 }
             }
         };
         let is_online = client
             .as_ref()
             .is_some_and(|client| client.read(cx).is_online());
+        let is_stopped = client
+            .as_ref()
+            .is_some_and(|client| *client.read(cx).status() == MachineStatus::Stopped);
         let id_suffix = machine.slug();
         let element_id = |action: &str| SharedString::from(format!("machine-{action}-{id_suffix}"));
         let controls = h_flex()
             .gap_2()
             .when_some(client.clone().filter(|_| !is_online), |controls, client| {
                 controls.child(
-                    Button::new(element_id("retry"), "Retry")
-                        .style(ButtonStyle::Outlined)
-                        .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry())),
+                    Button::new(
+                        element_id("retry"),
+                        if is_stopped { "Start Server" } else { "Retry" },
+                    )
+                    .style(ButtonStyle::Outlined)
+                    .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry())),
                 )
             })
             .when_some(
-                client.filter(|client| client.read(cx).is_outdated()),
+                client
+                    .clone()
+                    .filter(|client| client.read(cx).is_outdated()),
                 |controls, client| {
                     let name = label.clone();
                     controls.child(
@@ -1985,6 +2035,16 @@ impl SettingsPage {
                         .style(ButtonStyle::Outlined)
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(SettingsPageEvent::AddProject(machine))
+                        })),
+                )
+            })
+            .when_some(client.filter(|_| is_online), |controls, client| {
+                let name = label.clone();
+                controls.child(
+                    Button::new(element_id("stop"), "Stop Server…")
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.confirm_stop_server(client.clone(), name.clone(), window, cx)
                         })),
                 )
             })
