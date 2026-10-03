@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, ThreadMessage, ThreadView};
@@ -32,11 +33,14 @@ use util::ResultExt as _;
 
 use crate::agent_settings::AgentSettingsStore;
 use crate::checkpoints::Checkpoints;
+use crate::repositories::{self, RepositoryChecks};
 use crate::{AgentControl, CustomAgent, ServerConfig};
 use terminal_requests::Terminals;
 use tools::{PendingToolCall, ToolResults};
 
 const MAX_THREAD_TITLE_CHARS: usize = 48;
+/// t3code sweeps every project each minute; lookups that aren't stale are skipped.
+const REPOSITORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) type ClientId = u64;
 
@@ -117,6 +121,7 @@ pub(crate) struct Server {
     pending_tool_calls: Vec<PendingToolCall>,
     tool_results: ToolResults,
     projects: ProjectStore,
+    repository_checks: RepositoryChecks,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     threads: HashMap<ThreadId, AgentThread>,
@@ -173,6 +178,7 @@ impl Server {
             registry_sent: RegistrySnapshot::default(),
             agent_settings_revision_sent: agent_settings.revision(),
             projects,
+            repository_checks: RepositoryChecks::default(),
             registry,
             agent_settings,
             threads: HashMap::default(),
@@ -187,7 +193,46 @@ impl Server {
         };
         server.forward(registry_inbox, Input::Registry);
         server.registry_sent = server.registry_snapshot();
+        server.refresh_repositories();
+        let inputs = server.inputs.clone();
+        server.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(REPOSITORY_SWEEP_INTERVAL).await;
+                let sweep = Input::Run(Box::new(|server: &mut Server| {
+                    server.refresh_repositories()
+                }));
+                if inputs.unbounded_send(sweep).is_err() {
+                    break;
+                }
+            }
+        });
         server
+    }
+
+    /// Looks up the repository of each project whose last lookup is stale.
+    fn refresh_repositories(&mut self) {
+        let paths = self
+            .projects
+            .projects()
+            .iter()
+            .map(|project| project.path.clone());
+        for path in self.repository_checks.take_due(paths, Instant::now()) {
+            let resolved = repositories::resolve(path.clone());
+            self.spawn_then(resolved, move |server, repository| {
+                server
+                    .repository_checks
+                    .finish(path.clone(), repository.is_some(), Instant::now());
+                let project = server
+                    .projects
+                    .projects()
+                    .iter()
+                    .find(|project| project.path == path)
+                    .map(|project| project.id);
+                if let Some(project) = project {
+                    server.projects.set_project_repository(project, repository);
+                }
+            });
+        }
     }
 
     pub(crate) async fn run(mut self, mut inbox: mpsc::UnboundedReceiver<Input>) {
@@ -368,7 +413,9 @@ impl Server {
                 if !path.is_dir() {
                     return Err(anyhow!("{} isn't a folder here", path.display()));
                 }
-                Ok(Response::ProjectAdded(self.projects.add_project(path)))
+                let project = self.projects.add_project(path);
+                self.refresh_repositories();
+                Ok(Response::ProjectAdded(project))
             }
             Request::SetProjectName { project_id, name } => {
                 self.projects.set_project_name(project_id, &name);

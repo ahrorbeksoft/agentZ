@@ -41,6 +41,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+url.workspace = true
 util.workspace = true
 uuid.workspace = true
 

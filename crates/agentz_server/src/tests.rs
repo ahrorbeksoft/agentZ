@@ -481,6 +481,42 @@ async fn shuts_down_on_request() {
         .expect("the server stops");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn projects_learn_their_repository() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = server.project_dir.path();
+    for args in [
+        &["init", "--quiet"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    ] {
+        crate::git::git(folder, args, &[]).await.expect("git");
+    }
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(folder).await;
+    client
+        .wait_until(|client| {
+            client.projects.as_ref().is_some_and(|projects| {
+                projects.projects.iter().any(|project| {
+                    project.id == project_id
+                        && project
+                            .repository
+                            .as_ref()
+                            .map(|r| r.canonical_key.as_str())
+                            == Some("github.com/owner/repo")
+                })
+            })
+        })
+        .await;
+}
+
 impl TestClient {
     async fn add_project(&mut self, path: &std::path::Path) -> ProjectId {
         match self

@@ -246,11 +246,13 @@ Then the server:
       `filesystem.browse`). Settings › Machines has Add Project… per connected machine.
 - [x] Per-machine agents: install, log in, defaults (Settings › Agents has a machine picker).
 - [ ] Managed Node for npm agents when the machine has none (Zed's `node_runtime`).
-- [ ] Repository identity from each server, as t3code does:
-  - [ ] repository root, then the primary remote (`upstream`, `origin`, first by name);
-  - [ ] canonical key via `normalizeGitRemoteUrl`;
-  - [ ] display name `owner/repo`;
-  - [ ] cached for 15 minutes, or 1 minute when there's no repository or remote.
+- [x] Repository identity from each server, as t3code does (`agentz_server::repositories`,
+      sent as `Project::repository`):
+  - [x] repository root, then the primary remote (`upstream`, `origin`, first by name);
+  - [x] canonical key via `normalizeGitRemoteUrl` (its tests ported);
+  - [x] display name `owner/repo`;
+  - [x] cached for 15 minutes, or 1 minute when there's no repository or remote (swept every
+        minute, and right after a project is added).
 - [ ] Merged projects:
   - [ ] grouping modes `repository` (default), `repository_path`, `separate`;
   - [ ] Settings › General switch and a per-project override;
@@ -582,3 +584,4 @@ Then the server:
 - 2026-10-03: Phase 9: adding projects on other machines, with folder completion.
 - 2026-10-03: Phase 9: an older server left running on a machine is detected and replaced
   only after the user confirms. Fixed `agentz-server proxy` lingering after its server quit.
+- 2026-10-03: Phase 9: each server resolves its projects' repository identity.

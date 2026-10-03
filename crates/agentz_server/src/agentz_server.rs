@@ -11,6 +11,7 @@ mod connection;
 mod detect;
 mod directories;
 mod git;
+mod repositories;
 mod server;
 mod terminal_programs;
 mod terminals;

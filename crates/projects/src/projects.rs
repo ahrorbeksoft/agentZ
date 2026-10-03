@@ -37,6 +37,29 @@ pub struct Project {
     /// Worktrees and pastures made for its threads, oldest first.
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
+    /// The repository the folder is in, by its primary remote, which projects on other
+    /// machines and other checkouts are matched by. Kept up to date by the server.
+    #[serde(default)]
+    pub repository: Option<RepositoryIdentity>,
+}
+
+/// t3code's `RepositoryIdentity`, from a git remote.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RepositoryIdentity {
+    /// The remote's URL normalized, as `host/owner/repo`. Equal for every clone.
+    pub canonical_key: String,
+    /// The repository's top folder on its machine.
+    pub root_path: PathBuf,
+    pub remote_name: String,
+    pub remote_url: String,
+    /// The key without its host, as `owner/repo`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// The last part of the key.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl Project {
@@ -487,6 +510,7 @@ impl ProjectStore {
             custom_name: None,
             icon: None,
             workspaces: Vec::new(),
+            repository: None,
         });
         self.changed();
         id
@@ -512,6 +536,19 @@ impl ProjectStore {
             && project.icon != icon
         {
             project.icon = icon;
+            self.changed();
+        }
+    }
+
+    pub fn set_project_repository(
+        &mut self,
+        id: ProjectId,
+        repository: Option<RepositoryIdentity>,
+    ) {
+        if let Some(project) = self.projects.iter_mut().find(|project| project.id == id)
+            && project.repository != repository
+        {
+            project.repository = repository;
             self.changed();
         }
     }
