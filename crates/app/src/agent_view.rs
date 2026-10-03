@@ -1,14 +1,16 @@
 //! The conversation with one agent. Layout, spacing and colors follow Zed's agent thread view
 //! (`agent_ui::conversation_view::thread_view`).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
 };
+use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
@@ -93,6 +95,11 @@ pub struct AgentView {
     is_archived: bool,
     /// Whether the shell shows this thread's changes beside it.
     is_diff_open: bool,
+    /// How many files the thread has changed, for the diff button's dot.
+    changed_files: usize,
+    /// The turn completion and connection `changed_files` was last asked for.
+    changed_files_asked_for: Option<(Option<SystemTime>, bool)>,
+    _changed_files_load: Task<()>,
     thread: Entity<AgentThread>,
     title: SharedString,
     /// The thread's machine.
@@ -161,10 +168,14 @@ impl AgentView {
             cx.observe(&registry, |_, _, cx| cx.notify()),
             cx.observe(&store, |this, _, cx| {
                 this.sync_blocked_subthreads(cx);
+                this.load_changed_files(false, cx);
                 cx.notify();
             }),
             // Whether messages can be sent follows the machine's connection.
-            cx.observe(&client, |_, _, cx| cx.notify()),
+            cx.observe(&client, |this, _, cx| {
+                this.load_changed_files(false, cx);
+                cx.notify();
+            }),
         ];
         let mut subscriptions = subscriptions;
         subscriptions.push(cx.subscribe(&composer, |this, _, _: &TextInputEvent, cx| {
@@ -192,6 +203,9 @@ impl AgentView {
             title,
             is_archived: false,
             is_diff_open: false,
+            changed_files: 0,
+            changed_files_asked_for: None,
+            _changed_files_load: Task::ready(()),
             client,
             store,
             registry,
@@ -221,6 +235,7 @@ impl AgentView {
         };
         this.sync_markdowns(cx);
         this.sync_blocked_subthreads(cx);
+        this.load_changed_files(false, cx);
         this
     }
 
@@ -564,8 +579,55 @@ impl AgentView {
     pub fn set_diff_open(&mut self, is_diff_open: bool, cx: &mut Context<Self>) {
         if self.is_diff_open != is_diff_open {
             self.is_diff_open = is_diff_open;
+            // Reverting from the panel changes the files without a turn.
+            if !is_diff_open {
+                self.load_changed_files(true, cx);
+            }
             cx.notify();
         }
+    }
+
+    /// Asks the server how many files the thread has changed, after each turn and on
+    /// reconnecting, or now when `force`d.
+    fn load_changed_files(&mut self, force: bool, cx: &mut Context<Self>) {
+        let completed_at = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .and_then(|thread| thread.completed_at);
+        let client = self.client.read(cx);
+        let asked_for = (completed_at, client.connection().is_some());
+        if !force && self.changed_files_asked_for == Some(asked_for) {
+            return;
+        }
+        self.changed_files_asked_for = Some(asked_for);
+        if !client.has_capability(CAPABILITY_THREAD_DIFF) {
+            return;
+        }
+        let request = client.request(Request::ThreadDiff {
+            thread_id: self.thread_id,
+            scope: DiffScope::All,
+        });
+        self._changed_files_load = cx.spawn(async move |this, cx| {
+            let changed_files = match request.await {
+                Ok(Response::ThreadDiff(diff)) => diff.files.len(),
+                Ok(response) => {
+                    log::error!("expected a diff, got {response:?}");
+                    return;
+                }
+                Err(error) => {
+                    log::warn!("couldn't load the thread's changes: {error:#}");
+                    return;
+                }
+            };
+            this.update(cx, |this, cx| {
+                if this.changed_files != changed_files {
+                    this.changed_files = changed_files;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
     }
 
     /// Opens the thread's terminal under it and focuses it, or closes it.
@@ -1043,24 +1105,36 @@ impl AgentView {
                             })),
                     )
                     .when(!running.is_empty(), |button| {
-                        button.child(
-                            div()
-                                .absolute()
-                                .top(px(3.))
-                                .right(px(3.))
-                                .size_1p5()
-                                .rounded_full()
-                                .bg(Color::Accent.color(cx)),
-                        )
+                        button.child(indicator_dot(cx))
                     })
             })
-            .child(
-                IconButton::new("toggle-diff", IconName::Diff)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.is_diff_open)
-                    .tooltip(|_, cx| Tooltip::for_action("Show Changes", &ToggleDiff, cx))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx)),
-            )
+            .child({
+                // With the changes hidden, a dot says the thread has changed files.
+                let changed_files = if self.is_diff_open {
+                    0
+                } else {
+                    self.changed_files
+                };
+                let tooltip: SharedString = match changed_files {
+                    0 => "Show Changes".into(),
+                    1 => "Show Changes · 1 file changed".into(),
+                    count => format!("Show Changes · {count} files changed").into(),
+                };
+                div()
+                    .relative()
+                    .child(
+                        IconButton::new("toggle-diff", IconName::Diff)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(self.is_diff_open)
+                            .tooltip(move |_, cx| {
+                                Tooltip::for_action(tooltip.clone(), &ToggleDiff, cx)
+                            })
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleDiff), cx)
+                            }),
+                    )
+                    .when(changed_files > 0, |button| button.child(indicator_dot(cx)))
+            })
             .child(
                 // Zed's agent options: log in again, log out, or restart the agent.
                 PopoverMenu::new("thread-options")
@@ -3133,6 +3207,17 @@ fn humanize_token_count(count: u64) -> String {
             }
         }
     }
+}
+
+/// The dot in a toolbar button's corner that says something is behind it.
+fn indicator_dot(cx: &App) -> Div {
+    div()
+        .absolute()
+        .top(px(3.))
+        .right(px(3.))
+        .size_1p5()
+        .rounded_full()
+        .bg(Color::Accent.color(cx))
 }
 
 fn diff_stat(added: usize, removed: usize) -> impl IntoElement {

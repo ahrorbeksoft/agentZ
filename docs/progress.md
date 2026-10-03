@@ -755,3 +755,7 @@ Then the server:
 - 2026-10-03: Cmd-B (Zed's left dock key) and a title-bar button before the project switcher
   hide the sidebar, in Agents and Workspaces, remembered in settings.json. Modals close on a
   press anywhere outside them (74f3ff2).
+- 2026-10-03: The drawer's Close Terminal is an X, last in its toolbar. With the changes
+  hidden, a dot on an agent thread's diff button says the thread has changed files (all turns,
+  asked of the server after each turn, on reconnecting and when the panel closes). Terminal
+  threads have no checkpoints, so theirs never shows one.
