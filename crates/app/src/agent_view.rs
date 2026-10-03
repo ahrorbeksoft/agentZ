@@ -47,8 +47,8 @@ gpui::actions!(
 /// Matches Zed's default `agent.max_content_width`.
 const MAX_CONTENT_WIDTH: Pixels = px(850.);
 /// Every header along the top of a view: the thread, terminal and diff toolbars, the
-/// workspace tabs (`ui::Tab`), and the sidebars' search and settings rows, so their
-/// bottom borders line up.
+/// workspace tabs (`ui::Tab`) and pane headers, and the sidebars' search and settings
+/// rows, so their bottom borders line up.
 pub(crate) const TOOLBAR_HEIGHT: Pixels = px(36.);
 /// Unchanged lines shown around an edit, like a diff editor's context.
 const DIFF_CONTEXT_LINES: usize = 3;

@@ -48,7 +48,6 @@ use crate::worktree_modal::WorktreeModalMode;
 const KEY_CONTEXT: &str = "Workspaces";
 const RENAME_KEY_CONTEXT: &str = "WorkspacesRename";
 const SEARCH_KEY_CONTEXT: &str = "WorkspacesSearch";
-const PANE_HEADER_HEIGHT: Pixels = px(28.);
 /// The grab area of a split's border. The line drawn in its middle is a pixel wide.
 const DIVIDER_SIZE: Pixels = px(5.);
 /// The area panes are laid out in to find their neighbors. Only the proportions matter.
@@ -2163,7 +2162,7 @@ impl SpacesView {
             PopoverMenu::new(key.element_id("pane-split"))
                 .trigger_with_tooltip(
                     IconButton::new(key.element_id("pane-split-button"), IconName::Split)
-                        .icon_size(IconSize::XSmall),
+                        .icon_size(IconSize::Small),
                     Tooltip::text("Split Pane"),
                 )
                 .anchor(gpui::Anchor::TopRight)
@@ -2192,10 +2191,9 @@ impl SpacesView {
         };
         let header = h_flex()
             .id(key.element_id("pane-header"))
-            .h(PANE_HEADER_HEIGHT)
+            .h(TOOLBAR_HEIGHT)
             .flex_none()
-            .pl_2()
-            .pr_1()
+            .px_2()
             .gap_1p5()
             .border_b_1()
             .border_color(colors.border_variant)
@@ -2204,7 +2202,7 @@ impl SpacesView {
             } else {
                 colors.tab_inactive_background
             })
-            .child(icon.size(IconSize::XSmall).color(if is_focused {
+            .child(icon.size(IconSize::Small).color(if is_focused {
                 Color::Default
             } else {
                 Color::Muted
@@ -2231,7 +2229,7 @@ impl SpacesView {
             .when(shows_focus || is_zoomed, |header| {
                 header.child(
                     IconButton::new(key.element_id("pane-zoom"), IconName::Maximize)
-                        .icon_size(IconSize::XSmall)
+                        .icon_size(IconSize::Small)
                         .toggle_state(is_zoomed)
                         .selected_icon(IconName::Minimize)
                         .tooltip(move |_, cx| {
@@ -2248,7 +2246,7 @@ impl SpacesView {
             })
             .child(
                 IconButton::new(key.element_id("pane-close"), IconName::Close)
-                    .icon_size(IconSize::XSmall)
+                    .icon_size(IconSize::Small)
                     .tooltip(|_, cx| Tooltip::for_action("Close Pane", &ClosePane, cx))
                     .on_click(cx.listener(move |this, _, _, cx| this.close_pane(key, cx))),
             )
