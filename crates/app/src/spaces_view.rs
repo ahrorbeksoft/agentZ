@@ -639,6 +639,7 @@ impl SpacesView {
                             cx,
                         );
                         view.set_archived(is_archived, cx);
+                        view.hide_toolbar(cx);
                         view
                     });
                     let machine = key.machine;
@@ -1777,10 +1778,14 @@ impl SpacesView {
                     .projects(key.machine, cx)
                     .and_then(|store| store.read(cx).thread(*thread_id).cloned());
                 match thread {
+                    // Like the thread's toolbar in the Agents view: its title, then its agent.
                     Some(thread) => (
                         thread_agent_icon(machines, key.machine, &thread, cx),
                         thread.title.clone().into(),
-                        None,
+                        self.panes.get(&key).and_then(|open| match &open.view {
+                            PaneView::Agent(view) => Some(view.read(cx).agent_name(cx)),
+                            PaneView::Terminal(_) => None,
+                        }),
                     ),
                     None => (Icon::new(IconName::Chat), "Thread".into(), None),
                 }
@@ -2189,6 +2194,12 @@ impl SpacesView {
                     }))
                 })
         };
+        let thread_buttons = match &view {
+            Some(PaneView::Agent(view)) => Some(view.update(cx, |view, cx| {
+                view.render_toolbar_buttons(cx).into_any_element()
+            })),
+            _ => None,
+        };
         let header = h_flex()
             .id(key.element_id("pane-header"))
             .h(TOOLBAR_HEIGHT)
@@ -2225,6 +2236,7 @@ impl SpacesView {
             }))
             .children(status.map(|status| render_status_dot(status, cx)))
             .child(div().flex_1())
+            .children(thread_buttons)
             .child(split_menu)
             .when(shows_focus || is_zoomed, |header| {
                 header.child(

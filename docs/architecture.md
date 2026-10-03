@@ -284,6 +284,10 @@ since a thread's workspace is its checkout.
   counts and the machine's icon, laid out as the sidebar's shell rows, with the thread cards'
   details popover on hover (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
+  An ACP thread's pane has one header: the thread's title, agent and toolbar buttons
+  (`AgentView::render_toolbar_buttons`) beside the pane's own, so its toolbar is hidden there.
+  Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
+  settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
 - **Row menu**: Rename, Close, and in a git repository (a project or not) New Worktree and
   Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch
   (herdr's generated `agentz/<adjective>-<noun>-<hex>` by default) and makes a worktree or a

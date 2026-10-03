@@ -97,6 +97,9 @@ pub struct AgentView {
     focus_handle: FocusHandle,
     /// Archived threads stay readable but take no new messages until they're unarchived.
     is_archived: bool,
+    /// A workspace pane shows the title and this toolbar's buttons in its own header,
+    /// so the thread doesn't stack a second header under it.
+    shows_toolbar: bool,
     /// Whether the shell shows this thread's changes beside it.
     is_diff_open: bool,
     /// How many files the thread has changed, for the diff button's dot.
@@ -206,6 +209,7 @@ impl AgentView {
             thread,
             title,
             is_archived: false,
+            shows_toolbar: true,
             is_diff_open: false,
             changed_files: 0,
             changed_files_asked_for: None,
@@ -571,6 +575,11 @@ impl AgentView {
                     })),
             )
             .into_any_element()
+    }
+
+    pub fn hide_toolbar(&mut self, cx: &mut Context<Self>) {
+        self.shows_toolbar = false;
+        cx.notify();
     }
 
     pub fn set_archived(&mut self, is_archived: bool, cx: &mut Context<Self>) {
@@ -1023,7 +1032,7 @@ impl AgentView {
         }
     }
 
-    fn agent_name(&self, cx: &App) -> SharedString {
+    pub(crate) fn agent_name(&self, cx: &App) -> SharedString {
         self.agent_id
             .as_ref()
             .and_then(|agent_id| self.registry.read(cx).agent(agent_id))
@@ -1051,7 +1060,6 @@ impl AgentView {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_name = self.agent_name(cx);
-        let thread = self.thread.clone();
         h_flex()
             .h(TOOLBAR_HEIGHT)
             .flex_none()
@@ -1075,6 +1083,14 @@ impl AgentView {
                     .color(Color::Muted),
             )
             .child(div().flex_1())
+            .child(self.render_toolbar_buttons(cx))
+    }
+
+    /// The terminal, changes and options buttons, also shown in a workspace pane's header.
+    pub(crate) fn render_toolbar_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let thread = self.thread.clone();
+        h_flex()
+            .gap_1p5()
             .child({
                 // With the drawer hidden, a dot says something still runs in its terminals.
                 let running: Vec<String> = if self.is_drawer_open {
@@ -3079,7 +3095,9 @@ impl Render for AgentView {
                     }
                 }),
             )
-            .child(self.render_toolbar(cx))
+            .when(self.shows_toolbar, |this| {
+                this.child(self.render_toolbar(cx))
+            })
             // A full-screen terminal hides the conversation and the composer.
             .when(!is_drawer_full_screen, |this| {
                 this.children(self.render_restore_notice(cx))
