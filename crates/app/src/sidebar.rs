@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::machines::{MachineId, Machines, ProjectKey, Scope, ThreadKey};
+use crate::machines::{MachineId, Machines, ProjectKey, Scope, ThreadKey, project_at};
 use crate::project_store::{ProjectStore, ThreadStatus};
 use agentz_protocol::agents::AgentId;
 use gpui::{
@@ -454,8 +454,9 @@ impl Sidebar {
         machine: MachineId,
         thread: &Thread,
         is_archived: bool,
-        // A shell only renames and deletes: it isn't archived, nor tied to its project.
-        is_shell: bool,
+        // A terminal thread renames and deletes, and can add the folder it's in as a project.
+        // It isn't archived, nor tied to the project it started in.
+        is_terminal: bool,
         cx: &mut Context<Self>,
     ) -> impl Fn(&mut Window, &mut App) -> Entity<ContextMenu> + 'static {
         let sidebar = cx.entity().downgrade();
@@ -474,10 +475,22 @@ impl Sidebar {
             .and_then(|checkout| checkout.workspace.as_ref())
             .is_some_and(|workspace| workspace.kind == WorkspaceKind::Pasture);
         let folder = checkout.map(|checkout| checkout.folder);
+        // Where a terminal is, when that's in no project yet.
+        let new_project = is_terminal
+            .then(|| {
+                let store = self.store(machine, cx)?;
+                let store = store.read(cx);
+                let folder = store.terminal_folder(thread.id)?;
+                project_at(store.projects(), &folder.path)
+                    .is_none()
+                    .then(|| folder.path.clone())
+            })
+            .flatten();
         move |window, cx| {
             let sidebar = sidebar.clone();
             let title = title.clone();
             let folder = folder.clone();
+            let new_project = new_project.clone();
             ContextMenu::build(window, cx, move |menu, _, _| {
                 let new_thread_here = folder.clone().map(|folder| {
                     let sidebar = sidebar.clone();
@@ -556,13 +569,33 @@ impl Sidebar {
                         .icon_color(Color::Muted)
                         .handler(rename),
                 );
-                if is_shell {
-                    return menu.separator().item(
-                        ContextMenuEntry::new("Delete…")
-                            .icon(IconName::Trash)
-                            .icon_color(Color::Muted)
-                            .handler(delete),
-                    );
+                if is_terminal {
+                    let add_project = new_project.clone().map(|path| {
+                        let sidebar = sidebar.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            sidebar
+                                .update(cx, |sidebar, cx| {
+                                    sidebar.add_project(machine, path.clone(), cx)
+                                })
+                                .ok();
+                        }
+                    });
+                    return menu
+                        .when_some(add_project, |menu, handler| {
+                            menu.item(
+                                ContextMenuEntry::new("Add Project")
+                                    .icon(IconName::Plus)
+                                    .icon_color(Color::Muted)
+                                    .handler(handler),
+                            )
+                        })
+                        .separator()
+                        .item(
+                            ContextMenuEntry::new("Delete…")
+                                .icon(IconName::Trash)
+                                .icon_color(Color::Muted)
+                                .handler(delete),
+                        );
                 }
                 menu.item(
                     ContextMenuEntry::new(if is_archived { "Unarchive" } else { "Archive" })
@@ -613,6 +646,20 @@ impl Sidebar {
                 )
             })
         }
+    }
+
+    /// Adds a folder on the machine as a project.
+    fn add_project(&mut self, machine: MachineId, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(store) = self.store(machine, cx) else {
+            return;
+        };
+        let added = store.update(cx, |store, cx| store.add_project(path, cx));
+        cx.background_spawn(async move {
+            if let Err(error) = added.await {
+                log::error!("failed to add the project: {error:#}");
+            }
+        })
+        .detach();
     }
 
     /// Shows the hovered thread's details after a moment, like t3code's row tooltip.
@@ -1040,7 +1087,7 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(machine, &thread, false, false, cx);
+        let menu = self.thread_menu(machine, &thread, false, thread.terminal.is_some(), cx);
         right_click_menu(thread_element_id("thread-menu", thread_id))
             .trigger(move |is_menu_open, _, _| {
                 div()
@@ -1870,7 +1917,8 @@ fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_relative_time, project_at};
+    use super::format_relative_time;
+    use crate::machines::project_at;
     use projects::{Project, ProjectId, Workspace, WorkspaceKind};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
@@ -2001,18 +2049,4 @@ fn folder_name(folder: &Path) -> SharedString {
             |name| name.to_string_lossy().into_owned(),
         )
         .into()
-}
-
-/// The project a folder is in: the deepest whose folder, worktree or pasture holds it.
-fn project_at<'a>(projects: &'a [Project], folder: &Path) -> Option<&'a Project> {
-    projects
-        .iter()
-        .flat_map(|project| {
-            std::iter::once(&project.path)
-                .chain(project.workspaces.iter().map(|workspace| &workspace.path))
-                .filter(|root| folder.starts_with(root))
-                .map(move |root| (root.components().count(), project))
-        })
-        .max_by_key(|(depth, _)| *depth)
-        .map(|(_, project)| project)
 }

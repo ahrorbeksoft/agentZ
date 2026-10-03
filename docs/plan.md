@@ -555,7 +555,10 @@ to Shells. A shell is named after the folder it's in (`~` for home), following `
 renamed; its row shows the icon of the project it's in (a folder outside every project), the
 branch of that folder (no second line outside git) and its last activity, or **Running** and
 the program while one runs in front of the shell. Its menu only renames and deletes; its
-details popover stays, for the machine. A terminal's output counts as its thread's
+details popover stays, for the machine. A terminal thread (shell or CLI agent) is listed under
+the project its current folder is in, and with all projects only when that's in none; its menu
+is Rename, Add Project (when its folder isn't one) and Delete. Closing a terminal ends every
+process left in its session (herdr's pane shutdown: hang up, terminate, kill). A terminal's output counts as its thread's
 activity, at most every 10 seconds. Agent CLIs are watched for in workspace panes and terminal
 threads, not in a thread's drawer. New Thread offers no agent CLIs from `PATH`, only a plain terminal, for now.
 

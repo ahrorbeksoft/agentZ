@@ -5,6 +5,7 @@
 //! Views of a single thread hold that thread's machine. The sidebar, the project switcher and
 //! New Thread show every machine's projects together, as t3code shows its environments.
 
+use std::path::Path;
 use std::time::SystemTime;
 
 use collections::HashMap;
@@ -614,9 +615,7 @@ impl Machines {
             thread.archived_at.is_none()
                 && thread.task.is_none()
                 && !self.is_shell(machine, thread, cx)
-                && groups
-                    .iter()
-                    .any(|group| group.contains(machine, thread.project_id))
+                && self.is_thread_visible(&groups, machine, thread, cx)
         });
         let order = self.thread_order(cx);
         threads.sort_by(|(a_machine, a), (b_machine, b)| {
@@ -640,14 +639,47 @@ impl Machines {
             thread.archived_at.is_none()
                 && thread.task.is_none()
                 && self.is_shell(machine, thread, cx)
-                && groups
-                    .iter()
-                    .any(|group| group.contains(machine, thread.project_id))
+                && self.is_thread_visible(&groups, machine, thread, cx)
         });
         threads.sort_by_key(|(_, thread)| {
             std::cmp::Reverse(thread.last_activity_at.or(thread.created_at))
         });
         threads
+    }
+
+    /// The project a thread is listed under. A terminal thread belongs to where it is now:
+    /// the project its folder is in, or none outside every project.
+    pub fn thread_project(
+        &self,
+        machine: MachineId,
+        thread: &Thread,
+        cx: &App,
+    ) -> Option<ProjectId> {
+        let Some(store) = self.projects(machine, cx) else {
+            return Some(thread.project_id);
+        };
+        let store = store.read(cx);
+        match store.terminal_folder(thread.id) {
+            Some(folder) => project_at(store.projects(), &folder.path).map(|project| project.id),
+            None => Some(thread.project_id),
+        }
+    }
+
+    /// Whether the scope's groups show the thread. One in no project shows with all
+    /// projects.
+    fn is_thread_visible(
+        &self,
+        groups: &[ProjectGroup],
+        machine: MachineId,
+        thread: &Thread,
+        cx: &App,
+    ) -> bool {
+        match self.thread_project(machine, thread, cx) {
+            Some(project_id) => groups
+                .iter()
+                .any(|group| group.contains(machine, project_id)),
+            None => self.scope(cx) == Scope::All,
+        }
     }
 
     /// A terminal thread with no agent CLI running in it.
@@ -1071,4 +1103,18 @@ pub fn machine_kind_icon(kind: &MachineKind) -> IconName {
         MachineKind::MacMini => IconName::MacMini,
         MachineKind::MacStudio => IconName::MacStudio,
     }
+}
+
+/// The project a folder is in: the deepest whose folder, worktree or pasture holds it.
+pub fn project_at<'a>(projects: &'a [Project], folder: &Path) -> Option<&'a Project> {
+    projects
+        .iter()
+        .flat_map(|project| {
+            std::iter::once(&project.path)
+                .chain(project.workspaces.iter().map(|workspace| &workspace.path))
+                .filter(|root| folder.starts_with(root))
+                .map(move |root| (root.components().count(), project))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, project)| project)
 }

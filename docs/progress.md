@@ -731,3 +731,6 @@ Then the server:
   stayed a "Claude Code" card, a pane kept its agent): leaving is now always reported.
 - 2026-10-03: A terminal thread's card follows its current folder too: that folder's project
   (or the folder), branch, and details.
+- 2026-10-03: Terminal threads are listed under their current folder's project (all projects
+  only, outside every project); their menu is Rename, Add Project, Delete; closing a terminal
+  ends its whole session, `nohup` included (6e2eb64).
