@@ -331,7 +331,7 @@ pub struct ProjectStore {
     blocked_threads: HashSet<ThreadId>,
     /// Counts changes, so the owner can tell whether a call changed anything.
     revision: u64,
-    saver: Option<Saver>,
+    saver: Option<Saver<PersistedState>>,
 }
 
 impl ProjectStore {
@@ -340,7 +340,7 @@ impl ProjectStore {
     pub fn load(state_path: Option<PathBuf>) -> Self {
         let state = state_path
             .as_deref()
-            .and_then(|path| read_state(path).log_err())
+            .and_then(|path| read_state::<PersistedState>(path).log_err())
             .flatten()
             .unwrap_or_default();
         Self::from_state(state, state_path)
@@ -357,7 +357,7 @@ impl ProjectStore {
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
             revision: 0,
-            saver: state_path.map(Saver::new),
+            saver: state_path.map(|path| Saver::new(path, "projects-saver")),
         };
         let highest_id = this
             .projects
@@ -979,18 +979,18 @@ impl ProjectStore {
     }
 }
 
-/// Writes the state on its own thread, once changes have paused for [`SAVE_DEBOUNCE`]. Dropping
-/// it writes any pending state before returning, so nothing is lost on quit.
-struct Saver {
-    sender: Option<mpsc::Sender<PersistedState>>,
+/// Writes a state as JSON on its own thread, once changes have paused for [`SAVE_DEBOUNCE`].
+/// Dropping it writes any pending state before returning, so nothing is lost on quit.
+pub struct Saver<T> {
+    sender: Option<mpsc::Sender<T>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Saver {
-    fn new(state_path: PathBuf) -> Self {
-        let (sender, receiver) = mpsc::channel::<PersistedState>();
+impl<T: Serialize + Send + 'static> Saver<T> {
+    pub fn new(state_path: PathBuf, thread_name: &str) -> Self {
+        let (sender, receiver) = mpsc::channel::<T>();
         let thread = std::thread::Builder::new()
-            .name("projects-saver".into())
+            .name(thread_name.into())
             .spawn(move || {
                 while let Ok(mut state) = receiver.recv() {
                     loop {
@@ -1013,20 +1013,20 @@ impl Saver {
         }
     }
 
-    fn save(&self, state: PersistedState) {
+    pub fn save(&self, state: T) {
         if let Some(sender) = &self.sender {
             sender.send(state).log_err();
         }
     }
 }
 
-impl Drop for Saver {
+impl<T> Drop for Saver<T> {
     fn drop(&mut self) {
         self.sender.take();
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
-            log::error!("the projects saver thread panicked");
+            log::error!("a saver thread panicked");
         }
     }
 }
@@ -1038,7 +1038,8 @@ fn project_name(path: &Path) -> SharedString {
         .into()
 }
 
-fn read_state(path: &Path) -> Result<Option<PersistedState>> {
+/// Reads a state [`Saver`] wrote, or `None` when there's none yet.
+pub fn read_state<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1051,7 +1052,7 @@ fn read_state(path: &Path) -> Result<Option<PersistedState>> {
     Ok(Some(state))
 }
 
-fn write_state(path: &Path, state: &PersistedState) -> Result<()> {
+fn write_state(path: &Path, state: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -1198,7 +1199,7 @@ mod tests {
         store.add_project(dir.path().to_path_buf());
         assert!(!state_path.exists(), "saving waits for changes to pause");
         std::thread::sleep(SAVE_DEBOUNCE * 3);
-        let saved = read_state(&state_path).expect("readable").expect("saved");
+        let saved: PersistedState = read_state(&state_path).expect("readable").expect("saved");
         assert_eq!(saved.projects.len(), 1);
     }
 

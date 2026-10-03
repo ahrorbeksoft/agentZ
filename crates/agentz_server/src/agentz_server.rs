@@ -13,6 +13,7 @@ mod directories;
 mod git;
 mod repositories;
 mod server;
+mod spaces;
 mod terminal_programs;
 mod terminals;
 mod workspaces;
@@ -112,6 +113,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             agentz_protocol::CAPABILITY_TERMINALS.to_string(),
             agentz_protocol::CAPABILITY_BROWSE_DIRECTORIES.to_string(),
             agentz_protocol::CAPABILITY_RELAY.to_string(),
+            agentz_protocol::CAPABILITY_SPACES.to_string(),
         ],
         build: installed_build(),
         error: None,

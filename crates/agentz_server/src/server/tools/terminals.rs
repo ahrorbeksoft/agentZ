@@ -223,7 +223,7 @@ impl Server {
 
     fn terminal_summary(&self, key: &TerminalKey) -> Value {
         let thread_id = key.thread_id();
-        let thread = self.projects.thread(thread_id);
+        let thread = thread_id.and_then(|thread_id| self.projects.thread(thread_id));
         let running = self.terminals.running.get(key);
         let exit = running.and_then(|running| running.terminal.exit());
         let status = match (running, exit) {
@@ -232,17 +232,18 @@ impl Server {
             (Some(_), Some(_)) => "exited",
         };
         json!({
-            "threadId": thread_id.0,
+            "threadId": thread_id.map(|thread_id| thread_id.0),
             "kind": match key {
                 TerminalKey::Thread(_) => "terminal_thread",
                 TerminalKey::Drawer(_) => "drawer",
                 TerminalKey::Agent { .. } => "agent_command",
+                TerminalKey::Pane(_) => "pane",
             },
             "threadTitle": thread.map(|thread| thread.title.clone()),
             "command": thread
                 .and_then(|thread| thread.terminal.as_ref())
                 .and_then(|terminal| terminal.command.clone()),
-            "folder": self.projects.thread_folder(thread_id),
+            "folder": thread_id.and_then(|thread_id| self.projects.thread_folder(thread_id)),
             "status": status,
             "exitCode": exit.and_then(|exit| exit.code),
             "signal": exit.and_then(|exit| exit.signal.clone()),

@@ -15,6 +15,7 @@
 pub mod agents;
 pub mod diff;
 pub mod layout;
+pub mod spaces;
 pub mod terminal;
 pub mod terminal_keys;
 pub mod thread;
@@ -32,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use crate::diff::{DiffScope, ThreadDiff};
+use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
 use crate::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalProgram,
 };
@@ -55,6 +57,9 @@ pub const CAPABILITY_BROWSE_DIRECTORIES: &str = "browse_directories";
 /// [`ServerWelcome::capabilities`]: agents can reach the app's other machines through it
 /// ([`Request::SetPeers`], [`Event::RelayToolCall`]).
 pub const CAPABILITY_RELAY: &str = "relay";
+/// [`ServerWelcome::capabilities`]: the server keeps the Workspaces view's spaces
+/// ([`Request::Spaces`], [`SessionSnapshot::spaces`]) and runs their pane terminals.
+pub const CAPABILITY_SPACES: &str = "spaces";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -326,6 +331,10 @@ pub enum Request {
         result: ToolResult,
     },
 
+    /// The Workspaces view's spaces, tabs and panes. Changes reach session subscribers as
+    /// [`Event::Spaces`].
+    Spaces(SpaceRequest),
+
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -434,6 +443,7 @@ pub enum Response {
     TerminalPrograms(Vec<TerminalProgram>),
     TerminalFrame(TerminalFrame),
     Directories(DirectoryListing),
+    SpacePane(PaneLocation),
     /// What a finished action did, to show the user.
     Message(String),
     /// From a newer version.
@@ -446,6 +456,8 @@ pub struct SessionSnapshot {
     pub projects: ProjectsSnapshot,
     pub registry: RegistrySnapshot,
     pub agent_settings: BTreeMap<AgentId, AgentSettings>,
+    #[serde(default)]
+    pub spaces: SpacesSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -453,6 +465,7 @@ pub enum Event {
     Projects(ProjectsSnapshot),
     Registry(RegistrySnapshot),
     AgentSettings(BTreeMap<AgentId, AgentSettings>),
+    Spaces(SpacesSnapshot),
     Thread {
         connection: ConnectionId,
         update: ThreadUpdate,

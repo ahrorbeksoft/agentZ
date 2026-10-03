@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use projects::ThreadId;
 use serde::{Deserialize, Serialize};
 
+use crate::layout::PaneId;
+
 pub use projects::TerminalCommand;
 
 /// Which terminal: they're named by what they belong to, so a client can open a thread's
@@ -22,13 +24,17 @@ pub enum TerminalKey {
         thread_id: ThreadId,
         terminal_id: String,
     },
+    /// A terminal pane in the Workspaces view.
+    Pane(PaneId),
 }
 
 impl TerminalKey {
-    pub fn thread_id(&self) -> ThreadId {
+    /// The thread it belongs to; a pane's belongs to none.
+    pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
-            Self::Thread(thread_id) | Self::Drawer(thread_id) => *thread_id,
-            Self::Agent { thread_id, .. } => *thread_id,
+            Self::Thread(thread_id) | Self::Drawer(thread_id) => Some(*thread_id),
+            Self::Agent { thread_id, .. } => Some(*thread_id),
+            Self::Pane(_) => None,
         }
     }
 }

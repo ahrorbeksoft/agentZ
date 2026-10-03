@@ -8,6 +8,10 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
+use agentz_protocol::layout::{Direction, Node};
+use agentz_protocol::spaces::{
+    PaneAgentState, PaneContent, PaneLocation, PaneTerminal, SpaceRequest, SpacesSnapshot,
+};
 use agentz_protocol::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalPoint,
     TerminalSelectionKind, TerminalSelectionUpdate,
@@ -2322,4 +2326,236 @@ async fn agents_drive_terminals_through_tools() {
         .filter_map(|terminal| terminal["kind"].as_str())
         .collect();
     assert_eq!(kinds, ["drawer", "terminal_thread"]);
+}
+
+impl TestClient {
+    async fn space_pane(&mut self, request: SpaceRequest) -> PaneLocation {
+        match self.ok(Request::Spaces(request)).await {
+            Response::SpacePane(location) => location,
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+
+    fn space_snapshot(&self) -> SpacesSnapshot {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Spaces(spaces) => Some(spaces.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn shell_in(folder: &std::path::Path) -> PaneContent {
+    PaneContent::Terminal(PaneTerminal {
+        folder: folder.to_path_buf(),
+        command: None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spaces_are_saved_restored_and_streamed() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = std::fs::canonicalize(server.project_dir.path()).expect("canonical path");
+    let mut client = server.connect().await;
+    assert!(
+        client
+            .welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == agentz_protocol::CAPABILITY_SPACES)
+    );
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(&folder).await;
+    let thread_id = client.create_thread_in(project_id).await;
+
+    // A space opens with one terminal pane in its folder.
+    let first = client
+        .space_pane(SpaceRequest::CreateSpace {
+            folder: folder.clone(),
+            project_id: Some(project_id),
+            content: shell_in(std::path::Path::new("")),
+        })
+        .await;
+    let key = TerminalKey::Pane(first.pane);
+    client.subscribe_terminal(key.clone()).await;
+    client.type_into(&key, "echo in-$PWD\n").await;
+    client
+        .wait_for_screen(&key, &format!("in-{}", folder.display()))
+        .await;
+
+    // Split right with a shell, and down with the thread.
+    let second = client
+        .space_pane(SpaceRequest::SplitPane {
+            pane: first.pane,
+            direction: Direction::Horizontal,
+            content: shell_in(&folder),
+        })
+        .await;
+    let third = client
+        .space_pane(SpaceRequest::SplitPane {
+            pane: second.pane,
+            direction: Direction::Vertical,
+            content: PaneContent::Thread(thread_id),
+        })
+        .await;
+    assert_eq!((second.tab, third.tab), (first.tab, first.tab));
+    client
+        .ok(Request::Spaces(SpaceRequest::SetSplitRatio {
+            tab: first.tab,
+            path: vec![],
+            ratio: 0.25,
+        }))
+        .await;
+    client
+        .ok(Request::Spaces(SpaceRequest::RenameSpace {
+            space: first.space,
+            name: Some("Work".into()),
+        }))
+        .await;
+    let tab = client
+        .space_pane(SpaceRequest::CreateTab {
+            space: first.space,
+            content: shell_in(&folder),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client
+                .space_snapshot()
+                .space(first.space)
+                .is_some_and(|space| space.tabs.len() == 2 && space.name.is_some())
+        })
+        .await;
+    let spaces = client.space_snapshot();
+    let (space, tab_one) = spaces.tab(first.tab).expect("the tab");
+    assert_eq!(space.label(), "Work");
+    assert_eq!(tab_one.panes.len(), 3);
+    assert!(matches!(
+        tab_one.root,
+        Node::Split { direction: Direction::Horizontal, ratio, .. } if (ratio - 0.25).abs() < 1e-6
+    ));
+
+    // A pane whose shell exits closes, as in herdr.
+    let second_key = TerminalKey::Pane(second.pane);
+    client.subscribe_terminal(second_key.clone()).await;
+    client.type_into(&second_key, "exit\n").await;
+    client
+        .wait_until(|client| {
+            client
+                .space_snapshot()
+                .tab(first.tab)
+                .is_some_and(|(_, tab)| tab.pane(second.pane).is_none())
+        })
+        .await;
+    assert!(!client.terminals.contains_key(&second_key));
+
+    // Closing the tab's last pane closes the tab.
+    client
+        .ok(Request::Spaces(SpaceRequest::ClosePane(tab.pane)))
+        .await;
+    client
+        .wait_until(|client| client.space_snapshot().tab(tab.tab).is_none())
+        .await;
+
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+
+    // After a restart, the layout is back, terminal panes as new shells in their folders,
+    // and thread panes on their threads.
+    let Some(server) = TestServer::start_with(server.data_dir, server.project_dir) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let (space, tab) = session.spaces.tab(first.tab).expect("the tab is back");
+    assert_eq!(space.name.as_deref(), Some("Work"));
+    assert_eq!(space.tabs.len(), 1);
+    assert_eq!(tab.panes.len(), 2);
+    assert_eq!(
+        tab.pane(third.pane).map(|pane| &pane.content),
+        Some(&PaneContent::Thread(thread_id))
+    );
+    client.subscribe_terminal(key.clone()).await;
+    client.type_into(&key, "echo back-in-$PWD\n").await;
+    client
+        .wait_for_screen(&key, &format!("back-in-{}", folder.display()))
+        .await;
+
+    // Deleting the thread closes its pane; closing the space ends its terminals.
+    client.ok(Request::DeleteThread(thread_id)).await;
+    client
+        .wait_until(|client| {
+            client
+                .space_snapshot()
+                .tab(first.tab)
+                .is_some_and(|(_, tab)| tab.panes.len() == 1)
+        })
+        .await;
+    client
+        .ok(Request::Spaces(SpaceRequest::CloseSpace(first.space)))
+        .await;
+    client
+        .wait_until(|client| !client.terminals.contains_key(&key))
+        .await;
+    assert!(client.space_snapshot().spaces.is_empty());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_panes_show_their_agents() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let bin = tempfile::tempdir().expect("temp dir");
+    let codex = bin.path().join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\necho codex ready\nwhile read line; do printf '\\033]0;%s\\007' \"$line\"; done\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("permissions");
+
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let location = client
+        .space_pane(SpaceRequest::CreateSpace {
+            folder: server.project_dir.path().to_path_buf(),
+            project_id: None,
+            content: PaneContent::Terminal(PaneTerminal {
+                folder: server.project_dir.path().to_path_buf(),
+                command: Some(codex.display().to_string()),
+            }),
+        })
+        .await;
+    let key = TerminalKey::Pane(location.pane);
+    client.subscribe_terminal(key.clone()).await;
+    client.wait_for_screen(&key, "codex ready").await;
+    let agent = move |client: &TestClient| {
+        client
+            .space_snapshot()
+            .pane(location.pane)
+            .and_then(|(_, _, pane)| pane.agent.clone())
+    };
+    client.type_into(&key, "⠋ project\n").await;
+    client
+        .wait_until(|client| {
+            agent(client).is_some_and(|agent| agent.state == PaneAgentState::Working)
+        })
+        .await;
+    assert_eq!(agent(&client).expect("an agent").name, "Codex");
+    client.type_into(&key, "project\n").await;
+    client
+        .wait_until(|client| agent(client).is_some_and(|agent| agent.state == PaneAgentState::Idle))
+        .await;
 }

@@ -318,11 +318,16 @@ Then the server:
 ## 11. Workspaces view
 
 - [ ] Title bar tabs: **Agents** (the current app, a thread full screen) | **Workspaces**.
-- [ ] Server: workspaces (machine plus folder), tabs, and pane trees (herdr's `TileLayout`):
-  - [ ] saved;
-  - [ ] restored after a restart, terminals as new shells in their folders, threads
+- [x] Server: workspaces (machine plus folder), tabs, and pane trees (herdr's `TileLayout`).
+      They're called spaces in code (`agentz_protocol::spaces`, `Request::Spaces`), since a
+      thread's workspace is its checkout. Panes hold a terminal of their own
+      (`TerminalKey::Pane`) or a thread. A pane closes when its terminal's process ends, a tab
+      with its last pane, a space with its last tab (herdr). Terminal panes get herdr's agent
+      detection, and each space its folder's branch and ahead/behind, every 5 seconds.
+  - [x] saved (`spaces.json`, without the runtime agent and git state);
+  - [x] restored after a restart, terminals as new shells in their folders, threads
         reattached;
-  - [ ] streamed to clients.
+  - [x] streamed to clients (`SessionSnapshot::spaces`, `Event::Spaces`).
 - [ ] Workspaces sidebar:
   - [ ] search;
   - [ ] **+** picker: a project checkout, worktree or pasture, or a machine's home folder;
@@ -352,7 +357,7 @@ Then the server:
 - [ ] Tests:
   - [x] the pane tree (split, close, resize, swap): herdr's `TileLayout` ported to
         `agentz_protocol::layout` with its tests;
-  - [ ] save and restore;
+  - [x] save and restore (`spaces_are_saved_restored_and_streamed`, and the store's tests);
   - [ ] a headless UI test of the layout.
 
 ## Findings

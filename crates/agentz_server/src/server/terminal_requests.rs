@@ -129,9 +129,15 @@ impl Server {
         self.start_terminal(key.clone(), spawn, TerminalSize::default())
     }
 
-    /// What a thread's terminal or drawer runs.
+    /// What a thread's terminal or drawer, or a pane's terminal, runs.
     fn terminal_spawn(&self, key: &TerminalKey) -> Result<TerminalSpawn> {
-        let thread_id = key.thread_id();
+        let thread_id = match key {
+            TerminalKey::Thread(thread_id) | TerminalKey::Drawer(thread_id) => *thread_id,
+            TerminalKey::Agent { .. } => {
+                return Err(anyhow!("an agent's terminal starts when the agent asks"));
+            }
+            TerminalKey::Pane(pane) => return self.pane_terminal_spawn(*pane),
+        };
         let thread = self.projects.thread(thread_id).context("no such thread")?;
         let command = match key {
             TerminalKey::Thread(_) => thread
@@ -140,12 +146,24 @@ impl Server {
                 .context("this thread runs an agent, not a terminal")?
                 .command
                 .clone(),
-            TerminalKey::Drawer(_) => None,
-            TerminalKey::Agent { .. } => {
-                return Err(anyhow!("an agent's terminal starts when the agent asks"));
-            }
+            _ => None,
         };
-        let program = match (&self.terminal_shell, command) {
+        Ok(TerminalSpawn {
+            program: self.terminal_program(command),
+            cwd: self
+                .projects
+                .thread_folder(thread_id)
+                .context("no such project")?,
+            env: self.terminal_env(Some(thread_id)),
+        })
+    }
+
+    /// The shell, or the shell running `command`.
+    pub(super) fn terminal_program(
+        &self,
+        command: Option<String>,
+    ) -> Option<(String, Vec<String>)> {
+        match (&self.terminal_shell, command) {
             (Some(shell), None) => Some((shell.clone(), Vec::new())),
             (Some(shell), Some(command)) => Some((shell.clone(), vec!["-c".into(), command])),
             (None, None) => None,
@@ -155,19 +173,11 @@ impl Server {
                 util::shell::get_system_shell(),
                 vec!["-l".into(), "-i".into(), "-c".into(), command],
             )),
-        };
-        Ok(TerminalSpawn {
-            program,
-            cwd: self
-                .projects
-                .thread_folder(thread_id)
-                .context("no such project")?,
-            env: self.terminal_env(thread_id),
-        })
+        }
     }
 
     /// herdr's `HERDR_*` variables, so the CLI run in the terminal knows its thread.
-    pub(super) fn terminal_env(&self, thread_id: ThreadId) -> HashMap<String, String> {
+    pub(super) fn terminal_env(&self, thread_id: Option<ThreadId>) -> HashMap<String, String> {
         let mut env = HashMap::new();
         if let Some(control) = &self.agent_control {
             env.insert(
@@ -178,7 +188,9 @@ impl Server {
                 "AGENTZ_SOCKET".to_string(),
                 control.socket.to_string_lossy().into_owned(),
             );
-            env.insert("AGENTZ_THREAD_ID".to_string(), thread_id.0.to_string());
+            if let Some(thread_id) = thread_id {
+                env.insert("AGENTZ_THREAD_ID".to_string(), thread_id.0.to_string());
+            }
         }
         env
     }
@@ -219,6 +231,10 @@ impl Server {
                 self.publish_terminal_agent_state(thread_id, AgentState::Unknown);
                 Some(AgentTracker::default())
             }
+            TerminalKey::Pane(pane) => {
+                self.spaces.set_pane_agent(pane, None);
+                Some(AgentTracker::default())
+            }
             TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => None,
         };
         self.terminals.running.insert(
@@ -241,8 +257,12 @@ impl Server {
         if self.terminals.running.remove(key).is_none() {
             return;
         }
-        if let TerminalKey::Thread(thread_id) = key {
-            self.publish_terminal_agent_state(*thread_id, AgentState::Unknown);
+        match key {
+            TerminalKey::Thread(thread_id) => {
+                self.publish_terminal_agent_state(*thread_id, AgentState::Unknown)
+            }
+            TerminalKey::Pane(pane) => self.spaces.set_pane_agent(*pane, None),
+            TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
         }
         for client in self.clients.values_mut() {
             if client.terminals.remove(key).is_some() {
@@ -266,7 +286,15 @@ impl Server {
             if let Some(tracker) = &mut running.tracker {
                 tracker.content_changed(Instant::now());
             }
+            let pane_exited = match key {
+                TerminalKey::Pane(pane) => running.terminal.exit().is_some().then_some(pane),
+                _ => None,
+            };
             self.terminal_changed(key);
+            // herdr closes a pane when its process ends.
+            if let Some(pane) = pane_exited {
+                self.close_space_pane(pane);
+            }
         }
     }
 
@@ -292,13 +320,12 @@ impl Server {
         let mut published = Vec::new();
         let mut next_tick: Option<Duration> = None;
         for (key, running) in &mut self.terminals.running {
-            let (TerminalKey::Thread(thread_id), Some(tracker)) = (key, &mut running.tracker)
-            else {
+            let Some(tracker) = &mut running.tracker else {
                 continue;
             };
             if running.terminal.exit().is_some() {
                 if let Some(state) = tracker.exited() {
-                    published.push((*thread_id, state));
+                    published.push((key.clone(), None, state));
                 }
                 continue;
             }
@@ -337,13 +364,19 @@ impl Server {
                 }
             }
             if let Some(state) = update {
-                published.push((*thread_id, state));
+                published.push((key.clone(), tracker.agent(), state));
             }
             let tick = tracker.next_tick();
             next_tick = Some(next_tick.map_or(tick, |next| next.min(tick)));
         }
-        for (thread_id, state) in published {
-            self.publish_terminal_agent_state(thread_id, state);
+        for (key, agent, state) in published {
+            match key {
+                TerminalKey::Thread(thread_id) => {
+                    self.publish_terminal_agent_state(thread_id, state)
+                }
+                TerminalKey::Pane(pane) => self.publish_pane_agent(pane, agent, state),
+                TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
+            }
         }
         if let Some(next_tick) = next_tick {
             self.schedule_agent_detection(next_tick);
@@ -367,13 +400,18 @@ impl Server {
         }
     }
 
-    /// Closes the terminals of threads that are gone.
+    /// Closes the terminals of threads and panes that are gone.
     pub(super) fn close_orphaned_terminals(&mut self) {
         let orphaned: Vec<TerminalKey> = self
             .terminals
             .running
             .keys()
-            .filter(|key| self.projects.thread(key.thread_id()).is_none())
+            .filter(|key| match key {
+                TerminalKey::Pane(pane) => self.spaces.pane(*pane).is_none(),
+                key => key
+                    .thread_id()
+                    .is_none_or(|thread_id| self.projects.thread(thread_id).is_none()),
+            })
             .cloned()
             .collect();
         for key in orphaned {
@@ -546,7 +584,7 @@ impl Server {
             Some(cwd) => folder.join(cwd),
             None => folder,
         };
-        let mut env = self.terminal_env(thread_id);
+        let mut env = self.terminal_env(Some(thread_id));
         // Nothing waits at a pager for a key the agent can't press (Zed).
         env.insert("PAGER".into(), String::new());
         env.insert("GIT_PAGER".into(), "cat".into());

@@ -1,5 +1,6 @@
 //! The state the server owns, and how requests and background results change it.
 
+mod space_requests;
 mod terminal_requests;
 mod tools;
 mod workspace_requests;
@@ -34,6 +35,7 @@ use util::ResultExt as _;
 use crate::agent_settings::AgentSettingsStore;
 use crate::checkpoints::Checkpoints;
 use crate::repositories::{self, RepositoryChecks};
+use crate::spaces::SpaceStore;
 use crate::{AgentControl, CustomAgent, ServerConfig};
 use terminal_requests::Terminals;
 use tools::{PendingToolCall, ToolResults};
@@ -130,9 +132,11 @@ pub(crate) struct Server {
     accounts: HashMap<u64, Account>,
     next_account_id: u64,
     terminals: Terminals,
+    spaces: SpaceStore,
     clients: HashMap<ClientId, Client>,
     // What session subscribers were last sent.
     projects_revision_sent: u64,
+    spaces_revision_sent: u64,
     registry_sent: RegistrySnapshot,
     agent_settings_revision_sent: u64,
     registry_changed: bool,
@@ -164,6 +168,7 @@ impl Server {
             data_dir.join("node"),
         );
         registry.refresh_if_stale();
+        let spaces = SpaceStore::load(Some(data_dir.join("spaces.json")));
         let mut server = Self {
             runtime,
             inputs,
@@ -189,6 +194,8 @@ impl Server {
             accounts: HashMap::default(),
             next_account_id: 1,
             terminals: Terminals::default(),
+            spaces_revision_sent: spaces.revision(),
+            spaces,
             clients: HashMap::default(),
             registry_changed: false,
             changed_connections: HashSet::default(),
@@ -198,6 +205,7 @@ impl Server {
         server.forward(registry_inbox, Input::Registry);
         server.registry_sent = server.registry_snapshot();
         server.refresh_repositories();
+        server.restore_spaces();
         let inputs = server.inputs.clone();
         server.runtime.spawn(async move {
             loop {
@@ -394,6 +402,7 @@ impl Server {
                     projects: self.projects.snapshot(),
                     registry: self.registry_snapshot(),
                     agent_settings: self.agent_settings.all().clone(),
+                    spaces: self.spaces.snapshot(),
                 }))
             }
             Request::SubscribeThread(connection) => {
@@ -667,6 +676,7 @@ impl Server {
                 Err(anyhow!("workspace requests are handled separately"))
             }
             Request::BrowseDirectories { .. } => Err(anyhow!("browsing is handled separately")),
+            Request::Spaces(request) => self.space_request(request),
             Request::Unknown(request) => Err(anyhow!("unsupported request: {request}")),
         }
     }
@@ -1092,6 +1102,7 @@ impl Server {
         let threads = &self.threads;
         self.tool_sessions
             .retain(|_, thread_id| threads.contains_key(thread_id));
+        self.close_orphaned_panes();
         self.close_orphaned_terminals();
         self.move_threads();
         self.finish_tasks();
@@ -1123,6 +1134,10 @@ impl Server {
         if self.projects.revision() != self.projects_revision_sent {
             self.projects_revision_sent = self.projects.revision();
             self.broadcast(Event::Projects(self.projects.snapshot()));
+        }
+        if self.spaces.revision() != self.spaces_revision_sent {
+            self.spaces_revision_sent = self.spaces.revision();
+            self.broadcast(Event::Spaces(self.spaces.snapshot()));
         }
         if std::mem::take(&mut self.registry_changed) {
             let registry = self.registry_snapshot();

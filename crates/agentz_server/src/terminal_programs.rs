@@ -30,6 +30,14 @@ const AGENT_CLIS: &[(&str, &str)] = &[
     ("muse", "Muse"),
 ];
 
+/// What New Thread calls an agent CLI, such as "Claude Code" for `claude`.
+pub(crate) fn label(command: &str) -> Option<&'static str> {
+    AGENT_CLIS
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map(|(_, label)| *label)
+}
+
 /// The agent CLIs on `PATH`, in herdr's order.
 pub(crate) fn find_on_path() -> Vec<TerminalProgram> {
     let Some(path) = std::env::var_os("PATH") else {

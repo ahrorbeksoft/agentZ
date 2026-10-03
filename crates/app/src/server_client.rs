@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError};
 use agentz_protocol::agents::{AgentId, AgentSettings};
+use agentz_protocol::spaces::SpacesSnapshot;
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{
     AgentSettingsChange, CAPABILITY_RELAY, ClientKind, ConnectionId, DirectoryListing, Event,
@@ -86,6 +87,8 @@ pub struct ServerClient {
     projects: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
     agent_settings: BTreeMap<AgentId, AgentSettings>,
+    /// The Workspaces view's spaces on this machine.
+    spaces: SpacesSnapshot,
     /// Open threads and account connections, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
@@ -124,6 +127,7 @@ impl ServerClient {
                 projects,
                 registry,
                 agent_settings: BTreeMap::new(),
+                spaces: SpacesSnapshot::default(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
@@ -313,6 +317,13 @@ impl ServerClient {
         }
     }
 
+    fn set_spaces(&mut self, spaces: SpacesSnapshot, cx: &mut Context<Self>) {
+        if spaces != self.spaces {
+            self.spaces = spaces;
+            cx.notify();
+        }
+    }
+
     /// The thread's copy, if a view still holds it.
     pub(crate) fn thread(&self, connection: ConnectionId) -> Option<Entity<AgentThread>> {
         self.threads.get(&connection)?.upgrade()
@@ -397,6 +408,7 @@ impl ServerClient {
             registry.set_snapshot(session.registry, cx)
         });
         self.set_agent_settings(session.agent_settings, cx);
+        self.set_spaces(session.spaces, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }
@@ -406,7 +418,10 @@ impl ServerClient {
         if let Some(queued) = &mut self.queued_session_events
             && matches!(
                 event,
-                Event::Projects(_) | Event::Registry(_) | Event::AgentSettings(_)
+                Event::Projects(_)
+                    | Event::Registry(_)
+                    | Event::AgentSettings(_)
+                    | Event::Spaces(_)
             )
         {
             queued.push(event);
@@ -420,6 +435,7 @@ impl ServerClient {
                 .registry
                 .update(cx, |store, cx| store.set_snapshot(registry, cx)),
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
+            Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::Thread { connection, update } => {
                 if let Some(thread) = self.threads.get(&connection).and_then(|t| t.upgrade()) {
                     thread.update(cx, |thread, cx| thread.apply_update(update, cx));
