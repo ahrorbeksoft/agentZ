@@ -741,3 +741,7 @@ Then the server:
   agent CLI.
 - 2026-10-03: A terminal thread hides Restart while an agent CLI runs in it, so one click
   can't end the agent's session.
+- 2026-10-03: A thread's terminal drawer and Changes panel resize by dragging their edge,
+  go full screen over the thread, and open in their own window (a header button, or dragging
+  the header out of the window); closing that window puts them back. Cmd-J and the terminal
+  button now work whatever has focus (ccd21d9).

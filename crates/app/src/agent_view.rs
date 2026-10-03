@@ -11,8 +11,9 @@ use agentz_protocol::thread::{
 };
 use collections::{HashMap, HashSet};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, KeyBinding, ScrollHandle, Subscription, Task, Window, pulsating_between,
+    Animation, AnimationExt as _, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, Hsla, KeyBinding, MouseButton, Point, ScrollHandle, Subscription, Task,
+    Window, WindowHandle, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{TaskEnd, ThreadId};
@@ -22,6 +23,7 @@ use ui::{
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
+use crate::detached_panel::{self, DetachedPanel};
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
@@ -46,6 +48,31 @@ const MAX_CONTENT_WIDTH: Pixels = px(850.);
 const DIFF_CONTEXT_LINES: usize = 3;
 /// t3code's default drawer height.
 const DRAWER_HEIGHT: Pixels = px(280.);
+const MIN_DRAWER_HEIGHT: Pixels = px(100.);
+/// What a dragged drawer leaves of the conversation.
+const MIN_CONVERSATION_HEIGHT: Pixels = px(160.);
+/// The strip along a panel's edge that drags to resize it.
+pub(crate) const RESIZE_EDGE_SIZE: Pixels = px(6.);
+
+/// The drawer's top edge, being dragged to resize it.
+struct DraggedDrawerEdge;
+
+/// The drawer, dragged by its header.
+struct DraggedDrawer;
+
+/// What follows the mouse while a panel is dragged by its header.
+pub(crate) struct DraggedLabel(pub SharedString);
+
+impl Render for DraggedLabel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .elevation_2(cx)
+            .child(Label::new(self.0.clone()).size(LabelSize::Small))
+    }
+}
 /// The most lines of a command's terminal a tool call shows.
 const TOOL_TERMINAL_MAX_LINES: usize = 16;
 
@@ -111,6 +138,14 @@ pub struct AgentView {
     blocked_subthreads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
     /// The terminal under the thread, while it's open (t3code's drawer).
     drawer: Option<Entity<TerminalView>>,
+    /// The drawer's height, as its top edge was last dragged.
+    drawer_height: Pixels,
+    /// The drawer fills the thread's area.
+    drawer_full_screen: bool,
+    /// The drawer moved into its own window, which puts it back when closed.
+    drawer_window: Option<(WindowHandle<DetachedPanel>, Subscription)>,
+    /// Where a drag of the drawer's header left the window, to open it there when let go.
+    drawer_drag_out: Option<Point<Pixels>>,
     /// The terminals the agent runs its commands in, by the ids it got, shown in their tool
     /// calls.
     tool_terminals: HashMap<String, Entity<TerminalView>>,
@@ -131,6 +166,12 @@ impl AgentView {
         let registry = client.read(cx).registry().clone();
         let composer = cx.new(|cx| TextInput::new("Message the agent…", cx));
         let subscriptions = vec![
+            // A detached drawer's window goes with the thread's view.
+            cx.on_release(|this: &mut Self, cx| {
+                if let Some((handle, _)) = this.drawer_window.take() {
+                    detached_panel::close(handle, cx);
+                }
+            }),
             cx.observe(&thread, |this, _, cx| {
                 // Only follow new output if the user hasn't scrolled up to read.
                 let follow = this.is_scrolled_to_bottom();
@@ -196,6 +237,10 @@ impl AgentView {
             agents_expanded: true,
             blocked_subthreads: HashMap::default(),
             drawer: None,
+            drawer_height: DRAWER_HEIGHT,
+            drawer_full_screen: false,
+            drawer_window: None,
+            drawer_drag_out: None,
             tool_terminals: HashMap::default(),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
@@ -557,6 +602,10 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) {
         if self.drawer.take().is_some() {
+            self.drawer_full_screen = false;
+            if let Some((handle, _)) = self.drawer_window.take() {
+                detached_panel::close(handle, cx);
+            }
             window.focus(&self.focus_handle(cx), cx);
         } else {
             let terminal = Terminal::shared(&self.client, TerminalKey::Drawer(self.thread_id), cx);
@@ -567,65 +616,156 @@ impl AgentView {
         cx.notify();
     }
 
+    /// Moves the drawer into a window of its own, at `origin` on screen when a drag let go
+    /// there. Closing the window brings it back.
+    fn detach_drawer(
+        &mut self,
+        origin: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drawer) = self.drawer.clone() else {
+            return;
+        };
+        if self.drawer_window.is_some() {
+            return;
+        }
+        let title = SharedString::from(format!("Terminal — {}", self.title));
+        let Some((handle, panel)) =
+            DetachedPanel::open(title, drawer.clone().into(), origin, window, cx)
+        else {
+            return;
+        };
+        let closed = cx.observe_release(&panel, |this, _, cx| {
+            this.drawer_window = None;
+            cx.notify();
+        });
+        self.drawer_window = Some((handle, closed));
+        self.drawer_full_screen = false;
+        handle
+            .update(cx, |_, window, cx| {
+                window.focus(&drawer.focus_handle(cx), cx);
+            })
+            .ok();
+        cx.notify();
+    }
+
+    /// The drawer under the conversation, or filling the thread's area. A detached drawer
+    /// shows in its own window instead.
     fn render_drawer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let drawer = self.drawer.clone()?;
+        if self.drawer_window.is_some() {
+            return None;
+        }
         let terminal = drawer.read(cx).terminal().clone();
         let exit = terminal
             .read(cx)
             .frame()
             .and_then(|frame| frame.exited.clone());
         let colors = cx.theme().colors();
+        let is_full_screen = self.drawer_full_screen;
+        let header = h_flex()
+            .id("drawer-header")
+            .h(px(28.))
+            .flex_none()
+            .px_2()
+            .gap_1p5()
+            .cursor_grab()
+            // Dragged out of the window, it opens in one of its own.
+            .on_drag(DraggedDrawer, |_, _, _, cx| {
+                cx.new(|_| DraggedLabel("Terminal".into()))
+            })
+            .child(
+                Icon::new(IconName::Terminal)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("Terminal")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .children(exit.map(|exit| {
+                Label::new(match exit.code {
+                    Some(code) if code != 0 => format!("Exited with code {code}"),
+                    _ => "Exited".to_string(),
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+            }))
+            .child(div().flex_1())
+            .child(
+                IconButton::new("restart-drawer", IconName::RotateCw)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Restart Terminal"))
+                    .on_click(move |_, _, cx| {
+                        terminal.update(cx, |terminal, cx| terminal.restart(cx))
+                    }),
+            )
+            .child(
+                IconButton::new("detach-drawer", IconName::ArrowUpRight)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Open in a Window"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.detach_drawer(None, window, cx)),
+                    ),
+            )
+            .child(
+                IconButton::new(
+                    "full-screen-drawer",
+                    if is_full_screen {
+                        IconName::Minimize
+                    } else {
+                        IconName::Maximize
+                    },
+                )
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text(if is_full_screen {
+                    "Exit Full Screen"
+                } else {
+                    "Full Screen"
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.drawer_full_screen = !this.drawer_full_screen;
+                    cx.notify();
+                })),
+            )
+            .child(
+                IconButton::new("close-drawer", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(|_, cx| {
+                        Tooltip::for_action("Close Terminal", &ToggleTerminalDrawer, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
+                    })),
+            );
+        // The top edge drags to resize, as Zed's docks do.
+        let resize_edge = div()
+            .id("drawer-resize-edge")
+            .absolute()
+            .top(-RESIZE_EDGE_SIZE / 2.)
+            .left_0()
+            .w_full()
+            .h(RESIZE_EDGE_SIZE)
+            .cursor_row_resize()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_drag(DraggedDrawerEdge, |_, _, _, cx| cx.new(|_| gpui::Empty));
         Some(
             v_flex()
-                .h(DRAWER_HEIGHT)
-                .flex_none()
+                .relative()
+                .map(|this| {
+                    if is_full_screen {
+                        this.flex_1().min_h_0()
+                    } else {
+                        this.h(self.drawer_height).flex_none()
+                    }
+                })
                 .border_t_1()
                 .border_color(colors.border)
                 .bg(colors.terminal_background)
-                .child(
-                    h_flex()
-                        .h(px(28.))
-                        .flex_none()
-                        .px_2()
-                        .gap_1p5()
-                        .child(
-                            Icon::new(IconName::Terminal)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new("Terminal")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .children(exit.map(|exit| {
-                            Label::new(match exit.code {
-                                Some(code) if code != 0 => format!("Exited with code {code}"),
-                                _ => "Exited".to_string(),
-                            })
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                        }))
-                        .child(div().flex_1())
-                        .child(
-                            IconButton::new("restart-drawer", IconName::RotateCw)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Restart Terminal"))
-                                .on_click(move |_, _, cx| {
-                                    terminal.update(cx, |terminal, cx| terminal.restart(cx))
-                                }),
-                        )
-                        .child(
-                            IconButton::new("close-drawer", IconName::Close)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(|_, cx| {
-                                    Tooltip::for_action("Close Terminal", &ToggleTerminalDrawer, cx)
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
-                                })),
-                        ),
-                )
+                .when(!is_full_screen, |this| this.child(resize_edge))
+                .child(header)
                 .child(div().flex_1().min_h_0().pb_1().child(drawer))
                 .into_any_element(),
         )
@@ -2928,6 +3068,8 @@ impl Render for AgentView {
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
 
         let is_subthread = self.parent(cx).is_some();
+        let is_drawer_full_screen =
+            self.drawer_full_screen && self.drawer.is_some() && self.drawer_window.is_none();
 
         v_flex()
             // Otherwise clicking the conversation would take focus from the message editor.
@@ -2935,69 +3077,110 @@ impl Render for AgentView {
             .size_full()
             .bg(panel_background)
             .on_action(cx.listener(Self::toggle_terminal_drawer))
-            .child(self.render_toolbar(cx))
-            .children(self.render_restore_notice(cx))
-            .child(
-                // Each row is a direct child of the scrolled element, so rows can be scrolled to
-                // by index (entries come first, in order).
-                v_flex()
-                    .id("agent-conversation")
-                    .flex_1()
-                    .min_h_0()
-                    .pt_2()
-                    .pb_4()
-                    .items_center()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .children(
-                        rows.into_iter()
-                            .map(|row| div().w_full().max_w(MAX_CONTENT_WIDTH).child(row)),
-                    )
-                    .when(!has_rows && is_connecting, |this| {
-                        // Zed's loading state: while the agent starts and the session (and its
-                        // history) loads, not the empty-thread prompt.
-                        this.child(
-                            v_flex()
-                                .flex_1()
-                                .w_full()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Label::new("Loading…").color(Color::Muted).with_animation(
-                                        "loading-agent-label",
-                                        Animation::new(Duration::from_secs(2))
-                                            .repeat()
-                                            .with_easing(pulsating_between(0.3, 0.7)),
-                                        |label, delta| label.alpha(delta),
-                                    ),
-                                ),
-                        )
-                    })
-                    .when(!has_rows && !is_connecting, |this| {
-                        this.child(
-                            div().w_full().max_w(MAX_CONTENT_WIDTH).px_5().py_8().child(
-                                Label::new(format!(
-                                    "Start a conversation with {}.",
-                                    self.agent_name(cx)
-                                ))
-                                .color(Color::Muted),
-                            ),
-                        )
-                    }),
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedDrawerEdge>, _, cx| {
+                    let available = event.bounds.size.height - MIN_CONVERSATION_HEIGHT;
+                    let height = (event.bounds.bottom() - event.event.position.y)
+                        .min(available)
+                        .max(MIN_DRAWER_HEIGHT);
+                    if this.drawer_height != height {
+                        this.drawer_height = height;
+                        cx.notify();
+                    }
+                }),
             )
-            .children(self.render_auth_required(cx))
-            .children(self.render_errors(cx))
-            .children(self.render_activity_bar(window, cx))
-            .map(|this| {
-                if let Some(parent) = self.parent(cx) {
-                    this.child(self.render_subthread_bar(parent, cx))
-                } else if self.is_archived {
-                    this.child(self.render_archived_notice(cx))
-                } else if !self.client.read(cx).is_online() {
-                    this.child(self.render_offline_notice(cx))
-                } else {
-                    this.child(self.render_message_editor(cx))
-                }
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedDrawer>, window, _| {
+                    let position = event.event.position;
+                    let size = window.viewport_size();
+                    let is_outside = position.x < px(0.)
+                        || position.y < px(0.)
+                        || position.x > size.width
+                        || position.y > size.height;
+                    this.drawer_drag_out = is_outside.then_some(position);
+                }),
+            )
+            // Let go outside the window, the dragged drawer opens in its own there.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if let Some(position) = this.drawer_drag_out.take() {
+                        let origin = window.bounds().origin + position;
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.detach_drawer(Some(origin), window, cx)
+                        });
+                    }
+                }),
+            )
+            .capture_any_mouse_up(cx.listener(|this, _, _, _| this.drawer_drag_out = None))
+            .child(self.render_toolbar(cx))
+            // A full-screen terminal hides the conversation and the composer.
+            .when(!is_drawer_full_screen, |this| {
+                this.children(self.render_restore_notice(cx))
+                    .child(
+                        // Each row is a direct child of the scrolled element, so rows can be scrolled to
+                        // by index (entries come first, in order).
+                        v_flex()
+                            .id("agent-conversation")
+                            .flex_1()
+                            .min_h_0()
+                            .pt_2()
+                            .pb_4()
+                            .items_center()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .children(
+                                rows.into_iter()
+                                    .map(|row| div().w_full().max_w(MAX_CONTENT_WIDTH).child(row)),
+                            )
+                            .when(!has_rows && is_connecting, |this| {
+                                // Zed's loading state: while the agent starts and the session (and its
+                                // history) loads, not the empty-thread prompt.
+                                this.child(
+                                    v_flex()
+                                        .flex_1()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Label::new("Loading…")
+                                                .color(Color::Muted)
+                                                .with_animation(
+                                                    "loading-agent-label",
+                                                    Animation::new(Duration::from_secs(2))
+                                                        .repeat()
+                                                        .with_easing(pulsating_between(0.3, 0.7)),
+                                                    |label, delta| label.alpha(delta),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when(!has_rows && !is_connecting, |this| {
+                                this.child(
+                                    div().w_full().max_w(MAX_CONTENT_WIDTH).px_5().py_8().child(
+                                        Label::new(format!(
+                                            "Start a conversation with {}.",
+                                            self.agent_name(cx)
+                                        ))
+                                        .color(Color::Muted),
+                                    ),
+                                )
+                            }),
+                    )
+                    .children(self.render_auth_required(cx))
+                    .children(self.render_errors(cx))
+                    .children(self.render_activity_bar(window, cx))
+                    .map(|this| {
+                        if let Some(parent) = self.parent(cx) {
+                            this.child(self.render_subthread_bar(parent, cx))
+                        } else if self.is_archived {
+                            this.child(self.render_archived_notice(cx))
+                        } else if !self.client.read(cx).is_online() {
+                            this.child(self.render_offline_notice(cx))
+                        } else {
+                            this.child(self.render_message_editor(cx))
+                        }
+                    })
             })
             .children(self.render_drawer(cx))
     }

@@ -13,8 +13,8 @@ use agentz_protocol::thread::DiffLineKind;
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, Context, Entity, ListAlignment, ListState, PromptLevel, Subscription, Task,
-    WeakEntity, Window, list,
+    AnyElement, App, Context, Entity, EventEmitter, ListAlignment, ListState, PromptLevel,
+    Subscription, Task, WeakEntity, Window, list,
 };
 use projects::ThreadId;
 use ui::{
@@ -23,9 +23,21 @@ use ui::{
 };
 
 use crate::ToggleDiff;
+use crate::agent_view::DraggedLabel;
 use crate::server_client::ServerClient;
 
 pub const DIFF_PANEL_WIDTH: Pixels = px(520.);
+
+/// What the panel asks of the window showing it.
+pub enum DiffPanelEvent {
+    Close,
+    ToggleFullScreen,
+    /// Into a window of its own.
+    Detach,
+}
+
+/// The panel, dragged by its header: let go outside the window, it opens in one of its own.
+pub struct DraggedDiffPanel;
 const TAB: &str = "    ";
 
 /// One line of the panel's list.
@@ -62,11 +74,24 @@ pub struct DiffPanel {
     viewed: HashMap<String, u64>,
     rows: Rc<Vec<Row>>,
     list_state: ListState,
+    is_full_screen: bool,
+    is_detached: bool,
     _load: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
+impl EventEmitter<DiffPanelEvent> for DiffPanel {}
+
 impl DiffPanel {
+    /// Where the panel shows, for its header's buttons.
+    pub fn set_layout(&mut self, is_full_screen: bool, is_detached: bool, cx: &mut Context<Self>) {
+        if (self.is_full_screen, self.is_detached) != (is_full_screen, is_detached) {
+            self.is_full_screen = is_full_screen;
+            self.is_detached = is_detached;
+            cx.notify();
+        }
+    }
+
     pub fn new(client: Entity<ServerClient>, thread_id: ThreadId, cx: &mut Context<Self>) -> Self {
         let store = client.read(cx).projects().clone();
         let completed_at = store
@@ -95,6 +120,8 @@ impl DiffPanel {
             viewed: HashMap::default(),
             rows: Rc::new(Vec::new()),
             list_state: ListState::new(0, ListAlignment::Top, px(400.)),
+            is_full_screen: false,
+            is_detached: false,
             _load: Task::ready(()),
             _subscriptions: subscriptions,
         };
@@ -325,6 +352,12 @@ impl DiffPanel {
             !files.is_empty() && files.iter().all(|file| self.collapsed.contains(&file.path))
         });
         h_flex()
+            .id("diff-header")
+            .when(!self.is_detached, |this| {
+                this.cursor_grab().on_drag(DraggedDiffPanel, |_, _, _, cx| {
+                    cx.new(|_| DraggedLabel("Changes".into()))
+                })
+            })
             .h(px(36.))
             .flex_none()
             .px_2()
@@ -417,11 +450,39 @@ impl DiffPanel {
                     .tooltip(Tooltip::text("Refresh"))
                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
             )
+            .when(!self.is_detached, |this| {
+                let is_full_screen = self.is_full_screen;
+                this.child(
+                    IconButton::new("diff-detach", IconName::ArrowUpRight)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Open in a Window"))
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DiffPanelEvent::Detach))),
+                )
+                .child(
+                    IconButton::new(
+                        "diff-full-screen",
+                        if is_full_screen {
+                            IconName::Minimize
+                        } else {
+                            IconName::Maximize
+                        },
+                    )
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text(if is_full_screen {
+                        "Exit Full Screen"
+                    } else {
+                        "Full Screen"
+                    }))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DiffPanelEvent::ToggleFullScreen))),
+                )
+            })
             .child(
                 IconButton::new("diff-close", IconName::Close)
                     .icon_size(IconSize::Small)
                     .tooltip(|_, cx| Tooltip::for_action("Hide Changes", &ToggleDiff, cx))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx)),
+                    // An event, not the action: a detached panel's window has no shell to
+                    // handle it.
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DiffPanelEvent::Close))),
             )
     }
 
