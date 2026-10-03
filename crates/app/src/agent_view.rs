@@ -1979,10 +1979,6 @@ impl AgentView {
             MachineStatus::Attention { error, .. } | MachineStatus::Reconnecting(error) => {
                 format!("{error}. New messages can be sent once it reconnects.")
             }
-            MachineStatus::Stopped => {
-                "Its agentz-server is stopped. Start it in Settings › Machines to send messages."
-                    .to_string()
-            }
             MachineStatus::Connecting | MachineStatus::Online => {
                 "New messages can be sent once it reconnects.".to_string()
             }

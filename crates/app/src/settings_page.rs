@@ -18,7 +18,7 @@ use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, ContextMenuEntry, DropdownMenu, IconPosition, Switch, Tooltip, WithScrollbar as _,
+    ContextMenu, DropdownMenu, IconPosition, PopoverMenu, Switch, Tooltip, WithScrollbar as _,
     prelude::*,
 };
 use util::ResultExt as _;
@@ -736,69 +736,6 @@ impl SettingsPage {
             ThreadOrder::LastActivity => "Latest activity",
             ThreadOrder::Created => "Newest first",
         };
-        let local = Machines::local(cx);
-        let server_client = local.read(cx);
-        let (server_description, is_connected): (SharedString, bool) =
-            match (server_client.status(), server_client.connection()) {
-                (MachineStatus::Online, Some(connection)) if server_client.is_outdated() => {
-                    let welcome = connection.welcome();
-                    (
-                        format!(
-                            "agentz-server {}, pid {}, is older than the one installed. Update it \
-                             to use the new one; terminals keep running.",
-                            welcome.server_version, welcome.pid
-                        )
-                        .into(),
-                        true,
-                    )
-                }
-                (MachineStatus::Online, Some(connection)) => {
-                    let welcome = connection.welcome();
-                    (
-                        format!(
-                            "agentz-server {}, pid {}. It runs your agents, so they keep working \
-                             after agentZ quits.",
-                            welcome.server_version, welcome.pid
-                        )
-                        .into(),
-                        true,
-                    )
-                }
-                (
-                    MachineStatus::Reconnecting(error) | MachineStatus::Attention { error, .. },
-                    _,
-                ) => (format!("Not connected: {error}").into(), false),
-                (MachineStatus::Stopped, _) => (
-                    "Stopped. Agents on this Mac can't run until it starts again.".into(),
-                    false,
-                ),
-                _ => ("Connecting…".into(), false),
-            };
-        let is_stopped = *server_client.status() == MachineStatus::Stopped;
-        // One action applies at a time: an outdated server is updated (which keeps its
-        // terminals), and a current one can only be restarted.
-        let can_update =
-            is_connected && server_client.is_outdated() && server_client.can_update_server();
-        let server_button = if is_stopped {
-            let local = local.clone();
-            Button::new("start-server", "Start Server")
-                .style(ButtonStyle::Outlined)
-                .on_click(move |_, _, cx| local.update(cx, |client, _| client.retry()))
-        } else if can_update {
-            let local = local.clone();
-            Button::new("update-server", "Update Server")
-                .style(ButtonStyle::Outlined)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.update_server(local.clone(), window, cx)
-                }))
-        } else {
-            Button::new("restart-server", "Restart Server")
-                .style(ButtonStyle::Outlined)
-                .disabled(!is_connected)
-                .on_click(
-                    cx.listener(|this, _, window, cx| this.confirm_restart_server(window, cx)),
-                )
-        };
         vec![
             render_section(
                 "Threads",
@@ -813,29 +750,21 @@ impl SettingsPage {
             render_section("Projects", self.render_grouping_rows(window, cx), cx),
             render_section(
                 "Server",
-                vec![
-                    render_row(
-                        "Background server",
-                        server_description,
-                        h_flex().gap_2().child(server_button).into_any_element(),
-                        cx,
-                    ),
-                    render_row(
-                        "Start at login",
-                        "Starts the server when you log in, before agentZ opens, so scripts \
+                vec![render_row(
+                    "Start at login",
+                    "Starts the server when you log in, before agentZ opens, so scripts \
                          using agentz-server call can reach it.",
-                        Switch::new("start-at-login", self.starts_at_login.into())
-                            .on_click(cx.listener(|this, state, _, cx| {
-                                let enabled = *state == ToggleState::Selected;
-                                if crate::login_item::set_enabled(enabled).log_err().is_some() {
-                                    this.starts_at_login = enabled;
-                                    cx.notify();
-                                }
-                            }))
-                            .into_any_element(),
-                        cx,
-                    ),
-                ],
+                    Switch::new("start-at-login", self.starts_at_login.into())
+                        .on_click(cx.listener(|this, state, _, cx| {
+                            let enabled = *state == ToggleState::Selected;
+                            if crate::login_item::set_enabled(enabled).log_err().is_some() {
+                                this.starts_at_login = enabled;
+                                cx.notify();
+                            }
+                        }))
+                        .into_any_element(),
+                    cx,
+                )],
                 cx,
             ),
         ]
@@ -1009,35 +938,6 @@ impl SettingsPage {
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(0) {
                 cx.update(|cx| client.read(cx).restart_server(cx));
-            }
-        })
-        .detach();
-    }
-
-    fn confirm_stop_server(
-        &mut self,
-        client: Entity<ServerClient>,
-        name: SharedString,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let title = match client.read(cx).machine() {
-            MachineId::Local => "Stop the background server?".to_string(),
-            MachineId::Remote(_) => format!("Stop agentz-server on {name}?"),
-        };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &title,
-            Some(
-                "Agents and terminals running there will stop. It stays stopped until you \
-                 choose Start Server.",
-            ),
-            &["Stop Server", "Cancel"],
-            cx,
-        );
-        cx.spawn(async move |_, cx| {
-            if answer.await == Ok(0) {
-                cx.update(|cx| client.update(cx, |client, cx| client.stop_server(cx)));
             }
         })
         .detach();
@@ -2030,13 +1930,13 @@ impl SettingsPage {
 
     /// Settings › Machines: this Mac, the saved machines with how their connections are doing,
     /// and the form that adds or edits one (herdr's endpoints).
-    fn render_machines(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_machines(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let profiles = self.app_settings.read(cx).settings().machines.clone();
-        let mut rows = vec![self.render_machine_row(None, window, cx)];
+        let mut rows = vec![self.render_machine_row(None, cx)];
         rows.extend(
             profiles
                 .iter()
-                .map(|profile| self.render_machine_row(Some(profile), window, cx)),
+                .map(|profile| self.render_machine_row(Some(profile), cx)),
         );
         vec![
             render_section("Machines", rows, cx),
@@ -2047,7 +1947,6 @@ impl SettingsPage {
     fn render_machine_row(
         &self,
         profile: Option<&MachineProfile>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let machine = profile.map_or(MachineId::Local, |profile| MachineId::Remote(profile.id));
@@ -2099,97 +1998,130 @@ impl SettingsPage {
                         hint = help.clone();
                         (error.clone(), Color::Error)
                     }
-                    MachineStatus::Stopped => ("Server stopped".into(), Color::Muted),
                 }
             }
         };
         let is_online = client
             .as_ref()
             .is_some_and(|client| client.read(cx).is_online());
-        let is_stopped = client
-            .as_ref()
-            .is_some_and(|client| *client.read(cx).status() == MachineStatus::Stopped);
         let id_suffix = machine.slug();
         let element_id = |action: &str| SharedString::from(format!("machine-{action}-{id_suffix}"));
-        // t3code's icon picker: the kinds, with the one detected marked. Its server keeps the
-        // choice, so it waits for a server that can.
-        let icon_picker = client
-            .clone()
-            .filter(|client| {
-                let client = client.read(cx);
-                client.is_online() && client.has_capability(CAPABILITY_MACHINE_ICON)
-            })
-            .map(|client| {
-                let icon = client.read(cx).machine_icon().clone();
-                let current = icon.kind();
-                let current_label = current.label();
-                let detected = icon.detected.unwrap_or(MachineKind::Server);
-                let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for kind in MachineKind::ALL {
-                        let label = if kind == detected {
-                            format!("{} (detected)", kind.label())
-                        } else {
-                            kind.label().to_string()
+        let current_icon = self.machines.read(cx).machine_icon(machine, cx);
+        // t3code's row: another machine's switch connects to it (Remove is in the menu, and
+        // keeps nothing); servers are never stopped from here.
+        let switch = profile.map(|profile| {
+            let id = profile.id;
+            let tooltip = if profile.enabled {
+                "Switch Off"
+            } else {
+                "Switch On"
+            };
+            div()
+                .id(element_id("switch-tooltip"))
+                .tooltip(Tooltip::text(tooltip))
+                .child(
+                    Switch::new(element_id("switch"), profile.enabled.into()).on_click(
+                        cx.listener(move |this, state: &ToggleState, _, cx| {
+                            let enabled = *state == ToggleState::Selected;
+                            this.update_machine(id, |profile| profile.enabled = enabled, cx)
+                        }),
+                    ),
+                )
+        });
+        let options_menu = {
+            let this = cx.entity().downgrade();
+            let client = client.clone();
+            let profile = profile.cloned();
+            let name = label.clone();
+            PopoverMenu::new(element_id("options"))
+                .menu(move |window, cx| {
+                    let this = this.clone();
+                    let client = client.clone();
+                    let profile = profile.clone();
+                    let name = name.clone();
+                    Some(ContextMenu::build(window, cx, move |menu, _, cx| {
+                        let menu = machine_icon_menu(menu, client.clone(), current_icon, cx);
+                        let Some(profile) = profile.clone() else {
+                            return menu;
                         };
-                        let client = client.clone();
-                        let chosen = kind.clone();
-                        menu = menu.item(
-                            ContextMenuEntry::new(label)
-                                .icon(machine_kind_icon(&kind))
-                                .icon_color(Color::Muted)
-                                .toggleable(IconPosition::End, kind == current)
-                                .handler(move |_, cx| {
-                                    client.read(cx).choose_machine_icon(chosen.clone(), cx)
-                                }),
-                        );
-                    }
-                    menu
-                });
-                DropdownMenu::new(element_id("icon"), current_label, menu)
-                    .trigger_tooltip(Tooltip::text("Icon"))
-            });
+                        let edit = {
+                            let this = this.clone();
+                            let profile = profile.clone();
+                            move |window: &mut Window, cx: &mut App| {
+                                this.update(cx, |this, cx| this.edit_machine(&profile, window, cx))
+                                    .log_err();
+                            }
+                        };
+                        let remove = {
+                            let this = this.clone();
+                            move |window: &mut Window, cx: &mut App| {
+                                this.update(cx, |this, cx| {
+                                    this.confirm_remove_machine(
+                                        profile.id,
+                                        name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                            }
+                        };
+                        menu.entry("Edit…", None, edit)
+                            .separator()
+                            .entry("Remove…", None, remove)
+                    }))
+                })
+                .trigger_with_tooltip(
+                    IconButton::new(element_id("options-trigger"), IconName::Ellipsis)
+                        .icon_size(IconSize::Small),
+                    Tooltip::text("Machine Options"),
+                )
+                .anchor(gpui::Anchor::TopRight)
+        };
+        // One server action at a time: reconnect, update an outdated one (which keeps its
+        // terminals), or restart it (only this Mac's while it's current).
+        let server_button = client.and_then(|client| {
+            let (is_outdated, can_update) = {
+                let client = client.read(cx);
+                (client.is_outdated(), client.can_update_server())
+            };
+            if !is_online {
+                return Some(
+                    Button::new(element_id("retry"), "Retry")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry())),
+                );
+            }
+            if is_outdated && can_update {
+                return Some(
+                    Button::new(element_id("update"), "Update Server")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.update_server(client.clone(), window, cx)
+                        })),
+                );
+            }
+            if !is_outdated && machine != MachineId::Local {
+                return None;
+            }
+            let name = label.clone();
+            Some(
+                Button::new(element_id("restart"), "Restart Server…")
+                    .style(ButtonStyle::Outlined)
+                    .on_click(cx.listener(move |this, _, window, cx| match machine {
+                        MachineId::Local => this.confirm_restart_server(window, cx),
+                        MachineId::Remote(_) => this.confirm_restart_remote_server(
+                            client.clone(),
+                            name.clone(),
+                            window,
+                            cx,
+                        ),
+                    })),
+            )
+        });
         let controls = h_flex()
             .gap_2()
-            .children(icon_picker)
-            .when_some(client.clone().filter(|_| !is_online), |controls, client| {
-                controls.child(
-                    Button::new(
-                        element_id("retry"),
-                        if is_stopped { "Start Server" } else { "Retry" },
-                    )
-                    .style(ButtonStyle::Outlined)
-                    .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry())),
-                )
-            })
-            .when_some(
-                client
-                    .clone()
-                    .filter(|client| client.read(cx).is_outdated()),
-                |controls, client| {
-                    let name = label.clone();
-                    if client.read(cx).can_update_server() {
-                        return controls.child(
-                            Button::new(element_id("update"), "Update Server")
-                                .style(ButtonStyle::Outlined)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.update_server(client.clone(), window, cx)
-                                })),
-                        );
-                    }
-                    controls.child(
-                        Button::new(element_id("restart"), "Restart Server…")
-                            .style(ButtonStyle::Outlined)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_restart_remote_server(
-                                    client.clone(),
-                                    name.clone(),
-                                    window,
-                                    cx,
-                                )
-                            })),
-                    )
-                },
-            )
+            .children(server_button)
             .when(is_online && machine != MachineId::Local, |controls| {
                 controls.child(
                     Button::new(element_id("add-project"), "Add Project…")
@@ -2199,46 +2131,8 @@ impl SettingsPage {
                         })),
                 )
             })
-            .when_some(client.filter(|_| is_online), |controls, client| {
-                let name = label.clone();
-                controls.child(
-                    Button::new(element_id("stop"), "Stop Server…")
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.confirm_stop_server(client.clone(), name.clone(), window, cx)
-                        })),
-                )
-            })
-            .when_some(profile.cloned(), |controls, profile| {
-                let id = profile.id;
-                let enabled = profile.enabled;
-                let name: SharedString = profile.display_label().into();
-                controls
-                    .child(
-                        Button::new(element_id("edit"), "Edit")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit_machine(&profile, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(
-                            element_id("toggle"),
-                            if enabled { "Disable" } else { "Enable" },
-                        )
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_machine(id, |profile| profile.enabled = !enabled, cx)
-                        })),
-                    )
-                    .child(
-                        Button::new(element_id("remove"), "Remove…")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_remove_machine(id, name.clone(), window, cx)
-                            })),
-                    )
-            });
+            .children(switch)
+            .child(options_menu);
         h_flex()
             .px_4()
             .py_3()
@@ -2896,7 +2790,7 @@ impl Render for SettingsPage {
             Section::General => ("General".into(), self.render_general(window, cx)),
             Section::Appearance => ("Appearance".into(), self.render_appearance(window, cx)),
             Section::Agents => ("Agents".into(), self.render_agents(window, cx)),
-            Section::Machines => ("Machines".into(), self.render_machines(window, cx)),
+            Section::Machines => ("Machines".into(), self.render_machines(cx)),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
                     project.name(),
@@ -2942,6 +2836,87 @@ impl Render for SettingsPage {
                     .vertical_scrollbar_for(&self.content_scroll, window, cx),
             )
     }
+}
+
+/// t3code's Icon submenu: the machine kinds, with the one its server detected marked. The
+/// server keeps the choice, so it's locked until a server that can is connected.
+fn machine_icon_menu(
+    menu: ContextMenu,
+    client: Option<Entity<ServerClient>>,
+    current_icon: IconName,
+    cx: &App,
+) -> ContextMenu {
+    let lock = match &client {
+        Some(client) if client.read(cx).is_online() => (!client
+            .read(cx)
+            .has_capability(CAPABILITY_MACHINE_ICON))
+        .then_some("This machine's server is too old to keep an icon. Update it to choose one."),
+        _ => Some("Connect to this machine to change its icon."),
+    };
+    let icon = client
+        .as_ref()
+        .map(|client| client.read(cx).machine_icon().clone())
+        .unwrap_or_default();
+    menu.submenu_with_icon("Icon", current_icon, move |mut menu, _, _| {
+        if let Some(lock) = lock {
+            menu = menu.label(lock).separator();
+        }
+        let current = icon.kind();
+        let detected = icon.detected.clone().unwrap_or(MachineKind::Server);
+        // Zed's entries draw their icon as the check mark, so each kind draws its own row:
+        // its icon, its name, "detected" and the check, as t3code's radio items do.
+        for kind in MachineKind::ALL {
+            let is_current = kind == current;
+            let is_detected = kind == detected;
+            let is_locked = lock.is_some();
+            let row_kind = kind.clone();
+            let client = client.clone();
+            menu = menu
+                .custom_entry(
+                    move |_, _| {
+                        let color = if is_locked {
+                            Color::Disabled
+                        } else {
+                            Color::Default
+                        };
+                        h_flex()
+                            .w_full()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(machine_kind_icon(&row_kind))
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(row_kind.label()).color(color))
+                            .when(is_detected, |row| {
+                                row.child(
+                                    Label::new("detected")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                            })
+                            .child(div().flex_1().min_w_4())
+                            .child(
+                                div()
+                                    .child(
+                                        Icon::new(IconName::Check)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    )
+                                    .when(!is_current, |check| check.invisible()),
+                            )
+                            .into_any_element()
+                    },
+                    move |_, cx| {
+                        if let Some(client) = &client {
+                            client.read(cx).choose_machine_icon(kind.clone(), cx)
+                        }
+                    },
+                )
+                .selectable(!is_locked);
+        }
+        menu
+    })
 }
 
 #[cfg(test)]

@@ -819,6 +819,7 @@ impl Shell {
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
+        let tabs_border = colors.border;
         let machines = self.machines.read(cx);
         let project_info = ProjectInfoStore::global(cx).read(cx);
         let scope_group = match machines.scope(cx) {
@@ -985,8 +986,12 @@ impl Shell {
             .child(div().flex_1())
             .children(self.render_connection_status(cx))
             .child(
-                // Keeps a press on the tabs from starting a window drag.
+                // Keeps a press on the tabs from starting a window drag. Outlined in the
+                // title bar's own border color: Zed's outlined group fades it to near nothing.
                 div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(tabs_border)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(view_tabs),
             )
@@ -1007,15 +1012,6 @@ impl Shell {
                     Color::Muted,
                 ),
                 MachineStatus::Online => continue,
-                MachineStatus::Stopped => {
-                    let tooltip = match client.machine() {
-                        MachineId::Local => "agentz-server is stopped".to_string(),
-                        MachineId::Remote(_) => {
-                            format!("agentz-server on {} is stopped", client.label())
-                        }
-                    };
-                    (IconName::Disconnected, tooltip.into(), Color::Muted)
-                }
                 MachineStatus::Reconnecting(error) | MachineStatus::Attention { error, .. } => {
                     let color = match client.status() {
                         MachineStatus::Attention { .. } => Color::Warning,

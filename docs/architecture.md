@@ -239,7 +239,12 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
 - **Updates**: an older server keeps running beside the new binary (over SSH told by the
   installed SHA-256, on this Mac by the binary's modification time); the title bar shows it and
   Settings › Machines offers Update Server (Restart Server… for servers without the
-  `hand_off` capability). Per-machine Stop Server.
+  `hand_off` capability).
+- **Machines settings** (`settings_page.rs`, t3code's `ConnectionsSettings.tsx`): each row has
+  the one server action that applies (Retry, Update Server, or Restart Server… for this Mac),
+  a switch that connects to another machine or not (Remove… is separate), and a menu with the
+  Icon submenu (`machine_icon_menu`, t3code's `EnvironmentIconMenu`). Servers aren't stopped
+  from the app, as in t3code.
 - **Server handoff** (`handoff.rs`, `server/hand_off.rs`, `terminals.rs`, herdr's live
   handoff): `Request::HandOff` starts the installed binary as `run --handoff` with a socket pair
   as its stdin, flushes `state.json` and `spaces.json`, pauses every terminal's event loop and
@@ -262,7 +267,7 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   primary remote are one project; modes `repository`, `repository_path`, `separate`. New Thread
   then asks which checkout.
 - **Machine icons** (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`): detected from
-  the hardware, or chosen in Settings › Machines.
+  the hardware, or chosen in the row menu's Icon submenu in Settings › Machines.
 - **Start at login** (`login_item.rs`): a launch agent that runs `agentz-server start` once.
 
 ### Workspaces view
