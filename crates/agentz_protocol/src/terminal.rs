@@ -17,8 +17,10 @@ pub use projects::TerminalCommand;
 pub enum TerminalKey {
     /// A terminal thread's terminal.
     Thread(ThreadId),
-    /// The drawer under an agent thread.
+    /// The drawer under an agent thread: its first terminal (t3code's "Terminal 1").
     Drawer(ThreadId),
+    /// Another of the drawer's terminals, numbered from 2 (t3code's split and new terminals).
+    DrawerTerminal { thread_id: ThreadId, number: u32 },
     /// One a thread's agent started through ACP's `terminal/create`, by the id the agent got.
     Agent {
         thread_id: ThreadId,
@@ -29,10 +31,20 @@ pub enum TerminalKey {
 }
 
 impl TerminalKey {
+    /// A thread's drawer terminal by its number, 1 being the drawer's first.
+    pub fn drawer(thread_id: ThreadId, number: u32) -> Self {
+        if number <= 1 {
+            Self::Drawer(thread_id)
+        } else {
+            Self::DrawerTerminal { thread_id, number }
+        }
+    }
+
     /// The thread it belongs to; a pane's belongs to none.
     pub fn thread_id(&self) -> Option<ThreadId> {
         match self {
             Self::Thread(thread_id) | Self::Drawer(thread_id) => Some(*thread_id),
+            Self::DrawerTerminal { thread_id, .. } => Some(*thread_id),
             Self::Agent { thread_id, .. } => Some(*thread_id),
             Self::Pane(_) => None,
         }

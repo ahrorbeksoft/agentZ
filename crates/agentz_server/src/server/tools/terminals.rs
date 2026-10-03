@@ -235,7 +235,7 @@ impl Server {
             "threadId": thread_id.map(|thread_id| thread_id.0),
             "kind": match key {
                 TerminalKey::Thread(_) => "terminal_thread",
-                TerminalKey::Drawer(_) => "drawer",
+                TerminalKey::Drawer(_) | TerminalKey::DrawerTerminal { .. } => "drawer",
                 TerminalKey::Agent { .. } => "agent_command",
                 TerminalKey::Pane(_) => "pane",
             },

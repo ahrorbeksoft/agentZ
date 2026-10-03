@@ -76,6 +76,24 @@ impl Server {
             Request::TerminalPrograms => {
                 Ok(Response::TerminalPrograms(terminal_programs::find_on_path()))
             }
+            Request::DrawerTerminals(thread) => {
+                let mut numbers: Vec<u32> = self
+                    .terminals
+                    .running
+                    .keys()
+                    .filter_map(|key| match key {
+                        TerminalKey::Drawer(thread_id) if *thread_id == thread => Some(1),
+                        TerminalKey::DrawerTerminal { thread_id, number }
+                            if *thread_id == thread =>
+                        {
+                            Some(*number)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                numbers.sort_unstable();
+                Ok(Response::DrawerTerminals(numbers))
+            }
             Request::SubscribeTerminal(key) => {
                 self.client(client)?;
                 self.ensure_terminal(&key)?;
@@ -145,7 +163,9 @@ impl Server {
     /// What a thread's terminal or drawer, or a pane's terminal, runs.
     fn terminal_spawn(&self, key: &TerminalKey) -> Result<TerminalSpawn> {
         let thread_id = match key {
-            TerminalKey::Thread(thread_id) | TerminalKey::Drawer(thread_id) => *thread_id,
+            TerminalKey::Thread(thread_id)
+            | TerminalKey::Drawer(thread_id)
+            | TerminalKey::DrawerTerminal { thread_id, .. } => *thread_id,
             TerminalKey::Agent { .. } => {
                 return Err(anyhow!("an agent's terminal starts when the agent asks"));
             }
@@ -248,7 +268,9 @@ impl Server {
                 self.spaces.set_pane_agent(pane, None);
                 Some(AgentTracker::default())
             }
-            TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => None,
+            TerminalKey::Drawer(_)
+            | TerminalKey::DrawerTerminal { .. }
+            | TerminalKey::Agent { .. } => None,
         };
         self.terminals.running.insert(
             key.clone(),
@@ -280,7 +302,9 @@ impl Server {
                 self.projects.set_terminal_folder(*thread_id, None);
             }
             TerminalKey::Pane(pane) => self.spaces.set_pane_agent(*pane, None),
-            TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
+            TerminalKey::Drawer(_)
+            | TerminalKey::DrawerTerminal { .. }
+            | TerminalKey::Agent { .. } => {}
         }
         for client in self.clients.values_mut() {
             if client.terminals.remove(key).is_some() {
@@ -460,7 +484,9 @@ impl Server {
                     self.publish_terminal_agent(thread_id, agent, state)
                 }
                 TerminalKey::Pane(pane) => self.publish_pane_agent(pane, agent, state),
-                TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
+                TerminalKey::Drawer(_)
+                | TerminalKey::DrawerTerminal { .. }
+                | TerminalKey::Agent { .. } => {}
             }
         }
         if let Some(next_tick) = next_tick {

@@ -2827,3 +2827,45 @@ async fn deleting_a_terminal_thread_ends_everything_it_started() {
     .await;
     assert!(ended.is_ok(), "process {pid} outlived its terminal");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drawer_holds_several_terminals() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let drawer_terminals = |response: Response| match response {
+        Response::DrawerTerminals(numbers) => numbers,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(
+        drawer_terminals(client.ok(Request::DrawerTerminals(thread_id)).await),
+        Vec::<u32>::new()
+    );
+
+    // Terminal 1 is the drawer's own; split and new terminals are numbered after it.
+    for number in [1, 2, 3] {
+        let key = TerminalKey::drawer(thread_id, number);
+        client.subscribe_terminal(key.clone()).await;
+        client
+            .type_into(&key, &format!("echo terminal-{number}\n"))
+            .await;
+        client
+            .wait_for_screen(&key, &format!("terminal-{number}"))
+            .await;
+    }
+    assert_eq!(
+        drawer_terminals(client.ok(Request::DrawerTerminals(thread_id)).await),
+        vec![1, 2, 3]
+    );
+
+    client
+        .ok(Request::CloseTerminal(TerminalKey::drawer(thread_id, 2)))
+        .await;
+    assert_eq!(
+        drawer_terminals(client.ok(Request::DrawerTerminals(thread_id)).await),
+        vec![1, 3]
+    );
+}

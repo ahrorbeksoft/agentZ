@@ -116,6 +116,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             agentz_protocol::CAPABILITY_RELAY.to_string(),
             agentz_protocol::CAPABILITY_SPACES.to_string(),
             agentz_protocol::CAPABILITY_MACHINE_ICON.to_string(),
+            agentz_protocol::CAPABILITY_DRAWER_TERMINALS.to_string(),
         ],
         build: installed_build(),
         error: None,

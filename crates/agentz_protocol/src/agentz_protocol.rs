@@ -63,6 +63,9 @@ pub const CAPABILITY_SPACES: &str = "spaces";
 /// [`ServerWelcome::capabilities`]: the server detects its machine's kind and keeps the icon
 /// chosen for it ([`SessionSnapshot::machine_icon`], [`Request::SetMachineIcon`]).
 pub const CAPABILITY_MACHINE_ICON: &str = "machine_icon";
+/// [`ServerWelcome::capabilities`]: a thread's drawer holds several terminals
+/// ([`terminal::TerminalKey::DrawerTerminal`], [`Request::DrawerTerminals`]).
+pub const CAPABILITY_DRAWER_TERMINALS: &str = "drawer_terminals";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -266,6 +269,9 @@ pub enum Request {
     },
     /// Agent CLIs on the server's `PATH`: [`Response::TerminalPrograms`].
     TerminalPrograms,
+    /// The numbers of the thread's drawer terminals running now:
+    /// [`Response::DrawerTerminals`].
+    DrawerTerminals(ThreadId),
     /// A terminal's screen: a full [`Response::TerminalFrame`], then [`Event::TerminalFrame`]s
     /// while it changes. A thread's terminal or drawer starts if it isn't running.
     SubscribeTerminal(TerminalKey),
@@ -512,6 +518,7 @@ pub enum Response {
     ProjectGit(ProjectGit),
     WorkspaceRemoval(WorkspaceRemoval),
     TerminalPrograms(Vec<TerminalProgram>),
+    DrawerTerminals(Vec<u32>),
     TerminalFrame(TerminalFrame),
     Directories(DirectoryListing),
     SpacePane(PaneLocation),

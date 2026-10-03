@@ -680,6 +680,7 @@ impl Server {
                 Err(anyhow!("diffs are handled separately"))
             }
             request @ (Request::TerminalPrograms
+            | Request::DrawerTerminals(_)
             | Request::SubscribeTerminal(_)
             | Request::UnsubscribeTerminal(_)
             | Request::TerminalInput { .. }
