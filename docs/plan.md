@@ -662,6 +662,21 @@ Each phase ships on its own, keeps the app working, and is committed.
 Everything after phase 1 depends on it. Phase 4 needs 3. Phase 8 needs 7. The workspace tools
 need phase 3. Otherwise phases 3–8 and 9 can go in any order.
 
+### Later (not scheduled)
+
+Offered earlier and wanted, but the user has other work first (2026-10-03). Each follows Zed's
+agent panel or t3code, as everything else does.
+
+- **A multi-line composer**, Zed's message editor: Shift-Enter for a new line and Enter to send,
+  pasted text keeps its line breaks (the single-line field turns them into spaces), the box
+  grows with its text up to a few lines and then scrolls, and Up/Down move between lines.
+- **@-mentions and adding context** (files, symbols, threads) to a message.
+- **Pasting images** into a message.
+- **Opening files** from tool calls.
+- **Searching message text**, not only titles.
+- **Deleting sessions on the agent's side** when a thread is deleted.
+- **t3code's pin, snooze and drag-to-reorder** for threads.
+
 ## Testing
 
 - **Server and protocol:** in-process tests that drive a server over a socket pair with the mock

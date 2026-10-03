@@ -211,13 +211,5 @@ Done:
 - Zed's Reauthenticate, Log Out and Reload Agent.
 - The local background server: agents keep working after the app quits, and the app reattaches.
 
-Not built yet (offered earlier, not scheduled):
-- A multi-line composer.
-- @-mentions and adding context.
-- Pasting images.
-- Opening files from tool calls.
-- Searching message text.
-- Deleting sessions on the agent's side.
-- t3code's pin, snooze and drag-to-reorder.
-- A git-branch line per thread (only the project's current branch is shown). Planned with
-  worktrees in `docs/plan.md`.
+Not built yet: the list under "Later (not scheduled)" in `docs/plan.md`, starting with a
+multi-line composer.

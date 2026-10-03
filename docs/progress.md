@@ -8,7 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Nothing scheduled. Every phase of the plan is done; ask the user what's next.
+**Next:** Nothing scheduled. Every phase of the plan is done; ask the user what's next. Wanted
+later: the plan's "Later (not scheduled)" list.
 
 | Phase | Status |
 |---|---|
@@ -693,3 +694,6 @@ Then the server:
   user's request.
 - 2026-10-03: Finished phase 11: the headless layout test, with test-only clients and
   settings so the app's views can be tested without a server.
+- 2026-10-03: Added the unscheduled ideas (multi-line composer, @-mentions, pasting images, …)
+  to the plan under "Later". The git-branch line per thread was dropped from that list: phase 6
+  built it.
