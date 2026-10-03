@@ -13,7 +13,8 @@ use gpui::{
 };
 use ui::prelude::*;
 
-use crate::terminal_element::{GridLayout, TerminalElement, TerminalMode};
+use crate::app_settings::AppSettingsStore;
+use crate::terminal_element::{self, GridLayout, TerminalElement, TerminalMode};
 use crate::terminal_entity::Terminal;
 use crate::terminal_mouse::{
     SelectionSide, alt_scroll, grid_point, grid_point_and_side, mouse_button_report,
@@ -48,6 +49,12 @@ actions!(
         ScrollToTop,
         /// Scrolls back to the prompt.
         ScrollToBottom,
+        /// Makes every terminal's text bigger.
+        IncreaseFontSize,
+        /// Makes every terminal's text smaller.
+        DecreaseFontSize,
+        /// Puts every terminal's text back to its default size.
+        ResetFontSize,
     ]
 );
 
@@ -102,6 +109,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-home", ScrollToTop, context),
         KeyBinding::new("shift-end", ScrollToBottom, context),
         KeyBinding::new("cmd-end", ScrollToBottom, context),
+        // Zed's keys for the font size.
+        KeyBinding::new("cmd-=", IncreaseFontSize, context),
+        KeyBinding::new("cmd-+", IncreaseFontSize, context),
+        KeyBinding::new("cmd--", DecreaseFontSize, context),
+        KeyBinding::new("cmd-0", ResetFontSize, context),
     ]);
 }
 
@@ -588,6 +600,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::scroll_page_down))
             .on_action(cx.listener(Self::scroll_to_top))
             .on_action(cx.listener(Self::scroll_to_bottom))
+            .on_action(|_: &IncreaseFontSize, _, cx| change_font_size(Some(1.), cx))
+            .on_action(|_: &DecreaseFontSize, _, cx| change_font_size(Some(-1.), cx))
+            .on_action(|_: &ResetFontSize, _, cx| change_font_size(None, cx))
             .on_action(cx.listener(Self::select_all))
             .on_key_down(cx.listener(Self::key_down))
             .child(TerminalElement::new(
@@ -606,5 +621,65 @@ impl Render for TerminalView {
                     ),
                 )
             })
+    }
+}
+
+/// Steps every terminal's font size by a point, or back to the default, and redraws them.
+fn change_font_size(step: Option<f32>, cx: &mut App) {
+    let size = match step {
+        Some(step) => Some((f32::from(terminal_element::font_size(cx)) + step).clamp(
+            terminal_element::MIN_FONT_SIZE,
+            terminal_element::MAX_FONT_SIZE,
+        )),
+        None => None,
+    };
+    AppSettingsStore::global(cx).update(cx, |store, cx| {
+        store.update(|settings| settings.terminal_font_size = size, cx)
+    });
+    cx.refresh_windows();
+}
+
+#[cfg(test)]
+mod tests {
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use agentz_protocol::terminal::TerminalKey;
+    use gpui::{TestAppContext, VisualTestContext};
+    use projects::ThreadId;
+
+    use super::*;
+    use crate::machines::MachineId;
+    use crate::server_client::ServerClient;
+
+    #[gpui::test]
+    fn cmd_plus_and_minus_size_every_terminal(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            Terminal::shared(&client, TerminalKey::Drawer(ThreadId(1)), cx)
+        });
+        let (view, cx) =
+            cx.add_window_view(|_, cx| TerminalView::new(terminal, TerminalMode::Scrollable, cx));
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle(cx), cx)
+        });
+        let size = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| f32::from(terminal_element::font_size(cx)))
+        };
+        assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE);
+        cx.simulate_keystrokes("cmd-=");
+        assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE + 1.);
+        cx.simulate_keystrokes("cmd-- cmd-- cmd--");
+        assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE - 2.);
+        for _ in 0..20 {
+            cx.simulate_keystrokes("cmd--");
+        }
+        assert_eq!(size(cx), terminal_element::MIN_FONT_SIZE);
+        cx.simulate_keystrokes("cmd-0");
+        assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE);
     }
 }

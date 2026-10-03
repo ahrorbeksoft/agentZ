@@ -18,6 +18,7 @@ use theme::{ActiveTheme as _, Theme};
 use ui::utils::ensure_minimum_contrast;
 use util::ResultExt as _;
 
+use crate::app_settings::AppSettingsStore;
 use crate::terminal_entity::{Terminal, TerminalSize};
 use crate::terminal_mouse::TerminalBounds;
 use crate::terminal_view::TerminalView;
@@ -26,7 +27,21 @@ use crate::terminal_view::TerminalView;
 /// further apart than the user wanted.
 const LINE_HEIGHT: f32 = 1.3;
 /// t3code's default terminal font size, smaller than the code font's.
-const FONT_SIZE: Pixels = px(12.);
+pub const DEFAULT_FONT_SIZE: f32 = 12.;
+/// t3code's bounds for the terminal font size.
+pub const MIN_FONT_SIZE: f32 = 8.;
+pub const MAX_FONT_SIZE: f32 = 20.;
+
+/// The terminals' font size: the user's, else the default.
+pub fn font_size(cx: &App) -> Pixels {
+    let size = AppSettingsStore::global(cx)
+        .read(cx)
+        .settings()
+        .terminal_font_size
+        .unwrap_or(DEFAULT_FONT_SIZE)
+        .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+    px(size)
+}
 /// Zed's `terminal.minimum_contrast` default.
 const MINIMUM_CONTRAST: f32 = 45.;
 
@@ -791,7 +806,7 @@ impl TerminalMetrics {
             weight: buffer_font.weight,
             style: FontStyle::Normal,
         };
-        let font_size = FONT_SIZE;
+        let font_size = font_size(cx);
         let line_height = px((f32::from(font_size) * LINE_HEIGHT).round());
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&font);
