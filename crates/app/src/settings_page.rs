@@ -59,6 +59,8 @@ pub fn init(cx: &mut App) {
 pub enum SettingsPageEvent {
     Close,
     AddProject(MachineId),
+    /// Open the Add Machine dialog, or Edit… for the machine given.
+    EditMachine(Option<MachineProfile>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -80,11 +82,7 @@ pub struct SettingsPage {
     /// The machine whose agents Settings › Agents shows.
     agents_machine: MachineId,
     agent_search: Entity<TextInput>,
-    machine_label_input: Entity<TextInput>,
-    machine_target_input: Entity<TextInput>,
     /// The saved machine the form edits, rather than adding one.
-    editing_machine: Option<u64>,
-    machine_form_error: Option<SharedString>,
     /// Whether this Mac's server has a launch agent, so it starts at login.
     starts_at_login: bool,
     /// The agent whose account panel is open, with the connection made to log in or out.
@@ -155,16 +153,6 @@ impl SettingsPage {
         ];
         let agent_search = cx.new(|cx| TextInput::new("Search agents…", cx));
         subscriptions.push(cx.subscribe(&agent_search, |_, _, _: &TextInputEvent, cx| cx.notify()));
-        let machine_label_input = cx.new(|cx| TextInput::new("Name (optional)", cx));
-        let machine_target_input =
-            cx.new(|cx| TextInput::new("user@host, or a Host from ~/.ssh/config", cx));
-        subscriptions.push(cx.subscribe(
-            &machine_target_input,
-            |this, _, _: &TextInputEvent, cx| {
-                this.machine_form_error = None;
-                cx.notify();
-            },
-        ));
         let project_info = ProjectInfoStore::global(cx);
         subscriptions.push(cx.observe(&project_info, |_, _, cx| cx.notify()));
         Self {
@@ -176,10 +164,6 @@ impl SettingsPage {
             monogram_input,
             agents_machine: MachineId::Local,
             agent_search,
-            machine_label_input,
-            machine_target_input,
-            editing_machine: None,
-            machine_form_error: None,
             starts_at_login: crate::login_item::is_enabled(),
             account: None,
             nav_scroll: ScrollHandle::new(),
@@ -1938,12 +1922,58 @@ impl SettingsPage {
                 .iter()
                 .map(|profile| self.render_machine_row(Some(profile), cx)),
         );
-        vec![
-            render_section("Machines", rows, cx),
-            self.render_machine_form(cx),
-        ]
+        // t3code's header: Update All for the servers that can update in place, and Add.
+        let updatable: Vec<Entity<ServerClient>> = self
+            .machines
+            .read(cx)
+            .clients()
+            .into_iter()
+            .filter(|client| {
+                let client = client.read(cx);
+                client.is_outdated() && client.can_update_server()
+            })
+            .cloned()
+            .collect();
+        let actions = h_flex()
+            .gap_1()
+            .when(!updatable.is_empty(), |actions| {
+                actions.child(
+                    Button::new("machines-update-all", "Update All")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            for client in &updatable {
+                                this.update_server(client.clone(), window, cx);
+                            }
+                        })),
+                )
+            })
+            .child(
+                Button::new("machines-add", "Add Machine")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(
+                        cx.listener(|_, _, _, cx| cx.emit(SettingsPageEvent::EditMachine(None))),
+                    ),
+            );
+        vec![render_section_with_actions(
+            "Machines",
+            rows,
+            actions.into_any_element(),
+            cx,
+        )]
     }
 
+    /// t3code's `EnvironmentRow`: the machine's icon, its name over one line of how it's
+    /// reached, its status and (when there's an update) its server's version, then the
+    /// update button, another machine's switch and the row menu. A switched-off row dims.
     fn render_machine_row(
         &self,
         profile: Option<&MachineProfile>,
@@ -1951,64 +1981,92 @@ impl SettingsPage {
     ) -> AnyElement {
         let machine = profile.map_or(MachineId::Local, |profile| MachineId::Remote(profile.id));
         let client = self.machines.read(cx).client(machine, cx);
+        let is_enabled = profile.is_none_or(|profile| profile.enabled);
         let label: SharedString = match profile {
             Some(profile) => profile.display_label().into(),
             None => "This Mac".into(),
         };
-        let mut details = Vec::new();
-        if let Some(profile) = profile
-            && !profile.label.trim().is_empty()
-        {
-            details.push(profile.target.clone());
-        }
+        let transport = match profile {
+            Some(profile) => format!("SSH {}", profile.target),
+            None => "Local".to_string(),
+        };
         let mut hint = None;
-        let (status, status_color): (SharedString, Color) = match &client {
-            None => ("Disabled".into(), Color::Muted),
+        let mut server_version = None;
+        let (status, is_error): (String, bool) = match &client {
+            None => ("Off".into(), false),
             Some(client) => {
                 let client = client.read(cx);
                 match client.status() {
-                    MachineStatus::Connecting => ("Connecting…".into(), Color::Muted),
-                    MachineStatus::Online if client.is_outdated() => {
-                        hint = Some(if client.can_update_server() {
-                            "A newer agentz-server is installed there. Update the server to use \
-                             it; terminals keep running, and agents start again."
-                                .into()
-                        } else {
-                            "A newer agentz-server is installed there. Restart the server to \
-                             use it; agents and terminals running there will stop."
-                                .into()
-                        });
-                        ("Connected · older server".into(), Color::Warning)
-                    }
+                    MachineStatus::Connecting => ("Connecting".into(), false),
                     MachineStatus::Online => {
-                        if let Some(connection) = client.connection() {
-                            let welcome = connection.welcome();
-                            details.push(format!(
-                                "{} · {} {}",
-                                welcome.machine.hostname, welcome.machine.os, welcome.machine.arch
-                            ));
-                            details.push(format!("agentz-server {}", welcome.server_version));
+                        if client.is_outdated() {
+                            server_version = client
+                                .connection()
+                                .map(|connection| connection.welcome().server_version.clone());
                         }
-                        ("Connected".into(), Color::Success)
+                        ("Connected".into(), false)
                     }
-                    MachineStatus::Reconnecting(error) => {
-                        (format!("Reconnecting · {error}").into(), Color::Warning)
-                    }
+                    MachineStatus::Reconnecting(error) => (format!("Reconnecting: {error}"), true),
                     MachineStatus::Attention { error, hint: help } => {
                         hint = help.clone();
-                        (error.clone(), Color::Error)
+                        (error.to_string(), true)
                     }
                 }
             }
         };
+        let subtitle: SharedString = [Some(transport), Some(status.clone()), server_version]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
+            .into();
         let is_online = client
             .as_ref()
             .is_some_and(|client| client.read(cx).is_online());
+        let (is_outdated, can_update) = client.as_ref().map_or((false, false), |client| {
+            let client = client.read(cx);
+            (client.is_outdated(), client.can_update_server())
+        });
+        let status_tooltip: SharedString = if is_outdated {
+            format!("{status}\nA newer agentz-server is installed there.").into()
+        } else {
+            status.into()
+        };
         let id_suffix = machine.slug();
         let element_id = |action: &str| SharedString::from(format!("machine-{action}-{id_suffix}"));
         let current_icon = self.machines.read(cx).machine_icon(machine, cx);
-        // t3code's row: another machine's switch connects to it (Remove is in the menu, and
-        // keeps nothing); servers are never stopped from here.
+
+        // An older server updates without ending its terminals, or, when it can't, restarts.
+        let update_button = client
+            .clone()
+            .filter(|_| is_online && is_outdated)
+            .map(|client| {
+                let name = label.clone();
+                let tooltip = if can_update {
+                    "Update Server"
+                } else {
+                    "Restart Server to Update…"
+                };
+                IconButton::new(element_id("update"), IconName::CircleArrowUp)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if can_update {
+                            this.update_server(client.clone(), window, cx)
+                        } else if machine == MachineId::Local {
+                            this.confirm_restart_server(window, cx)
+                        } else {
+                            this.confirm_restart_remote_server(
+                                client.clone(),
+                                name.clone(),
+                                window,
+                                cx,
+                            )
+                        }
+                    }))
+            });
+        // Another machine's switch connects to it or not; Remove… is in the menu.
         let switch = profile.map(|profile| {
             let id = profile.id;
             let tooltip = if profile.enabled {
@@ -2030,7 +2088,6 @@ impl SettingsPage {
         });
         let options_menu = {
             let this = cx.entity().downgrade();
-            let client = client.clone();
             let profile = profile.cloned();
             let name = label.clone();
             PopoverMenu::new(element_id("options"))
@@ -2041,15 +2098,47 @@ impl SettingsPage {
                     let name = name.clone();
                     Some(ContextMenu::build(window, cx, move |menu, _, cx| {
                         let menu = machine_icon_menu(menu, client.clone(), current_icon, cx);
+                        let retry = client
+                            .clone()
+                            .filter(|client| !client.read(cx).is_online())
+                            .map(|client| {
+                                move |_: &mut Window, cx: &mut App| {
+                                    client.update(cx, |client, _| client.retry())
+                                }
+                            });
+                        let menu = menu
+                            .when_some(retry, |menu, retry| menu.entry("Retry Now", None, retry));
                         let Some(profile) = profile.clone() else {
-                            return menu;
+                            let restart = {
+                                let this = this.clone();
+                                move |window: &mut Window, cx: &mut App| {
+                                    this.update(cx, |this, cx| {
+                                        this.confirm_restart_server(window, cx)
+                                    })
+                                    .log_err();
+                                }
+                            };
+                            return menu.when(is_online, |menu| {
+                                menu.entry("Restart Server…", None, restart)
+                            });
+                        };
+                        let add_project = {
+                            let this = this.clone();
+                            move |_: &mut Window, cx: &mut App| {
+                                this.update(cx, |_, cx| {
+                                    cx.emit(SettingsPageEvent::AddProject(machine))
+                                })
+                                .log_err();
+                            }
                         };
                         let edit = {
                             let this = this.clone();
                             let profile = profile.clone();
-                            move |window: &mut Window, cx: &mut App| {
-                                this.update(cx, |this, cx| this.edit_machine(&profile, window, cx))
-                                    .log_err();
+                            move |_: &mut Window, cx: &mut App| {
+                                this.update(cx, |_, cx| {
+                                    cx.emit(SettingsPageEvent::EditMachine(Some(profile.clone())))
+                                })
+                                .log_err();
                             }
                         };
                         let remove = {
@@ -2066,265 +2155,63 @@ impl SettingsPage {
                                 .log_err();
                             }
                         };
-                        menu.entry("Edit…", None, edit)
-                            .separator()
-                            .entry("Remove…", None, remove)
+                        menu.when(is_online, |menu| {
+                            menu.entry("Add Project…", None, add_project)
+                        })
+                        .entry("Edit…", None, edit)
+                        .separator()
+                        .entry("Remove…", None, remove)
                     }))
                 })
                 .trigger_with_tooltip(
                     IconButton::new(element_id("options-trigger"), IconName::Ellipsis)
-                        .icon_size(IconSize::Small),
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted),
                     Tooltip::text("Machine Options"),
                 )
                 .anchor(gpui::Anchor::TopRight)
         };
-        // One server action at a time: reconnect, update an outdated one (which keeps its
-        // terminals), or restart it (only this Mac's while it's current).
-        let server_button = client.and_then(|client| {
-            let (is_outdated, can_update) = {
-                let client = client.read(cx);
-                (client.is_outdated(), client.can_update_server())
-            };
-            if !is_online {
-                return Some(
-                    Button::new(element_id("retry"), "Retry")
-                        .style(ButtonStyle::Outlined)
-                        .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry())),
-                );
-            }
-            if is_outdated && can_update {
-                return Some(
-                    Button::new(element_id("update"), "Update Server")
-                        .style(ButtonStyle::Outlined)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.update_server(client.clone(), window, cx)
-                        })),
-                );
-            }
-            if !is_outdated && machine != MachineId::Local {
-                return None;
-            }
-            let name = label.clone();
-            Some(
-                Button::new(element_id("restart"), "Restart Server…")
-                    .style(ButtonStyle::Outlined)
-                    .on_click(cx.listener(move |this, _, window, cx| match machine {
-                        MachineId::Local => this.confirm_restart_server(window, cx),
-                        MachineId::Remote(_) => this.confirm_restart_remote_server(
-                            client.clone(),
-                            name.clone(),
-                            window,
-                            cx,
-                        ),
-                    })),
-            )
-        });
-        let controls = h_flex()
-            .gap_2()
-            .children(server_button)
-            .when(is_online && machine != MachineId::Local, |controls| {
-                controls.child(
-                    Button::new(element_id("add-project"), "Add Project…")
-                        .style(ButtonStyle::Outlined)
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(SettingsPageEvent::AddProject(machine))
-                        })),
-                )
-            })
-            .children(switch)
-            .child(options_menu);
         h_flex()
             .px_4()
-            .py_3()
+            .py_2p5()
             .gap_3()
+            .when(!is_enabled, |row| row.opacity(0.6))
             .child(
-                Icon::new(self.machines.read(cx).machine_icon(machine, cx))
-                    .size(IconSize::Small)
+                Icon::new(current_icon)
+                    .size(IconSize::Medium)
                     .color(Color::Muted),
             )
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_0p5()
+                    .child(Label::new(label).truncate())
                     .child(
-                        h_flex().gap_2().child(Label::new(label)).child(
-                            Label::new(status)
-                                .size(LabelSize::Small)
-                                .color(status_color)
-                                .truncate(),
-                        ),
+                        div()
+                            .id(element_id("status"))
+                            .tooltip(Tooltip::text(status_tooltip))
+                            .child(
+                                Label::new(subtitle)
+                                    .size(LabelSize::Small)
+                                    .color(if is_error { Color::Error } else { Color::Muted })
+                                    .truncate(),
+                            ),
                     )
-                    .when(!details.is_empty(), |column| {
-                        column.child(
-                            Label::new(details.join(" · "))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        )
-                    })
                     .children(
                         hint.map(|hint| {
                             Label::new(hint).size(LabelSize::Small).color(Color::Muted)
                         }),
                     ),
             )
-            .child(div().flex_none().child(controls))
-            .into_any_element()
-    }
-
-    fn render_machine_form(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let input_box = |input: Entity<TextInput>| {
-            div()
-                .w(px(256.))
-                .h(px(28.))
-                .px_2()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .rounded_md()
-                .border_1()
-                .border_color(colors.border)
-                .bg(colors.editor_background)
-                .child(input)
-                .into_any_element()
-        };
-        let is_editing = self.editing_machine.is_some();
-        let has_target = !self.machine_target_input.read(cx).text().trim().is_empty();
-        let buttons = h_flex()
-            .gap_2()
-            .when(is_editing, |buttons| {
-                buttons.child(
-                    Button::new("machine-form-cancel", "Cancel")
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_machine_form(cx))),
-                )
-            })
             .child(
-                Button::new(
-                    "machine-form-save",
-                    if is_editing { "Save" } else { "Add Machine" },
-                )
-                .style(ButtonStyle::Outlined)
-                .disabled(!has_target)
-                .on_click(cx.listener(|this, _, _, cx| this.save_machine_form(cx))),
-            );
-        let mut rows = vec![
-            render_row(
-                "SSH target",
-                "What you'd give ssh. Your keys, agent and ~/.ssh/config are used; password prompts aren't.",
-                input_box(self.machine_target_input.clone()),
-                cx,
-            ),
-            render_row(
-                "Name",
-                "Shown in the sidebar. Leave it empty for the target.",
-                input_box(self.machine_label_input.clone()),
-                cx,
-            ),
-        ];
-        rows.push(
-            h_flex()
-                .px_4()
-                .py_3()
-                .gap_3()
-                .child(
-                    div().flex_1().min_w_0().child(
-                        Label::new(match &self.machine_form_error {
-                            Some(error) => error.clone(),
-                            None => {
-                                "agentZ installs its server in ~/.agentz there, and nothing else."
-                                    .into()
-                            }
-                        })
-                        .size(LabelSize::Small)
-                        .color(if self.machine_form_error.is_some() {
-                            Color::Error
-                        } else {
-                            Color::Muted
-                        }),
-                    ),
-                )
-                .child(buttons)
-                .into_any_element(),
-        );
-        render_section(
-            if is_editing {
-                "Edit Machine"
-            } else {
-                "Add a Machine"
-            },
-            rows,
-            cx,
-        )
-    }
-
-    fn edit_machine(
-        &mut self,
-        profile: &MachineProfile,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.editing_machine = Some(profile.id);
-        self.machine_label_input
-            .update(cx, |input, cx| input.set_text(profile.label.clone(), cx));
-        self.machine_target_input
-            .update(cx, |input, cx| input.set_text(profile.target.clone(), cx));
-        self.machine_form_error = None;
-        window.focus(&self.machine_target_input.focus_handle(cx), cx);
-        cx.notify();
-    }
-
-    fn reset_machine_form(&mut self, cx: &mut Context<Self>) {
-        self.editing_machine = None;
-        self.machine_label_input
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.machine_target_input
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.machine_form_error = None;
-        cx.notify();
-    }
-
-    fn save_machine_form(&mut self, cx: &mut Context<Self>) {
-        let target = self.machine_target_input.read(cx).text().trim().to_string();
-        let label = self.machine_label_input.read(cx).text().trim().to_string();
-        if let Err(error) = agentz_client::ssh::validate_target(&target) {
-            self.machine_form_error = Some(format!("{error:#}").into());
-            cx.notify();
-            return;
-        }
-        let is_taken = self
-            .app_settings
-            .read(cx)
-            .settings()
-            .machines
-            .iter()
-            .any(|profile| profile.target == target && Some(profile.id) != self.editing_machine);
-        if is_taken {
-            self.machine_form_error = Some(format!("{target} is already saved.").into());
-            cx.notify();
-            return;
-        }
-        match self.editing_machine {
-            Some(id) => self.update_machine(
-                id,
-                |profile| {
-                    profile.label = label;
-                    profile.target = target;
-                },
-                cx,
-            ),
-            None => self.app_settings.update(cx, |store, cx| {
-                store.update(
-                    |settings| {
-                        settings.add_machine(label, target);
-                    },
-                    cx,
-                )
-            }),
-        }
-        self.reset_machine_form(cx);
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .children(update_button)
+                    .children(switch)
+                    .child(options_menu),
+            )
+            .into_any_element()
     }
 
     fn update_machine(
@@ -2368,9 +2255,6 @@ impl SettingsPage {
         cx.spawn(async move |this, cx| {
             if answer.await == Ok(0) {
                 this.update(cx, |this, cx| {
-                    if this.editing_machine == Some(id) {
-                        this.reset_machine_form(cx);
-                    }
                     this.app_settings.update(cx, |store, cx| {
                         store.update(
                             |settings| settings.machines.retain(|profile| profile.id != id),
@@ -2733,11 +2617,26 @@ fn select_choices(
 
 /// t3code's settings section: a small heading over a bordered group of rows.
 fn render_section(title: &'static str, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+    render_section_with_actions(title, rows, gpui::Empty.into_any_element(), cx)
+}
+
+/// A section with buttons beside its title, as t3code's `headerAction`.
+fn render_section_with_actions(
+    title: &'static str,
+    rows: Vec<AnyElement>,
+    actions: AnyElement,
+    cx: &App,
+) -> AnyElement {
     let colors = cx.theme().colors().clone();
     let count = rows.len();
     v_flex()
         .gap_2()
-        .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+        .child(
+            h_flex()
+                .justify_between()
+                .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                .child(actions),
+        )
         .child(
             v_flex()
                 .rounded_lg()

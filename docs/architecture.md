@@ -240,11 +240,13 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   installed SHA-256, on this Mac by the binary's modification time); the title bar shows it and
   Settings › Machines offers Update Server (Restart Server… for servers without the
   `hand_off` capability).
-- **Machines settings** (`settings_page.rs`, t3code's `ConnectionsSettings.tsx`): each row has
-  the one server action that applies (Retry, Update Server, or Restart Server… for this Mac),
-  a switch that connects to another machine or not (Remove… is separate), and a menu with the
-  Icon submenu (`machine_icon_menu`, t3code's `EnvironmentIconMenu`). Servers aren't stopped
-  from the app, as in t3code.
+- **Machines settings** (`settings_page.rs`, `machine_modal.rs`, t3code's `ConnectionsSettings.tsx`
+  and `EnvironmentRow`): one row per machine with its icon, name, and one line of transport,
+  status and (when an update is installed) the server's version; the update button, another
+  machine's switch (connect or not; Remove… is separate) and a row menu with the Icon submenu
+  (`machine_icon_menu`, t3code's `EnvironmentIconMenu`), Retry Now, Add Project…, Edit… and
+  Restart Server… for this Mac. A switched-off row dims. The section header has Update All and
+  Add Machine, which opens the Add/Edit dialog. Servers aren't stopped from the app.
 - **Server handoff** (`handoff.rs`, `server/hand_off.rs`, `terminals.rs`, herdr's live
   handoff): `Request::HandOff` starts the installed binary as `run --handoff` with a socket pair
   as its stdin, flushes `state.json` and `spaces.json`, pauses every terminal's event loop and

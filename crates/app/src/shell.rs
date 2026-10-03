@@ -17,8 +17,9 @@ use util::ResultExt as _;
 
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
-use crate::app_settings::{AppSettingsStore, is_sidebar_hidden};
+use crate::app_settings::{AppSettingsStore, MachineProfile, is_sidebar_hidden};
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
+use crate::machine_modal::MachineModal;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
@@ -119,6 +120,7 @@ pub struct Shell {
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
     add_project_modal: Option<(Entity<AddProjectModal>, Vec<Subscription>)>,
     worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
+    machine_modal: Option<(Entity<MachineModal>, Subscription)>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
@@ -277,6 +279,7 @@ impl Shell {
             new_thread_modal: None,
             add_project_modal: None,
             worktree_modal: None,
+            machine_modal: None,
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
@@ -464,6 +467,9 @@ impl Shell {
                         SettingsPageEvent::AddProject(machine) => {
                             this.close_settings(window, cx);
                             this.open_add_project_modal(Some(*machine), window, cx);
+                        }
+                        SettingsPageEvent::EditMachine(profile) => {
+                            this.open_machine_modal(profile.as_ref(), window, cx)
                         }
                     });
                 self.settings_page = Some((page.clone(), subscription));
@@ -670,8 +676,10 @@ impl Shell {
         let had_new_thread_modal = self.new_thread_modal.take().is_some();
         let had_add_project_modal = self.add_project_modal.take().is_some();
         let had_worktree_modal = self.worktree_modal.take().is_some();
+        let had_machine_modal = self.machine_modal.take().is_some();
         self.thread_target = None;
-        if had_new_thread_modal || had_add_project_modal || had_worktree_modal {
+        if had_new_thread_modal || had_add_project_modal || had_worktree_modal || had_machine_modal
+        {
             self.focus_main(window, cx);
             cx.notify();
         }
@@ -738,6 +746,21 @@ impl Shell {
             }),
         ];
         self.add_project_modal = Some((modal, subscriptions));
+        cx.notify();
+    }
+
+    fn open_machine_modal(
+        &mut self,
+        profile: Option<&MachineProfile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| MachineModal::new(profile, window, cx));
+        let subscription =
+            cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            });
+        self.machine_modal = Some((modal, subscription));
         cx.notify();
     }
 
@@ -1172,6 +1195,11 @@ impl Render for Shell {
                     })
                     .or_else(|| {
                         self.worktree_modal
+                            .as_ref()
+                            .map(|(modal, _)| AnyView::from(modal.clone()))
+                    })
+                    .or_else(|| {
+                        self.machine_modal
                             .as_ref()
                             .map(|(modal, _)| AnyView::from(modal.clone()))
                     }),

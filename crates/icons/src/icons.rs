@@ -69,6 +69,7 @@ pub enum IconName {
     ChevronUp,
     ChevronUpDown,
     Circle,
+    CircleArrowUp,
     CircleHelp,
     Clock,
     Close,

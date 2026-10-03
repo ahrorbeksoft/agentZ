@@ -3,6 +3,7 @@ mod agent_view;
 mod app_settings;
 mod diff_panel;
 mod login_item;
+mod machine_modal;
 mod machines;
 mod new_space_picker;
 mod new_thread_modal;
@@ -187,6 +188,7 @@ fn main() {
             spaces_view::init(cx);
             add_project_modal::init(cx);
             worktree_modal::init(cx);
+            machine_modal::init(cx);
             agent_view::init(cx);
             sidebar::init(cx);
             terminal_view::init(cx);
