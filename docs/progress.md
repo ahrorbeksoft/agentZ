@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 5, diffs: checkpoints as hidden git refs around each turn, turn and thread
-diffs, `agentz_thread_diff`, and the diff panel.
+**Next:** Phase 6, worktrees and pastures: thread workspaces in `projects`, `git worktree add`,
+cow's pastures, and New Thread's workspace step.
 
 | Phase | Status |
 |---|---|
@@ -18,7 +18,7 @@ diffs, `agentz_thread_diff`, and the diff panel.
 | 2. Attention states and notifications | Done |
 | 3. Agent control (MCP and CLI) | Done |
 | 4. Subthreads | Done |
-| 5. Diffs | Not started |
+| 5. Diffs | Done |
 | 6. Worktrees and pastures | Not started |
 | 7. Terminals | Not started |
 | 8. Terminal agent detection | Not started |
@@ -143,11 +143,11 @@ Then the server:
 
 ## 5. Diffs
 
-- [ ] Server: checkpoints as hidden git refs before and after each turn. Skip projects that
+- [x] Server: checkpoints as hidden git refs before and after each turn. Skip projects that
       aren't git repositories.
-- [ ] Turn diff and thread diff queries. `agentz_thread_diff`.
-- [ ] Diff panel: This turn / All changes, files and hunks, mark as viewed.
-- [ ] Tests with temporary repositories.
+- [x] Turn diff and thread diff queries. `agentz_thread_diff`.
+- [x] Diff panel: This turn / All changes, files and hunks, mark as viewed.
+- [x] Tests with temporary repositories.
 
 ## 6. Worktrees and pastures
 
@@ -438,6 +438,25 @@ Then the server:
     view with Stop and Open Parent in place of the composer. Its permission requests show as
     cards on the parent, and the parent's card shows Pending Approval.
 
+- 2026-10-03: Diffs (phase 5):
+  - **Checkpoints are t3code's:** a commit of the whole working tree (untracked files included)
+    made with a private index, under `refs/agentz/checkpoints/<machine>/<thread>/<turn>`. Turn 0
+    is taken when the first turn starts; turn N when turn N ends. The index lives in the git
+    common directory and is reused between captures, so only changed files are hashed again.
+    Sparse checkouts and folders outside git are skipped; deleting a thread or removing its
+    project deletes its refs.
+  - **A turn hook in `agent_thread`** runs before and after each prompt, so the checkpoint
+    finishes before the turn counts as ended. A cancel during the "before" checkpoint skips the
+    prompt.
+  - **Diffs are parsed on the server** (`agentz_protocol::diff`), capped at 10 MB of patch, and
+    sent as files and hunks. `Request::ThreadDiff` asks for the latest turn or all changes;
+    the `thread_diff` capability says the server has it. `agentz_thread_diff` gives agents the
+    same diff as a patch or a file list (default 50,000 characters).
+  - **The diff panel** sits right of the thread (Cmd-D, or the toolbar button) and follows the
+    open thread. It reloads when a turn ends. Files collapse; Viewed collapses a file until its
+    contents change (t3code). No restore yet: phase 6 adds it for threads in their own
+    workspace.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -489,3 +508,5 @@ Then the server:
 - 2026-10-03: Finished phase 4: `delegate_task`, `task_status` and `task_cancel`, finalization
   that survives restarts, the Agents section, read-only subthreads and their permissions on the
   parent.
+- 2026-10-03: Finished phase 5: checkpoints as hidden git refs around every turn (a932899),
+  `agentz_thread_diff`, and the diff panel.

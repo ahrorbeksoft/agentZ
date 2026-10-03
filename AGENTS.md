@@ -33,8 +33,8 @@ agentZ's own crates (everything else in `crates/` is copied from Zed):
 | Crate | What it is |
 |---|---|
 | `crates/app` | The application (`agentz` binary), a GPUI client of the server. See the modules below. |
-| `crates/agentz_server` | The background server (`agentz-server` binary, GPUI-free, tokio). One task (`server.rs`) owns the projects, the registry, agent settings and the running threads, so agents keep working when the app quits. `server/tools.rs` has the agent-control tools (t3code's orchestrator MCP, `agentz_` for `t3_`), including delegation to subthreads and their finalization. `main.rs` has `run`, `start`, `proxy`, `stop`, and for agents `mcp-bridge` (`mcp_bridge.rs`, the stdio MCP server every session gets), `tools` and `call <tool> [json]`. |
-| `crates/agentz_protocol` | The wire format (length-prefixed JSON) and the types the server and clients share: requests, responses, events, thread views and updates, registry and agent settings. |
+| `crates/agentz_server` | The background server (`agentz-server` binary, GPUI-free, tokio). One task (`server.rs`) owns the projects, the registry, agent settings and the running threads, so agents keep working when the app quits. `server/tools.rs` has the agent-control tools (t3code's orchestrator MCP, `agentz_` for `t3_`), including delegation to subthreads and their finalization. `checkpoints.rs` snapshots the working tree as hidden git refs around every turn (t3code's checkpoints) and diffs them. `main.rs` has `run`, `start`, `proxy`, `stop`, and for agents `mcp-bridge` (`mcp_bridge.rs`, the stdio MCP server every session gets), `tools` and `call <tool> [json]`. |
+| `crates/agentz_protocol` | The wire format (length-prefixed JSON) and the types the server and clients share: requests, responses, events, thread views and updates, registry and agent settings. `diff.rs` has thread diffs and the patch parser. |
 | `crates/agentz_client` | A connection to the server: requests answered through futures, events in order, and starting a local server. |
 | `crates/agent_thread` | One ACP connection and session, run by the server: process, protocol, entries, permissions, config options, login/logout, reload. `test_support/mock_agent.py` is a scripted ACP agent for tests. |
 | `crates/projects` | `ProjectStore`: projects (custom name and icon), threads (title, agent, session id, model, archived, created by an agent, and for subthreads the delegated task and its outcome), scope, thread order. Saved to `state.json`. |
@@ -48,7 +48,8 @@ agentZ's own crates (everything else in `crates/` is copied from Zed):
 | Module | What it is |
 |---|---|
 | `main.rs` | Startup, actions, key bindings, menus, theme fonts. |
-| `shell.rs` | The window: title bar with the project switcher and the disconnected icon, sidebar, main area (thread or settings), New Thread modal. |
+| `shell.rs` | The window: title bar with the project switcher and the disconnected icon, sidebar, main area (thread or settings), diff panel, New Thread modal. |
+| `diff_panel.rs` | The open thread's changes (Cmd-D): latest turn or all, files and hunks, Viewed. |
 | `server_client.rs` | The global connection to the server: starts it if needed, reconnects with backoff, and feeds events to the copies below. |
 | `project_store.rs`, `registry_store.rs`, `thread_entity.rs` | GPUI copies of the server's projects, registry and threads, with the same names and methods as the core types. Changes go to the server as requests and come back as events. |
 | `sidebar.rs` | t3code-style thread cards, the Archived shelf, search mode, rename, context menu, details popover, Settings footer. |
@@ -125,7 +126,8 @@ From Zed's guidelines, which this code follows:
 - **Unit and integration:** `agent_thread` tests drive the real mock agent process (login, logout,
   reload, defaults, history replay). Extend the mock when you need a protocol feature; it speaks
   JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp` (or
-  `mcp <tool> <json>`), `slow` and `demo` script different turns (see its docstring).
+  `mcp <tool> <json>`), `slow`, `demo`, `write <path> <text>` and `delete <path>` script
+  different turns (see its docstring).
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.

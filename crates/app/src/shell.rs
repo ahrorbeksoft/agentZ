@@ -11,6 +11,7 @@ use util::ResultExt as _;
 
 use crate::agent_view::{AgentView, AgentViewEvent};
 use crate::app_settings::AppSettingsStore;
+use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel};
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
@@ -19,7 +20,7 @@ use crate::server_client::{ServerClient, ServerStatus};
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::thread_entity::AgentThread;
-use crate::{NewThread, OpenFolder, OpenSettings, ToggleProjectSwitcher};
+use crate::{NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher};
 
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 /// Leaves room for the macOS traffic lights.
@@ -42,6 +43,10 @@ pub struct Shell {
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadId, OpenThread>,
     active_thread: Option<ThreadId>,
+    /// Whether the active thread's changes show beside it. Stays on across threads.
+    show_diff: bool,
+    /// The active thread's changes while shown. Only one, so hidden threads don't reload theirs.
+    diff_panel: Option<Entity<DiffPanel>>,
     should_move_window: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -95,6 +100,7 @@ impl Shell {
                 // handlers, and do nothing.
                 if closed_active_thread {
                     window.focus(&this.focus_handle, cx);
+                    this.sync_diff_panel(cx);
                 }
                 this.mark_active_thread_viewed(window, cx);
                 cx.notify();
@@ -148,6 +154,8 @@ impl Shell {
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
+            show_diff: false,
+            diff_panel: None,
             should_move_window: false,
             _subscriptions: subscriptions,
         }
@@ -202,6 +210,37 @@ impl Shell {
         cx.notify();
     }
 
+    fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_diff = !self.show_diff;
+        self.sync_diff_panel(cx);
+    }
+
+    /// Shows the active thread's changes when they're wanted, and tells the views.
+    fn sync_diff_panel(&mut self, cx: &mut Context<Self>) {
+        let thread_id = self
+            .active_thread
+            .filter(|_| self.show_diff && self.settings_page.is_none());
+        match thread_id {
+            Some(thread_id) => {
+                let is_current = self
+                    .diff_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.read(cx).thread_id() == thread_id);
+                if !is_current {
+                    self.diff_panel = Some(cx.new(|cx| DiffPanel::new(thread_id, cx)));
+                }
+            }
+            None => self.diff_panel = None,
+        }
+        for (open_thread_id, open_thread) in &self.open_threads {
+            let is_diff_open = thread_id == Some(*open_thread_id);
+            open_thread
+                .view
+                .update(cx, |view, cx| view.set_diff_open(is_diff_open, cx));
+        }
+        cx.notify();
+    }
+
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         let page = match &self.settings_page {
             Some((page, _)) => page.clone(),
@@ -216,7 +255,7 @@ impl Shell {
             }
         };
         window.focus(&page.focus_handle(cx), cx);
-        cx.notify();
+        self.sync_diff_panel(cx);
     }
 
     fn open_project_settings(
@@ -243,7 +282,7 @@ impl Shell {
             None => window.focus(&self.focus_handle, cx),
         }
         self.mark_active_thread_viewed(window, cx);
-        cx.notify();
+        self.sync_diff_panel(cx);
     }
 
     fn open_thread(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
@@ -264,7 +303,7 @@ impl Shell {
             window.focus(&open_thread.view.focus_handle(cx), cx);
         }
         self.mark_active_thread_viewed(window, cx);
-        cx.notify();
+        self.sync_diff_panel(cx);
     }
 
     /// Whether the user can see the thread right now, as Zed's `agent_status_visible` decides.
@@ -546,6 +585,8 @@ impl Render for Shell {
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
+        let diff_panel = self.diff_panel.clone();
+        let border = cx.theme().colors().border;
         let active_view = self
             .active_thread
             .and_then(|thread_id| self.open_threads.get(&thread_id))
@@ -558,6 +599,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::toggle_project_switcher))
             .on_action(cx.listener(Self::new_thread))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::toggle_diff))
             .relative()
             .size_full()
             .bg(background)
@@ -584,7 +626,18 @@ impl Render for Shell {
                                 (None, Some(view)) => main.child(view),
                                 (None, None) => main.child(render_no_thread_selected()),
                             }),
-                    ),
+                    )
+                    .when_some(diff_panel, |row, panel| {
+                        row.child(
+                            div()
+                                .w(DIFF_PANEL_WIDTH)
+                                .flex_none()
+                                .h_full()
+                                .border_l_1()
+                                .border_color(border)
+                                .child(panel),
+                        )
+                    }),
             )
             .when_some(
                 self.new_thread_modal

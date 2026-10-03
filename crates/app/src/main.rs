@@ -1,5 +1,6 @@
 mod agent_view;
 mod app_settings;
+mod diff_panel;
 mod new_thread_modal;
 mod project_info;
 mod project_store;
@@ -39,6 +40,8 @@ actions!(
         NewThread,
         /// Opens the settings page.
         OpenSettings,
+        /// Shows or hides the open thread's changes.
+        ToggleDiff,
     ]
 );
 
@@ -94,6 +97,7 @@ fn init_actions(cx: &mut App) {
         KeyBinding::new("secondary-alt-o", ToggleProjectSwitcher, None),
         KeyBinding::new("secondary-n", NewThread, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
+        KeyBinding::new("secondary-d", ToggleDiff, None),
     ]);
     cx.set_menus([
         Menu::new("agentZ").items([
@@ -106,6 +110,7 @@ fn init_actions(cx: &mut App) {
             MenuItem::action("Open Folder…", OpenFolder),
             MenuItem::action("Switch Project…", ToggleProjectSwitcher),
         ]),
+        Menu::new("View").items([MenuItem::action("Changes", ToggleDiff)]),
     ]);
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {

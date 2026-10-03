@@ -69,6 +69,17 @@ impl ServerClient {
         self.connection.as_ref()
     }
 
+    /// Whether the connected server has the feature. An older server lacks newer ones.
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.connection.as_ref().is_some_and(|connection| {
+            connection
+                .welcome()
+                .capabilities
+                .iter()
+                .any(|known| known == capability)
+        })
+    }
+
     /// Sends a request now; the future waits for the answer. It fails at once while
     /// disconnected.
     pub fn request(&self, request: Request) -> BoxFuture<'static, Result<Response>> {

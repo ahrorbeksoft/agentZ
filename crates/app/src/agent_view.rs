@@ -21,6 +21,7 @@ use ui::{
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
+use crate::ToggleDiff;
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::thread_entity::AgentThread;
@@ -70,6 +71,8 @@ pub struct AgentView {
     focus_handle: FocusHandle,
     /// Archived threads stay readable but take no new messages until they're unarchived.
     is_archived: bool,
+    /// Whether the shell shows this thread's changes beside it.
+    is_diff_open: bool,
     thread: Entity<AgentThread>,
     title: SharedString,
     registry: Entity<AgentRegistryStore>,
@@ -151,6 +154,7 @@ impl AgentView {
             thread,
             title,
             is_archived: false,
+            is_diff_open: false,
             registry,
             agent_id,
             composer,
@@ -516,6 +520,13 @@ impl AgentView {
         }
     }
 
+    pub fn set_diff_open(&mut self, is_diff_open: bool, cx: &mut Context<Self>) {
+        if self.is_diff_open != is_diff_open {
+            self.is_diff_open = is_diff_open;
+            cx.notify();
+        }
+    }
+
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
         if self.title != title {
             self.title = title;
@@ -852,6 +863,13 @@ impl AgentView {
                     .color(Color::Muted),
             )
             .child(div().flex_1())
+            .child(
+                IconButton::new("toggle-diff", IconName::Diff)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.is_diff_open)
+                    .tooltip(|_, cx| Tooltip::for_action("Show Changes", &ToggleDiff, cx))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx)),
+            )
             .child(
                 // Zed's agent options: log in again, log out, or restart the agent.
                 PopoverMenu::new("thread-options")
