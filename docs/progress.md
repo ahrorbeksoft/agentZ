@@ -713,3 +713,5 @@ Then the server:
   Whether a pane agent's finish has been seen now lives in the app's `ServerClient`, shared by
   both views. Checked on screen against a scratch server with a fake `codex` in a pane.
 - 2026-10-03: Fixed agent detection for agent CLIs started from a pane's shell on macOS.
+- 2026-10-03: Took workspace agent CLIs back out of Agents at the user's request: Agents is
+  threads only, terminal agents live in Workspaces.

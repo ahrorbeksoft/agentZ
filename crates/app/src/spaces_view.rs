@@ -130,8 +130,6 @@ impl PaneKey {
 pub enum SpacesViewEvent {
     /// Show the thread in Agents.
     OpenThread(ThreadKey),
-    /// Show the pane's agent CLI full screen in Agents.
-    OpenPane(PaneKey),
     /// New Thread, to be shown in the pane once it's made.
     NewThreadInPane {
         pane: PaneKey,
@@ -2056,8 +2054,6 @@ impl SpacesView {
             PaneContent::Thread(thread) => Some(*thread),
             PaneContent::Terminal(_) | PaneContent::Unknown(_) => None,
         };
-        // Agents lists the agent CLIs found in panes.
-        let has_agent = matches!(pane.content, PaneContent::Terminal(_)) && pane.agent.is_some();
         move |window, cx| {
             let this = this.clone();
             let machines = Machines::global(cx);
@@ -2154,13 +2150,7 @@ impl SpacesView {
                         .ok();
                     })
                 })
-                .when(has_agent, |menu| {
-                    let this = this.clone();
-                    menu.entry("Open in Agents", None, move |_, cx| {
-                        this.update(cx, |_, cx| cx.emit(SpacesViewEvent::OpenPane(key)))
-                            .ok();
-                    })
-                })
+
                 .separator()
                 .entry(
                     "Close Pane",

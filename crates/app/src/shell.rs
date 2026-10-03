@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey};
 use crate::project_store::ThreadStatus;
 use agentz_protocol::agents::AgentId;
-use agentz_protocol::spaces::PaneContent;
-use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use collections::HashMap;
 use gpui::{
     AnyView, App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton,
@@ -108,10 +106,6 @@ pub struct Shell {
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
     active_thread: Option<ThreadKey>,
-    /// Workspaces panes' agent CLIs opened full screen, kept while their pane runs a terminal.
-    open_panes: HashMap<PaneKey, Entity<TerminalThreadView>>,
-    /// Shown in place of the active thread.
-    active_pane: Option<PaneKey>,
     /// Whether the active thread's changes show beside it. Stays on across threads.
     show_diff: bool,
     /// The active thread's changes while shown. Only one, so hidden threads don't reload theirs.
@@ -131,7 +125,6 @@ impl Shell {
                 window,
                 |this, _, event, window, cx| match event {
                     SpacesViewEvent::OpenThread(thread) => this.open_thread(*thread, window, cx),
-                    SpacesViewEvent::OpenPane(pane) => this.open_pane(*pane, window, cx),
                     SpacesViewEvent::NewThreadInPane {
                         pane,
                         project,
@@ -187,7 +180,6 @@ impl Shell {
                     window.focus(&this.focus_handle, cx);
                     this.sync_diff_panel(cx);
                 }
-                this.sync_open_panes(window, cx);
                 this.mark_active_thread_viewed(window, cx);
                 cx.notify();
             }),
@@ -205,10 +197,6 @@ impl Shell {
             }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
                 SidebarEvent::OpenThread(thread_id) => this.open_thread(*thread_id, window, cx),
-                SidebarEvent::OpenPane(pane) => this.open_pane(*pane, window, cx),
-                SidebarEvent::ShowPaneInWorkspaces(pane) => {
-                    this.show_pane_in_workspaces(*pane, window, cx)
-                }
                 SidebarEvent::OpenProjectSettings(project_id) => {
                     this.open_project_settings(*project_id, window, cx)
                 }
@@ -253,27 +241,10 @@ impl Shell {
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
-            open_panes: HashMap::default(),
-            active_pane: None,
             show_diff: false,
             diff_panel: None,
             should_move_window: false,
             _subscriptions: subscriptions,
-        }
-    }
-
-    /// What the Agents view shows: a pane's agent, or the active thread.
-    fn active_view(&self) -> Option<ThreadView> {
-        match self.active_pane {
-            Some(pane) => self
-                .open_panes
-                .get(&pane)
-                .cloned()
-                .map(ThreadView::Terminal),
-            None => self
-                .active_thread
-                .and_then(|thread_id| self.open_threads.get(&thread_id))
-                .map(|open_thread| open_thread.view.clone()),
         }
     }
 
@@ -443,7 +414,6 @@ impl Shell {
             self.open_threads.insert(thread_id, open_thread);
         }
         self.active_thread = Some(thread_id);
-        self.active_pane = None;
         // A subthread isn't in the sidebar, so its top-level thread is highlighted.
         let sidebar_thread = ThreadKey {
             machine: thread_id.machine,
@@ -465,106 +435,6 @@ impl Shell {
         self.sync_diff_panel(cx);
     }
 
-    /// The pane's terminal, if it still runs one: what it runs, and its agent's name.
-    fn pane_terminal(&self, pane: PaneKey, cx: &App) -> Option<(TerminalCommand, SharedString)> {
-        let client = self.machines.read(cx).client(pane.machine, cx)?;
-        let (_, _, found) = client.read(cx).spaces().pane(pane.pane)?;
-        let PaneContent::Terminal(terminal) = &found.content else {
-            return None;
-        };
-        let name = found
-            .agent
-            .as_ref()
-            .map(|agent| agent.name.clone())
-            .or_else(|| terminal.command.clone())
-            .unwrap_or_else(|| "Shell".to_string());
-        Some((
-            TerminalCommand {
-                command: terminal.command.clone(),
-            },
-            name.into(),
-        ))
-    }
-
-    /// Shows a Workspaces pane's agent CLI full screen, the same terminal the pane shows.
-    fn open_pane(&mut self, pane: PaneKey, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((command, title)) = self.pane_terminal(pane, cx) else {
-            return;
-        };
-        let Some(client) = self.machines.read(cx).client(pane.machine, cx) else {
-            return;
-        };
-        self.settings_page = None;
-        if self.view != MainView::Agents {
-            self.view = MainView::Agents;
-            self.spaces_view
-                .update(cx, |view, cx| view.set_visible(false, window, cx));
-        }
-        let view = self
-            .open_panes
-            .entry(pane)
-            .or_insert_with(|| {
-                cx.new(|cx| {
-                    TerminalThreadView::new(
-                        &client,
-                        TerminalKey::Pane(pane.pane),
-                        title,
-                        command,
-                        cx,
-                    )
-                })
-            })
-            .clone();
-        self.active_thread = None;
-        self.active_pane = Some(pane);
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_active_pane(Some(pane), cx));
-        window.focus(&view.focus_handle(cx), cx);
-        self.mark_active_thread_viewed(window, cx);
-        self.sync_diff_panel(cx);
-        cx.notify();
-    }
-
-    fn show_pane_in_workspaces(
-        &mut self,
-        pane: PaneKey,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_view(MainView::Workspaces, window, cx);
-        self.spaces_view
-            .update(cx, |view, cx| view.focus_pane(pane, window, cx));
-    }
-
-    /// Closes full-screen panes whose pane is gone or no longer runs a terminal, and keeps
-    /// their titles on their agents' names.
-    fn sync_open_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut titles = Vec::new();
-        let mut closed = Vec::new();
-        for (pane, view) in &self.open_panes {
-            match self.pane_terminal(*pane, cx) {
-                Some((_, title)) => titles.push((view.clone(), title)),
-                None => closed.push(*pane),
-            }
-        }
-        for (view, title) in titles {
-            view.update(cx, |view, cx| view.set_title(title, cx));
-        }
-        for pane in &closed {
-            self.open_panes.remove(pane);
-        }
-        if self.active_pane.is_some_and(|pane| closed.contains(&pane)) {
-            self.active_pane = None;
-            let sidebar = self.sidebar.clone();
-            // Deferred: the change may have come from the sidebar itself.
-            cx.defer(move |cx| sidebar.update(cx, |sidebar, cx| sidebar.set_active_pane(None, cx)));
-            // As for a closed thread: focus must stay under the shell for its actions to work.
-            if self.view == MainView::Agents {
-                window.focus(&self.focus_handle, cx);
-            }
-        }
-    }
-
     /// Whether the user can see the thread right now, as Zed's `agent_status_visible` decides.
     fn is_thread_visible(&self, thread_id: ThreadKey, window: &Window, cx: &App) -> bool {
         if !window.is_window_active() || self.settings_page.is_some() {
@@ -577,14 +447,6 @@ impl Shell {
     }
 
     fn mark_active_thread_viewed(&self, window: &Window, cx: &mut Context<Self>) {
-        if let Some(pane) = self.active_pane
-            && self.view == MainView::Agents
-            && self.settings_page.is_none()
-            && window.is_window_active()
-            && let Some(client) = self.machines.read(cx).client(pane.machine, cx)
-        {
-            client.update(cx, |client, cx| client.mark_pane_seen(pane.pane, cx));
-        }
         let Some(thread_id) = self.active_thread else {
             return;
         };
@@ -653,9 +515,7 @@ impl Shell {
             .clone();
         if let Some(command) = thread.terminal.clone() {
             let title = SharedString::from(thread.title);
-            let view = cx.new(|cx| {
-                TerminalThreadView::new(&client, TerminalKey::Thread(thread_id), title, command, cx)
-            });
+            let view = cx.new(|cx| TerminalThreadView::new(&client, thread_id, title, command, cx));
             return Some(OpenThread {
                 view: ThreadView::Terminal(view),
                 _subscriptions: Vec::new(),
@@ -707,8 +567,11 @@ impl Shell {
     /// Focus goes back to what the main area shows.
     fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.view {
-            MainView::Agents => match self.active_view() {
-                Some(view) => window.focus(&view.focus_handle(cx), cx),
+            MainView::Agents => match self
+                .active_thread
+                .and_then(|thread_id| self.open_threads.get(&thread_id))
+            {
+                Some(open_thread) => window.focus(&open_thread.view.focus_handle(cx), cx),
                 None => window.focus(&self.focus_handle, cx),
             },
             MainView::Workspaces => self
@@ -1041,7 +904,10 @@ impl Render for Shell {
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
         let diff_panel = self.diff_panel.clone();
         let border = cx.theme().colors().border;
-        let active_view = self.active_view();
+        let active_view = self
+            .active_thread
+            .and_then(|thread_id| self.open_threads.get(&thread_id))
+            .map(|open_thread| open_thread.view.clone());
         let shows_workspaces = self.view == MainView::Workspaces && settings_page.is_none();
 
         v_flex()

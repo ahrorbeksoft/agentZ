@@ -539,9 +539,10 @@ The user asked for this on 2026-10-03. The app gets two views, chosen by tabs in
 **Agents** is the current app: the t3code sidebar, with one thread **full screen** in the main
 area. Every agent shows up here:
 
-- ACP threads, including those shown in workspace panes;
-- agent CLIs like `claude` running in workspace panes, as cards that open the pane's terminal
-  full screen (the same terminal; it takes the size of the view last used).
+- ACP threads, including those shown in workspace panes.
+
+Agent CLIs running in workspace panes stay in Workspaces (the user, 2026-10-03): Agents is
+threads only, so its cards keep what threads have (rename, archive, changes, activity order).
 
 Agent CLIs are only detected in workspace panes (the user, 2026-10-03): one started in a
 terminal thread or a thread's drawer is just a terminal. New Thread offers no agent CLIs from
