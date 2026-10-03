@@ -5,13 +5,14 @@ use crate::project_store::ThreadStatus;
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
-    App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
-    Subscription, SystemNotification, Window, WindowControlArea,
+    AnyView, App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton,
+    PathPromptOptions, Subscription, SystemNotification, Window, WindowControlArea,
 };
 use projects::Thread;
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::ResultExt as _;
 
+use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent};
 use crate::app_settings::AppSettingsStore;
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel};
@@ -85,6 +86,7 @@ pub struct Shell {
     sidebar: Entity<Sidebar>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
+    add_project_modal: Option<(Entity<AddProjectModal>, Vec<Subscription>)>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
@@ -201,6 +203,7 @@ impl Shell {
             sidebar,
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
+            add_project_modal: None,
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
@@ -252,15 +255,15 @@ impl Shell {
         let modal = cx.new(|cx| NewThreadModal::new(project, workspace, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
-                this.dismiss_new_thread_modal(window, cx);
+                this.dismiss_modal(window, cx);
             }),
             cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
                 NewThreadModalEvent::ThreadCreated(thread_id) => {
-                    this.dismiss_new_thread_modal(window, cx);
+                    this.dismiss_modal(window, cx);
                     this.open_thread(*thread_id, window, cx);
                 }
                 NewThreadModalEvent::OpenAgentSettings => {
-                    this.dismiss_new_thread_modal(window, cx);
+                    this.dismiss_modal(window, cx);
                     this.open_settings(&OpenSettings, window, cx);
                     if let Some((page, _)) = &this.settings_page {
                         page.update(cx, |page, cx| page.show_agents(window, cx));
@@ -314,6 +317,10 @@ impl Shell {
                 let subscription =
                     cx.subscribe_in(&page, window, |this, _, event, window, cx| match event {
                         SettingsPageEvent::Close => this.close_settings(window, cx),
+                        SettingsPageEvent::AddProject(machine) => {
+                            this.close_settings(window, cx);
+                            this.open_add_project_modal(Some(*machine), window, cx);
+                        }
                     });
                 self.settings_page = Some((page.clone(), subscription));
                 page
@@ -502,8 +509,10 @@ impl Shell {
         })
     }
 
-    fn dismiss_new_thread_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.new_thread_modal.take().is_some() {
+    fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_new_thread_modal = self.new_thread_modal.take().is_some();
+        let had_add_project_modal = self.add_project_modal.take().is_some();
+        if had_new_thread_modal || had_add_project_modal {
             match self
                 .active_thread
                 .and_then(|thread_id| self.open_threads.get(&thread_id))
@@ -515,7 +524,42 @@ impl Shell {
         }
     }
 
-    fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
+    /// With other machines, asks which machine the project is on first.
+    fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.machines.read(cx).has_remotes() {
+            self.open_add_project_modal(None, window, cx);
+        } else {
+            self.pick_local_folders(cx);
+        }
+    }
+
+    fn open_add_project_modal(
+        &mut self,
+        machine: Option<MachineId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| AddProjectModal::new(machine, window, cx));
+        let subscriptions = vec![
+            cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            }),
+            cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
+                AddProjectModalEvent::ProjectAdded(project) => {
+                    this.dismiss_modal(window, cx);
+                    reveal_project(&this.machines, *project, cx);
+                }
+                AddProjectModalEvent::ChooseLocalFolder => {
+                    this.dismiss_modal(window, cx);
+                    this.pick_local_folders(cx);
+                }
+            }),
+        ];
+        self.add_project_modal = Some((modal, subscriptions));
+        cx.notify();
+    }
+
+    fn pick_local_folders(&mut self, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -542,17 +586,15 @@ impl Shell {
                     Err(error) => log::error!("failed to add the project: {error:#}"),
                 }
             }
-            // In "All projects" the new project simply appears; otherwise switch to it so it
-            // doesn't get added out of sight.
-            cx.update(|cx| {
-                let machines = machines.read(cx);
-                if let Some(id) = last_added
-                    && machines.scope(cx) != Scope::All
-                    && let Some(group) = machines.group_of(MachineId::Local, id, cx)
-                {
-                    Machines::set_scope(Scope::Group(group.key), cx);
-                }
-            });
+            if let Some(project) = last_added {
+                cx.update(|cx| {
+                    let project = ProjectKey {
+                        machine: MachineId::Local,
+                        project,
+                    };
+                    reveal_project(&machines, project, cx)
+                });
+            }
         })
         .detach();
     }
@@ -784,7 +826,12 @@ impl Render for Shell {
             .when_some(
                 self.new_thread_modal
                     .as_ref()
-                    .map(|(modal, _)| modal.clone()),
+                    .map(|(modal, _)| AnyView::from(modal.clone()))
+                    .or_else(|| {
+                        self.add_project_modal
+                            .as_ref()
+                            .map(|(modal, _)| AnyView::from(modal.clone()))
+                    }),
                 |shell, modal| {
                     shell.child(
                         div()
@@ -795,9 +842,9 @@ impl Render for Shell {
                             .justify_center()
                             .pt(px(96.))
                             .bg(gpui::black().opacity(0.25))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dismiss_new_thread_modal(window, cx)
-                            }))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
+                            )
                             .child(
                                 // Clicks inside the modal must not reach the backdrop.
                                 div()
@@ -823,6 +870,17 @@ fn render_no_thread_selected() -> impl IntoElement {
                 .style(ButtonStyle::Outlined)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
         )
+}
+
+/// In "All projects" a new project simply appears; otherwise this switches to it so it isn't
+/// added out of sight.
+fn reveal_project(machines: &Entity<Machines>, project: ProjectKey, cx: &mut App) {
+    let machines = machines.read(cx);
+    if machines.scope(cx) != Scope::All
+        && let Some(group) = machines.group_of(project.machine, project.project, cx)
+    {
+        Machines::set_scope(Scope::Group(group.key), cx);
+    }
 }
 
 fn notification_tag(thread: ThreadKey) -> SharedString {

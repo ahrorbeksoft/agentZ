@@ -9,6 +9,7 @@ mod agent_settings;
 mod checkpoints;
 mod connection;
 mod detect;
+mod directories;
 mod git;
 mod server;
 mod terminal_programs;
@@ -100,6 +101,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             agentz_protocol::CAPABILITY_THREAD_DIFF.to_string(),
             agentz_protocol::CAPABILITY_WORKSPACES.to_string(),
             agentz_protocol::CAPABILITY_TERMINALS.to_string(),
+            agentz_protocol::CAPABILITY_BROWSE_DIRECTORIES.to_string(),
         ],
         error: None,
     };

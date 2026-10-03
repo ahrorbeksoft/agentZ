@@ -275,6 +275,21 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::BrowseDirectories { partial_path },
+            } => self.spawn_then(
+                async move {
+                    tokio::task::spawn_blocking(move || crate::directories::browse(&partial_path))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|listing| listing)
+                },
+                move |server, listing| {
+                    server.respond(client, id, listing.map(Response::Directories))
+                },
+            ),
+            Input::Request {
+                client,
+                id,
                 request,
             } => {
                 let result = self
@@ -345,6 +360,14 @@ impl Server {
             }
 
             Request::AddProject { path } => {
+                // Typed on another machine, so it may not exist here.
+                // Collecting the components drops a trailing `/` left by completion.
+                let path: PathBuf = crate::directories::expand_home(&path)
+                    .components()
+                    .collect();
+                if !path.is_dir() {
+                    return Err(anyhow!("{} isn't a folder here", path.display()));
+                }
                 Ok(Response::ProjectAdded(self.projects.add_project(path)))
             }
             Request::SetProjectName { project_id, name } => {
@@ -582,6 +605,7 @@ impl Server {
             | Request::BringBackWorkspace { .. } => {
                 Err(anyhow!("workspace requests are handled separately"))
             }
+            Request::BrowseDirectories { .. } => Err(anyhow!("browsing is handled separately")),
             Request::Unknown(request) => Err(anyhow!("unsupported request: {request}")),
         }
     }

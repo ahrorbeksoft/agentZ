@@ -11,7 +11,9 @@ use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError};
 use agentz_protocol::agents::{AgentId, AgentSettings};
 use agentz_protocol::terminal::TerminalKey;
-use agentz_protocol::{AgentSettingsChange, ClientKind, ConnectionId, Event, Request, Response};
+use agentz_protocol::{
+    AgentSettingsChange, ClientKind, ConnectionId, DirectoryListing, Event, Request, Response,
+};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use futures::FutureExt as _;
@@ -193,6 +195,21 @@ impl ServerClient {
             }
         })
         .detach();
+    }
+
+    /// The machine's folders that complete `partial_path`, for adding a project there.
+    pub fn browse_directories(
+        &self,
+        partial_path: String,
+        cx: &App,
+    ) -> Task<Result<DirectoryListing>> {
+        let response = self.request(Request::BrowseDirectories { partial_path });
+        cx.background_spawn(async move {
+            match response.await? {
+                Response::Directories(listing) => Ok(listing),
+                response => Err(anyhow!("unexpected response: {response:?}")),
+            }
+        })
     }
 
     pub fn agent_settings(&self, agent_id: &str) -> AgentSettings {

@@ -1,3 +1,4 @@
+mod add_project_modal;
 mod agent_view;
 mod app_settings;
 mod diff_panel;
@@ -153,6 +154,7 @@ fn main() {
             text_input::init(cx);
             project_switcher::init(cx);
             new_thread_modal::init(cx);
+            add_project_modal::init(cx);
             agent_view::init(cx);
             sidebar::init(cx);
             terminal_view::init(cx);

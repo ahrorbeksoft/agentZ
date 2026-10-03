@@ -48,6 +48,9 @@ pub const CAPABILITY_WORKSPACES: &str = "workspaces";
 /// [`ServerWelcome::capabilities`]: the server runs terminals ([`Request::SubscribeTerminal`]
 /// and the rest), and terminal threads.
 pub const CAPABILITY_TERMINALS: &str = "terminals";
+/// [`ServerWelcome::capabilities`]: the server lists folders ([`Request::BrowseDirectories`]),
+/// so projects can be added on its machine.
+pub const CAPABILITY_BROWSE_DIRECTORIES: &str = "browse_directories";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -143,6 +146,12 @@ pub enum Request {
     SubscribeThread(ConnectionId),
     UnsubscribeThread(ConnectionId),
 
+    /// The folders matching a path being typed, as t3code's `filesystem.browse`: the folder's
+    /// own entries after a trailing `/`, otherwise its siblings starting with the last segment.
+    /// `~` is the server's home.
+    BrowseDirectories {
+        partial_path: String,
+    },
     AddProject {
         path: PathBuf,
     },
@@ -303,6 +312,20 @@ pub enum Request {
     Unknown(serde_json::Value),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryListing {
+    /// The folder listed, with `~` expanded.
+    pub parent: PathBuf,
+    /// Sorted by name.
+    pub entries: Vec<DirectoryEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: PathBuf,
+}
+
 /// Who is calling a tool, which decides the project it may manage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ToolCaller {
@@ -351,6 +374,7 @@ pub enum Response {
     WorkspaceRemoval(WorkspaceRemoval),
     TerminalPrograms(Vec<TerminalProgram>),
     TerminalFrame(TerminalFrame),
+    Directories(DirectoryListing),
     /// What a finished action did, to show the user.
     Message(String),
     /// From a newer version.

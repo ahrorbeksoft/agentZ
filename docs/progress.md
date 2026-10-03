@@ -8,7 +8,7 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 9: remote projects (adding one on a machine, with path completion), then
+**Next:** Phase 9: replacing an outdated running remote server (after asking), then
 repository identity and merged projects.
 
 | Phase | Status |
@@ -242,7 +242,9 @@ Then the server:
 - [x] Connection states: Online / Reconnecting (backoff up to 2 minutes) / Attention, with the
       error and the command to run.
 - [x] Offline machines stay visible but dimmed, with input disabled.
-- [ ] Remote projects: path field with completion from that machine.
+- [x] Remote projects: Open Folder asks for the machine when there are others (This Mac uses
+      the folder picker), then a path field completed from that machine's folders (t3code's
+      `filesystem.browse`). Settings › Machines has Add Project… per connected machine.
 - [x] Per-machine agents: install, log in, defaults (Settings › Agents has a machine picker).
 - [ ] Managed Node for npm agents when the machine has none (Zed's `node_runtime`).
 - [ ] Repository identity from each server, as t3code does:
@@ -566,3 +568,4 @@ Then the server:
 - 2026-10-03: Phase 9: the SSH transport, Linux server builds, and the app working with
   several machines at once: a client per machine, Settings › Machines, per-machine agents,
   offline dimming. Connected to `devbox1` and `t3-home`.
+- 2026-10-03: Phase 9: adding projects on other machines, with folder completion.

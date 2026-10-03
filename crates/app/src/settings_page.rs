@@ -52,6 +52,7 @@ pub fn init(cx: &mut App) {
 
 pub enum SettingsPageEvent {
     Close,
+    AddProject(MachineId),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1805,6 +1806,15 @@ impl SettingsPage {
                     Button::new(element_id("retry"), "Retry")
                         .style(ButtonStyle::Outlined)
                         .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry())),
+                )
+            })
+            .when(is_online && machine != MachineId::Local, |controls| {
+                controls.child(
+                    Button::new(element_id("add-project"), "Add Project…")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(SettingsPageEvent::AddProject(machine))
+                        })),
                 )
             })
             .when_some(profile.cloned(), |controls, profile| {
