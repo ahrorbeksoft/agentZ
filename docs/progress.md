@@ -22,8 +22,8 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 7. Terminals | Done |
 | 8. Terminal agent detection | Done |
 | 9. Machines over SSH | Done |
-| 10. Polish | In progress |
-| 11. Workspaces view | Not started |
+| 10. Polish | Done |
+| 11. Workspaces view | In progress |
 
 ## 0. Spike
 
@@ -658,6 +658,7 @@ Then the server:
   machines, through the app.
 - 2026-10-03: Phase 9: npm agents install on machines without Node.js.
 - 2026-10-03: Finished phase 9.
+- 2026-10-03: Finished phase 10: Stop Server, start at login, the app bundle.
 - 2026-10-03: Added phase 11, the Workspaces view (herdr's workspaces, tabs and panes) next to
   the Agents view, at the user's request.
 - 2026-10-03: The user settled phase 11's questions:
