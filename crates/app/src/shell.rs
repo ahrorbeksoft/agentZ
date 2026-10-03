@@ -464,10 +464,6 @@ impl Shell {
                 let subscription =
                     cx.subscribe_in(&page, window, |this, _, event, window, cx| match event {
                         SettingsPageEvent::Close => this.close_settings(window, cx),
-                        SettingsPageEvent::AddProject(machine) => {
-                            this.close_settings(window, cx);
-                            this.open_add_project_modal(Some(*machine), window, cx);
-                        }
                         SettingsPageEvent::EditMachine(profile) => {
                             this.open_machine_modal(profile.as_ref(), window, cx)
                         }

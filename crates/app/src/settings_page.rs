@@ -18,8 +18,8 @@ use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, DropdownMenu, IconPosition, PopoverMenu, Switch, Tooltip, WithScrollbar as _,
-    prelude::*,
+    ContextMenu, ContextMenuEntry, DropdownMenu, IconPosition, PopoverMenu, Switch, Tooltip,
+    WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -58,7 +58,6 @@ pub fn init(cx: &mut App) {
 
 pub enum SettingsPageEvent {
     Close,
-    AddProject(MachineId),
     /// Open the Add Machine dialog, or Edit… for the machine given.
     EditMachine(Option<MachineProfile>),
 }
@@ -2101,8 +2100,14 @@ impl SettingsPage {
                                     client.update(cx, |client, _| client.retry())
                                 }
                             });
-                        let menu = menu
-                            .when_some(retry, |menu, retry| menu.entry("Retry Now", None, retry));
+                        let menu = menu.when_some(retry, |menu, retry| {
+                            menu.item(
+                                ContextMenuEntry::new("Retry Now")
+                                    .icon(IconName::RotateCw)
+                                    .icon_color(Color::Muted)
+                                    .handler(retry),
+                            )
+                        });
                         let Some(profile) = profile.clone() else {
                             let restart = {
                                 let this = this.clone();
@@ -2114,17 +2119,13 @@ impl SettingsPage {
                                 }
                             };
                             return menu.when(is_online, |menu| {
-                                menu.entry("Restart Server…", None, restart)
+                                menu.item(
+                                    ContextMenuEntry::new("Restart Server…")
+                                        .icon(IconName::ArrowCircle)
+                                        .icon_color(Color::Muted)
+                                        .handler(restart),
+                                )
                             });
-                        };
-                        let add_project = {
-                            let this = this.clone();
-                            move |_: &mut Window, cx: &mut App| {
-                                this.update(cx, |_, cx| {
-                                    cx.emit(SettingsPageEvent::AddProject(machine))
-                                })
-                                .log_err();
-                            }
                         };
                         let edit = {
                             let this = this.clone();
@@ -2150,12 +2151,19 @@ impl SettingsPage {
                                 .log_err();
                             }
                         };
-                        menu.when(is_online, |menu| {
-                            menu.entry("Add Project…", None, add_project)
-                        })
-                        .entry("Edit…", None, edit)
+                        menu.item(
+                            ContextMenuEntry::new("Edit…")
+                                .icon(IconName::Pencil)
+                                .icon_color(Color::Muted)
+                                .handler(edit),
+                        )
                         .separator()
-                        .entry("Remove…", None, remove)
+                        .item(
+                            ContextMenuEntry::new("Remove…")
+                                .icon(IconName::Trash)
+                                .icon_color(Color::Muted)
+                                .handler(remove),
+                        )
                     }))
                 })
                 .trigger_with_tooltip(
