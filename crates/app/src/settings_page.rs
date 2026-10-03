@@ -775,19 +775,22 @@ impl SettingsPage {
                 _ => ("Connecting…".into(), false),
             };
         let is_stopped = *server_client.status() == MachineStatus::Stopped;
-        let update_button = (is_connected && server_client.can_update_server()).then(|| {
+        // One action applies at a time: an outdated server is updated (which keeps its
+        // terminals), and a current one can only be restarted.
+        let can_update =
+            is_connected && server_client.is_outdated() && server_client.can_update_server();
+        let server_button = if is_stopped {
+            let local = local.clone();
+            Button::new("start-server", "Start Server")
+                .style(ButtonStyle::Outlined)
+                .on_click(move |_, _, cx| local.update(cx, |client, _| client.retry()))
+        } else if can_update {
             let local = local.clone();
             Button::new("update-server", "Update Server")
                 .style(ButtonStyle::Outlined)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.update_server(local.clone(), window, cx)
                 }))
-        });
-        let server_button = if is_stopped {
-            let local = local.clone();
-            Button::new("start-server", "Start Server")
-                .style(ButtonStyle::Outlined)
-                .on_click(move |_, _, cx| local.update(cx, |client, _| client.retry()))
         } else {
             Button::new("restart-server", "Restart Server")
                 .style(ButtonStyle::Outlined)
@@ -814,11 +817,7 @@ impl SettingsPage {
                     render_row(
                         "Background server",
                         server_description,
-                        h_flex()
-                            .gap_2()
-                            .children(update_button)
-                            .child(server_button)
-                            .into_any_element(),
+                        h_flex().gap_2().child(server_button).into_any_element(),
                         cx,
                     ),
                     render_row(
