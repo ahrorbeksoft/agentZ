@@ -317,6 +317,10 @@ impl ServerClient {
         }
     }
 
+    pub fn spaces(&self) -> &SpacesSnapshot {
+        &self.spaces
+    }
+
     fn set_spaces(&mut self, spaces: SpacesSnapshot, cx: &mut Context<Self>) {
         if spaces != self.spaces {
             self.spaces = spaces;

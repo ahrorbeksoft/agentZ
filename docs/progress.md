@@ -317,7 +317,8 @@ Then the server:
 
 ## 11. Workspaces view
 
-- [ ] Title bar tabs: **Agents** (the current app, a thread full screen) | **Workspaces**.
+- [x] Title bar tabs: **Agents** (the current app, a thread full screen) | **Workspaces**
+      (`shell.rs`, `spaces_view.rs`).
 - [x] Server: workspaces (machine plus folder), tabs, and pane trees (herdr's `TileLayout`).
       They're called spaces in code (`agentz_protocol::spaces`, `Request::Spaces`), since a
       thread's workspace is its checkout. Panes hold a terminal of their own
@@ -328,23 +329,27 @@ Then the server:
   - [x] restored after a restart, terminals as new shells in their folders, threads
         reattached;
   - [x] streamed to clients (`SessionSnapshot::spaces`, `Event::Spaces`).
-- [ ] Workspaces sidebar:
-  - [ ] search;
-  - [ ] **+** picker: a project checkout, worktree or pasture, or a machine's home folder;
-  - [ ] rows with rolled-up state, name, branch and ahead/behind.
+- [x] Workspaces sidebar:
+  - [x] search;
+  - [x] **+** picker (`new_space_picker.rs`): a project checkout, worktree or pasture, or a
+        machine's home folder;
+  - [x] rows with rolled-up state (herdr's order: blocked, unseen finished, working), name,
+        branch and ahead/behind. Double-click renames, drag reorders, right-click menu.
 - [ ] Agents list at the bottom of the sidebar:
   - [ ] every agent on every machine;
   - [ ] slim rows like the Archived shelf;
   - [ ] state, machine, workspace, tab, agent;
   - [ ] clicking a row focuses its pane, or opens it in Agents when it isn't in one.
-- [ ] Tabs: new, rename, close, reorder, next/previous.
+- [ ] Tabs: new, rename, close, reorder, next/previous. All but the next/previous keys are
+      done (the actions exist, unbound).
 - [ ] Panes:
-  - [ ] split right/down;
-  - [ ] drag to resize;
-  - [ ] zoom, swap, close;
-  - [ ] focus by click and keyboard.
-- [ ] A pane can hold a shell, an agent CLI, or an ACP thread (new or existing). The thread is
-      the same one shown in Agents.
+  - [x] split right/down (Zed's split menu in the pane header, and its right-click menu);
+  - [x] drag to resize (`SetSplitRatio` on drop);
+  - [x] zoom, swap (drag a pane's header onto another), close;
+  - [ ] focus by click and keyboard: click done; the keyboard actions exist, unbound.
+- [x] A pane can hold a shell, an agent CLI, or an ACP thread (new or existing). The thread is
+      the same one shown in Agents. The pane menu: Show a Shell, New Thread…, Show Thread ›,
+      Open in Agents.
 - [ ] A terminal shown in two places follows the size of the view last interacted with.
 - [ ] Mac-style shortcuts for herdr's actions, for example:
   - [ ] Cmd-T new tab;
@@ -673,3 +678,7 @@ Then the server:
   - Mac-style direct shortcuts;
   - the agents list shows every agent on every machine;
   - workspaces live on the server and are restored after restarts.
+- 2026-10-03: Phase 11, step 3: the app's Workspaces view (title-bar tabs, the workspaces
+  sidebar and **+** picker, tab bar, pane tree with resizing, zoom, swap and close, pane
+  menus). Not yet checked on screen. Left for step 4: the agents list, key bindings, the
+  headless layout test, screenshots.

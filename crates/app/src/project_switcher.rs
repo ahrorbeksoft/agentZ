@@ -461,7 +461,7 @@ impl Render for ProjectSwitcher {
 
 /// Case-insensitive subsequence match, returning the byte positions of the matched characters;
 /// `query` must already be lowercase.
-fn fuzzy_match(query: &str, candidate: &str) -> Option<Vec<usize>> {
+pub(crate) fn fuzzy_match(query: &str, candidate: &str) -> Option<Vec<usize>> {
     let mut positions = Vec::new();
     let mut candidate_chars = candidate.char_indices();
     for query_char in query.chars() {

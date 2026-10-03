@@ -9,7 +9,10 @@ use gpui::{
     PathPromptOptions, Subscription, SystemNotification, Window, WindowControlArea,
 };
 use projects::Thread;
-use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
+use ui::{
+    ButtonLike, PopoverMenu, PopoverMenuHandle, ToggleButtonGroup, ToggleButtonGroupSize,
+    ToggleButtonSimple, Tooltip, prelude::*,
+};
 use util::ResultExt as _;
 
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
@@ -22,6 +25,7 @@ use crate::project_switcher::ProjectSwitcher;
 use crate::server_client::MachineStatus;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
+use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::{NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher};
@@ -29,6 +33,13 @@ use crate::{NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitch
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 /// Leaves room for the macOS traffic lights.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
+
+/// The title bar's tabs: one thread full screen, or herdr's workspaces of panes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MainView {
+    Agents,
+    Workspaces,
+}
 
 /// An open thread. Kept while the app runs so its agent keeps working in the background.
 struct OpenThread {
@@ -83,7 +94,11 @@ impl ThreadView {
 pub struct Shell {
     focus_handle: FocusHandle,
     machines: Entity<Machines>,
+    view: MainView,
     sidebar: Entity<Sidebar>,
+    spaces_view: Entity<SpacesView>,
+    /// The pane New Thread's thread goes in, when it was asked for from one.
+    thread_target: Option<PaneKey>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
     add_project_modal: Option<(Entity<AddProjectModal>, Vec<Subscription>)>,
@@ -103,7 +118,23 @@ impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let machines = Machines::global(cx);
         let sidebar = cx.new(Sidebar::new);
+        let spaces_view = cx.new(|cx| SpacesView::new(window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(
+                &spaces_view,
+                window,
+                |this, _, event, window, cx| match event {
+                    SpacesViewEvent::OpenThread(thread) => this.open_thread(*thread, window, cx),
+                    SpacesViewEvent::NewThreadInPane {
+                        pane,
+                        project,
+                        folder,
+                    } => {
+                        this.open_new_thread_modal(*project, folder.clone(), window, cx);
+                        this.thread_target = Some(*pane);
+                    }
+                },
+            ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
                 // Close views (and stop their agents) for threads that were deleted, removed
                 // along with their project, or whose machine was removed. Archived threads stay
@@ -200,7 +231,10 @@ impl Shell {
         Self {
             focus_handle: cx.focus_handle(),
             machines,
+            view: MainView::Agents,
             sidebar,
+            spaces_view,
+            thread_target: None,
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
             add_project_modal: None,
@@ -259,8 +293,16 @@ impl Shell {
             }),
             cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
                 NewThreadModalEvent::ThreadCreated(thread_id) => {
+                    let target = this.thread_target.take();
                     this.dismiss_modal(window, cx);
-                    this.open_thread(*thread_id, window, cx);
+                    match target {
+                        Some(pane) if pane.machine == thread_id.machine => {
+                            this.spaces_view.update(cx, |view, cx| {
+                                view.show_thread_in_pane(pane, thread_id.thread, cx)
+                            })
+                        }
+                        _ => this.open_thread(*thread_id, window, cx),
+                    }
                 }
                 NewThreadModalEvent::OpenAgentSettings => {
                     this.dismiss_modal(window, cx);
@@ -282,9 +324,9 @@ impl Shell {
 
     /// Shows the active thread's changes when they're wanted, and tells the views.
     fn sync_diff_panel(&mut self, cx: &mut Context<Self>) {
-        let thread_id = self
-            .active_thread
-            .filter(|_| self.show_diff && self.settings_page.is_none());
+        let thread_id = self.active_thread.filter(|_| {
+            self.show_diff && self.settings_page.is_none() && self.view == MainView::Agents
+        });
         match thread_id {
             Some(key) => {
                 let is_current = self.diff_panel.as_ref().is_some_and(|panel| {
@@ -346,13 +388,7 @@ impl Shell {
         if self.settings_page.take().is_none() {
             return;
         }
-        match self
-            .active_thread
-            .and_then(|thread_id| self.open_threads.get(&thread_id))
-        {
-            Some(open_thread) => window.focus(&open_thread.view.focus_handle(cx), cx),
-            None => window.focus(&self.focus_handle, cx),
-        }
+        self.focus_main(window, cx);
         self.mark_active_thread_viewed(window, cx);
         self.sync_diff_panel(cx);
     }
@@ -366,6 +402,11 @@ impl Shell {
 
     fn open_thread(&mut self, thread_id: ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page = None;
+        if self.view != MainView::Agents {
+            self.view = MainView::Agents;
+            self.spaces_view
+                .update(cx, |view, cx| view.set_visible(false, window, cx));
+        }
         if !self.open_threads.contains_key(&thread_id) {
             let Some(open_thread) = self.start_thread(thread_id, window, cx) else {
                 return;
@@ -395,17 +436,21 @@ impl Shell {
     }
 
     /// Whether the user can see the thread right now, as Zed's `agent_status_visible` decides.
-    fn is_thread_visible(&self, thread_id: ThreadKey, window: &Window) -> bool {
-        window.is_window_active()
-            && self.settings_page.is_none()
-            && self.active_thread == Some(thread_id)
+    fn is_thread_visible(&self, thread_id: ThreadKey, window: &Window, cx: &App) -> bool {
+        if !window.is_window_active() || self.settings_page.is_some() {
+            return false;
+        }
+        match self.view {
+            MainView::Agents => self.active_thread == Some(thread_id),
+            MainView::Workspaces => self.spaces_view.read(cx).shows_thread(thread_id, cx),
+        }
     }
 
     fn mark_active_thread_viewed(&self, window: &Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.active_thread else {
             return;
         };
-        if self.is_thread_visible(thread_id, window) {
+        if self.view == MainView::Agents && self.is_thread_visible(thread_id, window, cx) {
             if let Some(store) = self.machines.read(cx).projects(thread_id.machine, cx) {
                 store.update(cx, |store, cx| store.mark_viewed(thread_id.thread, cx));
             }
@@ -421,7 +466,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_thread_visible(thread_id, window) {
+        if self.is_thread_visible(thread_id, window, cx) {
             return;
         }
         let machines = self.machines.read(cx);
@@ -512,16 +557,40 @@ impl Shell {
     fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let had_new_thread_modal = self.new_thread_modal.take().is_some();
         let had_add_project_modal = self.add_project_modal.take().is_some();
+        self.thread_target = None;
         if had_new_thread_modal || had_add_project_modal {
-            match self
+            self.focus_main(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Focus goes back to what the main area shows.
+    fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.view {
+            MainView::Agents => match self
                 .active_thread
                 .and_then(|thread_id| self.open_threads.get(&thread_id))
             {
                 Some(open_thread) => window.focus(&open_thread.view.focus_handle(cx), cx),
                 None => window.focus(&self.focus_handle, cx),
-            }
-            cx.notify();
+            },
+            MainView::Workspaces => self
+                .spaces_view
+                .update(cx, |view, cx| view.focus_active(window, cx)),
         }
+    }
+
+    fn set_view(&mut self, view: MainView, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_page = None;
+        if self.view != view {
+            self.view = view;
+            self.spaces_view.update(cx, |spaces_view, cx| {
+                spaces_view.set_visible(view == MainView::Workspaces, window, cx)
+            });
+        }
+        self.focus_main(window, cx);
+        self.mark_active_thread_viewed(window, cx);
+        self.sync_diff_panel(cx);
     }
 
     /// With other machines, asks which machine the project is on first.
@@ -637,6 +706,34 @@ impl Shell {
             ),
         };
         let shell = cx.entity().downgrade();
+        let view_tabs = {
+            let agents = shell.clone();
+            let workspaces = shell.clone();
+            ToggleButtonGroup::single_row(
+                "main-view",
+                [
+                    ToggleButtonSimple::new("Agents", move |_, window, cx| {
+                        agents
+                            .update(cx, |shell, cx| shell.set_view(MainView::Agents, window, cx))
+                            .ok();
+                    }),
+                    ToggleButtonSimple::new("Workspaces", move |_, window, cx| {
+                        workspaces
+                            .update(cx, |shell, cx| {
+                                shell.set_view(MainView::Workspaces, window, cx)
+                            })
+                            .ok();
+                    }),
+                ],
+            )
+            .size(ToggleButtonGroupSize::Default)
+            .auto_width()
+            .selected_index(match self.view {
+                MainView::Agents => 0,
+                MainView::Workspaces => 1,
+            })
+        };
+        let shows_switcher = self.view == MainView::Agents;
 
         h_flex()
             .id("title-bar")
@@ -671,56 +768,66 @@ impl Shell {
                 }
             })
             .child(
-                // Keeps a press on the switcher from starting a window drag.
+                // Keeps a press on the tabs from starting a window drag.
                 div()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        PopoverMenu::new("project-switcher")
-                            .with_handle(self.switcher_handle.clone())
-                            .menu(move |window, cx| {
-                                let shell = shell.clone();
-                                let open_project_settings =
-                                    move |project_id, window: &mut Window, cx: &mut App| {
-                                        shell
-                                            .update(cx, |shell, cx| {
-                                                shell.open_project_settings(project_id, window, cx)
-                                            })
-                                            .ok();
-                                    };
-                                Some(cx.new(|cx| {
-                                    ProjectSwitcher::new(open_project_settings, window, cx)
-                                }))
-                            })
-                            .trigger_with_tooltip(
-                                ButtonLike::new("project-switcher-trigger").child(
-                                    h_flex()
-                                        .px_1()
-                                        .gap_1p5()
-                                        .child(scope_icon)
-                                        .child(Label::new(scope_label).size(LabelSize::Small))
-                                        .children(scope_machines.map(|label| {
-                                            Label::new(label)
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted)
-                                        }))
-                                        .child(
-                                            Icon::new(IconName::ChevronDown)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Muted),
-                                        ),
-                                ),
-                                |_, cx| {
-                                    Tooltip::for_action(
-                                        "Switch Project",
-                                        &ToggleProjectSwitcher,
-                                        cx,
-                                    )
-                                },
-                            )
-                            .anchor(gpui::Anchor::TopLeft)
-                            .offset(gpui::point(px(0.), px(4.))),
-                    ),
+                    .child(view_tabs),
             )
+            .when(shows_switcher, |title_bar| {
+                title_bar.child(
+                    // Keeps a press on the switcher from starting a window drag.
+                    div()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            PopoverMenu::new("project-switcher")
+                                .with_handle(self.switcher_handle.clone())
+                                .menu(move |window, cx| {
+                                    let shell = shell.clone();
+                                    let open_project_settings =
+                                        move |project_id, window: &mut Window, cx: &mut App| {
+                                            shell
+                                                .update(cx, |shell, cx| {
+                                                    shell.open_project_settings(
+                                                        project_id, window, cx,
+                                                    )
+                                                })
+                                                .ok();
+                                        };
+                                    Some(cx.new(|cx| {
+                                        ProjectSwitcher::new(open_project_settings, window, cx)
+                                    }))
+                                })
+                                .trigger_with_tooltip(
+                                    ButtonLike::new("project-switcher-trigger").child(
+                                        h_flex()
+                                            .px_1()
+                                            .gap_1p5()
+                                            .child(scope_icon)
+                                            .child(Label::new(scope_label).size(LabelSize::Small))
+                                            .children(scope_machines.map(|label| {
+                                                Label::new(label)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted)
+                                            }))
+                                            .child(
+                                                Icon::new(IconName::ChevronDown)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            ),
+                                    ),
+                                    |_, cx| {
+                                        Tooltip::for_action(
+                                            "Switch Project",
+                                            &ToggleProjectSwitcher,
+                                            cx,
+                                        )
+                                    },
+                                )
+                                .anchor(gpui::Anchor::TopLeft)
+                                .offset(gpui::point(px(0.), px(4.))),
+                        ),
+                )
+            })
             .child(div().flex_1())
             .children(self.render_connection_status(cx))
     }
@@ -801,6 +908,7 @@ impl Render for Shell {
             .active_thread
             .and_then(|thread_id| self.open_threads.get(&thread_id))
             .map(|open_thread| open_thread.view.clone());
+        let shows_workspaces = self.view == MainView::Workspaces && settings_page.is_none();
 
         v_flex()
             .key_context("Shell")
@@ -817,38 +925,43 @@ impl Render for Shell {
             .font_ui(cx)
             .text_ui(cx)
             .child(self.render_title_bar(cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    // Settings brings its own navigation in place of the thread list.
-                    .when(settings_page.is_none(), |row| {
-                        row.child(self.sidebar.clone())
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(SIDEBAR_WIDTH)
-                            .h_full()
-                            .bg(main_background)
-                            .map(|main| match (settings_page, active_view) {
-                                (Some(page), _) => main.child(page),
-                                (None, Some(view)) => main.child(view.into_any_element()),
-                                (None, None) => main.child(render_no_thread_selected()),
-                            }),
-                    )
-                    .when_some(diff_panel, |row, panel| {
-                        row.child(
+            .when(shows_workspaces, |shell| {
+                shell.child(div().flex_1().min_h_0().child(self.spaces_view.clone()))
+            })
+            .when(!shows_workspaces, |shell| {
+                shell.child(
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        // Settings brings its own navigation in place of the thread list.
+                        .when(settings_page.is_none(), |row| {
+                            row.child(self.sidebar.clone())
+                        })
+                        .child(
                             div()
-                                .w(DIFF_PANEL_WIDTH)
-                                .flex_none()
+                                .flex_1()
+                                .min_w(SIDEBAR_WIDTH)
                                 .h_full()
-                                .border_l_1()
-                                .border_color(border)
-                                .child(panel),
+                                .bg(main_background)
+                                .map(|main| match (settings_page, active_view) {
+                                    (Some(page), _) => main.child(page),
+                                    (None, Some(view)) => main.child(view.into_any_element()),
+                                    (None, None) => main.child(render_no_thread_selected()),
+                                }),
                         )
-                    }),
-            )
+                        .when_some(diff_panel, |row, panel| {
+                            row.child(
+                                div()
+                                    .w(DIFF_PANEL_WIDTH)
+                                    .flex_none()
+                                    .h_full()
+                                    .border_l_1()
+                                    .border_color(border)
+                                    .child(panel),
+                            )
+                        }),
+                )
+            })
             .when_some(
                 self.new_thread_modal
                     .as_ref()

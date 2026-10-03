@@ -343,26 +343,6 @@ impl Sidebar {
             )
     }
 
-    fn agent_icon(&self, machine: MachineId, thread: &Thread, cx: &App) -> Icon {
-        let registry = self
-            .machines
-            .read(cx)
-            .client(machine, cx)
-            .map(|client| client.read(cx).registry().clone());
-        thread
-            .agent_id
-            .as_ref()
-            .and_then(|agent_id| {
-                registry?
-                    .read(cx)
-                    .agent(&AgentId::new(agent_id.clone()))?
-                    .icon_path()
-                    .cloned()
-            })
-            .map(Icon::from_external_svg)
-            .unwrap_or_else(|| Icon::new(IconName::Terminal))
-    }
-
     /// Clicking opens the thread; double-clicking renames it, as in t3code.
     fn thread_click_handler(
         &self,
@@ -729,7 +709,7 @@ impl Sidebar {
         let is_active = self.active_thread == Some(thread_id);
         let is_renaming = self.renaming_thread == Some(thread_id);
         let thread_status = store.read(cx).thread_status(thread.id);
-        let icon = self.agent_icon(machine, &thread, cx);
+        let icon = thread_agent_icon(self.machines.read(cx), machine, &thread, cx);
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let machines = self.machines.read(cx);
         // With one project selected, every card would repeat it, so the project line goes and
@@ -1691,6 +1671,31 @@ mod tests {
             "now"
         );
     }
+}
+
+/// The icon of the agent a thread runs, from its machine's registry. A terminal thread's is a
+/// terminal.
+pub(crate) fn thread_agent_icon(
+    machines: &Machines,
+    machine: MachineId,
+    thread: &Thread,
+    cx: &App,
+) -> Icon {
+    let registry = machines
+        .client(machine, cx)
+        .map(|client| client.read(cx).registry().clone());
+    thread
+        .agent_id
+        .as_ref()
+        .and_then(|agent_id| {
+            registry?
+                .read(cx)
+                .agent(&AgentId::new(agent_id.clone()))?
+                .icon_path()
+                .cloned()
+        })
+        .map(Icon::from_external_svg)
+        .unwrap_or_else(|| Icon::new(IconName::Terminal))
 }
 
 /// t3code's status pill: a dot and a label in the status color.
