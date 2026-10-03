@@ -23,6 +23,9 @@ use crate::terminals::{Terminal, TerminalSize, TerminalSpawn, frame_changes};
 
 /// Screens are sent at most this often, however fast the output.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// A terminal thread's output counts as activity at most this often: a busy terminal
+/// shouldn't save the threads on every frame.
+const TERMINAL_ACTIVITY_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(super) struct RunningTerminal {
     /// Tells this run's events from an earlier run's, after a restart.
@@ -38,6 +41,11 @@ pub(super) struct RunningTerminal {
     /// For a pane's or terminal thread's terminal: the agent CLI running in it and its state.
     /// A thread's drawer isn't watched.
     tracker: Option<AgentTracker>,
+    /// For a terminal thread: the process group last in front, to look up what runs there
+    /// only when it changes.
+    foreground_group: Option<u32>,
+    /// When the terminal's output last counted as its thread's activity.
+    activity_recorded_at: Option<Instant>,
 }
 
 /// The server's terminal bookkeeping.
@@ -247,6 +255,8 @@ impl Server {
                 released: false,
                 content: 0,
                 tracker,
+                foreground_group: None,
+                activity_recorded_at: None,
             },
         );
         self.terminal_changed(key);
@@ -260,7 +270,8 @@ impl Server {
         }
         match key {
             TerminalKey::Thread(thread_id) => {
-                self.publish_terminal_agent(*thread_id, None, AgentState::Unknown)
+                self.publish_terminal_agent(*thread_id, None, AgentState::Unknown);
+                self.projects.set_terminal_command(*thread_id, None);
             }
             TerminalKey::Pane(pane) => self.spaces.set_pane_agent(*pane, None),
             TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
@@ -283,14 +294,29 @@ impl Server {
             return;
         }
         if running.terminal.handle_event(event) {
+            let now = Instant::now();
             running.content += 1;
             if let Some(tracker) = &mut running.tracker {
-                tracker.content_changed(Instant::now());
+                tracker.content_changed(now);
             }
+            let active_thread = match key {
+                TerminalKey::Thread(thread_id)
+                    if running.activity_recorded_at.is_none_or(|recorded| {
+                        now.duration_since(recorded) >= TERMINAL_ACTIVITY_INTERVAL
+                    }) =>
+                {
+                    running.activity_recorded_at = Some(now);
+                    Some(thread_id)
+                }
+                _ => None,
+            };
             let pane_exited = match key {
                 TerminalKey::Pane(pane) => running.terminal.exit().is_some().then_some(pane),
                 _ => None,
             };
+            if let Some(thread_id) = active_thread {
+                self.projects.record_thread_activity(thread_id);
+            }
             self.terminal_changed(key);
             // herdr closes a pane when its process ends.
             if let Some(pane) = pane_exited {
@@ -319,6 +345,9 @@ impl Server {
         self.terminals.detection_scheduled = false;
         let now = Instant::now();
         let mut published = Vec::new();
+        // Terminal threads whose foreground changed, and the program now there unless it's
+        // the shell.
+        let mut foregrounds = Vec::new();
         let mut next_tick: Option<Duration> = None;
         for (key, running) in &mut self.terminals.running {
             let Some(tracker) = &mut running.tracker else {
@@ -328,10 +357,25 @@ impl Server {
                 if let Some(state) = tracker.exited() {
                     published.push((key.clone(), None, state));
                 }
+                if let TerminalKey::Thread(thread_id) = key
+                    && running.foreground_group.take().is_some()
+                {
+                    foregrounds.push((*thread_id, None));
+                }
                 continue;
             }
             let mut update = None;
             let process_group_id = running.terminal.foreground_process_group_id();
+            if let TerminalKey::Thread(thread_id) = key
+                && process_group_id != running.foreground_group
+            {
+                running.foreground_group = process_group_id;
+                let program = process_group_id
+                    .and_then(detect::process::group_leader)
+                    .filter(|leader| !detect::is_shell(leader))
+                    .map(|leader| leader.argv0.unwrap_or(leader.name));
+                foregrounds.push((*thread_id, program));
+            }
             if tracker.should_probe(now, process_group_id) {
                 let leader = process_group_id.and_then(detect::process::group_leader);
                 let agent = leader.as_ref().and_then(Agent::of_process);
@@ -369,6 +413,16 @@ impl Server {
             }
             let tick = tracker.next_tick();
             next_tick = Some(next_tick.map_or(tick, |next| next.min(tick)));
+        }
+        for (thread_id, program) in foregrounds {
+            // A thread started with a command runs it until it exits, whatever its shell
+            // shows in front.
+            let command = self
+                .projects
+                .thread(thread_id)
+                .and_then(|thread| thread.terminal.as_ref()?.command.clone());
+            self.projects
+                .set_terminal_command(thread_id, command.or(program));
         }
         for (key, agent, state) in published {
             match key {

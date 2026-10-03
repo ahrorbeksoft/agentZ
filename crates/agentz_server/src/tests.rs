@@ -1930,6 +1930,63 @@ impl TestClient {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_threads_show_what_runs_in_them() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = match client
+        .ok(Request::CreateTerminalThread {
+            project_id,
+            command: TerminalCommand { command: None },
+            workspace: Default::default(),
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => thread_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let snapshot = |client: &TestClient| client.projects.clone().expect("projects");
+    let last_activity = move |client: &TestClient| {
+        snapshot(client)
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .and_then(|thread| thread.last_activity_at)
+    };
+    let command = move |client: &TestClient| {
+        snapshot(client)
+            .terminal_commands
+            .iter()
+            .find(|(id, _)| *id == thread_id)
+            .map(|(_, command)| command.clone())
+    };
+    let created_activity = last_activity(&client);
+    assert!(created_activity.is_some());
+
+    // The shell's output counts as the thread's activity.
+    let key = TerminalKey::Thread(thread_id);
+    client.subscribe_terminal(key.clone()).await;
+    client
+        .wait_until(move |client| last_activity(client) > created_activity)
+        .await;
+    assert_eq!(command(&client), None);
+
+    // A program in front of the shell is running there, until it ends.
+    client.type_into(&key, "sleep 30\n").await;
+    client
+        .wait_until(move |client| command(client).as_deref() == Some("sleep"))
+        .await;
+    client.type_into(&key, "\x03").await;
+    client
+        .wait_until(move |client| command(client).is_none())
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn terminal_threads_stream_their_screens_to_watchers() {
     let Some(server) = TestServer::start() else {

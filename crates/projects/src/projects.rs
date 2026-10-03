@@ -301,6 +301,8 @@ pub struct ProjectsSnapshot {
     pub blocked_threads: Vec<ThreadId>,
     /// Terminal threads running an agent CLI, with its name. The rest are plain shells.
     pub terminal_agents: Vec<(ThreadId, String)>,
+    /// Terminal threads running a program in front of their shell, with its name.
+    pub terminal_commands: Vec<(ThreadId, String)>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -334,6 +336,8 @@ pub struct ProjectStore {
     blocked_threads: HashSet<ThreadId>,
     /// Terminal threads running an agent CLI, by its name. Not persisted either.
     terminal_agents: BTreeMap<ThreadId, String>,
+    /// Terminal threads running a program in front of their shell. Not persisted either.
+    terminal_commands: BTreeMap<ThreadId, String>,
     /// Counts changes, so the owner can tell whether a call changed anything.
     revision: u64,
     saver: Option<Saver<PersistedState>>,
@@ -362,6 +366,7 @@ impl ProjectStore {
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
             terminal_agents: BTreeMap::new(),
+            terminal_commands: BTreeMap::new(),
             revision: 0,
             saver: state_path.map(|path| Saver::new(path, "projects-saver")),
         };
@@ -573,6 +578,8 @@ impl ProjectStore {
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_agents
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
+        self.terminal_commands
+            .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
         }
@@ -750,6 +757,7 @@ impl ProjectStore {
                 self.working_threads.remove(&id);
                 self.blocked_threads.remove(&id);
                 self.terminal_agents.remove(&id);
+                self.terminal_commands.remove(&id);
             }
             self.changed();
         }
@@ -943,6 +951,25 @@ impl ProjectStore {
         }
     }
 
+    /// The program a terminal thread runs in front of its shell, if any.
+    pub fn terminal_command(&self, id: ThreadId) -> Option<&str> {
+        self.terminal_commands.get(&id).map(String::as_str)
+    }
+
+    /// Records the program a terminal thread runs in front of its shell, or that the shell is.
+    pub fn set_terminal_command(&mut self, id: ThreadId, command: Option<String>) {
+        let changed = match command {
+            Some(command) if self.thread(id).is_some() => {
+                self.terminal_commands.insert(id, command.clone()) != Some(command)
+            }
+            Some(_) => false,
+            None => self.terminal_commands.remove(&id).is_some(),
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
     pub fn record_thread_activity(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.last_activity_at = Some(SystemTime::now());
@@ -969,6 +996,11 @@ impl ProjectStore {
                 .iter()
                 .map(|(id, agent)| (*id, agent.clone()))
                 .collect(),
+            terminal_commands: self
+                .terminal_commands
+                .iter()
+                .map(|(id, command)| (*id, command.clone()))
+                .collect(),
         }
     }
 
@@ -988,6 +1020,7 @@ impl ProjectStore {
         this.working_threads = snapshot.working_threads.into_iter().collect();
         this.blocked_threads = snapshot.blocked_threads.into_iter().collect();
         this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
+        this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
         this
     }
 
