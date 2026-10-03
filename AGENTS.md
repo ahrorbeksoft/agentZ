@@ -100,8 +100,9 @@ From Zed's guidelines, which this code follows:
 - **Unit and integration:** `agent_thread` tests drive the real mock agent process (login, logout,
   reload, defaults, history replay). Extend the mock when you need a protocol feature; it speaks
   JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp` (or
-  `mcp <tool> <json>`), `slow`, `demo`, `write <path> <text>` and `delete <path>` script
-  different turns (see its docstring).
+  `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>` and `delete <path>` script
+  different turns (see its docstring). With `MOCK_LOGIN_FILE` in its env it needs a login, and
+  offers every kind: plain, terminal, browser (a page to open), API key and gateway.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.

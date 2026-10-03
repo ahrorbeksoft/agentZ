@@ -160,6 +160,53 @@ pub struct PermissionRequest {
     pub options: Vec<PermissionOption>,
 }
 
+/// A request for input from the agent (ACP's `elicitation/create`), waiting on the user.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Elicitation {
+    /// The thread's own id for it, to answer with.
+    pub id: u64,
+    pub request: acp::CreateElicitationRequest,
+    /// The user opened its URL (which answered it), and the agent hasn't said it's done yet.
+    #[serde(default)]
+    pub opened: bool,
+}
+
+impl Elicitation {
+    /// The URL to open, for a URL elicitation.
+    pub fn url(&self) -> Option<&str> {
+        match &self.request.mode {
+            acp::ElicitationMode::Url(url) => Some(&url.url),
+            _ => None,
+        }
+    }
+}
+
+/// The account an agent says it's logged in to, from its `_auth/status_update` notifications
+/// (Claude Agent and Codex send them). Kept as the agent words it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AuthStatus {
+    /// `none` when logged out; otherwise how it's logged in (`account`, `api_key`, …).
+    pub kind: String,
+    pub label: Option<String>,
+    pub account: Option<AuthAccount>,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AuthAccount {
+    pub email: Option<String>,
+    pub plan: Option<String>,
+    pub organization: Option<String>,
+}
+
+impl AuthStatus {
+    pub fn is_logged_in(&self) -> bool {
+        !self.kind.is_empty() && self.kind != "none"
+    }
+}
+
 /// How the thread's ACP session was set up when the agent started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionRestore {
@@ -196,6 +243,22 @@ pub struct ThreadState {
     pub capabilities: acp::AgentCapabilities,
     pub auth_methods: Vec<acp::AuthMethod>,
     pub auth_error: Option<SharedString>,
+    /// What the agent said when it asked for a login, if more than "authentication
+    /// required": Factory Droid gives its pairing code here.
+    pub auth_description: Option<SharedString>,
+    /// The login method whose `authenticate` is in flight. Browser logins wait in it until
+    /// the user finishes in the browser.
+    pub authenticating: Option<acp::AuthMethodId>,
+    /// Links the agent printed while logging in. They are how to finish when the agent's
+    /// machine can't open a browser itself (a remote machine).
+    pub auth_links: Vec<SharedString>,
+    /// A one-time code the agent printed while logging in, to enter on the page it links to
+    /// (a device login).
+    pub auth_code: Option<SharedString>,
+    /// The account the agent reported, if it reports one.
+    pub auth_status: Option<AuthStatus>,
+    /// Requests for input from the agent, oldest first.
+    pub elicitations: Vec<Elicitation>,
     /// The command the agent was started with, for its terminal login methods.
     pub command: Option<AgentCommand>,
     pub cwd: PathBuf,
@@ -329,6 +392,47 @@ impl ThreadView {
         self.state.auth_error.as_ref()
     }
 
+    pub fn auth_description(&self) -> Option<&SharedString> {
+        self.state.auth_description.as_ref()
+    }
+
+    /// The login method being authenticated, while `authenticate` is in flight.
+    pub fn authenticating(&self) -> Option<&acp::AuthMethod> {
+        let method_id = self.state.authenticating.as_ref()?;
+        self.state
+            .auth_methods
+            .iter()
+            .find(|method| method.id() == method_id)
+    }
+
+    pub fn is_authenticating(&self) -> bool {
+        self.state.authenticating.is_some()
+    }
+
+    pub fn auth_links(&self) -> &[SharedString] {
+        &self.state.auth_links
+    }
+
+    pub fn auth_code(&self) -> Option<&SharedString> {
+        self.state.auth_code.as_ref()
+    }
+
+    /// Whether the agent is waiting on the user to answer a request for input.
+    pub fn is_awaiting_input(&self) -> bool {
+        self.state
+            .elicitations
+            .iter()
+            .any(|elicitation| !elicitation.opened)
+    }
+
+    pub fn auth_status(&self) -> Option<&AuthStatus> {
+        self.state.auth_status.as_ref()
+    }
+
+    pub fn elicitations(&self) -> &[Elicitation] {
+        &self.state.elicitations
+    }
+
     /// What happened on the last log in or out of an account connection.
     pub fn account_notice(&self) -> Option<&SharedString> {
         self.state.account_notice.as_ref()
@@ -429,6 +533,99 @@ impl ThreadView {
     }
 }
 
+/// What a login method takes from the user before `authenticate`, as its `_meta` says. Agents
+/// read it back from `authenticate`'s `_meta` under the same key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginInput {
+    /// Nothing: the agent logs in by itself, often in a browser on its machine.
+    Nothing,
+    /// An API key: `_meta["api-key"]` (Codex's `api-key`), answered with
+    /// `{"api-key": {"apiKey": …}}`, which Antigravity also reads.
+    ApiKey,
+    /// An LLM gateway: `_meta["gateway"]` (Claude Agent's and Codex's), answered with
+    /// `{"gateway": {"baseUrl": …, "headers": {…}}}`.
+    Gateway,
+}
+
+pub fn login_input(method: &acp::AuthMethod) -> LoginInput {
+    let Some(meta) = method.meta() else {
+        return LoginInput::Nothing;
+    };
+    if meta.contains_key("api-key") {
+        LoginInput::ApiKey
+    } else if meta.contains_key("gateway") {
+        LoginInput::Gateway
+    } else {
+        LoginInput::Nothing
+    }
+}
+
+/// `authenticate`'s `_meta` for an [`LoginInput::ApiKey`] method.
+pub fn api_key_meta(api_key: &str) -> acp::Meta {
+    acp::Meta::from_iter([(
+        "api-key".to_string(),
+        serde_json::json!({ "apiKey": api_key }),
+    )])
+}
+
+/// `authenticate`'s `_meta` for a [`LoginInput::Gateway`] method.
+pub fn gateway_meta(base_url: &str, headers: &[(String, String)]) -> acp::Meta {
+    let headers: serde_json::Map<String, serde_json::Value> = headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone().into()))
+        .collect();
+    acp::Meta::from_iter([(
+        "gateway".to_string(),
+        serde_json::json!({ "baseUrl": base_url, "headers": headers }),
+    )])
+}
+
+/// A one-time code in what an agent says while logging in, as device logins print one ("Enter
+/// this one-time code: ABCD-1234"). Only in text that talks about a code, and only a word shaped
+/// like one: two or three groups of capitals and digits joined by dashes.
+pub fn login_code(text: &str) -> Option<String> {
+    let text = strip_ansi_escapes(text);
+    if !text.to_lowercase().contains("code") {
+        return None;
+    }
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphanumeric()))
+        .find(|word| is_login_code(word))
+        .map(str::to_string)
+}
+
+fn is_login_code(word: &str) -> bool {
+    let groups: Vec<&str> = word.split('-').collect();
+    (2..=3).contains(&groups.len())
+        && groups.iter().all(|group| {
+            (3..=8).contains(&group.len())
+                && group
+                    .chars()
+                    .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+        })
+}
+
+/// Text without the terminal color and cursor sequences agents put in what they print.
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\u{1b}' {
+            stripped.push(character);
+            continue;
+        }
+        if characters.peek() == Some(&'[') {
+            characters.next();
+            for character in characters.by_ref() {
+                if character.is_ascii_alphabetic() || character == '~' {
+                    break;
+                }
+            }
+        }
+    }
+    stripped
+}
+
 /// Whether the login method runs in a terminal rather than through ACP's `authenticate`.
 pub fn logs_in_through_terminal(method: &acp::AuthMethod) -> bool {
     matches!(method, acp::AuthMethod::Terminal(_)) || meta_terminal_auth(method).is_some()
@@ -519,6 +716,29 @@ mod tests {
     }
 
     #[test]
+    fn login_codes() {
+        assert_eq!(
+            login_code(
+                "2. Enter this one-time code (expires in 15 minutes)   \u{1b}[94mQXJ7-4KDM\u{1b}[0m"
+            )
+            .as_deref(),
+            Some("QXJ7-4KDM")
+        );
+        assert_eq!(
+            login_code("First copy your one-time code: WDJB-MJHT.").as_deref(),
+            Some("WDJB-MJHT")
+        );
+        // Words shaped like codes, without talk of a code, and words that only look close.
+        assert_eq!(login_code("Logging in to ABCD-EFGH"), None);
+        assert_eq!(login_code("The code is UTF-8 encoded"), None);
+        assert_eq!(
+            login_code("code at https://auth.openai.com/codex/device"),
+            None
+        );
+        assert_eq!(login_code("Enter the code abcd-efgh"), None);
+    }
+
+    #[test]
     fn thread_updates_carry_only_what_changed() {
         let mut client = ThreadView::default();
         let mut server = ThreadView::default();
@@ -550,6 +770,38 @@ mod tests {
         assert_eq!(update.entry_count, 0);
         client.apply(update);
         assert_eq!(client, server);
+    }
+
+    /// The shapes Codex, Claude Agent and Antigravity read.
+    #[test]
+    fn logins_take_what_their_meta_asks_for() {
+        let method = |meta: serde_json::Value| {
+            acp::AuthMethod::Agent(
+                acp::AuthMethodAgent::new("id", "Name")
+                    .meta(serde_json::from_value::<acp::Meta>(meta).expect("meta is an object")),
+            )
+        };
+        let api_key = method(serde_json::json!({"api-key": {"provider": "openai"}}));
+        assert_eq!(login_input(&api_key), LoginInput::ApiKey);
+        let gateway = method(serde_json::json!({"gateway": {"protocol": "anthropic"}}));
+        assert_eq!(login_input(&gateway), LoginInput::Gateway);
+        let browser = acp::AuthMethod::Agent(acp::AuthMethodAgent::new("chat-gpt", "ChatGPT"));
+        assert_eq!(login_input(&browser), LoginInput::Nothing);
+
+        assert_eq!(
+            serde_json::Value::Object(api_key_meta("sk-1")),
+            serde_json::json!({"api-key": {"apiKey": "sk-1"}})
+        );
+        assert_eq!(
+            serde_json::Value::Object(gateway_meta(
+                "https://gateway.example.com",
+                &[("Authorization".into(), "Bearer 1".into())]
+            )),
+            serde_json::json!({"gateway": {
+                "baseUrl": "https://gateway.example.com",
+                "headers": {"Authorization": "Bearer 1"}
+            }})
+        );
     }
 
     #[test]

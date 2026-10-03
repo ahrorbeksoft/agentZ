@@ -31,12 +31,14 @@ pub enum ThreadStatus {
     /// The agent finished a turn this client hasn't displayed yet.
     Completed,
     Working,
+    /// The agent asked for input (ACP's elicitation) that the user hasn't given yet.
+    AwaitingInput,
     /// A permission request is waiting.
     PendingApproval,
 }
 
 pub enum ProjectStoreEvent {
-    /// The thread finished a turn or started waiting for a permission answer.
+    /// The thread finished a turn, or started waiting for a permission answer or input.
     NeedsAttention(ThreadId, ThreadStatus),
 }
 
@@ -93,6 +95,8 @@ impl ProjectStore {
             for thread in store.threads() {
                 let became_blocked =
                     store.is_thread_blocked(thread.id) && !self.store.is_thread_blocked(thread.id);
+                let became_awaiting_input = store.is_thread_awaiting_input(thread.id)
+                    && !self.store.is_thread_awaiting_input(thread.id);
                 // A subthread's requests are answered in its top-level thread, and its
                 // completion is the parent's business.
                 if thread.task.is_some() {
@@ -116,6 +120,11 @@ impl ProjectStore {
                         thread.id,
                         ThreadStatus::PendingApproval,
                     ));
+                } else if became_awaiting_input {
+                    cx.emit(ProjectStoreEvent::NeedsAttention(
+                        thread.id,
+                        ThreadStatus::AwaitingInput,
+                    ));
                 } else if completed {
                     cx.emit(ProjectStoreEvent::NeedsAttention(
                         thread.id,
@@ -133,6 +142,9 @@ impl ProjectStore {
     pub fn thread_status(&self, id: ThreadId) -> Option<ThreadStatus> {
         if self.store.is_thread_or_subthread_blocked(id) {
             return Some(ThreadStatus::PendingApproval);
+        }
+        if self.store.is_thread_awaiting_input(id) {
+            return Some(ThreadStatus::AwaitingInput);
         }
         if self
             .store
@@ -480,4 +492,68 @@ fn write_viewed(path: &std::path::Path, viewed: &BTreeMap<u64, SystemTime>) -> R
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json).with_context(|| format!("writing {}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    #[gpui::test]
+    fn a_thread_waiting_for_input_asks_for_attention(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            )
+        });
+        let project_store = client.read_with(cx, |client, _| client.projects().clone());
+        let attention = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let attention = attention.clone();
+            cx.subscribe(&project_store, move |_, event: &ProjectStoreEvent, _| {
+                let ProjectStoreEvent::NeedsAttention(id, status) = event;
+                attention.borrow_mut().push((*id, *status));
+            })
+            .detach();
+        });
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = projects::ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let thread = store.add_thread(project, "Thread", None).expect("thread");
+        let show = |store: &projects::ProjectStore, cx: &mut TestAppContext| {
+            project_store.update(cx, |project_store, cx| {
+                project_store.set_snapshot(store.snapshot(), cx);
+                project_store.thread_status(thread)
+            })
+        };
+        assert_eq!(show(&store, cx), None);
+
+        store.set_thread_awaiting_input(thread, true);
+        assert_eq!(show(&store, cx), Some(ThreadStatus::AwaitingInput));
+
+        // A permission request is more pressing than a question.
+        store.set_thread_blocked(thread, true);
+        assert_eq!(show(&store, cx), Some(ThreadStatus::PendingApproval));
+
+        store.set_thread_blocked(thread, false);
+        store.set_thread_awaiting_input(thread, false);
+        assert_eq!(show(&store, cx), None);
+        assert_eq!(
+            *attention.borrow(),
+            vec![
+                (thread, ThreadStatus::AwaitingInput),
+                (thread, ThreadStatus::PendingApproval),
+            ]
+        );
+    }
 }

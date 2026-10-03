@@ -384,6 +384,24 @@ pub enum Request {
     Authenticate {
         connection: ConnectionId,
         method_id: acp::AuthMethodId,
+        /// What the method takes from the user, such as an API key or a gateway, in the shape
+        /// the agent reads from `authenticate`'s `_meta`.
+        #[serde(default)]
+        meta: Option<acp::Meta>,
+    },
+    /// Gives up on the `authenticate` in flight, restarting the agent: browser logins don't
+    /// return until the user finishes.
+    CancelAuthentication(ConnectionId),
+    RespondToElicitation {
+        connection: ConnectionId,
+        elicitation: u64,
+        action: acp::ElicitationAction,
+    },
+    /// Hides an opened URL elicitation the agent never said was done. It was answered when
+    /// opened, so the agent hears nothing.
+    DismissElicitation {
+        connection: ConnectionId,
+        elicitation: u64,
     },
     /// Runs one of the agent's terminal login methods in [`TerminalKey::Login`] on the server's
     /// machine, where the agent keeps its login. The agent restarts once the login exits

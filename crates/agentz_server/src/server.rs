@@ -600,8 +600,30 @@ impl Server {
             Request::Authenticate {
                 connection,
                 method_id,
+                meta,
             } => {
-                self.update_thread(connection, |thread| thread.authenticate(method_id))?;
+                self.update_thread(connection, |thread| thread.authenticate(method_id, meta))?;
+                Ok(Response::Ok)
+            }
+            Request::CancelAuthentication(connection) => {
+                self.update_thread(connection, |thread| thread.cancel_authentication())?;
+                Ok(Response::Ok)
+            }
+            Request::RespondToElicitation {
+                connection,
+                elicitation,
+                action,
+            } => {
+                self.update_thread(connection, |thread| {
+                    thread.respond_to_elicitation(elicitation, action)
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::DismissElicitation {
+                connection,
+                elicitation,
+            } => {
+                self.update_thread(connection, |thread| thread.dismiss_elicitation(elicitation))?;
                 Ok(Response::Ok)
             }
             Request::TerminalLogin {
@@ -1223,6 +1245,8 @@ impl Server {
         for (thread_id, thread) in &self.threads {
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());
+            self.projects
+                .set_thread_awaiting_input(*thread_id, thread.is_awaiting_input());
         }
         let projects = &self.projects;
         let accounts = &self.accounts;

@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::agent_icons::agent_icon;
 use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
@@ -27,12 +28,18 @@ use util::ResultExt as _;
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::Request;
-use agentz_protocol::thread::{ConnectionStatus, logs_in_through_terminal};
+use agentz_protocol::thread::{AuthStatus, ConnectionStatus};
 
 use std::collections::BTreeMap;
 
-use crate::agent_view::{TOOLBAR_HEIGHT, render_login_terminal, start_terminal_login};
+use crate::agent_login::{AgentLogin, LoginLayout};
+use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::app_settings::{AppSettingsStore, MachineProfile, ThemeMode};
+use crate::confirm_dialog::ConfirmRequest;
+use crate::controls::{
+    ActionButton, ActionStyle, account_badge, avatar, icon_tile, spinner, status_badge, status_dot,
+};
+use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machine_icon_picker::MachineIconPicker;
 use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfoStore, automatic_monogram, monogram_swatch, render_project_icon,
@@ -42,7 +49,6 @@ use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
-use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
 
 const KEY_CONTEXT: &str = "SettingsPage";
@@ -64,6 +70,8 @@ pub enum SettingsPageEvent {
     Close,
     /// Open the Add Machine dialog, or Edit… for the machine given.
     EditMachine(Option<MachineProfile>),
+    /// Ask before a destructive action, in the shell's modal layer.
+    Confirm(ConfirmRequest),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1100,16 +1108,37 @@ impl SettingsPage {
     /// The page's title (Zed's back button and breadcrumb on a sub-page) and the machine whose
     /// agents it shows.
     fn render_agents_header(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let page_title: Option<SharedString> = match &self.agents_page {
-            AgentsPage::Installed => None,
-            AgentsPage::Registry => Some("ACP Registry".into()),
-            AgentsPage::Agent(panel) => Some(panel.connection.read(cx).agent_name().clone()),
-        };
-        let heading = match page_title {
-            None => Headline::new("Agents")
+        let colors = cx.theme().colors().clone();
+        let heading = match &self.agents_page {
+            AgentsPage::Installed => Headline::new("Agents")
                 .size(HeadlineSize::Small)
                 .into_any_element(),
-            Some(page_title) => h_flex()
+            // The agent's own heading follows, so a plain way back is enough.
+            AgentsPage::Agent(_) => h_flex()
+                .id("agents-back")
+                .debug_selector(|| "agents-back".into())
+                .ml_neg_1p5()
+                .px_1p5()
+                .py_0p5()
+                .gap_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(colors.ghost_element_hover))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.show_agents_page(AgentsPage::Installed, window, cx)
+                }))
+                .child(
+                    Icon::new(IconName::ArrowLeft)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Agents")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            AgentsPage::Registry => h_flex()
                 .min_w_0()
                 .ml_neg_1p5()
                 .gap_1()
@@ -1134,7 +1163,7 @@ impl SettingsPage {
                         .size(HeadlineSize::Small)
                         .color(Color::Muted),
                 )
-                .child(Headline::new(page_title).size(HeadlineSize::Small))
+                .child(Headline::new("ACP Registry").size(HeadlineSize::Small))
                 .into_any_element(),
         };
         let machine = if !self.machines.read(cx).has_remotes() {
@@ -1601,100 +1630,215 @@ impl SettingsPage {
         })
     }
 
-    /// One agent's page: what it is, its account, the defaults new threads start with, and its
-    /// environment.
+    /// One agent's page: what it is and whether it's logged in, over tabs for its account, the
+    /// defaults new threads start with, and its environment.
     fn render_agent_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(panel) = self.account() else {
             return Vec::new();
         };
-        let registry = self.registry(cx);
-        let listing = registry.read(cx).agent(&panel.agent_id).cloned();
-        let mut sections = Vec::new();
-        sections.extend(listing.map(|agent| self.render_agent_about(&agent, cx)));
-        sections.push(render_section(
-            "Account",
-            vec![
-                div()
-                    .px_4()
-                    .py_3()
-                    .child(self.render_account_panel(cx))
-                    .into_any_element(),
-            ],
-            cx,
-        ));
-        sections.push(self.render_agent_defaults(window, cx));
-        sections.push(self.render_agent_env(cx));
-        sections
+        let listing = self.registry(cx).read(cx).agent(&panel.agent_id).cloned();
+        let content = match panel.tab {
+            AgentTab::Account => self.render_account_tab(cx),
+            AgentTab::Defaults => self.render_agent_defaults(window, cx),
+            AgentTab::Environment => self.render_agent_env(cx),
+        };
+        vec![
+            v_flex()
+                .gap(px(22.))
+                .child(self.render_agent_heading(listing.as_ref(), cx))
+                .child(self.render_agent_tabs(panel.tab, cx))
+                .into_any_element(),
+            content,
+        ]
     }
 
-    /// The agent's icon, name, version and description, its links, Uninstall, and Update when
-    /// there's a newer version.
-    fn render_agent_about(&self, agent: &AgentListing, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let id = agent.id().clone();
-        let name = agent.name().clone();
-        let (version, update_available) =
-            installed_version(agent).unwrap_or_else(|| match agent.install_state {
-                InstallState::Installing => ("Installing…".into(), false),
-                _ => ("Not installed".into(), false),
-            });
-        let uninstall = {
-            let id = id.clone();
-            let name = name.clone();
-            cx.listener(move |this, _, window, cx| this.confirm_uninstall(&id, &name, window, cx))
+    /// The agent's icon, its name beside whether it's logged in, its version, description and
+    /// links, Update when there's a newer version, and a menu with Uninstall.
+    fn render_agent_heading(
+        &self,
+        listing: Option<&AgentListing>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(panel) = self.account() else {
+            return div().into_any_element();
         };
+        let colors = cx.theme().colors().clone();
+        let status_colors = cx.theme().status().clone();
+        let connection = panel.connection.read(cx);
+        let id = panel.agent_id.clone();
+        let name = listing
+            .map(|agent| agent.name().clone())
+            .unwrap_or_else(|| connection.agent_name().clone());
+        let (badge_label, badge_color) = match AccountState::of(connection) {
+            AccountState::Connecting => ("Starting…", colors.text_muted),
+            AccountState::Failed => ("Couldn't start", status_colors.error),
+            AccountState::LoggingIn => ("Logging in…", colors.text_accent),
+            AccountState::LoggedIn => ("Logged in", status_colors.success),
+            AccountState::LoggedOut => ("Not logged in", status_colors.warning),
+        };
+        let (version, update_available) = listing
+            .and_then(installed_version)
+            .map_or((None, false), |(version, update_available)| {
+                (Some(version), update_available)
+            });
+        let description = listing
+            .map(|agent| agent.description().clone())
+            .filter(|description| !description.trim().is_empty());
+        let links = listing
+            .map(|agent| render_agent_text_links(agent, cx))
+            .unwrap_or_default();
+
+        let mut details: Vec<AnyElement> = Vec::new();
+        details.extend(version.map(|version| {
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .child(version)
+                .into_any_element()
+        }));
+        details.extend(description.map(|description| {
+            div()
+                .id("agent-description")
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(description.clone())
+                .tooltip(Tooltip::text(description))
+                .into_any_element()
+        }));
+        details.extend(links);
+        let detail_count = details.len();
+        let details = details.into_iter().enumerate().flat_map(|(index, detail)| {
+            let separator =
+                (index + 1 < detail_count).then(|| div().flex_none().child("·").into_any_element());
+            std::iter::once(detail).chain(separator)
+        });
+
+        let icon = match agent_icon(&id, cx) {
+            Some(markup) => Icon::from_svg_markup(markup),
+            None => Icon::new(IconName::Sparkle),
+        };
+        let menu_name = name.clone();
+        let menu_id = id.clone();
+        let page = cx.weak_entity();
+        let menu = PopoverMenu::new("agent-menu")
+            .menu(move |window, cx| {
+                let page = page.clone();
+                let id = menu_id.clone();
+                let name = menu_name.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry(format!("Uninstall {name}…"), None, move |window, cx| {
+                        page.update(cx, |page, cx| {
+                            page.confirm_uninstall(&id, &name, window, cx)
+                        })
+                        .log_err();
+                    })
+                }))
+            })
+            .trigger_with_tooltip(
+                IconButton::new("agent-menu-trigger", IconName::Ellipsis)
+                    .style(ButtonStyle::Outlined)
+                    .size(ButtonSize::Medium)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted),
+                Tooltip::text("More"),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .offset(gpui::point(px(0.), px(4.)));
+
         h_flex()
-            .px_4()
-            .py_3()
-            .gap_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.panel_background)
-            .child(render_agent_tile(agent.id(), px(40.), cx))
+            .gap_4()
+            .child(icon_tile(icon.color(Color::Default), px(52.), cx))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_0p5()
+                    .gap_1()
                     .child(
                         h_flex()
                             .min_w_0()
                             .gap_2()
-                            .child(Label::new(name).truncate())
                             .child(
-                                Label::new(version)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(rems_from_px(18_f32))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(name),
+                            )
+                            .child(status_badge(badge_label, badge_color)),
                     )
-                    .when(!agent.description().is_empty(), |column| {
-                        column.child(
-                            Label::new(agent.description().clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    }),
-            )
-            .child(
-                h_flex()
-                    .flex_none()
-                    .gap_1()
-                    .children(render_agent_links(agent))
                     .child(
-                        IconButton::new("agent-uninstall", IconName::Trash)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Uninstall…"))
-                            .on_click(uninstall),
-                    )
-                    .when(update_available, |buttons| {
-                        buttons.child(
-                            Button::new("agent-update", "Update")
-                                .style(ButtonStyle::Tinted(TintColor::Accent))
-                                .on_click(self.install_listener(&id, cx)),
-                        )
-                    }),
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .text_size(rems_from_px(12_f32))
+                            .text_color(colors.text_muted)
+                            .children(details),
+                    ),
+            )
+            .when(update_available, |row| {
+                row.child(
+                    ActionButton::new("agent-update", "Update")
+                        .style(ActionStyle::Primary)
+                        .on_click(self.install_listener(&id, cx)),
+                )
+            })
+            .child(menu)
+            .into_any_element()
+    }
+
+    /// Account, Defaults and Environment, underlined when chosen.
+    fn render_agent_tabs(&self, current: AgentTab, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        h_flex()
+            .gap_5()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .children(
+                [
+                    (AgentTab::Account, "Account"),
+                    (AgentTab::Defaults, "Defaults"),
+                    (AgentTab::Environment, "Environment"),
+                ]
+                .into_iter()
+                .map(|(tab, label)| {
+                    let is_current = tab == current;
+                    let selector = format!("agent-tab-{}", label.to_lowercase());
+                    div()
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector)
+                        .pb(px(10.))
+                        // Over the strip's border, so the underline replaces it.
+                        .mb(px(-1.))
+                        .border_b_2()
+                        .border_color(if is_current {
+                            colors.text_accent
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .text_size(rems_from_px(13_f32))
+                        .text_color(if is_current {
+                            colors.text
+                        } else {
+                            colors.text_muted
+                        })
+                        .when(!is_current, |this| {
+                            this.cursor_pointer()
+                                .hover(|style| style.text_color(colors.text))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(panel) = this.account_mut() {
+                                        panel.tab = tab;
+                                    }
+                                    this.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                                    cx.notify();
+                                }))
+                        })
+                        .child(label)
+                }),
             )
             .into_any_element()
     }
@@ -1746,9 +1890,26 @@ impl SettingsPage {
         let account_agent_id = id.clone();
         let connection =
             cx.new(|cx| AgentThread::open_account(client.clone(), account_agent_id, name, cx));
+        let login = cx
+            .new(|cx| AgentLogin::new(connection.clone(), LoginLayout::Rows, Some(id.clone()), cx));
         // The server remembers the options and modes the agent offers, and logins made in
         // the panel.
-        let subscription = cx.observe(&connection, |_, _, cx| cx.notify());
+        let subscription = cx.observe(&connection, |this, connection, cx| {
+            if let Some(panel) = this.account_mut() {
+                sync_elicitation_cards(&mut panel.elicitation_cards, &connection, cx);
+                let thread = connection.read(cx);
+                let was_authenticating =
+                    std::mem::replace(&mut panel.was_authenticating, thread.is_authenticating());
+                // A finished login settles the account change.
+                if was_authenticating
+                    && !thread.is_authenticating()
+                    && thread.auth_error().is_none()
+                {
+                    panel.changing_account = false;
+                }
+            }
+            cx.notify()
+        });
         let env_rows = agent_settings
             .env
             .iter()
@@ -1756,8 +1917,12 @@ impl SettingsPage {
             .collect();
         let panel = AccountPanel {
             agent_id: id.clone(),
+            tab: AgentTab::Account,
             connection,
-            login_terminal: None,
+            login,
+            elicitation_cards: Vec::new(),
+            changing_account: false,
+            was_authenticating: false,
             env_rows,
             _subscriptions: [subscription],
         };
@@ -2067,213 +2232,267 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    /// The agent's own ways to log in (the same ones a thread offers when it needs a login), and
-    /// ACP's logout when the agent supports it.
-    fn render_account_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The account card: who the agent is logged in as, with Change Account and Log Out; or
+    /// that it isn't, with a row for each way it offers to log in; or the login in progress.
+    /// The page a login asks to open shows in the card, other requests for input under it.
+    fn render_account_tab(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(account) = self.account() else {
             return div().into_any_element();
         };
+        let colors = cx.theme().colors().clone();
+        let status_colors = cx.theme().status().clone();
         let connection = account.connection.read(cx);
         let agent_name = connection.agent_name().clone();
-        let status = connection.status().clone();
-        let mut buttons: Vec<AnyElement> = Vec::new();
-        let (message, color): (SharedString, Color) = match &status {
-            ConnectionStatus::Connecting => {
-                (format!("Talking to {agent_name}…").into(), Color::Muted)
-            }
-            ConnectionStatus::Failed(error) => (error.clone(), Color::Error),
-            ConnectionStatus::Ready | ConnectionStatus::AuthRequired => {
-                for method in connection.auth_methods() {
-                    let is_terminal = logs_in_through_terminal(method);
-                    let (method_id, method_name, description) = match method {
-                        acp::AuthMethod::Agent(method) => (
-                            method.id.clone(),
-                            method.name.clone(),
-                            method.description.clone(),
-                        ),
-                        acp::AuthMethod::Terminal(method) => (
-                            method.id.clone(),
-                            method.name.clone(),
-                            method.description.clone(),
-                        ),
-                        _ => continue,
-                    };
-                    buttons.push(
-                        Button::new(
-                            SharedString::from(format!("account-auth-{}", method_id.0)),
-                            method_name.clone(),
-                        )
-                        .style(ButtonStyle::Outlined)
-                        .when_some(description, |button, description| {
-                            button.tooltip(Tooltip::text(description))
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.log_in(method_id.clone(), is_terminal, window, cx)
-                        }))
-                        .into_any_element(),
-                    );
-                }
-                if connection.supports_logout() && connection.logged_in() == Some(true) {
-                    buttons.push(
-                        Button::new("account-logout", "Log Out")
-                            .style(ButtonStyle::Outlined)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(account) = this.account_mut() {
-                                    account
-                                        .connection
-                                        .update(cx, |connection, cx| connection.logout(cx));
-                                }
-                            }))
-                            .into_any_element(),
-                    );
-                }
-                if let Some(error) = connection.auth_error() {
-                    (error.clone(), Color::Error)
-                } else if buttons.is_empty() {
-                    (
-                        format!("{agent_name} doesn't offer logging in or out from agentZ.").into(),
-                        Color::Muted,
-                    )
-                } else {
-                    (
-                        format!("{agent_name} keeps its login for every thread.").into(),
-                        Color::Muted,
-                    )
-                }
-            }
+        let state = AccountState::of(connection);
+        let has_auth_methods = !connection.auth_methods().is_empty();
+        let can_log_out = connection.supports_logout();
+        let auth_status = connection
+            .auth_status()
+            .filter(|status| status.is_logged_in())
+            .cloned();
+        let auth_error = connection.auth_error().cloned();
+        let failure = match connection.status() {
+            ConnectionStatus::Failed(error) => Some(error.clone()),
+            _ => None,
         };
-        // ACP can't say which account is logged in, only whether a session opens; the method is
-        // the one last used from agentZ.
+        // Agents that don't report their account leave the method last used from agentZ.
         let login_method = connection
             .client()
             .read(cx)
             .agent_settings(&account.agent_id.0)
             .login_method;
-        let (status_icon, status_text, status_color): (IconName, SharedString, Color) =
-            match (&status, connection.logged_in()) {
-                (ConnectionStatus::Failed(_), _) => {
-                    (IconName::XCircle, "Couldn't start".into(), Color::Error)
+        let machine = self.machines.read(cx).label(self.agents_machine, cx);
+        let check_again = IconButton::new("account-check", IconName::RotateCw)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text("Check Again"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(account) = this.account_mut() {
+                    account
+                        .connection
+                        .update(cx, |connection, cx| connection.check_login(cx));
                 }
-                (_, Some(true)) => (
-                    IconName::Check,
-                    match login_method.as_deref().and_then(login_method_subject) {
-                        Some(subject) => format!("Logged in with {subject}").into(),
-                        None => "Logged in".into(),
-                    },
-                    Color::Success,
-                ),
-                (_, Some(false)) => (IconName::Warning, "Not logged in".into(), Color::Warning),
-                _ => (
-                    IconName::LoadCircle,
-                    "Checking whether it's logged in…".into(),
-                    Color::Muted,
-                ),
-            };
-        let can_check = matches!(
-            status,
-            ConnectionStatus::Ready | ConnectionStatus::AuthRequired
-        );
-        let agent_info = connection.agent_info().map(|info| {
-            let name = info.title.clone().unwrap_or_else(|| info.name.clone());
-            format!("{name} {}", info.version)
-        });
-        v_flex()
-            .gap_2()
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(
-                        Icon::new(status_icon)
-                            .size(IconSize::Small)
-                            .color(status_color),
-                    )
-                    .child(Label::new(status_text).color(status_color))
-                    .children(agent_info.map(|info| {
-                        Label::new(format!("· {info}"))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                    }))
-                    .child(div().flex_1())
-                    .when(can_check, |row| {
-                        row.child(
-                            Button::new("account-check", "Check Again")
-                                .style(ButtonStyle::Subtle)
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(account) = this.account_mut() {
-                                        account.connection.update(cx, |connection, cx| {
-                                            connection.check_login(cx)
-                                        });
-                                    }
+            }))
+            .into_any_element();
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut shows_login = false;
+        match state {
+            AccountState::Connecting => rows.push(render_status_row(
+                spinner(Color::Muted),
+                format!("Checking whether {agent_name} is logged in…").into(),
+                None,
+                Vec::new(),
+            )),
+            AccountState::Failed => rows.push(render_status_row(
+                status_dot(status_colors.error).into_any_element(),
+                format!("Couldn't start {agent_name}").into(),
+                failure.map(|error| (error, Color::Error)),
+                vec![
+                    ActionButton::new("account-retry", "Try Again")
+                        .on_click(cx.listener(|this, _, window, cx| this.reopen_agent(window, cx)))
+                        .into_any_element(),
+                ],
+            )),
+            AccountState::LoggingIn => shows_login = true,
+            AccountState::LoggedOut => {
+                let subtitle = match auth_error {
+                    Some(error) => (error, Color::Error),
+                    None if has_auth_methods => (
+                        format!(
+                            "Choose how {agent_name} logs in. Every thread with it shares the \
+                             login."
+                        )
+                        .into(),
+                        Color::Muted,
+                    ),
+                    None => (
+                        format!(
+                            "{agent_name} doesn't offer logging in from agentZ. Log in where it \
+                             runs, then check again."
+                        )
+                        .into(),
+                        Color::Muted,
+                    ),
+                };
+                rows.push(render_status_row(
+                    status_dot(status_colors.warning).into_any_element(),
+                    "Not logged in".into(),
+                    Some(subtitle),
+                    vec![check_again],
+                ));
+                shows_login = has_auth_methods;
+            }
+            AccountState::LoggedIn => {
+                let email = auth_status
+                    .as_ref()
+                    .and_then(|status| status.account.as_ref())
+                    .and_then(|account| account.email.clone());
+                let title: SharedString = match &email {
+                    Some(email) => email.clone().into(),
+                    None => logged_in_title(auth_status.as_ref(), login_method.as_deref()),
+                };
+                let details = auth_status
+                    .as_ref()
+                    .map(account_details)
+                    .filter(|details| !details.is_empty())
+                    .map(|details| SharedString::from(details.join(" · ")));
+                let mut actions = Vec::new();
+                if has_auth_methods {
+                    actions.push(if account.changing_account {
+                        ActionButton::new("account-change", "Cancel")
+                            .style(ActionStyle::Ghost)
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.set_changing_account(false, cx)),
+                            )
+                            .into_any_element()
+                    } else {
+                        ActionButton::new("account-change", "Change Account")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.set_changing_account(true, cx)),
+                            )
+                            .into_any_element()
+                    });
+                }
+                if can_log_out && !account.changing_account {
+                    actions.push(
+                        ActionButton::new("account-logout", "Log Out")
+                            .style(ActionStyle::Ghost)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.confirm_logout(window, cx)),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                rows.push(
+                    h_flex()
+                        .px_4()
+                        .py_3()
+                        .gap_3()
+                        .child(match &email {
+                            Some(email) => avatar(email, cx),
+                            None => account_badge(cx),
+                        })
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(Label::new(title).truncate())
+                                .children(details.map(|details| {
+                                    Label::new(details)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate()
                                 })),
                         )
-                    }),
+                        .children(actions)
+                        .into_any_element(),
+                );
+                shows_login = account.changing_account;
+            }
+        }
+        let cards: Vec<AnyElement> = account
+            .elicitation_cards
+            .iter()
+            .map(|card| card.clone().into_any_element())
+            .collect();
+
+        v_flex()
+            .gap_5()
+            .child(
+                v_flex()
+                    .debug_selector(|| "account-card".into())
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel_background)
+                    .overflow_hidden()
+                    .children(rows)
+                    .when(shows_login, |card| card.child(account.login.clone())),
             )
-            .child(Label::new(message).size(LabelSize::Small).color(color))
-            .when(!buttons.is_empty(), |panel| {
-                panel.child(h_flex().flex_wrap().gap_2().children(buttons))
+            .when(state == AccountState::LoggedIn, |tab| {
+                tab.child(
+                    Label::new(format!(
+                        "Every thread with {agent_name} on {machine} uses this login."
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
             })
-            .children(render_login_terminal(account.login_terminal.as_ref(), cx))
+            .children(cards)
             .into_any_element()
     }
 
-    /// Agent methods log in through the agent; terminal methods run in a terminal on the
-    /// agent's machine, as a thread's do.
-    fn log_in(
-        &mut self,
-        method_id: acp::AuthMethodId,
-        is_terminal: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(account) = self.account_mut() else {
-            return;
-        };
-        if is_terminal {
-            start_terminal_login(
-                &account.connection,
-                method_id,
-                &mut account.login_terminal,
-                window,
-                cx,
-            );
-        } else {
-            account
-                .connection
-                .update(cx, |connection, cx| connection.authenticate(method_id, cx));
+    fn set_changing_account(&mut self, changing_account: bool, cx: &mut Context<Self>) {
+        if let Some(account) = self.account_mut() {
+            account.changing_account = changing_account;
         }
         cx.notify();
+    }
+
+    /// Starts the agent again for its page, on the tab that was open.
+    fn reopen_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.account() else {
+            return;
+        };
+        let id = account.agent_id.clone();
+        let tab = account.tab;
+        let name = account.connection.read(cx).agent_name().clone();
+        self.open_agent(&id, &name, window, cx);
+        if let Some(account) = self.account_mut() {
+            account.tab = tab;
+        }
+    }
+
+    /// Asks first, as t3code does: logging out affects every thread with the agent.
+    fn confirm_logout(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.account() else {
+            return;
+        };
+        let agent_name = account.connection.read(cx).agent_name().clone();
+        let page = cx.weak_entity();
+        cx.emit(SettingsPageEvent::Confirm(ConfirmRequest::logout(
+            &agent_name,
+            move |_, cx| {
+                page.update(cx, |page, cx| {
+                    if let Some(account) = page.account_mut() {
+                        account.changing_account = false;
+                        account
+                            .connection
+                            .update(cx, |connection, cx| connection.logout(cx));
+                    }
+                })
+                .log_err();
+            },
+        )));
     }
 
     fn confirm_uninstall(
         &mut self,
         id: &AgentId,
         name: &SharedString,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("Uninstall {name}?"),
-            Some("Threads that use it can't continue until it's installed again."),
-            &["Uninstall", "Cancel"],
-            cx,
-        );
         let registry = self.registry(cx);
         let id = id.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            registry.update(cx, |registry, cx| registry.uninstall(&id, cx));
-            this.update_in(cx, |this, window, cx| {
-                if this.account().is_some_and(|panel| panel.agent_id == id) {
-                    this.show_agents_page(AgentsPage::Installed, window, cx);
-                }
-            })
-            .log_err();
-        })
-        .detach();
+        let page = cx.weak_entity();
+        cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
+            icon: IconName::Trash,
+            title: format!("Uninstall {name}?").into(),
+            message: "Threads that use it can't continue until it's installed again.".into(),
+            confirm_label: "Uninstall".into(),
+            on_confirm: Rc::new(move |window, cx| {
+                registry.update(cx, |registry, cx| registry.uninstall(&id, cx));
+                page.update(cx, |page, cx| {
+                    if page.account().is_some_and(|panel| panel.agent_id == id) {
+                        page.show_agents_page(AgentsPage::Installed, window, cx);
+                    }
+                })
+                .log_err();
+            }),
+        }));
     }
 
     /// Which machine's agents the Agents page shows, once there's more than this Mac.
@@ -2917,12 +3136,51 @@ async fn remove_workspace(
         .await
 }
 
+/// The tabs of an agent's page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentTab {
+    Account,
+    Defaults,
+    Environment,
+}
+
+/// Where an agent's account stands, for the badge beside its name and its account card.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccountState {
+    Connecting,
+    Failed,
+    LoggingIn,
+    LoggedIn,
+    LoggedOut,
+}
+
+impl AccountState {
+    fn of(connection: &AgentThread) -> Self {
+        if let ConnectionStatus::Failed(_) = connection.status() {
+            return Self::Failed;
+        }
+        if connection.is_authenticating() {
+            return Self::LoggingIn;
+        }
+        match connection.logged_in() {
+            Some(true) => Self::LoggedIn,
+            Some(false) => Self::LoggedOut,
+            None => Self::Connecting,
+        }
+    }
+}
+
 struct AccountPanel {
     agent_id: AgentId,
+    tab: AgentTab,
     /// A session-less connection to the agent, alive only while the panel is open.
     connection: Entity<AgentThread>,
-    /// Where a terminal login method runs, on the agent's machine.
-    login_terminal: Option<Entity<TerminalView>>,
+    login: Entity<AgentLogin>,
+    elicitation_cards: Vec<Entity<ElicitationCard>>,
+    /// The user asked to log in to another account while logged in.
+    changing_account: bool,
+    /// Whether the connection was logging in when last seen, to notice when it's done.
+    was_authenticating: bool,
     env_rows: Vec<EnvRow>,
     _subscriptions: [Subscription; 1],
 }
@@ -2951,6 +3209,44 @@ fn login_method_subject(method: &str) -> Option<String> {
     }
     let is_bare = ["log in", "login", "sign in", "signin"].contains(&lower.as_str());
     (!is_bare && !trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// "Logged in as …" with the account the agent reported (Claude Agent and Codex report one),
+/// else the method last used from agentZ.
+fn logged_in_title(status: Option<&AuthStatus>, login_method: Option<&str>) -> SharedString {
+    if let Some(status) = status {
+        if let Some(email) = status
+            .account
+            .as_ref()
+            .and_then(|account| account.email.as_deref())
+        {
+            return format!("Logged in as {email}").into();
+        }
+        if let Some(label) = &status.label {
+            return format!("Logged in with {label}").into();
+        }
+    }
+    match login_method.and_then(login_method_subject) {
+        Some(subject) => format!("Logged in with {subject}").into(),
+        None => "Logged in".into(),
+    }
+}
+
+/// The rest of what the agent said about the account: how it's logged in (when the title
+/// shows the email), the plan, the organization, and any detail.
+fn account_details(status: &AuthStatus) -> Vec<String> {
+    let account = status.account.clone().unwrap_or_default();
+    let label = status.label.clone().filter(|_| account.email.is_some());
+    [
+        label,
+        account.plan,
+        account.organization,
+        status.detail.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|detail| !detail.trim().is_empty())
+    .collect()
 }
 
 /// A version as t3code shows it: a bare number gets a "v", anything else (a custom agent's
@@ -3059,6 +3355,66 @@ fn render_agent_links(agent: &AgentListing) -> Vec<AnyElement> {
         )
     })
     .collect()
+}
+
+/// The same links as words, for the line under an agent's name on its page.
+fn render_agent_text_links(agent: &AgentListing, cx: &App) -> Vec<AnyElement> {
+    let accent = cx.theme().colors().text_accent;
+    let metadata = &agent.metadata;
+    [
+        (metadata.repository.clone(), "Repository"),
+        (metadata.website.clone(), "Website"),
+        (metadata.license_url.clone(), "License"),
+    ]
+    .into_iter()
+    .filter_map(|(url, label)| {
+        let url = url?;
+        let tooltip = url.clone();
+        Some(
+            div()
+                .id(SharedString::from(format!(
+                    "agent-link-{}",
+                    label.to_lowercase()
+                )))
+                .flex_none()
+                .whitespace_nowrap()
+                .text_color(accent)
+                .cursor_pointer()
+                .hover(|style| style.underline())
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(move |_, _, cx| cx.open_url(&url))
+                .child(label)
+                .into_any_element(),
+        )
+    })
+    .collect()
+}
+
+/// The account card's first row: a status dot or spinner, what it means and why, and what to
+/// do about it.
+fn render_status_row(
+    indicator: AnyElement,
+    title: SharedString,
+    subtitle: Option<(SharedString, Color)>,
+    actions: Vec<AnyElement>,
+) -> AnyElement {
+    h_flex()
+        .px_4()
+        .py_3()
+        .gap_3()
+        .child(div().w(px(7.)).flex().justify_center().child(indicator))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(Label::new(title))
+                .children(subtitle.map(|(subtitle, color)| {
+                    Label::new(subtitle).size(LabelSize::Small).color(color)
+                })),
+        )
+        .children(actions)
+        .into_any_element()
 }
 
 /// A select option's choices, flattening groups.
@@ -3328,10 +3684,21 @@ mod tests {
         assert!(claude.top() < codex.top());
         assert!(cx.debug_bounds("agent-row-gemini").is_none());
 
-        // A row opens the agent's page, and the back button returns to the list.
+        // A row opens the agent's page at its account, and the tabs switch what it shows.
         cx.simulate_click(claude.center(), gpui::Modifiers::none());
         assert_eq!(agent_page_id(&page, cx).as_deref(), Some("claude"));
         assert!(cx.debug_bounds("agent-row-codex").is_none());
+        assert!(cx.debug_bounds("account-card").is_some());
+        let defaults = cx
+            .debug_bounds("agent-tab-defaults")
+            .expect("the page has tabs");
+        cx.simulate_click(defaults.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("account-card").is_none());
+        let account = cx
+            .debug_bounds("agent-tab-account")
+            .expect("the page has tabs");
+        cx.simulate_click(account.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("account-card").is_some());
         let back = cx
             .debug_bounds("agents-back")
             .expect("a sub-page has a back button");

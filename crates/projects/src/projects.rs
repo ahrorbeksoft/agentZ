@@ -304,6 +304,8 @@ pub struct ProjectsSnapshot {
     pub working_threads: Vec<ThreadId>,
     /// Threads waiting for the user to answer a permission request.
     pub blocked_threads: Vec<ThreadId>,
+    /// Threads whose agent asked for input (ACP's elicitation) that the user hasn't given.
+    pub awaiting_input_threads: Vec<ThreadId>,
     /// Terminal threads running an agent CLI, with its name. The rest are plain shells.
     pub terminal_agents: Vec<(ThreadId, String)>,
     /// Terminal threads running a program in front of their shell, with its name.
@@ -362,6 +364,8 @@ pub struct ProjectStore {
     working_threads: HashSet<ThreadId>,
     /// Threads with a permission request waiting. Not persisted either.
     blocked_threads: HashSet<ThreadId>,
+    /// Threads with a request for input waiting. Not persisted either.
+    awaiting_input_threads: HashSet<ThreadId>,
     /// Terminal threads running an agent CLI, by its name. Not persisted either.
     terminal_agents: BTreeMap<ThreadId, String>,
     /// Terminal threads running a program in front of their shell. Not persisted either.
@@ -397,6 +401,7 @@ impl ProjectStore {
             archived_expanded: state.archived_expanded,
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
+            awaiting_input_threads: HashSet::default(),
             terminal_agents: BTreeMap::new(),
             terminal_commands: BTreeMap::new(),
             terminal_folders: BTreeMap::new(),
@@ -610,6 +615,8 @@ impl ProjectStore {
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.blocked_threads
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
+        self.awaiting_input_threads
+            .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_agents
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_commands
@@ -774,6 +781,7 @@ impl ProjectStore {
             thread.archived_at = Some(SystemTime::now());
             self.working_threads.remove(&id);
             self.blocked_threads.remove(&id);
+            self.awaiting_input_threads.remove(&id);
             self.changed();
         }
     }
@@ -796,6 +804,7 @@ impl ProjectStore {
             for id in ids {
                 self.working_threads.remove(&id);
                 self.blocked_threads.remove(&id);
+                self.awaiting_input_threads.remove(&id);
                 self.terminal_agents.remove(&id);
                 self.terminal_commands.remove(&id);
                 self.terminal_folders.remove(&id);
@@ -1003,6 +1012,22 @@ impl ProjectStore {
         }
     }
 
+    pub fn is_thread_awaiting_input(&self, id: ThreadId) -> bool {
+        self.awaiting_input_threads.contains(&id)
+    }
+
+    /// Marks whether the thread's agent waits for the user to answer a request for input.
+    pub fn set_thread_awaiting_input(&mut self, id: ThreadId, awaiting_input: bool) {
+        let changed = if awaiting_input {
+            self.thread(id).is_some() && self.awaiting_input_threads.insert(id)
+        } else {
+            self.awaiting_input_threads.remove(&id)
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
     /// The agent CLI a terminal thread runs, if any.
     pub fn terminal_agent(&self, id: ThreadId) -> Option<&str> {
         self.terminal_agents.get(&id).map(String::as_str)
@@ -1099,6 +1124,9 @@ impl ProjectStore {
         working_threads.sort();
         let mut blocked_threads: Vec<_> = self.blocked_threads.iter().copied().collect();
         blocked_threads.sort();
+        let mut awaiting_input_threads: Vec<_> =
+            self.awaiting_input_threads.iter().copied().collect();
+        awaiting_input_threads.sort();
         ProjectsSnapshot {
             projects: self.projects.clone(),
             threads: self.threads.clone(),
@@ -1107,6 +1135,7 @@ impl ProjectStore {
             archived_expanded: self.archived_expanded,
             working_threads,
             blocked_threads,
+            awaiting_input_threads,
             terminal_agents: self
                 .terminal_agents
                 .iter()
@@ -1145,6 +1174,7 @@ impl ProjectStore {
         );
         this.working_threads = snapshot.working_threads.into_iter().collect();
         this.blocked_threads = snapshot.blocked_threads.into_iter().collect();
+        this.awaiting_input_threads = snapshot.awaiting_input_threads.into_iter().collect();
         this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
         this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
         this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
@@ -1459,6 +1489,25 @@ mod tests {
         store.delete_thread(parent);
         assert!(store.threads().is_empty());
         assert!(!store.is_thread_blocked(grandchild));
+    }
+
+    #[test]
+    fn threads_await_input_until_answered_or_deleted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let thread = store.add_thread(project, "Thread", None).expect("thread");
+
+        store.set_thread_awaiting_input(thread, true);
+        let copy = ProjectStore::from_snapshot(store.snapshot());
+        assert!(copy.is_thread_awaiting_input(thread));
+        store.set_thread_awaiting_input(thread, false);
+        assert!(!store.is_thread_awaiting_input(thread));
+
+        store.set_thread_awaiting_input(thread, true);
+        store.delete_thread(thread);
+        assert!(!store.is_thread_awaiting_input(thread));
+        assert!(store.snapshot().awaiting_input_threads.is_empty());
     }
 
     #[test]

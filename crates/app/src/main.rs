@@ -1,8 +1,12 @@
 mod add_project_modal;
 mod agent_icons;
+mod agent_login;
 mod agent_view;
 mod app_settings;
+mod confirm_dialog;
+mod controls;
 mod diff_panel;
+mod elicitation_card;
 mod login_item;
 mod machine_icon_picker;
 mod machine_modal;
@@ -192,7 +196,10 @@ fn main() {
             add_project_modal::init(cx);
             worktree_modal::init(cx);
             machine_modal::init(cx);
+            confirm_dialog::init(cx);
             agent_view::init(cx);
+            agent_login::init(cx);
+            elicitation_card::init(cx);
             sidebar::init(cx);
             terminal_view::init(cx);
             settings_page::init(cx);

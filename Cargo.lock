@@ -182,6 +182,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -423,11 +424,13 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "http_client",
+ "idna",
  "log",
  "markdown",
  "menu",
  "paths",
  "projects",
+ "regex",
  "reqwest_client",
  "serde",
  "serde_json",
@@ -438,6 +441,7 @@ dependencies = [
  "theme_json",
  "tokio",
  "ui",
+ "url",
  "util",
 ]
 

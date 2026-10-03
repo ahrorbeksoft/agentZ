@@ -18,6 +18,7 @@ use util::ResultExt as _;
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
 use crate::app_settings::{AppSettingsStore, MachineProfile, is_sidebar_hidden};
+use crate::confirm_dialog::{ConfirmDialog, ConfirmRequest};
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
 use crate::machine_modal::MachineModal;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
@@ -121,6 +122,7 @@ pub struct Shell {
     add_project_modal: Option<(Entity<AddProjectModal>, Vec<Subscription>)>,
     worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
     machine_modal: Option<(Entity<MachineModal>, Subscription)>,
+    confirm_dialog: Option<(Entity<ConfirmDialog>, Subscription)>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
@@ -170,6 +172,9 @@ impl Shell {
                         window,
                         cx,
                     ),
+                    SpacesViewEvent::Confirm(request) => {
+                        this.open_confirm_dialog(request.clone(), window, cx)
+                    }
                 },
             ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
@@ -280,6 +285,7 @@ impl Shell {
             add_project_modal: None,
             worktree_modal: None,
             machine_modal: None,
+            confirm_dialog: None,
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
@@ -467,6 +473,9 @@ impl Shell {
                         SettingsPageEvent::EditMachine(profile) => {
                             this.open_machine_modal(profile.as_ref(), window, cx)
                         }
+                        SettingsPageEvent::Confirm(request) => {
+                            this.open_confirm_dialog(request.clone(), window, cx)
+                        }
                     });
                 self.settings_page = Some((page.clone(), subscription));
                 page
@@ -583,6 +592,7 @@ impl Shell {
         };
         let caption = match status {
             ThreadStatus::PendingApproval => "Waiting for tool confirmation",
+            ThreadStatus::AwaitingInput => "Waiting for your input",
             ThreadStatus::Working | ThreadStatus::Completed => "Finished",
         };
         let mut body = match store.project(thread.project_id) {
@@ -660,6 +670,9 @@ impl Shell {
                     window,
                     cx,
                 ),
+                AgentViewEvent::Confirm(request) => {
+                    this.open_confirm_dialog(request.clone(), window, cx)
+                }
             },
         );
         Some(OpenThread {
@@ -673,8 +686,13 @@ impl Shell {
         let had_add_project_modal = self.add_project_modal.take().is_some();
         let had_worktree_modal = self.worktree_modal.take().is_some();
         let had_machine_modal = self.machine_modal.take().is_some();
+        let had_confirm_dialog = self.confirm_dialog.take().is_some();
         self.thread_target = None;
-        if had_new_thread_modal || had_add_project_modal || had_worktree_modal || had_machine_modal
+        if had_new_thread_modal
+            || had_add_project_modal
+            || had_worktree_modal
+            || had_machine_modal
+            || had_confirm_dialog
         {
             self.focus_main(window, cx);
             cx.notify();
@@ -683,6 +701,10 @@ impl Shell {
 
     /// Focus goes back to what the main area shows.
     fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((page, _)) = &self.settings_page {
+            window.focus(&page.focus_handle(cx), cx);
+            return;
+        }
         match self.view {
             MainView::Agents => match self
                 .active_thread
@@ -757,6 +779,21 @@ impl Shell {
                 this.dismiss_modal(window, cx);
             });
         self.machine_modal = Some((modal, subscription));
+        cx.notify();
+    }
+
+    fn open_confirm_dialog(
+        &mut self,
+        request: ConfirmRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = cx.new(|cx| ConfirmDialog::new(request, window, cx));
+        let subscription =
+            cx.subscribe_in(&dialog, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            });
+        self.confirm_dialog = Some((dialog, subscription));
         cx.notify();
     }
 
@@ -1077,7 +1114,7 @@ impl Render for Shell {
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
-        let is_dialog = self.machine_modal.is_some();
+        let is_dialog = self.machine_modal.is_some() || self.confirm_dialog.is_some();
         // Beside the thread, or filling its area when full screen.
         let diff_panel = self.diff_panel.clone();
         let is_diff_full_screen = self.diff_full_screen && diff_panel.is_some();
@@ -1199,6 +1236,11 @@ impl Render for Shell {
                         self.machine_modal
                             .as_ref()
                             .map(|(modal, _)| AnyView::from(modal.clone()))
+                    })
+                    .or_else(|| {
+                        self.confirm_dialog
+                            .as_ref()
+                            .map(|(dialog, _)| AnyView::from(dialog.clone()))
                     }),
                 |shell, modal| {
                     shell.child(

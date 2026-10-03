@@ -426,6 +426,55 @@ async fn threads_outlive_their_clients() {
         .await;
 }
 
+/// The sidebar shows a thread whose agent asked for input as awaiting it, until it's answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_waiting_for_input_are_marked() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            text: "form".into(),
+        })
+        .await;
+    let awaiting_input = move |client: &TestClient| {
+        client
+            .projects
+            .as_ref()
+            .is_some_and(|projects| projects.awaiting_input_threads.contains(&thread_id))
+    };
+    client
+        .wait_until(move |client| {
+            awaiting_input(client) && !client.thread(connection).elicitations().is_empty()
+        })
+        .await;
+    let elicitation = client
+        .thread(connection)
+        .elicitations()
+        .first()
+        .expect("the agent asked for input")
+        .clone();
+    client
+        .ok(Request::RespondToElicitation {
+            connection,
+            elicitation: elicitation.id,
+            action: acp::ElicitationAction::Decline,
+        })
+        .await;
+    client
+        .wait_until(move |client| !awaiting_input(client))
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn accounts_log_in_and_close_with_their_client() {
     let Some(server) = TestServer::start() else {
@@ -447,6 +496,7 @@ async fn accounts_log_in_and_close_with_their_client() {
         .ok(Request::Authenticate {
             connection,
             method_id: acp::AuthMethodId::new("mock-login"),
+            meta: None,
         })
         .await;
     client
@@ -476,6 +526,90 @@ async fn accounts_log_in_and_close_with_their_client() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(closed);
+}
+
+/// Codex's device-code login asks the client to open a URL (an elicitation) while
+/// `authenticate` waits. The request reaches the app through the server, and so does the
+/// answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn url_logins_relay_the_agents_elicitation() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let login_file = data_dir.path().join("logged-in");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        login_file.to_string_lossy().into_owned(),
+    );
+    let Some(server) =
+        TestServer::start_with_agent(data_dir, tempfile::tempdir().expect("temp dir"), command)
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let Response::AccountOpened(account_id) =
+        client.ok(Request::OpenAccount(AgentId::new("mock"))).await
+    else {
+        panic!("expected an account");
+    };
+    let connection = ConnectionId::Account(account_id);
+    client.subscribe_thread(connection).await;
+    // The agent's words when its session asked for a login.
+    client
+        .wait_until(|client| client.thread(connection).auth_description().is_some())
+        .await;
+    assert_eq!(
+        client
+            .thread(connection)
+            .auth_description()
+            .map(|description| description.as_ref()),
+        Some("Your code: MOCK-1234\n\nClick Log In.")
+    );
+    assert_eq!(client.thread(connection).logged_in(), Some(false));
+
+    client
+        .ok(Request::Authenticate {
+            connection,
+            method_id: acp::AuthMethodId::new("mock-browser-login"),
+            meta: None,
+        })
+        .await;
+    client
+        .wait_until(|client| !client.thread(connection).elicitations().is_empty())
+        .await;
+    let thread = client.thread(connection);
+    assert!(thread.is_authenticating());
+    let elicitation = thread.elicitations()[0].clone();
+    assert_eq!(
+        elicitation.url(),
+        Some("https://example.com/device?code=MOCK-1234")
+    );
+
+    client
+        .ok(Request::RespondToElicitation {
+            connection,
+            elicitation: elicitation.id,
+            action: acp::ElicitationAction::Accept(acp::ElicitationAcceptAction::new()),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            thread.logged_in() == Some(true)
+                && !thread.is_authenticating()
+                && thread.elicitations().is_empty()
+        })
+        .await;
+    assert!(login_file.exists());
+    let status = client.thread(connection).auth_status().cloned();
+    assert_eq!(
+        status
+            .and_then(|status| status.account)
+            .and_then(|account| account.email),
+        Some("mock@example.com".to_string())
+    );
 }
 
 /// Claude Agent and others log in by running a command in a terminal. It runs on the server's

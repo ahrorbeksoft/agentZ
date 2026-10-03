@@ -21,10 +21,11 @@ use std::time::SystemTime;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
+use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
-    ConnectionStatus, ContextUsage, DiffLineKind, Entry, FileDiff, PermissionOption,
-    PermissionRequest, PlanItem, SessionDefaults, SessionRestore, ThreadState, ThreadView,
-    ToolCall,
+    AuthStatus, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry, FileDiff,
+    PermissionOption, PermissionRequest, PlanItem, SessionDefaults, SessionRestore, ThreadState,
+    ThreadView, ToolCall,
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -40,6 +41,9 @@ use tokio::task::JoinSet;
 use crate::wire::{ANSWER_MARKER_SESSION, PAUSE_MARKER_SESSION, Parked, Wire, marker_line};
 
 const STDERR_LINES_KEPT: usize = 20;
+
+/// How Claude Agent and Codex report their login, unasked: an ACP extension notification.
+const AUTH_STATUS_NOTIFICATION: &str = "_auth/status_update";
 
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
@@ -142,6 +146,12 @@ enum MessageKind {
     PauseCalledOff(Parked),
     /// An adopted agent's new connection is ready.
     Reconnected(ConnectionTo<Agent>),
+    /// The agent says the URL elicitation is done (`elicitation/complete`).
+    ElicitationCompleted(acp::ElicitationId),
+    /// The agent called off an elicitation it asked for.
+    ElicitationCancelled(u64),
+    /// The agent reported its login (`_auth/status_update`).
+    AuthStatus(AuthStatus),
 }
 
 #[derive(Clone)]
@@ -168,6 +178,18 @@ enum Incoming {
         acp::RequestPermissionRequest,
         Responder<acp::RequestPermissionResponse>,
     ),
+    Elicitation(
+        acp::CreateElicitationRequest,
+        Responder<acp::CreateElicitationResponse>,
+    ),
+}
+
+/// The answer to an elicitation in [`ThreadState::elicitations`].
+struct ElicitationResponder {
+    id: u64,
+    responder: Responder<acp::CreateElicitationResponse>,
+    /// Dropped once answered, which ends the task watching for the agent to call it off.
+    _answered: oneshot::Sender<()>,
 }
 
 struct Session {
@@ -180,6 +202,8 @@ pub struct AgentThread {
     view: ThreadView,
     /// Answers to the permission requests in `view`, by tool call.
     permission_responders: Vec<(acp::ToolCallId, Responder<acp::RequestPermissionResponse>)>,
+    elicitation_responders: Vec<ElicitationResponder>,
+    next_elicitation_id: u64,
     /// Set once the agent is initialized; kept so a session can be (re)opened after logging in.
     connection: Option<ConnectionTo<Agent>>,
     previous_session: Option<acp::SessionId>,
@@ -361,6 +385,8 @@ impl AgentThread {
                 entries: Vec::new(),
             },
             permission_responders: Vec::new(),
+            elicitation_responders: Vec::new(),
+            next_elicitation_id: 0,
             connection: None,
             previous_session: None,
             session: None,
@@ -462,8 +488,14 @@ impl AgentThread {
     /// Applies the result of background work.
     pub fn handle(&mut self, message: ThreadMessage) {
         if message.generation != self.generation {
-            if let MessageKind::Incoming(Incoming::Permission(_, responder)) = message.kind {
-                cancel_permission(responder);
+            match message.kind {
+                MessageKind::Incoming(Incoming::Permission(_, responder)) => {
+                    cancel_permission(responder)
+                }
+                MessageKind::Incoming(Incoming::Elicitation(_, responder)) => {
+                    cancel_elicitation(responder)
+                }
+                _ => {}
             }
             return;
         }
@@ -529,22 +561,59 @@ impl AgentThread {
             MessageKind::Authenticated {
                 method_name,
                 result,
-            } => match result {
-                Ok(()) => {
-                    if let Some(method_name) = method_name {
-                        self.emit(AgentThreadEvent::LoggedIn(method_name));
+            } => {
+                self.view.state.authenticating = None;
+                self.view.state.auth_links.clear();
+                self.view.state.auth_code = None;
+                // Whatever the login asked for is moot once it's over.
+                self.cancel_elicitations(|elicitation| {
+                    matches!(
+                        elicitation.request.scope(),
+                        acp::ElicitationScope::Request(_)
+                    )
+                });
+                match result {
+                    Ok(()) => {
+                        if let Some(method_name) = method_name {
+                            self.emit(AgentThreadEvent::LoggedIn(method_name));
+                        }
+                        self.view.state.auth_description = None;
+                        if !self.opens_session {
+                            self.view.state.account_notice = Some("Logged in.".into());
+                            self.session = None;
+                        }
+                        if self.session.is_some() {
+                            // The session was open when a prompt asked for the login.
+                            self.view.state.status = ConnectionStatus::Ready;
+                            self.view.state.logged_in = Some(true);
+                        } else {
+                            self.open_session();
+                        }
                     }
-                    if !self.opens_session {
-                        self.view.state.account_notice = Some("Logged in.".into());
-                        self.session = None;
+                    Err(error) => {
+                        self.view.state.auth_error = Some(error_message(&error).into());
                     }
-                    self.open_session();
                 }
-                Err(error) => {
-                    self.view.state.status = ConnectionStatus::AuthRequired;
-                    self.view.state.auth_error = Some(error_message(&error).into());
-                }
-            },
+            }
+            MessageKind::ElicitationCompleted(elicitation_id) => {
+                self.view.state.elicitations.retain(|elicitation| {
+                    !(elicitation.opened
+                        && matches!(&elicitation.request.mode,
+                            acp::ElicitationMode::Url(url) if url.elicitation_id == elicitation_id))
+                });
+            }
+            MessageKind::ElicitationCancelled(id) => {
+                self.elicitation_responders
+                    .retain(|responder| responder.id != id);
+                self.view
+                    .state
+                    .elicitations
+                    .retain(|elicitation| elicitation.id != id);
+            }
+            MessageKind::AuthStatus(status) => {
+                self.view.state.logged_in = Some(status.is_logged_in());
+                self.view.state.auth_status = Some(status);
+            }
             MessageKind::LoggedOut(result) => match result {
                 Ok(()) => {
                     self.view.state.auth_error = None;
@@ -584,6 +653,13 @@ impl AgentThread {
                 self.turn_cancelled = None;
                 match result {
                     Ok(response) => self.view.state.last_stop_reason = Some(response.stop_reason),
+                    // Some agents (OpenCode) open sessions logged out and ask at the first
+                    // prompt.
+                    Err(error) if is_auth_required(&error) => {
+                        self.view.state.status = ConnectionStatus::AuthRequired;
+                        self.view.state.logged_in = Some(false);
+                        self.view.state.auth_description = auth_description(&error);
+                    }
                     Err(error) => {
                         log::error!("agent prompt failed: {error:?}");
                         self.view.state.turn_error = Some(error_message(&error).into());
@@ -591,6 +667,13 @@ impl AgentThread {
                 }
                 // A finished turn can't still be waiting on a permission answer.
                 self.cancel_permission_requests();
+                self.cancel_elicitations(|elicitation| {
+                    !elicitation.opened
+                        && matches!(
+                            elicitation.request.scope(),
+                            acp::ElicitationScope::Session(_)
+                        )
+                });
                 self.set_working(false);
             }
         }
@@ -615,12 +698,40 @@ impl AgentThread {
         self.view.state.prompts_from_agents.clear();
         self.view.state.plan.clear();
         self.cancel_permission_requests();
+        self.cancel_elicitations(|_| true);
         self.queued_prompts.clear();
         self.view.state.auth_error = None;
+        self.view.state.auth_description = None;
+        self.view.state.authenticating = None;
+        self.view.state.auth_links.clear();
+        self.view.state.auth_code = None;
         self.view.state.turn_error = None;
         self.view.state.status = ConnectionStatus::Connecting;
         self.set_working(false);
         self.connect_agent(futures::future::ready(Ok(command)).boxed());
+    }
+
+    /// Gives up on the login in flight. Agents' browser logins only return once the user
+    /// finishes (or the login expires), and some keep a callback server on a fixed port, so the
+    /// agent restarts, as t3code does. Prompts waiting for the login still go out after one.
+    pub fn cancel_authentication(&mut self) {
+        if self.view.state.authenticating.is_none() {
+            return;
+        }
+        let queued_prompts = std::mem::take(&mut self.queued_prompts);
+        // Without a session, the entries are only those prompts: nothing will replay them.
+        let conversation = self.session.is_none().then(|| {
+            (
+                std::mem::take(&mut self.view.entries),
+                std::mem::take(&mut self.view.state.prompts_from_agents),
+            )
+        });
+        self.reload();
+        self.queued_prompts = queued_prompts;
+        if let Some((entries, prompts_from_agents)) = conversation {
+            self.view.entries = entries;
+            self.view.state.prompts_from_agents = prompts_from_agents;
+        }
     }
 
     /// Pauses the connection between messages, to hand the agent to another server with
@@ -705,6 +816,7 @@ impl AgentThread {
         let mut view = self.view.clone();
         // The new connection is asked again, which shows them again.
         view.state.permission_requests.clear();
+        view.state.elicitations.clear();
         Ok(HandedOffAgent {
             snapshot: AgentSnapshot {
                 view,
@@ -983,6 +1095,7 @@ impl AgentThread {
                 }
                 self.view.state.status = ConnectionStatus::Ready;
                 self.view.state.logged_in = Some(true);
+                self.view.state.auth_description = None;
                 if setup.restore == SessionRestore::New && self.opens_session {
                     self.apply_defaults();
                 }
@@ -993,17 +1106,22 @@ impl AgentThread {
             Err(error) if is_auth_required(&error) => {
                 self.view.state.status = ConnectionStatus::AuthRequired;
                 self.view.state.logged_in = Some(false);
+                self.view.state.auth_description = auth_description(&error);
                 self.set_working(false);
             }
             Err(error) => self.fail(format!("starting a session: {}", error_message(&error))),
         }
     }
 
-    /// Logs in with one of the agent's own methods, then opens the session.
-    pub fn authenticate(&mut self, method_id: acp::AuthMethodId) {
+    /// Logs in with one of the agent's own methods, then opens the session. `meta` carries
+    /// what the method takes from the user (an API key, a gateway), as the agent reads it.
+    pub fn authenticate(&mut self, method_id: acp::AuthMethodId, meta: Option<acp::Meta>) {
         let Some(connection) = self.connection.clone() else {
             return;
         };
+        if self.view.state.authenticating.is_some() {
+            return;
+        }
         let method_name = self
             .view
             .state
@@ -1012,10 +1130,13 @@ impl AgentThread {
             .find(|method| *method.id() == method_id)
             .map(|method| SharedString::from(method.name().to_string()));
         let request = connection
-            .send_request(acp::AuthenticateRequest::new(method_id))
+            .send_request(acp::AuthenticateRequest::new(method_id.clone()).meta(meta))
             .block_task();
         self.view.state.account_notice = None;
-        self.view.state.status = ConnectionStatus::Connecting;
+        self.view.state.auth_error = None;
+        self.view.state.auth_links.clear();
+        self.view.state.auth_code = None;
+        self.view.state.authenticating = Some(method_id);
         self.spawn(async move {
             MessageKind::Authenticated {
                 method_name,
@@ -1276,6 +1397,57 @@ impl AgentThread {
         }
     }
 
+    /// Answers an elicitation. Accepting a URL keeps it shown, opened, until the agent says
+    /// it's done (`elicitation/complete`), as in Zed.
+    pub fn respond_to_elicitation(&mut self, id: u64, action: acp::ElicitationAction) {
+        let Some(index) = self
+            .elicitation_responders
+            .iter()
+            .position(|responder| responder.id == id)
+        else {
+            return;
+        };
+        let ElicitationResponder { responder, .. } = self.elicitation_responders.remove(index);
+        let accepted = matches!(action, acp::ElicitationAction::Accept(_));
+        self.view.state.elicitations.retain_mut(|elicitation| {
+            if elicitation.id != id {
+                return true;
+            }
+            elicitation.opened = accepted && elicitation.url().is_some();
+            elicitation.opened
+        });
+        if let Err(error) = responder.respond(acp::CreateElicitationResponse::new(action)) {
+            log::error!("failed to answer the agent's elicitation: {error:?}");
+        }
+    }
+
+    /// Hides an opened URL elicitation, which was answered when it was opened.
+    pub fn dismiss_elicitation(&mut self, id: u64) {
+        self.view
+            .state
+            .elicitations
+            .retain(|elicitation| !(elicitation.id == id && elicitation.opened));
+    }
+
+    /// Cancels the elicitations that match, and hides them.
+    fn cancel_elicitations(&mut self, matches: impl Fn(&Elicitation) -> bool) {
+        let mut cancelled = Vec::new();
+        self.view.state.elicitations.retain(|elicitation| {
+            let keep = !matches(elicitation);
+            if !keep {
+                cancelled.push(elicitation.id);
+            }
+            keep
+        });
+        let (cancel, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.elicitation_responders)
+            .into_iter()
+            .partition(|responder| cancelled.contains(&responder.id));
+        self.elicitation_responders = keep;
+        for ElicitationResponder { responder, .. } in cancel {
+            cancel_elicitation(responder);
+        }
+    }
+
     fn set_working(&mut self, working: bool) {
         if working == self.is_working() {
             return;
@@ -1293,10 +1465,34 @@ impl AgentThread {
         self.view.state.status = ConnectionStatus::Failed(message.into());
         self.session = None;
         self.queued_prompts.clear();
+        self.view.state.authenticating = None;
+        self.view.state.auth_links.clear();
+        self.view.state.auth_code = None;
+        self.cancel_elicitations(|_| true);
         self.set_working(false);
     }
 
     fn record_stderr(&mut self, line: String) {
+        if self.view.state.authenticating.is_some() {
+            // Device logins often print the code on the line after the one that mentions it.
+            let previous = self.stderr_lines.back().map(String::as_str).unwrap_or("");
+            if let Some(code) = login_code(&line).or_else(|| {
+                login_code(&format!("{previous}\n{line}")).filter(|code| line.contains(code))
+            }) {
+                self.view.state.auth_code = Some(code.into());
+            }
+            for link in login_links(&line) {
+                if !self
+                    .view
+                    .state
+                    .auth_links
+                    .iter()
+                    .any(|known| *known == link)
+                {
+                    self.view.state.auth_links.push(link.into());
+                }
+            }
+        }
         if self.stderr_lines.len() == STDERR_LINES_KEPT {
             self.stderr_lines.pop_front();
         }
@@ -1330,6 +1526,39 @@ impl AgentThread {
                             kind: option.kind,
                         })
                         .collect(),
+                });
+            }
+            Incoming::Elicitation(request, responder) => {
+                if let Err(message) = validate_elicitation(&request) {
+                    if let Err(error) =
+                        responder.respond_with_error(acp::Error::invalid_params().data(message))
+                    {
+                        log::error!("failed to refuse the agent's elicitation: {error:?}");
+                    }
+                    return;
+                }
+                let id = self.next_elicitation_id;
+                self.next_elicitation_id += 1;
+                let (answered, answered_receiver) = oneshot::channel::<()>();
+                let cancellation = responder.cancellation();
+                let sender = self.sender();
+                self.spawn_task(async move {
+                    let cancelled = std::pin::pin!(cancellation.cancelled());
+                    if let futures::future::Either::Left(_) =
+                        futures::future::select(cancelled, answered_receiver).await
+                    {
+                        sender.send(MessageKind::ElicitationCancelled(id)).ok();
+                    }
+                });
+                self.elicitation_responders.push(ElicitationResponder {
+                    id,
+                    responder,
+                    _answered: answered,
+                });
+                self.view.state.elicitations.push(Elicitation {
+                    id,
+                    request,
+                    opened: false,
                 });
             }
         }
@@ -1574,6 +1803,80 @@ fn cancel_permission(responder: Responder<acp::RequestPermissionResponse>) {
         .ok();
 }
 
+fn cancel_elicitation(responder: Responder<acp::CreateElicitationResponse>) {
+    responder
+        .respond(acp::CreateElicitationResponse::new(
+            acp::ElicitationAction::Cancel,
+        ))
+        .ok();
+}
+
+/// Zed's checks: a URL must be web address with a host, and the mode one ACP defines.
+fn validate_elicitation(
+    request: &acp::CreateElicitationRequest,
+) -> std::result::Result<(), String> {
+    match &request.mode {
+        acp::ElicitationMode::Url(mode) => {
+            let url = url::Url::parse(&mode.url)
+                .map_err(|error| format!("invalid elicitation URL: {error}"))?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err("elicitation URL must use HTTP or HTTPS and include a host".into());
+            }
+            Ok(())
+        }
+        acp::ElicitationMode::Form(_) => Ok(()),
+        _ => Err("unsupported elicitation mode".into()),
+    }
+}
+
+/// The agent's message when it asks for a login, unless it's only ACP's stock wording, as
+/// Zed decides.
+fn auth_description(error: &agent_client_protocol::Error) -> Option<SharedString> {
+    let message = error.message.trim();
+    (!message.is_empty() && message != acp::ErrorCode::AuthRequired.to_string())
+        .then(|| SharedString::from(message.to_string()))
+}
+
+/// The status in an `_auth/status_update`: `{"authStatus": {"kind": …, "label": …,
+/// "account": {"email": …, "plan": …}, "detail": …}}`.
+fn auth_status(params: &Value) -> Option<AuthStatus> {
+    let status = params.get("authStatus")?;
+    let status: AuthStatus = serde_json::from_value(status.clone()).ok()?;
+    (!status.kind.is_empty()).then_some(status)
+}
+
+/// Web links in a line the agent printed, except local callback addresses, which only the
+/// agent itself can use.
+fn login_links(line: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find("http") {
+        let candidate = &rest[start..];
+        let end = candidate
+            .find(|character: char| {
+                character.is_whitespace()
+                    || character.is_control()
+                    || matches!(character, '"' | '\'' | '<' | '>' | '`')
+            })
+            .unwrap_or(candidate.len());
+        let link = candidate[..end].trim_end_matches(['.', ',', ';', ':', ')', ']', '}']);
+        rest = &candidate[end.max(4)..];
+        let Ok(url) = url::Url::parse(link) else {
+            continue;
+        };
+        let is_local = match url.host() {
+            Some(url::Host::Domain(domain)) => domain == "localhost",
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => true,
+        };
+        if matches!(url.scheme(), "http" | "https") && !is_local {
+            links.push(link.to_string());
+        }
+    }
+    links
+}
+
 /// Spawns the agent and wires up and initializes the ACP connection. The agent's process and
 /// transport run in `agent_tasks`, and report through `sender`.
 async fn connect(
@@ -1643,18 +1946,7 @@ async fn connect(
     let initialize = connection
         .send_request(
             acp::InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(
-                    acp::ClientCapabilities::new()
-                        .terminal(supports_terminals)
-                        // The server runs terminal logins itself (`TerminalKey::Login`). Agents
-                        // offer them only to clients that say so: Claude Agent offers no login
-                        // at all otherwise. The `_meta` flag is the older form, as Zed sends it.
-                        .auth(acp::AuthCapabilities::new().terminal(true))
-                        .meta(acp::Meta::from_iter([(
-                            "terminal-auth".to_string(),
-                            true.into(),
-                        )])),
-                )
+                .client_capabilities(client_capabilities(supports_terminals))
                 .client_info(acp::Implementation::new("agentZ", version)),
         )
         .block_task()
@@ -1673,6 +1965,37 @@ async fn connect(
         wire,
         process,
     })
+}
+
+/// What agentZ supports, as Zed's `client_capabilities_for_agent` says it.
+fn client_capabilities(supports_terminals: bool) -> acp::ClientCapabilities {
+    acp::ClientCapabilities::new()
+        .terminal(supports_terminals)
+        // The server runs terminal logins itself (`TerminalKey::Login`). Agents offer them
+        // only to clients that say so: Claude Agent offers no login at all otherwise. The
+        // `_meta` flag below is the older form, as Zed sends it. `gateway` asks for the
+        // methods that log in through an LLM gateway (Claude Agent, Codex), which take a
+        // base URL and headers in `authenticate`'s `_meta`.
+        .auth(
+            acp::AuthCapabilities::new()
+                .terminal(true)
+                .meta(acp::Meta::from_iter([("gateway".to_string(), true.into())])),
+        )
+        .session(
+            acp::ClientSessionCapabilities::new().config_options(
+                acp::SessionConfigOptionsCapabilities::new()
+                    .boolean(acp::BooleanConfigOptionCapabilities::new()),
+            ),
+        )
+        .elicitation(
+            acp::ElicitationCapabilities::new()
+                .form(acp::ElicitationFormCapabilities::new())
+                .url(acp::ElicitationUrlCapabilities::new()),
+        )
+        .meta(acp::Meta::from_iter([(
+            "terminal-auth".to_string(),
+            true.into(),
+        )]))
 }
 
 type Transport = agent_client_protocol::Lines<
@@ -1706,6 +2029,9 @@ fn client_connection(
     };
     let host = Arc::new(host);
     let notification_sender = sender.clone();
+    let elicitation_sender = sender.clone();
+    let completion_sender = sender.clone();
+    let extension_sender = sender.clone();
     let permission_sender = sender;
     let (create_host, output_host, wait_host, kill_host, release_host) = (
         host.clone(),
@@ -1728,6 +2054,49 @@ fn client_connection(
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            async move |notification: acp::CompleteElicitationNotification, _connection| {
+                completion_sender
+                    .send(MessageKind::ElicitationCompleted(
+                        notification.elicitation_id,
+                    ))
+                    .ok();
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        // Extension notifications, after the typed ones so it sees only what they don't take.
+        .on_receive_notification(
+            async move |notification: agent_client_protocol::UntypedMessage, _connection| {
+                if notification.method == AUTH_STATUS_NOTIFICATION {
+                    match auth_status(&notification.params) {
+                        Some(status) => {
+                            extension_sender.send(MessageKind::AuthStatus(status)).ok();
+                        }
+                        None => log::warn!(
+                            "the agent sent an auth status that couldn't be read: {}",
+                            notification.params
+                        ),
+                    }
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: acp::CreateElicitationRequest,
+                        responder: Responder<acp::CreateElicitationResponse>,
+                        _connection| {
+                if let Err(message) = elicitation_sender.send(MessageKind::Incoming(
+                    Incoming::Elicitation(request, responder),
+                )) && let MessageKind::Incoming(Incoming::Elicitation(_, responder)) = *message
+                {
+                    cancel_elicitation(responder);
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: acp::RequestPermissionRequest,
@@ -2052,22 +2421,44 @@ mod tests {
             .wait_until(|account| account.status() == &ConnectionStatus::Ready)
             .await;
         assert!(account.thread.supports_logout());
-        // The terminal login is offered because the client says it runs them.
+        // The terminal, browser and gateway logins are offered because the client says it
+        // takes them.
         let methods: Vec<&str> = account
             .thread
             .auth_methods()
             .iter()
             .map(|method| &*method.id().0)
             .collect();
-        assert_eq!(methods, ["mock-login", "mock-terminal-login"]);
+        assert_eq!(
+            methods,
+            [
+                "mock-login",
+                "mock-terminal-login",
+                "mock-browser-login",
+                "mock-api-key",
+                "mock-gateway"
+            ]
+        );
         assert_eq!(
             account.thread.logged_in(),
             Some(true),
             "the mock opens sessions freely"
         );
         assert_eq!(account.thread.config_options().len(), 4);
+        account
+            .wait_until(|account| account.auth_status().is_some())
+            .await;
+        let status = account.thread.auth_status().expect("a status");
+        assert!(status.is_logged_in());
+        assert_eq!(
+            status
+                .account
+                .as_ref()
+                .and_then(|account| account.email.as_deref()),
+            Some("mock@example.com")
+        );
 
-        account.update(|account| account.authenticate(acp::AuthMethodId::new("mock-login")));
+        account.update(|account| account.authenticate(acp::AuthMethodId::new("mock-login"), None));
         account
             .wait_until(|account| {
                 account.account_notice().is_some() && account.status() == &ConnectionStatus::Ready
@@ -2089,14 +2480,228 @@ mod tests {
         account
             .wait_until(|account| {
                 account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
+                    && account
+                        .auth_status()
+                        .is_some_and(|status| !status.is_logged_in())
             })
             .await;
         assert_eq!(account.thread.logged_in(), Some(false));
 
         account.update(|account| account.check_login());
         account
+            .wait_until(|account| account.status() == &ConnectionStatus::AuthRequired)
+            .await;
+        assert_eq!(account.thread.logged_in(), Some(false));
+        account.update(|account| account.authenticate(acp::AuthMethodId::new("mock-login"), None));
+        account
             .wait_until(|account| account.logged_in() == Some(true))
             .await;
+    }
+
+    /// A browser login that asks the client to open a URL, as Codex's device code login does,
+    /// after the agent's own message asked for a login, as Factory Droid's does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logs_in_through_a_url_the_agent_asks_to_open() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let login_dir = tempfile::tempdir().expect("temp dir");
+        let login_file = login_dir.path().join("logged-in");
+        command.env.insert(
+            "MOCK_LOGIN_FILE".into(),
+            login_file.to_string_lossy().into_owned(),
+        );
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
+            .await;
+        assert_eq!(
+            thread.thread.auth_description().map(|text| text.as_ref()),
+            Some("Your code: MOCK-1234\n\nClick Log In.")
+        );
+
+        thread.update(|thread| {
+            thread.authenticate(acp::AuthMethodId::new("mock-browser-login"), None)
+        });
+        assert!(thread.thread.is_authenticating());
+        thread
+            .wait_until(|thread| !thread.elicitations().is_empty())
+            .await;
+        let elicitation = thread.thread.elicitations()[0].clone();
+        assert_eq!(
+            elicitation.url(),
+            Some("https://example.com/device?code=MOCK-1234")
+        );
+        assert!(matches!(
+            elicitation.request.scope(),
+            acp::ElicitationScope::Request(_)
+        ));
+
+        thread.update(|thread| {
+            thread.respond_to_elicitation(
+                elicitation.id,
+                acp::ElicitationAction::Accept(acp::ElicitationAcceptAction::new()),
+            )
+        });
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(!thread.thread.is_authenticating());
+        assert!(thread.thread.elicitations().is_empty());
+        assert_eq!(thread.thread.logged_in(), Some(true));
+        assert_eq!(thread.thread.auth_description(), None);
+        assert!(thread.events.iter().any(
+            |event| matches!(event, AgentThreadEvent::LoggedIn(name) if name == "Log in with a browser")
+        ));
+    }
+
+    /// Cancelling a login that waits on the user restarts the agent, which asks again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancels_a_login_in_progress() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let login_dir = tempfile::tempdir().expect("temp dir");
+        command.env.insert(
+            "MOCK_LOGIN_FILE".into(),
+            login_dir
+                .path()
+                .join("logged-in")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
+            .await;
+        thread.update(|thread| thread.send("hello".into()));
+        thread.update(|thread| {
+            thread.authenticate(acp::AuthMethodId::new("mock-browser-login"), None)
+        });
+        thread
+            .wait_until(|thread| !thread.elicitations().is_empty())
+            .await;
+
+        thread.update(AgentThread::cancel_authentication);
+        assert!(!thread.thread.is_authenticating());
+        assert!(thread.thread.elicitations().is_empty());
+        assert_eq!(thread.thread.status(), &ConnectionStatus::Connecting);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
+            .await;
+        // The prompt waiting for the login is kept.
+        assert_eq!(
+            thread.thread.entries(),
+            [Entry::UserMessage("hello".into())]
+        );
+        thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
+        thread
+            .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
+            .await;
+    }
+
+    /// Logins that take something from the user pass it in `authenticate`'s `_meta`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_key_and_gateway_logins_pass_what_the_user_entered() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let login_dir = tempfile::tempdir().expect("temp dir");
+        command.env.insert(
+            "MOCK_LOGIN_FILE".into(),
+            login_dir
+                .path()
+                .join("logged-in")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
+            .await;
+
+        thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-api-key"), None));
+        thread
+            .wait_until(|thread| thread.auth_error().is_some())
+            .await;
+        assert!(
+            thread
+                .thread
+                .auth_error()
+                .is_some_and(|error| error.contains("No API key given"))
+        );
+        assert_eq!(thread.thread.status(), &ConnectionStatus::AuthRequired);
+
+        let meta = |key: &str, value: Value| acp::Meta::from_iter([(key.to_string(), value)]);
+        thread.update(|thread| {
+            thread.authenticate(
+                acp::AuthMethodId::new("mock-gateway"),
+                Some(meta("gateway", serde_json::json!({}))),
+            )
+        });
+        thread
+            .wait_until(|thread| {
+                thread
+                    .auth_error()
+                    .is_some_and(|error| error.contains("No gateway given"))
+            })
+            .await;
+        thread.update(|thread| {
+            thread.authenticate(
+                acp::AuthMethodId::new("mock-api-key"),
+                Some(meta("api-key", serde_json::json!({"apiKey": "sk-mock"}))),
+            )
+        });
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+    }
+
+    /// A form the agent asks to fill in during a turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answers_a_form_elicitation() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("form".into()));
+        thread
+            .wait_until(|thread| !thread.elicitations().is_empty())
+            .await;
+        let elicitation = thread.thread.elicitations()[0].clone();
+        let acp::ElicitationMode::Form(form) = &elicitation.request.mode else {
+            panic!("expected a form, got {:?}", elicitation.request.mode);
+        };
+        assert_eq!(form.requested_schema.properties.len(), 4);
+        let content: std::collections::BTreeMap<_, _> = [
+            (
+                "name".to_string(),
+                acp::ElicitationContentValue::String("Ada".into()),
+            ),
+            (
+                "times".to_string(),
+                acp::ElicitationContentValue::Integer(2),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        thread.update(|thread| {
+            thread.respond_to_elicitation(
+                elicitation.id,
+                acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new().content(content),
+                ),
+            )
+        });
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert!(thread.thread.elicitations().is_empty());
+        assert_eq!(
+            agent_text(&thread.thread),
+            r#"Form: accept {"name": "Ada", "times": 2}"#
+        );
     }
 
     /// New sessions start with the agent's saved defaults, against `test_support/mock_agent.py`.
@@ -2162,7 +2767,7 @@ mod tests {
         thread
             .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
             .await;
-        thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login")));
+        thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
         thread
             .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
             .await;

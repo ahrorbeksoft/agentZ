@@ -1282,7 +1282,7 @@ impl Server {
         }
         let status = match self.thread_status(task) {
             "starting" => "queued",
-            "waiting_for_approval" | "needs_login" => "waiting",
+            "waiting_for_approval" | "waiting_for_input" | "needs_login" => "waiting",
             _ => "running",
         };
         let work_state = if !self.is_busy(task) && self.has_unannounced_tasks(task) {
@@ -1593,6 +1593,7 @@ impl Server {
             ConnectionStatus::Failed(_) => "failed",
             ConnectionStatus::AuthRequired => "needs_login",
             _ if !thread.state.permission_requests.is_empty() => "waiting_for_approval",
+            _ if thread.is_awaiting_input() => "waiting_for_input",
             _ if thread.is_working() => "running",
             _ if has_follow_ups => "queued",
             ConnectionStatus::Connecting => "starting",
@@ -1604,7 +1605,7 @@ impl Server {
     pub(super) fn is_busy(&self, thread_id: ThreadId) -> bool {
         matches!(
             self.thread_status(thread_id),
-            "running" | "waiting_for_approval" | "queued"
+            "running" | "waiting_for_approval" | "waiting_for_input" | "queued"
         )
     }
 
@@ -1893,11 +1894,11 @@ pub(super) fn definitions() -> Value {
         {
             "name": "agentz_thread_list",
             "title": "List agentZ threads",
-            "description": "List agentZ threads in the calling thread's project, newest first. Filter by status (idle, starting, running, waiting_for_approval, queued, needs_login, failed), title, or archived state, and paginate with the returned cursor. Threads from other projects are never exposed.",
+            "description": "List agentZ threads in the calling thread's project, newest first. Filter by status (idle, starting, running, waiting_for_approval, waiting_for_input, queued, needs_login, failed), title, or archived state, and paginate with the returned cursor. Threads from other projects are never exposed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "statuses": {"type": "array", "items": {"type": "string", "enum": ["idle", "starting", "running", "waiting_for_approval", "queued", "needs_login", "failed"]}, "maxItems": 10},
+                    "statuses": {"type": "array", "items": {"type": "string", "enum": ["idle", "starting", "running", "waiting_for_approval", "waiting_for_input", "queued", "needs_login", "failed"]}, "maxItems": 10},
                     "titleContains": {"type": "string", "maxLength": 256},
                     "archived": {"type": "boolean", "description": "true lists only archived threads; the default lists only active ones."},
                     "cursor": {"type": "integer", "minimum": 0},
@@ -2133,7 +2134,7 @@ pub(super) fn definitions() -> Value {
         {
             "name": "task_status",
             "title": "Get delegated task status",
-            "description": "Read a task this thread delegated. status is queued, running, waiting (for the user's approval or login), completed, failed, cancelled or interrupted. workState tells working, waiting_for_children (its turn ended but its own tasks are still running) and result_available apart. summary is the task's result once it has ended: the child's last message, or the error. Reading an ended task's result means this thread isn't sent a message about it.",
+            "description": "Read a task this thread delegated. status is queued, running, waiting (for the user's approval, input or login), completed, failed, cancelled or interrupted. workState tells working, waiting_for_children (its turn ended but its own tasks are still running) and result_available apart. summary is the task's result once it has ended: the child's last message, or the error. Reading an ended task's result means this thread isn't sent a message about it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"taskId": {"type": "integer", "description": "The taskId from delegate_task."}},

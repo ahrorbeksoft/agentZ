@@ -2010,10 +2010,15 @@ pub(crate) fn thread_agent_icon(thread: &Thread, cx: &App) -> Icon {
         .unwrap_or_else(|| Icon::new(IconName::Terminal))
 }
 
+/// Purple, apart from the other statuses' colors. Every bundled theme's fourth player color is
+/// one, and `Color::Player` skips the first (the local user's).
+const AWAITING_INPUT_COLOR: Color = Color::Player(2);
+
 /// t3code's status pill: a dot and a label in the status color.
 pub(crate) fn render_status_pill(status: ThreadStatus, cx: &App) -> impl IntoElement {
     let (label, color) = match status {
         ThreadStatus::PendingApproval => ("Pending Approval", Color::Warning),
+        ThreadStatus::AwaitingInput => ("Awaiting Input", AWAITING_INPUT_COLOR),
         ThreadStatus::Working => ("Working", Color::Accent),
         ThreadStatus::Completed => ("Completed", Color::Success),
     };
@@ -2028,6 +2033,7 @@ pub(crate) fn render_status_pill(status: ThreadStatus, cx: &App) -> impl IntoEle
 pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElement {
     let color = match status {
         ThreadStatus::PendingApproval => Color::Warning,
+        ThreadStatus::AwaitingInput => AWAITING_INPUT_COLOR,
         ThreadStatus::Working => Color::Accent,
         ThreadStatus::Completed => Color::Success,
     };

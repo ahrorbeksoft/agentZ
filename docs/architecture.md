@@ -66,7 +66,7 @@ agentZ's own crates. Everything else in `crates/` is copied from Zed at the same
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`). |
 | `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
-| `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, config options, login/logout, reload, the per-turn hook. `test_support/mock_agent.py` is the scripted test agent. |
+| `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook. `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
 | `paths` | Data locations (`AGENTZ_DATA_DIR` overrides). |
@@ -121,8 +121,11 @@ Each entry: what it does, where it lives, and where it comes from.
   combining repositories), Appearance (Zed's theme modes), Agents, Machines, and a page per
   project (with Checkouts).
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
-  installed agents as rows, each opening the agent's own page (its registry links, Update,
-  Uninstall, login, defaults for new threads, environment). Add Agent opens the ACP Registry
+  installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
+  a login status badge, the version and registry links, Update when there is one, and a "⋯"
+  menu with Uninstall. Below it are Account, Defaults (for new threads) and Environment tabs.
+  Account is a card: the login methods while logged out, or the account the agent reported
+  with Change Account and Log Out (both described under Agent threads). Add Agent opens the ACP Registry
   page, which has search, an All / Installed / Not Installed filter, and a card for each agent.
   As in Zed, the cards are a `uniform_list` below a pinned search bar: scrolling re-renders the
   page every frame, and laying out every card held it to about 6 fps. A sub-page has Zed's back button and breadcrumb. With more than one machine, a machine
@@ -156,6 +159,34 @@ Each entry: what it does, where it lives, and where it comes from.
   restarts the agent, which opens its session logged in. `initialize` advertises
   `auth.terminal` and Zed's `_meta["terminal-auth"]`: without them Claude Agent offers no login
   method at all, and Codex and Devin leave out their terminal ones.
+- **Logins that take something** (`agentz_protocol::thread::login_input`, `agent_login.rs`):
+  a method's `_meta` asks for an API key (`api-key`, Codex's) or an LLM gateway (`gateway`,
+  Claude Agent's and Codex's; `initialize` sets `auth._meta.gateway`). The form's answer goes
+  back in `authenticate`'s `_meta` under the same key. Keys are masked (`TextInput::set_masked`).
+- **Browser and device logins**: an agent may ask the client to open a page (a URL
+  elicitation, Codex's device login), or print a link and a one-time code
+  (`agentz_protocol::thread::login_code`). The login panel shows the code in boxes, Copy Code
+  and "Open <host>", then waits. Cancel restarts the agent (`Request::CancelAuthentication`),
+  as t3code does, since browser logins only return when the user finishes. The login's own
+  page request shows in the login panel, not as a card.
+- **The login panel** (`agent_login.rs`, agentZ's own design, since Zed only has a callout):
+  `LoginLayout::Rows` on the agent's page, a row for each method; `LoginLayout::Centered` in the
+  middle of a thread that needs a login, a full-width button for each method. While logged out,
+  the thread's composer is dimmed, says "Log in to <agent> to send a message", and doesn't send.
+- **The account** (`agentz_protocol::thread::AuthStatus`): Claude Agent and Codex report their
+  login, unasked, with `_auth/status_update` (the account's email, plan and how it's logged
+  in). The Account card shows it, or "Logged in" with the method last used from agentZ.
+- **Logging out** (`confirm_dialog.rs`, t3code's dialogs): Log Out on the agent's page or in a
+  thread's "…" menu first asks in a dialog in the shell's modal layer, since it stops every
+  thread that shares the login. Uninstall asks in the same dialog.
+- **Requests for input** (`elicitation_card.rs`, Zed's checks for ACP's `elicitation/create`): a
+  card in the thread for a form (text, numbers, a choice, checkboxes) with Decline and Submit,
+  or a page to open, named by its host, with a warning for non-ASCII hosts. An opened page
+  stays as "Waiting for you to finish in your browser" until the agent sends
+  `elicitation/complete`. × cancels.
+- **Controls** (`controls.rs`): the login, account and input-request surfaces' buttons with a
+  solid accent or red fill, fields with a focus ring, avatars, icon tiles and code boxes,
+  where `ui`'s styles fall short.
 - **Background turns** (`agentz_server`, herdr): agents keep working when the app quits; the app
   reattaches with a snapshot, then live events.
 
@@ -164,11 +195,14 @@ Each entry: what it does, where it lives, and where it comes from.
 herdr's states, t3code's labels and colors, Zed's notifications.
 
 - The server sends facts: `working_threads`, `blocked_threads` (a permission waiting, its own
-  or a subthread's), and each thread's `completed_at`. Each client decides "done" against the
+  or a subthread's), `awaiting_input_threads` (a request for input waiting), and each thread's
+  `completed_at`. Each client decides "done" against the
   completions it has displayed (`viewed.json`), so viewing in one client doesn't clear another.
+- Statuses by priority: Pending Approval (warning), Awaiting Input (purple, each theme's fourth
+  player color), Working, Completed. Agent control's tools report `waiting_for_input`.
 - "Displayed" is Zed's `agent_status_visible`: window active, settings closed, thread open.
-- Notifications ("Waiting for tool confirmation", "Finished") for threads not displayed. macOS
-  only shows them for an app bundle (`tooling/bundle-mac.sh`).
+- Notifications ("Waiting for tool confirmation", "Waiting for your input", "Finished") for
+  threads not displayed. macOS only shows them for an app bundle (`tooling/bundle-mac.sh`).
 
 ### Agent control (MCP and CLI)
 

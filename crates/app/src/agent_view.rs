@@ -9,7 +9,6 @@ use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
-    logs_in_through_terminal,
 };
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
@@ -25,8 +24,12 @@ use ui::{
     Callout, CommonAnimationExt as _, ContextMenu, Disclosure, IconPosition, PopoverMenu, Severity,
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
+use util::ResultExt as _;
 
 use crate::agent_icons::agent_icon;
+use crate::agent_login::{AgentLogin, LoginLayout};
+use crate::confirm_dialog::ConfirmRequest;
+use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
@@ -67,8 +70,6 @@ struct DraggedDrawerEdge;
 
 /// The most lines of a command's terminal a tool call shows.
 const TOOL_TERMINAL_MAX_LINES: usize = 16;
-/// Room for a login command's prompts, a URL and a pasted code.
-const LOGIN_TERMINAL_HEIGHT: Pixels = px(240.);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -90,7 +91,11 @@ pub enum AgentViewEvent {
     Unarchive,
     /// Show another thread: a subthread from the Agents control, or a subthread's parent.
     OpenThread(ThreadId),
+    /// Ask before a destructive action, in the shell's modal layer.
+    Confirm(ConfirmRequest),
 }
+
+const COMPOSER_PLACEHOLDER: &str = "Message the agent…";
 
 /// The most subthreads the Agents control lists before it scrolls.
 const MAX_AGENT_ROWS_SHOWN: usize = 6;
@@ -148,8 +153,12 @@ pub struct AgentView {
     /// The terminals the agent runs its commands in, by the ids it got, shown in their tool
     /// calls.
     tool_terminals: HashMap<String, Entity<TerminalView>>,
-    /// Where a terminal login method runs, shown under the login callout.
-    login_terminal: Option<Entity<TerminalView>>,
+    /// The agent's login methods, shown when it needs a login.
+    login: Entity<AgentLogin>,
+    /// What the agent is asking the user, by ACP's `elicitation/create`.
+    elicitation_cards: Vec<Entity<ElicitationCard>>,
+    /// What the composer says while empty: to log in first, while the agent needs a login.
+    composer_placeholder: SharedString,
     _subscriptions: Vec<Subscription>,
     _elapsed_refresh: Task<()>,
 }
@@ -165,12 +174,16 @@ impl AgentView {
         let client = thread.read(cx).client().clone();
         let store = client.read(cx).projects().clone();
         let registry = client.read(cx).registry().clone();
-        let composer = cx.new(|cx| TextInput::new("Message the agent…", cx));
+        let composer = cx.new(|cx| TextInput::new(COMPOSER_PLACEHOLDER, cx));
+        let login = cx
+            .new(|cx| AgentLogin::new(thread.clone(), LoginLayout::Centered, agent_id.clone(), cx));
         let subscriptions = vec![
-            cx.observe(&thread, |this, _, cx| {
+            cx.observe(&thread, |this, thread, cx| {
                 // Only follow new output if the user hasn't scrolled up to read.
                 let follow = this.is_scrolled_to_bottom();
                 this.sync_markdowns(cx);
+                sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
+                this.sync_composer_placeholder(cx);
                 if follow {
                     this.scroll_handle.scroll_to_bottom();
                 }
@@ -178,7 +191,10 @@ impl AgentView {
                 cx.notify();
             }),
             // The agent's display name and icon come from the registry, which may load later.
-            cx.observe(&registry, |_, _, cx| cx.notify()),
+            cx.observe(&registry, |this, _, cx| {
+                this.sync_composer_placeholder(cx);
+                cx.notify()
+            }),
             cx.observe(&store, |this, _, cx| {
                 this.sync_blocked_subthreads(cx);
                 this.load_changed_files(false, cx);
@@ -244,11 +260,16 @@ impl AgentView {
             drawer_height: DRAWER_HEIGHT,
             drawer_full_screen: false,
             tool_terminals: HashMap::default(),
-            login_terminal: None,
+            login,
+            elicitation_cards: Vec::new(),
+            composer_placeholder: COMPOSER_PLACEHOLDER.into(),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
         this.sync_markdowns(cx);
+        let thread = this.thread.clone();
+        sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
+        this.sync_composer_placeholder(cx);
         this.sync_blocked_subthreads(cx);
         this.load_changed_files(false, cx);
         this
@@ -893,8 +914,26 @@ impl AgentView {
         cx.notify();
     }
 
+    /// Whether the agent needs a login before it takes messages.
+    fn needs_login(&self, cx: &App) -> bool {
+        self.thread.read(cx).status() == &ConnectionStatus::AuthRequired
+    }
+
+    fn sync_composer_placeholder(&mut self, cx: &mut Context<Self>) {
+        let placeholder: SharedString = if self.needs_login(cx) {
+            format!("Log in to {} to send a message", self.agent_name(cx)).into()
+        } else {
+            COMPOSER_PLACEHOLDER.into()
+        };
+        if placeholder != self.composer_placeholder {
+            self.composer_placeholder = placeholder.clone();
+            self.composer
+                .update(cx, |composer, cx| composer.set_placeholder(placeholder, cx));
+        }
+    }
+
     fn send(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_archived || !self.client.read(cx).is_online() {
+        if self.is_archived || !self.client.read(cx).is_online() || self.needs_login(cx) {
             return;
         }
         let commands = self.matching_commands(cx);
@@ -1096,6 +1135,8 @@ impl AgentView {
     /// The terminal, changes and options buttons, also shown in a workspace pane's header.
     pub(crate) fn render_toolbar_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.clone();
+        let view = cx.weak_entity();
+        let agent_name = self.agent_name(cx);
         h_flex()
             .gap_1p5()
             .child({
@@ -1167,6 +1208,8 @@ impl AgentView {
                 PopoverMenu::new("thread-options")
                     .menu(move |window, cx| {
                         let thread = thread.clone();
+                        let view = view.clone();
+                        let agent_name = agent_name.clone();
                         let (has_auth_methods, supports_logout, can_reload) = {
                             let thread = thread.read(cx);
                             (
@@ -1185,8 +1228,19 @@ impl AgentView {
                             }
                             if supports_logout {
                                 let thread = thread.clone();
-                                menu = menu.entry("Log Out", None, move |_, cx| {
-                                    thread.update(cx, |thread, cx| thread.logout(cx))
+                                let view = view.clone();
+                                let agent_name = agent_name.clone();
+                                // Asks first: logging out affects every thread with the agent.
+                                menu = menu.entry("Log Out…", None, move |_, cx| {
+                                    let thread = thread.clone();
+                                    let request =
+                                        ConfirmRequest::logout(&agent_name, move |_, cx| {
+                                            thread.update(cx, |thread, cx| thread.logout(cx))
+                                        });
+                                    view.update(cx, |_, cx| {
+                                        cx.emit(AgentViewEvent::Confirm(request))
+                                    })
+                                    .log_err();
                                 });
                             }
                             if has_auth_methods || supports_logout {
@@ -2022,96 +2076,14 @@ impl AgentView {
         )
     }
 
-    /// Zed's "Authenticate to …" callout, with a button per login method the agent offers.
-    fn render_auth_required(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.thread.read(cx);
-        if thread.status() != &ConnectionStatus::AuthRequired {
-            return None;
-        }
-        let agent_name = self.agent_name(cx);
-        let methods = thread.auth_methods().to_vec();
-        let auth_error = thread.auth_error().cloned();
-        let has_terminal_method = methods.iter().any(logs_in_through_terminal);
-
-        let mut buttons = Vec::new();
-        for (index, method) in methods.iter().enumerate().rev() {
-            let is_terminal = logs_in_through_terminal(method);
-            let (method_id, name, description) = match method {
-                acp::AuthMethod::Agent(method) => (
-                    method.id.clone(),
-                    method.name.clone(),
-                    method.description.clone(),
-                ),
-                acp::AuthMethod::Terminal(method) => (
-                    method.id.clone(),
-                    method.name.clone(),
-                    method.description.clone(),
-                ),
-                _ => continue,
-            };
-            buttons.push(
-                Button::new(SharedString::from(format!("auth-{}", method_id.0)), name)
-                    .label_size(LabelSize::Small)
-                    .style(if index == 0 {
-                        ButtonStyle::Tinted(ui::TintColor::Accent)
-                    } else {
-                        ButtonStyle::Outlined
-                    })
-                    .when_some(description, |button, description| {
-                        button.tooltip(Tooltip::text(description))
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if is_terminal {
-                            start_terminal_login(
-                                &this.thread,
-                                method_id.clone(),
-                                &mut this.login_terminal,
-                                window,
-                                cx,
-                            );
-                        } else {
-                            let method_id = method_id.clone();
-                            this.thread
-                                .update(cx, |thread, cx| thread.authenticate(method_id, cx));
-                        }
-                    })),
-            );
-        }
-        if has_terminal_method {
-            buttons.push(
-                Button::new("auth-retry", "I've Logged In")
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Outlined)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.thread
-                            .update(cx, |thread, cx| thread.retry_session(cx));
-                    })),
-            );
-        }
-
-        let description = auth_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| {
-                if methods.len() > 1 {
-                    "Choose one of the following authentication options:".to_string()
-                } else {
-                    format!("{agent_name} needs you to log in before it can start.")
-                }
-            });
-        Some(
-            div()
-                .px_2()
-                .pb_2()
-                .child(
-                    Callout::new()
-                        .icon(IconName::Info)
-                        .title(format!("Authenticate to {agent_name}"))
-                        .description(description)
-                        .actions_slot(h_flex().justify_end().flex_wrap().gap_1().children(buttons)),
-                )
-                .children(render_login_terminal(self.login_terminal.as_ref(), cx))
-                .into_any_element(),
-        )
+    /// Requests for input that belong to a request rather than the conversation, such as a
+    /// login's, sit above the composer, as in Zed.
+    fn render_request_elicitations(&self, cx: &App) -> Vec<AnyElement> {
+        self.elicitation_cards
+            .iter()
+            .filter(|card| card.read(cx).is_for_request())
+            .map(|card| div().px_2().pb_2().child(card.clone()).into_any_element())
+            .collect()
     }
 
     fn render_errors(&self, cx: &App) -> Option<AnyElement> {
@@ -2857,6 +2829,7 @@ impl AgentView {
         let is_generating = thread.is_working();
         let is_editor_empty = self.composer.read(cx).text().trim().is_empty();
         let has_failed = matches!(thread.status(), ConnectionStatus::Failed(_));
+        let needs_login = thread.status() == &ConnectionStatus::AuthRequired;
 
         let send_button = if is_generating && is_editor_empty {
             IconButton::new("stop-generation", IconName::Stop)
@@ -2876,13 +2849,15 @@ impl AgentView {
             )
             .style(ButtonStyle::Filled)
             .map(|this| {
-                if is_editor_empty || has_failed {
+                if is_editor_empty || has_failed || needs_login {
                     this.disabled(true).icon_color(Color::Muted)
                 } else {
                     this.icon_color(Color::Accent)
                 }
             })
-            .tooltip(Tooltip::text(if is_editor_empty {
+            .tooltip(Tooltip::text(if needs_login {
+                "Log In to Send"
+            } else if is_editor_empty {
                 "Type to Send"
             } else if is_generating {
                 "Queue and Send"
@@ -2912,6 +2887,8 @@ impl AgentView {
                     .min_w_0()
                     .px_2()
                     .gap_2()
+                    // A draft can still be typed, but the composer reads as waiting on the login.
+                    .when(needs_login, |this| this.opacity(0.55))
                     .child(
                         v_flex()
                             .relative()
@@ -3063,11 +3040,18 @@ impl Render for AgentView {
             }
         }
         rows.extend(self.render_subthread_permissions(cx));
+        rows.extend(
+            self.elicitation_cards
+                .iter()
+                .filter(|card| !card.read(cx).is_for_request())
+                .map(|card| div().px_5().py_1p5().child(card.clone()).into_any_element()),
+        );
         if let Some(generating) = self.render_generating(cx) {
             rows.push(generating);
         }
         let has_rows = !rows.is_empty();
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
+        let needs_login = self.needs_login(cx);
 
         let is_subthread = self.parent(cx).is_some();
         let is_drawer_full_screen =
@@ -3135,7 +3119,7 @@ impl Render for AgentView {
                                         ),
                                 )
                             })
-                            .when(!has_rows && !is_connecting, |this| {
+                            .when(!has_rows && !is_connecting && !needs_login, |this| {
                                 this.child(
                                     div().w_full().max_w(MAX_CONTENT_WIDTH).px_5().py_8().child(
                                         Label::new(format!(
@@ -3145,9 +3129,23 @@ impl Render for AgentView {
                                         .color(Color::Muted),
                                     ),
                                 )
+                            })
+                            // The login takes the empty thread's middle, or follows its history.
+                            .when(needs_login, |this| {
+                                this.child(
+                                    v_flex()
+                                        .debug_selector(|| "thread-login".into())
+                                        .w_full()
+                                        .max_w(MAX_CONTENT_WIDTH)
+                                        .px_5()
+                                        .py_8()
+                                        .items_center()
+                                        .when(!has_rows, |panel| panel.flex_1().justify_center())
+                                        .child(self.login.clone()),
+                                )
                             }),
                     )
-                    .children(self.render_auth_required(cx))
+                    .children(self.render_request_elicitations(cx))
                     .children(self.render_errors(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
@@ -3251,60 +3249,6 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
                 .size(LabelSize::Small)
                 .color(Color::Deleted),
         )
-}
-
-/// Runs a terminal login method on the agent's machine and shows its terminal, reusing the
-/// view from an earlier attempt.
-pub(crate) fn start_terminal_login(
-    thread: &Entity<AgentThread>,
-    method_id: acp::AuthMethodId,
-    login_terminal: &mut Option<Entity<TerminalView>>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(connection) = thread.read(cx).connection() else {
-        return;
-    };
-    thread.update(cx, |thread, cx| thread.terminal_login(method_id, cx));
-    let view = match login_terminal {
-        Some(view) => {
-            // The server started the login over in a new terminal.
-            let terminal = view.read(cx).terminal().clone();
-            terminal.update(cx, |terminal, cx| terminal.reconnected(cx));
-            view.clone()
-        }
-        None => {
-            let client = thread.read(cx).client().clone();
-            let terminal = Terminal::shared(&client, TerminalKey::Login(connection), cx);
-            let view = cx.new(|cx| TerminalView::new(terminal, TerminalMode::Scrollable, cx));
-            *login_terminal = Some(view.clone());
-            view
-        }
-    };
-    window.focus(&view.focus_handle(cx), cx);
-}
-
-/// A terminal login while it runs. The server closes it once the login succeeds; a failed one
-/// stays to show why.
-pub(crate) fn render_login_terminal(
-    login_terminal: Option<&Entity<TerminalView>>,
-    cx: &App,
-) -> Option<AnyElement> {
-    let view = login_terminal?;
-    if view.read(cx).terminal().read(cx).error().is_some() {
-        return None;
-    }
-    Some(
-        div()
-            .mt_2()
-            .h(LOGIN_TERMINAL_HEIGHT)
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .overflow_hidden()
-            .child(view.clone())
-            .into_any_element(),
-    )
 }
 
 #[cfg(test)]

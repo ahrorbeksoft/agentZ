@@ -13,9 +13,19 @@ terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
 and replies "Terminal <exit code>: <output>", then releases it.
 
 With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail with
-"authentication required"); "mock-login" creates it, and so does the terminal login
-"mock-terminal-login", offered to clients that support terminal logins: it runs this
-script with `--login`, which waits for Enter, then creates the file and exits.
+"authentication required" and a pairing code, as Factory Droid does); "mock-login" creates
+it, and so does the terminal login "mock-terminal-login", offered to clients that support
+terminal logins: it runs this script with `--login`, which waits for Enter, then creates the
+file and exits. The other logins, as real agents offer them:
+- "mock-browser-login" (to clients that take URL elicitations) asks the client to open a
+  URL, as Codex's device-code login does, and logs in once the client accepts.
+- "mock-api-key" takes `_meta["api-key"]["apiKey"]`, as Codex's does.
+- "mock-gateway" (to clients that set `auth._meta.gateway`) takes `_meta["gateway"]`
+  with a `baseUrl`, as Claude Agent's does.
+Every login and logout is reported with `_auth/status_update`, as Claude Agent and Codex do.
+
+A prompt of "form" asks the client to fill in a form (a session elicitation) and replies
+"Form: <action> <content as JSON>".
 """
 import json
 import os
@@ -42,6 +52,8 @@ pending = {}
 mcp_servers = []
 session_cwd = os.getcwd()
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
+# Set by logout: sessions then need a login, until the process restarts.
+logged_out = False
 
 
 def config_options():
@@ -116,6 +128,69 @@ def client_request(method, params):
             return reply["result"]
 
 
+def logged_in():
+    if logged_out:
+        return False
+    return not LOGIN_FILE or os.path.exists(LOGIN_FILE)
+
+
+def log_in():
+    global logged_out
+    logged_out = False
+    if LOGIN_FILE:
+        open(LOGIN_FILE, "w").close()
+
+
+def send_auth_status():
+    if logged_in():
+        status = {"kind": "account", "label": "Mock Pro",
+                  "account": {"email": "mock@example.com", "plan": "Pro"}}
+    else:
+        status = {"kind": "none"}
+    send({"jsonrpc": "2.0", "method": "_auth/status_update", "params": {"authStatus": status}})
+
+
+def authenticate(request_id, params):
+    method_id = params.get("methodId")
+    meta = params.get("_meta") or {}
+    error = None
+    if method_id == "mock-browser-login":
+        answer = client_request("elicitation/create", {
+            "mode": "url", "requestId": request_id, "elicitationId": "login-1",
+            "url": "https://example.com/device?code=MOCK-1234",
+            "message": "Enter code MOCK-1234 to log in to the mock agent."})
+        if answer.get("action") == "accept":
+            send({"jsonrpc": "2.0", "method": "elicitation/complete",
+                  "params": {"elicitationId": "login-1"}})
+        else:
+            error = f"Login {answer.get('action')}"
+    elif method_id == "mock-api-key":
+        if not (meta.get("api-key") or {}).get("apiKey"):
+            error = "No API key given"
+    elif method_id == "mock-gateway":
+        if not (meta.get("gateway") or {}).get("baseUrl"):
+            error = "No gateway given"
+    if error:
+        send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": error}})
+        return
+    log_in()
+    send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    send_auth_status()
+
+
+def ask_form(session_id):
+    answer = client_request("elicitation/create", {
+        "mode": "form", "sessionId": session_id,
+        "message": "How should the mock agent greet you?",
+        "requestedSchema": {"type": "object", "required": ["name"], "properties": {
+            "name": {"type": "string", "title": "Name", "minLength": 1},
+            "tone": {"type": "string", "title": "Tone", "oneOf": [
+                {"const": "warm", "title": "Warm"}, {"const": "dry", "title": "Dry"}]},
+            "times": {"type": "integer", "title": "Times", "minimum": 1, "maximum": 3},
+            "loud": {"type": "boolean", "title": "Loud", "default": False}}}})
+    return f"Form: {answer.get('action')} {json.dumps(answer.get('content'), sort_keys=True)}"
+
+
 def run_in_terminal(session_id, command):
     created = client_request("terminal/create", {"sessionId": session_id, "command": command,
                                                  "outputByteLimit": 10000})
@@ -176,18 +251,30 @@ for line in sys.stdin:
         if capabilities.get("auth", {}).get("terminal"):
             auth_methods.append({"id": "mock-terminal-login", "name": "Log in in a terminal",
                                  "type": "terminal", "args": ["--login"]})
+        if "url" in (capabilities.get("elicitation") or {}):
+            auth_methods.append({"id": "mock-browser-login", "name": "Log in with a browser"})
+        auth_methods.append({"id": "mock-api-key", "name": "Use an API key",
+                             "_meta": {"api-key": {"provider": "mock"}}})
+        if ((capabilities.get("auth") or {}).get("_meta") or {}).get("gateway"):
+            auth_methods.append({"id": "mock-gateway", "name": "Use a gateway",
+                                 "_meta": {"gateway": {"protocol": "anthropic"}}})
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
                          "agentCapabilities": {"loadSession": HISTORY_PATH is not None,
                                                "auth": {"logout": {}}},
                          "authMethods": auth_methods}})
-    elif method in ("authenticate", "logout"):
-        if LOGIN_FILE and method == "authenticate":
-            open(LOGIN_FILE, "w").close()
+        send_auth_status()
+    elif method == "authenticate":
+        authenticate(message["id"], message["params"])
+    elif method == "logout":
+        logged_out = True
+        if LOGIN_FILE and os.path.exists(LOGIN_FILE):
+            os.remove(LOGIN_FILE)
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
-    elif method in ("session/new", "session/load") and LOGIN_FILE and not os.path.exists(LOGIN_FILE):
+        send_auth_status()
+    elif method in ("session/new", "session/load") and not logged_in():
         send({"jsonrpc": "2.0", "id": message["id"],
-              "error": {"code": -32000, "message": "Authentication required"}})
+              "error": {"code": -32000, "message": "\n\nYour code: MOCK-1234\n\nClick Log In."}})
     elif method == "session/new":
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)
@@ -247,6 +334,10 @@ for line in sys.stdin:
                 reply = run_in_terminal(params["sessionId"], prompt_text[len("terminal "):])
             except RuntimeError as error:
                 reply = f"Terminal failed: {error}"
+            update(params["sessionId"], text_chunk("agent_message_chunk", reply))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "form":
+            reply = ask_form(params["sessionId"])
             update(params["sessionId"], text_chunk("agent_message_chunk", reply))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "slow":

@@ -30,6 +30,7 @@ use ui::{
 
 use crate::OpenSettings;
 use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
+use crate::confirm_dialog::ConfirmRequest;
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
@@ -148,6 +149,8 @@ pub enum SpacesViewEvent {
         name: SharedString,
         mode: WorktreeModalMode,
     },
+    /// Ask before a destructive action, in the shell's modal layer.
+    Confirm(ConfirmRequest),
 }
 
 #[derive(Clone)]
@@ -652,6 +655,9 @@ impl SpacesView {
                                 machine,
                                 thread: *other,
                             }))
+                        }
+                        AgentViewEvent::Confirm(request) => {
+                            cx.emit(SpacesViewEvent::Confirm(request.clone()))
                         }
                     });
                     (PaneView::Agent(view), vec![subscription])
@@ -2586,10 +2592,12 @@ fn render_state_slot(status: Option<ThreadStatus>, cx: &App) -> AnyElement {
     }
 }
 
-/// herdr's rolled-up state: blocked first, then finished but unseen, then working.
+/// herdr's rolled-up state: blocked first (on a permission, then on input), then finished but
+/// unseen, then working.
 fn rolled_up(statuses: impl Iterator<Item = ThreadStatus>) -> Option<ThreadStatus> {
     statuses.max_by_key(|status| match status {
-        ThreadStatus::PendingApproval => 3,
+        ThreadStatus::PendingApproval => 4,
+        ThreadStatus::AwaitingInput => 3,
         ThreadStatus::Completed => 2,
         ThreadStatus::Working => 1,
     })

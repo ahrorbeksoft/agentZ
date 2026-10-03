@@ -226,11 +226,47 @@ impl AgentThread {
         self.request(Request::CheckLogin, cx)
     }
 
-    pub fn authenticate(&mut self, method_id: acp::AuthMethodId, cx: &mut Context<Self>) {
+    pub fn authenticate(
+        &mut self,
+        method_id: acp::AuthMethodId,
+        meta: Option<acp::Meta>,
+        cx: &mut Context<Self>,
+    ) {
         self.request(
             |connection| Request::Authenticate {
                 connection,
                 method_id,
+                meta,
+            },
+            cx,
+        )
+    }
+
+    pub fn cancel_authentication(&mut self, cx: &mut Context<Self>) {
+        self.request(Request::CancelAuthentication, cx)
+    }
+
+    pub fn respond_to_elicitation(
+        &mut self,
+        elicitation: u64,
+        action: acp::ElicitationAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(
+            |connection| Request::RespondToElicitation {
+                connection,
+                elicitation,
+                action,
+            },
+            cx,
+        )
+    }
+
+    pub fn dismiss_elicitation(&mut self, elicitation: u64, cx: &mut Context<Self>) {
+        self.request(
+            |connection| Request::DismissElicitation {
+                connection,
+                elicitation,
             },
             cx,
         )
