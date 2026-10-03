@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agentz_client::Connection;
-use agentz_client::ssh::{RemotePlatform, Ssh, SshError};
+use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
 use agentz_protocol::agents::{AgentId, AgentSettings};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
@@ -19,9 +19,9 @@ use agentz_protocol::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
-use futures::FutureExt as _;
-use futures::channel::oneshot;
+use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use ui::SharedString;
 
@@ -105,6 +105,8 @@ pub struct ServerClient {
     terminals: HashMap<TerminalKey, WeakEntity<Terminal>>,
     /// Session events that arrived while the session snapshot was on its way.
     queued_session_events: Option<Vec<Event>>,
+    /// How far installing the server on the machine is, while connecting.
+    upload_progress: Option<UploadProgress>,
     /// Cuts the wait before the next attempt short.
     retry_now: Option<oneshot::Sender<()>>,
     /// What the server was last told of the other machines, this connection.
@@ -142,6 +144,7 @@ impl ServerClient {
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
+                upload_progress: None,
                 retry_now: None,
                 peers_sent: None,
                 _maintain_connection: cx.spawn(async move |this, cx| {
@@ -188,6 +191,12 @@ impl ServerClient {
 
     pub fn connection(&self) -> Option<&Connection> {
         self.connection.as_ref()
+    }
+
+    /// How far installing the server on the machine is, while connecting to it.
+    pub fn upload_progress(&self) -> Option<UploadProgress> {
+        self.upload_progress
+            .filter(|_| self.status == MachineStatus::Connecting)
     }
 
     pub fn is_outdated(&self) -> bool {
@@ -487,6 +496,7 @@ impl ServerClient {
         self.peers_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
+        self.upload_progress = None;
         self.queued_session_events = Some(Vec::new());
         let threads: Vec<_> = self
             .threads
@@ -513,6 +523,7 @@ impl ServerClient {
     fn disconnected(&mut self, status: MachineStatus, cx: &mut Context<Self>) {
         self.connection = None;
         self.status = status;
+        self.upload_progress = None;
         self.queued_session_events = None;
         cx.notify();
     }
@@ -604,7 +615,22 @@ async fn maintain_connection(
     };
     let mut delay = min_delay;
     loop {
-        let status = match connect(&runtime, &transport).await {
+        // Shown while installing the server on the machine takes a while.
+        let (upload_progress, mut upload_updates) = mpsc::unbounded();
+        let shows_progress = this.clone();
+        cx.spawn(async move |cx| {
+            while let Some(update) = upload_updates.next().await {
+                let shown = shows_progress.update(cx, |this, cx| {
+                    this.upload_progress = Some(update);
+                    cx.notify();
+                });
+                if shown.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let status = match connect(&runtime, &transport, upload_progress).await {
             Ok((connection, mut events, is_outdated)) => {
                 let connected_at = Instant::now();
                 let session = connection.request(Request::SubscribeSession);
@@ -687,6 +713,7 @@ async fn maintain_connection(
 async fn connect(
     runtime: &tokio::runtime::Handle,
     transport: &Transport,
+    upload_progress: mpsc::UnboundedSender<UploadProgress>,
 ) -> Result<(Connection, agentz_client::Events, bool), SshError> {
     match transport {
         Transport::Local => connect_local(runtime)
@@ -714,6 +741,9 @@ async fn connect(
                         VERSION,
                         remote_server_binary,
                         ClientKind::App,
+                        move |update| {
+                            upload_progress.unbounded_send(update).ok();
+                        },
                     )
                     .await
                 })

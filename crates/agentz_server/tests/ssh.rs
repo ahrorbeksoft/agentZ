@@ -55,17 +55,27 @@ async fn connect(
     ssh: &Ssh,
     server_binary: impl FnOnce(RemotePlatform) -> anyhow::Result<PathBuf>,
 ) -> Session {
+    let progress = std::sync::Mutex::new(Vec::new());
     let Connected {
         connection,
         mut events,
         is_outdated,
     } = tokio::time::timeout(
         TIMEOUT,
-        agentz_client::ssh::connect(ssh, VERSION, server_binary, ClientKind::App),
+        agentz_client::ssh::connect(ssh, VERSION, server_binary, ClientKind::App, |update| {
+            progress.lock().expect("not poisoned").push(update)
+        }),
     )
     .await
     .expect("in time")
     .expect("connects");
+    // An upload, when there was one, is reported from the start to the whole binary.
+    let progress = progress.into_inner().expect("not poisoned");
+    if let (Some(first), Some(last)) = (progress.first(), progress.last()) {
+        assert_eq!(first.sent, 0);
+        assert_eq!(last.sent, last.total);
+        assert_eq!(last.percent(), 100);
+    }
     // Answers are delivered while the events are taken.
     let events_drained = tokio::spawn(async move { while events.next().await.is_some() {} });
     Session {
@@ -170,18 +180,25 @@ async fn connects_installs_and_reconnects_over_ssh() {
     shut_down(connected).await;
 
     let unreachable = Ssh::with_program(program.clone(), "unreachable").expect("valid target");
-    let error = agentz_client::ssh::connect(&unreachable, VERSION, server_binary, ClientKind::App)
-        .await
-        .err()
-        .expect("fails");
+    let error = agentz_client::ssh::connect(
+        &unreachable,
+        VERSION,
+        server_binary,
+        ClientKind::App,
+        |_| {},
+    )
+    .await
+    .err()
+    .expect("fails");
     assert!(error.message.contains("Connection refused"), "{error:?}");
     assert!(!error.needs_attention);
 
     let locked = Ssh::with_program(program, "locked").expect("valid target");
-    let error = agentz_client::ssh::connect(&locked, VERSION, server_binary, ClientKind::App)
-        .await
-        .err()
-        .expect("fails");
+    let error =
+        agentz_client::ssh::connect(&locked, VERSION, server_binary, ClientKind::App, |_| {})
+            .await
+            .err()
+            .expect("fails");
     assert!(error.needs_attention, "{error:?}");
     assert!(error.hint.is_some());
 }
@@ -217,6 +234,7 @@ async fn connects_to_a_real_machine() {
                     Ok(path)
                 },
                 ClientKind::App,
+                |_| {},
             ),
         )
         .await

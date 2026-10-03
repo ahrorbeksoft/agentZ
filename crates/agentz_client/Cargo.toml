@@ -21,7 +21,7 @@ libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt", "time"] }
 
 [dev-dependencies]
 agentz_server.workspace = true

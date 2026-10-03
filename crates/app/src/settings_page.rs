@@ -2023,7 +2023,13 @@ impl SettingsPage {
             Some(client) => {
                 let client = client.read(cx);
                 match client.status() {
-                    MachineStatus::Connecting => ("Connecting".into(), false),
+                    MachineStatus::Connecting => match client.upload_progress() {
+                        Some(progress) => (
+                            format!("Uploading agentz-server · {}%", progress.percent()),
+                            false,
+                        ),
+                        None => ("Connecting".into(), false),
+                    },
                     MachineStatus::Online => {
                         if client.is_outdated() {
                             server_version = client

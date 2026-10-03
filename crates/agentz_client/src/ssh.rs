@@ -28,7 +28,10 @@ const OUTPUT_READY_MARKER: &str = "agentz-remote-output-ready:1";
 /// Runs this instead of `ssh`, for tests.
 const SSH_PROGRAM_ENV_VAR: &str = "AGENTZ_SSH";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long uploading the server may go without ssh taking more of it. A slow link takes as
+/// long as it takes; one that stopped moving is given up.
+const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
 /// Covers starting the server on the other end, which loads the login shell's environment.
 const PROXY_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const STDERR_LIMIT: usize = 16 * 1024;
@@ -295,54 +298,25 @@ impl Ssh {
     /// Runs the script under `/bin/sh` on the machine, whatever the user's login shell, and
     /// returns what it printed.
     pub async fn run(&self, script: &str) -> Result<String> {
-        let output = self.run_with_input(script, None, COMMAND_TIMEOUT).await?;
-        String::from_utf8(output).context("the remote command printed invalid UTF-8")
-    }
-
-    async fn run_with_input(
-        &self,
-        script: &str,
-        input: Option<Vec<u8>>,
-        timeout: Duration,
-    ) -> Result<Vec<u8>> {
-        let mut command = self.command(&remote_script(script));
-        command
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+        let child = self
+            .command(&remote_script(script))
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("running {}", self.program.display()))?;
-        let stdin = child.stdin.take();
-        let write_input = async move {
-            if let (Some(mut stdin), Some(input)) = (stdin, input) {
-                stdin.write_all(&input).await?;
-                stdin.shutdown().await?;
-            }
-            anyhow::Ok(())
-        };
-        let (written, output) = tokio::time::timeout(timeout, async {
-            futures::join!(write_input, child.wait_with_output())
-        })
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "ssh {} didn't finish within {} seconds",
-                self.target,
-                timeout.as_secs()
-            )
-        })?;
-        let output = output.context("waiting for ssh")?;
-        if !output.status.success() {
-            bail!("{}", failure_message(&output.status, &output.stderr));
-        }
-        // A write error matters only when the command itself succeeded without the input.
-        written.context("sending to ssh")?;
-        discard_preamble(&output.stdout)
+        let output = tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "ssh {} didn't finish within {} seconds",
+                    self.target,
+                    COMMAND_TIMEOUT.as_secs()
+                )
+            })?
+            .context("waiting for ssh")?;
+        let output = finished_output(output)?;
+        String::from_utf8(output).context("the remote command printed invalid UTF-8")
     }
 
     /// The machine's platform, and the hash of the server already installed for `version`, in
@@ -368,7 +342,14 @@ impl Ssh {
 
     /// Copies the binary into place through ssh's stdin, as herdr does, then records its hash.
     /// A temporary name and a rename mean a server running from the old file keeps running.
-    async fn install(&self, version: &str, binary: Vec<u8>, hash: &str) -> Result<()> {
+    /// Reports how much of it ssh has taken as it goes.
+    async fn install(
+        &self,
+        version: &str,
+        binary: Vec<u8>,
+        hash: &str,
+        on_progress: &(dyn Fn(UploadProgress) + Send + Sync),
+    ) -> Result<()> {
         let directory = install_directory(version);
         let script = format!(
             "set -eu\n\
@@ -381,9 +362,50 @@ impl Ssh {
              printf '%s\\n' {hash} > \"$dir/agentz-server.sha256\"\n",
             hash = shell_quote(hash),
         );
-        self.run_with_input(&script, Some(binary), UPLOAD_TIMEOUT)
-            .await
-            .context("uploading agentz-server")?;
+        let mut child = self
+            .command(&remote_script(&script))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running {}", self.program.display()))?;
+        let mut stdin = child.stdin.take().context("ssh has no stdin")?;
+        let output = child.wait_with_output();
+        futures::pin_mut!(output);
+        let total = binary.len() as u64;
+        let upload = async {
+            let mut sent = 0;
+            on_progress(UploadProgress { sent, total });
+            for chunk in binary.chunks(UPLOAD_CHUNK_SIZE) {
+                tokio::time::timeout(UPLOAD_STALL_TIMEOUT, stdin.write_all(chunk))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "uploading to {} stopped for {} seconds",
+                            self.target,
+                            UPLOAD_STALL_TIMEOUT.as_secs()
+                        )
+                    })?
+                    .context("sending to ssh")?;
+                sent += chunk.len() as u64;
+                on_progress(UploadProgress { sent, total });
+            }
+            stdin.shutdown().await.context("sending to ssh")?;
+            drop(stdin);
+            anyhow::Ok(())
+        };
+        // Ssh ending before it took everything has the reason in its output. Dropping it
+        // stops it (`kill_on_drop`).
+        let output = tokio::select! {
+            uploaded = upload => {
+                uploaded.context("uploading agentz-server")?;
+                tokio::time::timeout(UPLOAD_STALL_TIMEOUT, &mut output)
+                    .await
+                    .map_err(|_| anyhow!("installing agentz-server on {} didn't finish", self.target))?
+            }
+            output = &mut output => output,
+        };
+        finished_output(output.context("waiting for ssh")?).context("uploading agentz-server")?;
         Ok(())
     }
 
@@ -452,17 +474,38 @@ pub struct Connected {
     pub is_outdated: bool,
 }
 
+/// How much of the server ssh has taken while installing it on a machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadProgress {
+    pub sent: u64,
+    pub total: u64,
+}
+
+impl UploadProgress {
+    pub fn percent(&self) -> u64 {
+        (self.sent * 100).checked_div(self.total).unwrap_or(100)
+    }
+}
+
 /// Connects to the server on the machine: checks its platform, uploads `server_binary`'s
-/// choice when the installed server differs, and starts the proxy. Call it on the runtime.
+/// choice when the installed server differs (reporting its progress), and starts the proxy.
+/// Call it on the runtime.
 pub async fn connect(
     ssh: &Ssh,
     version: &str,
     server_binary: impl FnOnce(RemotePlatform) -> Result<PathBuf>,
     client_kind: ClientKind,
+    on_upload_progress: impl Fn(UploadProgress) + Send + Sync,
 ) -> Result<Connected, SshError> {
-    connect_inner(ssh, version, server_binary, client_kind)
-        .await
-        .map_err(|error| SshError::classify(ssh.target(), &error))
+    connect_inner(
+        ssh,
+        version,
+        server_binary,
+        client_kind,
+        &on_upload_progress,
+    )
+    .await
+    .map_err(|error| SshError::classify(ssh.target(), &error))
 }
 
 async fn connect_inner(
@@ -470,6 +513,7 @@ async fn connect_inner(
     version: &str,
     server_binary: impl FnOnce(RemotePlatform) -> Result<PathBuf>,
     client_kind: ClientKind,
+    on_upload_progress: &(dyn Fn(UploadProgress) + Send + Sync),
 ) -> Result<Connected> {
     let (platform, installed) = ssh.probe(version).await?;
     let path = server_binary(platform)?;
@@ -482,7 +526,8 @@ async fn connect_inner(
             "installing agentz-server {version} for {platform} on {}",
             ssh.target()
         );
-        ssh.install(version, binary, &hash).await?;
+        ssh.install(version, binary, &hash, on_upload_progress)
+            .await?;
     }
     let stream = ssh.proxy(version).await?;
     let (connection, events) = Connection::new(
@@ -505,6 +550,14 @@ async fn connect_inner(
         events,
         is_outdated,
     })
+}
+
+/// What a remote command printed, once it succeeded.
+fn finished_output(output: std::process::Output) -> Result<Vec<u8>> {
+    if !output.status.success() {
+        bail!("{}", failure_message(&output.status, &output.stderr));
+    }
+    discard_preamble(&output.stdout)
 }
 
 /// `~/.agentz/server/<version>`, quoted for the remote shell with `$HOME` left to it.

@@ -233,7 +233,8 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
 
 - **Connecting** (`agentz_client/src/ssh.rs`, `machines.rs`, `server_client.rs`): OpenSSH with
   `BatchMode` and a shared ControlMaster; `uname -sm`; the server uploaded to
-  `~/.agentz/server/<version>/` (skipped when the SHA-256 matches); `proxy` over stdio. States:
+  `~/.agentz/server/<version>/` (skipped when the SHA-256 matches; streamed in chunks with
+  its progress shown on the machine's row, and given up only when it stops moving for a minute); `proxy` over stdio. States:
   Online, Reconnecting (backoff to 2 minutes), Attention (the error and the command to run).
 - **Linux servers**: static musl from `cargo zigbuild`, stripped (about 7 MB; 48 MB unstripped).
 - **Updates**: an older server keeps running beside the new binary (over SSH told by the
