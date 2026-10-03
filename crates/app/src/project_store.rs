@@ -8,7 +8,9 @@ use std::time::SystemTime;
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::terminal::TerminalCommand;
-use agentz_protocol::workspace::{ProjectGit, WorkspaceChoice, WorkspaceRemoval};
+use agentz_protocol::workspace::{
+    ProjectGit, RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval,
+};
 use agentz_protocol::{Request, Response};
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
@@ -316,17 +318,34 @@ impl ProjectStore {
         )
     }
 
-    /// Makes a worktree or pasture with no thread in it, resolving to its folder.
+    /// The repository `folder` is in, a project or not, and its checkouts.
+    pub fn repository_checkouts(
+        &self,
+        folder: PathBuf,
+        cx: &App,
+    ) -> Task<Result<RepositoryCheckouts>> {
+        self.request(
+            Request::RepositoryCheckouts(folder),
+            |response| match response {
+                Response::RepositoryCheckouts(checkouts) => Some(checkouts),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// Makes a worktree or pasture of the repository `folder` is in, from what `folder` has
+    /// checked out, with no thread in it. Resolves to its folder.
     pub fn create_workspace(
         &self,
-        project_id: ProjectId,
+        folder: PathBuf,
         kind: WorkspaceKind,
         branch: Option<String>,
         cx: &App,
     ) -> Task<Result<PathBuf>> {
         self.request(
             Request::CreateWorkspace {
-                project_id,
+                folder,
                 kind,
                 base: None,
                 branch,

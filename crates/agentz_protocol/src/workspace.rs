@@ -37,6 +37,25 @@ pub struct ProjectGit {
     pub pastures: PastureSupport,
 }
 
+/// [`crate::Request::RepositoryCheckouts`]'s answer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryCheckouts {
+    /// As for a project, but `branch` is what the asked-about folder has checked out.
+    pub git: ProjectGit,
+    /// The main checkout first, then its worktrees (`git worktree list`), then the pastures
+    /// of the project it is, if any.
+    pub checkouts: Vec<Checkout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Checkout {
+    pub path: PathBuf,
+    /// `None` when detached.
+    pub branch: Option<String>,
+    /// `None` for the main checkout.
+    pub kind: Option<WorkspaceKind>,
+}
+
 /// How a pasture of the project would be made on its machine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PastureSupport {

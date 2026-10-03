@@ -1850,7 +1850,7 @@ async fn threads_work_in_worktrees_and_pastures() {
     // A worktree made with no thread, for a terminal, is one of the project's for later threads.
     let Response::WorkspaceCreated(empty) = client
         .ok(Request::CreateWorkspace {
-            project_id,
+            folder: repository.to_path_buf(),
             kind: WorkspaceKind::Worktree,
             base: None,
             branch: Some("shell".into()),
@@ -1874,7 +1874,7 @@ async fn threads_work_in_worktrees_and_pastures() {
     assert!(
         client
             .request(Request::CreateWorkspace {
-                project_id,
+                folder: repository.to_path_buf(),
                 kind: WorkspaceKind::Worktree,
                 base: None,
                 branch: Some("shell".into()),
@@ -1882,6 +1882,52 @@ async fn threads_work_in_worktrees_and_pastures() {
             .await
             .is_err()
     );
+    // Asked from inside a worktree, the checkouts are the repository's, with that branch.
+    let Response::RepositoryCheckouts(checkouts) =
+        client.ok(Request::RepositoryCheckouts(empty.clone())).await
+    else {
+        panic!("expected the repository's checkouts");
+    };
+    assert_eq!(checkouts.git.branch.as_deref(), Some("shell"));
+    assert_eq!(checkouts.checkouts[0].kind, None);
+    assert!(
+        checkouts.checkouts.iter().any(
+            |checkout| checkout.path == empty && checkout.kind == Some(WorkspaceKind::Worktree)
+        )
+    );
+
+    // A repository that's no project gets worktrees too, starting from its own branch.
+    let other = tempfile::tempdir().expect("a folder");
+    let other = std::fs::canonicalize(other.path()).expect("a resolved path");
+    git(&other, &["init", "-q", "-b", "trunk"]).await;
+    git(&other, &["config", "user.name", "Test"]).await;
+    git(&other, &["config", "user.email", "test@example.com"]).await;
+    std::fs::write(other.join("README.md"), "other\n").expect("a file");
+    git(&other, &["add", "."]).await;
+    git(&other, &["commit", "-q", "-m", "first"]).await;
+    let Response::WorkspaceCreated(loose) = client
+        .ok(Request::CreateWorkspace {
+            folder: other.clone(),
+            kind: WorkspaceKind::Worktree,
+            base: None,
+            branch: Some("loose".into()),
+        })
+        .await
+    else {
+        panic!("expected the workspace's folder");
+    };
+    assert!(loose.join("README.md").exists());
+    let Response::RepositoryCheckouts(checkouts) =
+        client.ok(Request::RepositoryCheckouts(other.clone())).await
+    else {
+        panic!("expected the repository's checkouts");
+    };
+    let branches: Vec<_> = checkouts
+        .checkouts
+        .iter()
+        .map(|checkout| checkout.branch.as_deref())
+        .collect();
+    assert_eq!(branches, vec![Some("trunk"), Some("loose")]);
 
     if cfg!(target_os = "macos") {
         let Response::ThreadCreated(pasture_thread) = client

@@ -40,7 +40,7 @@ use crate::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalProgram,
 };
 use crate::thread::{ThreadUpdate, ThreadView};
-use crate::workspace::{ProjectGit, WorkspaceChoice, WorkspaceRemoval};
+use crate::workspace::{ProjectGit, RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval};
 
 /// Bumped when a change can't be made compatibly.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -290,12 +290,16 @@ pub enum Request {
     CloseTerminal(TerminalKey),
     /// The project's branches and whether pastures work there: [`Response::ProjectGit`].
     ProjectGit(ProjectId),
-    /// A worktree or pasture on a new branch, with no thread in it yet:
-    /// [`Response::WorkspaceCreated`] with its folder.
+    /// The repository a folder is in, and its checkouts: [`Response::RepositoryCheckouts`].
+    /// Any repository, a project or not.
+    RepositoryCheckouts(PathBuf),
+    /// A worktree or pasture of the repository `folder` is in, on a new branch, with no thread
+    /// in it yet: [`Response::WorkspaceCreated`] with its folder. A project's is recorded as one
+    /// of its workspaces.
     CreateWorkspace {
-        project_id: ProjectId,
+        folder: PathBuf,
         kind: WorkspaceKind,
-        /// What the branch starts from: the checkout's current branch by default.
+        /// What the branch starts from: what `folder` has checked out by default.
         #[serde(default)]
         base: Option<String>,
         /// `agentz/<short id>` by default.
@@ -533,6 +537,7 @@ pub enum Response {
     ProjectGit(ProjectGit),
     WorkspaceRemoval(WorkspaceRemoval),
     WorkspaceCreated(PathBuf),
+    RepositoryCheckouts(RepositoryCheckouts),
     TerminalPrograms(Vec<TerminalProgram>),
     DrawerTerminals(Vec<u32>),
     TerminalFrame(TerminalFrame),

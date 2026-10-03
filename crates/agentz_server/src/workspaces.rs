@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceRemoval};
+use agentz_protocol::workspace::{
+    Checkout, PastureSupport, ProjectGit, RepositoryCheckouts, WorkspaceRemoval,
+};
 use anyhow::{Context as _, Result, anyhow};
 use projects::{Workspace, WorkspaceKind};
 use serde::Deserialize;
@@ -479,6 +481,129 @@ pub(crate) async fn bring_back(repo: &Path, pasture: &Path, branch: &str) -> Res
     ))
 }
 
+/// The repository's main checkout, also from inside one of its worktrees.
+pub(crate) async fn main_checkout(folder: &Path) -> Result<PathBuf> {
+    let common_dir = git(
+        folder,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        &[],
+    )
+    .await?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    if common_dir.file_name().is_some_and(|name| name == ".git")
+        && let Some(root) = common_dir.parent()
+    {
+        return Ok(root.to_path_buf());
+    }
+    // A bare repository's or a separate git dir's checkout: the folder's own top.
+    let top_level = git(folder, &["rev-parse", "--show-toplevel"], &[]).await?;
+    Ok(PathBuf::from(top_level.trim()))
+}
+
+/// Makes a worktree or pasture of the repository `folder` is in, from what `folder` has
+/// checked out unless `base` says otherwise. Returns the repository's main checkout with it.
+pub(crate) async fn create_from(
+    folder: &Path,
+    kind: WorkspaceKind,
+    base: Option<String>,
+    branch: Option<String>,
+    data_dir: PathBuf,
+) -> Result<(PathBuf, Workspace)> {
+    anyhow::ensure!(
+        is_repository(folder).await,
+        "{} isn't in a git repository",
+        folder.display()
+    );
+    let repo = main_checkout(folder).await?;
+    let base = match base.filter(|base| !base.trim().is_empty()) {
+        Some(base) => base,
+        None => match current_branch(folder).await? {
+            Some(branch) => branch,
+            None => git(folder, &["rev-parse", "HEAD"], &[])
+                .await?
+                .trim()
+                .to_string(),
+        },
+    };
+    let workspace = create(NewWorkspace {
+        kind,
+        repo: repo.clone(),
+        data_dir,
+        base: Some(base),
+        branch,
+    })
+    .await?;
+    Ok((repo, workspace))
+}
+
+/// The repository `folder` is in, with what `folder` has checked out, and its checkouts:
+/// git's worktrees, then the pastures recorded on a project at its main checkout.
+pub(crate) async fn repository_checkouts(
+    folder: &Path,
+    data_dir: &Path,
+    project_workspaces: &[(PathBuf, Vec<Workspace>)],
+) -> Result<RepositoryCheckouts> {
+    anyhow::ensure!(
+        is_repository(folder).await,
+        "{} isn't in a git repository",
+        folder.display()
+    );
+    let root = main_checkout(folder).await?;
+    let mut git = project_git(&root, data_dir).await;
+    git.branch = current_branch(folder).await.ok().flatten();
+    let mut checkouts = worktrees(&root).await?;
+    let pastures = project_workspaces
+        .iter()
+        .filter(|(path, _)| *path == root)
+        .flat_map(|(_, workspaces)| workspaces)
+        .filter(|workspace| workspace.kind == WorkspaceKind::Pasture && workspace.path.exists());
+    for pasture in pastures {
+        let branch = current_branch(&pasture.path).await.ok().flatten();
+        checkouts.push(Checkout {
+            path: pasture.path.clone(),
+            branch: branch.or_else(|| pasture.branch.clone()),
+            kind: Some(WorkspaceKind::Pasture),
+        });
+    }
+    Ok(RepositoryCheckouts { git, checkouts })
+}
+
+/// The repository's checkouts as `git worktree list` has them, the main one first. Bare and
+/// prunable (deleted) ones are left out.
+pub(crate) async fn worktrees(repo: &Path) -> Result<Vec<Checkout>> {
+    let output = git(repo, &["worktree", "list", "--porcelain"], &[]).await?;
+    Ok(parse_worktree_list(&output))
+}
+
+/// herdr's `parse_worktree_list_porcelain`.
+fn parse_worktree_list(output: &str) -> Vec<Checkout> {
+    let mut checkouts = Vec::new();
+    for (index, entry) in output.split("\n\n").enumerate() {
+        let mut path = None;
+        let mut branch = None;
+        let mut is_skipped = false;
+        for line in entry.lines() {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(value));
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                branch = Some(
+                    value
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(value)
+                        .to_string(),
+                );
+            } else if line == "bare" || line.starts_with("prunable") {
+                is_skipped = true;
+            }
+        }
+        if let Some(path) = path.filter(|_| !is_skipped) {
+            let kind = (index > 0).then_some(WorkspaceKind::Worktree);
+            checkouts.push(Checkout { path, branch, kind });
+        }
+    }
+    checkouts
+}
+
 /// The project's branches and how a pasture of it would be made.
 pub(crate) async fn project_git(repo: &Path, data_dir: &Path) -> ProjectGit {
     if !is_repository(repo).await {
@@ -686,6 +811,48 @@ mod tests {
         run(&repo, &["add", "-A"]).await;
         run(&repo, &["commit", "-q", "-m", "init"]).await;
         repo
+    }
+
+    #[test]
+    fn worktree_lists_are_read_as_herdr_reads_them() {
+        let output = "\
+worktree /repo/main
+HEAD abc
+branch refs/heads/main
+
+worktree /repo/issue
+HEAD def
+branch refs/heads/agentz/issue
+
+worktree /repo/detached
+HEAD fed
+detached
+
+worktree /repo/gone
+HEAD 123
+branch refs/heads/gone
+prunable gitdir file points to non-existent location
+";
+        assert_eq!(
+            parse_worktree_list(output),
+            vec![
+                Checkout {
+                    path: PathBuf::from("/repo/main"),
+                    branch: Some("main".into()),
+                    kind: None,
+                },
+                Checkout {
+                    path: PathBuf::from("/repo/issue"),
+                    branch: Some("agentz/issue".into()),
+                    kind: Some(WorkspaceKind::Worktree),
+                },
+                Checkout {
+                    path: PathBuf::from("/repo/detached"),
+                    branch: None,
+                    kind: Some(WorkspaceKind::Worktree),
+                },
+            ]
+        );
     }
 
     #[tokio::test]

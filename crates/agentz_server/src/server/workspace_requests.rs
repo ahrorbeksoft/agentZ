@@ -64,28 +64,53 @@ impl Server {
                     move |server, git| server.respond(client, id, Ok(Response::ProjectGit(git))),
                 );
             }
+            Request::RepositoryCheckouts(folder) => {
+                let data_dir = self.data_dir.clone();
+                let project_workspaces: Vec<(PathBuf, Vec<Workspace>)> = self
+                    .projects
+                    .projects()
+                    .iter()
+                    .map(|project| (project.path.clone(), project.workspaces.clone()))
+                    .collect();
+                self.spawn_then(
+                    async move {
+                        workspaces::repository_checkouts(&folder, &data_dir, &project_workspaces)
+                            .await
+                    },
+                    move |server, checkouts| {
+                        server.respond(client, id, checkouts.map(Response::RepositoryCheckouts))
+                    },
+                );
+            }
             Request::CreateWorkspace {
-                project_id,
+                folder,
                 kind,
                 base,
                 branch,
-            } => match self
-                .prepare_workspace(project_id, WorkspaceChoice::New { kind, base, branch })
-            {
-                Ok(PreparedWorkspace::Create(work)) => {
-                    self.spawn_then(work, move |server, workspace| {
-                        let folder = workspace
-                            .map(|workspace| server.adopt_workspace(project_id, workspace));
+            } => {
+                let data_dir = self.data_dir.clone();
+                self.spawn_then(
+                    async move {
+                        workspaces::create_from(&folder, kind, base, branch, data_dir).await
+                    },
+                    move |server, created| {
+                        // A project's worktree is one of its workspaces, for its threads.
+                        let folder = created.map(|(repo, workspace)| {
+                            let project_id = server
+                                .projects
+                                .projects()
+                                .iter()
+                                .find(|project| project.path == repo)
+                                .map(|project| project.id);
+                            match project_id {
+                                Some(project_id) => server.adopt_workspace(project_id, workspace),
+                                None => workspace.path,
+                            }
+                        });
                         server.respond(client, id, folder.map(Response::WorkspaceCreated));
-                    })
-                }
-                Ok(PreparedWorkspace::Ready(_)) => self.respond(
-                    client,
-                    id,
-                    Err(anyhow!("expected a new workspace to be made")),
-                ),
-                Err(error) => self.respond(client, id, Err(error)),
-            },
+                    },
+                );
+            }
             Request::RemoveWorkspace {
                 project_id,
                 path,

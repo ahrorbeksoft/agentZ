@@ -463,22 +463,7 @@ pub(crate) async fn space_git(folder: &Path) -> Option<SpaceGit> {
 /// The folder of the repository's main checkout, found through its shared `.git`, so a linked
 /// worktree is named after the repository rather than itself.
 async fn repository_name(folder: &Path) -> Option<String> {
-    let common_dir = crate::git::git(
-        folder,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        &[],
-    )
-    .await
-    .ok()?;
-    let common_dir = PathBuf::from(common_dir.trim());
-    let root = if common_dir.file_name().is_some_and(|name| name == ".git") {
-        common_dir.parent()?.to_path_buf()
-    } else {
-        let top_level = crate::git::git(folder, &["rev-parse", "--show-toplevel"], &[])
-            .await
-            .ok()?;
-        PathBuf::from(top_level.trim())
-    };
+    let root = crate::workspaces::main_checkout(folder).await.ok()?;
     Some(root.file_name()?.to_string_lossy().into_owned())
 }
 

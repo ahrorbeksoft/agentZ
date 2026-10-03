@@ -43,6 +43,7 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
+use crate::worktree_modal::WorktreeModalMode;
 
 const KEY_CONTEXT: &str = "Workspaces";
 const RENAME_KEY_CONTEXT: &str = "WorkspacesRename";
@@ -139,10 +140,15 @@ pub enum SpacesViewEvent {
         project: Option<ProjectKey>,
         folder: Option<PathBuf>,
     },
-    /// New Worktree from a workspace in the project.
-    NewWorktree(ProjectKey),
-    /// Open Worktree… from a workspace in the project.
-    OpenWorktree(ProjectKey),
+    /// New Worktree or Open Worktree… from a workspace in a git repository.
+    Worktree {
+        machine: MachineId,
+        /// The workspace's folder.
+        folder: PathBuf,
+        /// The repository's name.
+        name: SharedString,
+        mode: WorktreeModalMode,
+    },
 }
 
 #[derive(Clone)]
@@ -712,19 +718,26 @@ impl SpacesView {
         );
     }
 
-    /// A new workspace with a shell in one of the project's folders.
+    /// A new workspace with a shell in the folder.
     pub fn open_space_at(
         &mut self,
-        project: ProjectKey,
+        machine: MachineId,
         folder: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let project_id = self
+            .machines
+            .read(cx)
+            .projects(machine, cx)
+            .and_then(|store| {
+                project_at(store.read(cx).projects(), &folder).map(|project| project.id)
+            });
         self.request(
-            project.machine,
+            machine,
             SpaceRequest::CreateSpace {
                 folder,
-                project_id: Some(project.project),
+                project_id,
                 content: new_shell(),
             },
             window,
@@ -1177,15 +1190,20 @@ impl SpacesView {
             Some(project) => render_project_icon(project, project_info.as_ref(), px(16.), cx),
             None => render_folder_icon(),
         };
-        // The worktree actions need the project the workspace is in.
-        let worktree_project = project.as_ref().map(|project| {
-            (
-                ProjectKey {
-                    machine,
-                    project: project.id,
-                },
-                !project.workspaces.is_empty(),
-            )
+        // herdr offers worktrees in any workspace inside a git repository.
+        let worktree_source = git.as_ref().map(|git| {
+            let folder = space.current_folder().to_path_buf();
+            let name: SharedString = git
+                .repository
+                .clone()
+                .or_else(|| {
+                    folder
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default()
+                .into();
+            (folder, name)
         });
         let details = ThreadDetails {
             title: label.clone(),
@@ -1395,6 +1413,7 @@ impl SpacesView {
             .menu(move |window, cx| {
                 let this = this.clone();
                 let label = label.clone();
+                let worktree_source = worktree_source.clone();
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     let rename = {
                         let this = this.clone();
@@ -1418,17 +1437,21 @@ impl SpacesView {
                                 .ok();
                         }
                     };
-                    let worktree_event = |event: fn(ProjectKey) -> SpacesViewEvent| {
-                        let this = this.clone();
-                        move |project: ProjectKey| {
+                    let worktree =
+                        |mode: WorktreeModalMode, (folder, name): (PathBuf, SharedString)| {
                             let this = this.clone();
                             move |_: &mut Window, cx: &mut App| {
-                                this.update(cx, |_, cx| cx.emit(event(project))).ok();
+                                this.update(cx, |_, cx| {
+                                    cx.emit(SpacesViewEvent::Worktree {
+                                        machine,
+                                        folder: folder.clone(),
+                                        name: name.clone(),
+                                        mode,
+                                    })
+                                })
+                                .ok();
                             }
-                        }
-                    };
-                    let new_worktree = worktree_event(SpacesViewEvent::NewWorktree);
-                    let open_worktree = worktree_event(SpacesViewEvent::OpenWorktree);
+                        };
                     menu.item(
                         ContextMenuEntry::new("Rename")
                             .icon(IconName::Pencil)
@@ -1441,25 +1464,21 @@ impl SpacesView {
                             .icon_color(Color::Muted)
                             .handler(close),
                     )
-                    .when_some(
-                        worktree_project,
-                        |menu, (project, has_worktrees)| {
-                            menu.separator()
-                                .item(
-                                    ContextMenuEntry::new("New Worktree")
-                                        .icon(IconName::GitWorktree)
-                                        .icon_color(Color::Muted)
-                                        .handler(new_worktree(project)),
-                                )
-                                .item(
-                                    ContextMenuEntry::new("Open Worktree…")
-                                        .icon(IconName::FolderOpen)
-                                        .icon_color(Color::Muted)
-                                        .disabled(!has_worktrees)
-                                        .handler(open_worktree(project)),
-                                )
-                        },
-                    )
+                    .when_some(worktree_source, |menu, source| {
+                        menu.separator()
+                            .item(
+                                ContextMenuEntry::new("New Worktree")
+                                    .icon(IconName::GitWorktree)
+                                    .icon_color(Color::Muted)
+                                    .handler(worktree(WorktreeModalMode::New, source.clone())),
+                            )
+                            .item(
+                                ContextMenuEntry::new("Open Worktree…")
+                                    .icon(IconName::FolderOpen)
+                                    .icon_color(Color::Muted)
+                                    .handler(worktree(WorktreeModalMode::Open, source)),
+                            )
+                    })
                 })
             })
             .into_any_element()

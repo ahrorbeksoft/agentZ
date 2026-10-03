@@ -155,12 +155,19 @@ impl Shell {
                         this.open_new_thread_modal(*project, folder.clone(), window, cx);
                         this.thread_target = Some(*pane);
                     }
-                    SpacesViewEvent::NewWorktree(project) => {
-                        this.open_worktree_modal(*project, WorktreeModalMode::New, window, cx)
-                    }
-                    SpacesViewEvent::OpenWorktree(project) => {
-                        this.open_worktree_modal(*project, WorktreeModalMode::Open, window, cx)
-                    }
+                    SpacesViewEvent::Worktree {
+                        machine,
+                        folder,
+                        name,
+                        mode,
+                    } => this.open_worktree_modal(
+                        *machine,
+                        folder.clone(),
+                        name.clone(),
+                        *mode,
+                        window,
+                        cx,
+                    ),
                 },
             ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
@@ -736,21 +743,23 @@ impl Shell {
 
     fn open_worktree_modal(
         &mut self,
-        project: ProjectKey,
+        machine: MachineId,
+        folder: PathBuf,
+        name: SharedString,
         mode: WorktreeModalMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let modal = cx.new(|cx| WorktreeModal::new(project, mode, window, cx));
+        let modal = cx.new(|cx| WorktreeModal::new(machine, folder, name, mode, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
                 this.dismiss_modal(window, cx);
             }),
             cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
-                WorktreeModalEvent::Open { project, folder } => {
+                WorktreeModalEvent::Open { machine, folder } => {
                     this.dismiss_modal(window, cx);
                     this.spaces_view.update(cx, |view, cx| {
-                        view.open_space_at(*project, folder.clone(), window, cx)
+                        view.open_space_at(*machine, folder.clone(), window, cx)
                     });
                 }
             }),

@@ -270,12 +270,13 @@ since a thread's workspace is its checkout.
   counts and the machine's icon, laid out as the sidebar's shell rows, with the thread cards'
   details popover on hover (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
-- **Row menu**: Rename, Close, and in a project New Worktree and Open Worktree… (herdr's
-  worktree overlays, `worktree_modal.rs`). New Worktree names the branch (herdr's generated
-  `agentz/<adjective>-<noun>-<hex>` by default), makes a worktree or a pasture of it from the
-  checkout's branch (`Request::CreateWorkspace`, no thread in it), and opens it as a new
-  workspace with a shell; Open Worktree… picks one of the project's worktrees and pastures the
-  same way.
+- **Row menu**: Rename, Close, and in a git repository (a project or not) New Worktree and
+  Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch
+  (herdr's generated `agentz/<adjective>-<noun>-<hex>` by default) and makes a worktree or a
+  pasture of the repository's main checkout from what the workspace has checked out
+  (`Request::CreateWorkspace`, no thread in it; a project's is recorded as its workspace). Open
+  Worktree… lists the repository's other checkouts (`Request::RepositoryCheckouts`: `git worktree
+  list`, then a project's pastures). Either opens as a new workspace with a shell.
 - **Keys** (Mac-style, in the `Workspaces` context, all with Cmd so terminals never get them):
   Cmd-T, Cmd-}/Cmd-{, Cmd-D/Cmd-Shift-D, Cmd-W, Cmd-Shift-Enter, Cmd-Option-arrows, Cmd-Shift-N.
 - A terminal shown in two places takes the size of the view last interacted with (herdr).

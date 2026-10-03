@@ -338,6 +338,7 @@ impl Server {
                     request @ (Request::CreateThread { .. }
                     | Request::CreateTerminalThread { .. }
                     | Request::ProjectGit(_)
+                    | Request::RepositoryCheckouts(_)
                     | Request::CreateWorkspace { .. }
                     | Request::RemoveWorkspace { .. }
                     | Request::SyncWorkspace { .. }
@@ -691,6 +692,7 @@ impl Server {
             Request::CreateThread { .. }
             | Request::CreateTerminalThread { .. }
             | Request::ProjectGit(_)
+            | Request::RepositoryCheckouts(_)
             | Request::CreateWorkspace { .. }
             | Request::RemoveWorkspace { .. }
             | Request::SyncWorkspace { .. }

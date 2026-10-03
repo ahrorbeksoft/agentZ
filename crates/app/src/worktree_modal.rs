@@ -1,23 +1,25 @@
-//! A workspace's New Worktree and Open Worktree… (herdr's worktree overlays): a new worktree
-//! or pasture of the workspace's project on a branch named here, or one the project already
-//! has. Either opens as a new workspace with a shell there.
+//! A workspace's New Worktree and Open Worktree… (herdr's worktree overlays), for any git
+//! repository the workspace is in, a project or not: a new worktree or pasture on a branch
+//! named here, or one of the repository's checkouts. Either opens as a new workspace with a
+//! shell there.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentz_protocol::workspace::{PastureSupport, ProjectGit};
+use agentz_protocol::workspace::{Checkout, PastureSupport, RepositoryCheckouts};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Task, Window,
 };
-use projects::{Workspace, WorkspaceKind};
+use projects::WorkspaceKind;
 use text_input::{TextInput, TextInputEvent};
 use ui::{CommonAnimationExt as _, ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};
 
-use crate::machines::{MachineId, Machines, ProjectKey};
+use crate::machines::{MachineId, Machines, project_at};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
+use crate::sidebar::render_folder_icon;
 
 const KEY_CONTEXT: &str = "WorktreeModal";
 /// The server's own prefix for branches it names.
@@ -36,31 +38,33 @@ pub fn init(cx: &mut App) {
 pub enum WorktreeModalMode {
     /// The input names the new branch; the rows pick a worktree or a pasture.
     New,
-    /// The input filters the project's worktrees and pastures.
+    /// The input filters the repository's checkouts.
     Open,
 }
 
 pub enum WorktreeModalEvent {
     /// Open a workspace with a shell in the folder.
-    Open {
-        project: ProjectKey,
-        folder: PathBuf,
-    },
+    Open { machine: MachineId, folder: PathBuf },
 }
 
 pub struct WorktreeModal {
-    project: ProjectKey,
+    machine: MachineId,
+    /// The workspace's folder, somewhere in the repository.
+    folder: PathBuf,
+    /// The repository's name, for the title.
+    name: SharedString,
     mode: WorktreeModalMode,
     projects: Option<Entity<ProjectStore>>,
     input: Entity<TextInput>,
-    git: Option<ProjectGit>,
-    /// What [`WorktreeModalMode::Open`] lists.
-    workspaces: Vec<Workspace>,
+    /// Loaded when the modal opens, or why it couldn't be.
+    repository: Option<Result<RepositoryCheckouts, SharedString>>,
+    /// What [`WorktreeModalMode::Open`] lists: the checkouts besides the workspace's own.
+    rows: Vec<Checkout>,
     selected_index: usize,
     scroll_handle: ScrollHandle,
     creating: Option<SharedString>,
     error: Option<SharedString>,
-    _load_git: Task<()>,
+    _load: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -75,13 +79,14 @@ impl Focusable for WorktreeModal {
 
 impl WorktreeModal {
     pub fn new(
-        project: ProjectKey,
+        machine: MachineId,
+        folder: PathBuf,
+        name: SharedString,
         mode: WorktreeModalMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let machines = Machines::global(cx);
-        let projects = machines.read(cx).projects(project.machine, cx);
+        let projects = Machines::global(cx).read(cx).projects(machine, cx);
         let input = cx.new(|cx| match mode {
             WorktreeModalMode::New => {
                 let mut input = TextInput::new("Branch name", cx);
@@ -91,7 +96,7 @@ impl WorktreeModal {
             }
             WorktreeModalMode::Open => TextInput::new("Search worktrees…", cx),
         });
-        let mut subscriptions = vec![
+        let subscriptions = vec![
             cx.subscribe(&input, |this, _, _: &TextInputEvent, cx| {
                 this.error = None;
                 if this.mode == WorktreeModalMode::Open {
@@ -102,65 +107,68 @@ impl WorktreeModal {
             }),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
         ];
-        if let Some(projects) = &projects {
-            subscriptions.push(cx.observe(projects, |this, _, cx| this.update_rows(cx)));
-        }
         window.focus(&input.focus_handle(cx), cx);
-        let load_git = match (mode, &projects) {
-            (WorktreeModalMode::New, Some(projects)) => {
-                let git = projects.read(cx).project_git(project.project, cx);
+        let load = match &projects {
+            Some(projects) => {
+                let checkouts = projects.read(cx).repository_checkouts(folder.clone(), cx);
                 cx.spawn(async move |this, cx| {
-                    // An older server, or one that can't read the repository, offers neither.
-                    let git = git.await.unwrap_or_default();
-                    this.update(cx, |this, cx| {
-                        this.git = Some(git);
-                        cx.notify();
-                    })
-                    .ok();
+                    let checkouts = checkouts
+                        .await
+                        .map_err(|error| SharedString::from(format!("{error:#}")));
+                    this.update(cx, |this, cx| this.set_repository(checkouts, cx))
+                        .ok();
                 })
             }
-            _ => Task::ready(()),
+            None => Task::ready(()),
         };
-        let mut this = Self {
-            project,
+        Self {
+            machine,
+            folder,
+            name,
             mode,
             projects,
             input,
-            git: None,
-            workspaces: Vec::new(),
+            repository: None,
+            rows: Vec::new(),
             selected_index: 0,
             scroll_handle: ScrollHandle::new(),
             creating: None,
             error: None,
-            _load_git: load_git,
+            _load: load,
             _subscriptions: subscriptions,
-        };
-        this.update_rows(cx);
-        this
+        }
+    }
+
+    fn set_repository(
+        &mut self,
+        repository: Result<RepositoryCheckouts, SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.repository = Some(repository);
+        self.update_rows(cx);
+    }
+
+    fn checkouts(&self) -> Option<&RepositoryCheckouts> {
+        self.repository.as_ref()?.as_ref().ok()
     }
 
     fn update_rows(&mut self, cx: &mut Context<Self>) {
         if self.mode == WorktreeModalMode::Open {
             let query = self.input.read(cx).text().trim().to_lowercase();
-            let heads = ProjectInfoStore::global(cx).read(cx);
-            let machine = self.project.machine;
-            self.workspaces = self
-                .projects
-                .as_ref()
-                .and_then(|projects| projects.read(cx).project(self.project.project))
-                .map(|project| project.workspaces.clone())
-                .unwrap_or_default()
+            let checkouts = self
+                .checkouts()
+                .map(|repository| repository.checkouts.clone())
+                .unwrap_or_default();
+            let own = own_checkout(&checkouts, &self.folder).map(|checkout| checkout.path.clone());
+            self.rows = checkouts
                 .into_iter()
-                .filter(|workspace| {
-                    let branch = heads
-                        .workspace_head(machine, &workspace.path)
-                        .map(|head| head.branch.clone())
-                        .or_else(|| workspace.branch.clone())
-                        .unwrap_or_default();
+                .filter(|checkout| Some(&checkout.path) != own.as_ref())
+                .filter(|checkout| {
                     let text = format!(
-                        "{} {branch} {}",
-                        workspace.kind.label(),
-                        workspace.path.display()
+                        "{} {} {}",
+                        checkout_kind_label(checkout.kind),
+                        checkout.branch.as_deref().unwrap_or("detached"),
+                        checkout.path.display()
                     );
                     query.is_empty() || text.to_lowercase().contains(&query)
                 })
@@ -173,7 +181,7 @@ impl WorktreeModal {
     fn row_count(&self) -> usize {
         match self.mode {
             WorktreeModalMode::New => 2,
-            WorktreeModalMode::Open => self.workspaces.len(),
+            WorktreeModalMode::Open => self.rows.len(),
         }
     }
 
@@ -207,8 +215,8 @@ impl WorktreeModal {
                 self.create(kind, cx);
             }
             WorktreeModalMode::Open => {
-                if let Some(workspace) = self.workspaces.get(self.selected_index).cloned() {
-                    self.open(workspace, cx);
+                if let Some(checkout) = self.rows.get(self.selected_index).cloned() {
+                    self.open(checkout, cx);
                 }
             }
         }
@@ -220,20 +228,22 @@ impl WorktreeModal {
         }
     }
 
-    /// Why a new worktree or pasture can't be made here yet, if it can't.
+    /// Why a new worktree or pasture can't be made, if it can't.
     fn unavailable(&self, kind: WorkspaceKind) -> Option<String> {
-        let git = self.git.as_ref()?;
-        if !git.is_repository {
-            return Some("Not a git repository".into());
-        }
-        match (kind, &git.pastures) {
-            (WorkspaceKind::Pasture, PastureSupport::Unsupported(reason)) => Some(reason.clone()),
-            _ => None,
+        match self.repository.as_ref()? {
+            Err(error) => Some(error.to_string()),
+            Ok(repository) => match (kind, &repository.git.pastures) {
+                (WorkspaceKind::Pasture, PastureSupport::Unsupported(reason)) => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            },
         }
     }
 
     fn create(&mut self, kind: WorkspaceKind, cx: &mut Context<Self>) {
-        if self.creating.is_some() || self.git.is_none() || self.unavailable(kind).is_some() {
+        if self.creating.is_some() || self.checkouts().is_none() || self.unavailable(kind).is_some()
+        {
             return;
         }
         let Some(projects) = self.projects.clone() else {
@@ -245,23 +255,21 @@ impl WorktreeModal {
             cx.notify();
             return;
         }
-        let created = projects.read(cx).create_workspace(
-            self.project.project,
-            kind,
-            Some(branch.clone()),
-            cx,
-        );
+        let created =
+            projects
+                .read(cx)
+                .create_workspace(self.folder.clone(), kind, Some(branch.clone()), cx);
         self.creating =
             Some(format!("Making the {} for {branch}…", kind.label().to_lowercase()).into());
         self.error = None;
         cx.notify();
-        let project = self.project;
+        let machine = self.machine;
         cx.spawn(async move |this, cx| {
             let created = created.await;
             this.update(cx, |this, cx| {
                 this.creating = None;
                 match created {
-                    Ok(folder) => cx.emit(WorktreeModalEvent::Open { project, folder }),
+                    Ok(folder) => cx.emit(WorktreeModalEvent::Open { machine, folder }),
                     Err(error) => {
                         this.error = Some(format!("{error:#}").into());
                         cx.notify();
@@ -273,19 +281,19 @@ impl WorktreeModal {
         .detach();
     }
 
-    fn open(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
-        if self.is_missing(&workspace) {
+    fn open(&mut self, checkout: Checkout, cx: &mut Context<Self>) {
+        if self.is_missing(&checkout) {
             return;
         }
         cx.emit(WorktreeModalEvent::Open {
-            project: self.project,
-            folder: workspace.path,
+            machine: self.machine,
+            folder: checkout.path,
         });
     }
 
     /// Only this Mac's folders can be checked from here.
-    fn is_missing(&self, workspace: &Workspace) -> bool {
-        self.project.machine == MachineId::Local && !workspace.path.exists()
+    fn is_missing(&self, checkout: &Checkout) -> bool {
+        self.machine == MachineId::Local && !checkout.path.exists()
     }
 
     fn render_kind_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -297,7 +305,8 @@ impl WorktreeModal {
                 Color::Muted,
             ),
             WorkspaceKind::Pasture => {
-                let (detail, color) = match self.git.as_ref().map(|git| &git.pastures) {
+                let pastures = self.checkouts().map(|repository| &repository.git.pastures);
+                let (detail, color) = match pastures {
                     Some(PastureSupport::CopyOnWrite) => (
                         "A copy-on-write clone of the folder, with dependencies and .env".into(),
                         Color::Muted,
@@ -315,7 +324,8 @@ impl WorktreeModal {
             }
         };
         let unavailable = self.unavailable(kind);
-        let disabled = self.git.is_none() || unavailable.is_some() || self.creating.is_some();
+        let disabled =
+            self.checkouts().is_none() || unavailable.is_some() || self.creating.is_some();
         let (detail, detail_color) = match unavailable {
             Some(reason) => (reason, Color::Muted),
             None => (detail, detail_color),
@@ -350,29 +360,24 @@ impl WorktreeModal {
             .into_any_element()
     }
 
-    fn render_workspace_row(
+    fn render_checkout_row(
         &self,
         index: usize,
-        workspace: Workspace,
+        checkout: Checkout,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let branch = ProjectInfoStore::global(cx)
-            .read(cx)
-            .workspace_head(self.project.machine, &workspace.path)
-            .map(|head| head.branch.clone())
-            .or_else(|| workspace.branch.clone())
-            .unwrap_or_else(|| workspace.kind.label().to_string());
-        let is_missing = self.is_missing(&workspace);
-        ListItem::new(("worktree-modal-workspace", index))
+        let branch = checkout
+            .branch
+            .clone()
+            .unwrap_or_else(|| "detached".to_string());
+        let icon = checkout.kind.map_or(IconName::Folder, workspace_icon);
+        let is_missing = self.is_missing(&checkout);
+        ListItem::new(("worktree-modal-checkout", index))
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(index == self.selected_index)
             .disabled(is_missing)
-            .start_slot(
-                Icon::new(workspace_icon(workspace.kind))
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
+            .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
             .child(
                 h_flex()
                     .min_w_0()
@@ -382,7 +387,7 @@ impl WorktreeModal {
                     ))
                     .child(
                         div().min_w_0().child(
-                            Label::new(compact_path(&workspace.path))
+                            Label::new(compact_path(&checkout.path))
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
                                 .truncate(),
@@ -390,36 +395,36 @@ impl WorktreeModal {
                     ),
             )
             .end_slot(
-                Label::new(workspace.kind.label())
+                Label::new(checkout_kind_label(checkout.kind))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.open(workspace.clone(), cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.open(checkout.clone(), cx)))
             .into_any_element()
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let border_variant = cx.theme().colors().border_variant;
+        // The project the workspace is in stands for the repository, as on its row.
         let project = self
             .projects
             .as_ref()
-            .and_then(|projects| projects.read(cx).project(self.project.project).cloned());
-        let info = ProjectInfoStore::global(cx)
-            .read(cx)
-            .info(self.project.machine, self.project.project)
-            .cloned();
-        let machine_label = (self.project.machine != MachineId::Local).then(|| {
-            Machines::global(cx)
-                .read(cx)
-                .label(self.project.machine, cx)
-        });
-        let name = project
-            .as_ref()
-            .map(|project| project.name().to_string())
-            .unwrap_or_default();
+            .and_then(|projects| project_at(projects.read(cx).projects(), &self.folder).cloned());
+        let icon = match &project {
+            Some(project) => {
+                let info = ProjectInfoStore::global(cx)
+                    .read(cx)
+                    .info(self.machine, project.id)
+                    .cloned();
+                render_project_icon(project, info.as_ref(), px(14.), cx)
+            }
+            None => render_folder_icon(),
+        };
+        let machine_label = (self.machine != MachineId::Local)
+            .then(|| Machines::global(cx).read(cx).label(self.machine, cx));
         let title = match self.mode {
-            WorktreeModalMode::New => format!("New worktree of {name}"),
-            WorktreeModalMode::Open => format!("Open a worktree of {name}"),
+            WorktreeModalMode::New => format!("New worktree of {}", self.name),
+            WorktreeModalMode::Open => format!("Open a worktree of {}", self.name),
         };
         h_flex()
             .px_3()
@@ -431,11 +436,7 @@ impl WorktreeModal {
                 h_flex()
                     .flex_none()
                     .gap_1p5()
-                    .children(
-                        project.as_ref().map(|project| {
-                            render_project_icon(project, info.as_ref(), px(14.), cx)
-                        }),
-                    )
+                    .child(icon)
                     .child(Label::new(title).color(Color::Muted))
                     .children(machine_label.map(|label| {
                         Label::new(format!("on {label}"))
@@ -468,9 +469,8 @@ impl WorktreeModal {
         let hint = match self.mode {
             WorktreeModalMode::New => {
                 let base = self
-                    .git
-                    .as_ref()
-                    .and_then(|git| git.branch.clone())
+                    .checkouts()
+                    .and_then(|repository| repository.git.branch.clone())
                     .unwrap_or_else(|| "HEAD".to_string());
                 format!("The branch starts from {base} · Enter makes it and opens a terminal there")
             }
@@ -489,6 +489,19 @@ fn new_row_kind(index: usize) -> WorkspaceKind {
     } else {
         WorkspaceKind::Pasture
     }
+}
+
+/// The checkout `folder` is in: the deepest one holding it, since a worktree may sit inside
+/// the main checkout.
+fn own_checkout<'a>(checkouts: &'a [Checkout], folder: &Path) -> Option<&'a Checkout> {
+    checkouts
+        .iter()
+        .filter(|checkout| folder.starts_with(&checkout.path))
+        .max_by_key(|checkout| checkout.path.components().count())
+}
+
+fn checkout_kind_label(kind: Option<WorkspaceKind>) -> &'static str {
+    kind.map_or("Main checkout", WorkspaceKind::label)
 }
 
 fn seed() -> u64 {
@@ -519,17 +532,19 @@ impl Render for WorktreeModal {
                 .map(|index| self.render_kind_row(index, cx))
                 .collect(),
             WorktreeModalMode::Open => self
-                .workspaces
+                .rows
                 .clone()
                 .into_iter()
                 .enumerate()
-                .map(|(index, workspace)| self.render_workspace_row(index, workspace, cx))
+                .map(|(index, checkout)| self.render_checkout_row(index, checkout, cx))
                 .collect(),
         };
-        let note: Option<SharedString> = match self.mode {
-            WorktreeModalMode::Open if rows.is_empty() => {
+        let note: Option<SharedString> = match (&self.repository, self.mode) {
+            (None, WorktreeModalMode::Open) => Some("Reading the repository…".into()),
+            (Some(Err(error)), WorktreeModalMode::Open) => Some(error.clone()),
+            (Some(Ok(_)), WorktreeModalMode::Open) if rows.is_empty() => {
                 Some(if self.input.read(cx).text().trim().is_empty() {
-                    "The project has no worktrees or pastures yet".into()
+                    "The repository has no other checkouts yet".into()
                 } else {
                     "No matching worktrees".into()
                 })
@@ -584,61 +599,45 @@ mod tests {
     use std::rc::Rc;
 
     use agentz_protocol::spaces::SpacesSnapshot;
+    use agentz_protocol::workspace::ProjectGit;
     use gpui::TestAppContext;
-    use projects::{Project, ProjectId, ProjectsSnapshot};
 
     use super::*;
     use crate::server_client::ServerClient;
 
-    fn workspace(kind: WorkspaceKind, branch: &str) -> Workspace {
-        Workspace {
-            kind,
-            path: PathBuf::from(format!("/tmp/agentz-test-workspaces/{branch}")),
+    const MACHINE: MachineId = MachineId::Remote(1);
+
+    fn init_machine(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            init(cx);
+            let client =
+                ServerClient::new_for_test(MACHINE, "Server".into(), SpacesSnapshot::default(), cx);
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+    }
+
+    fn checkout(path: &str, branch: &str, kind: Option<WorkspaceKind>) -> Checkout {
+        Checkout {
+            path: PathBuf::from(path),
             branch: Some(branch.to_string()),
-            base: Some("main".to_string()),
-            created_at: SystemTime::UNIX_EPOCH,
+            kind,
         }
     }
 
     #[gpui::test]
-    fn open_worktree_lists_the_projects_workspaces(cx: &mut TestAppContext) {
-        let project = ProjectKey {
-            machine: MachineId::Remote(1),
-            project: ProjectId(7),
-        };
-        cx.update(|cx| {
-            crate::init_for_test(cx);
-            init(cx);
-            let client = ServerClient::new_for_test(
-                project.machine,
-                "Server".into(),
-                SpacesSnapshot::default(),
-                cx,
-            );
-            client.read(cx).projects().clone().update(cx, |store, cx| {
-                store.set_snapshot(
-                    ProjectsSnapshot {
-                        projects: vec![Project {
-                            id: project.project,
-                            path: PathBuf::from("/tmp/demo"),
-                            custom_name: None,
-                            icon: None,
-                            workspaces: vec![
-                                workspace(WorkspaceKind::Worktree, "fix-login"),
-                                workspace(WorkspaceKind::Pasture, "grazing"),
-                            ],
-                            repository: None,
-                        }],
-                        ..ProjectsSnapshot::default()
-                    },
-                    cx,
-                )
-            });
-            crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
-        });
+    fn open_worktree_lists_the_other_checkouts(cx: &mut TestAppContext) {
+        init_machine(cx);
         let (modal, cx) = cx.add_window_view(|window, cx| {
-            WorktreeModal::new(project, WorktreeModalMode::Open, window, cx)
+            WorktreeModal::new(
+                MACHINE,
+                PathBuf::from("/repo/main/src"),
+                "main".into(),
+                WorktreeModalMode::Open,
+                window,
+                cx,
+            )
         });
         let opened = Rc::new(RefCell::new(None));
         cx.update(|_, cx| {
@@ -649,16 +648,38 @@ mod tests {
             })
             .detach();
         });
+        modal.update(cx, |modal, cx| {
+            modal.set_repository(
+                Ok(RepositoryCheckouts {
+                    git: ProjectGit::default(),
+                    checkouts: vec![
+                        checkout("/repo/main", "main", None),
+                        checkout(
+                            "/repo/main/.worktrees/fix",
+                            "fix-login",
+                            Some(WorkspaceKind::Worktree),
+                        ),
+                        checkout(
+                            "/data/pastures/grazing",
+                            "grazing",
+                            Some(WorkspaceKind::Pasture),
+                        ),
+                    ],
+                }),
+                cx,
+            )
+        });
         cx.run_until_parked();
         let branches = |cx: &mut gpui::VisualTestContext| {
             modal.read_with(cx, |modal, _| {
                 modal
-                    .workspaces
+                    .rows
                     .iter()
-                    .filter_map(|workspace| workspace.branch.clone())
+                    .filter_map(|checkout| checkout.branch.clone())
                     .collect::<Vec<_>>()
             })
         };
+        // The workspace is in the main checkout, so that one isn't offered.
         assert_eq!(branches(cx), vec!["fix-login", "grazing"]);
 
         modal.update(cx, |modal, cx| {
@@ -672,30 +693,22 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             opened.borrow().clone(),
-            Some(PathBuf::from("/tmp/agentz-test-workspaces/grazing"))
+            Some(PathBuf::from("/data/pastures/grazing"))
         );
     }
 
     #[gpui::test]
     fn new_worktree_suggests_a_branch(cx: &mut TestAppContext) {
-        let project = ProjectKey {
-            machine: MachineId::Remote(1),
-            project: ProjectId(7),
-        };
-        cx.update(|cx| {
-            crate::init_for_test(cx);
-            init(cx);
-            let client = ServerClient::new_for_test(
-                project.machine,
-                "Server".into(),
-                SpacesSnapshot::default(),
-                cx,
-            );
-            crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
-        });
+        init_machine(cx);
         let (modal, cx) = cx.add_window_view(|window, cx| {
-            WorktreeModal::new(project, WorktreeModalMode::New, window, cx)
+            WorktreeModal::new(
+                MACHINE,
+                PathBuf::from("/repo/main"),
+                "main".into(),
+                WorktreeModalMode::New,
+                window,
+                cx,
+            )
         });
         let branch = modal.read_with(cx, |modal, cx| modal.input.read(cx).text().clone());
         assert!(branch.starts_with(BRANCH_PREFIX), "{branch}");
