@@ -96,7 +96,9 @@ Data lives in `~/Library/Application Support/agentZ/`:
   expected.
 - **GPUI tests** need `--features gpui_platform/runtime_shaders` (see Testing below).
 - **Disk is tight** (a few GB free). `target/debug/incremental` once grew to 14 GB and froze the
-  machine. Check `df -h ~` before long build sessions; deleting the incremental cache is safe.
+  machine, and stale builds piled up to 42 GB in `target/debug`. Check `df -h ~` before long
+  build sessions. When space runs low, `cargo clean --profile dev` is safe and a full
+  `cargo build` takes about 2 minutes (4 GB).
 
 ## Rules from the user
 
