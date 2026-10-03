@@ -22,8 +22,11 @@ use crate::terminal_entity::{Terminal, TerminalSize};
 use crate::terminal_mouse::TerminalBounds;
 use crate::terminal_view::TerminalView;
 
-/// Zed's `terminal.line_height` default, "comfortable".
-const LINE_HEIGHT: f32 = 1.618;
+/// Zed's `terminal.line_height` "standard". Its default, "comfortable" (1.618), spaced lines
+/// further apart than the user wanted.
+const LINE_HEIGHT: f32 = 1.3;
+/// t3code's default terminal font size, smaller than the code font's.
+const FONT_SIZE: Pixels = px(12.);
 /// Zed's `terminal.minimum_contrast` default.
 const MINIMUM_CONTRAST: f32 = 45.;
 
@@ -788,7 +791,7 @@ impl TerminalMetrics {
             weight: buffer_font.weight,
             style: FontStyle::Normal,
         };
-        let font_size = settings.buffer_font_size(cx);
+        let font_size = FONT_SIZE;
         let line_height = px((f32::from(font_size) * LINE_HEIGHT).round());
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&font);
