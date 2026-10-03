@@ -8,7 +8,7 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 9: repository identity and merged projects.
+**Next:** Phase 11: the headless layout test, and trying the shortcuts by hand.
 
 | Phase | Status |
 |---|---|
@@ -335,35 +335,39 @@ Then the server:
         machine's home folder;
   - [x] rows with rolled-up state (herdr's order: blocked, unseen finished, working), name,
         branch and ahead/behind. Double-click renames, drag reorders, right-click menu.
-- [ ] Agents list at the bottom of the sidebar:
-  - [ ] every agent on every machine;
-  - [ ] slim rows like the Archived shelf;
-  - [ ] state, machine, workspace, tab, agent;
-  - [ ] clicking a row focuses its pane, or opens it in Agents when it isn't in one.
-- [ ] Tabs: new, rename, close, reorder, next/previous. All but the next/previous keys are
-      done (the actions exist, unbound).
+- [x] Agents list at the bottom of the sidebar:
+  - [x] every agent on every machine: agents in panes first, in workspace and tab order
+        (herdr), then every unarchived top-level thread in no pane, in the Agents order;
+  - [x] slim rows like the Archived shelf;
+  - [x] state, machine, workspace, tab, agent;
+  - [x] clicking a row focuses its pane, or opens it in Agents when it isn't in one.
+- [x] Tabs: new, rename, close, reorder, next/previous.
 - [ ] Panes:
   - [x] split right/down (Zed's split menu in the pane header, and its right-click menu);
   - [x] drag to resize (`SetSplitRatio` on drop);
   - [x] zoom, swap (drag a pane's header onto another), close;
-  - [ ] focus by click and keyboard: click done; the keyboard actions exist, unbound.
+  - [x] focus by click and keyboard.
 - [x] A pane can hold a shell, an agent CLI, or an ACP thread (new or existing). The thread is
       the same one shown in Agents. The pane menu: Show a Shell, New Thread…, Show Thread ›,
       Open in Agents.
-- [ ] A terminal shown in two places follows the size of the view last interacted with.
-- [ ] Mac-style shortcuts for herdr's actions, for example:
-  - [ ] Cmd-T new tab;
-  - [ ] Cmd-D / Cmd-Shift-D split right/down;
-  - [ ] Cmd-W close pane;
-  - [ ] Cmd-Option-arrows move between panes;
-  - [ ] Cmd-Shift-N new workspace.
+- [x] A terminal shown in two places follows the size of the view last interacted with: the
+      focused view sizes it; other views only record their size.
+- [x] Mac-style shortcuts for herdr's actions, in the `Workspaces` key context:
+  - [x] Cmd-T new tab, Cmd-} / Cmd-{ next/previous tab (Zed's);
+  - [x] Cmd-D / Cmd-Shift-D split right/down (over Cmd-D's Changes, which is Agents-only);
+  - [x] Cmd-W close pane, Cmd-Shift-Enter zoom;
+  - [x] Cmd-Option-arrows move between panes;
+  - [x] Cmd-Shift-N new workspace.
 
-  None may clash with keys terminal panes need.
+  All hold Cmd, which terminals never receive. Not yet pressed by hand: screenshots can't
+  send keys without focusing the window.
 - [ ] Tests:
   - [x] the pane tree (split, close, resize, swap): herdr's `TileLayout` ported to
         `agentz_protocol::layout` with its tests;
   - [x] save and restore (`spaces_are_saved_restored_and_streamed`, and the store's tests);
-  - [ ] a headless UI test of the layout.
+  - [ ] a headless UI test of the layout. The view now needs a server client, so it needs a
+        scratch server or a fake `ServerClient`. Checked with PopUp screenshots instead
+        (two workspaces, split panes, blocked, working and finished mock threads).
 
 ## Findings
 
@@ -682,3 +686,6 @@ Then the server:
   sidebar and **+** picker, tab bar, pane tree with resizing, zoom, swap and close, pane
   menus). Not yet checked on screen. Left for step 4: the agents list, key bindings, the
   headless layout test, screenshots.
+- 2026-10-03: Phase 11, step 4: the agents list, the shortcuts (with Enter and Escape for the
+  Workspaces rename and search fields, which had none), terminal sizing by the last-used view.
+  Checked on screen against a scratch server.

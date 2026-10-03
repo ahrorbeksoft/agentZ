@@ -159,6 +159,7 @@ fn main() {
             project_switcher::init(cx);
             new_thread_modal::init(cx);
             new_space_picker::init(cx);
+            spaces_view::init(cx);
             add_project_modal::init(cx);
             agent_view::init(cx);
             sidebar::init(cx);

@@ -29,7 +29,7 @@ const DETAILS_DELAY: Duration = Duration::from_millis(500);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 const RENAME_KEY_CONTEXT: &str = "SidebarRename";
 const SEARCH_KEY_CONTEXT: &str = "SidebarSearch";
-const ARCHIVED_ROW_HEIGHT: Pixels = px(36.);
+pub(crate) const ARCHIVED_ROW_HEIGHT: Pixels = px(36.);
 /// t3code pages its settled shelf: recent history is the common lookup, the deep tail stays
 /// behind "Show more".
 const ARCHIVED_INITIAL_COUNT: usize = 10;

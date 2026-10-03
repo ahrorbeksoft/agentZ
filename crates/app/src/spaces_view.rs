@@ -18,8 +18,8 @@ use agentz_protocol::{CAPABILITY_SPACES, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, MouseButton, PromptLevel, ScrollHandle, Subscription, Window, actions,
-    relative,
+    FocusHandle, Focusable, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Subscription,
+    Window, actions, relative,
 };
 use projects::ThreadId;
 use text_input::{TextInput, TextInputEvent};
@@ -33,7 +33,9 @@ use crate::agent_view::{AgentView, AgentViewEvent};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
 use crate::project_store::ThreadStatus;
-use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item, render_status_dot, thread_agent_icon};
+use crate::sidebar::{
+    ARCHIVED_ROW_HEIGHT, SIDEBAR_WIDTH, render_footer_item, render_status_dot, thread_agent_icon,
+};
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
@@ -77,6 +79,29 @@ actions!(
         ActivatePaneDown,
     ]
 );
+
+/// Mac-style keys for herdr's actions. A terminal pane needs none of them: they all hold Cmd,
+/// which terminals don't receive.
+pub fn init(cx: &mut App) {
+    let context = Some(KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("cmd-shift-n", NewWorkspace, context),
+        KeyBinding::new("cmd-t", NewTab, context),
+        KeyBinding::new("cmd-}", NextTab, context),
+        KeyBinding::new("cmd-{", PreviousTab, context),
+        KeyBinding::new("cmd-d", SplitRight, context),
+        KeyBinding::new("cmd-shift-d", SplitDown, context),
+        KeyBinding::new("cmd-w", ClosePane, context),
+        KeyBinding::new("cmd-shift-enter", ToggleZoom, context),
+        KeyBinding::new("cmd-alt-left", ActivatePaneLeft, context),
+        KeyBinding::new("cmd-alt-right", ActivatePaneRight, context),
+        KeyBinding::new("cmd-alt-up", ActivatePaneUp, context),
+        KeyBinding::new("cmd-alt-down", ActivatePaneDown, context),
+        KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(SEARCH_KEY_CONTEXT)),
+    ]);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SpaceKey {
@@ -192,11 +217,30 @@ struct DraggedPane {
     pane: PaneId,
 }
 
+/// A row of the sidebar's agents list.
+struct AgentEntry {
+    machine: MachineId,
+    target: AgentTarget,
+    icon: Icon,
+    title: SharedString,
+    status: Option<ThreadStatus>,
+    /// The workspace and tab of its pane.
+    location: Option<(SharedString, SharedString)>,
+}
+
+#[derive(Clone, Copy)]
+enum AgentTarget {
+    Pane(PaneKey),
+    /// A thread in no pane, which opens in Agents.
+    Thread(ThreadKey),
+}
+
 pub struct SpacesView {
     focus_handle: FocusHandle,
     machines: Entity<Machines>,
     search: Entity<TextInput>,
     sidebar_scroll: ScrollHandle,
+    agents_scroll: ScrollHandle,
     new_space_handle: PopoverMenuHandle<NewSpacePicker>,
     active_space: Option<SpaceKey>,
     active_tabs: HashMap<SpaceKey, TabId>,
@@ -245,6 +289,7 @@ impl SpacesView {
             machines,
             search,
             sidebar_scroll: ScrollHandle::new(),
+            agents_scroll: ScrollHandle::new(),
             new_space_handle: PopoverMenuHandle::default(),
             active_space: None,
             active_tabs: HashMap::default(),
@@ -1012,6 +1057,7 @@ impl SpacesView {
                     )
                     .vertical_scrollbar_for(&self.sidebar_scroll, window, cx),
             )
+            .child(self.render_agents(has_remotes, window, cx))
             .child(render_footer_item(
                 "workspaces-open-settings",
                 IconName::Settings,
@@ -1264,6 +1310,192 @@ impl SpacesView {
                         .entry("Close Workspace", None, close)
                 })
             })
+            .into_any_element()
+    }
+
+    /// Every agent on every machine: those in panes first, in workspace and tab order as herdr
+    /// lists them, then threads in no pane, in the Agents sidebar's order.
+    fn agent_entries(&self, cx: &App) -> Vec<AgentEntry> {
+        let mut entries = Vec::new();
+        let mut threads_in_panes = HashSet::default();
+        for (machine, space) in self.all_spaces(cx) {
+            let space_label: SharedString = space.label().into();
+            for (index, tab) in space.tabs.iter().enumerate() {
+                for pane in &tab.panes {
+                    let is_agent = match &pane.content {
+                        // A thread in several panes is listed at the first.
+                        PaneContent::Thread(thread) => threads_in_panes.insert(ThreadKey {
+                            machine,
+                            thread: *thread,
+                        }),
+                        PaneContent::Terminal(_) => pane.agent.is_some(),
+                        PaneContent::Unknown(_) => false,
+                    };
+                    if !is_agent {
+                        continue;
+                    }
+                    let key = PaneKey {
+                        machine,
+                        pane: pane.id,
+                    };
+                    let (icon, title, _) = self.pane_title(key, pane, cx);
+                    entries.push(AgentEntry {
+                        machine,
+                        target: AgentTarget::Pane(key),
+                        icon,
+                        title,
+                        status: self.pane_status(machine, pane, cx),
+                        location: Some((space_label.clone(), tab_label(tab, index).into())),
+                    });
+                }
+            }
+        }
+        let machines = self.machines.read(cx);
+        for (machine, thread) in machines.unarchived_threads(cx) {
+            let key = ThreadKey {
+                machine,
+                thread: thread.id,
+            };
+            if threads_in_panes.contains(&key) {
+                continue;
+            }
+            entries.push(AgentEntry {
+                machine,
+                target: AgentTarget::Thread(key),
+                icon: thread_agent_icon(machines, machine, &thread, cx),
+                title: thread.title.clone().into(),
+                status: machines
+                    .projects(machine, cx)
+                    .and_then(|store| store.read(cx).thread_status(thread.id)),
+                location: None,
+            });
+        }
+        entries
+    }
+
+    fn render_agents(
+        &self,
+        has_remotes: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entries = self.agent_entries(cx);
+        let focused_pane = self.is_visible.then(|| self.focused_pane(cx)).flatten();
+        let rows = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                self.render_agent_row(index, entry, focused_pane, has_remotes, cx)
+            })
+            .collect::<Vec<_>>();
+        let has_rows = !rows.is_empty();
+        let rule_color = cx.theme().colors().border_variant;
+
+        v_flex()
+            .flex_none()
+            .pt_1()
+            .child(
+                h_flex()
+                    .h_8()
+                    .mx_1()
+                    .px_2()
+                    .gap_2()
+                    .child(
+                        Label::new("Agents")
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::MEDIUM)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1().min_w_2().h_px().bg(rule_color)),
+            )
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        v_flex()
+                            .id("workspace-agents-list")
+                            .max_h(window.viewport_size().height * 0.4)
+                            .overflow_y_scroll()
+                            .track_scroll(&self.agents_scroll)
+                            .px_1()
+                            .pb_1()
+                            .children(rows)
+                            .when(!has_rows, |list| {
+                                list.child(
+                                    div().px_2().py_1().child(
+                                        Label::new("No agents yet")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                            }),
+                    )
+                    .vertical_scrollbar_for(&self.agents_scroll, window, cx),
+            )
+    }
+
+    /// The Archived shelf's slim row, with herdr's agent tokens: state, agent, then machine,
+    /// workspace and tab.
+    fn render_agent_row(
+        &self,
+        index: usize,
+        entry: AgentEntry,
+        focused_pane: Option<PaneKey>,
+        has_remotes: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let is_active =
+            matches!(entry.target, AgentTarget::Pane(pane) if Some(pane) == focused_pane);
+        let is_offline = !self.machines.read(cx).is_online(entry.machine, cx);
+        let machine_label = has_remotes.then(|| self.machines.read(cx).label(entry.machine, cx));
+        let location = match (machine_label, entry.location) {
+            (Some(machine), Some((space, tab))) => Some(format!("{machine} · {space} › {tab}")),
+            (None, Some((space, tab))) => Some(format!("{space} › {tab}")),
+            (Some(machine), None) => Some(machine.to_string()),
+            (None, None) => None,
+        };
+        let target = entry.target;
+
+        h_flex()
+            .id(ElementId::Name(format!("workspace-agent-{index}").into()))
+            .h(ARCHIVED_ROW_HEIGHT)
+            .w_full()
+            .px_2()
+            .gap_2()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_active, |row| row.bg(colors.ghost_element_selected))
+            .when(!is_active, |row| {
+                row.hover(|row| row.bg(colors.ghost_element_hover))
+            })
+            .when(is_offline, |row| row.opacity(0.5))
+            .child(render_state_slot(entry.status, cx))
+            .child(entry.icon.size(IconSize::Small).color(Color::Muted))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(entry.title)
+                        .size(LabelSize::Small)
+                        .color(if is_active {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        })
+                        .truncate(),
+                ),
+            )
+            .children(location.map(|location| {
+                div().min_w_0().max_w(px(120.)).child(
+                    Label::new(location)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| match target {
+                AgentTarget::Pane(pane) => this.focus_pane(pane, window, cx),
+                AgentTarget::Thread(thread) => cx.emit(SpacesViewEvent::OpenThread(thread)),
+            }))
             .into_any_element()
     }
 

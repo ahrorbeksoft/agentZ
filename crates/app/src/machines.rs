@@ -581,13 +581,26 @@ impl Machines {
     /// Unarchived top-level threads of the visible projects, newest or latest active first.
     pub fn active_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let groups = self.visible_groups(cx);
-        let mut threads = self.threads_where(cx, |machine, thread| {
+        let threads = self.threads_where(cx, |machine, thread| {
             thread.archived_at.is_none()
                 && thread.task.is_none()
                 && groups
                     .iter()
                     .any(|group| group.contains(machine, thread.project_id))
         });
+        self.sorted(threads, cx)
+    }
+
+    /// Unarchived top-level threads of every project on every machine, in the sidebar's order.
+    pub fn unarchived_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
+        let threads = self.threads_where(cx, |_, thread| {
+            thread.archived_at.is_none() && thread.task.is_none()
+        });
+        self.sorted(threads, cx)
+    }
+
+    /// Newest or latest active first, as the sidebar orders threads.
+    fn sorted(&self, mut threads: Vec<(MachineId, Thread)>, cx: &App) -> Vec<(MachineId, Thread)> {
         let order = self.thread_order(cx);
         threads.sort_by(|(a_machine, a), (b_machine, b)| {
             let key = |thread: &Thread| match order {
