@@ -250,18 +250,29 @@ impl ProjectSwitcher {
                     .read(cx)
                     .info(machine, project.id);
                 let name = group.name();
-                let machine_label =
-                    (machine != MachineId::Local).then(|| machines.label(machine, cx));
-                let path: SharedString = match &machine_label {
-                    Some(label) => format!("{label}: {}", project.path.display()).into(),
-                    None => compact_path(&project.path).into(),
-                };
+                let machine_label = machines.group_machines_label(&group, cx);
+                let path: SharedString = group
+                    .members
+                    .iter()
+                    .map(|(machine, project)| match machine {
+                        MachineId::Local => compact_path(&project.path),
+                        machine => {
+                            format!(
+                                "{}: {}",
+                                machines.label(*machine, cx),
+                                project.path.display()
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into();
                 let tooltip_title = name.clone();
                 let open_project_settings = self.open_project_settings.clone();
                 let status = machines
                     .group_status(&group, cx)
                     .map(|status| render_status_dot(status, cx));
-                let is_offline = !machines.is_online(machine, cx);
+                let is_offline = machines.is_group_offline(&group, cx);
                 item.start_slot(render_project_icon(project, info, px(16.), cx))
                     .child(
                         // Like Zed's popover, the path shows on hover rather than in the row.

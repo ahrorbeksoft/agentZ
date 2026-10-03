@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use theme::{ActiveTheme as _, DEFAULT_DARK_THEME, GlobalTheme, ThemeRegistry};
 use util::ResultExt as _;
 
-use crate::machines::Scope;
+use crate::machines::{GroupKey, ProjectGroupingMode, Scope};
 
 const DEFAULT_LIGHT_THEME: &str = "One Light";
 
@@ -64,6 +64,12 @@ pub struct AppSettings {
     pub dark_theme: String,
     pub machines: Vec<MachineProfile>,
     pub scope: Scope,
+    /// How checkouts of one repository are combined in the projects list.
+    pub project_grouping: ProjectGroupingMode,
+    /// Per project (by [`GroupKey::of_project`]), in place of `project_grouping`.
+    pub project_grouping_overrides: std::collections::BTreeMap<GroupKey, ProjectGroupingMode>,
+    /// The combining mode General's switch turns back on.
+    pub last_combined_grouping: ProjectGroupingMode,
 }
 
 impl Default for AppSettings {
@@ -74,6 +80,9 @@ impl Default for AppSettings {
             dark_theme: DEFAULT_DARK_THEME.to_string(),
             machines: Vec::new(),
             scope: Scope::default(),
+            project_grouping: ProjectGroupingMode::default(),
+            project_grouping_overrides: Default::default(),
+            last_combined_grouping: ProjectGroupingMode::default(),
         }
     }
 }

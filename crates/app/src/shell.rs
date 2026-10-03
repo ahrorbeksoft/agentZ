@@ -616,13 +616,17 @@ impl Shell {
             Scope::Group(key) => machines.group(&key, cx),
             Scope::All => None,
         };
+        let scope_machines = scope_group
+            .as_ref()
+            .filter(|group| group.machines().len() > 1)
+            .and_then(|group| machines.group_machines_label(group, cx));
         let (scope_icon, scope_label): (AnyElement, SharedString) = match scope_group
             .as_ref()
-            .and_then(|group| group.primary())
+            .and_then(|group| Some((group, group.primary()?)))
         {
-            Some((machine, project)) => (
+            Some((group, (machine, project))) => (
                 render_project_icon(project, project_info.info(machine, project.id), px(14.), cx),
-                project.name(),
+                group.name(),
             ),
             None => (
                 Icon::new(IconName::ListTree)
@@ -694,6 +698,11 @@ impl Shell {
                                         .gap_1p5()
                                         .child(scope_icon)
                                         .child(Label::new(scope_label).size(LabelSize::Small))
+                                        .children(scope_machines.map(|label| {
+                                            Label::new(label)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                        }))
                                         .child(
                                             Icon::new(IconName::ChevronDown)
                                                 .size(IconSize::XSmall)

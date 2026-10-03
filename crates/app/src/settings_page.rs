@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::machines::{MachineId, Machines, ProjectKey};
+use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::workspace::WorkspaceRemoval;
@@ -15,7 +15,9 @@ use gpui::{
 use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
-use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
+use ui::{
+    ContextMenu, DropdownMenu, IconPosition, Switch, Tooltip, WithScrollbar as _, prelude::*,
+};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::Request;
@@ -126,10 +128,16 @@ impl SettingsPage {
                     return;
                 };
                 let name = input.read(cx).text().to_string();
-                if let Some(store) = this.machines.read(cx).projects(key.machine, cx) {
-                    store.update(cx, |store, cx| {
-                        store.set_project_name(key.project, &name, cx)
-                    });
+                for (member, project) in this.group_members(key, cx) {
+                    // Opening the page writes the name back unchanged; that's no edit.
+                    if project.custom_name.as_deref().unwrap_or_default() == name {
+                        continue;
+                    }
+                    if let Some(store) = this.machines.read(cx).projects(member.machine, cx) {
+                        store.update(cx, |store, cx| {
+                            store.set_project_name(member.project, &name, cx)
+                        });
+                    }
                 }
             }),
             cx.subscribe(&monogram_input, |this, input, _: &TextInputEvent, cx| {
@@ -193,6 +201,51 @@ impl SettingsPage {
             .read(cx)
             .project(key.project)
             .cloned()
+    }
+
+    /// The project and the checkouts combined with it, which share its name and icon.
+    fn group_members(&self, key: ProjectKey, cx: &App) -> Vec<(ProjectKey, Project)> {
+        match self
+            .machines
+            .read(cx)
+            .group_of(key.machine, key.project, cx)
+        {
+            Some(group) => group
+                .members
+                .into_iter()
+                .map(|(machine, project)| {
+                    (
+                        ProjectKey {
+                            machine,
+                            project: project.id,
+                        },
+                        project,
+                    )
+                })
+                .collect(),
+            None => self
+                .project(key, cx)
+                .map(|project| (key, project))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Gives the project's group the icon. An image is a file on this Mac, so only this
+    /// Mac's checkouts take it.
+    fn set_group_icon(&self, key: ProjectKey, icon: Option<ProjectIcon>, cx: &mut App) {
+        let is_image = matches!(icon, Some(ProjectIcon::Image { .. }));
+        for (member, project) in self.group_members(key, cx) {
+            if project.icon == icon || (is_image && member.machine != MachineId::Local) {
+                continue;
+            }
+            if let Some(store) = self.machines.read(cx).projects(member.machine, cx) {
+                let icon = icon.clone();
+                store.update(cx, |store, cx| {
+                    store.set_project_icon(member.project, icon, cx)
+                });
+            }
+        }
     }
 
     /// The store of the project whose page is open.
@@ -266,24 +319,17 @@ impl SettingsPage {
             text: text.unwrap_or(current_text),
             color: color.map_or(current_color, str::to_string),
         };
-        if let Some(store) = self.project_store(cx) {
-            store.update(cx, |store, cx| {
-                store.set_project_icon(key.project, Some(icon), cx)
-            });
-        }
+        self.set_group_icon(key, Some(icon), cx);
     }
 
-    fn choose_icon_file(&mut self, id: ProjectId, cx: &mut Context<Self>) {
-        let Some(store) = self.project_store(cx) else {
-            return;
-        };
+    fn choose_icon_file(&mut self, key: ProjectKey, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some("Use as Icon".into()),
         });
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let path = match paths.await {
                 Ok(Ok(Some(paths))) => paths.into_iter().next(),
                 Ok(Ok(None)) | Err(_) => None,
@@ -293,9 +339,10 @@ impl SettingsPage {
                 }
             };
             if let Some(path) = path {
-                store.update(cx, |store, cx| {
-                    store.set_project_icon(id, Some(ProjectIcon::Image { path }), cx)
-                });
+                this.update(cx, |this, cx| {
+                    this.set_group_icon(key, Some(ProjectIcon::Image { path }), cx)
+                })
+                .ok();
             }
         })
         .detach();
@@ -712,6 +759,7 @@ impl SettingsPage {
                 )],
                 cx,
             ),
+            render_section("Projects", self.render_grouping_rows(window, cx), cx),
             render_section(
                 "Server",
                 vec![render_row(
@@ -729,6 +777,81 @@ impl SettingsPage {
                 cx,
             ),
         ]
+    }
+
+    /// t3code's "Combine matching repositories" switch, which turns grouping off or back to
+    /// the mode last used, and that mode.
+    fn render_grouping_rows(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let grouping = self.app_settings.read(cx).settings().project_grouping;
+        let app_settings = self.app_settings.clone();
+        let switch = Switch::new("combine-repositories", grouping.combines().into()).on_click(
+            move |state, _, cx| {
+                let combine = *state == ToggleState::Selected;
+                app_settings.update(cx, |store, cx| {
+                    store.update(
+                        |settings| {
+                            if combine {
+                                settings.project_grouping = match settings.last_combined_grouping {
+                                    ProjectGroupingMode::Separate => {
+                                        ProjectGroupingMode::Repository
+                                    }
+                                    mode => mode,
+                                };
+                            } else {
+                                if settings.project_grouping.combines() {
+                                    settings.last_combined_grouping = settings.project_grouping;
+                                }
+                                settings.project_grouping = ProjectGroupingMode::Separate;
+                            }
+                        },
+                        cx,
+                    )
+                });
+            },
+        );
+        let mut rows = vec![render_row(
+            "Combine matching repositories across machines",
+            "Checkouts of one repository, on this Mac or other machines, share one entry in \
+             the projects list.",
+            switch.into_any_element(),
+            cx,
+        )];
+        if grouping.combines() {
+            let app_settings = self.app_settings.clone();
+            let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for mode in [
+                    ProjectGroupingMode::Repository,
+                    ProjectGroupingMode::RepositoryPath,
+                ] {
+                    let app_settings = app_settings.clone();
+                    menu = menu.toggleable_entry(
+                        mode.label(),
+                        grouping == mode,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            app_settings.update(cx, |store, cx| {
+                                store.update(
+                                    |settings| {
+                                        settings.project_grouping = mode;
+                                        settings.last_combined_grouping = mode;
+                                    },
+                                    cx,
+                                )
+                            })
+                        },
+                    );
+                }
+                menu
+            });
+            rows.push(render_row(
+                "Combine by",
+                grouping.description(),
+                DropdownMenu::new("project-grouping", grouping.label(), menu).into_any_element(),
+                cx,
+            ));
+        }
+        rows
     }
 
     fn confirm_restart_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2151,10 +2274,15 @@ impl SettingsPage {
         &self,
         machine: MachineId,
         project: Project,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
         let id = project.id;
+        let key = ProjectKey {
+            machine,
+            project: id,
+        };
         let is_local = machine == MachineId::Local;
         let icon_description: SharedString = match &project.icon {
             None => "Automatic: the project's favicon, or a monogram.".into(),
@@ -2216,7 +2344,9 @@ impl SettingsPage {
                 this.child(
                     Button::new("choose-icon-file", "Choose File…")
                         .style(ButtonStyle::Outlined)
-                        .on_click(cx.listener(move |this, _, _, cx| this.choose_icon_file(id, cx))),
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.choose_icon_file(key, cx)),
+                        ),
                 )
             })
             .when(project.icon.is_some(), |this| {
@@ -2226,9 +2356,7 @@ impl SettingsPage {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.monogram_input
                                 .update(cx, |input, cx| input.set_text("", cx));
-                            if let Some(store) = this.project_store(cx) {
-                                store.update(cx, |store, cx| store.set_project_icon(id, None, cx));
-                            }
+                            this.set_group_icon(key, None, cx);
                         })),
                 )
             });
@@ -2275,6 +2403,10 @@ impl SettingsPage {
                 ],
                 cx,
             ),
+        ]
+        .into_iter()
+        .chain(self.render_repository(key, &project, window, cx))
+        .chain([
             self.render_checkouts(machine, &project, cx),
             render_section(
                 "Danger",
@@ -2296,8 +2428,113 @@ impl SettingsPage {
                     cx,
                 )],
                 cx,
+            )])
+        .collect()
+    }
+
+    /// The repository the project's checkout belongs to, what it's combined with, and how.
+    fn render_repository(
+        &self,
+        key: ProjectKey,
+        project: &Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let repository = project.repository.as_ref()?;
+        let settings = self.app_settings.read(cx).settings();
+        let default = settings.project_grouping;
+        let physical = GroupKey::of_project(key);
+        let current = settings.project_grouping_overrides.get(&physical).copied();
+        let app_settings = self.app_settings.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let choices = std::iter::once(None).chain(ProjectGroupingMode::ALL.map(Some));
+            for choice in choices {
+                let label: SharedString = match choice {
+                    None => format!("Default ({})", default.label()).into(),
+                    Some(mode) => mode.label().into(),
+                };
+                let app_settings = app_settings.clone();
+                let physical = physical.clone();
+                menu = menu.toggleable_entry(
+                    label,
+                    current == choice,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        app_settings.update(cx, |store, cx| {
+                            store.update(
+                                |settings| {
+                                    let overrides = &mut settings.project_grouping_overrides;
+                                    match choice {
+                                        Some(mode) => {
+                                            overrides.insert(physical.clone(), mode);
+                                        }
+                                        None => {
+                                            overrides.remove(&physical);
+                                        }
+                                    }
+                                },
+                                cx,
+                            )
+                        })
+                    },
+                );
+            }
+            menu
+        });
+        let mode = current.unwrap_or(default);
+        let dropdown_label: SharedString = match current {
+            Some(mode) => mode.label().into(),
+            None => "Default".into(),
+        };
+        let name = repository
+            .display_name
+            .clone()
+            .unwrap_or_else(|| repository.canonical_key.clone());
+        let mut rows = vec![
+            render_row(
+                "Repository",
+                format!(
+                    "{name} · {} {}",
+                    repository.remote_name, repository.remote_url
+                ),
+                div().into_any_element(),
+                cx,
             ),
-        ]
+            render_row(
+                "Grouping",
+                mode.description(),
+                DropdownMenu::new("project-grouping-override", dropdown_label, menu)
+                    .into_any_element(),
+                cx,
+            ),
+        ];
+        let machines = self.machines.read(cx);
+        let others: Vec<String> = self
+            .group_members(key, cx)
+            .into_iter()
+            .filter(|(member, _)| *member != key)
+            .map(|(member, project)| match member.machine {
+                MachineId::Local => compact_path(&project.path),
+                machine => format!(
+                    "{}: {}",
+                    machines.label(machine, cx),
+                    project.path.display()
+                ),
+            })
+            .collect();
+        if !others.is_empty() {
+            rows.push(render_row(
+                "Combined with",
+                format!(
+                    "{}. Name and icon changes apply to all of them.",
+                    others.join(", ")
+                ),
+                div().into_any_element(),
+                cx,
+            ));
+        }
+        Some(render_section("Repository", rows, cx))
     }
 }
 
@@ -2443,7 +2680,7 @@ impl Render for SettingsPage {
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
                     project.name(),
-                    self.render_project(key.machine, project, cx),
+                    self.render_project(key.machine, project, window, cx),
                 ),
                 None => (
                     SharedString::from("General"),

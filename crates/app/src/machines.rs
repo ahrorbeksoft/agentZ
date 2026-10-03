@@ -69,6 +69,55 @@ impl GroupKey {
     pub fn of_project(key: ProjectKey) -> Self {
         Self(format!("{}/{}", key.machine.slug(), key.project.0))
     }
+
+    /// The project, for a key made by [`Self::of_project`].
+    pub fn project(&self) -> Option<ProjectKey> {
+        let (machine, project) = self.0.split_once('/')?;
+        Some(ProjectKey {
+            machine: MachineId::from_slug(machine)?,
+            project: ProjectId(project.parse().ok()?),
+        })
+    }
+}
+
+/// How checkouts of one repository combine in the projects list (t3code's
+/// `SidebarProjectGroupingMode`). Projects without a remote never combine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectGroupingMode {
+    /// Every checkout of the repository, whichever folder of it was added.
+    #[default]
+    Repository,
+    /// Checkouts of the repository added at the same folder inside it, so a monorepo's
+    /// packages stay apart.
+    RepositoryPath,
+    Separate,
+}
+
+impl ProjectGroupingMode {
+    pub const ALL: [Self; 3] = [Self::Repository, Self::RepositoryPath, Self::Separate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Repository => "Group by repository",
+            Self::RepositoryPath => "Group by repository path",
+            Self::Separate => "Keep separate",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Repository => "Projects from the same repository share one row.",
+            Self::RepositoryPath => {
+                "Projects combine only when the repository and the folder inside it match."
+            }
+            Self::Separate => "Every project folder gets its own row.",
+        }
+    }
+
+    pub fn combines(self) -> bool {
+        self != Self::Separate
+    }
 }
 
 /// Which projects the sidebar shows threads for.
@@ -80,19 +129,30 @@ pub enum Scope {
     Group(GroupKey),
 }
 
-/// A project as the projects list shows it.
+/// A project as the projects list shows it: one folder, or checkouts of one repository on
+/// any machines, combined (t3code's `ProjectGroup`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectGroup {
     pub key: GroupKey,
+    pub label: SharedString,
+    /// This Mac's first, then each machine's in order.
     pub members: Vec<(MachineId, Project)>,
 }
 
 impl ProjectGroup {
     pub fn name(&self) -> SharedString {
-        self.members
-            .first()
-            .map(|(_, project)| project.name())
-            .unwrap_or_default()
+        self.label.clone()
+    }
+
+    /// The machines the group's checkouts are on, once each, in order.
+    pub fn machines(&self) -> Vec<MachineId> {
+        let mut machines: Vec<MachineId> = Vec::new();
+        for (machine, _) in &self.members {
+            if !machines.contains(machine) {
+                machines.push(*machine);
+            }
+        }
+        machines
     }
 
     /// The member shown for the whole group: its icon and settings.
@@ -278,32 +338,71 @@ impl Machines {
         self.clients.push(client);
     }
 
-    /// Every machine's projects, each its own group, in each machine's order.
+    /// Every machine's projects, combined as the grouping settings say, in the machines'
+    /// order or by latest activity.
     pub fn project_groups(&self, cx: &App) -> Vec<ProjectGroup> {
-        let order = self.thread_order(cx);
-        let mut groups = Vec::new();
+        let settings = AppSettingsStore::global(cx).read(cx).settings();
+        let mut projects = Vec::new();
+        let mut activity = HashMap::default();
         for client in &self.clients {
             let client = client.read(cx);
             let machine = client.machine();
             let store = client.projects().read(cx);
             for project in store.projects() {
-                groups.push((
-                    latest_activity(store, project.id),
-                    ProjectGroup {
-                        key: GroupKey::of_project(ProjectKey {
-                            machine,
-                            project: project.id,
-                        }),
-                        members: vec![(machine, project.clone())],
+                activity.insert(
+                    ProjectKey {
+                        machine,
+                        project: project.id,
                     },
-                ));
+                    latest_activity(store, project.id),
+                );
+                projects.push((machine, project.clone()));
             }
         }
-        if order == ThreadOrder::LastActivity {
+        let mut groups = build_project_groups(
+            projects,
+            settings.project_grouping,
+            &settings.project_grouping_overrides,
+        );
+        if self.thread_order(cx) == ThreadOrder::LastActivity {
+            let group_activity = |group: &ProjectGroup| {
+                group
+                    .members
+                    .iter()
+                    .filter_map(|(machine, project)| {
+                        *activity.get(&ProjectKey {
+                            machine: *machine,
+                            project: project.id,
+                        })?
+                    })
+                    .max()
+            };
             // Stable, so projects without threads keep their added order at the end.
-            groups.sort_by_key(|(activity, _)| std::cmp::Reverse(*activity));
+            groups.sort_by_cached_key(|group| std::cmp::Reverse(group_activity(group)));
         }
-        groups.into_iter().map(|(_, group)| group).collect()
+        groups
+    }
+
+    /// The machines a group is on, for its badge (t3code's `ProjectEnvironmentBadge`):
+    /// nothing when it's only on this Mac.
+    pub fn group_machines_label(&self, group: &ProjectGroup, cx: &App) -> Option<SharedString> {
+        let machines = group.machines();
+        if machines == [MachineId::Local] {
+            return None;
+        }
+        let labels: Vec<SharedString> = machines
+            .into_iter()
+            .map(|machine| self.label(machine, cx))
+            .collect();
+        Some(labels.join(", ").into())
+    }
+
+    /// Whether every machine the group is on is unreachable.
+    pub fn is_group_offline(&self, group: &ProjectGroup, cx: &App) -> bool {
+        group
+            .machines()
+            .into_iter()
+            .all(|machine| !self.is_online(machine, cx))
     }
 
     pub fn group(&self, key: &GroupKey, cx: &App) -> Option<ProjectGroup> {
@@ -336,12 +435,23 @@ impl Machines {
         }
     }
 
-    /// The scope, or all projects when its project is gone.
+    /// The scope, or all projects when its project is gone. A project combined or split off
+    /// since keeps its scope, by the group it's in now.
     pub fn scope(&self, cx: &App) -> Scope {
-        match &AppSettingsStore::global(cx).read(cx).settings().scope {
-            Scope::Group(key) if self.group(key, cx).is_some() => Scope::Group(key.clone()),
-            _ => Scope::All,
-        }
+        let Scope::Group(key) = &AppSettingsStore::global(cx).read(cx).settings().scope else {
+            return Scope::All;
+        };
+        let groups = self.project_groups(cx);
+        groups
+            .iter()
+            .find(|group| &group.key == key)
+            .or_else(|| {
+                let project = key.project()?;
+                groups
+                    .iter()
+                    .find(|group| group.contains(project.machine, project.project))
+            })
+            .map_or(Scope::All, |group| Scope::Group(group.key.clone()))
     }
 
     pub fn set_scope(scope: Scope, cx: &mut App) {
@@ -433,6 +543,115 @@ impl Machines {
     }
 }
 
+/// t3code's `buildProjectGroups`: a group per logical key, members in the order given, and
+/// t3code's label rule for groups of several.
+fn build_project_groups(
+    projects: Vec<(MachineId, Project)>,
+    mode: ProjectGroupingMode,
+    overrides: &std::collections::BTreeMap<GroupKey, ProjectGroupingMode>,
+) -> Vec<ProjectGroup> {
+    let mut groups: Vec<ProjectGroup> = Vec::new();
+    for (machine, project) in projects {
+        let physical = GroupKey::of_project(ProjectKey {
+            machine,
+            project: project.id,
+        });
+        let mode = overrides.get(&physical).copied().unwrap_or(mode);
+        let key = logical_key(&project, mode).unwrap_or(physical);
+        match groups.iter_mut().find(|group| group.key == key) {
+            Some(group) => group.members.push((machine, project)),
+            None => groups.push(ProjectGroup {
+                key,
+                label: project.name(),
+                members: vec![(machine, project)],
+            }),
+        }
+    }
+    for group in &mut groups {
+        if group.members.len() > 1 {
+            group.label = group_label(&group.members);
+        }
+    }
+    groups
+}
+
+/// The key projects combine by, or `None` to stand alone.
+fn logical_key(project: &Project, mode: ProjectGroupingMode) -> Option<GroupKey> {
+    let repository = project.repository.as_ref()?;
+    let key = match mode {
+        ProjectGroupingMode::Separate => return None,
+        ProjectGroupingMode::Repository => repository.canonical_key.clone(),
+        ProjectGroupingMode::RepositoryPath => {
+            match path_in_repository(&project.path, &repository.root_path) {
+                Some(relative) if !relative.is_empty() => {
+                    format!("{}::{relative}", repository.canonical_key)
+                }
+                _ => repository.canonical_key.clone(),
+            }
+        }
+    };
+    Some(GroupKey(format!("repository:{key}")))
+}
+
+/// The project's folder inside its repository, with `/` separators; empty at the top.
+fn path_in_repository(path: &std::path::Path, root: &std::path::Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    Some(
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// t3code's `deriveProjectGroupLabel`: the members' shared name unless it's just the
+/// repository's, else `owner/repo`, else the repository's name, else the first member's.
+fn group_label(members: &[(MachineId, Project)]) -> SharedString {
+    fn unique(values: impl Iterator<Item = Option<String>>) -> Vec<String> {
+        let mut unique: Vec<String> = Vec::new();
+        for value in values.flatten() {
+            let value = value.trim().to_string();
+            if !value.is_empty() && !unique.contains(&value) {
+                unique.push(value);
+            }
+        }
+        unique
+    }
+    let names = unique(
+        members
+            .iter()
+            .map(|(_, project)| Some(project.name().to_string())),
+    );
+    let display_names = unique(members.iter().map(|(_, project)| {
+        project
+            .repository
+            .as_ref()
+            .and_then(|repository| repository.display_name.clone())
+    }));
+    let repository_names = unique(members.iter().map(|(_, project)| {
+        project
+            .repository
+            .as_ref()
+            .and_then(|repository| repository.name.clone())
+    }));
+    match (
+        names.as_slice(),
+        display_names.as_slice(),
+        repository_names.as_slice(),
+    ) {
+        ([name], _, _) if !display_names.contains(name) && !repository_names.contains(name) => {
+            name.clone().into()
+        }
+        (_, [display_name], _) => display_name.clone().into(),
+        (_, _, [repository_name]) => repository_name.clone().into(),
+        _ => members
+            .first()
+            .map(|(_, project)| project.name())
+            .unwrap_or_default(),
+    }
+}
+
 fn latest_activity(store: &ProjectStore, project: ProjectId) -> Option<SystemTime> {
     store
         .threads()
@@ -440,4 +659,203 @@ fn latest_activity(store: &ProjectStore, project: ProjectId) -> Option<SystemTim
         .filter(|thread| thread.project_id == project)
         .filter_map(|thread| thread.last_activity_at)
         .max()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use projects::{Project, ProjectId, RepositoryIdentity};
+
+    use super::{GroupKey, MachineId, ProjectGroupingMode, ProjectKey, build_project_groups};
+
+    fn identity() -> RepositoryIdentity {
+        RepositoryIdentity {
+            canonical_key: "github.com/t3tools/t3code".into(),
+            root_path: PathBuf::from("/work/t3code"),
+            remote_name: "upstream".into(),
+            remote_url: "https://github.com/t3tools/t3code.git".into(),
+            display_name: Some("T3 Code".into()),
+            owner: Some("t3tools".into()),
+            name: Some("t3code".into()),
+        }
+    }
+
+    fn project(id: u64, path: &str, custom_name: Option<&str>) -> Project {
+        let mut repository = identity();
+        repository.root_path = PathBuf::from(path);
+        Project {
+            id: ProjectId(id),
+            path: PathBuf::from(path),
+            custom_name: custom_name.map(str::to_string),
+            icon: None,
+            workspaces: Vec::new(),
+            repository: Some(repository),
+        }
+    }
+
+    fn clones() -> Vec<(MachineId, Project)> {
+        vec![
+            (MachineId::Local, project(1, "/work/t3code", None)),
+            (MachineId::Local, project(2, "/work/t3code-2", None)),
+            (MachineId::Remote(1), project(1, "/home/me/t3code-3", None)),
+        ]
+    }
+
+    fn member_ids(groups: &[super::ProjectGroup]) -> Vec<Vec<(MachineId, u64)>> {
+        groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .map(|(machine, project)| (*machine, project.id.0))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn combines_every_clone_in_repository_modes() {
+        for mode in [
+            ProjectGroupingMode::Repository,
+            ProjectGroupingMode::RepositoryPath,
+        ] {
+            let groups = build_project_groups(clones(), mode, &BTreeMap::new());
+            assert_eq!(
+                member_ids(&groups),
+                [vec![
+                    (MachineId::Local, 1),
+                    (MachineId::Local, 2),
+                    (MachineId::Remote(1), 1)
+                ]]
+            );
+            assert_eq!(groups[0].label.as_ref(), "T3 Code");
+        }
+    }
+
+    #[test]
+    fn labels_like_t3code() {
+        let named = vec![
+            (
+                MachineId::Local,
+                project(1, "/work/a", Some("Custom project")),
+            ),
+            (
+                MachineId::Local,
+                project(2, "/work/b", Some("Custom project")),
+            ),
+        ];
+        let groups = build_project_groups(named, ProjectGroupingMode::Repository, &BTreeMap::new());
+        assert_eq!(groups[0].label.as_ref(), "Custom project");
+
+        let repository_named = vec![
+            (MachineId::Local, project(1, "/work/a/t3code", None)),
+            (MachineId::Remote(1), project(1, "/srv/t3code", None)),
+        ];
+        let groups = build_project_groups(
+            repository_named,
+            ProjectGroupingMode::Repository,
+            &BTreeMap::new(),
+        );
+        assert_eq!(groups[0].label.as_ref(), "T3 Code");
+
+        let alone = build_project_groups(
+            vec![(MachineId::Local, project(1, "/work/t3code", None))],
+            ProjectGroupingMode::Repository,
+            &BTreeMap::new(),
+        );
+        assert_eq!(alone[0].label.as_ref(), "t3code");
+    }
+
+    #[test]
+    fn keeps_clones_apart_when_asked() {
+        let groups =
+            build_project_groups(clones(), ProjectGroupingMode::Separate, &BTreeMap::new());
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.label.to_string())
+                .collect::<Vec<_>>(),
+            ["t3code", "t3code-2", "t3code-3"]
+        );
+
+        let overrides = BTreeMap::from([(
+            GroupKey::of_project(ProjectKey {
+                machine: MachineId::Local,
+                project: ProjectId(2),
+            }),
+            ProjectGroupingMode::Separate,
+        )]);
+        let groups = build_project_groups(clones(), ProjectGroupingMode::Repository, &overrides);
+        assert_eq!(
+            member_ids(&groups),
+            [
+                vec![(MachineId::Local, 1), (MachineId::Remote(1), 1)],
+                vec![(MachineId::Local, 2)]
+            ]
+        );
+    }
+
+    #[test]
+    fn repository_path_mode_keeps_monorepo_folders_apart() {
+        let mut app = project(1, "/work/mono/apps/web", None);
+        let mut server = project(2, "/work/mono/apps/server", None);
+        let mut remote_app = project(1, "/srv/mono/apps/web", None);
+        for (project, root) in [
+            (&mut app, "/work/mono"),
+            (&mut server, "/work/mono"),
+            (&mut remote_app, "/srv/mono"),
+        ] {
+            if let Some(repository) = &mut project.repository {
+                repository.root_path = PathBuf::from(root);
+            }
+        }
+        let projects = vec![
+            (MachineId::Local, app),
+            (MachineId::Local, server),
+            (MachineId::Remote(1), remote_app),
+        ];
+        let by_path = build_project_groups(
+            projects.clone(),
+            ProjectGroupingMode::RepositoryPath,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            member_ids(&by_path),
+            [
+                vec![(MachineId::Local, 1), (MachineId::Remote(1), 1)],
+                vec![(MachineId::Local, 2)]
+            ]
+        );
+        let by_repository =
+            build_project_groups(projects, ProjectGroupingMode::Repository, &BTreeMap::new());
+        assert_eq!(by_repository.len(), 1);
+    }
+
+    #[test]
+    fn a_project_is_found_from_its_own_key() {
+        let key = ProjectKey {
+            machine: MachineId::Remote(7),
+            project: ProjectId(3),
+        };
+        assert_eq!(GroupKey::of_project(key).project(), Some(key));
+        assert_eq!(GroupKey("repository:github.com/a/b".into()).project(), None);
+    }
+
+    #[test]
+    fn folders_without_a_remote_stand_alone() {
+        let mut first = project(1, "/work/a", None);
+        let mut second = project(2, "/work/b", None);
+        first.repository = None;
+        second.repository = None;
+        let groups = build_project_groups(
+            vec![(MachineId::Local, first), (MachineId::Local, second)],
+            ProjectGroupingMode::Repository,
+            &BTreeMap::new(),
+        );
+        assert_eq!(groups.len(), 2);
+    }
 }

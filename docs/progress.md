@@ -253,13 +253,16 @@ Then the server:
   - [x] display name `owner/repo`;
   - [x] cached for 15 minutes, or 1 minute when there's no repository or remote (swept every
         minute, and right after a project is added).
-- [ ] Merged projects:
-  - [ ] grouping modes `repository` (default), `repository_path`, `separate`;
-  - [ ] Settings › General switch and a per-project override;
-  - [ ] t3code's label rule;
-  - [ ] machines badge and combined threads;
-  - [ ] branch shown per checkout;
-  - [ ] project name and icon shared by the group.
+- [x] Merged projects (`machines::build_project_groups`, t3code's tests ported):
+  - [x] grouping modes `repository` (default), `repository_path`, `separate`;
+  - [x] Settings › General switch (back to the last combining mode) with a "Combine by"
+        choice, and a per-project override in the project's Repository section;
+  - [x] t3code's label rule;
+  - [x] machines badge (title bar and switcher, only when a group spans machines), combined
+        threads, and a machine tag on cards when one project is shown;
+  - [x] branch shown per checkout (each card's checkout line);
+  - [x] project name and icon shared by the group (images only by this Mac's checkouts);
+  - [x] the chosen project stays chosen when grouping changes.
 - [ ] New Thread: Project → Machine (only when the project is on several machines; defaults to
       the last used one) → Agent on that machine.
 - [ ] UI: machine icon on remote cards, machine line in the details popover, projects grouped by

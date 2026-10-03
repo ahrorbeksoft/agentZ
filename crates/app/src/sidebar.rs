@@ -880,11 +880,13 @@ impl Sidebar {
             let title_line = h_flex().mt_1().min_w_0().child(title_element);
             (Some(project_line), title_line)
         } else {
+            // A project combined across machines keeps telling its threads apart.
             let title_line = h_flex()
                 .relative()
                 .min_w_0()
                 .gap_1p5()
                 .child(title_element)
+                .children(machine_label.map(|label| render_machine_tag(label, is_offline)))
                 .child(status_slot)
                 .children(archive_slot);
             (None, title_line)
