@@ -791,13 +791,13 @@ impl Sidebar {
         let checkout = self.thread_checkout(machine, &thread, cx);
         let (branch, checkout) = match &folder {
             Some(folder) => (
-                folder.branch.clone(),
+                folder_branch_label(folder),
                 checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
             ),
             None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
         };
-        if folder.is_some() {
-            details.branch = branch.clone().map(SharedString::from);
+        if let Some(folder) = &folder {
+            details.branch = folder.branch.clone().map(SharedString::from);
             if checkout.is_none() {
                 details.workspace = None;
             }
@@ -1216,15 +1216,13 @@ impl Sidebar {
         // own. Before its server says where it is, the checkout it started in.
         let (branch, checkout) = match &folder {
             Some(folder) => (
-                folder.branch.clone(),
+                folder_branch_label(folder),
                 checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
             ),
             None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
         };
-        let is_repository = folder.as_ref().is_none_or(|folder| folder.is_repository);
-        // Outside a repository there's nothing to say under the title, unless something runs.
         let detail_line =
-            (!is_archived && (is_repository || running.is_some())).then(|| {
+            (!is_archived).then(|| {
                 // Under the title, past the icon and the gap.
                 h_flex()
                     .pl(px(26.))
@@ -2025,6 +2023,15 @@ pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElem
         .size_1p5()
         .rounded_full()
         .bg(color.color(cx))
+}
+
+/// The branch a terminal's folder is on, or that it's outside git.
+fn folder_branch_label(folder: &projects::TerminalFolder) -> Option<String> {
+    if folder.is_repository {
+        folder.branch.clone()
+    } else {
+        Some("No git".to_string())
+    }
 }
 
 /// A folder outside every project, in a slot as wide as a project's icon so names line up.
