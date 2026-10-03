@@ -17,7 +17,7 @@ use util::shell::Shell;
 use util::shell_builder::ShellBuilder;
 
 use super::{ClientId, Input, Server, send_to};
-use crate::detect::{self, Agent, AgentState, AgentTracker, DetectionInput, ProcessObservation};
+use crate::detect::{self, Agent, AgentTracker, DetectionInput, ProcessObservation};
 use crate::terminal_programs;
 use crate::terminals::{Terminal, TerminalSize, TerminalSpawn, frame_changes};
 
@@ -35,7 +35,8 @@ pub(super) struct RunningTerminal {
     released: bool,
     /// Counts the screen's changes, so agent detection only rereads a changed screen.
     content: u64,
-    /// For a terminal thread: the agent CLI running in it and its state.
+    /// For a pane's terminal: the agent CLI running in it and its state. Only panes are
+    /// watched; the user wants agents found in Workspaces alone.
     tracker: Option<AgentTracker>,
 }
 
@@ -226,16 +227,12 @@ impl Server {
             .get(&key)
             .and_then(|running| running.output_byte_limit);
         let tracker = match key {
-            TerminalKey::Thread(thread_id) => {
-                // Whatever ran before is gone with its terminal.
-                self.publish_terminal_agent_state(thread_id, AgentState::Unknown);
-                Some(AgentTracker::default())
-            }
             TerminalKey::Pane(pane) => {
+                // Whatever ran before is gone with its terminal.
                 self.spaces.set_pane_agent(pane, None);
                 Some(AgentTracker::default())
             }
-            TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => None,
+            TerminalKey::Thread(_) | TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => None,
         };
         self.terminals.running.insert(
             key.clone(),
@@ -257,12 +254,8 @@ impl Server {
         if self.terminals.running.remove(key).is_none() {
             return;
         }
-        match key {
-            TerminalKey::Thread(thread_id) => {
-                self.publish_terminal_agent_state(*thread_id, AgentState::Unknown)
-            }
-            TerminalKey::Pane(pane) => self.spaces.set_pane_agent(*pane, None),
-            TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
+        if let TerminalKey::Pane(pane) = key {
+            self.spaces.set_pane_agent(*pane, None);
         }
         for client in self.clients.values_mut() {
             if client.terminals.remove(key).is_some() {
@@ -312,8 +305,8 @@ impl Server {
         });
     }
 
-    /// Reads which agent each terminal thread runs and what its screen says, as herdr's
-    /// detection loop does for its panes, and shows it as the thread's state.
+    /// Reads which agent each pane's terminal runs and what its screen says, as herdr's
+    /// detection loop does.
     fn detect_terminal_agents(&mut self) {
         self.terminals.detection_scheduled = false;
         let now = Instant::now();
@@ -370,28 +363,13 @@ impl Server {
             next_tick = Some(next_tick.map_or(tick, |next| next.min(tick)));
         }
         for (key, agent, state) in published {
-            match key {
-                TerminalKey::Thread(thread_id) => {
-                    self.publish_terminal_agent_state(thread_id, state)
-                }
-                TerminalKey::Pane(pane) => self.publish_pane_agent(pane, agent, state),
-                TerminalKey::Drawer(_) | TerminalKey::Agent { .. } => {}
+            if let TerminalKey::Pane(pane) = key {
+                self.publish_pane_agent(pane, agent, state);
             }
         }
         if let Some(next_tick) = next_tick {
             self.schedule_agent_detection(next_tick);
         }
-    }
-
-    /// A terminal thread's agent state as the thread's own: working, waiting for an answer as
-    /// a permission request waits, or done once working ends.
-    fn publish_terminal_agent_state(&mut self, thread_id: ThreadId, state: AgentState) {
-        self.projects.set_thread_working(
-            thread_id,
-            matches!(state, AgentState::Working | AgentState::Blocked),
-        );
-        self.projects
-            .set_thread_blocked(thread_id, state == AgentState::Blocked);
     }
 
     pub(super) fn terminal_changed(&mut self, key: TerminalKey) {

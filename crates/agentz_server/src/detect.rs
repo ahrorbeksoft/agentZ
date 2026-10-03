@@ -1,4 +1,4 @@
-//! Which agent CLI a terminal thread runs, and whether it's working, waiting for the user or
+//! Which agent CLI a workspace pane runs, and whether it's working, waiting for the user or
 //! done, read from its screen the way herdr reads its panes (`src/detect/`): the foreground
 //! process names the agent, and that agent's manifest reads the bottom of the screen and the
 //! terminal's title.

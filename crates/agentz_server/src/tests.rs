@@ -2086,12 +2086,12 @@ async fn terminal_threads_stream_their_screens_to_watchers() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn terminal_threads_show_their_agents_state() {
+async fn terminal_threads_are_not_watched_for_agents() {
     let Some(server) = TestServer::start() else {
         return;
     };
-    // Named like an agent CLI, so the thread's foreground process reads as Codex. It sets
-    // the terminal's title to each line it reads, as Codex shows its state in the title.
+    // Named like an agent CLI, so the foreground process would read as Codex in a pane. It
+    // sets the terminal's title to each line it reads, as Codex shows its state in the title.
     let bin = tempfile::tempdir().expect("temp dir");
     let codex = bin.path().join("codex");
     std::fs::write(
@@ -2122,39 +2122,16 @@ async fn terminal_threads_show_their_agents_state() {
     client.subscribe_terminal(key.clone()).await;
     client.wait_for_screen(&key, "codex ready").await;
 
-    let snapshot = |client: &TestClient| client.projects.clone().expect("projects");
-    let is_working =
-        move |client: &TestClient| snapshot(client).working_threads.contains(&thread_id);
-    let is_blocked =
-        move |client: &TestClient| snapshot(client).blocked_threads.contains(&thread_id);
-    let completed_at = move |client: &TestClient| {
-        snapshot(client)
-            .threads
-            .iter()
-            .find(|thread| thread.id == thread_id)
-            .and_then(|thread| thread.completed_at)
-    };
-
-    // After the agent's startup grace, its title spinner says it's working.
+    // A spinner in the title makes a pane's Codex working once its startup grace is over
+    // (`terminal_panes_show_their_agents`); a thread's terminal isn't watched.
     client.type_into(&key, "⠋ project\n").await;
-    client.wait_until(is_working).await;
-    assert!(!is_blocked(&client));
-
-    client.type_into(&key, "Action Required\n").await;
-    client.wait_until(is_blocked).await;
-    assert!(is_working(&client));
-
-    client.type_into(&key, "project\n").await;
-    client.wait_until(move |client| !is_working(client)).await;
-    assert!(!is_blocked(&client));
-    let first_completion = completed_at(&client).expect("a completion");
-
-    // Exiting while working completes the thread too.
-    client.type_into(&key, "⠙ project\n").await;
-    client.wait_until(is_working).await;
-    client.type_into(&key, "\x04").await;
-    client.wait_until(move |client| !is_working(client)).await;
-    assert!(completed_at(&client).expect("a completion") > first_completion);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Reading up to a later screen applies every event sent before it.
+    client.type_into(&key, "checked\n").await;
+    client.wait_for_screen(&key, "checked").await;
+    let projects = client.projects.clone().expect("projects");
+    assert!(!projects.working_threads.contains(&thread_id));
+    assert!(!projects.blocked_threads.contains(&thread_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
