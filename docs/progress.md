@@ -299,7 +299,12 @@ Then the server:
 
 - [ ] A macOS app bundle (Info.plist, bundle id, ad-hoc signature) so system notifications show,
       and launching with `open -g` doesn't take focus.
-- [ ] Optional start at login (launchd agent, systemd user service).
+- [x] Optional start at login: Settings › General › Start at login writes a launch agent
+      (`~/Library/LaunchAgents/dev.agentz.server.plist`) that runs `agentz-server start` at
+      load, and nothing more, so a stopped server stays stopped. The app points it at its
+      current server when it opens. Checked with `launchctl bootstrap` in a scratch data
+      directory. Not on Linux: remote servers start when the app connects, and a systemd user
+      service would end at logout unless lingering is on, while today's server outlives it.
 - [x] Remote server updates, only after the user confirms: done in phase 9 (an older server
       keeps running, with Restart Server… in Settings › Machines).
 - [x] Per-machine "Stop Server…" in Settings › Machines, This Mac included. The machine shows

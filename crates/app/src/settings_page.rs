@@ -18,6 +18,7 @@ use theme::{Appearance, ThemeRegistry};
 use ui::{
     ContextMenu, DropdownMenu, IconPosition, Switch, Tooltip, WithScrollbar as _, prelude::*,
 };
+use util::ResultExt as _;
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::Request;
@@ -81,6 +82,8 @@ pub struct SettingsPage {
     /// The saved machine the form edits, rather than adding one.
     editing_machine: Option<u64>,
     machine_form_error: Option<SharedString>,
+    /// Whether this Mac's server has a launch agent, so it starts at login.
+    starts_at_login: bool,
     /// The agent whose account panel is open, with the connection made to log in or out.
     account: Option<AccountPanel>,
     nav_scroll: ScrollHandle,
@@ -174,6 +177,7 @@ impl SettingsPage {
             machine_target_input,
             editing_machine: None,
             machine_form_error: None,
+            starts_at_login: crate::login_item::is_enabled(),
             account: None,
             nav_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
@@ -780,12 +784,29 @@ impl SettingsPage {
             render_section("Projects", self.render_grouping_rows(window, cx), cx),
             render_section(
                 "Server",
-                vec![render_row(
-                    "Background server",
-                    server_description,
-                    server_button.into_any_element(),
-                    cx,
-                )],
+                vec![
+                    render_row(
+                        "Background server",
+                        server_description,
+                        server_button.into_any_element(),
+                        cx,
+                    ),
+                    render_row(
+                        "Start at login",
+                        "Starts the server when you log in, before agentZ opens, so scripts \
+                         using agentz-server call can reach it.",
+                        Switch::new("start-at-login", self.starts_at_login.into())
+                            .on_click(cx.listener(|this, state, _, cx| {
+                                let enabled = *state == ToggleState::Selected;
+                                if crate::login_item::set_enabled(enabled).log_err().is_some() {
+                                    this.starts_at_login = enabled;
+                                    cx.notify();
+                                }
+                            }))
+                            .into_any_element(),
+                        cx,
+                    ),
+                ],
                 cx,
             ),
         ]

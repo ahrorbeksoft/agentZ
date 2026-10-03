@@ -2,6 +2,7 @@ mod add_project_modal;
 mod agent_view;
 mod app_settings;
 mod diff_panel;
+mod login_item;
 mod machines;
 mod new_thread_modal;
 mod project_info;
@@ -29,6 +30,7 @@ use gpui::{
 use reqwest_client::ReqwestClient;
 use theme::{LoadThemes, ThemeRegistry, ThemeSettingsProvider, UiDensity};
 use ui::prelude::*;
+use util::ResultExt as _;
 
 use crate::shell::Shell;
 
@@ -162,6 +164,8 @@ fn main() {
             machines::init(cx);
             project_info::init(cx);
             init_actions(cx);
+            cx.background_spawn(async { login_item::refresh().log_err() })
+                .detach();
 
             let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
             let window = cx.open_window(

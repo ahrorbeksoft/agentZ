@@ -611,7 +611,7 @@ async fn connect_local(
 }
 
 /// `agentz-server` next to the app's executable, as `cargo build` and the app bundle place it.
-fn server_binary() -> Result<PathBuf> {
+pub(crate) fn server_binary() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os(SERVER_BINARY_ENV_VAR) {
         return Ok(PathBuf::from(path));
     }
