@@ -14,6 +14,8 @@ use crate::terminal_view::TerminalView;
 pub struct TerminalThreadView {
     title: SharedString,
     command: TerminalCommand,
+    /// An agent CLI runs in it, whose session a restart would end.
+    has_agent: bool,
     is_diff_open: bool,
     terminal: Entity<Terminal>,
     view: Entity<TerminalView>,
@@ -34,6 +36,7 @@ impl TerminalThreadView {
         Self {
             title,
             command,
+            has_agent: false,
             is_diff_open: false,
             terminal,
             view,
@@ -44,6 +47,13 @@ impl TerminalThreadView {
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
         if self.title != title {
             self.title = title;
+            cx.notify();
+        }
+    }
+
+    pub fn set_has_agent(&mut self, has_agent: bool, cx: &mut Context<Self>) {
+        if self.has_agent != has_agent {
+            self.has_agent = has_agent;
             cx.notify();
         }
     }
@@ -103,19 +113,22 @@ impl TerminalThreadView {
                     .size(LabelSize::Small)
                     .color(Color::Muted)
             }))
-            .child(
-                Button::new("restart-terminal", "Restart")
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
-                    .when(!has_exited, |button| button.style(ButtonStyle::Subtle))
-                    .when(has_exited, |button| button.style(ButtonStyle::Outlined))
-                    .tooltip(Tooltip::text("Run the command again"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.terminal
-                            .update(cx, |terminal, cx| terminal.restart(cx));
-                        window.focus(&this.view.focus_handle(cx), cx);
-                    })),
-            )
+            // Not while an agent CLI runs: one click would end its session.
+            .when(!self.has_agent, |toolbar| {
+                toolbar.child(
+                    Button::new("restart-terminal", "Restart")
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
+                        .when(!has_exited, |button| button.style(ButtonStyle::Subtle))
+                        .when(has_exited, |button| button.style(ButtonStyle::Outlined))
+                        .tooltip(Tooltip::text("Run the command again"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.terminal
+                                .update(cx, |terminal, cx| terminal.restart(cx));
+                            window.focus(&this.view.focus_handle(cx), cx);
+                        })),
+                )
+            })
             .child(
                 IconButton::new("toggle-diff", IconName::Diff)
                     .icon_size(IconSize::Small)

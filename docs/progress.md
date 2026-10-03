@@ -739,3 +739,5 @@ Then the server:
 - 2026-10-03: Machine icon on every card (before the agent's) and shell row; every details
   popover has the machine, and terminals' popovers their folder's project, branch or path, and
   agent CLI.
+- 2026-10-03: A terminal thread hides Restart while an agent CLI runs in it, so one click
+  can't end the agent's session.

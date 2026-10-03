@@ -68,6 +68,12 @@ impl ThreadView {
         }
     }
 
+    fn set_has_agent(&self, has_agent: bool, cx: &mut App) {
+        if let Self::Terminal(view) = self {
+            view.update(cx, |view, cx| view.set_has_agent(has_agent, cx));
+        }
+    }
+
     fn set_archived(&self, is_archived: bool, cx: &mut App) {
         if let Self::Agent(view) = self {
             view.update(cx, |view, cx| view.set_archived(is_archived, cx));
@@ -146,15 +152,20 @@ impl Shell {
                     .collect();
                 let is_live = |key: ThreadKey| threads.get(&key).is_some_and(Option::is_some);
                 this.open_threads.retain(|key, _| is_live(*key));
-                let states: Vec<(ThreadView, SharedString, bool)> = this
+                let machines = this.machines.read(cx);
+                let states: Vec<(ThreadView, SharedString, bool, bool)> = this
                     .open_threads
                     .iter()
                     .filter_map(|(key, open_thread)| {
                         let thread = threads.get(key)?.as_ref()?;
+                        let has_agent = machines.projects(key.machine, cx).is_some_and(|store| {
+                            store.read(cx).terminal_agent(key.thread).is_some()
+                        });
                         Some((
                             open_thread.view.clone(),
                             thread.title.clone().into(),
                             thread.archived_at.is_some(),
+                            has_agent,
                         ))
                     })
                     .collect();
@@ -169,9 +180,10 @@ impl Shell {
                         sidebar.update(cx, |sidebar, cx| sidebar.set_active_thread(None, cx))
                     });
                 }
-                for (view, title, is_archived) in states {
+                for (view, title, is_archived, has_agent) in states {
                     view.set_title(title, cx);
                     view.set_archived(is_archived, cx);
+                    view.set_has_agent(has_agent, cx);
                 }
                 // Focus was in the closed thread's view. Without moving it here, actions such as
                 // New Thread would be dispatched from the window's root, above the shell's
@@ -515,7 +527,17 @@ impl Shell {
             .clone();
         if let Some(command) = thread.terminal.clone() {
             let title = SharedString::from(thread.title);
-            let view = cx.new(|cx| TerminalThreadView::new(&client, thread_id, title, command, cx));
+            let has_agent = client
+                .read(cx)
+                .projects()
+                .read(cx)
+                .terminal_agent(thread_id)
+                .is_some();
+            let view = cx.new(|cx| {
+                let mut view = TerminalThreadView::new(&client, thread_id, title, command, cx);
+                view.set_has_agent(has_agent, cx);
+                view
+            });
             return Some(OpenThread {
                 view: ThreadView::Terminal(view),
                 _subscriptions: Vec::new(),
