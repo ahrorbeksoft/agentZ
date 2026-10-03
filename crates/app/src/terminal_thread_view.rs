@@ -6,6 +6,7 @@ use projects::ThreadId;
 use ui::{Tooltip, prelude::*};
 
 use crate::ToggleDiff;
+use crate::server_client::ServerClient;
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
@@ -21,12 +22,13 @@ pub struct TerminalThreadView {
 
 impl TerminalThreadView {
     pub fn new(
+        client: &Entity<ServerClient>,
         thread_id: ThreadId,
         title: SharedString,
         command: TerminalCommand,
         cx: &mut Context<Self>,
     ) -> Self {
-        let terminal = Terminal::shared(TerminalKey::Thread(thread_id), cx);
+        let terminal = Terminal::shared(client, TerminalKey::Thread(thread_id), cx);
         let view = cx.new(|cx| TerminalView::new(terminal.clone(), TerminalMode::Scrollable, cx));
         let subscriptions = vec![cx.observe(&terminal, |_, _, cx| cx.notify())];
         Self {

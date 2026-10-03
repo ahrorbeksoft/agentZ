@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 
 const DATA_DIR_ENV_VAR: &str = "AGENTZ_DATA_DIR";
 
-/// The app's data directory, `~/Library/Application Support/agentZ` on macOS.
+/// The app's data directory, `~/Library/Application Support/agentZ` on macOS. Elsewhere only
+/// the server runs, reached over SSH, and everything it keeps is in `~/.agentz`, next to the
+/// binaries the app uploads.
 ///
 /// `AGENTZ_DATA_DIR` overrides it, so development runs and tests can use a scratch directory
 /// instead of the real one.
@@ -15,10 +17,16 @@ pub fn data_dir() -> &'static PathBuf {
         if let Some(dir) = std::env::var_os(DATA_DIR_ENV_VAR) {
             return PathBuf::from(dir);
         }
-        dirs::data_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("agentZ")
+        if cfg!(target_os = "macos") {
+            dirs::data_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("agentZ")
+        } else {
+            dirs::home_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".agentz")
+        }
     })
 }
 

@@ -24,6 +24,7 @@ use ui::{
 
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
+use crate::server_client::{MachineStatus, ServerClient};
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
@@ -83,6 +84,9 @@ pub struct AgentView {
     is_diff_open: bool,
     thread: Entity<AgentThread>,
     title: SharedString,
+    /// The thread's machine.
+    client: Entity<ServerClient>,
+    store: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
     agent_id: Option<AgentId>,
     composer: Entity<TextInput>,
@@ -119,10 +123,12 @@ impl AgentView {
         thread_id: ThreadId,
         thread: Entity<AgentThread>,
         title: SharedString,
-        registry: Entity<AgentRegistryStore>,
         agent_id: Option<AgentId>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let client = thread.read(cx).client().clone();
+        let store = client.read(cx).projects().clone();
+        let registry = client.read(cx).registry().clone();
         let composer = cx.new(|cx| TextInput::new("Message the agent…", cx));
         let subscriptions = vec![
             cx.observe(&thread, |this, _, cx| {
@@ -137,10 +143,12 @@ impl AgentView {
             }),
             // The agent's display name and icon come from the registry, which may load later.
             cx.observe(&registry, |_, _, cx| cx.notify()),
-            cx.observe(&ProjectStore::global(cx), |this, _, cx| {
+            cx.observe(&store, |this, _, cx| {
                 this.sync_blocked_subthreads(cx);
                 cx.notify();
             }),
+            // Whether messages can be sent follows the machine's connection.
+            cx.observe(&client, |_, _, cx| cx.notify()),
         ];
         let mut subscriptions = subscriptions;
         subscriptions.push(cx.subscribe(&composer, |this, _, _: &TextInputEvent, cx| {
@@ -168,6 +176,8 @@ impl AgentView {
             title,
             is_archived: false,
             is_diff_open: false,
+            client,
+            store,
             registry,
             agent_id,
             composer,
@@ -198,7 +208,7 @@ impl AgentView {
     /// Follows the subthreads that wait for a permission answer, and stops following those
     /// that no longer do.
     fn sync_blocked_subthreads(&mut self, cx: &mut Context<Self>) {
-        let store = ProjectStore::global(cx);
+        let store = self.store.clone();
         let blocked: Vec<ThreadId> = store
             .read(cx)
             .thread_and_subthreads(self.thread_id)
@@ -212,7 +222,7 @@ impl AgentView {
             if self.blocked_subthreads.contains_key(&thread_id) {
                 continue;
             }
-            let thread = AgentThread::shared(thread_id, cx);
+            let thread = AgentThread::shared(&self.client, thread_id, cx);
             let subscription = cx.observe(&thread, |_, _, cx| cx.notify());
             self.blocked_subthreads
                 .insert(thread_id, (thread, subscription));
@@ -221,15 +231,12 @@ impl AgentView {
 
     /// The thread that delegated this one, for a subthread.
     fn parent(&self, cx: &App) -> Option<ThreadId> {
-        ProjectStore::global(cx)
-            .read(cx)
-            .thread(self.thread_id)?
-            .parent()
+        self.store.clone().read(cx).thread(self.thread_id)?.parent()
     }
 
     /// t3code's Agents control: the thread's subthreads, each with its state, title and agent.
     fn render_agents_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let store = ProjectStore::global(cx);
+        let store = self.store.clone();
         let store = store.read(cx);
         let subthreads: Vec<projects::Thread> = store
             .subthreads(self.thread_id)
@@ -372,7 +379,7 @@ impl AgentView {
 
     /// The permission requests of subthreads, answered here for them.
     fn render_subthread_permissions(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let store = ProjectStore::global(cx);
+        let store = self.store.clone();
         let mut subthreads: Vec<(&ThreadId, &(Entity<AgentThread>, Subscription))> =
             self.blocked_subthreads.iter().collect();
         subthreads.sort_by_key(|(thread_id, _)| **thread_id);
@@ -478,7 +485,7 @@ impl AgentView {
     /// messages come from its parent.
     fn render_subthread_bar(&self, parent: ThreadId, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
-        let store = ProjectStore::global(cx);
+        let store = self.store.clone();
         let parent_title = store
             .read(cx)
             .thread(parent)
@@ -552,7 +559,7 @@ impl AgentView {
         if self.drawer.take().is_some() {
             window.focus(&self.focus_handle(cx), cx);
         } else {
-            let terminal = Terminal::shared(TerminalKey::Drawer(self.thread_id), cx);
+            let terminal = Terminal::shared(&self.client, TerminalKey::Drawer(self.thread_id), cx);
             let drawer = cx.new(|cx| TerminalView::new(terminal, TerminalMode::Scrollable, cx));
             window.focus(&drawer.focus_handle(cx), cx);
             self.drawer = Some(drawer);
@@ -653,6 +660,7 @@ impl AgentView {
                     for terminal_id in &tool_call.terminals {
                         if !self.tool_terminals.contains_key(terminal_id) {
                             let terminal = Terminal::shared(
+                                &self.client,
                                 TerminalKey::Agent {
                                     thread_id: self.thread_id,
                                     terminal_id: terminal_id.clone(),
@@ -784,7 +792,7 @@ impl AgentView {
     }
 
     fn send(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_archived {
+        if self.is_archived || !self.client.read(cx).is_online() {
             return;
         }
         let commands = self.matching_commands(cx);
@@ -1063,7 +1071,7 @@ impl AgentView {
                 let sent_by = self.thread.read(cx).prompt_sender(index).map(|sender| {
                     format!(
                         "Sent by {}",
-                        ProjectStore::global(cx).read(cx).describe_creator(sender)
+                        self.store.clone().read(cx).describe_creator(sender)
                     )
                 });
                 v_flex()
@@ -1812,6 +1820,27 @@ impl AgentView {
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentViewEvent::Unarchive))),
             )
+            .into_any_element()
+    }
+
+    /// While the thread's machine is unreachable, in place of the message editor. The draft
+    /// stays in the editor for when it's back.
+    fn render_offline_notice(&self, cx: &App) -> AnyElement {
+        let label = self.client.read(cx).label().clone();
+        let description = match self.client.read(cx).status() {
+            MachineStatus::Attention { error, .. } | MachineStatus::Reconnecting(error) => {
+                format!("{error}. New messages can be sent once it reconnects.")
+            }
+            MachineStatus::Connecting | MachineStatus::Online => {
+                "New messages can be sent once it reconnects.".to_string()
+            }
+        };
+        Callout::new()
+            .border_position(ui::CalloutBorderPosition::Top)
+            .severity(Severity::Warning)
+            .icon(IconName::Disconnected)
+            .title(format!("{label} is offline"))
+            .description(description)
             .into_any_element()
     }
 
@@ -2958,6 +2987,8 @@ impl Render for AgentView {
                     this.child(self.render_subthread_bar(parent, cx))
                 } else if self.is_archived {
                     this.child(self.render_archived_notice(cx))
+                } else if !self.client.read(cx).is_online() {
+                    this.child(self.render_offline_notice(cx))
                 } else {
                     this.child(self.render_message_editor(cx))
                 }

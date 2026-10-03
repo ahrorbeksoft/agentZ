@@ -192,10 +192,12 @@ dependencies = [
  "collections",
  "futures",
  "http_client",
+ "libc",
  "log",
  "parking_lot",
  "projects",
  "registry",
+ "sha2",
  "tempfile",
  "tokio",
 ]

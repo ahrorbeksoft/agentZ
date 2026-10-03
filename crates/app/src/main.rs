@@ -1,6 +1,7 @@
 mod agent_view;
 mod app_settings;
 mod diff_panel;
+mod machines;
 mod new_thread_modal;
 mod project_info;
 mod project_store;
@@ -19,8 +20,6 @@ mod thread_entity;
 
 use std::sync::Arc;
 
-use crate::project_store::ProjectStore;
-use crate::registry_store::AgentRegistryStore;
 use assets::Assets;
 use gpui::{
     App, Bounds, Focusable as _, Font, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions,
@@ -158,14 +157,10 @@ fn main() {
             sidebar::init(cx);
             terminal_view::init(cx);
             settings_page::init(cx);
-            project_store::init(cx);
+            machines::init(cx);
             project_info::init(cx);
-            registry_store::init(cx);
-            server_client::init(cx);
             init_actions(cx);
 
-            let store = ProjectStore::global(cx);
-            let registry = AgentRegistryStore::global(cx);
             let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
             let window = cx.open_window(
                 WindowOptions {
@@ -178,7 +173,7 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let shell = cx.new(|cx| Shell::new(store, registry, window, cx));
+                    let shell = cx.new(|cx| Shell::new(window, cx));
                     window.focus(&shell.focus_handle(cx), cx);
                     shell
                 },

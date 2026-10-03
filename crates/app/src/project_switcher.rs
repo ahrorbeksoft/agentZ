@@ -3,12 +3,11 @@
 
 use std::rc::Rc;
 
-use crate::project_store::ProjectStore;
+use crate::machines::{GroupKey, MachineId, Machines, ProjectKey, Scope};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Window,
 };
-use projects::{ProjectId, ProjectScope};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Divider, HighlightedLabel, KeyBinding as KeyBindingHint, ListItem, ListItemSpacing,
@@ -31,24 +30,24 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Entry {
     AllProjects,
-    Project(ProjectId),
+    Project(GroupKey),
 }
 
 impl Entry {
-    fn scope(self) -> ProjectScope {
+    fn scope(&self) -> Scope {
         match self {
-            Entry::AllProjects => ProjectScope::All,
-            Entry::Project(id) => ProjectScope::Project(id),
+            Entry::AllProjects => Scope::All,
+            Entry::Project(key) => Scope::Group(key.clone()),
         }
     }
 }
 
 pub struct ProjectSwitcher {
-    store: Entity<ProjectStore>,
-    open_project_settings: Rc<dyn Fn(ProjectId, &mut Window, &mut App)>,
+    machines: Entity<Machines>,
+    open_project_settings: Rc<dyn Fn(ProjectKey, &mut Window, &mut App)>,
     search: Entity<TextInput>,
     entries: Vec<Entry>,
     /// Byte positions of the search's letters in each entry's name, for highlighting.
@@ -68,23 +67,23 @@ impl Focusable for ProjectSwitcher {
 
 impl ProjectSwitcher {
     pub fn new(
-        store: Entity<ProjectStore>,
-        open_project_settings: impl Fn(ProjectId, &mut Window, &mut App) + 'static,
+        open_project_settings: impl Fn(ProjectKey, &mut Window, &mut App) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let machines = Machines::global(cx);
         let search = cx.new(|cx| TextInput::new("Search projects…", cx));
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
                 this.update_entries(cx)
             }),
-            cx.observe(&store, |this, _, cx| this.update_entries(cx)),
+            cx.observe(&machines, |this, _, cx| this.update_entries(cx)),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
         ];
         window.focus(&search.focus_handle(cx), cx);
 
         let mut this = Self {
-            store,
+            machines,
             open_project_settings: Rc::new(open_project_settings),
             search,
             entries: Vec::new(),
@@ -94,9 +93,9 @@ impl ProjectSwitcher {
             _subscriptions: subscriptions,
         };
         this.update_entries(cx);
-        let current = match this.store.read(cx).scope() {
-            ProjectScope::All => Entry::AllProjects,
-            ProjectScope::Project(id) => Entry::Project(id),
+        let current = match this.machines.read(cx).scope(cx) {
+            Scope::All => Entry::AllProjects,
+            Scope::Group(key) => Entry::Project(key),
         };
         if let Some(index) = this.entries.iter().position(|entry| *entry == current) {
             this.selected_index = index;
@@ -106,7 +105,7 @@ impl ProjectSwitcher {
 
     fn update_entries(&mut self, cx: &mut Context<Self>) {
         let query = self.search.read(cx).text().trim().to_lowercase();
-        let store = self.store.read(cx);
+        let machines = self.machines.read(cx);
 
         let mut entries = Vec::new();
         let mut match_positions = Vec::new();
@@ -114,18 +113,25 @@ impl ProjectSwitcher {
             entries.push(Entry::AllProjects);
             match_positions.push(positions);
         }
-        for project in store.projects() {
-            let positions = fuzzy_match(&query, &project.name()).or_else(|| {
-                // A match on the path alone has nothing in the name to highlight.
-                project
-                    .path
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(&query)
+        for group in machines.project_groups(cx) {
+            let positions = fuzzy_match(&query, &group.name()).or_else(|| {
+                // A match on the path or machine alone has nothing in the name to highlight.
+                group
+                    .members
+                    .iter()
+                    .any(|(machine, project)| {
+                        project
+                            .path
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&query)
+                            || (*machine != MachineId::Local
+                                && machines.label(*machine, cx).to_lowercase().contains(&query))
+                    })
                     .then(Vec::new)
             });
             if let Some(positions) = positions {
-                entries.push(Entry::Project(project.id));
+                entries.push(Entry::Project(group.key));
                 match_positions.push(positions);
             }
         }
@@ -175,8 +181,8 @@ impl ProjectSwitcher {
     }
 
     fn confirm(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.entries.get(self.selected_index).copied() {
-            self.choose(entry, cx);
+        if let Some(entry) = self.entries.get(self.selected_index).cloned() {
+            self.choose(&entry, cx);
         }
     }
 
@@ -184,15 +190,14 @@ impl ProjectSwitcher {
         cx.emit(DismissEvent);
     }
 
-    fn choose(&mut self, entry: Entry, cx: &mut Context<Self>) {
-        self.store
-            .update(cx, |store, cx| store.set_scope(entry.scope(), cx));
+    fn choose(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        Machines::set_scope(entry.scope(), cx);
         cx.emit(DismissEvent);
     }
 
     fn render_entry(&self, index: usize, entry: Entry, cx: &mut Context<Self>) -> AnyElement {
-        let store = self.store.read(cx);
-        let is_current = store.scope() == entry.scope();
+        let machines = self.machines.read(cx);
+        let is_current = machines.scope(cx) == entry.scope();
         let positions = self.match_positions.get(index).cloned().unwrap_or_default();
         let check = is_current.then(|| {
             Icon::new(IconName::Check)
@@ -203,11 +208,14 @@ impl ProjectSwitcher {
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(index == self.selected_index)
-            .on_click(cx.listener(move |this, _, _, cx| this.choose(entry, cx)));
+            .on_click({
+                let entry = entry.clone();
+                cx.listener(move |this, _, _, cx| this.choose(&entry, cx))
+            });
 
         match entry {
             Entry::AllProjects => {
-                let count = store.projects().len();
+                let count = machines.project_groups(cx).len();
                 let detail = match count {
                     1 => "1 project".to_string(),
                     count => format!("{count} projects"),
@@ -227,18 +235,33 @@ impl ProjectSwitcher {
                 )
                 .into_any_element()
             }
-            Entry::Project(id) => {
-                let Some(project) = store.project(id) else {
+            Entry::Project(key) => {
+                let Some(group) = machines.group(&key, cx) else {
                     return div().into_any_element();
                 };
-                let info = ProjectInfoStore::global(cx).read(cx).info().get(&id);
-                let name = project.name();
-                let path: SharedString = compact_path(&project.path).into();
+                let Some((machine, project)) = group.primary() else {
+                    return div().into_any_element();
+                };
+                let id = ProjectKey {
+                    machine,
+                    project: project.id,
+                };
+                let info = ProjectInfoStore::global(cx)
+                    .read(cx)
+                    .info(machine, project.id);
+                let name = group.name();
+                let machine_label =
+                    (machine != MachineId::Local).then(|| machines.label(machine, cx));
+                let path: SharedString = match &machine_label {
+                    Some(label) => format!("{label}: {}", project.path.display()).into(),
+                    None => compact_path(&project.path).into(),
+                };
                 let tooltip_title = name.clone();
                 let open_project_settings = self.open_project_settings.clone();
-                let status = store
-                    .project_status(id)
+                let status = machines
+                    .group_status(&group, cx)
                     .map(|status| render_status_dot(status, cx));
+                let is_offline = !machines.is_online(machine, cx);
                 item.start_slot(render_project_icon(project, info, px(16.), cx))
                     .child(
                         // Like Zed's popover, the path shows on hover rather than in the row.
@@ -247,6 +270,13 @@ impl ProjectSwitcher {
                             .min_w_0()
                             .gap_1()
                             .child(HighlightedLabel::new(name, positions))
+                            .children(machine_label.map(|label| {
+                                Label::new(label)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate()
+                            }))
+                            .when(is_offline, |row| row.opacity(0.5))
                             .children(status)
                             .children(check)
                             .tooltip(move |_, cx| {
@@ -278,7 +308,7 @@ impl ProjectSwitcher {
 impl Render for ProjectSwitcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border_variant = cx.theme().colors().border_variant;
-        let has_projects = !self.store.read(cx).projects().is_empty();
+        let has_projects = !self.machines.read(cx).project_groups(cx).is_empty();
         let mut rows = Vec::with_capacity(self.entries.len() + 1);
         for (index, entry) in self.entries.clone().into_iter().enumerate() {
             let is_first_project = matches!(entry, Entry::Project(_))

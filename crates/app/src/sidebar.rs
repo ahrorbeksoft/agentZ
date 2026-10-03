@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::machines::{MachineId, Machines, ProjectKey, Scope, ThreadKey};
 use crate::project_store::{ProjectStore, ThreadStatus};
 use agentz_protocol::agents::AgentId;
-use collections::HashMap;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight, Hsla,
-    KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, svg,
+    AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, Focusable as _,
+    FontWeight, Hsla, KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored,
+    deferred, svg,
 };
-use projects::{Project, ProjectId, ProjectScope, Thread, ThreadId, Workspace, WorkspaceKind};
+use projects::{Project, Thread, Workspace, WorkspaceKind};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,
@@ -19,7 +20,6 @@ use crate::project_info::{
     GitHead, ProjectInfo, ProjectInfoStore, render_project_icon, workspace_icon,
 };
 use crate::project_switcher::compact_path;
-use crate::registry_store::AgentRegistryStore;
 use crate::{NewThread, OpenFolder, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
@@ -47,10 +47,15 @@ pub fn init(cx: &mut App) {
 }
 
 pub enum SidebarEvent {
-    OpenThread(ThreadId),
-    OpenProjectSettings(ProjectId),
+    OpenThread(ThreadKey),
+    OpenProjectSettings(ProjectKey),
     /// New Thread, working in this folder: a project's own, or one of its workspaces.
-    NewThreadIn(ProjectId, PathBuf),
+    NewThreadIn(ProjectKey, PathBuf),
+}
+
+/// An element id for a thread's row, unique across machines.
+fn thread_element_id(prefix: &str, key: ThreadKey) -> ElementId {
+    ElementId::Name(format!("{prefix}-{}-{}", key.machine.slug(), key.thread.0).into())
 }
 
 /// Where a thread works, for its card, details and menu.
@@ -78,46 +83,41 @@ enum PastureAction {
 /// The thread list, modeled on t3code's sidebar: active threads as cards and archived threads
 /// in a collapsible shelf at the bottom (t3code's "Settled" shelf).
 pub struct Sidebar {
-    store: Entity<ProjectStore>,
-    registry: Entity<AgentRegistryStore>,
-    active_thread: Option<ThreadId>,
+    machines: Entity<Machines>,
+    project_info: Entity<ProjectInfoStore>,
+    active_thread: Option<ThreadKey>,
     search: Entity<TextInput>,
     /// The highlighted search result, which Enter opens.
     search_index: usize,
     search_scroll: ScrollHandle,
     archived_shown: usize,
-    project_info: HashMap<ProjectId, ProjectInfo>,
-    workspace_heads: HashMap<PathBuf, GitHead>,
     /// The thread whose details popover is showing, after hovering it for a moment.
-    details_thread: Option<ThreadId>,
+    details_thread: Option<ThreadKey>,
     /// A popover waiting out the hover delay, and the thread it's for.
-    details_delay: Option<(ThreadId, Task<()>)>,
+    details_delay: Option<(ThreadKey, Task<()>)>,
     /// The row under the mouse.
-    hovered_thread: Option<ThreadId>,
-    renaming_thread: Option<ThreadId>,
+    hovered_thread: Option<ThreadKey>,
+    renaming_thread: Option<ThreadKey>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     _activity_refresh: Task<()>,
-    _project_info_subscription: Subscription,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
-    pub fn new(
-        store: Entity<ProjectStore>,
-        registry: Entity<AgentRegistryStore>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let machines = Machines::global(cx);
+        let project_info = ProjectInfoStore::global(cx);
         let search = cx.new(|cx| TextInput::new("Search…", cx));
         let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let subscriptions = vec![
             cx.subscribe(&rename_input, |this, _, _: &TextInputEvent, cx| {
                 this.apply_rename(cx)
             }),
-            cx.observe(&store, |_, _, cx| cx.notify()),
-            cx.observe(&registry, |_, _, cx| cx.notify()),
+            cx.observe(&machines, |_, _, cx| cx.notify()),
+            cx.observe(&project_info, |_, _, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
                 this.search_index = 0;
                 this.search_scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -134,24 +134,14 @@ impl Sidebar {
                 }
             }
         });
-        let project_info_store = ProjectInfoStore::global(cx);
-        let project_info = project_info_store.read(cx).info().clone();
-        let workspace_heads = project_info_store.read(cx).workspace_heads().clone();
-        let project_info_subscription = cx.observe(&project_info_store, |this, store, cx| {
-            this.project_info = store.read(cx).info().clone();
-            this.workspace_heads = store.read(cx).workspace_heads().clone();
-            cx.notify();
-        });
         Self {
-            store,
-            registry,
+            machines,
+            project_info,
             active_thread: None,
             search,
             search_index: 0,
             search_scroll: ScrollHandle::new(),
             archived_shown: ARCHIVED_INITIAL_COUNT,
-            project_info,
-            workspace_heads,
             details_thread: None,
             details_delay: None,
             hovered_thread: None,
@@ -160,18 +150,30 @@ impl Sidebar {
             _rename_blur: None,
             _subscriptions: subscriptions,
             _activity_refresh: activity_refresh,
-            _project_info_subscription: project_info_subscription,
         }
     }
 
-    pub fn set_active_thread(&mut self, thread_id: Option<ThreadId>, cx: &mut Context<Self>) {
-        self.active_thread = thread_id;
+    pub fn set_active_thread(&mut self, thread: Option<ThreadKey>, cx: &mut Context<Self>) {
+        self.active_thread = thread;
         cx.notify();
+    }
+
+    fn store(&self, machine: MachineId, cx: &App) -> Option<Entity<ProjectStore>> {
+        self.machines.read(cx).projects(machine, cx)
+    }
+
+    fn project_info<'a>(
+        &self,
+        machine: MachineId,
+        project: &Project,
+        cx: &'a App,
+    ) -> Option<&'a ProjectInfo> {
+        self.project_info.read(cx).info(machine, project.id)
     }
 
     fn start_renaming(
         &mut self,
-        thread_id: ThreadId,
+        thread_id: ThreadKey,
         title: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -200,20 +202,23 @@ impl Sidebar {
 
     /// Renames as you type; an empty title is ignored.
     fn apply_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.renaming_thread else {
+        let Some(key) = self.renaming_thread else {
+            return;
+        };
+        let Some(store) = self.store(key.machine, cx) else {
             return;
         };
         let title = self.rename_input.read(cx).text().trim().to_string();
-        let is_unchanged = self
-            .store
+        let is_unchanged = store
             .read(cx)
-            .thread(thread_id)
+            .thread(key.thread)
             .is_none_or(|thread| thread.title == title);
         if title.is_empty() || is_unchanged {
             return;
         }
-        self.store
-            .update(cx, |store, cx| store.set_custom_title(thread_id, title, cx));
+        store.update(cx, |store, cx| {
+            store.set_custom_title(key.thread, title, cx)
+        });
     }
 
     fn finish_renaming(&mut self, cx: &mut Context<Self>) {
@@ -245,15 +250,14 @@ impl Sidebar {
     }
 
     /// t3code's search results: every matching thread, active then archived, in one list.
-    fn search_results(&self, cx: &App) -> Vec<Thread> {
+    fn search_results(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let query = self.search_query(cx);
-        let store = self.store.read(cx);
-        store
-            .active_threads()
+        let machines = self.machines.read(cx);
+        machines
+            .active_threads(cx)
             .into_iter()
-            .chain(store.archived_threads())
-            .filter(|thread| matches_query(thread, &query))
-            .cloned()
+            .chain(machines.archived_threads(cx))
+            .filter(|(_, thread)| matches_query(thread, &query))
             .collect()
     }
 
@@ -272,7 +276,7 @@ impl Sidebar {
     }
 
     /// Opening a result ends the search, as in t3code.
-    fn open_search_result(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+    fn open_search_result(&mut self, thread_id: ThreadKey, cx: &mut Context<Self>) {
         self.search.update(cx, |search, cx| search.set_text("", cx));
         cx.emit(SidebarEvent::OpenThread(thread_id));
     }
@@ -291,8 +295,14 @@ impl Sidebar {
             }))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
                 let result = this.search_results(cx).into_iter().nth(this.search_index);
-                if let Some(thread) = result {
-                    this.open_search_result(thread.id, cx);
+                if let Some((machine, thread)) = result {
+                    this.open_search_result(
+                        ThreadKey {
+                            machine,
+                            thread: thread.id,
+                        },
+                        cx,
+                    );
                 }
             }))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
@@ -333,12 +343,17 @@ impl Sidebar {
             )
     }
 
-    fn agent_icon(&self, thread: &Thread, cx: &App) -> Icon {
+    fn agent_icon(&self, machine: MachineId, thread: &Thread, cx: &App) -> Icon {
+        let registry = self
+            .machines
+            .read(cx)
+            .client(machine, cx)
+            .map(|client| client.read(cx).registry().clone());
         thread
             .agent_id
             .as_ref()
             .and_then(|agent_id| {
-                self.registry
+                registry?
                     .read(cx)
                     .agent(&AgentId::new(agent_id.clone()))?
                     .icon_path()
@@ -351,7 +366,7 @@ impl Sidebar {
     /// Clicking opens the thread; double-clicking renames it, as in t3code.
     fn thread_click_handler(
         &self,
-        thread_id: ThreadId,
+        thread_id: ThreadKey,
         title: SharedString,
         cx: &mut Context<Self>,
     ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
@@ -364,24 +379,39 @@ impl Sidebar {
         })
     }
 
-    fn render_project_icon(&self, project: Option<&Project>, cx: &App) -> AnyElement {
+    fn render_project_icon(
+        &self,
+        machine: MachineId,
+        project: Option<&Project>,
+        cx: &App,
+    ) -> AnyElement {
         match project {
-            Some(project) => {
-                render_project_icon(project, self.project_info.get(&project.id), px(16.), cx)
-            }
+            Some(project) => render_project_icon(
+                project,
+                self.project_info(machine, project, cx),
+                px(16.),
+                cx,
+            ),
             None => div().size_4().flex_none().into_any_element(),
         }
     }
 
-    fn thread_checkout(&self, thread: &Thread, cx: &App) -> Option<ThreadCheckout> {
-        let store = self.store.read(cx);
+    fn thread_checkout(
+        &self,
+        machine: MachineId,
+        thread: &Thread,
+        cx: &App,
+    ) -> Option<ThreadCheckout> {
+        let store = self.store(machine, cx)?;
+        let store = store.read(cx);
         let folder = store.thread_folder(thread.id)?;
         let workspace = store.thread_workspace(thread.id).cloned();
+        let project_info = self.project_info.read(cx);
         let head = if workspace.is_some() {
-            self.workspace_heads.get(&folder).cloned()
+            project_info.workspace_head(machine, &folder).cloned()
         } else {
-            self.project_info
-                .get(&thread.project_id)
+            project_info
+                .info(machine, thread.project_id)
                 .and_then(|info| info.git_head.clone())
         };
         Some(ThreadCheckout {
@@ -394,17 +424,20 @@ impl Sidebar {
     /// Syncs the thread's pasture, or brings its branch to the project, and says how it went.
     fn run_pasture_action(
         &mut self,
-        thread_id: ThreadId,
+        key: ThreadKey,
         action: PastureAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = self.store.read(cx);
-        let Some(thread) = store.thread(thread_id) else {
+        let Some(store) = self.store(key.machine, cx) else {
+            return;
+        };
+        let store = store.read(cx);
+        let Some(thread) = store.thread(key.thread) else {
             return;
         };
         let project_id = thread.project_id;
-        let Some(folder) = store.thread_folder(thread_id) else {
+        let Some(folder) = store.thread_folder(key.thread) else {
             return;
         };
         let task = match action {
@@ -433,15 +466,22 @@ impl Sidebar {
     /// and Delete, each with its icon.
     fn thread_menu(
         &self,
+        machine: MachineId,
         thread: &Thread,
         is_archived: bool,
         cx: &mut Context<Self>,
     ) -> impl Fn(&mut Window, &mut App) -> Entity<ContextMenu> + 'static {
         let sidebar = cx.entity().downgrade();
-        let thread_id = thread.id;
-        let project_id = thread.project_id;
+        let thread_id = ThreadKey {
+            machine,
+            thread: thread.id,
+        };
+        let project_id = ProjectKey {
+            machine,
+            project: thread.project_id,
+        };
         let title = SharedString::from(thread.title.clone());
-        let checkout = self.thread_checkout(thread, cx);
+        let checkout = self.thread_checkout(machine, thread, cx);
         let is_pasture = checkout
             .as_ref()
             .and_then(|checkout| checkout.workspace.as_ref())
@@ -488,11 +528,14 @@ impl Sidebar {
                     move |_: &mut Window, cx: &mut App| {
                         sidebar
                             .update(cx, |sidebar, cx| {
-                                sidebar.store.update(cx, |store, cx| {
+                                let Some(store) = sidebar.store(machine, cx) else {
+                                    return;
+                                };
+                                store.update(cx, |store, cx| {
                                     if is_archived {
-                                        store.unarchive_thread(thread_id, cx)
+                                        store.unarchive_thread(thread_id.thread, cx)
                                     } else {
-                                        store.archive_thread(thread_id, cx)
+                                        store.archive_thread(thread_id.thread, cx)
                                     }
                                 })
                             })
@@ -503,15 +546,8 @@ impl Sidebar {
                     let sidebar = sidebar.clone();
                     move |_: &mut Window, cx: &mut App| {
                         sidebar
-                            .update(cx, |sidebar, cx| {
-                                let project_id = sidebar
-                                    .store
-                                    .read(cx)
-                                    .thread(thread_id)
-                                    .map(|thread| thread.project_id);
-                                if let Some(project_id) = project_id {
-                                    cx.emit(SidebarEvent::OpenProjectSettings(project_id));
-                                }
+                            .update(cx, |_, cx| {
+                                cx.emit(SidebarEvent::OpenProjectSettings(project_id));
                             })
                             .ok();
                     }
@@ -585,7 +621,7 @@ impl Sidebar {
     }
 
     /// Shows the hovered thread's details after a moment, like t3code's row tooltip.
-    fn thread_hovered(&mut self, thread_id: ThreadId, hovered: bool, cx: &mut Context<Self>) {
+    fn thread_hovered(&mut self, thread_id: ThreadKey, hovered: bool, cx: &mut Context<Self>) {
         if !hovered {
             if self.hovered_thread == Some(thread_id) {
                 self.hovered_thread = None;
@@ -626,13 +662,18 @@ impl Sidebar {
 
     fn thread_details(
         &self,
+        machine: MachineId,
         thread: &Thread,
         project: Option<&Project>,
         cx: &App,
     ) -> ThreadDetails {
+        let machines = self.machines.read(cx);
+        let registry = machines
+            .client(machine, cx)
+            .map(|client| client.read(cx).registry().read(cx));
         let agent = thread.agent_id.as_ref().map(|agent_id| {
             let agent_id = AgentId::new(agent_id.clone());
-            let registry_agent = self.registry.read(cx).agent(&agent_id);
+            let registry_agent = registry.and_then(|registry| registry.agent(&agent_id));
             let agent_name = registry_agent
                 .map(|agent| agent.name().clone())
                 .unwrap_or_else(|| agent_id.0.clone());
@@ -643,11 +684,16 @@ impl Sidebar {
             let icon_path = registry_agent.and_then(|agent| agent.icon_path().cloned());
             (icon_path, label)
         });
-        let checkout = self.thread_checkout(thread, cx);
+        let checkout = self.thread_checkout(machine, thread, cx);
         ThreadDetails {
             title: thread.title.clone().into(),
-            project: project
-                .map(|project| (project.clone(), self.project_info.get(&project.id).cloned())),
+            project: project.map(|project| {
+                (
+                    project.clone(),
+                    self.project_info(machine, project, cx).cloned(),
+                )
+            }),
+            machine: (machine != MachineId::Local).then(|| machines.label(machine, cx)),
             branch: checkout
                 .as_ref()
                 .and_then(|checkout| checkout.branch())
@@ -667,6 +713,7 @@ impl Sidebar {
     /// the agent's icon at the bottom right.
     fn render_thread_card(
         &self,
+        store: &Entity<ProjectStore>,
         thread: Thread,
         project: Option<Project>,
         cx: &mut Context<Self>,
@@ -674,24 +721,32 @@ impl Sidebar {
         let colors = cx.theme().colors();
         let hover_background = colors.ghost_element_hover;
         let selected_background = colors.ghost_element_selected;
-        let is_active = self.active_thread == Some(thread.id);
-        let is_renaming = self.renaming_thread == Some(thread.id);
-        let thread_status = self.store.read(cx).thread_status(thread.id);
-        let thread_id = thread.id;
-        let icon = self.agent_icon(&thread, cx);
-        let details = self.thread_details(&thread, project.as_ref(), cx);
+        let machine = store.read(cx).machine();
+        let thread_id = ThreadKey {
+            machine,
+            thread: thread.id,
+        };
+        let is_active = self.active_thread == Some(thread_id);
+        let is_renaming = self.renaming_thread == Some(thread_id);
+        let thread_status = store.read(cx).thread_status(thread.id);
+        let icon = self.agent_icon(machine, &thread, cx);
+        let details = self.thread_details(machine, &thread, project.as_ref(), cx);
+        let machines = self.machines.read(cx);
         // With one project selected, every card would repeat it, so the project line goes and
         // the status moves next to the title.
-        let shows_all_projects = self.store.read(cx).scope() == ProjectScope::All;
-        let checkout = self.thread_checkout(&thread, cx);
+        let shows_all_projects = machines.scope(cx) == Scope::All;
+        let is_offline = !machines.is_online(machine, cx);
+        let machine_label = (machine != MachineId::Local).then(|| machines.label(machine, cx));
+        let checkout = self.thread_checkout(machine, &thread, cx);
         let faint_text = cx.theme().colors().text_muted.opacity(0.4);
         let time = thread
             .last_activity_at
             .map(|time| format_relative_time(time, SystemTime::now()));
-        let group_name = SharedString::from(format!("thread-card-{}", thread.id.0));
+        let group_name =
+            SharedString::from(format!("thread-card-{}-{}", machine.slug(), thread.id.0));
         let title = SharedString::from(thread.title.clone());
         let subthreads = {
-            let store = self.store.read(cx);
+            let store = store.read(cx);
             let subthreads = store.subthreads(thread.id);
             let running = subthreads
                 .iter()
@@ -704,12 +759,9 @@ impl Sidebar {
                 .count();
             (subthreads.len(), running)
         };
-        let started_by = thread.created_by.map(|creator| {
-            format!(
-                "Started by {}",
-                self.store.read(cx).describe_creator(creator)
-            )
-        });
+        let started_by = thread
+            .created_by
+            .map(|creator| format!("Started by {}", store.read(cx).describe_creator(creator)));
 
         let status = match thread_status {
             Some(ThreadStatus::Working) => h_flex()
@@ -733,14 +785,15 @@ impl Sidebar {
                 .color(Color::Muted)
                 .into_any_element(),
         };
-        let store = self.store.clone();
+        let store = store.clone();
         // Like t3code's Settle button: muted text that brightens under the mouse, with no fill
         // of its own over the card's hover background.
         let muted_text = cx.theme().colors().text_muted;
         let bright_text = cx.theme().colors().text;
-        let button_group = SharedString::from(format!("archive-button-{}", thread.id.0));
+        let button_group =
+            SharedString::from(format!("archive-button-{}-{}", machine.slug(), thread.id.0));
         let archive_button = h_flex()
-            .id(("archive-thread", thread.id.0))
+            .id(thread_element_id("archive-thread", thread_id))
             .group(button_group.clone())
             .h_full()
             .px_1p5()
@@ -769,7 +822,7 @@ impl Sidebar {
             }))
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
-                store.update(cx, |store, cx| store.archive_thread(thread_id, cx));
+                store.update(cx, |store, cx| store.archive_thread(thread_id.thread, cx));
             });
 
         // The status yields to the Archive button on hover.
@@ -808,17 +861,19 @@ impl Sidebar {
                 .h_5()
                 .min_w_0()
                 .gap_1p5()
-                .child(self.render_project_icon(project.as_ref(), cx))
+                .child(self.render_project_icon(machine, project.as_ref(), cx))
                 .child(
-                    div()
+                    h_flex()
                         .flex_1()
                         .min_w_0()
+                        .gap_1()
                         .children(project.as_ref().map(|project| {
                             Label::new(project.name())
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
                                 .truncate()
-                        })),
+                        }))
+                        .children(machine_label.map(|label| render_machine_tag(label, is_offline))),
                 )
                 .child(status_slot)
                 .children(archive_slot);
@@ -836,7 +891,7 @@ impl Sidebar {
         };
 
         let card = v_flex()
-            .id(("thread-card", thread.id.0))
+            .id(thread_element_id("thread-card", thread_id))
             .group(group_name)
             .on_hover(
                 cx.listener(move |this, hovered, _, cx| {
@@ -856,6 +911,8 @@ impl Sidebar {
                     .hover(|card| card.bg(hover_background))
                     .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
             })
+            // Readable while its machine is unreachable, but plainly not live.
+            .when(is_offline, |card| card.opacity(0.5))
             .children(project_line)
             .child(title_line)
             .child(
@@ -890,7 +947,7 @@ impl Sidebar {
                         };
                         this.child(
                             h_flex()
-                                .id(("thread-agents", thread_id.0))
+                                .id(thread_element_id("thread-agents", thread_id))
                                 .flex_none()
                                 .gap_0p5()
                                 .tooltip(Tooltip::text(tooltip))
@@ -909,7 +966,7 @@ impl Sidebar {
                     .when_some(started_by, |this, started_by| {
                         this.child(
                             div()
-                                .id(("thread-started-by", thread_id.0))
+                                .id(thread_element_id("thread-started-by", thread_id))
                                 .flex_none()
                                 .tooltip(Tooltip::text(started_by))
                                 .child(
@@ -930,8 +987,8 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(&thread, false, cx);
-        right_click_menu(("thread-menu", thread.id.0))
+        let menu = self.thread_menu(machine, &thread, false, cx);
+        right_click_menu(thread_element_id("thread-menu", thread_id))
             .trigger(move |is_menu_open, _, _| {
                 div()
                     .relative()
@@ -978,34 +1035,47 @@ impl Sidebar {
                 .color(Color::Muted),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                this.store
-                    .update(cx, |store, cx| store.toggle_archived_expanded(cx));
+                // Kept by this Mac's server, like the thread order.
+                if let Some(store) = this.store(MachineId::Local, cx) {
+                    store.update(cx, |store, cx| store.toggle_archived_expanded(cx));
+                }
             }))
             .into_any_element()
     }
 
     /// t3code's slim row for parked threads: the project's icon, dimmed until hovered, and a way
     /// back on hover.
-    fn render_archived_row(&self, thread: Thread, cx: &mut Context<Self>) -> AnyElement {
+    fn render_archived_row(
+        &self,
+        store: &Entity<ProjectStore>,
+        thread: Thread,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors();
         let hover_background = colors.ghost_element_hover;
         let selected_background = colors.ghost_element_selected;
-        let is_active = self.active_thread == Some(thread.id);
-        let is_renaming = self.renaming_thread == Some(thread.id);
-        let thread_id = thread.id;
-        let project = self.store.read(cx).project(thread.project_id).cloned();
-        let project_icon = self.render_project_icon(project.as_ref(), cx);
-        let details = self.thread_details(&thread, project.as_ref(), cx);
+        let machine = store.read(cx).machine();
+        let thread_id = ThreadKey {
+            machine,
+            thread: thread.id,
+        };
+        let is_active = self.active_thread == Some(thread_id);
+        let is_renaming = self.renaming_thread == Some(thread_id);
+        let is_offline = !self.machines.read(cx).is_online(machine, cx);
+        let project = store.read(cx).project(thread.project_id).cloned();
+        let project_icon = self.render_project_icon(machine, project.as_ref(), cx);
+        let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let time = thread
             .archived_at
             .map(|time| format_relative_time(time, SystemTime::now()));
-        let group_name = SharedString::from(format!("archived-row-{}", thread.id.0));
+        let group_name =
+            SharedString::from(format!("archived-row-{}-{}", machine.slug(), thread.id.0));
         let title = SharedString::from(thread.title.clone());
-        let store = self.store.clone();
+        let store = store.clone();
 
         let row =
             h_flex()
-                .id(("archived-thread", thread.id.0))
+                .id(thread_element_id("archived-thread", thread_id))
                 .group(group_name.clone())
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
@@ -1023,6 +1093,7 @@ impl Sidebar {
                         .hover(|row| row.bg(hover_background))
                         .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
                 })
+                .when(is_offline, |row| row.opacity(0.5))
                 .child(
                     div()
                         .flex_none()
@@ -1056,16 +1127,19 @@ impl Sidebar {
                             .right_1()
                             .visible_on_hover(group_name.clone())
                             .child(
-                                IconButton::new(("unarchive-thread", thread.id.0), IconName::Undo)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text("Unarchive Thread"))
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        store.update(cx, |store, cx| {
-                                            store.unarchive_thread(thread_id, cx)
-                                        });
-                                    }),
+                                IconButton::new(
+                                    thread_element_id("unarchive-thread", thread_id),
+                                    IconName::Undo,
+                                )
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Unarchive Thread"))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    store.update(cx, |store, cx| {
+                                        store.unarchive_thread(thread_id.thread, cx)
+                                    });
+                                }),
                             ),
                     )
                 });
@@ -1073,8 +1147,8 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(&thread, true, cx);
-        right_click_menu(("archived-thread-menu", thread.id.0))
+        let menu = self.thread_menu(machine, &thread, true, cx);
+        right_click_menu(thread_element_id("archived-thread-menu", thread_id))
             .trigger(move |is_menu_open, _, _| {
                 div()
                     .relative()
@@ -1115,7 +1189,7 @@ impl Sidebar {
 
     fn confirm_delete_thread(
         &mut self,
-        thread_id: ThreadId,
+        thread_id: ThreadKey,
         title: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1127,10 +1201,12 @@ impl Sidebar {
             &["Delete", "Cancel"],
             cx,
         );
-        let store = self.store.clone();
+        let Some(store) = self.store(thread_id.machine, cx) else {
+            return;
+        };
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(0) {
-                store.update(cx, |store, cx| store.delete_thread(thread_id, cx));
+                store.update(cx, |store, cx| store.delete_thread(thread_id.thread, cx));
             }
         })
         .detach();
@@ -1156,15 +1232,21 @@ impl Sidebar {
     fn render_search_result(
         &self,
         index: usize,
+        machine: MachineId,
         thread: Thread,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
         let selected_background = colors.ghost_element_selected;
         let hover_background = colors.ghost_element_hover;
-        let thread_id = thread.id;
-        let project = self.store.read(cx).project(thread.project_id).cloned();
-        let details = self.thread_details(&thread, project.as_ref(), cx);
+        let thread_id = ThreadKey {
+            machine,
+            thread: thread.id,
+        };
+        let project = self
+            .store(machine, cx)
+            .and_then(|store| store.read(cx).project(thread.project_id).cloned());
+        let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let is_highlighted = index == self.search_index;
         let is_active = self.active_thread == Some(thread_id);
         let time = thread
@@ -1174,7 +1256,7 @@ impl Sidebar {
             .relative()
             .child(
                 h_flex()
-                    .id(("search-result", thread_id.0))
+                    .id(thread_element_id("search-result", thread_id))
                     .min_h(px(36.))
                     .px_2p5()
                     .py_1()
@@ -1187,7 +1269,7 @@ impl Sidebar {
                     .when(!is_highlighted && !is_active, |row| {
                         row.hover(|row| row.bg(hover_background))
                     })
-                    .child(self.render_project_icon(project.as_ref(), cx))
+                    .child(self.render_project_icon(machine, project.as_ref(), cx))
                     .child(
                         div().flex_1().min_w_0().child(
                             Label::new(thread.title)
@@ -1227,7 +1309,7 @@ impl Sidebar {
         let rows: Vec<AnyElement> = results
             .into_iter()
             .enumerate()
-            .map(|(index, thread)| self.render_search_result(index, thread, cx))
+            .map(|(index, (machine, thread))| self.render_search_result(index, machine, thread, cx))
             .collect();
         div()
             .id("sidebar-search-results-scroll")
@@ -1263,18 +1345,18 @@ impl Sidebar {
         if !self.search_query(cx).is_empty() {
             return self.render_search_results(window, cx);
         }
-        let store = self.store.read(cx);
-        let active: Vec<(Thread, Option<Project>)> = store
-            .active_threads()
-            .into_iter()
-            .map(|thread| (thread.clone(), store.project(thread.project_id).cloned()))
-            .collect();
-        let archived: Vec<Thread> = store.archived_threads().into_iter().cloned().collect();
-        let is_archived_expanded = store.archived_expanded();
+        let machines = self.machines.read(cx);
+        let active = machines.active_threads(cx);
+        let archived = machines.archived_threads(cx);
+        let is_archived_expanded = machines.archived_expanded(cx);
 
         let mut rows = Vec::with_capacity(active.len());
-        for (thread, project) in active {
-            rows.push(self.render_thread_card(thread, project, cx));
+        for (machine, thread) in active {
+            let Some(store) = self.store(machine, cx) else {
+                continue;
+            };
+            let project = store.read(cx).project(thread.project_id).cloned();
+            rows.push(self.render_thread_card(&store, thread, project, cx));
         }
         if rows.is_empty() {
             rows.push(
@@ -1296,8 +1378,10 @@ impl Sidebar {
             shelf.push(self.render_archived_header(archived_count, is_archived_expanded, cx));
             if is_archived_expanded {
                 let hidden_count = archived_count.saturating_sub(self.archived_shown);
-                for thread in archived.into_iter().take(self.archived_shown) {
-                    shelf.push(self.render_archived_row(thread, cx));
+                for (machine, thread) in archived.into_iter().take(self.archived_shown) {
+                    if let Some(store) = self.store(machine, cx) {
+                        shelf.push(self.render_archived_row(&store, thread, cx));
+                    }
                 }
                 if hidden_count > 0 {
                     shelf.push(self.render_show_more_archived(hidden_count, cx));
@@ -1327,7 +1411,12 @@ impl Render for Sidebar {
         let colors = cx.theme().colors();
         let border = colors.border;
         let panel_background = colors.panel_background;
-        let has_projects = !self.store.read(cx).projects().is_empty();
+        let has_projects = self
+            .machines
+            .read(cx)
+            .clients()
+            .iter()
+            .any(|client| !client.read(cx).projects().read(cx).projects().is_empty());
 
         v_flex()
             .w(SIDEBAR_WIDTH)
@@ -1356,6 +1445,8 @@ impl Render for Sidebar {
 struct ThreadDetails {
     title: SharedString,
     project: Option<(Project, Option<ProjectInfo>)>,
+    /// Another machine's name, for its threads.
+    machine: Option<SharedString>,
     branch: Option<SharedString>,
     /// The worktree or pasture it works in, described.
     workspace: Option<(WorkspaceKind, SharedString)>,
@@ -1387,6 +1478,12 @@ impl ThreadDetails {
             rows.push(detail_row(
                 render_project_icon(project, info.as_ref(), px(12.), cx),
                 Label::new(project.name()).truncate(),
+            ));
+        }
+        if let Some(machine) = &self.machine {
+            rows.push(detail_row(
+                small_icon(IconName::Server),
+                Label::new(machine.clone()).truncate(),
             ));
         }
         if let Some(branch) = &self.branch {
@@ -1442,7 +1539,7 @@ impl ThreadDetails {
 /// A worktree's or pasture's icon before the card's branch, or the worktree icon when the
 /// project's own folder is a linked worktree.
 fn render_checkout_marker(
-    thread_id: ThreadId,
+    thread_id: ThreadKey,
     checkout: &ThreadCheckout,
     color: Hsla,
 ) -> Option<AnyElement> {
@@ -1465,7 +1562,7 @@ fn render_checkout_marker(
     };
     Some(
         div()
-            .id(("thread-checkout", thread_id.0))
+            .id(thread_element_id("thread-checkout", thread_id))
             .flex_none()
             .tooltip(Tooltip::text(tooltip))
             .child(
@@ -1475,6 +1572,29 @@ fn render_checkout_marker(
             )
             .into_any_element(),
     )
+}
+
+/// Which machine a thread is on, after its project's name, when it isn't this Mac.
+fn render_machine_tag(label: SharedString, is_offline: bool) -> AnyElement {
+    h_flex()
+        .flex_none()
+        .gap_0p5()
+        .child(
+            Icon::new(if is_offline {
+                IconName::Disconnected
+            } else {
+                IconName::Server
+            })
+            .size(IconSize::XSmall)
+            .color(Color::Muted),
+        )
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .truncate(),
+        )
+        .into_any_element()
 }
 
 /// "Pasture · ~/.cow/pastures/app-1a2b".

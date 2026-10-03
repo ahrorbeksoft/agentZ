@@ -1,0 +1,184 @@
+//! Connecting over SSH, with a stand-in for `ssh` that runs the remote command here, under a
+//! scratch home and data directory. Everything else is real: the probe, the upload, the
+//! proxy, and the server it starts.
+
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use agentz_client::ssh::{RemotePlatform, Ssh};
+use agentz_protocol::{ClientKind, Request, Response};
+
+const VERSION: &str = "0.0.0-test";
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Skips ssh's options and runs the command with `sh -c`, as sshd hands it to the user's
+/// shell. A few targets fail the way real ssh does.
+fn fake_ssh(directory: &Path, home: &Path, data_dir: &Path) -> PathBuf {
+    let script = format!(
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|-S|-F) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+target="$1"
+shift
+case "$target" in
+  unreachable) echo "ssh: connect to host unreachable port 22: Connection refused" >&2; exit 255 ;;
+  locked) echo "me@locked: Permission denied (publickey)." >&2; exit 255 ;;
+esac
+echo "Welcome to the test machine"
+HOME='{home}' AGENTZ_DATA_DIR='{data_dir}' RUST_LOG=warn exec sh -c "$*"
+"#,
+        home = home.display(),
+        data_dir = data_dir.display(),
+    );
+    let path = directory.join("ssh");
+    std::fs::write(&path, script).expect("writes the fake ssh");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+fn server_binary(platform: RemotePlatform) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        Some(platform) == RemotePlatform::current(),
+        "no agentz-server for {platform}"
+    );
+    Ok(PathBuf::from(env!("CARGO_BIN_EXE_agentz-server")))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connects_installs_and_reconnects_over_ssh() {
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let home = scratch.path().join("home");
+    std::fs::create_dir(&home).expect("home");
+    // Short, for the server's socket path.
+    let data_dir = tempfile::Builder::new()
+        .prefix("azssh")
+        .tempdir_in("/tmp")
+        .expect("data dir");
+    let project = scratch.path().join("project");
+    std::fs::create_dir(&project).expect("project");
+    let program = fake_ssh(scratch.path(), &home, data_dir.path());
+    let ssh = Ssh::with_program(program.clone(), "devbox").expect("valid target");
+
+    let (connection, mut events) = tokio::time::timeout(
+        TIMEOUT,
+        agentz_client::ssh::connect(&ssh, VERSION, server_binary, ClientKind::App),
+    )
+    .await
+    .expect("in time")
+    .expect("connects");
+    tokio::spawn(async move { while events.next().await.is_some() {} });
+    let installed = home.join(".agentz/server").join(VERSION);
+    assert!(installed.join("agentz-server").is_file());
+    let hash = std::fs::read_to_string(installed.join("agentz-server.sha256")).expect("hash");
+    assert_eq!(hash.trim().len(), 64);
+    let server_pid = connection.welcome().pid;
+    assert_ne!(server_pid, std::process::id());
+    let added = connection
+        .request(Request::AddProject {
+            path: project.clone(),
+        })
+        .await
+        .expect("adds the project");
+    assert!(matches!(added, Response::ProjectAdded(_)));
+    drop(connection);
+
+    // The server outlives the session. Reconnecting finds it, and uploads nothing.
+    let modified = std::fs::metadata(installed.join("agentz-server"))
+        .and_then(|metadata| metadata.modified())
+        .expect("mtime");
+    let (connection, mut events) = tokio::time::timeout(
+        TIMEOUT,
+        agentz_client::ssh::connect(&ssh, VERSION, server_binary, ClientKind::App),
+    )
+    .await
+    .expect("in time")
+    .expect("reconnects");
+    tokio::spawn(async move { while events.next().await.is_some() {} });
+    assert_eq!(connection.welcome().pid, server_pid);
+    assert_eq!(
+        std::fs::metadata(installed.join("agentz-server"))
+            .and_then(|metadata| metadata.modified())
+            .expect("mtime"),
+        modified
+    );
+    let Response::Session(session) = connection
+        .request(Request::SubscribeSession)
+        .await
+        .expect("session")
+    else {
+        panic!("expected the session");
+    };
+    assert_eq!(session.projects.projects.len(), 1);
+    connection
+        .request(Request::Shutdown)
+        .await
+        .expect("shuts down");
+
+    let unreachable = Ssh::with_program(program.clone(), "unreachable").expect("valid target");
+    let error = agentz_client::ssh::connect(&unreachable, VERSION, server_binary, ClientKind::App)
+        .await
+        .err()
+        .expect("fails");
+    assert!(error.message.contains("Connection refused"), "{error:?}");
+    assert!(!error.needs_attention);
+
+    let locked = Ssh::with_program(program, "locked").expect("valid target");
+    let error = agentz_client::ssh::connect(&locked, VERSION, server_binary, ClientKind::App)
+        .await
+        .err()
+        .expect("fails");
+    assert!(error.needs_attention, "{error:?}");
+    assert!(error.hint.is_some());
+}
+
+/// Against a real machine, with the Linux servers from `tooling/build-remote-servers.sh`:
+/// `AGENTZ_SSH_TEST_TARGET=devbox1 cargo test -p agentz_server --test ssh -- --ignored`.
+/// Only `~/.agentz` changes there.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn connects_to_a_real_machine() {
+    let Some(target) = std::env::var_os("AGENTZ_SSH_TEST_TARGET") else {
+        panic!("set AGENTZ_SSH_TEST_TARGET to an SSH target");
+    };
+    let ssh = Ssh::new(&target.to_string_lossy()).expect("valid target");
+    let servers = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/remote-servers");
+    let (connection, mut events) = tokio::time::timeout(
+        Duration::from_secs(300),
+        agentz_client::ssh::connect(
+            &ssh,
+            env!("CARGO_PKG_VERSION"),
+            |platform| {
+                let path = agentz_client::ssh::bundled_server_binary(&servers, platform);
+                anyhow::ensure!(path.is_file(), "no {}", path.display());
+                Ok(path)
+            },
+            ClientKind::App,
+        ),
+    )
+    .await
+    .expect("in time")
+    .expect("connects");
+    tokio::spawn(async move { while events.next().await.is_some() {} });
+    let welcome = connection.welcome();
+    eprintln!(
+        "connected to agentz-server {} on {} ({} {}), pid {}",
+        welcome.server_version,
+        welcome.machine.hostname,
+        welcome.machine.os,
+        welcome.machine.arch,
+        welcome.pid
+    );
+    let Response::Session(_) = connection
+        .request(Request::SubscribeSession)
+        .await
+        .expect("session")
+    else {
+        panic!("expected the session");
+    };
+}

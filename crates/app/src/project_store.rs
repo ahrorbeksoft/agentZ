@@ -1,5 +1,5 @@
-//! The app's copy of the server's projects and threads. Reads go to the copy; changes go to the
-//! server, and come back as a new snapshot.
+//! The app's copy of one machine's projects and threads. Reads go to the copy; changes go to
+//! that machine's server, and come back as a new snapshot.
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -11,12 +11,13 @@ use agentz_protocol::terminal::{TerminalCommand, TerminalProgram};
 use agentz_protocol::workspace::{ProjectGit, WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{Request, Response};
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
-use projects::{
-    ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder,
-};
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
+use gpui::{App, AppContext as _, Context, EventEmitter, Task, WeakEntity};
+use projects::{ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder};
 use util::ResultExt as _;
 
+use crate::machines::MachineId;
 use crate::server_client::ServerClient;
 
 /// What a thread needs from the user, as t3code's sidebar shows it. Ordered by priority, so a
@@ -36,6 +37,8 @@ pub enum ProjectStoreEvent {
 }
 
 pub struct ProjectStore {
+    machine: MachineId,
+    client: WeakEntity<ServerClient>,
     store: projects::ProjectStore,
     has_snapshot: bool,
     /// The last completion this client displayed, per thread. Only this client's, so it's kept
@@ -47,23 +50,6 @@ pub struct ProjectStore {
 
 impl EventEmitter<ProjectStoreEvent> for ProjectStore {}
 
-struct GlobalProjectStore(Entity<ProjectStore>);
-
-impl Global for GlobalProjectStore {}
-
-pub fn init(cx: &mut App) {
-    let viewed_path = paths::data_dir().join("viewed.json");
-    let viewed = read_viewed(&viewed_path).log_err().unwrap_or_default();
-    let store = cx.new(|_| ProjectStore {
-        store: projects::ProjectStore::from_snapshot(ProjectsSnapshot::default()),
-        has_snapshot: false,
-        viewed,
-        viewed_path: Some(viewed_path),
-        _save_viewed: None,
-    });
-    cx.set_global(GlobalProjectStore(store));
-}
-
 impl Deref for ProjectStore {
     type Target = projects::ProjectStore;
 
@@ -73,8 +59,27 @@ impl Deref for ProjectStore {
 }
 
 impl ProjectStore {
-    pub fn global(cx: &App) -> Entity<Self> {
-        cx.global::<GlobalProjectStore>().0.clone()
+    pub(crate) fn new(machine: MachineId, client: WeakEntity<ServerClient>) -> Self {
+        let viewed_path = match machine {
+            MachineId::Local => paths::data_dir().join("viewed.json"),
+            MachineId::Remote(_) => paths::data_dir()
+                .join("machines")
+                .join(format!("viewed-{}.json", machine.slug())),
+        };
+        let viewed = read_viewed(&viewed_path).log_err().unwrap_or_default();
+        Self {
+            machine,
+            client,
+            store: projects::ProjectStore::from_snapshot(ProjectsSnapshot::default()),
+            has_snapshot: false,
+            viewed,
+            viewed_path: Some(viewed_path),
+            _save_viewed: None,
+        }
+    }
+
+    pub fn machine(&self) -> MachineId {
+        self.machine
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: ProjectsSnapshot, cx: &mut Context<Self>) {
@@ -188,7 +193,16 @@ impl ProjectStore {
     }
 
     fn send(&self, request: Request, cx: &App) {
-        ServerClient::global(cx).read(cx).send(request, cx);
+        if let Some(client) = self.client.upgrade() {
+            client.read(cx).send(request, cx);
+        }
+    }
+
+    fn server_request(&self, request: Request, cx: &App) -> BoxFuture<'static, Result<Response>> {
+        match self.client.upgrade() {
+            Some(client) => client.read(cx).request(request),
+            None => futures::future::ready(Err(anyhow!("the machine was removed"))).boxed(),
+        }
     }
 
     pub fn toggle_archived_expanded(&mut self, cx: &mut Context<Self>) {
@@ -199,19 +213,13 @@ impl ProjectStore {
         self.send(Request::SetThreadOrder(order), cx)
     }
 
-    pub fn set_scope(&mut self, scope: ProjectScope, cx: &mut Context<Self>) {
-        self.send(Request::SetScope(scope), cx)
-    }
-
     /// Resolves once the project is in this copy.
     pub fn add_project(
         &mut self,
         path: PathBuf,
         cx: &mut Context<Self>,
     ) -> Task<Result<ProjectId>> {
-        let response = ServerClient::global(cx)
-            .read(cx)
-            .request(Request::AddProject { path });
+        let response = self.server_request(Request::AddProject { path }, cx);
         cx.background_spawn(async move {
             match response.await? {
                 Response::ProjectAdded(project_id) => Ok(project_id),
@@ -383,7 +391,7 @@ impl ProjectStore {
         answer: fn(Response) -> Option<T>,
         cx: &App,
     ) -> Task<Result<T>> {
-        let response = ServerClient::global(cx).read(cx).request(request);
+        let response = self.server_request(request, cx);
         cx.background_spawn(async move {
             let response = response.await?;
             let description = format!("{response:?}");
@@ -432,6 +440,10 @@ fn read_viewed(path: &std::path::Path) -> Result<BTreeMap<u64, SystemTime>> {
 }
 
 fn write_viewed(path: &std::path::Path, viewed: &BTreeMap<u64, SystemTime>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
     let json = serde_json::to_vec(viewed)?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json).with_context(|| format!("writing {}", temporary.display()))?;

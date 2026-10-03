@@ -13,7 +13,7 @@ use agentz_protocol::thread::DiffLineKind;
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, Context, ListAlignment, ListState, PromptLevel, Subscription, Task,
+    AnyElement, App, Context, Entity, ListAlignment, ListState, PromptLevel, Subscription, Task,
     WeakEntity, Window, list,
 };
 use projects::ThreadId;
@@ -23,7 +23,6 @@ use ui::{
 };
 
 use crate::ToggleDiff;
-use crate::project_store::ProjectStore;
 use crate::server_client::ServerClient;
 
 pub const DIFF_PANEL_WIDTH: Pixels = px(520.);
@@ -49,6 +48,7 @@ enum Row {
 }
 
 pub struct DiffPanel {
+    client: Entity<ServerClient>,
     thread_id: ThreadId,
     scope: DiffScope,
     diff: Option<Rc<ThreadDiff>>,
@@ -67,8 +67,8 @@ pub struct DiffPanel {
 }
 
 impl DiffPanel {
-    pub fn new(thread_id: ThreadId, cx: &mut Context<Self>) -> Self {
-        let store = ProjectStore::global(cx);
+    pub fn new(client: Entity<ServerClient>, thread_id: ThreadId, cx: &mut Context<Self>) -> Self {
+        let store = client.read(cx).projects().clone();
         let completed_at = store
             .read(cx)
             .thread(thread_id)
@@ -84,6 +84,7 @@ impl DiffPanel {
             }
         })];
         let mut this = Self {
+            client,
             thread_id,
             scope: DiffScope::LatestTurn,
             diff: None,
@@ -105,8 +106,12 @@ impl DiffPanel {
         self.thread_id
     }
 
+    pub fn client(&self) -> &Entity<ServerClient> {
+        &self.client
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let client = ServerClient::global(cx);
+        let client = self.client.clone();
         let client_state = client.read(cx);
         if client_state.connection().is_some()
             && !client_state.has_capability(CAPABILITY_THREAD_DIFF)
@@ -266,7 +271,7 @@ impl DiffPanel {
             cx,
         );
         let thread_id = self.thread_id;
-        let client = ServerClient::global(cx);
+        let client = self.client.clone();
         self._load = cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;

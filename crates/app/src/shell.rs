@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
-use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
+use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey};
+use crate::project_store::ThreadStatus;
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
     App, Context, DismissEvent, Entity, FocusHandle, Focusable, MouseButton, PathPromptOptions,
     Subscription, SystemNotification, Window, WindowControlArea,
 };
-use projects::{ProjectId, ProjectScope, ThreadId};
+use projects::Thread;
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::ResultExt as _;
 
@@ -17,8 +18,7 @@ use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel};
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
-use crate::registry_store::AgentRegistryStore;
-use crate::server_client::{ServerClient, ServerStatus};
+use crate::server_client::MachineStatus;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::terminal_thread_view::TerminalThreadView;
@@ -81,15 +81,14 @@ impl ThreadView {
 
 pub struct Shell {
     focus_handle: FocusHandle,
-    store: Entity<ProjectStore>,
-    registry: Entity<AgentRegistryStore>,
+    machines: Entity<Machines>,
     sidebar: Entity<Sidebar>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
-    open_threads: HashMap<ThreadId, OpenThread>,
-    active_thread: Option<ThreadId>,
+    open_threads: HashMap<ThreadKey, OpenThread>,
+    active_thread: Option<ThreadKey>,
     /// Whether the active thread's changes show beside it. Stays on across threads.
     show_diff: bool,
     /// The active thread's changes while shown. Only one, so hidden threads don't reload theirs.
@@ -99,25 +98,26 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(
-        store: Entity<ProjectStore>,
-        registry: Entity<AgentRegistryStore>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let sidebar = cx.new(|cx| Sidebar::new(store.clone(), registry.clone(), cx));
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let machines = Machines::global(cx);
+        let sidebar = cx.new(Sidebar::new);
         let subscriptions = vec![
-            cx.observe_in(&store, window, |this, store, window, cx| {
-                // Close views (and stop their agents) for threads that were deleted or removed
-                // along with their project. Archived threads stay open, read-only.
-                let store = store.read(cx);
-                let is_live = |thread_id: ThreadId| store.thread(thread_id).is_some();
-                this.open_threads.retain(|thread_id, _| is_live(*thread_id));
+            cx.observe_in(&machines, window, |this, _, window, cx| {
+                // Close views (and stop their agents) for threads that were deleted, removed
+                // along with their project, or whose machine was removed. Archived threads stay
+                // open, read-only.
+                let threads: HashMap<ThreadKey, Option<Thread>> = this
+                    .open_threads
+                    .keys()
+                    .map(|key| (*key, this.thread(*key, cx)))
+                    .collect();
+                let is_live = |key: ThreadKey| threads.get(&key).is_some_and(Option::is_some);
+                this.open_threads.retain(|key, _| is_live(*key));
                 let states: Vec<(ThreadView, SharedString, bool)> = this
                     .open_threads
                     .iter()
-                    .filter_map(|(thread_id, open_thread)| {
-                        let thread = store.thread(*thread_id)?;
+                    .filter_map(|(key, open_thread)| {
+                        let thread = threads.get(key)?.as_ref()?;
                         Some((
                             open_thread.view.clone(),
                             thread.title.clone().into(),
@@ -150,11 +150,15 @@ impl Shell {
                 this.mark_active_thread_viewed(window, cx);
                 cx.notify();
             }),
-            cx.subscribe_in(&store, window, |this, _, event, window, cx| match event {
-                ProjectStoreEvent::NeedsAttention(thread_id, status) => {
-                    this.notify_attention(*thread_id, *status, window, cx)
-                }
-            }),
+            cx.subscribe_in(
+                &machines,
+                window,
+                |this, _, event, window, cx| match event {
+                    MachinesEvent::NeedsAttention(thread, status) => {
+                        this.notify_attention(*thread, *status, window, cx)
+                    }
+                },
+            ),
             cx.observe_window_activation(window, |this, window, cx| {
                 this.mark_active_thread_viewed(window, cx)
             }),
@@ -168,7 +172,6 @@ impl Shell {
                 }
             }),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
-            cx.observe(&ServerClient::global(cx), |_, _, cx| cx.notify()),
             // With the theme mode set to System, the theme follows macOS's appearance.
             cx.observe_window_appearance(window, |_, _, cx| {
                 AppSettingsStore::global(cx).update(cx, |store, cx| store.reapply_theme(cx));
@@ -194,8 +197,7 @@ impl Shell {
         });
         Self {
             focus_handle: cx.focus_handle(),
-            store,
-            registry,
+            machines,
             sidebar,
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
@@ -209,35 +211,45 @@ impl Shell {
         }
     }
 
+    /// The app's copy of a thread on any machine.
+    fn thread(&self, key: ThreadKey, cx: &App) -> Option<Thread> {
+        self.machines
+            .read(cx)
+            .projects(key.machine, cx)?
+            .read(cx)
+            .thread(key.thread)
+            .cloned()
+    }
+
     fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        if store.projects().is_empty() {
+        let machines = self.machines.read(cx);
+        let groups = machines.visible_groups(cx);
+        if machines.project_groups(cx).is_empty() {
             window.dispatch_action(Box::new(OpenFolder), cx);
             return;
         }
         // With all projects shown, the modal asks for the project first, unless there's only
         // one to choose.
-        let project_id = match store.scope() {
-            ProjectScope::Project(id) => Some(id),
-            ProjectScope::All => match store.projects() {
-                [project] => Some(project.id),
-                _ => None,
-            },
+        let project = match groups.as_slice() {
+            [group] if group.members.len() == 1 => {
+                group.primary().map(|(machine, project)| ProjectKey {
+                    machine,
+                    project: project.id,
+                })
+            }
+            _ => None,
         };
-        self.open_new_thread_modal(project_id, None, window, cx);
+        self.open_new_thread_modal(project, None, window, cx);
     }
 
     fn open_new_thread_modal(
         &mut self,
-        project_id: Option<ProjectId>,
+        project: Option<ProjectKey>,
         workspace: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = self.store.clone();
-        let registry = self.registry.clone();
-        let modal =
-            cx.new(|cx| NewThreadModal::new(project_id, workspace, store, registry, window, cx));
+        let modal = cx.new(|cx| NewThreadModal::new(project, workspace, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
                 this.dismiss_new_thread_modal(window, cx);
@@ -271,13 +283,18 @@ impl Shell {
             .active_thread
             .filter(|_| self.show_diff && self.settings_page.is_none());
         match thread_id {
-            Some(thread_id) => {
-                let is_current = self
-                    .diff_panel
-                    .as_ref()
-                    .is_some_and(|panel| panel.read(cx).thread_id() == thread_id);
+            Some(key) => {
+                let is_current = self.diff_panel.as_ref().is_some_and(|panel| {
+                    let panel = panel.read(cx);
+                    panel.thread_id() == key.thread
+                        && panel.client().read(cx).machine() == key.machine
+                });
                 if !is_current {
-                    self.diff_panel = Some(cx.new(|cx| DiffPanel::new(thread_id, cx)));
+                    self.diff_panel = self
+                        .machines
+                        .read(cx)
+                        .client(key.machine, cx)
+                        .map(|client| cx.new(|cx| DiffPanel::new(client, key.thread, cx)));
                 }
             }
             None => self.diff_panel = None,
@@ -293,7 +310,7 @@ impl Shell {
         let page = match &self.settings_page {
             Some((page, _)) => page.clone(),
             None => {
-                let page = cx.new(|cx| SettingsPage::new(self.store.clone(), cx));
+                let page = cx.new(SettingsPage::new);
                 let subscription =
                     cx.subscribe_in(&page, window, |this, _, event, window, cx| match event {
                         SettingsPageEvent::Close => this.close_settings(window, cx),
@@ -308,7 +325,7 @@ impl Shell {
 
     fn open_project_settings(
         &mut self,
-        project_id: ProjectId,
+        project_id: ProjectKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -333,7 +350,14 @@ impl Shell {
         self.sync_diff_panel(cx);
     }
 
-    fn open_thread(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_machine_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(&OpenSettings, window, cx);
+        if let Some((page, _)) = &self.settings_page {
+            page.update(cx, |page, cx| page.show_machines(window, cx));
+        }
+    }
+
+    fn open_thread(&mut self, thread_id: ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page = None;
         if !self.open_threads.contains_key(&thread_id) {
             let Some(open_thread) = self.start_thread(thread_id, window, cx) else {
@@ -343,7 +367,16 @@ impl Shell {
         }
         self.active_thread = Some(thread_id);
         // A subthread isn't in the sidebar, so its top-level thread is highlighted.
-        let sidebar_thread = self.store.read(cx).root_thread(thread_id);
+        let sidebar_thread = ThreadKey {
+            machine: thread_id.machine,
+            thread: self
+                .machines
+                .read(cx)
+                .projects(thread_id.machine, cx)
+                .map_or(thread_id.thread, |store| {
+                    store.read(cx).root_thread(thread_id.thread)
+                }),
+        };
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_active_thread(Some(sidebar_thread), cx)
         });
@@ -355,7 +388,7 @@ impl Shell {
     }
 
     /// Whether the user can see the thread right now, as Zed's `agent_status_visible` decides.
-    fn is_thread_visible(&self, thread_id: ThreadId, window: &Window) -> bool {
+    fn is_thread_visible(&self, thread_id: ThreadKey, window: &Window) -> bool {
         window.is_window_active()
             && self.settings_page.is_none()
             && self.active_thread == Some(thread_id)
@@ -366,8 +399,9 @@ impl Shell {
             return;
         };
         if self.is_thread_visible(thread_id, window) {
-            self.store
-                .update(cx, |store, cx| store.mark_viewed(thread_id, cx));
+            if let Some(store) = self.machines.read(cx).projects(thread_id.machine, cx) {
+                store.update(cx, |store, cx| store.mark_viewed(thread_id.thread, cx));
+            }
             cx.dismiss_system_notification(&notification_tag(thread_id));
         }
     }
@@ -375,7 +409,7 @@ impl Shell {
     /// A macOS notification for a thread that isn't on screen, as Zed notifies.
     fn notify_attention(
         &self,
-        thread_id: ThreadId,
+        thread_id: ThreadKey,
         status: ThreadStatus,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -383,18 +417,25 @@ impl Shell {
         if self.is_thread_visible(thread_id, window) {
             return;
         }
-        let store = self.store.read(cx);
-        let Some(thread) = store.thread(thread_id) else {
+        let machines = self.machines.read(cx);
+        let Some(store) = machines.projects(thread_id.machine, cx) else {
+            return;
+        };
+        let store = store.read(cx);
+        let Some(thread) = store.thread(thread_id.thread) else {
             return;
         };
         let caption = match status {
             ThreadStatus::PendingApproval => "Waiting for tool confirmation",
             ThreadStatus::Working | ThreadStatus::Completed => "Finished",
         };
-        let body = match store.project(thread.project_id) {
+        let mut body = match store.project(thread.project_id) {
             Some(project) => format!("{} · {caption}", project.name()),
             None => caption.to_string(),
         };
+        if thread_id.machine != MachineId::Local {
+            body = format!("{} · {body}", machines.label(thread_id.machine, cx));
+        }
         cx.show_system_notification(SystemNotification {
             tag: notification_tag(thread_id),
             title: thread.title.clone().into(),
@@ -408,26 +449,33 @@ impl Shell {
 
     fn start_thread(
         &mut self,
-        thread_id: ThreadId,
+        key: ThreadKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<OpenThread> {
-        let thread = self.store.read(cx).thread(thread_id)?.clone();
+        let client = self.machines.read(cx).client(key.machine, cx)?;
+        let thread_id = key.thread;
+        let thread = client
+            .read(cx)
+            .projects()
+            .read(cx)
+            .thread(thread_id)?
+            .clone();
         if let Some(command) = thread.terminal.clone() {
             let title = SharedString::from(thread.title);
-            let view = cx.new(|cx| TerminalThreadView::new(thread_id, title, command, cx));
+            let view = cx.new(|cx| TerminalThreadView::new(&client, thread_id, title, command, cx));
             return Some(OpenThread {
                 view: ThreadView::Terminal(view),
                 _subscriptions: Vec::new(),
             });
         }
         let agent_id = thread.agent_id.clone().map(AgentId::new);
-        let agent_thread = AgentThread::shared(thread_id, cx);
+        let agent_thread = AgentThread::shared(&client, thread_id, cx);
         let title = SharedString::from(thread.title);
-        let registry = self.registry.clone();
         let is_archived = thread.archived_at.is_some();
+        let store = client.read(cx).projects().clone();
         let view = cx.new(|cx| {
-            let mut view = AgentView::new(thread_id, agent_thread, title, registry, agent_id, cx);
+            let mut view = AgentView::new(thread_id, agent_thread, title, agent_id, cx);
             view.set_archived(is_archived, cx);
             view
         });
@@ -435,10 +483,17 @@ impl Shell {
             &view,
             window,
             move |this, _, event, window, cx| match event {
-                AgentViewEvent::Unarchive => this
-                    .store
-                    .update(cx, |store, cx| store.unarchive_thread(thread_id, cx)),
-                AgentViewEvent::OpenThread(other) => this.open_thread(*other, window, cx),
+                AgentViewEvent::Unarchive => {
+                    store.update(cx, |store, cx| store.unarchive_thread(thread_id, cx))
+                }
+                AgentViewEvent::OpenThread(other) => this.open_thread(
+                    ThreadKey {
+                        machine: key.machine,
+                        thread: *other,
+                    },
+                    window,
+                    cx,
+                ),
             },
         );
         Some(OpenThread {
@@ -467,7 +522,9 @@ impl Shell {
             multiple: true,
             prompt: Some("Open".into()),
         });
-        let store = self.store.clone();
+        // The folder picker shows this Mac's folders.
+        let machines = self.machines.clone();
+        let store = Machines::local(cx).read(cx).projects().clone();
         cx.spawn(async move |_, cx| {
             let paths = match paths.await {
                 Ok(Ok(Some(paths))) => paths,
@@ -487,11 +544,13 @@ impl Shell {
             }
             // In "All projects" the new project simply appears; otherwise switch to it so it
             // doesn't get added out of sight.
-            store.update(cx, |store, cx| {
+            cx.update(|cx| {
+                let machines = machines.read(cx);
                 if let Some(id) = last_added
-                    && store.scope() != ProjectScope::All
+                    && machines.scope(cx) != Scope::All
+                    && let Some(group) = machines.group_of(MachineId::Local, id, cx)
                 {
-                    store.set_scope(ProjectScope::Project(id), cx);
+                    Machines::set_scope(Scope::Group(group.key), cx);
                 }
             });
         })
@@ -509,23 +568,28 @@ impl Shell {
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let store = self.store.read(cx);
-        let project_info = ProjectInfoStore::global(cx).read(cx).info();
-        let (scope_icon, scope_label): (AnyElement, SharedString) =
-            match store.scope().project().and_then(|id| store.project(id)) {
-                Some(project) => (
-                    render_project_icon(project, project_info.get(&project.id), px(14.), cx),
-                    project.name(),
-                ),
-                None => (
-                    Icon::new(IconName::ListTree)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
-                        .into_any_element(),
-                    "All projects".into(),
-                ),
-            };
-        let switcher_store = self.store.clone();
+        let machines = self.machines.read(cx);
+        let project_info = ProjectInfoStore::global(cx).read(cx);
+        let scope_group = match machines.scope(cx) {
+            Scope::Group(key) => machines.group(&key, cx),
+            Scope::All => None,
+        };
+        let (scope_icon, scope_label): (AnyElement, SharedString) = match scope_group
+            .as_ref()
+            .and_then(|group| group.primary())
+        {
+            Some((machine, project)) => (
+                render_project_icon(project, project_info.info(machine, project.id), px(14.), cx),
+                project.name(),
+            ),
+            None => (
+                Icon::new(IconName::ListTree)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+                "All projects".into(),
+            ),
+        };
         let shell = cx.entity().downgrade();
 
         h_flex()
@@ -568,7 +632,6 @@ impl Shell {
                         PopoverMenu::new("project-switcher")
                             .with_handle(self.switcher_handle.clone())
                             .menu(move |window, cx| {
-                                let store = switcher_store.clone();
                                 let shell = shell.clone();
                                 let open_project_settings =
                                     move |project_id, window: &mut Window, cx: &mut App| {
@@ -579,7 +642,7 @@ impl Shell {
                                             .ok();
                                     };
                                 Some(cx.new(|cx| {
-                                    ProjectSwitcher::new(store, open_project_settings, window, cx)
+                                    ProjectSwitcher::new(open_project_settings, window, cx)
                                 }))
                             })
                             .trigger_with_tooltip(
@@ -611,21 +674,44 @@ impl Shell {
             .children(self.render_connection_status(cx))
     }
 
-    fn render_connection_status(&self, cx: &App) -> Option<AnyElement> {
-        match ServerClient::global(cx).read(cx).status() {
-            ServerStatus::Connecting | ServerStatus::Connected => None,
-            ServerStatus::Disconnected(error) => {
-                let tooltip: SharedString =
-                    format!("Disconnected from agentz-server: {error}").into();
-                Some(
-                    div()
-                        .id("disconnected")
-                        .child(Icon::new(IconName::Disconnected).size(IconSize::Small))
-                        .tooltip(Tooltip::text(tooltip))
-                        .into_any_element(),
-                )
-            }
+    /// An icon for each machine that can't be reached, which opens Settings › Machines.
+    fn render_connection_status(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let machines = self.machines.read(cx);
+        let mut icons = Vec::new();
+        for client in machines.clients() {
+            let client = client.read(cx);
+            let (error, color) = match client.status() {
+                MachineStatus::Connecting | MachineStatus::Online => continue,
+                MachineStatus::Reconnecting(error) => (error.clone(), Color::Muted),
+                MachineStatus::Attention { error, .. } => (error.clone(), Color::Warning),
+            };
+            let tooltip: SharedString = match client.machine() {
+                MachineId::Local => format!("Disconnected from agentz-server: {error}").into(),
+                MachineId::Remote(_) => {
+                    format!("Disconnected from {}: {error}", client.label()).into()
+                }
+            };
+            icons.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "disconnected-{}",
+                        client.machine().slug()
+                    )))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(IconName::Disconnected)
+                            .size(IconSize::Small)
+                            .color(color),
+                    )
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_machine_settings(window, cx)),
+                    )
+                    .into_any_element(),
+            );
         }
+        icons
     }
 }
 
@@ -739,11 +825,37 @@ fn render_no_thread_selected() -> impl IntoElement {
         )
 }
 
-fn notification_tag(thread_id: ThreadId) -> SharedString {
-    format!("thread-{}", thread_id.0).into()
+fn notification_tag(thread: ThreadKey) -> SharedString {
+    format!("thread-{}-{}", thread.machine.slug(), thread.thread.0).into()
 }
 
 /// The thread a notification is about, from its tag.
-fn thread_from_notification_tag(tag: &str) -> Option<ThreadId> {
-    tag.strip_prefix("thread-")?.parse().ok().map(ThreadId)
+fn thread_from_notification_tag(tag: &str) -> Option<ThreadKey> {
+    let (machine, thread) = tag.strip_prefix("thread-")?.rsplit_once('-')?;
+    Some(ThreadKey {
+        machine: MachineId::from_slug(machine)?,
+        thread: projects::ThreadId(thread.parse().ok()?),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{notification_tag, thread_from_notification_tag};
+    use crate::machines::{MachineId, ThreadKey};
+    use projects::ThreadId;
+
+    #[test]
+    fn notification_tags_round_trip() {
+        for machine in [MachineId::Local, MachineId::Remote(12)] {
+            let thread = ThreadKey {
+                machine,
+                thread: ThreadId(7),
+            };
+            assert_eq!(
+                thread_from_notification_tag(&notification_tag(thread)),
+                Some(thread)
+            );
+        }
+        assert_eq!(thread_from_notification_tag("thread-7"), None);
+    }
 }

@@ -8,7 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 9, machines over SSH: saved machine profiles, then the SSH transport.
+**Next:** Phase 9: remote projects (adding one on a machine, with path completion), then
+repository identity and merged projects.
 
 | Phase | Status |
 |---|---|
@@ -229,18 +230,20 @@ Then the server:
 
 ## 9. Machines over SSH
 
-- [ ] Client: saved machine profiles and Settings › Machines (add, rename, disable, remove).
-- [ ] SSH transport:
-  - [ ] `BatchMode` with a shared ControlMaster;
-  - [ ] `uname -sm` detection;
-  - [ ] upload to `~/.agentz/server/<version>/`;
-  - [ ] run `proxy` under a login shell.
-- [ ] Build the Linux servers (x86_64/aarch64 musl) with `cargo zigbuild`.
-- [ ] Connection states: Online / Reconnecting (backoff up to 2 minutes) / Attention, with the
+- [x] Client: saved machine profiles and Settings › Machines (add, rename, disable, remove).
+- [x] SSH transport (`agentz_client::ssh`, herdr's options and error classification):
+  - [x] `BatchMode` with a shared ControlMaster;
+  - [x] `uname -sm` detection;
+  - [x] upload to `~/.agentz/server/<version>/`, skipped when the SHA-256 matches;
+  - [x] run `proxy` (the server loads the login shell's environment itself).
+- [x] Build the Linux servers with `tooling/build-remote-servers.sh` (`cargo zigbuild`, musl;
+      x86_64 by default, aarch64 on request). The app looks for them next to itself, in
+      `../Resources`, `../remote-servers`, or `$AGENTZ_REMOTE_SERVERS`.
+- [x] Connection states: Online / Reconnecting (backoff up to 2 minutes) / Attention, with the
       error and the command to run.
-- [ ] Offline machines stay visible but dimmed, with input disabled.
+- [x] Offline machines stay visible but dimmed, with input disabled.
 - [ ] Remote projects: path field with completion from that machine.
-- [ ] Per-machine agents: install, log in, defaults.
+- [x] Per-machine agents: install, log in, defaults (Settings › Agents has a machine picker).
 - [ ] Managed Node for npm agents when the machine has none (Zed's `node_runtime`).
 - [ ] Repository identity from each server, as t3code does:
   - [ ] repository root, then the primary remote (`upstream`, `origin`, first by name);
@@ -262,6 +265,8 @@ Then the server:
       covers every machine of a merged project.
 - [ ] Ask before replacing a running remote server.
 - [ ] Test against `t3-home` and `devbox1`, leaving their t3code and herdr installs alone.
+  - [x] Install and reconnect: `AGENTZ_SSH_TEST_TARGET=<host> cargo test -p agentz_server --test
+        ssh -- --ignored` (1–4 s; the second run reuses the server and uploads nothing).
 
 ## 10. Polish
 
@@ -556,3 +561,8 @@ Then the server:
   workspace tools (13fbcc2).
 - 2026-10-03: Finished phase 6: New Thread's Workspace step, branches and markers on cards,
   the thread menu's pasture actions, Project Settings › Checkouts, and Revert in the diff panel.
+- 2026-10-03: Phase 7: terminals in the server (488876a) and in the app (dfe27ed).
+- 2026-10-03: Phase 8: terminal agent detection with herdr's manifests (f514af9).
+- 2026-10-03: Phase 9: the SSH transport, Linux server builds, and the app working with
+  several machines at once: a client per machine, Settings › Machines, per-machine agents,
+  offline dimming. Connected to `devbox1` and `t3-home`.

@@ -5,23 +5,14 @@ use std::ops::Deref;
 
 use agentz_protocol::Request;
 use agentz_protocol::agents::{AgentId, RegistrySnapshot};
-use gpui::{App, AppContext as _, Context, Entity, Global};
+use gpui::{App, Context, WeakEntity};
 
 use crate::server_client::ServerClient;
 
+/// One machine's agents.
 pub struct AgentRegistryStore {
     snapshot: RegistrySnapshot,
-}
-
-struct GlobalAgentRegistryStore(Entity<AgentRegistryStore>);
-
-impl Global for GlobalAgentRegistryStore {}
-
-pub fn init(cx: &mut App) {
-    let store = cx.new(|_| AgentRegistryStore {
-        snapshot: RegistrySnapshot::default(),
-    });
-    cx.set_global(GlobalAgentRegistryStore(store));
+    client: WeakEntity<ServerClient>,
 }
 
 impl Deref for AgentRegistryStore {
@@ -33,8 +24,11 @@ impl Deref for AgentRegistryStore {
 }
 
 impl AgentRegistryStore {
-    pub fn global(cx: &App) -> Entity<Self> {
-        cx.global::<GlobalAgentRegistryStore>().0.clone()
+    pub(crate) fn new(client: WeakEntity<ServerClient>) -> Self {
+        Self {
+            snapshot: RegistrySnapshot::default(),
+            client,
+        }
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: RegistrySnapshot, cx: &mut Context<Self>) {
@@ -45,7 +39,9 @@ impl AgentRegistryStore {
     }
 
     fn send(&self, request: Request, cx: &App) {
-        ServerClient::global(cx).read(cx).send(request, cx);
+        if let Some(client) = self.client.upgrade() {
+            client.read(cx).send(request, cx);
+        }
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {

@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::terminal::{TerminalCommand, TerminalProgram};
@@ -14,7 +15,7 @@ use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Task, Window,
 };
-use projects::{ProjectId, ThreadId, Workspace, WorkspaceKind};
+use projects::{ProjectId, Workspace, WorkspaceKind};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     ButtonLike, CommonAnimationExt as _, ContextMenu, DropdownMenu, IconPosition, ListItem,
@@ -58,18 +59,21 @@ enum WorkspaceRow {
 }
 
 pub enum NewThreadModalEvent {
-    ThreadCreated(ThreadId),
+    ThreadCreated(ThreadKey),
     OpenAgentSettings,
 }
 
 pub struct NewThreadModal {
+    machines: Entity<Machines>,
+    /// The chosen project's machine, whose agents and terminals the agent step offers.
+    machine: MachineId,
     projects: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
     search: Entity<TextInput>,
     step: Step,
     /// Whether the project was left to pick here, so the agent step can go back to it.
     picks_project: bool,
-    project_rows: Vec<ProjectId>,
+    project_rows: Vec<ProjectKey>,
     agent_rows: Vec<Starter>,
     workspace_rows: Vec<WorkspaceRow>,
     selected_index: usize,
@@ -103,32 +107,38 @@ impl NewThreadModal {
     /// With no `project_id`, the user picks the project first. With `workspace`, the thread
     /// works in that folder of the project.
     pub fn new(
-        project_id: Option<ProjectId>,
+        project: Option<ProjectKey>,
         workspace: Option<PathBuf>,
-        projects: Entity<ProjectStore>,
-        registry: Entity<AgentRegistryStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let machines = Machines::global(cx);
+        let machine = project.map_or(MachineId::Local, |project| project.machine);
+        let client = machines
+            .read(cx)
+            .client(machine, cx)
+            .unwrap_or_else(|| Machines::local(cx));
+        let projects = client.read(cx).projects().clone();
+        let registry = client.read(cx).registry().clone();
         let search = cx.new(|cx| TextInput::new("", cx));
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
                 this.selected_index = 0;
                 this.update_rows(cx);
             }),
-            cx.observe(&registry, |this, _, cx| this.update_rows(cx)),
-            cx.observe(&projects, |this, _, cx| this.update_rows(cx)),
+            cx.observe(&machines, |this, _, cx| this.update_rows(cx)),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
         ];
         window.focus(&search.focus_handle(cx), cx);
-        registry.update(cx, |registry, cx| registry.refresh_if_stale(cx));
 
         let mut this = Self {
+            machines,
+            machine: client.read(cx).machine(),
             projects,
             registry,
             search,
             step: Step::Project,
-            picks_project: project_id.is_none(),
+            picks_project: project.is_none(),
             project_rows: Vec::new(),
             agent_rows: Vec::new(),
             workspace_rows: Vec::new(),
@@ -144,9 +154,29 @@ impl NewThreadModal {
             _load_git: Task::ready(()),
             _subscriptions: subscriptions,
         };
-        this.load_terminal_programs(cx);
-        this.go_to(project_id.map_or(Step::Project, Step::Agent), cx);
+        match project {
+            Some(project) => this.choose_project(project, cx),
+            None => this.go_to(Step::Project, cx),
+        }
         this
+    }
+
+    /// Offers the project's machine's agents and terminals.
+    fn choose_project(&mut self, project: ProjectKey, cx: &mut Context<Self>) {
+        let client = self.machines.read(cx).client(project.machine, cx);
+        if let Some(client) = client
+            && (client.read(cx).machine() != self.machine || self.terminal_programs.is_empty())
+        {
+            self.machine = client.read(cx).machine();
+            self.projects = client.read(cx).projects().clone();
+            self.registry = client.read(cx).registry().clone();
+            self.git = None;
+            self.terminal_programs.clear();
+            self.registry
+                .update(cx, |registry, cx| registry.refresh_if_stale(cx));
+            self.load_terminal_programs(cx);
+        }
+        self.go_to(Step::Agent(project.project), cx);
     }
 
     fn go_to(&mut self, step: Step, cx: &mut Context<Self>) {
@@ -173,11 +203,12 @@ impl NewThreadModal {
         let query = self.search.read(cx).text().trim().to_lowercase();
         match self.step {
             Step::Project => {
-                self.project_rows = self
-                    .projects
-                    .read(cx)
-                    .visible_projects()
-                    .filter(|project| {
+                let machines = self.machines.read(cx);
+                self.project_rows = machines
+                    .visible_groups(cx)
+                    .into_iter()
+                    .flat_map(|group| group.members)
+                    .filter(|(machine, project)| {
                         query.is_empty()
                             || project.name().to_lowercase().contains(&query)
                             || project
@@ -185,8 +216,13 @@ impl NewThreadModal {
                                 .to_string_lossy()
                                 .to_lowercase()
                                 .contains(&query)
+                            || (*machine != MachineId::Local
+                                && machines.label(*machine, cx).to_lowercase().contains(&query))
                     })
-                    .map(|project| project.id)
+                    .map(|(machine, project)| ProjectKey {
+                        machine,
+                        project: project.id,
+                    })
                     .collect();
             }
             Step::Agent(_) => {
@@ -221,10 +257,7 @@ impl NewThreadModal {
             }
             Step::Workspace(project_id) => {
                 let store = self.projects.read(cx);
-                let heads = ProjectInfoStore::global(cx)
-                    .read(cx)
-                    .workspace_heads()
-                    .clone();
+                let heads = ProjectInfoStore::global(cx).read(cx);
                 let existing = store
                     .project(project_id)
                     .map(|project| project.workspaces.clone())
@@ -244,7 +277,7 @@ impl NewThreadModal {
                 .into_iter()
                 .chain(existing.into_iter().map(|workspace| {
                     let branch = heads
-                        .get(&workspace.path)
+                        .workspace_head(self.machine, &workspace.path)
                         .map(|head| head.branch.clone())
                         .or_else(|| workspace.branch.clone())
                         .unwrap_or_default();
@@ -298,8 +331,10 @@ impl NewThreadModal {
     fn confirm(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
         match self.step {
             Step::Project => {
-                if let Some(project_id) = self.project_rows.get(self.selected_index).copied() {
-                    self.go_to(Step::Agent(project_id), cx);
+                if let Some(project) = self.project_rows.get(self.selected_index).copied()
+                    && self.machines.read(cx).is_online(project.machine, cx)
+                {
+                    self.choose_project(project, cx);
                 }
             }
             Step::Agent(project_id) => {
@@ -467,7 +502,10 @@ impl NewThreadModal {
         cx.spawn(async move |this, cx| {
             let created = created.await;
             this.update(cx, |this, cx| match created {
-                Ok(thread_id) => cx.emit(NewThreadModalEvent::ThreadCreated(thread_id)),
+                Ok(thread) => cx.emit(NewThreadModalEvent::ThreadCreated(ThreadKey {
+                    machine: this.machine,
+                    thread,
+                })),
                 // Making a workspace can fail for reasons worth reading, like a dirty
                 // submodule; the step stays open to try another choice.
                 Err(error) if this.creating.is_some() => {
@@ -488,36 +526,63 @@ impl NewThreadModal {
     fn render_project_row(
         &self,
         index: usize,
-        project_id: ProjectId,
+        key: ProjectKey,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(project) = self.projects.read(cx).project(project_id) else {
+        let machines = self.machines.read(cx);
+        let Some(store) = machines.projects(key.machine, cx) else {
+            return div().into_any_element();
+        };
+        let Some(project) = store.read(cx).project(key.project) else {
             return div().into_any_element();
         };
         let info = ProjectInfoStore::global(cx)
             .read(cx)
-            .info()
-            .get(&project_id);
+            .info(key.machine, key.project);
+        let is_offline = !machines.is_online(key.machine, cx);
+        let path = match key.machine {
+            MachineId::Local => compact_path(&project.path),
+            MachineId::Remote(_) => format!(
+                "{}: {}",
+                machines.label(key.machine, cx),
+                project.path.display()
+            ),
+        };
+        let path = if is_offline {
+            format!("{path} (offline)")
+        } else {
+            path
+        };
         ListItem::new(("new-thread-project", index))
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(index == self.selected_index)
+            .disabled(is_offline)
             .start_slot(render_project_icon(project, info, px(16.), cx))
             .child(
                 h_flex()
                     .min_w_0()
                     .gap_2()
-                    .child(div().flex_none().child(Label::new(project.name())))
+                    .child(
+                        div().flex_none().child(
+                            Label::new(project.name())
+                                .when(is_offline, |label| label.color(Color::Disabled)),
+                        ),
+                    )
                     .child(
                         div().min_w_0().child(
-                            Label::new(compact_path(&project.path))
+                            Label::new(path)
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
                                 .truncate(),
                         ),
                     ),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.go_to(Step::Agent(project_id), cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.machines.read(cx).is_online(key.machine, cx) {
+                    this.choose_project(key, cx)
+                }
+            }))
             .into_any_element()
     }
 
@@ -685,18 +750,19 @@ impl NewThreadModal {
             WorkspaceRow::Existing(workspace) => {
                 let branch = ProjectInfoStore::global(cx)
                     .read(cx)
-                    .workspace_heads()
-                    .get(&workspace.path)
+                    .workspace_head(self.machine, &workspace.path)
                     .map(|head| head.branch.clone())
                     .or_else(|| workspace.branch.clone())
                     .unwrap_or_else(|| workspace.kind.label().to_string());
+                // Only this Mac's folders can be checked from here.
+                let is_missing = self.machine == MachineId::Local && !workspace.path.exists();
                 (
                     workspace_icon(workspace.kind),
                     branch.into(),
                     Some(compact_path(&workspace.path)),
                     Color::Muted,
                     Some(workspace.kind.label().to_string()),
-                    !workspace.path.exists(),
+                    is_missing,
                 )
             }
         };
@@ -808,8 +874,7 @@ impl NewThreadModal {
                 let project = store.project(project_id);
                 let info = ProjectInfoStore::global(cx)
                     .read(cx)
-                    .info()
-                    .get(&project_id);
+                    .info(self.machine, project_id);
                 h_flex()
                     .gap_1p5()
                     .when(
@@ -890,7 +955,7 @@ impl Render for NewThreadModal {
                 .clone()
                 .into_iter()
                 .enumerate()
-                .map(|(index, project_id)| self.render_project_row(index, project_id, cx))
+                .map(|(index, project)| self.render_project_row(index, project, cx))
                 .collect(),
             Step::Agent(project_id) => self
                 .agent_rows

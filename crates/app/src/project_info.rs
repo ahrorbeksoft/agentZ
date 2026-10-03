@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::machines::{MachineId, Machines};
 use crate::project_store::ProjectStore;
 use collections::HashMap;
 use gpui::{
@@ -50,7 +51,7 @@ pub fn workspace_icon(kind: WorkspaceKind) -> IconName {
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Every project's [`ProjectInfo`], kept current for the sidebar, the project switcher and
-/// settings.
+/// settings. Read from this Mac's disk, so only this Mac's projects have any.
 pub struct ProjectInfoStore {
     info: HashMap<ProjectId, ProjectInfo>,
     /// The branches of the projects' worktrees and pastures, by folder.
@@ -63,9 +64,9 @@ struct GlobalProjectInfo(Entity<ProjectInfoStore>);
 
 impl Global for GlobalProjectInfo {}
 
-/// Call after `projects::init`.
+/// Call after `machines::init`.
 pub fn init(cx: &mut App) {
-    let projects = ProjectStore::global(cx);
+    let projects = Machines::local(cx).read(cx).projects().clone();
     let store = cx.new(|cx| {
         let subscription = cx.observe(&projects, |this: &mut ProjectInfoStore, projects, cx| {
             // Added or removed projects shouldn't wait for the next refresh.
@@ -97,12 +98,19 @@ impl ProjectInfoStore {
         cx.global::<GlobalProjectInfo>().0.clone()
     }
 
-    pub fn info(&self) -> &HashMap<ProjectId, ProjectInfo> {
-        &self.info
+    pub fn info(&self, machine: MachineId, project: ProjectId) -> Option<&ProjectInfo> {
+        match machine {
+            MachineId::Local => self.info.get(&project),
+            MachineId::Remote(_) => None,
+        }
     }
 
-    pub fn workspace_heads(&self) -> &HashMap<PathBuf, GitHead> {
-        &self.workspace_heads
+    /// The branch checked out in a project's worktree or pasture.
+    pub fn workspace_head(&self, machine: MachineId, folder: &Path) -> Option<&GitHead> {
+        match machine {
+            MachineId::Local => self.workspace_heads.get(folder),
+            MachineId::Remote(_) => None,
+        }
     }
 
     fn refresh_loop(projects: Entity<ProjectStore>, cx: &mut Context<Self>) -> Task<()> {

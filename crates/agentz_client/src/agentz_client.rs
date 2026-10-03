@@ -4,6 +4,8 @@
 //! sent before it were taken, which means a client that applies events as it takes them is up
 //! to date when it hears back.
 
+pub mod ssh;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

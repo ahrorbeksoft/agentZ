@@ -17,9 +17,11 @@ agentz_protocol.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
+libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "time"] }
 
 [dev-dependencies]
 agentz_server.workspace = true

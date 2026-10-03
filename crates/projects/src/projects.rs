@@ -130,6 +130,10 @@ pub struct Thread {
     /// When the thread was created or its agent last did something.
     #[serde(default)]
     pub last_activity_at: Option<SystemTime>,
+    /// Orders threads newest first across machines, where ids don't compare. Missing on
+    /// threads made before it was recorded.
+    #[serde(default)]
+    pub created_at: Option<SystemTime>,
     /// The agent's ACP session, so the conversation can be restored after a restart.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -538,12 +542,14 @@ impl ProjectStore {
     ) -> Option<ThreadId> {
         self.project(project_id)?;
         let id = ThreadId(self.allocate_id());
+        let now = SystemTime::now();
         self.threads.push(Thread {
             id,
             project_id,
             title: title.into(),
             agent_id,
-            last_activity_at: Some(SystemTime::now()),
+            last_activity_at: Some(now),
+            created_at: Some(now),
             session_id: None,
             archived_at: None,
             has_custom_title: false,

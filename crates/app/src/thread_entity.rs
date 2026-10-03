@@ -10,11 +10,11 @@ use agentz_protocol::{ConnectionId, Request, Response};
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Task};
 use projects::ThreadId;
 
-use crate::project_store::ProjectStore;
-use crate::registry_store::AgentRegistryStore;
 use crate::server_client::ServerClient;
 
 pub struct AgentThread {
+    /// The server of the thread's machine.
+    client: Entity<ServerClient>,
     /// `None` until the server has opened an account connection.
     connection: Option<ConnectionId>,
     view: ThreadView,
@@ -47,8 +47,9 @@ impl Drop for AgentThread {
 }
 
 impl AgentThread {
-    fn new(agent_name: SharedString) -> Self {
+    fn new(client: Entity<ServerClient>, agent_name: SharedString) -> Self {
         Self {
+            client,
             connection: None,
             view: ThreadView {
                 state: ThreadState {
@@ -64,22 +65,30 @@ impl AgentThread {
     }
 
     /// Follows the thread's conversation. The server starts its agent if it isn't running.
-    pub fn open(thread_id: ThreadId, agent_name: SharedString, cx: &mut Context<Self>) -> Self {
-        let mut this = Self::new(agent_name);
+    pub fn open(
+        client: Entity<ServerClient>,
+        thread_id: ThreadId,
+        agent_name: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(client, agent_name);
         this.attach(ConnectionId::Thread(thread_id), cx);
         this
     }
 
     /// The app's one copy of the thread, shared by every view showing it: the server sends a
     /// client each thread's updates once.
-    pub fn shared(thread_id: ThreadId, cx: &mut App) -> Entity<Self> {
-        if let Some(thread) = ServerClient::global(cx)
-            .read(cx)
-            .thread(ConnectionId::Thread(thread_id))
-        {
+    pub fn shared(
+        client: &Entity<ServerClient>,
+        thread_id: ThreadId,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        if let Some(thread) = client.read(cx).thread(ConnectionId::Thread(thread_id)) {
             return thread;
         }
-        let agent_id = ProjectStore::global(cx)
+        let agent_id = client
+            .read(cx)
+            .projects()
             .read(cx)
             .thread(thread_id)
             .and_then(|thread| thread.agent_id.clone())
@@ -87,26 +96,28 @@ impl AgentThread {
         let agent_name = agent_id
             .as_ref()
             .and_then(|agent_id| {
-                AgentRegistryStore::global(cx)
+                client
+                    .read(cx)
+                    .registry()
                     .read(cx)
                     .agent(agent_id)
                     .map(|agent| agent.name().clone())
             })
             .or_else(|| agent_id.as_ref().map(|agent_id| agent_id.0.clone()))
             .unwrap_or_else(|| "Agent".into());
-        cx.new(|cx| Self::open(thread_id, agent_name, cx))
+        let client = client.clone();
+        cx.new(|cx| Self::open(client, thread_id, agent_name, cx))
     }
 
     /// Starts the agent only to log in or out. It stops when this is dropped.
     pub fn open_account(
+        client: Entity<ServerClient>,
         agent_id: AgentId,
         agent_name: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut this = Self::new(agent_name);
-        let response = ServerClient::global(cx)
-            .read(cx)
-            .request(Request::OpenAccount(agent_id));
+        let response = client.read(cx).request(Request::OpenAccount(agent_id));
+        let mut this = Self::new(client, agent_name);
         this._subscribe = cx.spawn(async move |this, cx| {
             let result = match response.await {
                 Ok(Response::AccountOpened(account_id)) => Ok(account_id),
@@ -125,7 +136,8 @@ impl AgentThread {
     fn attach(&mut self, connection: ConnectionId, cx: &mut Context<Self>) {
         self.connection = Some(connection);
         let this = cx.weak_entity();
-        ServerClient::global(cx).update(cx, |client, _| client.register_thread(connection, this));
+        self.client
+            .update(cx, |client, _| client.register_thread(connection, this));
         self.subscribe(cx);
     }
 
@@ -133,7 +145,7 @@ impl AgentThread {
         let Some(connection) = self.connection else {
             return;
         };
-        let client = ServerClient::global(cx);
+        let client = self.client.clone();
         self.server = client.read(cx).connection().cloned();
         self.queued_updates = Some(Vec::new());
         let response = client
@@ -158,6 +170,10 @@ impl AgentThread {
 
     /// The server is back. Threads pick up where they are; account connections ended with the
     /// old connection.
+    pub fn client(&self) -> &Entity<ServerClient> {
+        &self.client
+    }
+
     pub(crate) fn reconnected(&mut self, cx: &mut Context<Self>) {
         match self.connection {
             Some(ConnectionId::Thread(_)) => self.subscribe(cx),
@@ -189,9 +205,7 @@ impl AgentThread {
 
     fn request(&self, request: impl FnOnce(ConnectionId) -> Request, cx: &App) {
         match self.connection {
-            Some(connection) => ServerClient::global(cx)
-                .read(cx)
-                .send(request(connection), cx),
+            Some(connection) => self.client.read(cx).send(request(connection), cx),
             None => log::warn!("the agent's connection hasn't opened yet"),
         }
     }

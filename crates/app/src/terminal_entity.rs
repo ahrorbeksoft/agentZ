@@ -21,6 +21,8 @@ pub struct TerminalSize {
 }
 
 pub struct Terminal {
+    /// The server of the terminal's machine.
+    client: Entity<ServerClient>,
     key: TerminalKey,
     /// `None` until the server has answered the subscription.
     frame: Option<TerminalFrame>,
@@ -46,12 +48,14 @@ impl Drop for Terminal {
 impl Terminal {
     /// The app's one copy of the terminal, shared by every view showing it. The server starts
     /// a thread's terminal or drawer if it isn't running.
-    pub fn shared(key: TerminalKey, cx: &mut App) -> Entity<Self> {
-        if let Some(terminal) = ServerClient::global(cx).read(cx).terminal(&key) {
+    pub fn shared(client: &Entity<ServerClient>, key: TerminalKey, cx: &mut App) -> Entity<Self> {
+        if let Some(terminal) = client.read(cx).terminal(&key) {
             return terminal;
         }
+        let client = client.clone();
         cx.new(|cx| {
             let mut this = Self {
+                client: client.clone(),
                 key: key.clone(),
                 frame: None,
                 queued_frames: None,
@@ -61,7 +65,7 @@ impl Terminal {
                 _subscribe: Task::ready(()),
             };
             let weak = cx.weak_entity();
-            ServerClient::global(cx).update(cx, |client, _| client.register_terminal(key, weak));
+            client.update(cx, |client, _| client.register_terminal(key, weak));
             this.subscribe(cx);
             this
         })
@@ -88,7 +92,7 @@ impl Terminal {
     }
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
-        let client = ServerClient::global(cx);
+        let client = self.client.clone();
         self.server = client.read(cx).connection().cloned();
         self.queued_frames = Some(Vec::new());
         // The new connection's terminal hasn't been sized yet.
@@ -144,7 +148,7 @@ impl Terminal {
     }
 
     pub fn input(&mut self, input: TerminalInput, cx: &mut Context<Self>) {
-        ServerClient::global(cx).read(cx).send(
+        self.client.read(cx).send(
             Request::TerminalInput {
                 terminal: self.key.clone(),
                 input,
@@ -210,7 +214,8 @@ impl Terminal {
         if !self.has_selection() {
             return;
         }
-        let response = ServerClient::global(cx)
+        let response = self
+            .client
             .read(cx)
             .request(Request::TerminalSelectionText(self.key.clone()));
         cx.spawn(async move |_, cx| match response.await {
@@ -226,7 +231,7 @@ impl Terminal {
     /// Runs the terminal's program again, in place of the one that ran.
     pub fn restart(&mut self, cx: &mut Context<Self>) {
         self.size = None;
-        ServerClient::global(cx)
+        self.client
             .read(cx)
             .send(Request::RestartTerminal(self.key.clone()), cx);
     }
