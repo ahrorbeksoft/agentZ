@@ -111,6 +111,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             agentz_protocol::CAPABILITY_WORKSPACES.to_string(),
             agentz_protocol::CAPABILITY_TERMINALS.to_string(),
             agentz_protocol::CAPABILITY_BROWSE_DIRECTORIES.to_string(),
+            agentz_protocol::CAPABILITY_RELAY.to_string(),
         ],
         build: installed_build(),
         error: None,

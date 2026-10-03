@@ -14,8 +14,11 @@
 //! stay with the user. Mutations take an optional `clientRequestId`, so a retry returns the
 //! first answer instead of doing the work again.
 
+mod relay;
 mod terminals;
 mod workspaces;
+
+pub(super) use relay::Relays;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
@@ -523,6 +526,9 @@ impl Server {
             Value::Null => &empty,
             _ => return Err(invalid("The arguments must be an object.")),
         });
+        if let Some(outcome) = self.relay_if_elsewhere(caller, name, &arguments) {
+            return outcome;
+        }
         let request_key = arguments.string("clientRequestId", 256)?.map(|request_id| {
             format!(
                 "{}:{:?}:{name}:{request_id}",
@@ -538,8 +544,17 @@ impl Server {
             return Ok(Step::Done(value.clone()));
         }
         let step = match name {
-            "orchestrator_capabilities" => self.capabilities(caller),
-            "agentz_thread_list" => self.thread_list(caller, &arguments),
+            "orchestrator_capabilities" => self.capabilities(caller).map(|step| match step {
+                Step::Done(mut capabilities) => {
+                    self.add_machines(caller, &mut capabilities);
+                    Step::Done(capabilities)
+                }
+                step => step,
+            }),
+            "agentz_thread_list" => match self.thread_list(caller, &arguments)? {
+                Step::Done(local) => Ok(self.list_everywhere(caller, &arguments, local)),
+                step => Ok(step),
+            },
             "agentz_thread_read" => self.thread_read(caller, &arguments, timed_out),
             "agentz_thread_launch" => {
                 let mut spec = self.launch_spec(caller, &arguments, "prompt")?;
@@ -2142,6 +2157,21 @@ pub(super) fn definitions() -> Value {
     ]);
     if let Value::Array(tools) = &mut tools {
         tools.extend(terminals::definitions());
+        let machine = json!({
+            "type": "string",
+            "maxLength": 256,
+            "description": "Another machine with this project, by its name in orchestrator_capabilities' otherMachines. Thread ids are per machine, so pass it again for that machine's threads. Omit for this machine.",
+        });
+        for tool in tools {
+            let is_relayed = tool["name"]
+                .as_str()
+                .is_some_and(|name| relay::RELAYED_TOOLS.contains(&name));
+            if is_relayed
+                && let Some(properties) = tool["inputSchema"]["properties"].as_object_mut()
+            {
+                properties.insert("machine".into(), machine.clone());
+            }
+        }
     }
     tools
 }

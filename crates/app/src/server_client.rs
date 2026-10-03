@@ -12,14 +12,15 @@ use agentz_client::ssh::{RemotePlatform, Ssh, SshError};
 use agentz_protocol::agents::{AgentId, AgentSettings};
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{
-    AgentSettingsChange, ClientKind, ConnectionId, DirectoryListing, Event, Request, Response,
+    AgentSettingsChange, CAPABILITY_RELAY, ClientKind, ConnectionId, DirectoryListing, Event,
+    Peers, RelayToolCall, Request, Response,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use ui::SharedString;
 
 use crate::machines::MachineId;
@@ -62,6 +63,11 @@ pub enum MachineStatus {
     },
 }
 
+pub enum ServerClientEvent {
+    /// An agent on this machine wants a tool run on another.
+    RelayToolCall(RelayToolCall),
+}
+
 pub struct ServerClient {
     machine: MachineId,
     label: SharedString,
@@ -83,8 +89,12 @@ pub struct ServerClient {
     queued_session_events: Option<Vec<Event>>,
     /// Cuts the wait before the next attempt short.
     retry_now: Option<oneshot::Sender<()>>,
+    /// What the server was last told of the other machines, this connection.
+    peers_sent: Option<Peers>,
     _maintain_connection: Task<()>,
 }
+
+impl EventEmitter<ServerClientEvent> for ServerClient {}
 
 impl ServerClient {
     pub fn new(
@@ -112,6 +122,7 @@ impl ServerClient {
                 terminals: HashMap::default(),
                 queued_session_events: None,
                 retry_now: None,
+                peers_sent: None,
                 _maintain_connection: cx.spawn(async move |this, cx| {
                     maintain_connection(this, connect_transport, cx).await
                 }),
@@ -226,6 +237,26 @@ impl ServerClient {
         })
     }
 
+    /// Tells the server about the other machines, when that's changed.
+    pub(crate) fn set_peers(&mut self, peers: Peers, cx: &App) {
+        if !self.has_capability(CAPABILITY_RELAY) || self.peers_sent.as_ref() == Some(&peers) {
+            return;
+        }
+        self.send(Request::SetPeers(peers.clone()), cx);
+        self.peers_sent = Some(peers);
+    }
+
+    /// The server was told of this checkout, so its agents may work there.
+    pub(crate) fn may_relay_to(&self, machine: &str, path: &std::path::Path) -> bool {
+        self.peers_sent.as_ref().is_some_and(|peers| {
+            peers
+                .checkouts
+                .iter()
+                .flat_map(|checkouts| &checkouts.checkouts)
+                .any(|checkout| checkout.machine == machine && checkout.path == path)
+        })
+    }
+
     pub fn agent_settings(&self, agent_id: &str) -> AgentSettings {
         self.agent_settings
             .get(&AgentId::new(agent_id.to_string()))
@@ -300,6 +331,7 @@ impl ServerClient {
             connection.welcome().pid
         );
         self.connection = Some(connection);
+        self.peers_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
         self.queued_session_events = Some(Vec::new());
@@ -393,6 +425,7 @@ impl ServerClient {
                     terminal.update(cx, |terminal, cx| terminal.closed(cx));
                 }
             }
+            Event::RelayToolCall(call) => cx.emit(ServerClientEvent::RelayToolCall(call)),
             Event::Unknown(event) => log::warn!("unknown event from the server: {event}"),
         }
     }

@@ -51,6 +51,9 @@ pub const CAPABILITY_TERMINALS: &str = "terminals";
 /// [`ServerWelcome::capabilities`]: the server lists folders ([`Request::BrowseDirectories`]),
 /// so projects can be added on its machine.
 pub const CAPABILITY_BROWSE_DIRECTORIES: &str = "browse_directories";
+/// [`ServerWelcome::capabilities`]: agents can reach the app's other machines through it
+/// ([`Request::SetPeers`], [`Event::RelayToolCall`]).
+pub const CAPABILITY_RELAY: &str = "relay";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -312,9 +315,59 @@ pub enum Request {
         arguments: serde_json::Value,
     },
 
+    /// The app's other machines, and which of their projects it combines with this server's,
+    /// so agents here can work there: their tool calls naming a machine are relayed through
+    /// this client ([`Event::RelayToolCall`]). Replaces what the client sent before.
+    SetPeers(Peers),
+    /// The answer to an [`Event::RelayToolCall`].
+    RelayToolResult {
+        relay_id: u64,
+        result: ToolResult,
+    },
+
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
+}
+
+/// The machines an app reaches besides this server's, as it names them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Peers {
+    /// What the app calls this server's machine.
+    pub this_machine: String,
+    pub machines: Vec<PeerMachine>,
+    /// For each project here that the app combines with projects on other machines, those.
+    pub checkouts: Vec<PeerCheckouts>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerMachine {
+    pub name: String,
+    pub online: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerCheckouts {
+    pub project_id: ProjectId,
+    pub checkouts: Vec<PeerCheckout>,
+}
+
+/// A project on another machine, by its folder there.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerCheckout {
+    pub machine: String,
+    pub path: PathBuf,
+}
+
+/// A tool call for another machine: the client runs it there for the project at `path`
+/// ([`ToolCaller::Directory`]) and answers with [`Request::RelayToolResult`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RelayToolCall {
+    pub relay_id: u64,
+    pub machine: String,
+    pub path: PathBuf,
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -412,6 +465,8 @@ pub enum Event {
     },
     /// The terminal is gone (closed, or its thread deleted).
     TerminalClosed(TerminalKey),
+    /// A tool call for one of the client's other machines, from [`Request::SetPeers`].
+    RelayToolCall(RelayToolCall),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),

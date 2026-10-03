@@ -120,6 +120,8 @@ pub(crate) struct Server {
     /// Tool calls waiting for a thread, answered as soon as it's ready or their time is up.
     pending_tool_calls: Vec<PendingToolCall>,
     tool_results: ToolResults,
+    /// Tool calls for other machines, relayed through app clients.
+    relays: tools::Relays,
     projects: ProjectStore,
     repository_checks: RepositoryChecks,
     registry: AgentRegistryStore,
@@ -174,6 +176,7 @@ impl Server {
             moving_threads: HashMap::default(),
             pending_tool_calls: Vec::new(),
             tool_results: ToolResults::default(),
+            relays: tools::Relays::default(),
             projects_revision_sent: projects.revision(),
             registry_sent: RegistrySnapshot::default(),
             agent_settings_revision_sent: agent_settings.revision(),
@@ -349,6 +352,7 @@ impl Server {
             }
             Input::Disconnected(client) => {
                 self.clients.remove(&client);
+                self.relays.client_gone(client);
                 // Nobody is left to see an account panel's agent.
                 self.accounts.retain(|_, account| account.owner != client);
             }
@@ -631,6 +635,15 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::ListTools => Ok(Response::Tools(tools::definitions())),
+            Request::SetPeers(peers) => {
+                self.client(client)?;
+                self.relays.set_peers(client, peers);
+                Ok(Response::Ok)
+            }
+            Request::RelayToolResult { relay_id, result } => {
+                self.relays.finish(relay_id, result);
+                Ok(Response::Ok)
+            }
             // Handled by `call_tool`, `thread_diff` and `workspace_request`, since they may answer
             // later.
             Request::CallTool { .. } => Err(anyhow!("tool calls are handled separately")),

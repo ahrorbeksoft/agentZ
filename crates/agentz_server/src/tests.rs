@@ -16,8 +16,8 @@ use agentz_protocol::thread::{Entry, ThreadView};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, PROTOCOL_VERSION,
-    Request, Response, ServerMessage, ServerWelcome, ToolCaller, ToolResult, read_message,
-    write_message,
+    PeerCheckout, PeerCheckouts, PeerMachine, Peers, Request, Response, ServerMessage,
+    ServerWelcome, ToolCaller, ToolResult, read_message, write_message,
 };
 use futures::FutureExt as _;
 use projects::{ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, WorkspaceKind};
@@ -962,6 +962,164 @@ fn config_value(view: &ThreadView, config_id: &str) -> Option<String> {
         };
         (option.id.0.as_ref() == config_id).then(|| select.current_value.0.to_string())
     })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_work_on_other_machines_through_the_app() {
+    let (Some(here), Some(there)) = (TestServer::start(), TestServer::start()) else {
+        return;
+    };
+    let mut caller = here.connect().await;
+    let Response::Session(session) = caller.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    caller.projects = Some(session.projects);
+    let project_id = caller.add_project(here.project_dir.path()).await;
+    let orchestrator = caller.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(orchestrator);
+    caller.subscribe_thread(connection).await;
+    caller
+        .wait_until(|client| !client.thread(connection).config_options().is_empty())
+        .await;
+
+    // Without the app, other machines are out of reach.
+    let code = caller
+        .tool_failure(
+            ToolCaller::Thread(orchestrator),
+            "agentz_thread_list",
+            json!({"machine": "devbox"}),
+        )
+        .await;
+    assert_eq!(code, "machine_unavailable");
+
+    // The app: it tells this server about the other machine, and runs relayed calls there.
+    let mut app_there = there.connect().await;
+    app_there.add_project(there.project_dir.path()).await;
+    let mut app_here = here.connect().await;
+    app_here
+        .ok(Request::SetPeers(Peers {
+            this_machine: "mac".into(),
+            machines: vec![
+                PeerMachine {
+                    name: "devbox".into(),
+                    online: true,
+                },
+                PeerMachine {
+                    name: "laptop".into(),
+                    online: false,
+                },
+            ],
+            checkouts: vec![PeerCheckouts {
+                project_id,
+                checkouts: vec![PeerCheckout {
+                    machine: "devbox".into(),
+                    path: there.project_dir.path().to_path_buf(),
+                }],
+            }],
+        }))
+        .await;
+    let relay = tokio::spawn(async move {
+        loop {
+            let ServerMessage::Event(Event::RelayToolCall(call)) = app_here.next_message().await
+            else {
+                continue;
+            };
+            assert_eq!(call.machine, "devbox");
+            let result = app_there
+                .call_tool(ToolCaller::Directory(call.path), &call.name, call.arguments)
+                .await;
+            app_here
+                .ok(Request::RelayToolResult {
+                    relay_id: call.relay_id,
+                    result,
+                })
+                .await;
+        }
+    });
+
+    let capabilities = caller
+        .tool(orchestrator, "orchestrator_capabilities", json!({}))
+        .await;
+    assert_eq!(capabilities["machine"]["name"], json!("mac"));
+    assert_eq!(capabilities["otherMachines"][0]["name"], json!("devbox"));
+    assert_eq!(
+        capabilities["otherMachines"][0]["hasThisProject"],
+        json!(true)
+    );
+    assert_eq!(
+        capabilities["otherMachines"][1]["status"],
+        json!("disconnected")
+    );
+    let remote_capabilities = caller
+        .tool(
+            orchestrator,
+            "orchestrator_capabilities",
+            json!({"machine": "DevBox"}),
+        )
+        .await;
+    assert_eq!(remote_capabilities["machine"]["status"], json!("connected"));
+    assert_eq!(remote_capabilities["agents"][0]["agentId"], json!("mock"));
+
+    // A thread launched there takes this thread's agent, and is followed by machine.
+    let launched = caller
+        .tool(
+            orchestrator,
+            "agentz_thread_launch",
+            json!({"prompt": "hello", "machine": "devbox"}),
+        )
+        .await;
+    assert_eq!(launched["machine"], json!("devbox"));
+    assert_eq!(launched["agentId"], json!("mock"));
+    let remote_thread = launched["threadId"].clone();
+    let waited = caller
+        .tool(
+            orchestrator,
+            "agentz_thread_wait",
+            json!({"threadId": remote_thread, "machine": "devbox"}),
+        )
+        .await;
+    assert_eq!(waited["lastAgentMessage"], json!("Echo: hello"));
+
+    // The project's list covers both machines.
+    let list = caller
+        .tool(orchestrator, "agentz_thread_list", json!({}))
+        .await;
+    let listed: Vec<(Value, Value)> = list["threads"]
+        .as_array()
+        .expect("threads")
+        .iter()
+        .map(|thread| (thread["machine"].clone(), thread["threadId"].clone()))
+        .collect();
+    assert!(listed.contains(&(json!("devbox"), remote_thread.clone())));
+    assert!(listed.contains(&(json!("mac"), json!(orchestrator.0))));
+    assert_eq!(list["total"], json!(2));
+
+    // A task for another machine runs as an ordinary thread there.
+    let delegated = caller
+        .tool(
+            orchestrator,
+            "delegate_task",
+            json!({"task": "hi", "mode": "wait", "machine": "devbox"}),
+        )
+        .await;
+    assert_eq!(delegated["lastAgentMessage"], json!("Echo: hi"));
+    assert_eq!(delegated["machine"], json!("devbox"));
+    assert!(delegated["note"].is_string());
+
+    for (machine, expected) in [
+        ("nowhere", "invalid_request"),
+        ("laptop", "machine_unavailable"),
+    ] {
+        let code = caller
+            .tool_failure(
+                ToolCaller::Thread(orchestrator),
+                "agentz_thread_list",
+                json!({"machine": machine}),
+            )
+            .await;
+        assert_eq!(code, expected);
+    }
+    relay.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

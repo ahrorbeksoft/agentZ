@@ -269,8 +269,12 @@ Then the server:
       disabled) → Agent on that machine. With one project shown, it opens on the machine step.
 - [x] UI: machine icon on remote cards, machine line in the details popover, projects grouped by
       machine in the switcher (combined ones under "On several machines", first).
-- [ ] Agent control across machines: `delegate_task` and thread launch with a machine; listing
-      covers every machine of a merged project.
+- [x] Agent control across machines: the thread and task tools take `machine`, and the
+      server relays the call through the app, which sends it to that machine's server as the
+      calling project (so it works only while the app is open). The app tells each server which
+      machines its projects are on (`SetPeers`). `agentz_thread_list` covers every machine of a
+      combined project. A task delegated elsewhere is an ordinary thread there, since the
+      child's server can't report back to the parent's.
 - [x] Ask before replacing a running remote server: the server reports the hash recorded
       beside its binary when it started, the SSH client compares it with the one installed
       now, and an older server shows an icon in the title bar and Restart Server… in
@@ -627,5 +631,7 @@ Then the server:
 - 2026-10-03: Phase 9: an older server left running on a machine is detected and replaced
   only after the user confirms. Fixed `agentz-server proxy` lingering after its server quit.
 - 2026-10-03: Phase 9: each server resolves its projects' repository identity.
+- 2026-10-03: Phase 9: agents can start, message and list threads on the project's other
+  machines, through the app.
 - 2026-10-03: Added phase 11, the Workspaces view (herdr's workspaces, tabs and panes) next to
   the Agents view, at the user's request.

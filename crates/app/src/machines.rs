@@ -15,7 +15,12 @@ use ui::SharedString;
 
 use crate::app_settings::{AppSettingsStore, MachineProfile};
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
-use crate::server_client::{ServerClient, Transport};
+use crate::server_client::{ServerClient, ServerClientEvent, Transport};
+use agentz_protocol::{
+    PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response, ToolCaller,
+    ToolResult,
+};
+use futures::FutureExt as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MachineId {
@@ -310,6 +315,82 @@ impl Machines {
         if changed {
             cx.notify();
         }
+        self.sync_peers(cx);
+    }
+
+    /// Tells each server about the other machines and the projects combined with its own, so
+    /// its agents can work there.
+    fn sync_peers(&mut self, cx: &mut Context<Self>) {
+        let groups = self.project_groups(cx);
+        let machines: Vec<(MachineId, SharedString, bool)> = self
+            .clients
+            .iter()
+            .map(|client| {
+                let client = client.read(cx);
+                (client.machine(), client.label().clone(), client.is_online())
+            })
+            .collect();
+        for client in self.clients.clone() {
+            let machine = client.read(cx).machine();
+            let peers = Peers {
+                this_machine: self.label(machine, cx).to_string(),
+                machines: machines
+                    .iter()
+                    .filter(|(other, _, _)| *other != machine)
+                    .map(|(_, name, online)| PeerMachine {
+                        name: name.to_string(),
+                        online: *online,
+                    })
+                    .collect(),
+                checkouts: peer_checkouts(&groups, machine, |machine| {
+                    self.label(machine, cx).to_string()
+                }),
+            };
+            client.update(cx, |client, cx| client.set_peers(peers, cx));
+        }
+    }
+
+    /// Runs an agent's call on the machine it names, and answers the agent's server.
+    fn relay_tool_call(
+        &mut self,
+        source: Entity<ServerClient>,
+        call: RelayToolCall,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .clients
+            .iter()
+            .find(|client| client.read(cx).label().as_ref() == call.machine)
+            .cloned();
+        let response = match target {
+            // Only to checkouts the server was told of, whatever it asks.
+            Some(target) if source.read(cx).may_relay_to(&call.machine, &call.path) => {
+                target.read(cx).request(Request::CallTool {
+                    caller: ToolCaller::Directory(call.path),
+                    name: call.name,
+                    arguments: call.arguments,
+                })
+            }
+            _ => futures::future::ready(Err(anyhow::anyhow!(
+                "{} has no such project in agentZ",
+                call.machine
+            )))
+            .boxed(),
+        };
+        let relay_id = call.relay_id;
+        cx.spawn(async move |_, cx| {
+            let result = match response.await {
+                Ok(Response::ToolResult(result)) => result,
+                Ok(response) => relay_failure(format!("unexpected response: {response:?}")),
+                Err(error) => relay_failure(format!("{error:#}")),
+            };
+            cx.update(|cx| {
+                source
+                    .read(cx)
+                    .send(Request::RelayToolResult { relay_id, result }, cx)
+            });
+        })
+        .detach();
     }
 
     fn add(&mut self, client: Entity<ServerClient>, cx: &mut Context<Self>) {
@@ -319,8 +400,19 @@ impl Machines {
         self.subscriptions.insert(
             machine,
             vec![
-                cx.observe(&client, |_, _, cx| cx.notify()),
-                cx.observe(&projects, |_, _, cx| cx.notify()),
+                cx.observe(&client, |this, _, cx| {
+                    this.sync_peers(cx);
+                    cx.notify()
+                }),
+                cx.observe(&projects, |this, _, cx| {
+                    this.sync_peers(cx);
+                    cx.notify()
+                }),
+                cx.subscribe(&client, |this, client, event, cx| match event {
+                    ServerClientEvent::RelayToolCall(call) => {
+                        this.relay_tool_call(client, call.clone(), cx)
+                    }
+                }),
                 cx.observe(&registry, |_, _, cx| cx.notify()),
                 cx.subscribe(&projects, move |_, _, event, cx| match event {
                     ProjectStoreEvent::NeedsAttention(thread, status) => {
@@ -662,6 +754,45 @@ fn group_label(members: &[(MachineId, Project)]) -> SharedString {
             .first()
             .map(|(_, project)| project.name())
             .unwrap_or_default(),
+    }
+}
+
+/// For each of the machine's projects combined with others, those on other machines.
+fn peer_checkouts(
+    groups: &[ProjectGroup],
+    machine: MachineId,
+    label: impl Fn(MachineId) -> String,
+) -> Vec<PeerCheckouts> {
+    let mut checkouts = Vec::new();
+    for group in groups {
+        let elsewhere: Vec<PeerCheckout> = group
+            .members
+            .iter()
+            .filter(|(member_machine, _)| *member_machine != machine)
+            .map(|(member_machine, project)| PeerCheckout {
+                machine: label(*member_machine),
+                path: project.path.clone(),
+            })
+            .collect();
+        if elsewhere.is_empty() {
+            continue;
+        }
+        for (member_machine, project) in &group.members {
+            if *member_machine == machine {
+                checkouts.push(PeerCheckouts {
+                    project_id: project.id,
+                    checkouts: elsewhere.clone(),
+                });
+            }
+        }
+    }
+    checkouts
+}
+
+fn relay_failure(message: String) -> ToolResult {
+    ToolResult {
+        value: serde_json::json!({"code": "machine_unavailable", "message": message}),
+        is_error: true,
     }
 }
 
