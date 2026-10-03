@@ -227,6 +227,75 @@ impl Checkpoints {
         })
     }
 
+    /// Puts the folder back as it was at the scope's first checkpoint, and drops the later ones,
+    /// so the restored turns no longer count. t3code's `restoreCheckpoint`: ignored files stay.
+    pub(crate) async fn restore(&self, scope: DiffScope) -> Result<()> {
+        let turns = match self.latest().await? {
+            None | Some(0) => anyhow::bail!("no turn has finished yet"),
+            Some(latest) => latest,
+        };
+        let target = match scope {
+            DiffScope::LatestTurn => turns - 1,
+            DiffScope::All => 0,
+        };
+        let commit = git(
+            &self.cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{commit}}", self.turn_ref(target)),
+            ],
+            &[],
+        )
+        .await?;
+        let commit = commit.trim();
+        let tracked = git(
+            &self.cwd,
+            &[
+                "ls-files",
+                "--cached",
+                &format!("--with-tree={commit}"),
+                "-z",
+                "--",
+                ".",
+            ],
+            &[],
+        )
+        .await?;
+        // An empty index and checkpoint have nothing for the pathspec to match.
+        if !tracked.is_empty() {
+            git(
+                &self.cwd,
+                &[
+                    "restore",
+                    "--source",
+                    commit,
+                    "--worktree",
+                    "--staged",
+                    "--",
+                    ".",
+                ],
+                &[],
+            )
+            .await?;
+        }
+        git(&self.cwd, &["clean", "-fd", "--", "."], &[]).await?;
+        let has_head = git(
+            &self.cwd,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            &[],
+        )
+        .await
+        .is_ok();
+        if has_head {
+            git(&self.cwd, &["reset", "--quiet", "--", "."], &[]).await?;
+        }
+        for turn in target + 1..=turns {
+            git(&self.cwd, &["update-ref", "-d", &self.turn_ref(turn)], &[]).await?;
+        }
+        Ok(())
+    }
+
     /// Removes the thread's checkpoints, as when it's deleted.
     pub(crate) async fn delete(&self) -> Result<()> {
         if !is_repository(&self.cwd).await {
@@ -402,6 +471,61 @@ mod tests {
 
         checkpoints.delete().await.expect("deleted");
         assert_eq!(checkpoints.latest().await.expect("refs"), None);
+    }
+
+    #[tokio::test]
+    async fn restoring_puts_files_back_and_forgets_later_turns() {
+        if git(Path::new("/"), &["--version"], &[]).await.is_err() {
+            return;
+        }
+        let repository = repository().await;
+        let cwd = repository.path();
+        std::fs::write(cwd.join(".gitignore"), "build/\n").expect("a file");
+        let checkpoints = Checkpoints::new(cwd.to_path_buf(), "machine-1", ThreadId(3));
+        let readme = || std::fs::read_to_string(cwd.join("README.md")).unwrap_or_default();
+
+        checkpoints.on_turn(TurnPoint::Starting).await;
+        std::fs::write(cwd.join("README.md"), "one\ntwo\nthree\n").expect("a change");
+        std::fs::write(cwd.join("notes.txt"), "new\n").expect("an untracked file");
+        checkpoints.on_turn(TurnPoint::Ended).await;
+        checkpoints.on_turn(TurnPoint::Starting).await;
+        std::fs::remove_file(cwd.join("README.md")).expect("a deletion");
+        std::fs::write(cwd.join("other.txt"), "other\n").expect("another file");
+        std::fs::create_dir(cwd.join("build")).expect("an ignored folder");
+        std::fs::write(cwd.join("build/out"), "out\n").expect("an ignored file");
+        checkpoints.on_turn(TurnPoint::Ended).await;
+
+        checkpoints
+            .restore(DiffScope::LatestTurn)
+            .await
+            .expect("restores the latest turn");
+        assert_eq!(readme(), "one\ntwo\nthree\n");
+        assert!(cwd.join("notes.txt").exists());
+        assert!(!cwd.join("other.txt").exists());
+        assert!(cwd.join("build/out").exists(), "ignored files stay");
+        assert_eq!(checkpoints.latest().await.expect("refs"), Some(1));
+        assert_eq!(
+            run(cwd, &["status", "--porcelain"]).await,
+            " M README.md\n?? .gitignore\n?? notes.txt\n",
+            "nothing is staged"
+        );
+
+        checkpoints
+            .restore(DiffScope::All)
+            .await
+            .expect("restores everything");
+        assert_eq!(readme(), "one\ntwo\n");
+        assert!(!cwd.join("notes.txt").exists());
+        assert!(cwd.join(".gitignore").exists(), "it was in the baseline");
+        assert_eq!(
+            checkpoints
+                .diff(DiffScope::All)
+                .await
+                .expect("a diff")
+                .status,
+            DiffStatus::NoTurns
+        );
+        assert!(checkpoints.restore(DiffScope::All).await.is_err());
     }
 
     #[tokio::test]

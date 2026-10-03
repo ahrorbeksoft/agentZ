@@ -22,6 +22,27 @@ pub struct ThreadDiff {
     pub files: Vec<DiffFile>,
     /// The patch was too big, so the last files are missing or cut short.
     pub truncated: bool,
+    #[serde(default)]
+    pub restore: RestoreAvailability,
+}
+
+/// Whether [`crate::Request::RestoreCheckpoint`] can put the thread's files back. A checkpoint
+/// saves the whole folder, so only a thread alone in its own worktree or pasture may restore
+/// (t3code).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RestoreAvailability {
+    Available,
+    /// Why not.
+    Unavailable(String),
+    /// From a newer version.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
+}
+
+impl Default for RestoreAvailability {
+    fn default() -> Self {
+        RestoreAvailability::Unavailable("This server can't restore files.".into())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

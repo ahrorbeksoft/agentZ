@@ -1,20 +1,24 @@
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::project_store::{ProjectStore, ThreadStatus};
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight,
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, Focusable as _, FontWeight, Hsla,
     KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, svg,
 };
-use projects::{Project, ProjectId, ProjectScope, Thread, ThreadId};
+use projects::{Project, ProjectId, ProjectScope, Thread, ThreadId, Workspace, WorkspaceKind};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,
     prelude::*, right_click_menu,
 };
 
-use crate::project_info::{ProjectInfo, ProjectInfoStore, render_project_icon};
+use crate::project_info::{
+    GitHead, ProjectInfo, ProjectInfoStore, render_project_icon, workspace_icon,
+};
+use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::{NewThread, OpenFolder, OpenSettings};
 
@@ -45,6 +49,30 @@ pub fn init(cx: &mut App) {
 pub enum SidebarEvent {
     OpenThread(ThreadId),
     OpenProjectSettings(ProjectId),
+    /// New Thread, working in this folder: a project's own, or one of its workspaces.
+    NewThreadIn(ProjectId, PathBuf),
+}
+
+/// Where a thread works, for its card, details and menu.
+struct ThreadCheckout {
+    folder: PathBuf,
+    workspace: Option<Workspace>,
+    head: Option<GitHead>,
+}
+
+impl ThreadCheckout {
+    fn branch(&self) -> Option<String> {
+        self.head
+            .as_ref()
+            .map(|head| head.branch.clone())
+            .or_else(|| self.workspace.as_ref()?.branch.clone())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PastureAction {
+    Sync,
+    BringBack,
 }
 
 /// The thread list, modeled on t3code's sidebar: active threads as cards and archived threads
@@ -59,6 +87,7 @@ pub struct Sidebar {
     search_scroll: ScrollHandle,
     archived_shown: usize,
     project_info: HashMap<ProjectId, ProjectInfo>,
+    workspace_heads: HashMap<PathBuf, GitHead>,
     /// The thread whose details popover is showing, after hovering it for a moment.
     details_thread: Option<ThreadId>,
     /// A popover waiting out the hover delay, and the thread it's for.
@@ -107,8 +136,10 @@ impl Sidebar {
         });
         let project_info_store = ProjectInfoStore::global(cx);
         let project_info = project_info_store.read(cx).info().clone();
+        let workspace_heads = project_info_store.read(cx).workspace_heads().clone();
         let project_info_subscription = cx.observe(&project_info_store, |this, store, cx| {
             this.project_info = store.read(cx).info().clone();
+            this.workspace_heads = store.read(cx).workspace_heads().clone();
             cx.notify();
         });
         Self {
@@ -120,6 +151,7 @@ impl Sidebar {
             search_scroll: ScrollHandle::new(),
             archived_shown: ARCHIVED_INITIAL_COUNT,
             project_info,
+            workspace_heads,
             details_thread: None,
             details_delay: None,
             hovered_thread: None,
@@ -341,19 +373,105 @@ impl Sidebar {
         }
     }
 
-    /// Rename, Archive or Unarchive, Project Settings, and Delete, each with its icon.
+    fn thread_checkout(&self, thread: &Thread, cx: &App) -> Option<ThreadCheckout> {
+        let store = self.store.read(cx);
+        let folder = store.thread_folder(thread.id)?;
+        let workspace = store.thread_workspace(thread.id).cloned();
+        let head = if workspace.is_some() {
+            self.workspace_heads.get(&folder).cloned()
+        } else {
+            self.project_info
+                .get(&thread.project_id)
+                .and_then(|info| info.git_head.clone())
+        };
+        Some(ThreadCheckout {
+            folder,
+            workspace,
+            head,
+        })
+    }
+
+    /// Syncs the thread's pasture, or brings its branch to the project, and says how it went.
+    fn run_pasture_action(
+        &mut self,
+        thread_id: ThreadId,
+        action: PastureAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.read(cx);
+        let Some(thread) = store.thread(thread_id) else {
+            return;
+        };
+        let project_id = thread.project_id;
+        let Some(folder) = store.thread_folder(thread_id) else {
+            return;
+        };
+        let task = match action {
+            PastureAction::Sync => store.sync_workspace(project_id, folder, cx),
+            PastureAction::BringBack => store.bring_back_workspace(project_id, folder, cx),
+        };
+        let title = match action {
+            PastureAction::Sync => "Sync from Project",
+            PastureAction::BringBack => "Bring Branch to Project",
+        };
+        cx.spawn_in(window, async move |_, cx| {
+            let (level, detail) = match task.await {
+                Ok(message) => (PromptLevel::Info, message),
+                Err(error) => (PromptLevel::Critical, format!("{error:#}")),
+            };
+            let answer =
+                cx.update(|window, cx| window.prompt(level, title, Some(&detail), &["OK"], cx));
+            if let Ok(answer) = answer {
+                answer.await.ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Rename, Archive or Unarchive, New Thread Here, the pasture's actions, Project Settings,
+    /// and Delete, each with its icon.
     fn thread_menu(
         &self,
-        thread_id: ThreadId,
-        title: SharedString,
+        thread: &Thread,
         is_archived: bool,
         cx: &mut Context<Self>,
     ) -> impl Fn(&mut Window, &mut App) -> Entity<ContextMenu> + 'static {
         let sidebar = cx.entity().downgrade();
+        let thread_id = thread.id;
+        let project_id = thread.project_id;
+        let title = SharedString::from(thread.title.clone());
+        let checkout = self.thread_checkout(thread, cx);
+        let is_pasture = checkout
+            .as_ref()
+            .and_then(|checkout| checkout.workspace.as_ref())
+            .is_some_and(|workspace| workspace.kind == WorkspaceKind::Pasture);
+        let folder = checkout.map(|checkout| checkout.folder);
         move |window, cx| {
             let sidebar = sidebar.clone();
             let title = title.clone();
+            let folder = folder.clone();
             ContextMenu::build(window, cx, move |menu, _, _| {
+                let new_thread_here = folder.clone().map(|folder| {
+                    let sidebar = sidebar.clone();
+                    move |_: &mut Window, cx: &mut App| {
+                        sidebar
+                            .update(cx, |_, cx| {
+                                cx.emit(SidebarEvent::NewThreadIn(project_id, folder.clone()))
+                            })
+                            .ok();
+                    }
+                });
+                let pasture_action = |action: PastureAction| {
+                    let sidebar = sidebar.clone();
+                    move |window: &mut Window, cx: &mut App| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.run_pasture_action(thread_id, action, window, cx)
+                            })
+                            .ok();
+                    }
+                };
                 let rename = {
                     let sidebar = sidebar.clone();
                     let title = title.clone();
@@ -425,6 +543,30 @@ impl Sidebar {
                         .icon_color(Color::Muted)
                         .handler(toggle_archived),
                 )
+                .when_some(new_thread_here, |menu, handler| {
+                    menu.item(
+                        ContextMenuEntry::new("New Thread Here")
+                            .icon(IconName::Plus)
+                            .icon_color(Color::Muted)
+                            .handler(handler),
+                    )
+                })
+                .when(is_pasture, |menu| {
+                    menu.separator()
+                        .item(
+                            ContextMenuEntry::new("Sync from Project")
+                                .icon(IconName::ArrowCircle)
+                                .icon_color(Color::Muted)
+                                .handler(pasture_action(PastureAction::Sync)),
+                        )
+                        .item(
+                            ContextMenuEntry::new("Bring Branch to Project")
+                                .icon(IconName::GitBranch)
+                                .icon_color(Color::Muted)
+                                .handler(pasture_action(PastureAction::BringBack)),
+                        )
+                        .separator()
+                })
                 .item(
                     ContextMenuEntry::new("Project Settings")
                         .icon(IconName::Settings)
@@ -501,14 +643,22 @@ impl Sidebar {
             let icon_path = registry_agent.and_then(|agent| agent.icon_path().cloned());
             (icon_path, label)
         });
+        let checkout = self.thread_checkout(thread, cx);
         ThreadDetails {
             title: thread.title.clone().into(),
             project: project
                 .map(|project| (project.clone(), self.project_info.get(&project.id).cloned())),
-            branch: project
-                .and_then(|project| self.project_info.get(&project.id))
-                .and_then(|info| info.git_head.as_ref())
-                .map(|git_head| git_head.branch.clone().into()),
+            branch: checkout
+                .as_ref()
+                .and_then(|checkout| checkout.branch())
+                .map(SharedString::from),
+            workspace: checkout.and_then(|checkout| {
+                let workspace = checkout.workspace?;
+                Some((
+                    workspace.kind,
+                    describe_folder(workspace.kind, &checkout.folder),
+                ))
+            }),
             agent,
         }
     }
@@ -533,16 +683,13 @@ impl Sidebar {
         // With one project selected, every card would repeat it, so the project line goes and
         // the status moves next to the title.
         let shows_all_projects = self.store.read(cx).scope() == ProjectScope::All;
-        let git_head = project
-            .as_ref()
-            .and_then(|project| self.project_info.get(&project.id))
-            .and_then(|info| info.git_head.clone());
+        let checkout = self.thread_checkout(&thread, cx);
         let faint_text = cx.theme().colors().text_muted.opacity(0.4);
         let time = thread
             .last_activity_at
             .map(|time| format_relative_time(time, SystemTime::now()));
         let group_name = SharedString::from(format!("thread-card-{}", thread.id.0));
-        let title = SharedString::from(thread.title);
+        let title = SharedString::from(thread.title.clone());
         let subthreads = {
             let store = self.store.read(cx);
             let subthreads = store.subthreads(thread.id);
@@ -688,117 +835,102 @@ impl Sidebar {
             (None, title_line)
         };
 
-        let card =
-            v_flex()
-                .id(("thread-card", thread.id.0))
-                .group(group_name)
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
+        let card = v_flex()
+            .id(("thread-card", thread.id.0))
+            .group(group_name)
+            .on_hover(
+                cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
-                }))
-                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-                .relative()
-                .w_full()
-                .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
-                .px_2p5()
-                .py_2()
-                .rounded_md()
-                .when(is_active, |card| card.bg(selected_background))
-                .when(!is_renaming, |card| {
-                    card.cursor_pointer()
-                        .hover(|card| card.bg(hover_background))
-                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
-                })
-                .children(project_line)
-                .child(title_line)
-                .child(
-                    h_flex()
-                        .mt_0p5()
-                        .min_w_0()
-                        .gap_1p5()
-                        .child(h_flex().flex_1().min_w_0().gap_1().when_some(
-                            git_head,
-                            |this, git_head| {
-                                this.when_some(git_head.worktree.clone(), |this, worktree| {
-                                    let tooltip = format!(
-                                        "Worktree: {} ({})",
-                                        worktree.display(),
-                                        git_head.branch
-                                    );
-                                    this.child(
-                                        div()
-                                            .id(("thread-worktree", thread_id.0))
-                                            .flex_none()
-                                            .tooltip(Tooltip::text(tooltip))
-                                            .child(
-                                                Icon::new(IconName::GitWorktree)
-                                                    .size(IconSize::XSmall)
-                                                    .color(Color::Custom(faint_text)),
-                                            ),
-                                    )
-                                })
-                                .child(
-                                    Label::new(git_head.branch)
+                }),
+            )
+            .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+            .relative()
+            .w_full()
+            .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
+            .px_2p5()
+            .py_2()
+            .rounded_md()
+            .when(is_active, |card| card.bg(selected_background))
+            .when(!is_renaming, |card| {
+                card.cursor_pointer()
+                    .hover(|card| card.bg(hover_background))
+                    .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
+            })
+            .children(project_line)
+            .child(title_line)
+            .child(
+                h_flex()
+                    .mt_0p5()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(h_flex().flex_1().min_w_0().gap_1().when_some(
+                        checkout,
+                        |this, checkout| {
+                            let branch = checkout.branch();
+                            this.children(render_checkout_marker(thread_id, &checkout, faint_text))
+                                .children(branch.map(|branch| {
+                                    Label::new(branch)
                                         .size(LabelSize::Small)
                                         .color(Color::Custom(faint_text))
-                                        .truncate_middle(),
-                                )
-                            },
-                        ))
-                        .when(subthreads.0 > 0, |this| {
-                            let (count, running) = subthreads;
-                            let tooltip = match (count, running) {
-                                (1, 0) => "1 agent".to_string(),
-                                (count, 0) => format!("{count} agents"),
-                                (count, running) => format!("{count} agents, {running} running"),
-                            };
-                            let color = if running > 0 {
-                                Color::Accent
-                            } else {
-                                Color::Custom(faint_text)
-                            };
-                            this.child(
-                                h_flex()
-                                    .id(("thread-agents", thread_id.0))
-                                    .flex_none()
-                                    .gap_0p5()
-                                    .tooltip(Tooltip::text(tooltip))
-                                    .child(
-                                        Icon::new(IconName::UserGroup)
-                                            .size(IconSize::XSmall)
-                                            .color(color),
-                                    )
-                                    .child(
-                                        Label::new(count.to_string())
-                                            .size(LabelSize::XSmall)
-                                            .color(color),
-                                    ),
-                            )
-                        })
-                        .when_some(started_by, |this, started_by| {
-                            this.child(
-                                div()
-                                    .id(("thread-started-by", thread_id.0))
-                                    .flex_none()
-                                    .tooltip(Tooltip::text(started_by))
-                                    .child(
-                                        Icon::new(IconName::Sparkle)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Custom(faint_text)),
-                                    ),
-                            )
-                        })
-                        .child(
-                            div()
+                                        .truncate_middle()
+                                }))
+                        },
+                    ))
+                    .when(subthreads.0 > 0, |this| {
+                        let (count, running) = subthreads;
+                        let tooltip = match (count, running) {
+                            (1, 0) => "1 agent".to_string(),
+                            (count, 0) => format!("{count} agents"),
+                            (count, running) => format!("{count} agents, {running} running"),
+                        };
+                        let color = if running > 0 {
+                            Color::Accent
+                        } else {
+                            Color::Custom(faint_text)
+                        };
+                        this.child(
+                            h_flex()
+                                .id(("thread-agents", thread_id.0))
                                 .flex_none()
-                                .opacity(0.6)
-                                .child(icon.size(IconSize::Small).color(Color::Muted)),
-                        ),
-                );
+                                .gap_0p5()
+                                .tooltip(Tooltip::text(tooltip))
+                                .child(
+                                    Icon::new(IconName::UserGroup)
+                                        .size(IconSize::XSmall)
+                                        .color(color),
+                                )
+                                .child(
+                                    Label::new(count.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(color),
+                                ),
+                        )
+                    })
+                    .when_some(started_by, |this, started_by| {
+                        this.child(
+                            div()
+                                .id(("thread-started-by", thread_id.0))
+                                .flex_none()
+                                .tooltip(Tooltip::text(started_by))
+                                .child(
+                                    Icon::new(IconName::Sparkle)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Custom(faint_text)),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .opacity(0.6)
+                            .child(icon.size(IconSize::Small).color(Color::Muted)),
+                    ),
+            );
 
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(thread_id, title, false, cx);
+        let menu = self.thread_menu(&thread, false, cx);
         right_click_menu(("thread-menu", thread.id.0))
             .trigger(move |is_menu_open, _, _| {
                 div()
@@ -868,7 +1000,7 @@ impl Sidebar {
             .archived_at
             .map(|time| format_relative_time(time, SystemTime::now()));
         let group_name = SharedString::from(format!("archived-row-{}", thread.id.0));
-        let title = SharedString::from(thread.title);
+        let title = SharedString::from(thread.title.clone());
         let store = self.store.clone();
 
         let row =
@@ -906,7 +1038,7 @@ impl Sidebar {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(Label::new(title.clone()).color(Color::Muted).truncate())
+                        .child(Label::new(title).color(Color::Muted).truncate())
                         .into_any_element()
                 })
                 .when_some(time.filter(|_| !is_renaming), |row, time| {
@@ -941,7 +1073,7 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(thread_id, title, true, cx);
+        let menu = self.thread_menu(&thread, true, cx);
         right_click_menu(("archived-thread-menu", thread.id.0))
             .trigger(move |is_menu_open, _, _| {
                 div()
@@ -1225,6 +1357,8 @@ struct ThreadDetails {
     title: SharedString,
     project: Option<(Project, Option<ProjectInfo>)>,
     branch: Option<SharedString>,
+    /// The worktree or pasture it works in, described.
+    workspace: Option<(WorkspaceKind, SharedString)>,
     agent: Option<(Option<SharedString>, SharedString)>,
 }
 
@@ -1259,6 +1393,12 @@ impl ThreadDetails {
             rows.push(detail_row(
                 small_icon(IconName::GitBranch),
                 Label::new(branch.clone()).truncate_middle(),
+            ));
+        }
+        if let Some((kind, description)) = &self.workspace {
+            rows.push(detail_row(
+                small_icon(workspace_icon(*kind)),
+                Label::new(description.clone()).truncate_middle(),
             ));
         }
         if let Some((icon_path, label)) = &self.agent {
@@ -1297,6 +1437,49 @@ impl ThreadDetails {
             )
             .into_any_element()
     }
+}
+
+/// A worktree's or pasture's icon before the card's branch, or the worktree icon when the
+/// project's own folder is a linked worktree.
+fn render_checkout_marker(
+    thread_id: ThreadId,
+    checkout: &ThreadCheckout,
+    color: Hsla,
+) -> Option<AnyElement> {
+    let (icon, tooltip) = match (&checkout.workspace, &checkout.head) {
+        (Some(workspace), _) => (
+            workspace_icon(workspace.kind),
+            describe_folder(workspace.kind, &checkout.folder),
+        ),
+        (
+            None,
+            Some(GitHead {
+                worktree: Some(worktree),
+                ..
+            }),
+        ) => (
+            IconName::GitWorktree,
+            describe_folder(WorkspaceKind::Worktree, worktree),
+        ),
+        _ => return None,
+    };
+    Some(
+        div()
+            .id(("thread-checkout", thread_id.0))
+            .flex_none()
+            .tooltip(Tooltip::text(tooltip))
+            .child(
+                Icon::new(icon)
+                    .size(IconSize::XSmall)
+                    .color(Color::Custom(color)),
+            )
+            .into_any_element(),
+    )
+}
+
+/// "Pasture · ~/.cow/pastures/app-1a2b".
+fn describe_folder(kind: WorkspaceKind, folder: &Path) -> SharedString {
+    format!("{} · {}", kind.label(), compact_path(folder)).into()
 }
 
 /// Placed beside the row's right edge, top-aligned, as t3code places its row tooltip.

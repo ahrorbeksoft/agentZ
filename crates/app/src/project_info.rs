@@ -1,5 +1,6 @@
 //! What t3code's sidebar shows about a project besides its name: an icon (the project's
-//! favicon, or a colored monogram when it has none) and the checked-out git branch.
+//! favicon, or a colored monogram when it has none) and the checked-out git branch, also of
+//! each of its worktrees and pastures.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,7 +11,7 @@ use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, Global, Hsla, Subscription,
     Task, img, rgb,
 };
-use projects::{Project, ProjectIcon, ProjectId};
+use projects::{Project, ProjectIcon, ProjectId, WorkspaceKind};
 use ui::{StyledImage as _, prelude::*};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -37,6 +38,14 @@ impl ProjectInfo {
     }
 }
 
+/// A worktree's or pasture's icon, wherever workspaces are listed.
+pub fn workspace_icon(kind: WorkspaceKind) -> IconName {
+    match kind {
+        WorkspaceKind::Worktree => IconName::GitWorktree,
+        WorkspaceKind::Pasture => IconName::Copy,
+    }
+}
+
 /// How often icons and checked-out branches are re-read.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -44,6 +53,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// settings.
 pub struct ProjectInfoStore {
     info: HashMap<ProjectId, ProjectInfo>,
+    /// The branches of the projects' worktrees and pastures, by folder.
+    workspace_heads: HashMap<PathBuf, GitHead>,
     refresh: Task<()>,
     _projects_subscription: Subscription,
 }
@@ -62,13 +73,18 @@ pub fn init(cx: &mut App) {
             let is_stale = current.len() != this.info.len()
                 || current
                     .iter()
-                    .any(|project| !this.info.contains_key(&project.id));
+                    .any(|project| !this.info.contains_key(&project.id))
+                || current
+                    .iter()
+                    .flat_map(|project| &project.workspaces)
+                    .any(|workspace| !this.workspace_heads.contains_key(&workspace.path));
             if is_stale {
                 this.refresh = ProjectInfoStore::refresh_loop(projects, cx);
             }
         });
         ProjectInfoStore {
             info: HashMap::default(),
+            workspace_heads: HashMap::default(),
             refresh: ProjectInfoStore::refresh_loop(projects.clone(), cx),
             _projects_subscription: subscription,
         }
@@ -85,27 +101,47 @@ impl ProjectInfoStore {
         &self.info
     }
 
+    pub fn workspace_heads(&self) -> &HashMap<PathBuf, GitHead> {
+        &self.workspace_heads
+    }
+
     fn refresh_loop(projects: Entity<ProjectStore>, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let roots: Vec<(ProjectId, PathBuf)> = projects.read_with(cx, |projects, _| {
-                    projects
+                let (roots, folders) = projects.read_with(cx, |projects, _| {
+                    let roots: Vec<(ProjectId, PathBuf)> = projects
                         .projects()
                         .iter()
                         .map(|project| (project.id, project.path.clone()))
-                        .collect()
+                        .collect();
+                    let folders: Vec<PathBuf> = projects
+                        .projects()
+                        .iter()
+                        .flat_map(|project| &project.workspaces)
+                        .map(|workspace| workspace.path.clone())
+                        .collect();
+                    (roots, folders)
                 });
-                let info = cx
+                let (info, workspace_heads) = cx
                     .background_spawn(async move {
-                        roots
+                        let info = roots
                             .into_iter()
                             .map(|(id, root)| (id, ProjectInfo::read(&root)))
-                            .collect::<HashMap<_, _>>()
+                            .collect::<HashMap<_, _>>();
+                        let heads = folders
+                            .into_iter()
+                            .filter_map(|folder| {
+                                let head = read_git_head(&folder)?;
+                                Some((folder, head))
+                            })
+                            .collect::<HashMap<_, _>>();
+                        (info, heads)
                     })
                     .await;
                 let updated = this.update(cx, |this, cx| {
-                    if this.info != info {
+                    if this.info != info || this.workspace_heads != workspace_heads {
                         this.info = info;
+                        this.workspace_heads = workspace_heads;
                         cx.notify();
                     }
                 });

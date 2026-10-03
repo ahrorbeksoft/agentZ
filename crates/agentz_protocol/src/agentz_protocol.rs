@@ -199,6 +199,13 @@ pub enum Request {
         thread_id: ThreadId,
         scope: DiffScope,
     },
+    /// Puts the thread's files back as they were before the scope's changes: before its latest
+    /// turn, or before its first. Later checkpoints are dropped. Answers with the new
+    /// [`Response::ThreadDiff`].
+    RestoreCheckpoint {
+        thread_id: ThreadId,
+        scope: DiffScope,
+    },
 
     Prompt {
         connection: ConnectionId,

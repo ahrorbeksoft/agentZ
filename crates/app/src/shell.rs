@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
@@ -118,6 +120,9 @@ impl Shell {
                 SidebarEvent::OpenProjectSettings(project_id) => {
                     this.open_project_settings(*project_id, window, cx)
                 }
+                SidebarEvent::NewThreadIn(project_id, folder) => {
+                    this.open_new_thread_modal(Some(*project_id), Some(folder.clone()), window, cx)
+                }
             }),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
             cx.observe(&ServerClient::global(cx), |_, _, cx| cx.notify()),
@@ -176,18 +181,20 @@ impl Shell {
                 _ => None,
             },
         };
-        self.open_new_thread_modal(project_id, window, cx);
+        self.open_new_thread_modal(project_id, None, window, cx);
     }
 
     fn open_new_thread_modal(
         &mut self,
         project_id: Option<ProjectId>,
+        workspace: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let store = self.store.clone();
         let registry = self.registry.clone();
-        let modal = cx.new(|cx| NewThreadModal::new(project_id, store, registry, window, cx));
+        let modal =
+            cx.new(|cx| NewThreadModal::new(project_id, workspace, store, registry, window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
                 this.dismiss_new_thread_modal(window, cx);

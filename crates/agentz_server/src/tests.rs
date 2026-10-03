@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
-use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, ThreadDiff};
+use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::thread::{Entry, ThreadView};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -1498,6 +1498,26 @@ async fn threads_work_in_worktrees_and_pastures() {
     let diff = client.thread_diff(thread, DiffScope::All).await;
     assert_eq!(diff_files(&diff), vec![("a.txt", FileChange::Added, 1, 0)]);
 
+    // Alone in its worktree, the thread can put its files back.
+    assert_eq!(diff.restore, RestoreAvailability::Available);
+    client.prompt_and_wait(thread, "write c.txt bye").await;
+    let Response::ThreadDiff(restored) = client
+        .ok(Request::RestoreCheckpoint {
+            thread_id: thread,
+            scope: DiffScope::LatestTurn,
+        })
+        .await
+    else {
+        panic!("expected the diff after restoring");
+    };
+    assert!(!worktree.join("c.txt").exists());
+    assert!(worktree.join("a.txt").exists());
+    assert_eq!(restored.turns, 1);
+    assert_eq!(
+        diff_files(&restored),
+        vec![("a.txt", FileChange::Added, 1, 0)]
+    );
+
     let status = client
         .tool(thread, "agentz_workspace_status", json!({}))
         .await;
@@ -1544,6 +1564,21 @@ async fn threads_work_in_worktrees_and_pastures() {
             .project_thread(launched)
             .and_then(|thread| thread.workspace.clone()),
         Some(worktree.clone())
+    );
+    // Sharing it, neither may restore.
+    let shared = client.thread_diff(thread, DiffScope::All).await;
+    assert!(matches!(
+        shared.restore,
+        RestoreAvailability::Unavailable(_)
+    ));
+    assert!(
+        client
+            .request(Request::RestoreCheckpoint {
+                thread_id: thread,
+                scope: DiffScope::All,
+            })
+            .await
+            .is_err()
     );
 
     // Removing asks first when work would be lost.

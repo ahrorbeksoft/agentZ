@@ -1,14 +1,17 @@
 //! The settings page, laid out like t3code's: a list of sections on the left (General,
 //! Appearance, then one entry per project) and the chosen section's rows on the right.
 
+use std::path::PathBuf;
+
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::workspace::WorkspaceRemoval;
 use collections::HashMap;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Window, actions,
 };
-use projects::{Project, ProjectIcon, ProjectId, ThreadOrder};
+use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Tooltip, WithScrollbar as _, prelude::*};
@@ -23,8 +26,9 @@ use crate::agent_view::open_in_terminal;
 use crate::app_settings::{AppSettingsStore, ThemeMode};
 use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfo, ProjectInfoStore, automatic_monogram, monogram_swatch,
-    render_project_icon,
+    render_project_icon, workspace_icon,
 };
+use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{ServerClient, ServerStatus};
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
@@ -252,6 +256,160 @@ impl SettingsPage {
             }
         })
         .detach();
+    }
+
+    /// Asks first, then asks again when the server finds work that removing would lose.
+    fn confirm_remove_workspace(
+        &mut self,
+        project_id: ProjectId,
+        workspace: &Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = workspace.kind.label().to_lowercase();
+        let thread_count = self.store.read(cx).threads_in_folder(&workspace.path).len();
+        let detail = match thread_count {
+            0 => "Its folder is deleted from disk.".to_string(),
+            1 => "Its folder is deleted from disk. 1 thread works there and stops.".to_string(),
+            count => {
+                format!("Its folder is deleted from disk. {count} threads work there and stop.")
+            }
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Remove the {kind} at {}?", compact_path(&workspace.path)),
+            Some(&detail),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        let store = self.store.clone();
+        let path = workspace.path.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let removal = remove_workspace(&store, project_id, path.clone(), false, cx).await;
+            let failure = match removal {
+                Ok(WorkspaceRemoval::NeedsConfirmation(reason)) => {
+                    let answer = cx.update(|window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            &format!("Remove the {kind} anyway?"),
+                            Some(&reason),
+                            &["Remove Anyway", "Cancel"],
+                            cx,
+                        )
+                    });
+                    let Ok(answer) = answer else {
+                        return;
+                    };
+                    if answer.await != Ok(0) {
+                        return;
+                    }
+                    remove_workspace(&store, project_id, path, true, cx)
+                        .await
+                        .err()
+                }
+                Ok(_) => None,
+                Err(error) => Some(error),
+            };
+            if let Some(error) = failure {
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Critical,
+                        &format!("Couldn't remove the {kind}"),
+                        Some(&format!("{error:#}")),
+                        &["OK"],
+                        cx,
+                    )
+                });
+                if let Ok(answer) = answer {
+                    answer.await.ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Project Settings › Checkouts: the project's worktrees and pastures, each with its branch,
+    /// folder and threads, and a way to remove it.
+    fn render_checkouts(&self, project: &Project, cx: &mut Context<Self>) -> AnyElement {
+        let project_id = project.id;
+        let heads = ProjectInfoStore::global(cx)
+            .read(cx)
+            .workspace_heads()
+            .clone();
+        let mut rows: Vec<AnyElement> = project
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| {
+                let branch = heads
+                    .get(&workspace.path)
+                    .map(|head| head.branch.clone())
+                    .or_else(|| workspace.branch.clone())
+                    .unwrap_or_else(|| "No branch".to_string());
+                let thread_count = self.store.read(cx).threads_in_folder(&workspace.path).len();
+                let mut description = format!(
+                    "{} · {}",
+                    workspace.kind.label(),
+                    compact_path(&workspace.path)
+                );
+                match thread_count {
+                    0 => {}
+                    1 => description.push_str(" · 1 thread"),
+                    count => description.push_str(&format!(" · {count} threads")),
+                }
+                let workspace = workspace.clone();
+                h_flex()
+                    .px_4()
+                    .py_3()
+                    .gap_3()
+                    .child(
+                        Icon::new(workspace_icon(workspace.kind))
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(Label::new(branch).truncate())
+                            .child(
+                                Label::new(description)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate_middle(),
+                            ),
+                    )
+                    .child(
+                        Button::new(("remove-workspace", index), "Remove…")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_remove_workspace(project_id, &workspace, window, cx)
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(
+                div()
+                    .px_4()
+                    .py_3()
+                    .child(
+                        Label::new(
+                            "No worktrees or pastures yet. New Thread offers them for git \
+                             repositories, and agents can make them too.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+        render_section("Checkouts", rows, cx)
     }
 
     fn render_nav(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1506,6 +1664,7 @@ impl SettingsPage {
                 ],
                 cx,
             ),
+            self.render_checkouts(&project, cx),
             render_section(
                 "Danger",
                 vec![render_row(
@@ -1529,6 +1688,20 @@ impl SettingsPage {
             ),
         ]
     }
+}
+
+async fn remove_workspace(
+    store: &Entity<ProjectStore>,
+    project_id: ProjectId,
+    path: PathBuf,
+    force: bool,
+    cx: &mut gpui::AsyncWindowContext,
+) -> anyhow::Result<WorkspaceRemoval> {
+    store
+        .read_with(cx, |store, cx| {
+            store.remove_workspace(project_id, path, force, cx)
+        })
+        .await
 }
 
 struct AccountPanel {

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::workspace::{ProjectGit, WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{Request, Response};
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
@@ -247,25 +248,111 @@ impl ProjectStore {
         self.send(Request::RemoveProject(id), cx)
     }
 
-    /// Resolves once the thread is in this copy. The server starts its agent right away.
+    /// Resolves once the thread is in this copy, after any new workspace is made. The server
+    /// starts its agent right away.
     pub fn create_thread(
         &mut self,
         project_id: ProjectId,
         agent_id: AgentId,
+        workspace: WorkspaceChoice,
         cx: &mut Context<Self>,
     ) -> Task<Result<ThreadId>> {
-        let response = ServerClient::global(cx)
-            .read(cx)
-            .request(Request::CreateThread {
+        self.request(
+            Request::CreateThread {
                 project_id,
                 agent_id,
-                workspace: Default::default(),
-            });
+                workspace,
+            },
+            |response| match response {
+                Response::ThreadCreated(thread_id) => Some(thread_id),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// The project's branches and whether pastures can be made, for New Thread.
+    pub fn project_git(&self, project_id: ProjectId, cx: &App) -> Task<Result<ProjectGit>> {
+        self.request(
+            Request::ProjectGit(project_id),
+            |response| match response {
+                Response::ProjectGit(git) => Some(git),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// Removes a worktree or pasture; without `force`, work it would lose is reported first.
+    pub fn remove_workspace(
+        &self,
+        project_id: ProjectId,
+        path: PathBuf,
+        force: bool,
+        cx: &App,
+    ) -> Task<Result<WorkspaceRemoval>> {
+        self.request(
+            Request::RemoveWorkspace {
+                project_id,
+                path,
+                force,
+            },
+            |response| match response {
+                Response::WorkspaceRemoval(removal) => Some(removal),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// Rebases a pasture onto the branch it started from, and says how it went.
+    pub fn sync_workspace(
+        &self,
+        project_id: ProjectId,
+        path: PathBuf,
+        cx: &App,
+    ) -> Task<Result<String>> {
+        self.request(
+            Request::SyncWorkspace {
+                project_id,
+                path,
+                branch: None,
+                merge: false,
+            },
+            message_response,
+            cx,
+        )
+    }
+
+    /// Creates the pasture's branch in the project's checkout, and says how it went.
+    pub fn bring_back_workspace(
+        &self,
+        project_id: ProjectId,
+        path: PathBuf,
+        cx: &App,
+    ) -> Task<Result<String>> {
+        self.request(
+            Request::BringBackWorkspace {
+                project_id,
+                path,
+                branch: None,
+            },
+            message_response,
+            cx,
+        )
+    }
+
+    fn request<T: Send + 'static>(
+        &self,
+        request: Request,
+        answer: fn(Response) -> Option<T>,
+        cx: &App,
+    ) -> Task<Result<T>> {
+        let response = ServerClient::global(cx).read(cx).request(request);
         cx.background_spawn(async move {
-            match response.await? {
-                Response::ThreadCreated(thread_id) => Ok(thread_id),
-                response => Err(anyhow!("unexpected response: {response:?}")),
-            }
+            let response = response.await?;
+            let description = format!("{response:?}");
+            answer(response).ok_or_else(|| anyhow!("unexpected response: {description}"))
         })
     }
 
@@ -289,6 +376,13 @@ impl ProjectStore {
             },
             cx,
         )
+    }
+}
+
+fn message_response(response: Response) -> Option<String> {
+    match response {
+        Response::Message(message) => Some(message),
+        _ => None,
     }
 }
 

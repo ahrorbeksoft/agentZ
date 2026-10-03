@@ -8,8 +8,8 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 6, worktrees and pastures: thread workspaces in `projects`, `git worktree add`,
-cow's pastures, and New Thread's workspace step.
+**Next:** Phase 7, terminals: port Zed's `terminal` into the server, stream screens to the app,
+terminal threads and the thread terminal drawer.
 
 | Phase | Status |
 |---|---|
@@ -19,7 +19,7 @@ cow's pastures, and New Thread's workspace step.
 | 3. Agent control (MCP and CLI) | Done |
 | 4. Subthreads | Done |
 | 5. Diffs | Done |
-| 6. Worktrees and pastures | Not started |
+| 6. Worktrees and pastures | Done |
 | 7. Terminals | Not started |
 | 8. Terminal agent detection | Not started |
 | 9. Machines over SSH | Not started |
@@ -151,40 +151,41 @@ Then the server:
 
 ## 6. Worktrees and pastures
 
-- [ ] Thread workspace in `projects`: kind (checkout, worktree, pasture), path and branch. The ACP
+- [x] Thread workspace in `projects`: kind (checkout, worktree, pasture), path and branch. The ACP
       session's `cwd` follows it.
-- [ ] Server, worktrees:
-  - [ ] `git worktree add -b agentz/<id> <data>/worktrees/<repo>/<branch> <base>`;
-  - [ ] recursive submodules.
-- [ ] Server, pastures (port of cow's `create`):
-  - [ ] `clonefile(2)` on macOS, skipping `target`, `.build`, `DerivedData`, `.turbo`;
-  - [ ] on Linux, `cp --reflink=always -R`, falling back to a full `cp -R` with a warning
+- [x] Server, worktrees:
+  - [x] `git worktree add -b agentz/<id> <data>/worktrees/<repo>/<branch> <base>`;
+  - [x] recursive submodules.
+- [x] Server, pastures (port of cow's `create`):
+  - [x] `clonefile(2)` on macOS, skipping `target`, `.build`, `DerivedData`, `.turbo`;
+  - [x] on Linux, `cp --reflink=always -R`, falling back to a full `cp -R` with a warning
         (cow);
-  - [ ] git fixes: drop `.git/worktrees`, `checkout.guess false`, branch;
-  - [ ] cleanup: `*.pid`, `*.sock`, `*.socket`, plus `.cow.json` `post_clone`;
-  - [ ] roll back on failure.
-- [ ] Pastures: sync from the project (temporary remote, rebase or merge, abort on conflict) and
+  - [x] git fixes: drop `.git/worktrees`, `checkout.guess false`, branch;
+  - [x] cleanup: `*.pid`, `*.sock`, `*.socket`, plus `.cow.json` `post_clone`;
+  - [x] roll back on failure.
+- [x] Pastures: sync from the project (temporary remote, rebase or merge, abort on conflict) and
       bring the branch back to the project.
-- [ ] List the project's worktrees and pastures.
-- [ ] New Thread › Workspace: Current checkout / New pasture / New worktree (base branch) /
-      existing. Thread menu: New thread in this workspace, Sync, Bring branch to project.
-- [ ] Cards show the thread's own branch. The details popover shows the workspace kind and
+- [x] List the project's worktrees and pastures.
+- [x] New Thread › Workspace: Current checkout / New pasture / New worktree (base branch) /
+      existing. Thread menu: New Thread Here, Sync from Project, Bring Branch to Project.
+- [x] Cards show the thread's own branch. The details popover shows the workspace kind and
       folder.
-- [ ] Project Settings › Checkouts:
-  - [ ] list worktrees and pastures;
-  - [ ] remove a worktree with `git worktree remove`, asking again before forcing;
-  - [ ] remove a pasture, warning about uncommitted or unpushed work;
-  - [ ] keep branches;
-  - [ ] refuse while the workspace is in use.
-- [ ] Tools:
-  - [ ] `agentz_workspace_status`, `agentz_workspace_list`;
-  - [ ] `agentz_workspace_handoff`, reopening the session with `session/load` in the new
+- [x] Project Settings › Checkouts:
+  - [x] list worktrees and pastures;
+  - [x] remove a worktree with `git worktree remove`, asking again before forcing;
+  - [x] remove a pasture, warning about uncommitted or unpushed work;
+  - [x] keep branches;
+  - [x] refuse while the workspace is in use.
+- [x] Tools:
+  - [x] `agentz_workspace_status`, `agentz_workspace_list`;
+  - [x] `agentz_workspace_handoff`, reopening the session with `session/load` in the new
         `cwd` or a new session;
-  - [ ] `agentz_workspace_sync`, `agentz_workspace_bring_back`;
-  - [ ] `workspaceStrategy` (root, worktree, pasture, existing) on `agentz_thread_launch` and
+  - [x] `agentz_workspace_sync`, `agentz_workspace_bring_back`;
+  - [x] `workspaceStrategy` (root, worktree, pasture, existing) on `agentz_thread_launch` and
         `delegate_task`.
-- [ ] Diffs: restoring files only for a thread in its own, unshared workspace.
-- [ ] Tests with temporary repositories (APFS for pastures).
+- [x] Diffs: restoring files only for a thread in its own, unshared workspace (the diff panel's
+      Revert, `Request::RestoreCheckpoint`).
+- [x] Tests with temporary repositories (APFS for pastures).
 
 ## 7. Terminals
 
@@ -457,6 +458,31 @@ Then the server:
     contents change (t3code). No restore yet: phase 6 adds it for threads in their own
     workspace.
 
+- 2026-10-03: Worktrees and pastures (phase 6):
+  - **A thread's workspace is a path** into its project's `workspaces`, which record kind,
+    branch and base. `thread_folder` is the agent's `cwd` and where checkpoints are taken.
+    Subthreads and delegated tasks work where their parent does unless given a
+    `workspaceStrategy`; launched threads default to the project's folder (`root`).
+  - **Making a workspace is slow work off the server's task:** `spawn_then` runs git or the
+    clone and comes back as `Input::Run`. Tools return `Step::Then` so a tool call can wait for a
+    workspace without blocking the server.
+  - **Workspace paths are canonicalized** (`/private/tmp`, not `/tmp`), as project paths are, so
+    an agent's reported folder matches.
+  - **Handoff** records the thread in `moving_threads`. When its turn ends, the server closes the
+    agent and starts it again in the new folder (with `session/load` when it can), then sends
+    the continuation prompt.
+  - **Sync's dirty check ignores untracked files** (`--untracked-files=no`): a pasture copies
+    untracked files like `.cow.json` from the project.
+  - **Restoring** follows t3code's `restoreCheckpoint` (`git restore --source`, `git clean -fd`,
+    then unstage), then drops the later checkpoints so the reverted turns stop counting. Only a
+    thread alone in its worktree or pasture (its own subthreads aside) may restore, and not while
+    a turn runs there. ACP can't rewind a conversation, so only files go back.
+  - **The app:** New Thread's Workspace step loads the repository's branches and pasture support
+    when the agent step opens and skips itself for folders outside git. Cards show the thread's
+    own branch with a worktree or pasture icon; the details popover shows the folder. Project
+    Settings › Checkouts lists workspaces with their threads and removes them, asking again
+    when the server reports work that would be lost.
+
 ## Open questions
 
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
@@ -510,3 +536,7 @@ Then the server:
   parent.
 - 2026-10-03: Finished phase 5: checkpoints as hidden git refs around every turn (a932899),
   `agentz_thread_diff`, and the diff panel.
+- 2026-10-03: Phase 6: thread workspaces, worktrees and pastures on the server, and the
+  workspace tools (13fbcc2).
+- 2026-10-03: Finished phase 6: New Thread's Workspace step, branches and markers on cards,
+  the thread menu's pasture actions, Project Settings › Checkouts, and Revert in the diff panel.

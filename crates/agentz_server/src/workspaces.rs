@@ -105,6 +105,11 @@ pub(crate) async fn create(new: NewWorkspace) -> Result<Workspace> {
     tokio::fs::create_dir_all(parent)
         .await
         .with_context(|| format!("creating {}", parent.display()))?;
+    // Agents report their folder resolved (`/private/tmp`, not `/tmp`), as projects are stored.
+    let path = match path.file_name() {
+        Some(name) => tokio::fs::canonicalize(parent).await?.join(name),
+        None => path,
+    };
     match new.kind {
         WorkspaceKind::Worktree => create_worktree(repo, &path, &branch, &base).await?,
         WorkspaceKind::Pasture => {
@@ -699,7 +704,10 @@ mod tests {
         .expect("creates");
         assert_eq!(
             workspace.path,
-            data_dir.join("worktrees/demo/feature-login")
+            data_dir
+                .canonicalize()
+                .expect("resolves")
+                .join("worktrees/demo/feature-login")
         );
         assert_eq!(workspace.base.as_deref(), Some("main"));
         assert!(workspace.path.join("README.md").exists());

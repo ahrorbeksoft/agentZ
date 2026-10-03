@@ -13,7 +13,7 @@ use agent_thread::{AgentThread, AgentThreadEvent, ThreadMessage, ThreadView};
 use agentz_protocol::agents::{
     AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
-use agentz_protocol::diff::{DiffScope, ThreadDiff};
+use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::{
     AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineInfo, Request, Response,
     ServerMessage, SessionSnapshot,
@@ -234,6 +234,11 @@ impl Server {
                 id,
                 request: Request::ThreadDiff { thread_id, scope },
             } => self.thread_diff(client, id, thread_id, scope),
+            Input::Request {
+                client,
+                id,
+                request: Request::RestoreCheckpoint { thread_id, scope },
+            } => self.restore_checkpoint(client, id, thread_id, scope),
             Input::Respond { client, id, result } => {
                 self.send(client, ServerMessage::Response { id, result })
             }
@@ -536,7 +541,9 @@ impl Server {
             // Handled by `call_tool`, `thread_diff` and `workspace_request`, since they may answer
             // later.
             Request::CallTool { .. } => Err(anyhow!("tool calls are handled separately")),
-            Request::ThreadDiff { .. } => Err(anyhow!("diffs are handled separately")),
+            Request::ThreadDiff { .. } | Request::RestoreCheckpoint { .. } => {
+                Err(anyhow!("diffs are handled separately"))
+            }
             Request::CreateThread { .. }
             | Request::ProjectGit(_)
             | Request::RemoveWorkspace { .. }
@@ -587,6 +594,73 @@ impl Server {
         self.send(client, ServerMessage::Response { id, result });
     }
 
+    /// A checkpoint is the whole folder, so restoring is only for a thread alone in its own
+    /// worktree or pasture, with its own subthreads (t3code's isolation rule).
+    fn restore_availability(&self, thread_id: ThreadId) -> RestoreAvailability {
+        let Some(folder) = self.projects.thread_folder(thread_id) else {
+            return RestoreAvailability::Unavailable("There's no such thread.".into());
+        };
+        let Some(workspace) = self.projects.thread_workspace(thread_id) else {
+            return RestoreAvailability::Unavailable(
+                "Restoring files needs a thread in its own worktree or pasture. The project's \
+                 folder may hold changes from other threads and from you."
+                    .into(),
+            );
+        };
+        let is_shared = self
+            .projects
+            .threads_in_folder(&folder)
+            .into_iter()
+            .any(|other| other != thread_id && self.projects.root_thread(other) != thread_id);
+        if is_shared {
+            return RestoreAvailability::Unavailable(format!(
+                "Another thread works in this {} too, so its files may hold that thread's \
+                 changes.",
+                workspace.kind.label().to_lowercase()
+            ));
+        }
+        RestoreAvailability::Available
+    }
+
+    fn restore_checkpoint(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        thread_id: ThreadId,
+        scope: DiffScope,
+    ) {
+        let prepared = (|| {
+            if let RestoreAvailability::Unavailable(reason) = self.restore_availability(thread_id) {
+                anyhow::bail!(reason);
+            }
+            let checkpoints = self.checkpoints(thread_id).context("no such thread")?;
+            let folder = self
+                .projects
+                .thread_folder(thread_id)
+                .context("no such thread")?;
+            anyhow::ensure!(
+                !self
+                    .projects
+                    .threads_in_folder(&folder)
+                    .into_iter()
+                    .any(|thread| self.projects.is_thread_working(thread)),
+                "a turn is running there; wait for it to end, or stop it"
+            );
+            Ok(checkpoints)
+        })();
+        let checkpoints = match prepared {
+            Ok(checkpoints) => checkpoints,
+            Err(error) => return self.respond(client, id, Err(error)),
+        };
+        self.spawn_then(
+            async move {
+                checkpoints.restore(scope).await?;
+                thread_diff(&checkpoints, scope, RestoreAvailability::Available).await
+            },
+            move |server, diff| server.respond(client, id, diff.map(Response::ThreadDiff)),
+        );
+    }
+
     fn delete_checkpoints(&self, threads: Vec<ThreadId>) {
         let checkpoints: Vec<Checkpoints> = threads
             .into_iter()
@@ -613,9 +687,10 @@ impl Server {
             );
             return;
         };
+        let restore = self.restore_availability(thread_id);
         let inputs = self.inputs.clone();
         self.runtime.spawn(async move {
-            let result = thread_diff(&checkpoints, scope)
+            let result = thread_diff(&checkpoints, scope, restore)
                 .await
                 .map(Response::ThreadDiff)
                 .map_err(|error| ErrorResponse {
@@ -989,13 +1064,18 @@ fn send_to(outgoing: &mpsc::UnboundedSender<ServerMessage>, message: ServerMessa
 }
 
 /// The thread's changes in the scope, with the patch parsed into files.
-async fn thread_diff(checkpoints: &Checkpoints, scope: DiffScope) -> Result<ThreadDiff> {
+async fn thread_diff(
+    checkpoints: &Checkpoints,
+    scope: DiffScope,
+    restore: RestoreAvailability,
+) -> Result<ThreadDiff> {
     let diff = checkpoints.diff(scope).await?;
     Ok(ThreadDiff {
         status: diff.status,
         turns: diff.turns,
         files: agentz_protocol::diff::parse_patch(&diff.patch),
         truncated: diff.truncated,
+        restore,
     })
 }
 

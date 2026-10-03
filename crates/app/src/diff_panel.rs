@@ -6,13 +6,15 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::rc::Rc;
 use std::time::SystemTime;
 
-use agentz_protocol::diff::{DiffFile, DiffScope, DiffStatus, FileChange, ThreadDiff};
+use agentz_protocol::diff::{
+    DiffFile, DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff,
+};
 use agentz_protocol::thread::DiffLineKind;
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, Context, ListAlignment, ListState, Subscription, Task, WeakEntity, Window,
-    list,
+    AnyElement, App, Context, ListAlignment, ListState, PromptLevel, Subscription, Task,
+    WeakEntity, Window, list,
 };
 use projects::ThreadId;
 use ui::{
@@ -241,6 +243,75 @@ impl DiffPanel {
         cx.notify();
     }
 
+    /// Puts the files back as they were before the shown changes, after asking.
+    fn confirm_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scope = self.scope;
+        let (message, detail) = match scope {
+            DiffScope::LatestTurn => (
+                "Revert the latest turn?",
+                "Its changes to files are undone, and it no longer counts. The conversation \
+                 stays as it is.",
+            ),
+            DiffScope::All => (
+                "Revert all changes?",
+                "Files go back to how they were before the thread's first turn. The \
+                 conversation stays as it is.",
+            ),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            message,
+            Some(detail),
+            &["Revert", "Cancel"],
+            cx,
+        );
+        let thread_id = self.thread_id;
+        let client = ServerClient::global(cx);
+        self._load = cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let request = client.read_with(cx, |client, _| {
+                client.request(Request::RestoreCheckpoint { thread_id, scope })
+            });
+            this.update(cx, |this, cx| {
+                this.loading = true;
+                cx.notify();
+            })
+            .ok();
+            let response = request.await;
+            let failure = this
+                .update(cx, |this, cx| {
+                    this.loading = false;
+                    cx.notify();
+                    match response {
+                        Ok(Response::ThreadDiff(diff)) => {
+                            this.set_diff(diff);
+                            None
+                        }
+                        Ok(response) => Some(format!("Unexpected response: {response:?}")),
+                        Err(error) => Some(format!("{error:#}")),
+                    }
+                })
+                .ok()
+                .flatten();
+            if let Some(failure) = failure {
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Critical,
+                        "Couldn't revert",
+                        Some(&failure),
+                        &["OK"],
+                        cx,
+                    )
+                });
+                if let Ok(answer) = answer {
+                    answer.await.ok();
+                }
+            }
+        });
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let latest = cx.entity().downgrade();
         let all = latest.clone();
@@ -306,6 +377,34 @@ impl DiffPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_all_collapsed(cx))),
                 )
             })
+            .when_some(
+                self.diff
+                    .as_ref()
+                    .filter(|diff| !diff.files.is_empty())
+                    .map(|diff| diff.restore.clone()),
+                |this, restore| {
+                    let label = match self.scope {
+                        DiffScope::LatestTurn => "Revert Latest Turn",
+                        DiffScope::All => "Revert All Changes",
+                    };
+                    let (available, tooltip) = match restore {
+                        RestoreAvailability::Available => (true, SharedString::from(label)),
+                        RestoreAvailability::Unavailable(reason) => (false, reason.into()),
+                        RestoreAvailability::Unknown(_) => {
+                            (false, "This server can't restore files.".into())
+                        }
+                    };
+                    this.child(
+                        IconButton::new("diff-restore", IconName::Undo)
+                            .icon_size(IconSize::Small)
+                            .disabled(!available || self.loading)
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.confirm_restore(window, cx)),
+                            ),
+                    )
+                },
+            )
             .child(
                 IconButton::new("diff-refresh", IconName::ArrowCircle)
                     .icon_size(IconSize::Small)
@@ -703,6 +802,7 @@ diff --git a/b.txt b/b.txt
             turns: 1,
             files: agentz_protocol::diff::parse_patch(patch),
             truncated: false,
+            restore: RestoreAvailability::Available,
         };
         let collapsed = HashSet::from_iter(["b.txt".to_string()]);
         let numbers: Vec<(Option<u32>, Option<u32>)> = build_rows(&diff, &collapsed)
