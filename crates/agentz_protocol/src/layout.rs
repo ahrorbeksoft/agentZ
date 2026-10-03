@@ -80,6 +80,16 @@ pub enum Node {
     },
 }
 
+impl Node {
+    /// The top-left pane.
+    pub fn first_pane(&self) -> PaneId {
+        match self {
+            Node::Pane(id) => *id,
+            Node::Split { first, .. } => first.first_pane(),
+        }
+    }
+}
+
 /// A tree of splits and the focused pane.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TileLayout {

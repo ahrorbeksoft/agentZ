@@ -5,7 +5,7 @@
 //! Spaces are shared session state (herdr's runtime/client rule): the server keeps, saves and
 //! restores them. Which tab is shown, which pane is focused, and zoom belong to each client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use projects::{ProjectId, ThreadId};
 use serde::{Deserialize, Serialize};
@@ -67,19 +67,57 @@ pub struct Space {
     /// The folder's branch, looked up by the server from time to time. Not saved.
     #[serde(default)]
     pub git: Option<SpaceGit>,
+    /// The folder most of its tabs are in now, which may not be where it was opened. The
+    /// server looks it up from time to time, and `git` describes it. Not saved.
+    #[serde(default)]
+    pub current: Option<SpaceFolder>,
 }
 
 impl Space {
-    /// The name the sidebar shows: the user's, or the folder's.
+    /// The name the sidebar shows: the user's, or the folder the workspace is in now, or the
+    /// folder it was opened in.
     pub fn label(&self) -> String {
         if let Some(name) = &self.name {
             return name.clone();
         }
-        self.folder
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.folder.to_string_lossy().into_owned())
+        match &self.current {
+            Some(current) => current.name(),
+            None => folder_name(&self.folder),
+        }
     }
+
+    /// Where the workspace is now.
+    pub fn current_folder(&self) -> &Path {
+        self.current
+            .as_ref()
+            .map_or(self.folder.as_path(), |current| current.path.as_path())
+    }
+}
+
+/// A folder as its machine's user would write it, since a client can't tell another
+/// machine's home.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceFolder {
+    pub path: PathBuf,
+    /// `~` for home.
+    pub display_path: String,
+}
+
+impl SpaceFolder {
+    /// The folder's own name, or `~` for home.
+    pub fn name(&self) -> String {
+        if self.display_path == "~" {
+            return self.display_path.clone();
+        }
+        folder_name(&self.path)
+    }
+}
+
+fn folder_name(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.to_string_lossy().into_owned())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -227,4 +265,40 @@ pub enum SpaceRequest {
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn space(name: Option<&str>, current: Option<(&str, &str)>) -> Space {
+        Space {
+            id: SpaceId(1),
+            name: name.map(str::to_string),
+            folder: PathBuf::from("/work/app"),
+            project_id: None,
+            tabs: Vec::new(),
+            git: None,
+            current: current.map(|(path, display_path)| SpaceFolder {
+                path: PathBuf::from(path),
+                display_path: display_path.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_label_follows_the_current_folder_unless_renamed() {
+        assert_eq!(space(None, None).label(), "app");
+        assert_eq!(space(None, Some(("/work/lib", "/work/lib"))).label(), "lib");
+        assert_eq!(space(None, Some(("/Users/me", "~"))).label(), "~");
+        assert_eq!(
+            space(Some("Mine"), Some(("/work/lib", "/work/lib"))).label(),
+            "Mine"
+        );
+        assert_eq!(
+            space(None, Some(("/work/lib", "/work/lib"))).current_folder(),
+            Path::new("/work/lib")
+        );
+        assert_eq!(space(None, None).current_folder(), Path::new("/work/app"));
+    }
 }

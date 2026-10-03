@@ -18,7 +18,7 @@ use agentz_protocol::{Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Subscription,
+    FocusHandle, Focusable, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Subscription, Task,
     Window, actions, relative,
 };
 use projects::ThreadId;
@@ -30,11 +30,13 @@ use ui::{
 
 use crate::OpenSettings;
 use crate::agent_view::{AgentView, AgentViewEvent};
-use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
+use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
+use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_store::ThreadStatus;
 use crate::sidebar::{
-    ARCHIVED_ROW_HEIGHT, SIDEBAR_WIDTH, render_footer_item, render_status_dot, thread_agent_icon,
+    ARCHIVED_ROW_HEIGHT, DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover,
+    render_folder_icon, render_footer_item, render_status_dot, thread_agent_icon,
 };
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -246,6 +248,10 @@ pub struct SpacesView {
     renaming: Option<RenameTarget>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
+    /// The workspace whose details popover shows, and the one waiting to show it.
+    details_space: Option<SpaceKey>,
+    details_delay: Option<(SpaceKey, Task<()>)>,
+    hovered_space: Option<SpaceKey>,
     is_visible: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -268,6 +274,7 @@ impl SpacesView {
                 this.sync(window, cx)
             }),
             cx.subscribe(&search, |_, _, _: &TextInputEvent, cx| cx.notify()),
+            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 this.mark_visible_seen(window, cx)
             }),
@@ -289,6 +296,9 @@ impl SpacesView {
             renaming: None,
             rename_input,
             _rename_blur: None,
+            details_space: None,
+            details_delay: None,
+            hovered_space: None,
             is_visible: false,
             _subscriptions: subscriptions,
         };
@@ -372,7 +382,7 @@ impl SpacesView {
                 match self.layouts.get_mut(&key) {
                     Some(layout) => layout.set_root(tab.root.clone()),
                     None => {
-                        let first = first_pane(&tab.root);
+                        let first = tab.root.first_pane();
                         self.layouts
                             .insert(key, TileLayout::from_saved(tab.root.clone(), first));
                     }
@@ -974,7 +984,7 @@ impl SpacesView {
             if !matches_space(&space, &query) {
                 continue;
             }
-            rows.push(self.render_space_row(machine, row_index, &space, has_remotes, cx));
+            rows.push(self.render_space_row(machine, row_index, &space, cx));
         }
 
         v_flex()
@@ -1090,7 +1100,6 @@ impl SpacesView {
         machine: MachineId,
         index: usize,
         space: &Space,
-        has_remotes: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = SpaceKey {
@@ -1108,14 +1117,59 @@ impl SpacesView {
                 .filter_map(|pane| self.pane_status(machine, pane, cx)),
         );
         let is_renaming = self.renaming == Some(RenameTarget::Space(key));
-        let machine_label = has_remotes.then(|| self.machines.read(cx).label(machine, cx));
+        let machine_icon = self.machines.read(cx).machine_icon(machine, cx);
+        let machine_label = self.machines.read(cx).label(machine, cx);
         let git = space.git.clone();
+        let path: SharedString = space
+            .current
+            .as_ref()
+            .map(|current| current.display_path.clone())
+            .unwrap_or_else(|| space.folder.to_string_lossy().into_owned())
+            .into();
+        let (terminals, agents) = self.space_contents(machine, space, cx);
+        let contents = contents_label(terminals, agents);
+        // The project the workspace is in now, if any: its icon stands for the workspace.
+        let project = self
+            .machines
+            .read(cx)
+            .projects(machine, cx)
+            .and_then(|store| {
+                project_at(store.read(cx).projects(), space.current_folder()).cloned()
+            });
+        let project_info = project.as_ref().and_then(|project| {
+            ProjectInfoStore::global(cx)
+                .read(cx)
+                .info(machine, project.id)
+                .cloned()
+        });
+        let icon = match &project {
+            Some(project) => render_project_icon(project, project_info.as_ref(), px(16.), cx),
+            None => render_folder_icon(),
+        };
+        let details = ThreadDetails {
+            title: label.clone(),
+            project: project.map(|project| (project, project_info)),
+            machine: (machine_icon, machine_label.clone()),
+            branch: git.as_ref().map(|git| {
+                git.branch
+                    .clone()
+                    .unwrap_or_else(|| "detached".to_string())
+                    .into()
+            }),
+            path: Some(path.clone()),
+            workspace: None,
+            agent: None,
+            contents: contents.clone().map(Into::into),
+        };
+        let details_popover =
+            (self.details_space == Some(key)).then(|| render_details_popover(details, cx));
         let id = format!("workspace-{}-{}", machine.slug(), space.id.0);
 
         let name_line = h_flex()
             .gap_2()
             .min_w_0()
             .child(render_state_slot(status, cx))
+            .child(icon)
             .child(if is_renaming {
                 self.render_rename_input(cx)
             } else {
@@ -1130,28 +1184,49 @@ impl SpacesView {
                     .into_any_element()
             })
             .child(div().flex_1())
-            .children(machine_label.map(|label| {
-                Label::new(label)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .truncate()
-            }));
-        let git_line = git.map(|git| {
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(machine_icon)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(machine_label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+            );
+        let has_git = git.is_some();
+        // The branch inside a repository, and the folder outside one.
+        let git_line = Some(git.unwrap_or_default()).map(|git| {
             h_flex()
-                .pl(px(14.))
+                .pl(px(38.))
                 .gap_1()
                 .min_w_0()
                 .child(
-                    Icon::new(IconName::GitBranch)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
+                    Icon::new(if has_git {
+                        IconName::GitBranch
+                    } else {
+                        IconName::Folder
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
                 )
-                .child(
+                .child(if has_git {
                     Label::new(git.branch.unwrap_or_else(|| "detached".to_string()))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted)
-                        .truncate(),
-                )
+                        .truncate()
+                } else {
+                    Label::new(path)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate_middle()
+                })
                 .when(git.ahead > 0, |line| {
                     line.child(
                         Label::new(format!("↑{}", git.ahead))
@@ -1168,63 +1243,85 @@ impl SpacesView {
                 })
         });
 
-        let row = v_flex()
-            .id(ElementId::Name(id.clone().into()))
-            .mx_1()
-            .px_2()
-            .py_1()
-            .gap_0p5()
-            .rounded_md()
-            .cursor_pointer()
-            .when(is_active, |row| row.bg(colors.element_selected))
-            .when(!is_active, |row| {
-                row.hover(|row| row.bg(colors.ghost_element_hover))
-            })
-            .child(name_line)
-            .children(git_line)
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                if event.click_count() == 2 {
-                    let label = this
-                        .space(key, cx)
-                        .map(|space| space.label())
-                        .unwrap_or_default();
-                    this.start_renaming(RenameTarget::Space(key), label.into(), window, cx);
-                } else {
-                    this.activate_space(key, window, cx);
-                }
-            }))
-            .on_drag(
-                DraggedLabel {
-                    item: key,
-                    label: label.clone(),
-                },
-                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
-            )
-            .drag_over::<DraggedLabel<SpaceKey>>(move |style, dragged, _, cx| {
-                if dragged.item.machine == machine {
-                    style.bg(cx.theme().colors().drop_target_background)
-                } else {
-                    style
-                }
-            })
-            .on_drop(
-                cx.listener(move |this, dragged: &DraggedLabel<SpaceKey>, _, cx| {
-                    if dragged.item.machine == machine && dragged.item != key {
-                        this.send(
-                            machine,
-                            SpaceRequest::MoveSpace {
-                                space: dragged.item.space,
-                                index,
-                            },
-                            cx,
-                        );
+        let row =
+            v_flex()
+                .id(ElementId::Name(id.clone().into()))
+                .debug_selector({
+                    let id = id.clone();
+                    move || id
+                })
+                .mx_1()
+                .px_2()
+                .py_1()
+                .gap_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .when(is_active, |row| row.bg(colors.element_selected))
+                .when(!is_active, |row| {
+                    row.hover(|row| row.bg(colors.ghost_element_hover))
+                })
+                .child(name_line)
+                .children(git_line)
+                .children(contents.map(|contents| {
+                    h_flex().pl(px(38.)).child(
+                        Label::new(contents)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.space_hovered(key, *hovered, cx)
+                }))
+                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    if event.click_count() == 2 {
+                        let label = this
+                            .space(key, cx)
+                            .map(|space| space.label())
+                            .unwrap_or_default();
+                        this.start_renaming(RenameTarget::Space(key), label.into(), window, cx);
+                    } else {
+                        this.activate_space(key, window, cx);
                     }
-                }),
-            );
+                }))
+                .on_drag(
+                    DraggedLabel {
+                        item: key,
+                        label: label.clone(),
+                    },
+                    |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                )
+                .drag_over::<DraggedLabel<SpaceKey>>(move |style, dragged, _, cx| {
+                    if dragged.item.machine == machine {
+                        style.bg(cx.theme().colors().drop_target_background)
+                    } else {
+                        style
+                    }
+                })
+                .on_drop(
+                    cx.listener(move |this, dragged: &DraggedLabel<SpaceKey>, _, cx| {
+                        if dragged.item.machine == machine && dragged.item != key {
+                            this.send(
+                                machine,
+                                SpaceRequest::MoveSpace {
+                                    space: dragged.item.space,
+                                    index,
+                                },
+                                cx,
+                            );
+                        }
+                    }),
+                );
 
         let this = cx.entity().downgrade();
         right_click_menu(ElementId::Name(format!("{id}-menu").into()))
-            .trigger(move |_, _, _| row)
+            .trigger(move |is_menu_open, _, _| {
+                div()
+                    .relative()
+                    .child(row)
+                    .when(!is_menu_open, |this| this.children(details_popover))
+            })
             .menu(move |window, cx| {
                 let this = this.clone();
                 let label = label.clone();
@@ -1265,6 +1362,76 @@ impl SpacesView {
                 })
             })
             .into_any_element()
+    }
+
+    /// Shows a workspace's details after a moment, like the thread cards do.
+    fn space_hovered(&mut self, key: SpaceKey, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            if self.hovered_space == Some(key) {
+                self.hovered_space = None;
+            }
+            let is_pending = self
+                .details_delay
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == key);
+            if is_pending || self.details_space == Some(key) {
+                self.hide_details(cx);
+            }
+            return;
+        }
+        self.hovered_space = Some(key);
+        if self.details_space == Some(key) {
+            return;
+        }
+        let delay = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DETAILS_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.details_delay = None;
+                this.details_space = Some(key);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.details_delay = Some((key, delay));
+    }
+
+    fn hide_details(&mut self, cx: &mut Context<Self>) {
+        self.details_delay = None;
+        if self.details_space.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// How many terminals and agents a workspace holds across its tabs. An agent CLI in a
+    /// terminal is an agent, not a terminal, and a thread in several panes counts once.
+    fn space_contents(&self, machine: MachineId, space: &Space, cx: &App) -> (usize, usize) {
+        let store = self.machines.read(cx).projects(machine, cx);
+        let store = store.as_ref().map(|store| store.read(cx));
+        let mut threads = HashSet::default();
+        let (mut terminals, mut agents) = (0, 0);
+        for pane in space.tabs.iter().flat_map(|tab| &tab.panes) {
+            match &pane.content {
+                PaneContent::Terminal(_) if pane.agent.is_some() => agents += 1,
+                PaneContent::Terminal(_) => terminals += 1,
+                PaneContent::Thread(thread_id) => {
+                    if !threads.insert(*thread_id) {
+                        continue;
+                    }
+                    let is_terminal = store
+                        .and_then(|store| store.thread(*thread_id))
+                        .is_some_and(|thread| thread.terminal.is_some());
+                    let has_agent =
+                        store.is_some_and(|store| store.terminal_agent(*thread_id).is_some());
+                    if is_terminal && !has_agent {
+                        terminals += 1;
+                    } else {
+                        agents += 1;
+                    }
+                }
+                PaneContent::Unknown(_) => {}
+            }
+        }
+        (terminals, agents)
     }
 
     /// The agents in panes on every machine, in workspace and tab order as herdr lists them:
@@ -2297,6 +2464,22 @@ fn rolled_up(statuses: impl Iterator<Item = ThreadStatus>) -> Option<ThreadStatu
     })
 }
 
+/// "2 terminals · 1 agent", leaving out what's zero.
+fn contents_label(terminals: usize, agents: usize) -> Option<String> {
+    let plural =
+        |count: usize, word: &str| format!("{count} {word}{}", if count == 1 { "" } else { "s" });
+    match (terminals, agents) {
+        (0, 0) => None,
+        (terminals, 0) => Some(plural(terminals, "terminal")),
+        (0, agents) => Some(plural(agents, "agent")),
+        (terminals, agents) => Some(format!(
+            "{} · {}",
+            plural(terminals, "terminal"),
+            plural(agents, "agent")
+        )),
+    }
+}
+
 /// A tab's name, or its number, as herdr numbers unnamed tabs.
 fn tab_label(tab: &Tab, index: usize) -> String {
     tab.name.clone().unwrap_or_else(|| (index + 1).to_string())
@@ -2325,16 +2508,9 @@ fn new_shell() -> PaneContent {
     })
 }
 
-fn first_pane(node: &Node) -> PaneId {
-    match node {
-        Node::Pane(id) => *id,
-        Node::Split { first, .. } => first_pane(first),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use agentz_protocol::spaces::{PaneAgent, PaneAgentState, SpacesSnapshot};
+    use agentz_protocol::spaces::{PaneAgent, PaneAgentState, SpaceFolder, SpacesSnapshot};
     use gpui::TestAppContext;
 
     use super::*;
@@ -2386,6 +2562,7 @@ mod tests {
                     panes: vec![pane(3, None), pane(4, None), agent_pane],
                 }],
                 git: None,
+                current: None,
             }],
         }
     }
@@ -2404,6 +2581,7 @@ mod tests {
             let client =
                 ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(), cx);
             crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
@@ -2466,6 +2644,68 @@ mod tests {
         );
         assert_eq!(rolled_up([Working].into_iter()), Some(Working));
         assert_eq!(rolled_up(std::iter::empty()), None);
+    }
+
+    #[gpui::test]
+    fn a_workspace_shows_its_current_folder_and_details_on_hover(cx: &mut TestAppContext) {
+        let mut state = spaces();
+        for pane in state.spaces[0].tabs[0].panes.iter_mut().take(2) {
+            pane.content = new_shell();
+        }
+        state.spaces[0].current = Some(SpaceFolder {
+            path: PathBuf::from("/tmp/other"),
+            display_path: "/tmp/other".to_string(),
+        });
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+
+        let key = SpaceKey {
+            machine: MachineId::Local,
+            space: SpaceId(1),
+        };
+        // Three panes: two terminals, and one running an agent.
+        let (space, contents) = view.read_with(cx, |view, cx| {
+            let space = view.space(key, cx).expect("the workspace");
+            let contents = view.space_contents(MachineId::Local, &space, cx);
+            (space, contents)
+        });
+        assert_eq!(space.label(), "other");
+        assert_eq!(contents, (2, 1));
+
+        let row = cx
+            .debug_bounds("workspace-local-1")
+            .expect("the workspace row is drawn");
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        assert_eq!(view.read_with(cx, |view, _| view.details_space), None);
+        cx.executor().advance_clock(DETAILS_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.details_space), Some(key));
+
+        cx.simulate_mouse_move(
+            gpui::point(px(900.), px(600.)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.details_space), None);
+    }
+
+    #[test]
+    fn contents_leave_out_what_is_zero() {
+        assert_eq!(contents_label(0, 0), None);
+        assert_eq!(contents_label(1, 0).as_deref(), Some("1 terminal"));
+        assert_eq!(contents_label(0, 2).as_deref(), Some("2 agents"));
+        assert_eq!(
+            contents_label(3, 1).as_deref(),
+            Some("3 terminals · 1 agent")
+        );
     }
 
     #[test]

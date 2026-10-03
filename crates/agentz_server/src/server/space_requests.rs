@@ -7,13 +7,14 @@ use std::time::Duration;
 use agentz_protocol::Response;
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::spaces::{
-    Pane, PaneAgent, PaneAgentState, PaneContent, PaneTerminal, SpaceId, SpaceRequest,
+    Pane, PaneAgent, PaneAgentState, PaneContent, PaneTerminal, SpaceFolder, SpaceId, SpaceRequest,
 };
 use agentz_protocol::terminal::TerminalKey;
 use anyhow::{Context as _, Result, anyhow};
 use projects::ThreadId;
 use util::ResultExt as _;
 
+use super::terminal_requests::home_relative;
 use super::{Input, Server};
 use crate::detect::{Agent, AgentState};
 use crate::spaces;
@@ -25,6 +26,27 @@ const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Server {
     pub(super) fn space_request(&mut self, request: SpaceRequest) -> Result<Response> {
+        // Which folder most tabs are in changes with the tabs and their first panes.
+        let moves_tabs = matches!(
+            request,
+            SpaceRequest::CreateTab { .. }
+                | SpaceRequest::CloseTab(_)
+                | SpaceRequest::MoveTab { .. }
+                | SpaceRequest::ClosePane(_)
+                | SpaceRequest::SwapPanes(..)
+                | SpaceRequest::SetPaneContent { .. }
+        );
+        let response = self.handle_space_request(request)?;
+        if moves_tabs {
+            let spaces: Vec<SpaceId> = self.spaces.spaces().iter().map(|space| space.id).collect();
+            for space in spaces {
+                self.refresh_space_git(space);
+            }
+        }
+        Ok(response)
+    }
+
+    fn handle_space_request(&mut self, request: SpaceRequest) -> Result<Response> {
         match request {
             SpaceRequest::CreateSpace {
                 folder,
@@ -256,14 +278,85 @@ impl Server {
         }
     }
 
+    /// Looks up where a workspace is now, the folder most of its tabs are in, and that
+    /// folder's branch.
     fn refresh_space_git(&mut self, space: SpaceId) {
-        let Ok(folder) = self.space_folder(space) else {
+        let Some(folder) = self.space_current_folder(space) else {
             return;
         };
         self.spawn_then(
-            async move { spaces::space_git(&folder).await },
-            move |server, git| server.spaces.set_git(space, git),
+            async move {
+                let git = spaces::space_git(&folder).await;
+                (folder, git)
+            },
+            move |server, (folder, git)| {
+                server.spaces.set_current(
+                    space,
+                    Some(SpaceFolder {
+                        display_path: home_relative(&folder),
+                        path: folder,
+                    }),
+                );
+                server.spaces.set_git(space, git);
+            },
         );
+    }
+
+    pub(super) fn refresh_space_of_pane(&mut self, pane: PaneId) {
+        let space = self
+            .spaces
+            .panes()
+            .find(|(_, candidate)| candidate.id == pane)
+            .map(|(space, _)| space.id);
+        if let Some(space) = space {
+            self.refresh_space_git(space);
+        }
+    }
+
+    /// The folder most of a workspace's tabs are in, each tab by its top-left pane. A workspace
+    /// whose tabs have no folder yet is still where it was opened.
+    fn space_current_folder(&self, space: SpaceId) -> Option<PathBuf> {
+        let space = self
+            .spaces
+            .spaces()
+            .iter()
+            .find(|candidate| candidate.id == space)?;
+        let tab_folders: Vec<PathBuf> = space
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let pane = tab.pane(tab.root.first_pane())?;
+                self.pane_current_folder(&pane.content, pane.id)
+            })
+            .collect();
+        Some(
+            spaces::majority_folder(&tab_folders)
+                .unwrap_or(&space.folder)
+                .clone(),
+        )
+    }
+
+    fn pane_current_folder(&self, content: &PaneContent, pane: PaneId) -> Option<PathBuf> {
+        match content {
+            PaneContent::Terminal(terminal) => self
+                .terminals
+                .running
+                .get(&TerminalKey::Pane(pane))
+                .and_then(|running| running.folder.clone())
+                .or_else(|| Some(terminal.folder.clone()))
+                .filter(|folder| !folder.as_os_str().is_empty()),
+            PaneContent::Thread(thread_id) => {
+                if let Some(folder) = self.projects.terminal_folder(*thread_id) {
+                    return Some(folder.path.clone());
+                }
+                let thread = self.projects.thread(*thread_id)?;
+                thread
+                    .workspace
+                    .clone()
+                    .or_else(|| Some(self.projects.project(thread.project_id)?.path.clone()))
+            }
+            PaneContent::Unknown(_) => None,
+        }
     }
 
     /// A pane terminal's agent and its state, from agent detection.

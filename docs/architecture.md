@@ -253,9 +253,16 @@ since a thread's workspace is its checkout.
 - **Server** (`spaces.rs`, `server/space_requests.rs`): spaces rooted at a folder on one machine,
   with tabs of split-pane trees (`agentz_protocol::layout`, herdr's `TileLayout` with its tests).
   Saved in `spaces.json` and restored after a restart: terminals as new shells in their folders,
-  threads reattached. Branch and ahead/behind every 5 seconds.
+  threads reattached. A workspace is where most of its tabs are: each tab by its top-left pane's
+  folder (a shell's foreground process, as terminal threads are followed; a thread pane's
+  terminal folder or checkout), a tie going to the earliest tab. That folder, not the one it was
+  opened in, names it unless renamed, and its branch and ahead/behind are looked up every
+  5 seconds and whenever a pane `cd`s or tabs change (`Space::current`, not saved).
 - **App** (`spaces_view.rs`, `new_space_picker.rs`): the sidebar of spaces (search, **+**,
-  rename, reorder) with the agents in panes below; tab bar; panes holding a shell, an agent CLI,
+  rename, reorder) with the agents in panes below; each row shows the icon of the project the folder is in (a folder icon outside every
+  project), the folder's name, the machine,
+  the branch (or the path outside git) and "2 terminals · 1 agent", with the thread cards'
+  details popover on hover (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
 - **Keys** (Mac-style, in the `Workspaces` context, all with Cmd so terminals never get them):
   Cmd-T, Cmd-}/Cmd-{, Cmd-D/Cmd-Shift-D, Cmd-W, Cmd-Shift-Enter, Cmd-Option-arrows, Cmd-Shift-N.

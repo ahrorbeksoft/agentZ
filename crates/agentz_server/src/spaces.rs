@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use agentz_protocol::layout::{Direction, Node, PaneId, TileLayout};
 use agentz_protocol::spaces::{
-    Pane, PaneAgent, PaneContent, PaneLocation, Space, SpaceGit, SpaceId, SpacesSnapshot, Tab,
-    TabId,
+    Pane, PaneAgent, PaneContent, PaneLocation, Space, SpaceFolder, SpaceGit, SpaceId,
+    SpacesSnapshot, Tab, TabId,
 };
 use anyhow::{Context as _, Result, anyhow};
 use projects::{ProjectId, Saver, ThreadId};
@@ -44,6 +44,7 @@ impl SpaceStore {
         };
         for space in &mut this.spaces {
             space.git = None;
+            space.current = None;
             space.tabs.retain_mut(|tab| {
                 for pane in &mut tab.panes {
                     pane.agent = None;
@@ -124,6 +125,7 @@ impl SpaceStore {
             project_id,
             tabs: vec![tab],
             git: None,
+            current: None,
         });
         self.changed();
         location
@@ -309,6 +311,17 @@ impl SpaceStore {
     }
 
     /// Runtime state: not saved, but sent to clients.
+    pub(crate) fn set_current(&mut self, id: SpaceId, current: Option<SpaceFolder>) {
+        let Some(space) = self.spaces.iter_mut().find(|space| space.id == id) else {
+            return;
+        };
+        if space.current != current {
+            space.current = current;
+            self.revision += 1;
+        }
+    }
+
+    /// Runtime state: not saved, but sent to clients.
     pub(crate) fn set_pane_agent(&mut self, id: PaneId, agent: Option<PaneAgent>) {
         let Ok((space, tab, pane)) = self.pane_index(id) else {
             return;
@@ -393,6 +406,7 @@ impl SpaceStore {
         let mut spaces = self.spaces.clone();
         for space in &mut spaces {
             space.git = None;
+            space.current = None;
             for pane in space.tabs.iter_mut().flat_map(|tab| &mut tab.panes) {
                 pane.agent = None;
             }
@@ -433,6 +447,18 @@ pub(crate) async fn space_git(folder: &Path) -> Option<SpaceGit> {
         ahead,
         behind,
     })
+}
+
+/// The folder most tabs are in. When tabs are split evenly, the earliest tab's wins.
+pub(crate) fn majority_folder(tab_folders: &[PathBuf]) -> Option<&PathBuf> {
+    let mut best: Option<(&PathBuf, usize)> = None;
+    for folder in tab_folders {
+        let count = tab_folders.iter().filter(|other| *other == folder).count();
+        if best.is_none_or(|(_, best_count)| count > best_count) {
+            best = Some((folder, count));
+        }
+    }
+    best.map(|(folder, _)| folder)
 }
 
 fn parse_ahead_behind(output: &str) -> Option<(u32, u32)> {
@@ -607,11 +633,31 @@ mod tests {
                     panes: Vec::new(),
                 }],
                 git: None,
+                current: None,
             }],
         };
         std::fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
         let store = SpaceStore::load(Some(path));
         assert!(store.spaces().is_empty());
+    }
+
+    #[test]
+    fn the_majority_of_tabs_picks_the_folder() {
+        let folders = |paths: &[&str]| paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(majority_folder(&[]), None);
+        assert_eq!(
+            majority_folder(&folders(&["/a", "/b", "/b"])),
+            Some(&PathBuf::from("/b"))
+        );
+        // A tie goes to the earliest tab.
+        assert_eq!(
+            majority_folder(&folders(&["/a", "/b", "/b", "/a"])),
+            Some(&PathBuf::from("/a"))
+        );
+        assert_eq!(
+            majority_folder(&folders(&["/a", "/b"])),
+            Some(&PathBuf::from("/a"))
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::{NewThread, OpenFolder, OpenSettings};
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const CARD_HEIGHT: Pixels = px(78.);
-const DETAILS_DELAY: Duration = Duration::from_millis(500);
+pub(crate) const DETAILS_DELAY: Duration = Duration::from_millis(500);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 const RENAME_KEY_CONTEXT: &str = "SidebarRename";
 const SEARCH_KEY_CONTEXT: &str = "SidebarSearch";
@@ -775,6 +775,7 @@ impl Sidebar {
                 ))
             }),
             agent,
+            contents: None,
         }
     }
 
@@ -1700,17 +1701,19 @@ impl Render for Sidebar {
 }
 
 /// t3code's thread popover: the title, then the project, branch, and model with agent.
-struct ThreadDetails {
-    title: SharedString,
-    project: Option<(Project, Option<ProjectInfo>)>,
+pub(crate) struct ThreadDetails {
+    pub(crate) title: SharedString,
+    pub(crate) project: Option<(Project, Option<ProjectInfo>)>,
     /// The machine's icon and name.
-    machine: (IconName, SharedString),
-    branch: Option<SharedString>,
+    pub(crate) machine: (IconName, SharedString),
+    pub(crate) branch: Option<SharedString>,
     /// Where a terminal is, outside git.
-    path: Option<SharedString>,
+    pub(crate) path: Option<SharedString>,
     /// The worktree or pasture it works in, described.
-    workspace: Option<(WorkspaceKind, SharedString)>,
-    agent: Option<(Option<SharedString>, SharedString)>,
+    pub(crate) workspace: Option<(WorkspaceKind, SharedString)>,
+    pub(crate) agent: Option<(Option<SharedString>, SharedString)>,
+    /// What a Workspaces view workspace holds, such as "2 terminals · 1 agent".
+    pub(crate) contents: Option<SharedString>,
 }
 
 impl ThreadDetails {
@@ -1774,6 +1777,12 @@ impl ThreadDetails {
                     .child(icon.size(IconSize::XSmall).color(Color::Muted))
                     .into_any_element(),
                 Label::new(label.clone()).truncate(),
+            ));
+        }
+        if let Some(contents) = &self.contents {
+            rows.push(detail_row(
+                small_icon(IconName::Terminal),
+                Label::new(contents.clone()).truncate(),
             ));
         }
         v_flex()
@@ -1868,7 +1877,7 @@ fn describe_folder(kind: WorkspaceKind, folder: &Path) -> SharedString {
 }
 
 /// Placed beside the row's right edge, top-aligned, as t3code places its row tooltip.
-fn render_details_popover(details: ThreadDetails, cx: &App) -> AnyElement {
+pub(crate) fn render_details_popover(details: ThreadDetails, cx: &App) -> AnyElement {
     div()
         .absolute()
         .top_0()
@@ -2062,7 +2071,7 @@ fn folder_branch_label(folder: &projects::TerminalFolder) -> Option<String> {
 }
 
 /// A folder outside every project, in a slot as wide as a project's icon so names line up.
-fn render_folder_icon() -> AnyElement {
+pub(crate) fn render_folder_icon() -> AnyElement {
     h_flex()
         .size_4()
         .flex_none()

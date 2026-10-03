@@ -48,8 +48,9 @@ pub(super) struct RunningTerminal {
     foreground_group: Option<u32>,
     /// When the terminal's output last counted as its thread's activity.
     activity_recorded_at: Option<Instant>,
-    /// For a terminal thread: the folder last seen in front, which names a shell.
-    folder: Option<PathBuf>,
+    /// For a terminal thread or workspace pane: the folder last seen in front. It names a
+    /// shell, and a workspace follows the folders of its tabs.
+    pub(super) folder: Option<PathBuf>,
 }
 
 /// The server's terminal bookkeeping.
@@ -382,6 +383,8 @@ impl Server {
         let mut foregrounds: Vec<(TerminalKey, Option<String>)> = Vec::new();
         // Terminal threads whose foreground moved to another folder.
         let mut folders = Vec::new();
+        // Workspace panes whose foreground moved to another folder.
+        let mut moved_panes = Vec::new();
         let mut next_tick: Option<Duration> = None;
         for (key, running) in &mut self.terminals.running {
             // A drawer's terminals aren't watched for agents, only for what runs in them.
@@ -434,6 +437,13 @@ impl Server {
             {
                 running.folder = Some(folder.clone());
                 folders.push((*thread_id, folder));
+            }
+            if let TerminalKey::Pane(pane) = key
+                && let Some(folder) = process_group_id.and_then(detect::process::process_cwd)
+                && running.folder.as_ref() != Some(&folder)
+            {
+                running.folder = Some(folder);
+                moved_panes.push(*pane);
             }
             if tracker.should_probe(now, process_group_id) {
                 let leader = process_group_id.and_then(detect::process::group_leader);
@@ -506,6 +516,9 @@ impl Server {
                 self.projects
                     .rename_thread(thread_id, folder_title(&folder));
             }
+        }
+        for pane in moved_panes {
+            self.refresh_space_of_pane(pane);
         }
         for (key, agent, state) in published {
             match key {
@@ -876,7 +889,7 @@ fn folder_title(folder: &Path) -> String {
 }
 
 /// The path with home written as `~`.
-fn home_relative(path: &Path) -> String {
+pub(super) fn home_relative(path: &Path) -> String {
     let home = util::paths::home_dir();
     match path.strip_prefix(home.as_path()) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),

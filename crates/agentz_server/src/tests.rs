@@ -2631,6 +2631,65 @@ async fn spaces_are_saved_restored_and_streamed() {
     assert!(client.space_snapshot().spaces.is_empty());
 }
 
+/// A workspace is named after the folder most of its tabs are in, and describes that folder.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_follows_the_folder_most_tabs_are_in() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = std::fs::canonicalize(server.project_dir.path()).expect("canonical path");
+    let inner = folder.join("inner");
+    std::fs::create_dir(&inner).expect("an inner folder");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let first = client
+        .space_pane(SpaceRequest::CreateSpace {
+            folder: folder.clone(),
+            project_id: None,
+            content: shell_in(&folder),
+        })
+        .await;
+    let current = move |client: &TestClient| {
+        client
+            .space_snapshot()
+            .space(first.space)
+            .and_then(|space| space.current.clone())
+    };
+    client
+        .wait_until(|client| current(client).is_some_and(|current| current.path == folder))
+        .await;
+
+    // The only tab moved, so the workspace did.
+    let key = TerminalKey::Pane(first.pane);
+    client.subscribe_terminal(key.clone()).await;
+    client.type_into(&key, "cd inner\n").await;
+    client
+        .wait_until(|client| current(client).is_some_and(|current| current.path == inner))
+        .await;
+    assert_eq!(
+        client
+            .space_snapshot()
+            .space(first.space)
+            .expect("the space")
+            .label(),
+        "inner"
+    );
+
+    // Two more tabs in the original folder outvote it.
+    for _ in 0..2 {
+        client
+            .space_pane(SpaceRequest::CreateTab {
+                space: first.space,
+                content: shell_in(&folder),
+            })
+            .await;
+    }
+    client
+        .wait_until(|client| current(client).is_some_and(|current| current.path == folder))
+        .await;
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_started_from_a_panes_shell_are_found() {

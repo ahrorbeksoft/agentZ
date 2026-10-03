@@ -863,6 +863,7 @@ mod tests {
                     }],
                 }],
                 git: None,
+                current: None,
             }],
         }
     }
