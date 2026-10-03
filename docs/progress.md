@@ -289,6 +289,9 @@ Then the server:
   - [x] Install and reconnect: `AGENTZ_SSH_TEST_TARGET=<host> cargo test -p agentz_server --test
         ssh -- --ignored` (1–4 s; the second run reuses the server and uploads nothing).
         `AGENTZ_SSH_TEST_RESTART=1` replaces an older running server (done on both).
+  - [x] npm agents: `AGENTZ_SSH_TEST_INSTALL_AGENT=claude-acp` installed it on `devbox1` in
+        5 s, with the Node.js 24 that nvm has put on both machines since the first check
+        (found through the login shell). The download path is tested on this Mac.
 
 ## 10. Polish
 
@@ -353,7 +356,7 @@ Then the server:
     plain `cp -R` there: it works, but costs the full size and copy time. Worktrees stay the
     cheap option.
   - **No Node.** npm registry agents can't install until the server can manage its own Node.
-    That's added to phase 9.
+    That's added to phase 9. (Later, both machines got Node.js 24 through nvm.)
   - **No Rust.** Building on the remote isn't an option, so we cross-build here.
   - **`t3-home` is small** (2 CPUs, 3.7 GB RAM). Keep the server light.
 

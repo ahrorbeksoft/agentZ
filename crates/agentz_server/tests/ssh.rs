@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use agentz_client::Connection;
 use agentz_client::ssh::{Connected, RemotePlatform, Ssh};
-use agentz_protocol::{ClientKind, Request, Response};
+use agentz_protocol::agents::{AgentId, InstallState, RegistrySnapshot};
+use agentz_protocol::{ClientKind, Event, Request, Response};
 
 const VERSION: &str = "0.0.0-test";
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -188,7 +189,9 @@ async fn connects_installs_and_reconnects_over_ssh() {
 /// Against a real machine, with the Linux servers from `tooling/build-remote-servers.sh`:
 /// `AGENTZ_SSH_TEST_TARGET=devbox1 cargo test -p agentz_server --test ssh -- --ignored`.
 /// Only `~/.agentz` changes there. With `AGENTZ_SSH_TEST_RESTART=1`, an older server running
-/// there is stopped and replaced, which stops its agents.
+/// there is stopped and replaced, which stops its agents. `AGENTZ_SSH_TEST_INSTALL_AGENT=<id>`
+/// installs that registry agent there (downloading Node.js first for an npm agent, when the
+/// machine has none), without starting it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn connects_to_a_real_machine() {
@@ -197,6 +200,7 @@ async fn connects_to_a_real_machine() {
     };
     let ssh = Ssh::new(&target.to_string_lossy()).expect("valid target");
     let servers = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/remote-servers");
+    let (registry_sender, mut registry_updates) = tokio::sync::mpsc::unbounded_channel();
     let connect = || async {
         let Connected {
             connection,
@@ -218,7 +222,14 @@ async fn connects_to_a_real_machine() {
         .await
         .expect("in time")
         .expect("connects");
-        let events_drained = tokio::spawn(async move { while events.next().await.is_some() {} });
+        let registry_sender = registry_sender.clone();
+        let events_drained = tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                if let Event::Registry(registry) = event {
+                    registry_sender.send(registry).ok();
+                }
+            }
+        });
         Session {
             connection,
             is_outdated,
@@ -252,4 +263,49 @@ async fn connects_to_a_real_machine() {
     else {
         panic!("expected the session");
     };
+
+    let Some(agent) = std::env::var_os("AGENTZ_SSH_TEST_INSTALL_AGENT") else {
+        return;
+    };
+    let agent = AgentId::new(agent.to_string_lossy().into_owned());
+    connection
+        .request(Request::RefreshRegistry { if_stale: false })
+        .await
+        .expect("refreshes the registry");
+    let install_state = |registry: &RegistrySnapshot| {
+        registry
+            .agents
+            .iter()
+            .find(|listing| listing.metadata.id == agent)
+            .map(|listing| listing.install_state.clone())
+    };
+    let started = std::time::Instant::now();
+    let mut requested = false;
+    loop {
+        let registry = tokio::time::timeout(Duration::from_secs(600), registry_updates.recv())
+            .await
+            .expect("in time")
+            .expect("registry updates");
+        if registry.is_fetching {
+            continue;
+        }
+        match install_state(&registry) {
+            None => panic!("{agent} isn't in the registry"),
+            Some(InstallState::Installed { version, .. }) => {
+                eprintln!("{agent} {version} is installed ({:.0?})", started.elapsed());
+                break;
+            }
+            Some(InstallState::Failed(error)) => panic!("installing {agent} failed: {error}"),
+            Some(InstallState::Installing) => {}
+            // An update sent before the request may still be queued.
+            Some(InstallState::NotInstalled) if requested => {}
+            Some(InstallState::NotInstalled) => {
+                connection
+                    .request(Request::InstallAgent(agent.clone()))
+                    .await
+                    .expect("installs the agent");
+                requested = true;
+            }
+        }
+    }
 }
