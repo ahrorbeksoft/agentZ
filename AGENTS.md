@@ -135,7 +135,9 @@ From Zed's guidelines, which this code follows:
   their behavior and policy; `tests/agent_control.rs` has the mock agent call them through the
   real `mcp-bridge`, and runs `call` as a thread's shell would. Delegated tasks run the mock
   agent too, so a task's prompt is a mock script (`hello`, `slow`, `permission`).
-- **The app against a scratch server:** set `AGENTZ_DATA_DIR` to a temporary directory and put
+- **The app against a scratch server:** set `AGENTZ_DATA_DIR` to a short temporary directory
+  (`mktemp -d /tmp/az.XXXX`: `server.sock`'s path must fit in `SUN_LEN`, which the scratchpad's
+  doesn't) and put
   the mock agent in its `agents/custom.json`. The app starts a server for that directory. Stop it
   afterwards with `AGENTZ_DATA_DIR=<dir> ./target/debug/agentz-server stop`.
 - **UI behavior (hover, layout, focus, timing):** headless GPUI tests in `crates/app`
