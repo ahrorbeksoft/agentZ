@@ -1110,14 +1110,21 @@ impl Render for Shell {
                             .justify_center()
                             .pt(px(96.))
                             .bg(gpui::black().opacity(0.25))
-                            .on_click(
+                            // As Zed's modal layer: nothing under the backdrop gets the mouse
+                            // (the title bar would start a window drag and swallow the click),
+                            // and pressing on it dismisses at once.
+                            .occlude()
+                            .on_mouse_down(
+                                MouseButton::Left,
                                 cx.listener(|this, _, window, cx| this.dismiss_modal(window, cx)),
                             )
                             .child(
-                                // Clicks inside the modal must not reach the backdrop.
+                                // Presses inside the modal must not reach the backdrop.
                                 div()
                                     .id("modal-container")
-                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
                                     .child(modal),
                             ),
                     )
@@ -1183,5 +1190,73 @@ mod tests {
             );
         }
         assert_eq!(thread_from_notification_tag("thread-7"), None);
+    }
+}
+
+#[cfg(test)]
+mod modal_tests {
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::{Modifiers, TestAppContext, point};
+    use projects::{Project, ProjectId, ProjectsSnapshot};
+
+    use super::*;
+    use crate::server_client::ServerClient;
+
+    #[gpui::test]
+    fn clicking_outside_new_thread_closes_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let projects = client.read(cx).projects().clone();
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![Project {
+                            id: ProjectId(1),
+                            path: "/tmp/demo".into(),
+                            custom_name: None,
+                            icon: None,
+                            workspaces: Vec::new(),
+                            repository: None,
+                        }],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            crate::new_thread_modal::init(cx);
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_new_thread_modal(None, None, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_some()));
+
+        // Inside the modal, it stays.
+        let width = cx.update(|window, _| window.viewport_size().width);
+        cx.simulate_click(point(width / 2., px(130.)), Modifiers::none());
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_some()));
+
+        // Over the title bar, which drags the window.
+        cx.simulate_click(point(px(300.), px(15.)), Modifiers::none());
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_new_thread_modal(None, None, window, cx)
+        });
+        // Well away from the modal, which sits at the top middle.
+        cx.simulate_click(point(px(20.), px(500.)), Modifiers::none());
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
     }
 }
