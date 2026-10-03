@@ -324,6 +324,9 @@ pub struct TerminalFolder {
     pub branch: Option<String>,
     #[serde(default)]
     pub is_repository: bool,
+    /// The repository's name: its main checkout's folder, also for a worktree of it.
+    #[serde(default)]
+    pub repository: Option<String>,
     /// The path as its machine's user would write it, `~` for home, since a client can't
     /// tell another machine's home.
     #[serde(default)]

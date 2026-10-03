@@ -193,6 +193,9 @@ pub struct SpaceGit {
     /// Commits ahead of and behind the branch's upstream; zero without one.
     pub ahead: u32,
     pub behind: u32,
+    /// The repository's name: its main checkout's folder, also for a worktree of it.
+    #[serde(default)]
+    pub repository: Option<String>,
 }
 
 /// Where a request put a pane: [`crate::Response::SpacePane`].

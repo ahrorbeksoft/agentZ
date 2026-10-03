@@ -37,7 +37,7 @@ use crate::project_store::ThreadStatus;
 use crate::sidebar::{
     ARCHIVED_ROW_HEIGHT, DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover,
     render_folder_icon, render_footer_item, render_status_dot, render_status_pill,
-    thread_agent_icon,
+    repository_branch, thread_agent_icon,
 };
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -1228,10 +1228,12 @@ impl SpacesView {
             .min_w_0()
             .gap_1()
             .child(match &git {
-                Some(git) => {
-                    faint_label(git.branch.clone().unwrap_or_else(|| "detached".to_string()))
-                        .truncate_middle()
-                }
+                Some(git) => faint_label(repository_branch(
+                    Some(&label),
+                    git.repository.as_deref(),
+                    git.branch.as_deref().unwrap_or("detached"),
+                ))
+                .truncate_middle(),
                 None => faint_label(path.to_string()).truncate_middle(),
             })
             // Unpushed commits in the theme's added color, unpulled ones in its deleted color.

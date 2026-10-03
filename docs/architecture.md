@@ -113,7 +113,10 @@ Each entry: what it does, where it lives, and where it comes from.
   folder, a terminal's agent CLI) keep updating under the user's own (`Thread::automatic_title`),
   which shows while set; clearing it shows the automatic one again, as with workspaces.
 - **Shells shelf** (`sidebar.rs`): terminal threads, named after their current folder, under the
-  project that folder is in; one becomes a thread card while an agent CLI runs in it.
+  project that folder is in; one becomes a thread card while an agent CLI runs in it. Under a
+  title that isn't the repository's name (renamed, in a subfolder, an agent CLI), the branch
+  reads `repository/branch` (`sidebar::repository_branch`); workspace rows do the same. The
+  repository is its main checkout's folder, so worktrees keep its name.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Restart Server, start at login,
   combining repositories), Appearance (Zed's theme modes), Agents (registry, per-agent login,
   defaults, environment, a machine picker), Machines, and a page per project (with Checkouts).

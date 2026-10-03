@@ -578,6 +578,7 @@ impl Server {
                             display_path: Some(home_relative(&path)),
                             path,
                             is_repository: git.is_some(),
+                            repository: git.as_ref().and_then(|git| git.repository.clone()),
                             branch: git.and_then(|git| git.branch),
                         }),
                     );

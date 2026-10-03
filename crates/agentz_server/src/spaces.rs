@@ -456,7 +456,30 @@ pub(crate) async fn space_git(folder: &Path) -> Option<SpaceGit> {
         branch,
         ahead,
         behind,
+        repository: repository_name(folder).await,
     })
+}
+
+/// The folder of the repository's main checkout, found through its shared `.git`, so a linked
+/// worktree is named after the repository rather than itself.
+async fn repository_name(folder: &Path) -> Option<String> {
+    let common_dir = crate::git::git(
+        folder,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        &[],
+    )
+    .await
+    .ok()?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let root = if common_dir.file_name().is_some_and(|name| name == ".git") {
+        common_dir.parent()?.to_path_buf()
+    } else {
+        let top_level = crate::git::git(folder, &["rev-parse", "--show-toplevel"], &[])
+            .await
+            .ok()?;
+        PathBuf::from(top_level.trim())
+    };
+    Some(root.file_name()?.to_string_lossy().into_owned())
 }
 
 /// The folder most tabs are in. When tabs are split evenly, the earliest tab's wins.
@@ -595,6 +618,7 @@ mod tests {
                     branch: Some("main".into()),
                     ahead: 1,
                     behind: 0,
+                    repository: Some("w".into()),
                 }),
             );
             store.set_pane_agent(
@@ -707,13 +731,59 @@ mod tests {
         crate::git::git(directory.path(), &["init", "-q", "-b", "trunk"], &[])
             .await
             .expect("init");
+        let name = std::fs::canonicalize(directory.path())
+            .expect("canonical path")
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
         assert_eq!(
             space_git(directory.path()).await,
             Some(SpaceGit {
                 branch: Some("trunk".into()),
                 ahead: 0,
                 behind: 0,
+                repository: name.clone(),
             })
+        );
+        // Inside it, and in a worktree of it, the repository keeps its name.
+        let inner = directory.path().join("inner");
+        std::fs::create_dir(&inner).expect("inner folder");
+        assert_eq!(space_git(&inner).await.and_then(|git| git.repository), name);
+        let run = |args: &'static [&'static str]| {
+            let folder = directory.path().to_path_buf();
+            async move { crate::git::git(&folder, args, &[]).await.expect("git") }
+        };
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "first",
+        ])
+        .await;
+        let worktrees = tempfile::tempdir().expect("tempdir");
+        let worktree = worktrees.path().join("feature");
+        crate::git::git(
+            directory.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                &worktree.to_string_lossy(),
+            ],
+            &[],
+        )
+        .await
+        .expect("worktree");
+        let git = space_git(&worktree).await.expect("a repository");
+        assert_eq!(
+            (git.branch.as_deref(), git.repository),
+            (Some("feature"), name)
         );
     }
 }

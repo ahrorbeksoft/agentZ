@@ -742,7 +742,7 @@ impl Sidebar {
                 project_at(store.projects(), &folder.path),
                 folder.branch.clone(),
                 (!folder.is_repository)
-                    .then(|| folder_branch_label(folder))
+                    .then(|| folder_branch_label(folder, None))
                     .flatten(),
                 checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
             ),
@@ -814,13 +814,6 @@ impl Sidebar {
         };
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let checkout = self.thread_checkout(machine, &thread, cx);
-        let (branch, checkout) = match &folder {
-            Some(folder) => (
-                folder_branch_label(folder),
-                checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
-            ),
-            None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
-        };
         let machines = self.machines.read(cx);
         // With one project selected, every card would repeat it, so the project line goes and
         // the status moves next to the title.
@@ -847,6 +840,16 @@ impl Sidebar {
             .filter(|_| !thread.has_custom_title)
             .map(SharedString::from)
             .unwrap_or_else(|| title.clone());
+        // The project line names the repository already; without it, a title that isn't the
+        // repository's name says which one the branch is in.
+        let branch_title = (!shows_all_projects).then_some(display_title.as_ref());
+        let (branch, checkout) = match &folder {
+            Some(folder) => (
+                folder_branch_label(folder, branch_title),
+                checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
+            ),
+            None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
+        };
         let subthreads = {
             let store = store.read(cx);
             let subthreads = store.subthreads(thread.id);
@@ -1226,7 +1229,7 @@ impl Sidebar {
         // own. Before its server says where it is, the checkout it started in.
         let (branch, checkout) = match &folder {
             Some(folder) => (
-                folder_branch_label(folder),
+                folder_branch_label(folder, Some(&thread.title)),
                 checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
             ),
             None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
@@ -1946,7 +1949,21 @@ fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_relative_time;
+    use super::{format_relative_time, repository_branch};
+
+    #[test]
+    fn a_branch_names_its_repository_under_another_title() {
+        assert_eq!(
+            repository_branch(Some("agentZ"), Some("agentZ"), "main"),
+            "main"
+        );
+        assert_eq!(
+            repository_branch(Some("Claude Code"), Some("agentZ"), "main"),
+            "agentZ/main"
+        );
+        assert_eq!(repository_branch(None, Some("agentZ"), "main"), "main");
+        assert_eq!(repository_branch(Some("app"), None, "main"), "main");
+    }
     use crate::machines::project_at;
     use projects::{Project, ProjectId, Workspace, WorkspaceKind};
     use std::path::{Path, PathBuf};
@@ -2056,10 +2073,16 @@ pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElem
         .bg(color.color(cx))
 }
 
-/// The branch a terminal's folder is on, or outside git, where the folder is.
-fn folder_branch_label(folder: &projects::TerminalFolder) -> Option<String> {
+/// The branch a terminal's folder is on, or outside git, where the folder is. Under a title
+/// that isn't the repository's name, the branch says which repository it's in.
+fn folder_branch_label(folder: &projects::TerminalFolder, title: Option<&str>) -> Option<String> {
     if folder.is_repository {
-        folder.branch.clone()
+        let branch = folder.branch.as_deref()?;
+        Some(repository_branch(
+            title,
+            folder.repository.as_deref(),
+            branch,
+        ))
     } else {
         Some(
             folder
@@ -2067,6 +2090,20 @@ fn folder_branch_label(folder: &projects::TerminalFolder) -> Option<String> {
                 .clone()
                 .unwrap_or_else(|| folder.path.display().to_string()),
         )
+    }
+}
+
+/// `repository/branch`, unless the title already is the repository's name.
+pub(crate) fn repository_branch(
+    title: Option<&str>,
+    repository: Option<&str>,
+    branch: &str,
+) -> String {
+    match (title, repository) {
+        (Some(title), Some(repository)) if title != repository => {
+            format!("{repository}/{branch}")
+        }
+        _ => branch.to_string(),
     }
 }
 
