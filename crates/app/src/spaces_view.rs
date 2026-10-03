@@ -247,6 +247,8 @@ pub struct SpacesView {
     pending_focus: Option<PaneKey>,
     split_override: Option<SplitOverride>,
     renaming: Option<RenameTarget>,
+    /// The name the rename started from, so ending it unchanged keeps an automatic name.
+    rename_original: SharedString,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
     /// The workspace whose details popover shows, and the one waiting to show it.
@@ -297,6 +299,7 @@ impl SpacesView {
             pending_focus: None,
             split_override: None,
             renaming: None,
+            rename_original: SharedString::default(),
             rename_input,
             _rename_blur: None,
             details_space: None,
@@ -817,6 +820,7 @@ impl SpacesView {
         cx: &mut Context<Self>,
     ) {
         self.finish_renaming(true, cx);
+        self.rename_original = name.clone();
         self.rename_input.update(cx, |input, cx| {
             input.set_text(name, cx);
             input.select_all_text(cx);
@@ -837,9 +841,8 @@ impl SpacesView {
             return;
         };
         self._rename_blur = None;
-        if keep {
-            let name = self.rename_input.read(cx).text().trim().to_string();
-            let name = (!name.is_empty()).then_some(name);
+        let text = self.rename_input.read(cx).text().clone();
+        if keep && let Some(name) = renamed_to(&self.rename_original, &text) {
             let (machine, request) = match target {
                 RenameTarget::Space(key) => (
                     key.machine,
@@ -2486,6 +2489,16 @@ fn rolled_up(statuses: impl Iterator<Item = ThreadStatus>) -> Option<ThreadStatu
     })
 }
 
+/// The name a rename sets, `None` inside for the automatic one again. A name left as it
+/// started changes nothing, so an automatic name keeps following its folder.
+fn renamed_to(original: &str, text: &str) -> Option<Option<String>> {
+    let name = text.trim();
+    if name == original.trim() {
+        return None;
+    }
+    Some((!name.is_empty()).then(|| name.to_string()))
+}
+
 /// "2 terminals · 1 agent", leaving out what's zero.
 fn contents_label(terminals: usize, agents: usize) -> Option<String> {
     let plural =
@@ -2730,6 +2743,17 @@ mod tests {
         );
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.details_space), None);
+    }
+
+    #[test]
+    fn a_rename_left_as_it_started_changes_nothing() {
+        assert_eq!(renamed_to("projects", "projects"), None);
+        assert_eq!(renamed_to("projects", " projects "), None);
+        assert_eq!(
+            renamed_to("projects", "Work"),
+            Some(Some("Work".to_string()))
+        );
+        assert_eq!(renamed_to("Work", ""), Some(None));
     }
 
     #[test]
