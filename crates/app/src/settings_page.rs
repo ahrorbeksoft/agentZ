@@ -6,18 +6,19 @@ use std::path::PathBuf;
 
 use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
 use crate::project_store::ProjectStore;
-use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::agents::{AgentId, AgentListing, InstallState};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Window, actions,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, DropdownMenu, IconPosition, PopoverMenu, Switch, Tooltip, WithScrollbar as _,
-    prelude::*,
+    ContextMenu, DropdownMenu, IconButtonShape, IconPosition, PopoverMenu, Switch, TintColor,
+    ToggleButtonGroup, ToggleButtonGroupSize, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip,
+    WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -70,6 +71,23 @@ enum Section {
     Project(ProjectKey),
 }
 
+/// What Settings › Agents shows, as Zed's settings window opens sub-pages.
+enum AgentsPage {
+    Installed,
+    /// Zed's ACP Registry page, to install more agents.
+    Registry,
+    /// One agent's settings, with the connection made to log in or out.
+    Agent(AccountPanel),
+}
+
+/// Zed's filter on the ACP Registry page.
+#[derive(Clone, Copy, PartialEq)]
+enum RegistryFilter {
+    All,
+    Installed,
+    NotInstalled,
+}
+
 pub struct SettingsPage {
     focus_handle: FocusHandle,
     machines: Entity<Machines>,
@@ -84,8 +102,8 @@ pub struct SettingsPage {
     updating: std::collections::HashSet<MachineId>,
     /// Whether this Mac's server has a launch agent, so it starts at login.
     starts_at_login: bool,
-    /// The agent whose account panel is open, with the connection made to log in or out.
-    account: Option<AccountPanel>,
+    agents_page: AgentsPage,
+    registry_filter: RegistryFilter,
     nav_scroll: ScrollHandle,
     content_scroll: ScrollHandle,
     /// Detected favicons, so automatic icons match the sidebar's.
@@ -165,7 +183,8 @@ impl SettingsPage {
             agent_search,
             updating: Default::default(),
             starts_at_login: crate::login_item::is_enabled(),
-            account: None,
+            agents_page: AgentsPage::Installed,
+            registry_filter: RegistryFilter::All,
             nav_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
             project_info,
@@ -264,11 +283,13 @@ impl SettingsPage {
             self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
         self.section = section;
+        // Agents always opens on the installed agents; leaving an agent's page stops the agent.
+        if !matches!(self.agents_page, AgentsPage::Installed) {
+            self.show_agents_page(AgentsPage::Installed, window, cx);
+        }
         if section == Section::Agents {
             self.registry(cx)
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
-            // Typing on the Agents page searches it.
-            window.focus(&self.agent_search.focus_handle(cx), cx);
         }
         if let Section::Project(key) = section
             && let Some(project) = self.project(key, cx)
@@ -1055,32 +1076,224 @@ impl SettingsPage {
         )]
     }
 
-    /// The agents from the ACP Registry: the installed ones to update or uninstall, then the
-    /// rest to install.
+    /// Settings › Agents: the installed agents, the ACP Registry, or one agent's page.
     fn render_agents(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        match &self.agents_page {
+            AgentsPage::Installed => self.render_installed_agents(cx),
+            AgentsPage::Registry => self.render_registry(cx),
+            AgentsPage::Agent(_) => self.render_agent_page(window, cx),
+        }
+    }
+
+    /// The page's title (Zed's back button and breadcrumb on a sub-page) and the machine whose
+    /// agents it shows.
+    fn render_agents_header(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let page_title: Option<SharedString> = match &self.agents_page {
+            AgentsPage::Installed => None,
+            AgentsPage::Registry => Some("ACP Registry".into()),
+            AgentsPage::Agent(panel) => Some(panel.connection.read(cx).agent_name().clone()),
+        };
+        let heading = match page_title {
+            None => Headline::new("Agents")
+                .size(HeadlineSize::Small)
+                .into_any_element(),
+            Some(page_title) => h_flex()
+                .min_w_0()
+                .ml_neg_1p5()
+                .gap_1()
+                .child(
+                    div().debug_selector(|| "agents-back".into()).child(
+                        IconButton::new("agents-back", IconName::ArrowLeft)
+                            .icon_size(IconSize::Small)
+                            .shape(IconButtonShape::Square)
+                            .tooltip(Tooltip::text("Back to Agents"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_agents_page(AgentsPage::Installed, window, cx)
+                            })),
+                    ),
+                )
+                .child(
+                    Headline::new("Agents")
+                        .size(HeadlineSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Headline::new("/")
+                        .size(HeadlineSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Headline::new(page_title).size(HeadlineSize::Small))
+                .into_any_element(),
+        };
+        let machine = if !self.machines.read(cx).has_remotes() {
+            None
+        } else if let AgentsPage::Agent(_) = self.agents_page {
+            // An agent's page belongs to the machine it was opened on.
+            let machines = self.machines.read(cx);
+            Some(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(machines.machine_icon(self.agents_machine, cx))
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(machines.label(self.agents_machine, cx)).color(Color::Muted))
+                    .into_any_element(),
+            )
+        } else {
+            Some(self.render_agents_machine_picker(window, cx))
+        };
+        h_flex()
+            .h(px(28.))
+            .gap_4()
+            .justify_between()
+            .child(heading)
+            .children(machine)
+            .into_any_element()
+    }
+
+    /// The installed agents, each a link to its page.
+    fn render_installed_agents(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let registry = self.registry(cx);
+        let mut installed: Vec<AgentListing> = registry
+            .read(cx)
+            .agents()
+            .iter()
+            .filter(|agent| counts_as_installed(&agent.install_state))
+            .cloned()
+            .collect();
+        installed.sort_by_key(|agent| agent.name().to_lowercase());
+        let count = installed.len();
+        let mut rows: Vec<AnyElement> = installed
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| {
+                self.render_installed_agent(agent, index == 0, index + 1 == count, cx)
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(self.render_agents_message(
+                "No agents installed yet. Add one from the ACP Registry.",
+                cx,
+            ));
+        }
+        let add = Button::new("agents-add", "Add Agent")
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .start_icon(
+                Icon::new(IconName::Plus)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_agents_page(AgentsPage::Registry, window, cx)
+            }));
+        vec![render_section_with_actions(
+            "Installed",
+            rows,
+            add.into_any_element(),
+            cx,
+        )]
+    }
+
+    /// A settings row that opens the agent's page: its icon, name and version, Update when
+    /// there's a newer one, and a chevron.
+    fn render_installed_agent(
+        &self,
+        agent: &AgentListing,
+        is_first: bool,
+        is_last: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let id = agent.id().clone();
+        let name = agent.name().clone();
+        let (detail, has_update) =
+            installed_version(agent).unwrap_or_else(|| ("Installing…".into(), false));
+        // Its files are being replaced, so it can't be started to show its page.
+        let is_installing = matches!(agent.install_state, InstallState::Installing);
+        let row_id = format!("agent-row-{}", id.0);
+        h_flex()
+            .id(SharedString::from(row_id.clone()))
+            .debug_selector(move || row_id)
+            .px_4()
+            .py_2p5()
+            .gap_3()
+            // So the hover fills the row up to the group's rounded border.
+            .when(is_first, |row| row.rounded_t_lg())
+            .when(is_last, |row| row.rounded_b_lg())
+            .child(render_agent_tile(agent.icon_path(), px(32.), cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(name.clone()).truncate())
+                    .child(
+                        Label::new(detail)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+            )
+            .when(has_update, |row| {
+                row.child(
+                    Button::new(
+                        SharedString::from(format!("agent-update-{}", id.0)),
+                        "Update",
+                    )
+                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                    .label_size(LabelSize::Small)
+                    .on_click(self.install_listener(&id, cx)),
+                )
+            })
+            .when(!is_installing, |row| {
+                row.cursor_pointer()
+                    .hover(|row| row.bg(colors.ghost_element_hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_agent(&id, &name, window, cx)
+                    }))
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+            })
+            .into_any_element()
+    }
+
+    /// Zed's ACP Registry page: a search, the All / Installed / Not Installed filter, and a
+    /// card for each agent that runs on the machine.
+    fn render_registry(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
         let query = self.agent_search.read(cx).text().trim().to_lowercase();
+        let filter = self.registry_filter;
         let registry = self.registry(cx);
-        let registry = registry.read(cx);
-        let is_fetching = registry.is_fetching();
-        let fetch_error = registry.fetch_error();
-        let has_agents = !registry.agents().is_empty();
-        let mut installed = Vec::new();
-        let mut available = Vec::new();
-        for agent in registry.agents() {
-            let matches = query.is_empty()
-                || agent.name().to_lowercase().contains(&query)
-                || agent.id().0.to_lowercase().contains(&query);
-            if !agent.supports_current_platform() || !matches {
-                continue;
-            }
-            match registry.install_state(agent.id()) {
-                InstallState::Installed { .. } => installed.push(agent.id().clone()),
-                _ => available.push(agent.id().clone()),
-            }
-        }
+        let mut agents: Vec<AgentListing> = registry
+            .read(cx)
+            .agents()
+            .iter()
+            .filter(|agent| {
+                let matches_query = query.is_empty()
+                    || agent.name().to_lowercase().contains(&query)
+                    || agent.id().0.to_lowercase().contains(&query)
+                    || agent.description().to_lowercase().contains(&query);
+                let is_installed = counts_as_installed(&agent.install_state);
+                let matches_filter = match filter {
+                    RegistryFilter::All => true,
+                    RegistryFilter::Installed => is_installed,
+                    RegistryFilter::NotInstalled => !is_installed,
+                };
+                agent.supports_current_platform() && matches_query && matches_filter
+            })
+            .cloned()
+            .collect();
+        agents.sort_by_key(|agent| agent.name().to_lowercase());
 
         let search = h_flex()
+            .flex_1()
+            .min_w_0()
             .h(px(32.))
             .px_3()
             .gap_2()
@@ -1093,192 +1306,366 @@ impl SettingsPage {
                     .size(IconSize::Small)
                     .color(Color::Muted),
             )
-            .child(div().flex_1().min_w_0().child(self.agent_search.clone()))
-            .into_any_element();
-        let mut sections = vec![search];
-        if self.machines.read(cx).has_remotes() {
-            sections.insert(0, self.render_agents_machine_picker(window, cx));
-        }
-        if !installed.is_empty() {
-            let rows = installed
-                .iter()
-                .map(|id| self.render_agent_row(id, window, cx))
-                .collect();
-            sections.push(render_section("Installed", rows, cx));
-        }
-        if !available.is_empty() {
-            let rows = available
-                .iter()
-                .map(|id| self.render_agent_row(id, window, cx))
-                .collect();
-            sections.push(render_section("From the ACP Registry", rows, cx));
-        }
-        if installed.is_empty() && available.is_empty() {
-            let message = if is_fetching && !has_agents {
-                "Loading agents from the ACP Registry…".to_string()
-            } else if let Some(error) = fetch_error.as_ref().filter(|_| !has_agents) {
-                format!("Couldn't load the ACP Registry: {error}")
-            } else {
-                "No matching agents".to_string()
+            .child(div().flex_1().min_w_0().child(self.agent_search.clone()));
+        let filter_buttons = ToggleButtonGroup::single_row(
+            "registry-filter",
+            [
+                ToggleButtonSimple::new(
+                    "All",
+                    cx.listener(|this, _, _, cx| this.set_registry_filter(RegistryFilter::All, cx)),
+                ),
+                ToggleButtonSimple::new(
+                    "Installed",
+                    cx.listener(|this, _, _, cx| {
+                        this.set_registry_filter(RegistryFilter::Installed, cx)
+                    }),
+                ),
+                ToggleButtonSimple::new(
+                    "Not Installed",
+                    cx.listener(|this, _, _, cx| {
+                        this.set_registry_filter(RegistryFilter::NotInstalled, cx)
+                    }),
+                ),
+            ],
+        )
+        .style(ToggleButtonGroupStyle::Outlined)
+        .size(ToggleButtonGroupSize::Custom(rems_from_px(32_f32)))
+        .label_size(LabelSize::Default)
+        .auto_width()
+        .selected_index(match filter {
+            RegistryFilter::All => 0,
+            RegistryFilter::Installed => 1,
+            RegistryFilter::NotInstalled => 2,
+        });
+
+        let list = if agents.is_empty() {
+            let has_query = !query.is_empty();
+            let empty = match (filter, has_query) {
+                (RegistryFilter::All, true) => "No agents match your search.",
+                (RegistryFilter::All, false) => "No agents available.",
+                (RegistryFilter::Installed, true) => "No installed agents match your search.",
+                (RegistryFilter::Installed, false) => "No installed agents.",
+                (RegistryFilter::NotInstalled, true) => "No uninstalled agents match your search.",
+                (RegistryFilter::NotInstalled, false) => "No uninstalled agents.",
             };
-            sections.push(
-                v_flex()
-                    .gap_2()
-                    .items_start()
-                    .child(Label::new(message).color(Color::Muted))
-                    .when(fetch_error.is_some() && !has_agents, |column| {
-                        column.child(
-                            Button::new("retry-registry", "Retry")
-                                .style(ButtonStyle::Outlined)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.registry(cx)
-                                        .update(cx, |registry, cx| registry.refresh(cx))
-                                })),
-                        )
-                    })
-                    .into_any_element(),
-            );
-        }
-        sections
+            div()
+                .rounded_md()
+                .border_1()
+                .border_dashed()
+                .border_color(colors.border)
+                .child(self.render_agents_message(empty, cx))
+                .into_any_element()
+        } else {
+            let cards: Vec<AnyElement> = agents
+                .iter()
+                .map(|agent| self.render_registry_card(agent, cx))
+                .collect();
+            v_flex().gap_2().children(cards).into_any_element()
+        };
+        vec![
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(search)
+                        .child(div().flex_none().child(filter_buttons)),
+                )
+                .child(list)
+                .into_any_element(),
+        ]
     }
 
-    fn render_agent_row(
-        &self,
-        id: &AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let registry = self.registry(cx);
-        let registry = registry.read(cx);
-        let Some(agent) = registry.agent(id) else {
-            return div().into_any_element();
-        };
-        let name = agent.name().clone();
-        let icon = match agent.icon_path() {
-            Some(path) => Icon::from_external_svg(path.clone()),
-            None => Icon::new(IconName::Terminal),
-        };
-        let element_id = |action: &str| SharedString::from(format!("agent-{action}-{}", id.0));
-        let is_account_open = self
-            .account
-            .as_ref()
-            .is_some_and(|account| &account.agent_id == id);
-        let install = {
-            let id = id.clone();
-            cx.listener(move |this, _, _, cx| {
-                this.registry(cx)
-                    .update(cx, |registry, cx| registry.install(&id, cx))
-            })
-        };
-        let (detail, controls): (SharedString, AnyElement) = match registry.install_state(id) {
+    fn set_registry_filter(&mut self, filter: RegistryFilter, cx: &mut Context<Self>) {
+        self.registry_filter = filter;
+        self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Zed's registry card: the agent's icon, name, version and description, links to its
+    /// repository, website and license, and what can be done with it.
+    fn render_registry_card(&self, agent: &AgentListing, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let id = agent.id().clone();
+        let element_id = |action: &str| SharedString::from(format!("registry-{action}-{}", id.0));
+        let mut actions: Vec<AnyElement> = Vec::new();
+        match &agent.install_state {
+            InstallState::NotInstalled => actions.push(
+                Button::new(element_id("install"), "Install")
+                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                    .start_icon(
+                        Icon::new(IconName::Download)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(self.install_listener(&id, cx))
+                    .into_any_element(),
+            ),
+            InstallState::Installing => actions.push(
+                Button::new(element_id("installing"), "Installing…")
+                    .style(ButtonStyle::OutlinedGhost)
+                    .disabled(true)
+                    .into_any_element(),
+            ),
             InstallState::Installed {
-                version,
-                update_available,
+                update_available, ..
             } => {
+                if *update_available {
+                    actions.push(
+                        Button::new(element_id("update"), "Update")
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .on_click(self.install_listener(&id, cx))
+                            .into_any_element(),
+                    );
+                }
                 let uninstall = {
                     let id = id.clone();
-                    let name = name.clone();
+                    let name = agent.name().clone();
                     cx.listener(move |this, _, window, cx| {
                         this.confirm_uninstall(&id, &name, window, cx)
                     })
                 };
-                (
-                    if update_available {
-                        format!("v{version} · v{} available", agent.version()).into()
-                    } else {
-                        format!("v{version}").into()
-                    },
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new(element_id("settings"), "Settings")
-                                .style(ButtonStyle::Outlined)
-                                .toggle_state(is_account_open)
-                                .on_click({
-                                    let id = id.clone();
-                                    let name = name.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.toggle_account(&id, &name, cx)
-                                    })
-                                }),
-                        )
-                        .when(update_available, |controls| {
-                            controls.child(
-                                Button::new(element_id("update"), "Update")
-                                    .style(ButtonStyle::Outlined)
-                                    .on_click(install),
-                            )
-                        })
-                        .child(
-                            Button::new(element_id("uninstall"), "Uninstall")
-                                .style(ButtonStyle::Subtle)
-                                .on_click(uninstall),
-                        )
+                actions.push(
+                    Button::new(element_id("uninstall"), "Uninstall")
+                        .style(ButtonStyle::OutlinedGhost)
+                        .on_click(uninstall)
                         .into_any_element(),
-                )
+                );
             }
-            InstallState::Installing => (
-                agent.description().clone(),
-                Label::new("Installing…")
-                    .color(Color::Muted)
-                    .into_any_element(),
-            ),
-            InstallState::NotInstalled => (
-                agent.description().clone(),
-                Button::new(element_id("install"), "Install")
-                    .style(ButtonStyle::Outlined)
-                    .on_click(install)
-                    .into_any_element(),
-            ),
-            InstallState::Failed(error) => (
-                agent.description().clone(),
+            InstallState::Failed(error) => actions.push(
                 Button::new(element_id("retry"), "Retry")
                     .style(ButtonStyle::Outlined)
                     .color(Color::Error)
-                    .tooltip(Tooltip::text(error))
-                    .on_click(install)
+                    .tooltip(Tooltip::text(error.clone()))
+                    .on_click(self.install_listener(&id, cx))
                     .into_any_element(),
             ),
-        };
-        let account_panel = is_account_open.then(|| self.render_agent_settings(window, cx));
-        v_flex()
+        }
+        let card_id = format!("registry-card-{}", id.0);
+        h_flex()
+            .debug_selector(move || card_id)
+            .p_3()
+            .gap_3()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.elevated_surface_background.opacity(0.5))
+            .child(render_agent_tile(agent.icon_path(), px(32.), cx))
             .child(
-                h_flex()
-                    .px_4()
-                    .py_3()
-                    .gap_3()
-                    .child(icon.size(IconSize::Medium).color(Color::Muted))
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
                     .child(
-                        v_flex()
-                            .flex_1()
+                        h_flex()
                             .min_w_0()
-                            .gap_0p5()
-                            .child(Label::new(name))
+                            .gap_2()
+                            .child(Label::new(agent.name().clone()).truncate())
                             .child(
-                                Label::new(detail)
+                                Label::new(version_label(agent.version()))
                                     .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate(),
+                                    .color(Color::Muted),
                             ),
                     )
-                    .child(div().flex_none().child(controls)),
+                    .child(
+                        Label::new(agent.description().clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
             )
-            .children(account_panel)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .children(render_agent_links(agent))
+                    .children(actions),
+            )
             .into_any_element()
     }
 
-    /// Opens the agent's account panel, starting the agent to talk to it, or closes it (which
-    /// stops the agent again).
-    fn toggle_account(&mut self, id: &AgentId, name: &SharedString, cx: &mut Context<Self>) {
-        if self
-            .account
-            .as_ref()
-            .is_some_and(|account| &account.agent_id == id)
-        {
-            self.account = None;
-            cx.notify();
-            return;
+    /// In place of a list of agents: the registry loading, failing to load (with Retry), or
+    /// `empty` once it has loaded.
+    fn render_agents_message(&self, empty: &str, cx: &mut Context<Self>) -> AnyElement {
+        let registry = self.registry(cx);
+        let registry = registry.read(cx);
+        let has_agents = !registry.agents().is_empty();
+        let fetch_error = registry.fetch_error().filter(|_| !has_agents);
+        let message: SharedString = if registry.is_fetching() && !has_agents {
+            "Loading agents from the ACP Registry…".into()
+        } else if let Some(error) = &fetch_error {
+            format!("Couldn't load the ACP Registry: {error}").into()
+        } else {
+            empty.to_string().into()
+        };
+        h_flex()
+            .px_4()
+            .py_3()
+            .gap_3()
+            .justify_between()
+            .child(Label::new(message).color(Color::Muted))
+            .when(fetch_error.is_some(), |row| {
+                row.child(
+                    Button::new("retry-registry", "Retry")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.registry(cx)
+                                .update(cx, |registry, cx| registry.refresh(cx))
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn install_listener(
+        &self,
+        id: &AgentId,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        let id = id.clone();
+        cx.listener(move |this, _, _, cx| {
+            this.registry(cx)
+                .update(cx, |registry, cx| registry.install(&id, cx))
+        })
+    }
+
+    /// One agent's page: what it is, its account, the defaults new threads start with, and its
+    /// environment.
+    fn render_agent_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(panel) = self.account() else {
+            return Vec::new();
+        };
+        let registry = self.registry(cx);
+        let listing = registry.read(cx).agent(&panel.agent_id).cloned();
+        let mut sections = Vec::new();
+        sections.extend(listing.map(|agent| self.render_agent_about(&agent, cx)));
+        sections.push(render_section(
+            "Account",
+            vec![
+                div()
+                    .px_4()
+                    .py_3()
+                    .child(self.render_account_panel(cx))
+                    .into_any_element(),
+            ],
+            cx,
+        ));
+        sections.push(self.render_agent_defaults(window, cx));
+        sections.push(self.render_agent_env(cx));
+        sections
+    }
+
+    /// The agent's icon, name, version and description, its links, Uninstall, and Update when
+    /// there's a newer version.
+    fn render_agent_about(&self, agent: &AgentListing, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let id = agent.id().clone();
+        let name = agent.name().clone();
+        let (version, update_available) =
+            installed_version(agent).unwrap_or_else(|| match agent.install_state {
+                InstallState::Installing => ("Installing…".into(), false),
+                _ => ("Not installed".into(), false),
+            });
+        let uninstall = {
+            let id = id.clone();
+            let name = name.clone();
+            cx.listener(move |this, _, window, cx| this.confirm_uninstall(&id, &name, window, cx))
+        };
+        h_flex()
+            .px_4()
+            .py_3()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.panel_background)
+            .child(render_agent_tile(agent.icon_path(), px(40.), cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(Label::new(name).truncate())
+                            .child(
+                                Label::new(version)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .when(!agent.description().is_empty(), |column| {
+                        column.child(
+                            Label::new(agent.description().clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .children(render_agent_links(agent))
+                    .child(
+                        IconButton::new("agent-uninstall", IconName::Trash)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Uninstall…"))
+                            .on_click(uninstall),
+                    )
+                    .when(update_available, |buttons| {
+                        buttons.child(
+                            Button::new("agent-update", "Update")
+                                .style(ButtonStyle::Tinted(TintColor::Accent))
+                                .on_click(self.install_listener(&id, cx)),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The agent whose page is open.
+    fn account(&self) -> Option<&AccountPanel> {
+        match &self.agents_page {
+            AgentsPage::Agent(panel) => Some(panel),
+            _ => None,
         }
+    }
+
+    fn account_mut(&mut self) -> Option<&mut AccountPanel> {
+        match &mut self.agents_page {
+            AgentsPage::Agent(panel) => Some(panel),
+            _ => None,
+        }
+    }
+
+    fn show_agents_page(&mut self, page: AgentsPage, window: &mut Window, cx: &mut Context<Self>) {
+        self.agents_page = page;
+        if let AgentsPage::Registry = self.agents_page {
+            self.agent_search
+                .update(cx, |search, cx| search.set_text(String::new(), cx));
+            // Typing on the registry page searches it.
+            window.focus(&self.agent_search.focus_handle(cx), cx);
+            self.registry(cx)
+                .update(cx, |registry, cx| registry.refresh_if_stale(cx));
+        } else {
+            // The last page's inputs are gone, and actions need focus under the shell.
+            window.focus(&self.focus_handle, cx);
+        }
+        self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Opens the agent's page, starting the agent to talk to it. Leaving the page stops it.
+    fn open_agent(
+        &mut self,
+        id: &AgentId,
+        name: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let client = self.agents_client(cx);
         let agent_settings = client.read(cx).agent_settings(&id.0);
         let name = name.clone();
@@ -1292,8 +1679,7 @@ impl SettingsPage {
             // A login started in Terminal counts once a check finds the agent logged in.
             let logged_in = connection.read(cx).logged_in() == Some(true);
             let finished_terminal_login = this
-                .account
-                .as_mut()
+                .account_mut()
                 .filter(|_| logged_in)
                 .and_then(|panel| panel.pending_terminal_method.take());
             if let Some(method) = finished_terminal_login {
@@ -1317,15 +1703,15 @@ impl SettingsPage {
             .iter()
             .map(|(key, value)| self.new_env_row(key, value, cx))
             .collect();
-        self.account = Some(AccountPanel {
+        let panel = AccountPanel {
             agent_id: id.clone(),
             connection,
             terminal_hint: None,
             pending_terminal_method: None,
             env_rows,
             _subscriptions: [subscription],
-        });
-        cx.notify();
+        };
+        self.show_agents_page(AgentsPage::Agent(panel), window, cx);
     }
 
     fn new_env_row(&self, key: &str, value: &str, cx: &mut Context<Self>) -> EnvRow {
@@ -1356,7 +1742,7 @@ impl SettingsPage {
 
     /// Writes the panel's variables to the agent's settings; rows without a name are skipped.
     fn save_env(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = &self.account else {
+        let Some(panel) = self.account() else {
             return;
         };
         let env: BTreeMap<String, String> = panel
@@ -1374,69 +1760,11 @@ impl SettingsPage {
         });
     }
 
-    /// The agent's settings: its account, the defaults new threads start with, and its
-    /// environment.
-    fn render_agent_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let heading = |title: &'static str| {
-            Label::new(title)
-                .size(LabelSize::Small)
-                .weight(gpui::FontWeight::MEDIUM)
-        };
-        v_flex()
-            .mx_4()
-            .mb_3()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .child(heading("Account"))
-                    .child(self.render_account_panel(cx)),
-            )
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(colors.border_variant)
-                    .child(heading("Defaults for New Threads"))
-                    .child(self.render_agent_defaults(window, cx)),
-            )
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(colors.border_variant)
-                    .child(heading("Environment Variables"))
-                    .child(self.render_agent_env(cx)),
-            )
-            .child(
-                h_flex()
-                    .p_2()
-                    .justify_end()
-                    .border_t_1()
-                    .border_color(colors.border_variant)
-                    .child(
-                        Button::new("agent-settings-done", "Done")
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.account = None;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
     /// Zed's per-agent defaults: what a new session starts with. Choosing a setting in a thread
     /// changes these too.
     fn render_agent_defaults(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(panel) = &self.account else {
+        const TITLE: &str = "Defaults for New Threads";
+        let Some(panel) = self.account() else {
             return div().into_any_element();
         };
         let agent_id = panel.agent_id.0.to_string();
@@ -1504,14 +1832,16 @@ impl SettingsPage {
                 }
                 menu
             });
-            rows.push(render_default_row(
-                option.name.clone().into(),
+            rows.push(render_row(
+                option.name.clone(),
+                option.description.clone().unwrap_or_default(),
                 DropdownMenu::new(
                     SharedString::from(format!("agent-default-{}", option.id.0)),
                     label,
                     menu,
                 )
                 .into_any_element(),
+                cx,
             ));
         }
         // Agents that predate config options offer modes instead.
@@ -1565,9 +1895,11 @@ impl SettingsPage {
                 }
                 menu
             });
-            rows.push(render_default_row(
-                "Mode".into(),
+            rows.push(render_row(
+                "Mode",
+                "",
                 DropdownMenu::new("agent-default-mode", label, menu).into_any_element(),
+                cx,
             ));
         }
         if rows.is_empty() {
@@ -1577,24 +1909,24 @@ impl SettingsPage {
                 (ConnectionStatus::Connecting, _) => format!("Loading {agent_name}'s settings…"),
                 _ => format!("{agent_name} doesn't offer any settings."),
             };
-            return Label::new(message)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
+            let message = div()
+                .px_4()
+                .py_3()
+                .child(Label::new(message).color(Color::Muted))
                 .into_any_element();
+            return render_section(TITLE, vec![message], cx);
         }
-        v_flex()
-            .gap_1()
-            .child(
-                Label::new("Choosing one in a thread also makes it the default, as in Zed.")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .children(rows)
-            .into_any_element()
+        render_section_with_note(
+            TITLE,
+            rows,
+            "Choosing one in a thread also makes it the default.",
+            cx,
+        )
     }
 
+    /// The variables the agent starts with, one row each.
     fn render_agent_env(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(panel) = &self.account else {
+        let Some(panel) = self.account() else {
             return div().into_any_element();
         };
         let colors = cx.theme().colors().clone();
@@ -1609,15 +1941,17 @@ impl SettingsPage {
                 .rounded_md()
                 .border_1()
                 .border_color(colors.border)
-                .bg(colors.panel_background)
+                .bg(colors.editor_background)
                 .child(input)
         };
-        let rows: Vec<AnyElement> = panel
+        let mut rows: Vec<AnyElement> = panel
             .env_rows
             .iter()
             .enumerate()
             .map(|(index, row)| {
                 h_flex()
+                    .px_4()
+                    .py_2()
                     .gap_2()
                     .child(div().w(px(180.)).child(input_box(row.key.clone())))
                     .child(Label::new("=").color(Color::Muted))
@@ -1627,7 +1961,7 @@ impl SettingsPage {
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Remove Variable"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(panel) = &mut this.account
+                                if let Some(panel) = this.account_mut()
                                     && index < panel.env_rows.len()
                                 {
                                     panel.env_rows.remove(index);
@@ -1639,29 +1973,46 @@ impl SettingsPage {
                     .into_any_element()
             })
             .collect();
+        if rows.is_empty() {
+            rows.push(
+                div()
+                    .px_4()
+                    .py_3()
+                    .child(Label::new("No variables.").color(Color::Muted))
+                    .into_any_element(),
+            );
+        }
+        let add = Button::new("add-env", "Add Variable")
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .start_icon(
+                Icon::new(IconName::Plus)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                let row = this.new_env_row("", "", cx);
+                if let Some(panel) = this.account_mut() {
+                    panel.env_rows.push(row);
+                }
+                cx.notify();
+            }));
         v_flex()
             .gap_2()
+            .child(render_section_with_actions(
+                "Environment Variables",
+                rows,
+                add.into_any_element(),
+                cx,
+            ))
             .child(
                 Label::new(format!(
-                    "Passed to {agent_name} when it starts. Running threads pick them up after Reload Agent."
+                    "Passed to {agent_name} when it starts. Running threads pick them up after \
+                     Reload Agent."
                 ))
                 .size(LabelSize::Small)
                 .color(Color::Muted),
-            )
-            .children(rows)
-            .child(
-                h_flex().child(
-                    Button::new("add-env", "Add Variable")
-                        .style(ButtonStyle::Subtle)
-                        .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let row = this.new_env_row("", "", cx);
-                            if let Some(panel) = &mut this.account {
-                                panel.env_rows.push(row);
-                            }
-                            cx.notify();
-                        })),
-                ),
             )
             .into_any_element()
     }
@@ -1669,7 +2020,7 @@ impl SettingsPage {
     /// The agent's own ways to log in (the same ones a thread offers when it needs a login), and
     /// ACP's logout when the agent supports it.
     fn render_account_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(account) = &self.account else {
+        let Some(account) = self.account() else {
             return div().into_any_element();
         };
         let connection = account.connection.read(cx);
@@ -1721,7 +2072,7 @@ impl SettingsPage {
                         Button::new("account-logout", "Log Out")
                             .style(ButtonStyle::Outlined)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(account) = &mut this.account {
+                                if let Some(account) = this.account_mut() {
                                     account.terminal_hint = None;
                                     account
                                         .connection
@@ -1806,7 +2157,7 @@ impl SettingsPage {
                                 .style(ButtonStyle::Subtle)
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(account) = &mut this.account {
+                                    if let Some(account) = this.account_mut() {
                                         account.terminal_hint = None;
                                         account.connection.update(cx, |connection, cx| {
                                             connection.check_login(cx)
@@ -1832,7 +2183,7 @@ impl SettingsPage {
         is_terminal: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(account) = &mut self.account else {
+        let Some(account) = self.account_mut() else {
             return;
         };
         if !is_terminal {
@@ -1877,10 +2228,17 @@ impl SettingsPage {
         );
         let registry = self.registry(cx);
         let id = id.clone();
-        cx.spawn(async move |_, cx| {
-            if answer.await == Ok(0) {
-                registry.update(cx, |registry, cx| registry.uninstall(&id, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
             }
+            registry.update(cx, |registry, cx| registry.uninstall(&id, cx));
+            this.update_in(cx, |this, window, cx| {
+                if this.account().is_some_and(|panel| panel.agent_id == id) {
+                    this.show_agents_page(AgentsPage::Installed, window, cx);
+                }
+            })
+            .log_err();
         })
         .detach();
     }
@@ -1900,6 +2258,7 @@ impl SettingsPage {
             .collect();
         let current = self.agents_machine;
         let label = self.machines.read(cx).label(current, cx);
+        let icon = self.machines.read(cx).machine_icon(current, cx);
         let this = cx.entity().downgrade();
         let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
             for (machine, label) in machines {
@@ -1917,16 +2276,16 @@ impl SettingsPage {
             }
             menu
         });
-        render_section(
-            "Machine",
-            vec![render_row(
-                "Agents on",
+        let trigger = h_flex()
+            .gap_1p5()
+            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+            .child(Label::new(label))
+            .into_any_element();
+        DropdownMenu::new_with_element("agents-machine", trigger, menu)
+            .trigger_tooltip(Tooltip::text(
                 "Each machine installs and runs its own agents.",
-                DropdownMenu::new("agents-machine", label, menu).into_any_element(),
-                cx,
-            )],
-            cx,
-        )
+            ))
+            .into_any_element()
     }
 
     fn set_agents_machine(&mut self, machine: MachineId, cx: &mut Context<Self>) {
@@ -1934,7 +2293,10 @@ impl SettingsPage {
             return;
         }
         self.agents_machine = machine;
-        self.account = None;
+        // Only the installed agents and the registry offer the picker.
+        if let AgentsPage::Agent(_) = self.agents_page {
+            self.agents_page = AgentsPage::Installed;
+        }
         self.registry(cx)
             .update(cx, |registry, cx| registry.refresh_if_stale(cx));
         cx.notify();
@@ -2559,14 +2921,112 @@ fn login_method_subject(method: &str) -> Option<String> {
     (!is_bare && !trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn render_default_row(name: SharedString, control: AnyElement) -> AnyElement {
-    h_flex()
-        .py_0p5()
-        .gap_3()
-        .justify_between()
-        .child(Label::new(name))
-        .child(control)
+/// A version as t3code shows it: a bare number gets a "v", anything else (a custom agent's
+/// "custom") stays as it is.
+fn version_label(version: &str) -> String {
+    if version.starts_with(|character: char| character.is_ascii_digit()) {
+        format!("v{version}")
+    } else {
+        version.to_string()
+    }
+}
+
+/// The installed version, with the registry's newer one when there is one, and whether there
+/// is.
+fn installed_version(agent: &AgentListing) -> Option<(SharedString, bool)> {
+    let InstallState::Installed {
+        version,
+        update_available,
+    } = &agent.install_state
+    else {
+        return None;
+    };
+    let label = if *update_available {
+        format!(
+            "{} · {} available",
+            version_label(version),
+            version_label(agent.version())
+        )
+    } else {
+        version_label(version)
+    };
+    Some((label.into(), *update_available))
+}
+
+/// Whether an agent belongs with the installed ones. An agent being updated reports
+/// Installing, so an agent being installed for the first time joins them a little early.
+fn counts_as_installed(state: &InstallState) -> bool {
+    matches!(
+        state,
+        InstallState::Installed { .. } | InstallState::Installing
+    )
+}
+
+/// An agent's icon at full contrast on a neutral tile. The ACP Registry's icons are drawn in
+/// `currentColor`, so they take the text color.
+fn render_agent_tile(icon_path: Option<&SharedString>, size: Pixels, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    let icon = match icon_path {
+        Some(path) => Icon::from_external_svg(path.clone()),
+        None => Icon::new(IconName::Sparkle),
+    };
+    div()
+        .size(size)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .border_color(colors.border_variant)
+        .bg(colors.element_background)
+        .child(
+            icon.size(IconSize::Custom(rems_from_px(f32::from(size) / 2.)))
+                .color(Color::Default),
+        )
         .into_any_element()
+}
+
+/// Zed's links from an agent's registry entry: its repository, website and license.
+fn render_agent_links(agent: &AgentListing) -> Vec<AnyElement> {
+    let metadata = &agent.metadata;
+    [
+        (
+            metadata.repository.clone(),
+            IconName::Github,
+            "repository",
+            "Visit Agent Repository",
+        ),
+        (
+            metadata.website.clone(),
+            IconName::Link,
+            "website",
+            "Visit Agent Website",
+        ),
+        (
+            metadata.license_url.clone(),
+            IconName::FileTextOutlined,
+            "license",
+            "View Agent License or Terms of Service",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(url, icon, kind, title)| {
+        let url = url?;
+        let tooltip_url = url.clone();
+        Some(
+            IconButton::new(
+                SharedString::from(format!("agent-{kind}-{}", agent.id().0)),
+                icon,
+            )
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(move |_, cx| Tooltip::with_meta(title, None, tooltip_url.clone(), cx))
+            .on_click(move |_, _, cx| cx.open_url(&url))
+            .into_any_element(),
+        )
+    })
+    .collect()
 }
 
 /// A select option's choices, flattening groups.
@@ -2626,13 +3086,32 @@ fn render_section_with_actions(
         .into_any_element()
 }
 
+/// A section with a note under its rows.
+fn render_section_with_note(
+    title: &'static str,
+    rows: Vec<AnyElement>,
+    note: impl Into<SharedString>,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .gap_2()
+        .child(render_section(title, rows, cx))
+        .child(
+            Label::new(note.into())
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
 /// A setting's title and description on the left, its control on the right.
 fn render_row(
-    title: &'static str,
+    title: impl Into<SharedString>,
     description: impl Into<SharedString>,
     control: AnyElement,
     _cx: &App,
 ) -> AnyElement {
+    let description = description.into();
     h_flex()
         .px_4()
         .py_3()
@@ -2644,11 +3123,13 @@ fn render_row(
                 .min_w_0()
                 .gap_0p5()
                 .child(Label::new(title))
-                .child(
-                    Label::new(description.into())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
+                .when(!description.is_empty(), |column| {
+                    column.child(
+                        Label::new(description)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                }),
         )
         .child(div().flex_none().child(control))
         .into_any_element()
@@ -2657,20 +3138,28 @@ fn render_row(
 impl Render for SettingsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let (title, sections) = match self.section {
-            Section::General => ("General".into(), self.render_general(window, cx)),
-            Section::Appearance => ("Appearance".into(), self.render_appearance(window, cx)),
-            Section::Agents => ("Agents".into(), self.render_agents(window, cx)),
-            Section::Machines => ("Machines".into(), self.render_machines(cx)),
+        let headline = |title: SharedString| {
+            Headline::new(title)
+                .size(HeadlineSize::Small)
+                .into_any_element()
+        };
+        let (header, sections) = match self.section {
+            Section::General => (headline("General".into()), self.render_general(window, cx)),
+            Section::Appearance => (
+                headline("Appearance".into()),
+                self.render_appearance(window, cx),
+            ),
+            Section::Agents => (
+                self.render_agents_header(window, cx),
+                self.render_agents(window, cx),
+            ),
+            Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
-                    project.name(),
+                    headline(project.name()),
                     self.render_project(key.machine, project, window, cx),
                 ),
-                None => (
-                    SharedString::from("General"),
-                    self.render_general(window, cx),
-                ),
+                None => (headline("General".into()), self.render_general(window, cx)),
             },
         };
         h_flex()
@@ -2700,7 +3189,7 @@ impl Render for SettingsPage {
                                     .px_8()
                                     .py_6()
                                     .gap_6()
-                                    .child(Headline::new(title).size(HeadlineSize::Small))
+                                    .child(header)
                                     .children(sections),
                             ),
                     )
@@ -2711,7 +3200,140 @@ impl Render for SettingsPage {
 
 #[cfg(test)]
 mod tests {
-    use super::login_method_subject;
+    use agentz_protocol::agents::{RegistryAgentMetadata, RegistrySnapshot};
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::TestAppContext;
+
+    use super::*;
+    use crate::server_client::ServerClient;
+
+    fn listing(id: &str, name: &str, install_state: InstallState) -> AgentListing {
+        AgentListing {
+            metadata: RegistryAgentMetadata {
+                id: AgentId::new(id.to_string()),
+                name: name.to_string().into(),
+                description: format!("{name}, for tests").into(),
+                version: "2.0.0".into(),
+                repository: None,
+                website: None,
+                license_url: None,
+                icon_path: None,
+            },
+            supports_current_platform: true,
+            install_state,
+        }
+    }
+
+    fn agent_page_id(
+        page: &Entity<SettingsPage>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<String> {
+        page.read_with(cx, |page, _| {
+            page.account().map(|panel| panel.agent_id.0.to_string())
+        })
+    }
+
+    #[gpui::test]
+    fn installed_agents_open_their_own_page_and_the_registry_lists_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![
+                            listing(
+                                "codex",
+                                "Codex",
+                                InstallState::Installed {
+                                    version: "1.0.0".into(),
+                                    update_available: true,
+                                },
+                            ),
+                            listing(
+                                "claude",
+                                "Claude Agent",
+                                InstallState::Installed {
+                                    version: "2.0.0".into(),
+                                    update_available: false,
+                                },
+                            ),
+                            listing("gemini", "Gemini CLI", InstallState::NotInstalled),
+                        ],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+
+        // Only the installed agents are listed, sorted by name.
+        let claude = cx
+            .debug_bounds("agent-row-claude")
+            .expect("Claude is listed");
+        let codex = cx.debug_bounds("agent-row-codex").expect("Codex is listed");
+        assert!(claude.top() < codex.top());
+        assert!(cx.debug_bounds("agent-row-gemini").is_none());
+
+        // A row opens the agent's page, and the back button returns to the list.
+        cx.simulate_click(claude.center(), gpui::Modifiers::none());
+        assert_eq!(agent_page_id(&page, cx).as_deref(), Some("claude"));
+        assert!(cx.debug_bounds("agent-row-codex").is_none());
+        let back = cx
+            .debug_bounds("agents-back")
+            .expect("a sub-page has a back button");
+        cx.simulate_click(back.center(), gpui::Modifiers::none());
+        assert_eq!(agent_page_id(&page, cx), None);
+        assert!(cx.debug_bounds("agent-row-codex").is_some());
+
+        // The registry lists every agent, and typing there searches it.
+        page.update_in(cx, |page, window, cx| {
+            page.show_agents_page(AgentsPage::Registry, window, cx)
+        });
+        cx.run_until_parked();
+        for card in [
+            "registry-card-claude",
+            "registry-card-codex",
+            "registry-card-gemini",
+        ] {
+            assert!(cx.debug_bounds(card).is_some(), "{card} is listed");
+        }
+        cx.simulate_input("gem");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("registry-card-gemini").is_some());
+        assert!(cx.debug_bounds("registry-card-claude").is_none());
+
+        // Not Installed hides the installed agents even without a search.
+        page.update_in(cx, |page, window, cx| {
+            page.show_agents_page(AgentsPage::Registry, window, cx);
+            page.set_registry_filter(RegistryFilter::NotInstalled, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("registry-card-gemini").is_some());
+        assert!(cx.debug_bounds("registry-card-codex").is_none());
+
+        // Leaving Agents and coming back starts at the installed agents again.
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::General, window, cx);
+            page.select(Section::Agents, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agent-row-claude").is_some());
+    }
 
     #[test]
     fn login_method_subjects() {

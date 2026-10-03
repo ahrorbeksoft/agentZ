@@ -118,8 +118,15 @@ Each entry: what it does, where it lives, and where it comes from.
   reads `repository/branch` (`sidebar::repository_branch`); workspace rows do the same. The
   repository is its main checkout's folder, so worktrees keep its name.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
-  combining repositories), Appearance (Zed's theme modes), Agents (registry, per-agent login,
-  defaults, environment, a machine picker), Machines, and a page per project (with Checkouts).
+  combining repositories), Appearance (Zed's theme modes), Agents, Machines, and a page per
+  project (with Checkouts).
+- **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
+  installed agents as rows, each opening the agent's own page (its registry links, Update,
+  Uninstall, login, defaults for new threads, environment). Add Agent opens the ACP Registry
+  page, which has search, an All / Installed / Not Installed filter, and a card for each agent.
+  A sub-page has Zed's back button and breadcrumb. With more than one machine, a machine
+  picker sits in the header. Registry icons are single-color (`currentColor`), so they are
+  drawn in the text color on a neutral tile.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
 
 ### Agent threads
