@@ -21,8 +21,8 @@ Note anything that changed the plan under **Findings**, and update the plan itse
 | 6. Worktrees and pastures | Done |
 | 7. Terminals | Done |
 | 8. Terminal agent detection | Done |
-| 9. Machines over SSH | In progress |
-| 10. Polish | Not started |
+| 9. Machines over SSH | Done |
+| 10. Polish | In progress |
 | 11. Workspaces view | Not started |
 
 ## 0. Spike
@@ -285,13 +285,15 @@ Then the server:
       beside its binary when it started, the SSH client compares it with the one installed
       now, and an older server shows an icon in the title bar and Restart Server… in
       Settings › Machines.
-- [ ] Test against `t3-home` and `devbox1`, leaving their t3code and herdr installs alone.
+- [x] Test against `t3-home` and `devbox1`, leaving their t3code and herdr installs alone.
   - [x] Install and reconnect: `AGENTZ_SSH_TEST_TARGET=<host> cargo test -p agentz_server --test
         ssh -- --ignored` (1–4 s; the second run reuses the server and uploads nothing).
         `AGENTZ_SSH_TEST_RESTART=1` replaces an older running server (done on both).
   - [x] npm agents: `AGENTZ_SSH_TEST_INSTALL_AGENT=claude-acp` installed it on `devbox1` in
         5 s, with the Node.js 24 that nvm has put on both machines since the first check
         (found through the login shell). The download path is tested on this Mac.
+  - [x] The app: both connect and show in Settings › Machines with their OS and server
+        version; projects added there list and complete their folders.
 
 ## 10. Polish
 
@@ -643,5 +645,6 @@ Then the server:
 - 2026-10-03: Phase 9: agents can start, message and list threads on the project's other
   machines, through the app.
 - 2026-10-03: Phase 9: npm agents install on machines without Node.js.
+- 2026-10-03: Finished phase 9.
 - 2026-10-03: Added phase 11, the Workspaces view (herdr's workspaces, tabs and panes) next to
   the Agents view, at the user's request.
