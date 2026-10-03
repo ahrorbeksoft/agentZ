@@ -297,8 +297,12 @@ Then the server:
 
 ## 10. Polish
 
-- [ ] A macOS app bundle (Info.plist, bundle id, ad-hoc signature) so system notifications show,
-      and launching with `open -g` doesn't take focus.
+- [x] A macOS app bundle (Info.plist, bundle id, ad-hoc signature) so system notifications show,
+      and launching with `open -g` doesn't take focus: `tooling/bundle-mac.sh [--debug]` makes
+      `target/bundle/agentZ.app` (`dev.agentz.agentZ`), with the server beside the app and the
+      Linux servers in `Resources`. A bundled app leaves activation to Launch Services. Checked
+      with `open -g`: the front app stayed in front, and notifications were enabled. No app
+      icon yet.
 - [x] Optional start at login: Settings › General › Start at login writes a launch agent
       (`~/Library/LaunchAgents/dev.agentz.server.plist`) that runs `agentz-server start` at
       load, and nothing more, so a stopped server stays stopped. The app points it at its

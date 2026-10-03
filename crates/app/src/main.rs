@@ -189,6 +189,18 @@ fn main() {
                 cx.quit();
                 return;
             }
-            cx.activate(true);
+            // Launch Services brings a bundled app forward itself, except when it's opened in
+            // the background (`open -g`). From a terminal, nothing else would.
+            if !runs_from_bundle() {
+                cx.activate(true);
+            }
         });
+}
+
+fn runs_from_bundle() -> bool {
+    std::env::current_exe().is_ok_and(|executable| {
+        executable
+            .parent()
+            .is_some_and(|directory| directory.ends_with("Contents/MacOS"))
+    })
 }
