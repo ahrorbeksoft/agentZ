@@ -73,6 +73,8 @@ pub struct AppSettings {
     /// Terminals' font size, as Cmd-+ and Cmd-- in a terminal left it. `None` is the
     /// default.
     pub terminal_font_size: Option<f32>,
+    /// The sidebar was hidden with Cmd-B, in Agents and Workspaces alike.
+    pub is_sidebar_hidden: bool,
 }
 
 impl Default for AppSettings {
@@ -87,6 +89,7 @@ impl Default for AppSettings {
             project_grouping_overrides: Default::default(),
             last_combined_grouping: ProjectGroupingMode::default(),
             terminal_font_size: None,
+            is_sidebar_hidden: false,
         }
     }
 }
@@ -222,4 +225,12 @@ fn write_settings(path: &std::path::Path, settings: &AppSettings) -> Result<()> 
     }
     let json = serde_json::to_vec_pretty(settings)?;
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Whether Cmd-B hid the sidebar.
+pub fn is_sidebar_hidden(cx: &App) -> bool {
+    AppSettingsStore::global(cx)
+        .read(cx)
+        .settings()
+        .is_sidebar_hidden
 }

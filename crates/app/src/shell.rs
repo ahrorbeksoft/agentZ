@@ -17,7 +17,7 @@ use util::ResultExt as _;
 
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
-use crate::app_settings::AppSettingsStore;
+use crate::app_settings::{AppSettingsStore, is_sidebar_hidden};
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
@@ -29,7 +29,8 @@ use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::{
-    NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher, ToggleTerminalDrawer,
+    NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher, ToggleSidebar,
+    ToggleTerminalDrawer,
 };
 
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
@@ -365,6 +366,17 @@ impl Shell {
                 view.toggle_terminal_drawer(action, window, cx)
             });
         }
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        AppSettingsStore::global(cx).update(cx, |store, cx| {
+            store.update(
+                |settings| settings.is_sidebar_hidden = !settings.is_sidebar_hidden,
+                cx,
+            )
+        });
+        self.spaces_view.update(cx, |_, cx| cx.notify());
+        cx.notify();
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -854,6 +866,26 @@ impl Shell {
                     window.titlebar_double_click();
                 }
             })
+            .child(
+                // Keeps a press on the button from starting a window drag.
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        IconButton::new(
+                            "toggle-sidebar",
+                            if is_sidebar_hidden(cx) {
+                                IconName::ThreadsSidebarLeftClosed
+                            } else {
+                                IconName::ThreadsSidebarLeftOpen
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(|_, cx| Tooltip::for_action("Toggle Sidebar", &ToggleSidebar, cx))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_sidebar(&ToggleSidebar, window, cx)
+                        })),
+                    ),
+            )
             .when(shows_switcher, |title_bar| {
                 title_bar.child(
                     // Keeps a press on the switcher from starting a window drag.
@@ -1007,6 +1039,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::new_thread))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_diff))
+            .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_terminal_drawer))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDiffEdge>, _, cx| {
@@ -1036,7 +1069,7 @@ impl Render for Shell {
                         .flex_1()
                         .min_h_0()
                         // Settings brings its own navigation in place of the thread list.
-                        .when(settings_page.is_none(), |row| {
+                        .when(settings_page.is_none() && !is_sidebar_hidden(cx), |row| {
                             row.child(self.sidebar.clone())
                         })
                         .when(!is_diff_full_screen, |row| {
@@ -1258,5 +1291,32 @@ mod modal_tests {
         cx.simulate_click(point(px(20.), px(500.)), Modifiers::none());
         cx.run_until_parked();
         assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
+    }
+
+    #[gpui::test]
+    fn cmd_b_hides_and_shows_the_sidebar(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new("cmd-b", ToggleSidebar, None)]);
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            window.focus(&shell.focus_handle, cx)
+        });
+        let hidden = |cx: &mut gpui::VisualTestContext| cx.update(|_, cx| is_sidebar_hidden(cx));
+        assert!(!hidden(cx));
+        cx.simulate_keystrokes("cmd-b");
+        assert!(hidden(cx));
+        cx.simulate_keystrokes("cmd-b");
+        assert!(!hidden(cx));
     }
 }

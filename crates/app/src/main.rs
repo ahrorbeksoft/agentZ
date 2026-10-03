@@ -52,6 +52,8 @@ actions!(
         OpenSettings,
         /// Shows or hides the open thread's changes.
         ToggleDiff,
+        /// Shows or hides the sidebar.
+        ToggleSidebar,
         /// Opens or closes the terminal under the open thread.
         ToggleTerminalDrawer,
     ]
@@ -128,6 +130,8 @@ fn init_actions(cx: &mut App) {
         KeyBinding::new("secondary-n", NewThread, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-d", ToggleDiff, None),
+        // Zed's key for its left dock.
+        KeyBinding::new("secondary-b", ToggleSidebar, None),
         KeyBinding::new("secondary-j", ToggleTerminalDrawer, None),
     ]);
     cx.set_menus([
@@ -142,6 +146,7 @@ fn init_actions(cx: &mut App) {
             MenuItem::action("Switch Project…", ToggleProjectSwitcher),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Sidebar", ToggleSidebar),
             MenuItem::action("Changes", ToggleDiff),
             MenuItem::action("Terminal", ToggleTerminalDrawer),
         ]),

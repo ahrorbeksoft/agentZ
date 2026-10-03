@@ -752,3 +752,6 @@ Then the server:
 - 2026-10-03: Terminals: Cmd-+/Cmd--/Cmd-0 size their font (saved); with a thread's drawer
   hidden, a dot on its terminal button says something runs in it (the server watches drawer
   terminals' foreground and sends `drawer_commands`).
+- 2026-10-03: Cmd-B (Zed's left dock key) and a title-bar button before the project switcher
+  hide the sidebar, in Agents and Workspaces, remembered in settings.json. Modals close on a
+  press anywhere outside them (74f3ff2).

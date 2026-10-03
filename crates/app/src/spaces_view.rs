@@ -2223,7 +2223,9 @@ impl Render for SpacesView {
                     );
                 }
             }))
-            .child(self.render_sidebar(window, cx))
+            .when(!crate::app_settings::is_sidebar_hidden(cx), |view| {
+                view.child(self.render_sidebar(window, cx))
+            })
             .child(
                 div()
                     .flex_1()
