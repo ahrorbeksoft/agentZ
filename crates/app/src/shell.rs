@@ -28,7 +28,9 @@ use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
-use crate::{NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher};
+use crate::{
+    NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher, ToggleTerminalDrawer,
+};
 
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 /// Leaves room for the macOS traffic lights.
@@ -327,6 +329,28 @@ impl Shell {
         ];
         self.new_thread_modal = Some((modal, subscriptions));
         cx.notify();
+    }
+
+    /// Cmd-J with focus outside the thread view (the Changes panel, the sidebar): the open
+    /// thread's terminal. With focus inside, the thread view handles it first.
+    fn toggle_terminal_drawer(
+        &mut self,
+        action: &ToggleTerminalDrawer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view != MainView::Agents || self.settings_page.is_some() {
+            return;
+        }
+        let view = self
+            .active_thread
+            .and_then(|thread_id| self.open_threads.get(&thread_id))
+            .map(|open_thread| open_thread.view.clone());
+        if let Some(ThreadView::Agent(view)) = view {
+            view.update(cx, |view, cx| {
+                view.toggle_terminal_drawer(action, window, cx)
+            });
+        }
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -940,6 +964,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::new_thread))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_diff))
+            .on_action(cx.listener(Self::toggle_terminal_drawer))
             .relative()
             .size_full()
             .bg(background)

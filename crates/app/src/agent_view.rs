@@ -550,7 +550,7 @@ impl AgentView {
     }
 
     /// Opens the thread's terminal under it and focuses it, or closes it.
-    fn toggle_terminal_drawer(
+    pub fn toggle_terminal_drawer(
         &mut self,
         _: &ToggleTerminalDrawer,
         window: &mut Window,
@@ -996,9 +996,11 @@ impl AgentView {
                     .tooltip(|_, cx| {
                         Tooltip::for_action("Toggle Terminal", &ToggleTerminalDrawer, cx)
                     })
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(ToggleTerminalDrawer), cx)
-                    }),
+                    // Directly: dispatched, the action would start wherever focus is, which may
+                    // be outside this view.
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
+                    })),
             )
             .child(
                 IconButton::new("toggle-diff", IconName::Diff)
