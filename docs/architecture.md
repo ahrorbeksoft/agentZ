@@ -246,7 +246,7 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   name, and one line of transport, status and (when an update is installed) the server's
   version; then icon buttons for Update Server, Retry Now (while offline), Restart Server… (this
   Mac), Edit… and Remove…, and another machine's switch (connect or not). The icon opens a grid
-  of the machine kinds (t3code's `EnvironmentIconMenu` as tiles). A switched-off row dims. The
+  of the machine kinds' icons, named in tooltips (t3code's `EnvironmentIconMenu`). A switched-off row dims. The
   section header has Update All and Add Machine, which opens the Add/Edit dialog. Servers aren't stopped from the app.
 - **Server handoff** (`handoff.rs`, `server/hand_off.rs`, `terminals.rs`, herdr's live
   handoff): `Request::HandOff` starts the installed binary as `run --handoff` with a socket pair

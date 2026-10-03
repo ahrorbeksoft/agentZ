@@ -2146,7 +2146,8 @@ impl SettingsPage {
                     .icon_color(Color::Muted),
                 Tooltip::text("Change Icon"),
             )
-            .anchor(gpui::Anchor::TopLeft);
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)));
         h_flex()
             .px_4()
             .py_2p5()
