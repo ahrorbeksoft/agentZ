@@ -2,6 +2,7 @@
 //! screens to the clients watching (herdr's "surface interest"), at most once a frame.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,8 @@ pub(super) struct RunningTerminal {
     foreground_group: Option<u32>,
     /// When the terminal's output last counted as its thread's activity.
     activity_recorded_at: Option<Instant>,
+    /// For a terminal thread: the folder last seen in front, which names a shell.
+    folder: Option<PathBuf>,
 }
 
 /// The server's terminal bookkeeping.
@@ -257,6 +260,7 @@ impl Server {
                 tracker,
                 foreground_group: None,
                 activity_recorded_at: None,
+                folder: None,
             },
         );
         self.terminal_changed(key);
@@ -348,6 +352,8 @@ impl Server {
         // Terminal threads whose foreground changed, and the program now there unless it's
         // the shell.
         let mut foregrounds = Vec::new();
+        // Terminal threads whose foreground moved to another folder.
+        let mut folders = Vec::new();
         let mut next_tick: Option<Duration> = None;
         for (key, running) in &mut self.terminals.running {
             let Some(tracker) = &mut running.tracker else {
@@ -375,6 +381,15 @@ impl Server {
                     .filter(|leader| !detect::is_shell(leader))
                     .map(|leader| leader.argv0.unwrap_or(leader.name));
                 foregrounds.push((*thread_id, program));
+            }
+            // The group's leader is the shell, or a program it started, which works where
+            // the shell is.
+            if let TerminalKey::Thread(thread_id) = key
+                && let Some(folder) = process_group_id.and_then(detect::process::process_cwd)
+                && running.folder.as_ref() != Some(&folder)
+            {
+                running.folder = Some(folder.clone());
+                folders.push((*thread_id, folder));
             }
             if tracker.should_probe(now, process_group_id) {
                 let leader = process_group_id.and_then(detect::process::group_leader);
@@ -423,6 +438,18 @@ impl Server {
                 .and_then(|thread| thread.terminal.as_ref()?.command.clone());
             self.projects
                 .set_terminal_command(thread_id, command.or(program));
+        }
+        for (thread_id, folder) in folders {
+            // A shell is named after where it is; one started with a command keeps its name.
+            let is_shell = self
+                .projects
+                .thread(thread_id)
+                .and_then(|thread| thread.terminal.as_ref())
+                .is_some_and(|terminal| terminal.command.is_none());
+            if is_shell {
+                self.projects
+                    .rename_thread(thread_id, folder_title(&folder));
+            }
         }
         for (key, agent, state) in published {
             match key {
@@ -740,4 +767,15 @@ mod tests {
             ("llo".into(), true)
         );
     }
+}
+
+/// A shell's name for its folder: `~` for home, else the folder's own name.
+fn folder_title(folder: &Path) -> String {
+    if folder == util::paths::home_dir().as_path() {
+        return "~".to_string();
+    }
+    folder.file_name().map_or_else(
+        || folder.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }

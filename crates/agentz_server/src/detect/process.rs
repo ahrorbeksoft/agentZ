@@ -1,6 +1,6 @@
 //! The process in a terminal's foreground, as herdr finds it (`src/platform/`): the terminal's
-//! foreground process group, read through its shell, and that group's leader's name and
-//! arguments.
+//! foreground process group, read through its shell, that group's leader's name and
+//! arguments, and a process's working directory.
 //!
 //! Ported from herdr (https://github.com/herdrdev/herdr), licensed under the Apache License,
 //! Version 2.0 (see `LICENSE-APACHE`). Changed: only the group's leader is read.
@@ -80,6 +80,37 @@ mod platform {
             .and_then(|buffer| procargs2_argv(&buffer))
             .unwrap_or_default();
         Some(ForegroundProcess::new(name, argv))
+    }
+
+    /// A process's working directory (herdr's `process_cwd`): `pvi_cdir` from
+    /// `PROC_PIDVNODEPATHINFO`.
+    pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt as _;
+        // SAFETY: `info` is plain data the size `proc_pidinfo` is told to fill.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: the buffer is `size` bytes.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if filled != size {
+            return None;
+        }
+        // SAFETY: `vip_path` is `MAXPATHLEN` bytes, declared as nested arrays.
+        let path = unsafe {
+            std::slice::from_raw_parts(
+                info.pvi_cdir.vip_path.as_ptr() as *const u8,
+                libc::MAXPATHLEN as usize,
+            )
+        };
+        let end = path.iter().position(|&byte| byte == 0)?;
+        (end > 0).then(|| std::ffi::OsStr::from_bytes(&path[..end]).into())
     }
 
     fn kern_procargs2(pid: u32) -> Option<Vec<u8>> {
@@ -191,6 +222,11 @@ mod platform {
             .unwrap_or_default();
         Some(ForegroundProcess::new(name, argv))
     }
+
+    /// A process's working directory (herdr's `process_cwd`).
+    pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -204,6 +240,10 @@ mod platform {
     pub(crate) fn group_leader(_process_group_id: u32) -> Option<ForegroundProcess> {
         None
     }
+
+    pub(crate) fn process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
-pub(crate) use platform::{foreground_process_group_id, group_leader};
+pub(crate) use platform::{foreground_process_group_id, group_leader, process_cwd};

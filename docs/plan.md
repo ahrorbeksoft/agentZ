@@ -547,8 +547,11 @@ threads only, so its cards keep what threads have (rename, archive, changes, act
 Terminal threads (New Thread › Terminal) are shells, grouped in a collapsible **Shells** shelf
 above Archived (the user, 2026-10-03). While an agent CLI runs in one, it's a thread card,
 named after the agent unless renamed, with the agent's state; when the agent ends it goes back
-to Shells. Agent CLIs are watched for in workspace panes and terminal threads, not in a
-thread's drawer. New Thread offers no agent CLIs from `PATH`, only a plain terminal, for now.
+to Shells. A shell is named after the folder it's in (`~` for home), following `cd`, unless
+renamed; its row shows its checkout's branch and its last activity, or **Running** and the
+program while one runs in front of the shell. A terminal's output counts as its thread's
+activity, at most every 10 seconds. Agent CLIs are watched for in workspace panes and terminal
+threads, not in a thread's drawer. New Thread offers no agent CLIs from `PATH`, only a plain terminal, for now.
 
 **Workspaces** is herdr's model (`references/herdr`: `concepts.mdx`, `keyboard.mdx`,
 `configuration.mdx` § Sidebar row layouts, `session-state.mdx`, `src/layout.rs`,

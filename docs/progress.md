@@ -718,3 +718,6 @@ Then the server:
 - 2026-10-03: Terminal threads are shells in a Shells shelf in the Agents sidebar, and become
   thread cards while an agent CLI runs in them (the server watches terminal threads again and
   sends `terminal_agents` in the projects snapshot). Checked on screen with a fake `codex`.
+- 2026-10-03: Shell rows: named after the shell's current folder (read from the foreground
+  process's working directory, as herdr does), with the checkout's branch, last activity, and
+  Running with the program in front. Terminal output counts as activity.

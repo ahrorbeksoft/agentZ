@@ -1036,7 +1036,8 @@ impl Sidebar {
     }
 
     /// t3code's slim row for parked threads: the project's icon, dimmed until hovered, and for
-    /// an archived thread a way back on hover. Shells use it too.
+    /// an archived thread a way back on hover. A shell's row adds where it works, and shows
+    /// what runs in it in place of its last activity.
     fn render_slim_row(
         &self,
         store: &Entity<ProjectStore>,
@@ -1065,51 +1066,90 @@ impl Sidebar {
         }
         .map(|time| format_relative_time(time, SystemTime::now()));
         let prefix = if is_archived { "archived" } else { "shell" };
+        let running = (!is_archived)
+            .then(|| {
+                store
+                    .read(cx)
+                    .terminal_command(thread.id)
+                    .map(SharedString::from)
+            })
+            .flatten();
+        let faint_text = colors.text_muted.opacity(0.4);
+        let detail_line =
+            (!is_archived).then(|| {
+                // The title names the folder the shell is in; this is the checkout it
+                // started in.
+                let checkout = self.thread_checkout(machine, &thread, cx);
+                let branch = checkout.as_ref().and_then(ThreadCheckout::branch);
+                // Under the title, past the icon and the gap.
+                h_flex()
+                    .pl(px(26.))
+                    .min_w_0()
+                    .gap_1()
+                    .children(checkout.as_ref().and_then(|checkout| {
+                        render_checkout_marker(thread_id, checkout, faint_text)
+                    }))
+                    .children(branch.map(|branch| {
+                        Label::new(branch)
+                            .size(LabelSize::Small)
+                            .color(Color::Custom(faint_text))
+                            .truncate_middle()
+                    }))
+                    .child(div().flex_1())
+                    .children(running.clone().map(|command| {
+                        div().flex_none().max_w(px(100.)).child(
+                            Label::new(command)
+                                .size(LabelSize::Small)
+                                .color(Color::Custom(faint_text))
+                                .truncate(),
+                        )
+                    }))
+            });
         let group_name =
             SharedString::from(format!("{prefix}-row-{}-{}", machine.slug(), thread.id.0));
         let title = SharedString::from(thread.title.clone());
         let store = store.clone();
 
-        let row =
-            h_flex()
-                .id(thread_element_id(&format!("{prefix}-thread"), thread_id))
-                .group(group_name.clone())
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    this.thread_hovered(thread_id, *hovered, cx)
-                }))
-                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-                .relative()
-                .h(ARCHIVED_ROW_HEIGHT)
-                .w_full()
-                .px_2p5()
-                .gap_2p5()
-                .rounded_md()
-                .when(is_active, |row| row.bg(selected_background))
-                .when(!is_renaming, |row| {
-                    row.cursor_pointer()
-                        .hover(|row| row.bg(hover_background))
-                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
-                })
-                .when(is_offline, |row| row.opacity(0.5))
-                .child(
-                    div()
+        let main_line = h_flex()
+            .relative()
+            .when(is_archived, |line| line.h_full())
+            .when(!is_archived, |line| line.h_6())
+            .gap_2p5()
+            .child(
+                div()
+                    .flex_none()
+                    .when(!is_active, |this| {
+                        this.opacity(0.4)
+                            .group_hover(group_name.clone(), |this| this.opacity(1.))
+                    })
+                    .child(project_icon),
+            )
+            .child(if is_renaming {
+                self.render_rename_input(cx)
+            } else {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(title.clone()).color(Color::Muted).truncate())
+                    .into_any_element()
+            })
+            .when(running.is_some() && !is_renaming, |row| {
+                row.child(
+                    h_flex()
                         .flex_none()
-                        .when(!is_active, |this| {
-                            this.opacity(0.4)
-                                .group_hover(group_name.clone(), |this| this.opacity(1.))
-                        })
-                        .child(project_icon),
+                        .gap_1()
+                        .child(div().size_1p5().rounded_full().bg(Color::Accent.color(cx)))
+                        .child(
+                            Label::new("Running")
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::MEDIUM)
+                                .color(Color::Accent),
+                        ),
                 )
-                .child(if is_renaming {
-                    self.render_rename_input(cx)
-                } else {
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Label::new(title).color(Color::Muted).truncate())
-                        .into_any_element()
-                })
-                .when_some(time.filter(|_| !is_renaming), |row, time| {
+            })
+            .when_some(
+                time.filter(|_| !is_renaming && running.is_none()),
+                |row, time| {
                     row.child(
                         div()
                             .flex_none()
@@ -1118,30 +1158,54 @@ impl Sidebar {
                             })
                             .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
                     )
+                },
+            )
+            .when(is_archived && !is_renaming, |row| {
+                row.child(
+                    div()
+                        .absolute()
+                        .right_1()
+                        .visible_on_hover(group_name.clone())
+                        .child(
+                            IconButton::new(
+                                thread_element_id("unarchive-thread", thread_id),
+                                IconName::Undo,
+                            )
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Unarchive Thread"))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                store.update(cx, |store, cx| {
+                                    store.unarchive_thread(thread_id.thread, cx)
+                                });
+                            }),
+                        ),
+                )
+            });
+        let row =
+            v_flex()
+                .id(thread_element_id(&format!("{prefix}-thread"), thread_id))
+                .group(group_name)
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    this.thread_hovered(thread_id, *hovered, cx)
+                }))
+                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+                .relative()
+                .when(is_archived, |row| row.h(ARCHIVED_ROW_HEIGHT))
+                .when(!is_archived, |row| row.py_1p5())
+                .w_full()
+                .px_2p5()
+                .rounded_md()
+                .when(is_active, |row| row.bg(selected_background))
+                .when(!is_renaming, |row| {
+                    row.cursor_pointer()
+                        .hover(|row| row.bg(hover_background))
+                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
                 })
-                .when(is_archived && !is_renaming, |row| {
-                    row.child(
-                        div()
-                            .absolute()
-                            .right_1()
-                            .visible_on_hover(group_name.clone())
-                            .child(
-                                IconButton::new(
-                                    thread_element_id("unarchive-thread", thread_id),
-                                    IconName::Undo,
-                                )
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Unarchive Thread"))
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    store.update(cx, |store, cx| {
-                                        store.unarchive_thread(thread_id.thread, cx)
-                                    });
-                                }),
-                            ),
-                    )
-                });
+                .when(is_offline, |row| row.opacity(0.5))
+                .child(main_line)
+                .children(detail_line);
 
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =

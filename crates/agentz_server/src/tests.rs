@@ -1932,7 +1932,7 @@ impl TestClient {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn terminal_threads_show_what_runs_in_them() {
+async fn terminal_threads_show_where_they_are_and_what_runs() {
     let Some(server) = TestServer::start() else {
         return;
     };
@@ -1975,6 +1975,32 @@ async fn terminal_threads_show_what_runs_in_them() {
         .wait_until(move |client| last_activity(client) > created_activity)
         .await;
     assert_eq!(command(&client), None);
+
+    // A shell is named after the folder it's in, and follows `cd`.
+    let title = move |client: &TestClient| {
+        snapshot(client)
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.title.clone())
+    };
+    let project_name = server
+        .project_dir
+        .path()
+        .canonicalize()
+        .expect("project folder")
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+    client
+        .wait_until(move |client| title(client).as_deref() == Some(project_name.as_str()))
+        .await;
+    std::fs::create_dir(server.project_dir.path().join("inner")).expect("folder");
+    client.type_into(&key, "cd inner\n").await;
+    client
+        .wait_until(move |client| title(client).as_deref() == Some("inner"))
+        .await;
 
     // A program in front of the shell is running there, until it ends.
     client.type_into(&key, "sleep 30\n").await;
