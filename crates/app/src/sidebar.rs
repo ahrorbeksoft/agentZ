@@ -726,7 +726,33 @@ impl Sidebar {
             let icon_path = registry_agent.and_then(|agent| agent.icon_path().cloned());
             (icon_path, label)
         });
+        let store = machines.projects(machine, cx);
+        let store = store.as_ref().map(|store| store.read(cx));
+        // A terminal's agent CLI, by name.
+        let agent = agent.or_else(|| {
+            let name = store?.terminal_agent(thread.id)?;
+            Some((None, SharedString::from(name.to_string())))
+        });
         let checkout = self.thread_checkout(machine, thread, cx);
+        // A terminal is described by where it is now: that folder's project and branch, or its
+        // path outside git, and its worktree or pasture only while it's still in there.
+        let folder = store.and_then(|store| store.terminal_folder(thread.id));
+        let (project, branch, path, checkout) = match (folder, store) {
+            (Some(folder), Some(store)) => (
+                project_at(store.projects(), &folder.path),
+                folder.branch.clone(),
+                (!folder.is_repository)
+                    .then(|| folder_branch_label(folder))
+                    .flatten(),
+                checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
+            ),
+            _ => (
+                project,
+                checkout.as_ref().and_then(ThreadCheckout::branch),
+                None,
+                checkout,
+            ),
+        };
         ThreadDetails {
             title: thread.title.clone().into(),
             project: project.map(|project| {
@@ -735,16 +761,12 @@ impl Sidebar {
                     self.project_info(machine, project, cx).cloned(),
                 )
             }),
-            machine: machines.has_remotes().then(|| {
-                (
-                    machines.machine_icon(machine, cx),
-                    machines.label(machine, cx),
-                )
-            }),
-            branch: checkout
-                .as_ref()
-                .and_then(|checkout| checkout.branch())
-                .map(SharedString::from),
+            machine: (
+                machines.machine_icon(machine, cx),
+                machines.label(machine, cx),
+            ),
+            branch: branch.map(SharedString::from),
+            path: path.map(SharedString::from),
             workspace: checkout.and_then(|checkout| {
                 let workspace = checkout.workspace?;
                 Some((
@@ -777,6 +799,8 @@ impl Sidebar {
         let is_renaming = self.renaming_thread == Some(thread_id);
         let thread_status = store.read(cx).thread_status(thread.id);
         let icon = thread_agent_icon(self.machines.read(cx), machine, &thread, cx);
+        // Which machine it runs on, just before the agent.
+        let machine_icon = Icon::new(self.machines.read(cx).machine_icon(machine, cx));
         // A terminal thread is described by where it is now, which may not be where it
         // started: that folder's project, or the folder itself outside every project.
         let folder = store.read(cx).terminal_folder(thread.id).cloned();
@@ -787,7 +811,7 @@ impl Sidebar {
             },
             None => (project, None),
         };
-        let mut details = self.thread_details(machine, &thread, project.as_ref(), cx);
+        let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let checkout = self.thread_checkout(machine, &thread, cx);
         let (branch, checkout) = match &folder {
             Some(folder) => (
@@ -796,12 +820,6 @@ impl Sidebar {
             ),
             None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
         };
-        if let Some(folder) = &folder {
-            details.branch = folder.branch.clone().map(SharedString::from);
-            if checkout.is_none() {
-                details.workspace = None;
-            }
-        }
         let machines = self.machines.read(cx);
         // With one project selected, every card would repeat it, so the project line goes and
         // the status moves next to the title.
@@ -1082,6 +1100,12 @@ impl Sidebar {
                             div()
                                 .flex_none()
                                 .opacity(0.6)
+                                .child(machine_icon.size(IconSize::Small).color(Color::Muted)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .opacity(0.6)
                                 .child(icon.size(IconSize::Small).color(Color::Muted)),
                         ),
                 );
@@ -1176,25 +1200,7 @@ impl Sidebar {
             },
             None => self.render_project_icon(machine, project.as_ref(), cx),
         };
-        let mut details = self.thread_details(machine, &thread, project.as_ref(), cx);
-        // A shell's details follow where it is: that folder's project and branch.
-        if let Some(folder) = &folder {
-            let store = store.read(cx);
-            details.project = project_at(store.projects(), &folder.path).map(|project| {
-                (
-                    project.clone(),
-                    self.project_info(machine, project, cx).cloned(),
-                )
-            });
-            details.branch = folder.branch.clone().map(SharedString::from);
-            // The worktree or pasture line, only while it's still in there.
-            let is_in_checkout = self
-                .thread_checkout(machine, &thread, cx)
-                .is_some_and(|checkout| folder.path.starts_with(&checkout.folder));
-            if !is_in_checkout {
-                details.workspace = None;
-            }
-        }
+        let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let time = if is_archived {
             thread.archived_at
         } else {
@@ -1202,6 +1208,7 @@ impl Sidebar {
         }
         .map(|time| format_relative_time(time, SystemTime::now()));
         let prefix = if is_archived { "archived" } else { "shell" };
+        let machine_icon = Icon::new(self.machines.read(cx).machine_icon(machine, cx));
         let running = (!is_archived)
             .then(|| {
                 store
@@ -1248,6 +1255,12 @@ impl Sidebar {
                                 .truncate(),
                         )
                     }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .opacity(0.6)
+                            .child(machine_icon.size(IconSize::Small).color(Color::Muted)),
+                    )
             });
         let group_name =
             SharedString::from(format!("{prefix}-row-{}-{}", machine.slug(), thread.id.0));
@@ -1690,9 +1703,11 @@ impl Render for Sidebar {
 struct ThreadDetails {
     title: SharedString,
     project: Option<(Project, Option<ProjectInfo>)>,
-    /// The machine's icon and name, once there are several.
-    machine: Option<(IconName, SharedString)>,
+    /// The machine's icon and name.
+    machine: (IconName, SharedString),
     branch: Option<SharedString>,
+    /// Where a terminal is, outside git.
+    path: Option<SharedString>,
     /// The worktree or pasture it works in, described.
     workspace: Option<(WorkspaceKind, SharedString)>,
     agent: Option<(Option<SharedString>, SharedString)>,
@@ -1725,16 +1740,21 @@ impl ThreadDetails {
                 Label::new(project.name()).truncate(),
             ));
         }
-        if let Some((icon, machine)) = &self.machine {
-            rows.push(detail_row(
-                small_icon(*icon),
-                Label::new(machine.clone()).truncate(),
-            ));
-        }
+        let (machine_icon, machine) = &self.machine;
+        rows.push(detail_row(
+            small_icon(*machine_icon),
+            Label::new(machine.clone()).truncate(),
+        ));
         if let Some(branch) = &self.branch {
             rows.push(detail_row(
                 small_icon(IconName::GitBranch),
                 Label::new(branch.clone()).truncate_middle(),
+            ));
+        }
+        if let Some(path) = &self.path {
+            rows.push(detail_row(
+                small_icon(IconName::Folder),
+                Label::new(path.clone()).truncate_middle(),
             ));
         }
         if let Some((kind, description)) = &self.workspace {

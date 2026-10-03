@@ -525,8 +525,9 @@ Worktrees share `.git` with the project, so their branches are already there.
 **UI** (t3code):
 
 - With only Local, nothing changes.
-- Remote threads get a machine icon on their card. The details popover gets its machine line
-  back, for every thread once there are several machines.
+- Every thread card has its machine's icon just before the agent's, and every details popover
+  a machine line (icon and name). A terminal's popover follows its folder: project, branch or
+  path, and its agent CLI as the agent.
 - Machine icons are t3code's (`EnvironmentMachineIcon`): server, cloud VM, Linux/WSL, desktop,
   laptop, Mac mini, Mac Studio. Each server detects its kind from the hardware
   (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`) and keeps the kind chosen in

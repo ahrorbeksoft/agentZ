@@ -736,3 +736,6 @@ Then the server:
   ends its whole session, `nohup` included (6e2eb64).
 - 2026-10-03: Outside git, a terminal's second line shows its folder's path (`~` for home,
   sent by its server). Terminal cards have no Archive button: terminals aren't archived.
+- 2026-10-03: Machine icon on every card (before the agent's) and shell row; every details
+  popover has the machine, and terminals' popovers their folder's project, branch or path, and
+  agent CLI.
