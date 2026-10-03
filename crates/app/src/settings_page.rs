@@ -2745,11 +2745,16 @@ fn machine_icon_menu(
     current_icon: IconName,
     cx: &App,
 ) -> ContextMenu {
-    let lock = match &client {
-        Some(client) if client.read(cx).is_online() => (!client
-            .read(cx)
-            .has_capability(CAPABILITY_MACHINE_ICON))
-        .then_some("This machine's server is too old to keep an icon. Update it to choose one."),
+    let lock = match client.as_ref().map(|client| client.read(cx)) {
+        Some(client) if client.is_online() => {
+            if client.has_capability(CAPABILITY_MACHINE_ICON) {
+                None
+            } else if client.is_outdated() {
+                Some("Its server is too old to keep an icon. Update it to choose one.")
+            } else {
+                Some("Its server is too old to keep an icon.")
+            }
+        }
         _ => Some("Connect to this machine to change its icon."),
     };
     let icon = client
@@ -2757,8 +2762,21 @@ fn machine_icon_menu(
         .map(|client| client.read(cx).machine_icon().clone())
         .unwrap_or_default();
     menu.submenu_with_icon("Icon", current_icon, move |mut menu, _, _| {
+        // Wrapped: Zed places a submenu as if it were at most 200px wide, so a wider one
+        // would cover its parent menu.
         if let Some(lock) = lock {
-            menu = menu.label(lock).separator();
+            menu = menu
+                .custom_entry(
+                    move |_, _| {
+                        div()
+                            .max_w(px(180.))
+                            .child(Label::new(lock).size(LabelSize::Small).color(Color::Muted))
+                            .into_any_element()
+                    },
+                    |_, _| {},
+                )
+                .selectable(false)
+                .separator();
         }
         let current = icon.kind();
         let detected = icon.detected.clone().unwrap_or(MachineKind::Server);
