@@ -3,6 +3,7 @@
 //! through `proxy` over SSH.
 
 use std::io::IsTerminal as _;
+use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
@@ -13,6 +14,7 @@ use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, PROTOCOL_VERSION, Request, Response, ServerMessage,
     ServerWelcome, ToolCaller, read_message, write_message,
 };
+use agentz_server::handoff::{HandedOver, Takeover};
 use agentz_server::{AgentControl, ServerConfig};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -43,7 +45,12 @@ struct Arguments {
 #[derive(Subcommand)]
 enum Command {
     /// Serves in the foreground. The default.
-    Run,
+    Run {
+        /// Takes over from the server that started this one, which hands over its socket and
+        /// terminals on stdin.
+        #[arg(long, hide = true)]
+        handoff: bool,
+    },
     /// Starts the server in the background unless it's running, and returns once it accepts
     /// connections.
     Start,
@@ -79,8 +86,8 @@ fn main() {
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let arguments = Arguments::parse();
-    let result = match arguments.command.unwrap_or(Command::Run) {
-        Command::Run => run(),
+    let result = match arguments.command.unwrap_or(Command::Run { handoff: false }) {
+        Command::Run { handoff } => run(handoff),
         Command::Start => start(),
         Command::Proxy => start().and_then(|()| run_proxy()),
         Command::Stop => block_on(stop()),
@@ -106,24 +113,58 @@ fn block_on(future: impl Future<Output = Result<()>>) -> Result<()> {
         .block_on(future)
 }
 
-fn run() -> Result<()> {
+/// What the server before this one handed over.
+struct Handoff {
+    listener: std::os::unix::net::UnixListener,
+    handed_over: HandedOver,
+    takeover: Takeover,
+}
+
+fn run(handoff: bool) -> Result<()> {
     let socket = paths::server_socket();
-    prepare_socket_path(&socket)?;
+    let handoff = if handoff {
+        let connection = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("reading the handoff")?;
+        let (listener, handed_over, takeover) =
+            agentz_server::handoff::receive(std::os::unix::net::UnixStream::from(connection))?;
+        Some(Handoff {
+            listener,
+            handed_over,
+            takeover,
+        })
+    } else {
+        prepare_socket_path(&socket)?;
+        None
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the runtime")?;
-    runtime.block_on(serve(&socket))
+    runtime.block_on(serve(&socket, handoff))
 }
 
-async fn serve(socket: &Path) -> Result<()> {
-    let listener =
-        UnixListener::bind(socket).with_context(|| format!("listening on {}", socket.display()))?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("restricting {}", socket.display()))?;
-    let pid_file = paths::server_pid_file();
-    std::fs::write(&pid_file, std::process::id().to_string())
-        .with_context(|| format!("writing {}", pid_file.display()))?;
+async fn serve(socket: &Path, handoff: Option<Handoff>) -> Result<()> {
+    let (listener, handed_over, takeover) = match handoff {
+        Some(handoff) => {
+            handoff
+                .listener
+                .set_nonblocking(true)
+                .context("taking over the socket")?;
+            let listener =
+                UnixListener::from_std(handoff.listener).context("taking over the socket")?;
+            (listener, Some(handoff.handed_over), Some(handoff.takeover))
+        }
+        None => {
+            let listener = UnixListener::bind(socket)
+                .with_context(|| format!("listening on {}", socket.display()))?;
+            std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {}", socket.display()))?;
+            write_pid_file()?;
+            (listener, None, None)
+        }
+    };
 
     // Started from the app or by SSH, the environment lacks the user's `PATH`.
     let started_from_terminal = std::io::stdout().is_terminal();
@@ -157,8 +198,25 @@ async fn serve(socket: &Path) -> Result<()> {
                 socket: socket.to_path_buf(),
             }),
             terminal_shell: None,
+            listener: Some(listener.as_raw_fd()),
+            handed_over,
         },
     )?;
+    if let Some(takeover) = takeover {
+        let ready = tokio::task::spawn_blocking(move || takeover.ready())
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|ready| ready);
+        if let Err(error) = ready {
+            log::error!("failed to take over from the server before: {error:#}");
+            // At once, without dropping the terminals: their processes are the old server's
+            // again.
+            std::process::exit(1);
+        }
+        log::info!("took over from the server before");
+        write_pid_file()?;
+    }
+    let pid_file = paths::server_pid_file();
     log::info!(
         "agentz-server {VERSION} listening on {} (pid {})",
         socket.display(),
@@ -179,12 +237,22 @@ async fn serve(socket: &Path) -> Result<()> {
         }
     }
 
-    std::fs::remove_file(socket).log_err();
+    // A server that took over listens on it now.
+    if !server.handed_off() {
+        std::fs::remove_file(socket).log_err();
+    }
     if std::fs::read_to_string(&pid_file).ok().as_deref() == Some(&std::process::id().to_string()) {
         std::fs::remove_file(&pid_file).log_err();
     }
     log::info!("stopped");
     Ok(())
+}
+
+/// Written as soon as clients can connect, which `start` waits for.
+fn write_pid_file() -> Result<()> {
+    let pid_file = paths::server_pid_file();
+    std::fs::write(&pid_file, std::process::id().to_string())
+        .with_context(|| format!("writing {}", pid_file.display()))
 }
 
 /// Removes a socket left behind by a server that died, and refuses to start next to a live one

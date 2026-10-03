@@ -11,6 +11,8 @@ mod connection;
 mod detect;
 mod directories;
 mod git;
+#[cfg(unix)]
+pub mod handoff;
 mod machine_kind;
 mod repositories;
 mod server;
@@ -22,7 +24,7 @@ mod workspaces;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::{MachineInfo, PROTOCOL_VERSION, ServerWelcome};
@@ -51,6 +53,13 @@ pub struct ServerConfig {
     /// The shell terminals run, and run commands with (`-c`). `None` is the user's login
     /// shell, which tests avoid since it reads the user's own setup.
     pub terminal_shell: Option<String>,
+    /// The socket clients connect to, handed with the terminals to a newer server
+    /// ([`agentz_protocol::Request::HandOff`]). `None` can't hand off.
+    #[cfg(unix)]
+    pub listener: Option<std::os::fd::RawFd>,
+    /// The terminals the server before this one handed over.
+    #[cfg(unix)]
+    pub handed_over: Option<handoff::HandedOver>,
 }
 
 /// What agents are given to manage threads: the `agentz` MCP server in every session, and the
@@ -77,6 +86,7 @@ pub struct ServerHandle {
     welcome: Arc<ServerWelcome>,
     next_client_id: Arc<AtomicU64>,
     stopped: tokio::sync::watch::Receiver<bool>,
+    handed_off: Arc<AtomicBool>,
 }
 
 /// Reads `agents/custom.json`: agent ids, each with a `name` and a `command` (`path`, `args`,
@@ -100,9 +110,23 @@ fn installed_build() -> Option<String> {
     Some(hash.trim().to_string()).filter(|hash| !hash.is_empty())
 }
 
+/// When this binary was last modified, read at start for the same reason.
+fn binary_modified() -> Option<u64> {
+    let modified = std::fs::metadata(std::env::current_exe().ok()?)
+        .ok()?
+        .modified()
+        .ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since_epoch.as_millis()).ok()
+}
+
 /// Starts the server on the runtime.
 pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<ServerHandle> {
     let machine = machine_info(&config.data_dir)?;
+    #[cfg(unix)]
+    let can_hand_off = config.listener.is_some() && config.agent_control.is_some();
+    #[cfg(not(unix))]
+    let can_hand_off = false;
     let welcome = ServerWelcome {
         protocol_version: PROTOCOL_VERSION,
         server_version: config.version.clone(),
@@ -117,12 +141,17 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             agentz_protocol::CAPABILITY_SPACES.to_string(),
             agentz_protocol::CAPABILITY_MACHINE_ICON.to_string(),
             agentz_protocol::CAPABILITY_DRAWER_TERMINALS.to_string(),
-        ],
+        ]
+        .into_iter()
+        .chain(can_hand_off.then(|| agentz_protocol::CAPABILITY_HAND_OFF.to_string()))
+        .collect(),
         build: installed_build(),
+        binary_modified: binary_modified(),
         error: None,
     };
     let (inputs, inbox) = mpsc::unbounded();
     let (stopped_sender, stopped) = tokio::sync::watch::channel(false);
+    let handed_off = Arc::new(AtomicBool::new(false));
     let server = {
         // The stores spawn their background work onto the runtime as they're created.
         let _guard = runtime.enter();
@@ -131,6 +160,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             config,
             welcome.machine.clone(),
             inputs.clone(),
+            handed_off.clone(),
         )
     };
     runtime.spawn(async move {
@@ -143,6 +173,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
         welcome: Arc::new(welcome),
         next_client_id: Arc::new(AtomicU64::new(1)),
         stopped,
+        handed_off,
     })
 }
 
@@ -166,6 +197,12 @@ impl ServerHandle {
     /// Stops the agents, saves, and ends the server.
     pub fn shut_down(&self) {
         self.inputs.unbounded_send(Input::Shutdown).ok();
+    }
+
+    /// Whether the server stopped because it handed its terminals and socket to a newer one,
+    /// which listens on the socket now.
+    pub fn handed_off(&self) -> bool {
+        self.handed_off.load(Ordering::Acquire)
     }
 
     /// Resolves once the server has shut down.

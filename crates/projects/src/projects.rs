@@ -1156,6 +1156,20 @@ impl ProjectStore {
         this
     }
 
+    /// Writes the state now, and returns once it's written.
+    pub fn flush_saves(&self) {
+        if let Some(saver) = &self.saver {
+            saver.flush();
+        }
+    }
+
+    /// Stops writing the state: another process owns it now.
+    pub fn stop_saving(&mut self) {
+        if let Some(saver) = self.saver.take() {
+            saver.discard();
+        }
+    }
+
     fn allocate_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -1181,28 +1195,54 @@ impl ProjectStore {
 /// Writes a state as JSON on its own thread, once changes have paused for [`SAVE_DEBOUNCE`].
 /// Dropping it writes any pending state before returning, so nothing is lost on quit.
 pub struct Saver<T> {
-    sender: Option<mpsc::Sender<T>>,
+    sender: Option<mpsc::Sender<SaverMessage<T>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+enum SaverMessage<T> {
+    Save(T),
+    /// Write what's pending now, then answer.
+    Flush(mpsc::Sender<()>),
+    /// Stop without writing what's pending.
+    Discard,
 }
 
 impl<T: Serialize + Send + 'static> Saver<T> {
     pub fn new(state_path: PathBuf, thread_name: &str) -> Self {
-        let (sender, receiver) = mpsc::channel::<T>();
+        let (sender, receiver) = mpsc::channel::<SaverMessage<T>>();
         let thread = std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
-                while let Ok(mut state) = receiver.recv() {
-                    loop {
-                        match receiver.recv_timeout(SAVE_DEBOUNCE) {
-                            Ok(newer) => state = newer,
-                            Err(mpsc::RecvTimeoutError::Timeout) => break,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let mut pending: Option<T> = None;
+                loop {
+                    let message = if pending.is_some() {
+                        receiver.recv_timeout(SAVE_DEBOUNCE)
+                    } else {
+                        receiver
+                            .recv()
+                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    };
+                    match message {
+                        Ok(SaverMessage::Save(state)) => pending = Some(state),
+                        Ok(SaverMessage::Flush(done)) => {
+                            if let Some(state) = pending.take() {
                                 write_state(&state_path, &state).log_err();
-                                return;
+                            }
+                            done.send(()).ok();
+                        }
+                        Ok(SaverMessage::Discard) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Some(state) = pending.take() {
+                                write_state(&state_path, &state).log_err();
                             }
                         }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            if let Some(state) = pending.take() {
+                                write_state(&state_path, &state).log_err();
+                            }
+                            return;
+                        }
                     }
-                    write_state(&state_path, &state).log_err();
                 }
             })
             .log_err();
@@ -1214,7 +1254,25 @@ impl<T: Serialize + Send + 'static> Saver<T> {
 
     pub fn save(&self, state: T) {
         if let Some(sender) = &self.sender {
-            sender.send(state).log_err();
+            sender.send(SaverMessage::Save(state)).log_err();
+        }
+    }
+
+    /// Writes the pending state now, and returns once it's written.
+    pub fn flush(&self) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        let (done, written) = mpsc::channel();
+        if sender.send(SaverMessage::Flush(done)).log_err().is_some() {
+            written.recv().log_err();
+        }
+    }
+
+    /// Stops saving, dropping what's pending: another process owns the file now.
+    pub fn discard(mut self) {
+        if let Some(sender) = self.sender.take() {
+            sender.send(SaverMessage::Discard).log_err();
         }
     }
 }

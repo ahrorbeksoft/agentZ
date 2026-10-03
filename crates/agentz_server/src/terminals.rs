@@ -5,9 +5,13 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use util::ResultExt as _;
 
 use agentz_protocol::terminal::{
@@ -15,26 +19,38 @@ use agentz_protocol::terminal::{
     TerminalLine, TerminalModes, TerminalPoint, TerminalRun, TerminalScroll, TerminalSelection,
     TerminalSelectionKind, TerminalStyle,
 };
+use alacritty_terminal::Grid;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, Notify as _, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
+use alacritty_terminal::event_loop::{
+    EventLoop, EventLoopSender, Msg, Notifier, State as EventLoopState,
+};
 use alacritty_terminal::grid::{Dimensions, Scroll as AlacScroll};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, SEMANTIC_ESCAPE_CHARS, Term, TermMode};
-use alacritty_terminal::tty;
+use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite};
 use alacritty_terminal::vte::ansi::{
-    ClearMode, Color as AlacColor, CursorShape as AlacCursorShape, Handler as _, Rgb,
+    ClearMode, Color as AlacColor, CursorShape as AlacCursorShape, Handler as _, Processor, Rgb,
 };
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use futures::channel::oneshot;
+use polling::{Event as PollEvent, PollMode, Poller};
+use serde::{Deserialize, Serialize};
 
 /// t3code keeps 5,000 lines of scrollback.
 const SCROLLBACK_LINES: usize = 5_000;
+/// How often an adopted terminal's process is checked for, since it isn't this server's child
+/// to wait for.
+const ADOPTED_PROCESS_POLL: Duration = Duration::from_millis(250);
+/// `alacritty_terminal`'s keys for a PTY's sources in its event loop's poller (crate-private
+/// there).
+const PTY_READ_WRITE_TOKEN: usize = 0;
+const PTY_CHILD_EVENT_TOKEN: usize = 1;
 
 /// What to start in a terminal.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TerminalSpawn {
     /// A program and its arguments; `None` is the user's login shell.
     pub program: Option<(String, Vec<String>)>,
@@ -44,7 +60,7 @@ pub(crate) struct TerminalSpawn {
 }
 
 /// The terminal's size in cells, and the cell size in pixels for programs that ask.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TerminalSize {
     pub columns: u16,
     pub screen_lines: u16,
@@ -106,9 +122,30 @@ impl EventListener for Listener {
     }
 }
 
+/// A terminal as it's handed to the server taking over: enough to show the same screen and
+/// keep using the same process, whose PTY goes alongside.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TerminalHandoff {
+    pub spawn: TerminalSpawn,
+    pub size: TerminalSize,
+    pub title: Option<String>,
+    pub palette: Option<Vec<[u8; 3]>>,
+    pub child_pid: Option<u32>,
+    /// The screen and scrollback as escape sequences that draw them again.
+    pub screen: String,
+}
+
+type TerminalEventLoop = EventLoop<TerminalPty, Listener>;
+
 pub(crate) struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
+    /// The event loop's thread, until the process ends. It gives the loop back when stopped.
+    event_loop: Option<JoinHandle<(TerminalEventLoop, EventLoopState)>>,
+    /// The stopped loop, while the terminal is being handed to another server.
+    paused: Option<TerminalEventLoop>,
+    /// Handed to another server, which runs its process now.
+    detached: bool,
     wakeup_pending: Arc<AtomicBool>,
     spawn: TerminalSpawn,
     size: TerminalSize,
@@ -162,8 +199,69 @@ impl Terminal {
         let child_pid = Some(pty.child().id());
         #[cfg(not(unix))]
         let child_pid = None;
+        let file = pty
+            .file()
+            .try_clone()
+            .context("opening the terminal's PTY")?;
+        let pty = TerminalPty {
+            file: PtyFile {
+                file,
+                hang_up: None,
+            },
+            kind: PtyKind::Started(pty),
+        };
+        Self::run(spawn, size, palette, None, child_pid, pty, None, on_event)
+    }
+
+    /// Takes over a terminal another server ran, with its PTY. Its process keeps running and
+    /// its screen is drawn again; programs that draw the whole screen are asked to draw it
+    /// again, as after a resize.
+    #[cfg(unix)]
+    pub(crate) fn adopt(
+        handoff: TerminalHandoff,
+        pty: std::os::fd::OwnedFd,
+        on_event: Arc<dyn Fn(AlacEvent) + Send + Sync>,
+    ) -> Result<Self> {
+        let file = File::from(pty);
+        set_nonblocking(&file)?;
+        let (adopted, hang_up) = AdoptedPty::new(handoff.child_pid)?;
+        let pty = TerminalPty {
+            file: PtyFile {
+                file,
+                hang_up: Some((hang_up, false)),
+            },
+            kind: PtyKind::Adopted(adopted),
+        };
+        let terminal = Self::run(
+            handoff.spawn,
+            handoff.size,
+            handoff.palette,
+            handoff.title,
+            handoff.child_pid,
+            pty,
+            Some(&handoff.screen),
+            on_event,
+        )?;
+        if let Some(group) = terminal.foreground_process_group_id() {
+            // SAFETY: only sends a signal.
+            unsafe { libc::kill(-(group as libc::pid_t), libc::SIGWINCH) };
+        }
+        Ok(terminal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        spawn: TerminalSpawn,
+        size: TerminalSize,
+        palette: Option<Vec<[u8; 3]>>,
+        title: Option<String>,
+        child_pid: Option<u32>,
+        pty: TerminalPty,
+        screen: Option<&str>,
+        on_event: Arc<dyn Fn(AlacEvent) + Send + Sync>,
+    ) -> Result<Self> {
         #[cfg(unix)]
-        let pty_fd = std::os::fd::AsRawFd::as_raw_fd(pty.file());
+        let pty_fd = std::os::fd::AsRawFd::as_raw_fd(&pty.file.file);
 
         let wakeup_pending = Arc::new(AtomicBool::new(false));
         let listener = Listener {
@@ -176,17 +274,24 @@ impl Terminal {
             ..Config::default()
         };
         let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
+        if let Some(screen) = screen {
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut *term.lock(), screen.as_bytes());
+        }
         let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)
             .context("starting the terminal's event loop")?;
         let sender = event_loop.channel();
-        event_loop.spawn();
+        let event_loop = event_loop.spawn();
         Ok(Self {
             term,
             sender,
+            event_loop: Some(event_loop),
+            paused: None,
+            detached: false,
             wakeup_pending,
             spawn,
             size,
-            title: None,
+            title,
             exit: None,
             palette,
             exit_waiters: Vec::new(),
@@ -194,6 +299,54 @@ impl Terminal {
             #[cfg(unix)]
             pty_fd,
         })
+    }
+
+    /// Stops reading the PTY, so the process's output waits for the server taking over, and
+    /// describes the terminal for it. [`Self::resume`] undoes it, and [`Self::detach`] lets the
+    /// terminal go.
+    pub(crate) fn pause(&mut self) -> Result<TerminalHandoff> {
+        if self.exit.is_some() {
+            return Err(anyhow!("the terminal's process has ended"));
+        }
+        let event_loop = self
+            .event_loop
+            .take()
+            .context("the terminal's event loop has stopped")?;
+        self.sender.send(Msg::Shutdown).ok();
+        let (event_loop, _) = event_loop
+            .join()
+            .map_err(|_| anyhow!("the terminal's event loop panicked"))?;
+        self.paused = Some(event_loop);
+        Ok(TerminalHandoff {
+            spawn: self.spawn.clone(),
+            size: self.size,
+            title: self.title.clone(),
+            palette: self.palette.clone(),
+            child_pid: self.child_pid,
+            screen: screen_replay(&mut self.term.lock()),
+        })
+    }
+
+    pub(crate) fn resume(&mut self) {
+        if let Some(event_loop) = self.paused.take() {
+            self.event_loop = Some(event_loop.spawn());
+        }
+    }
+
+    /// Lets a paused terminal go without ending its process, which another server runs now.
+    pub(crate) fn detach(mut self) {
+        // Dropping the PTY would hang up on the process.
+        if let Some(event_loop) = self.paused.take() {
+            std::mem::forget(event_loop);
+        }
+        self.detached = true;
+    }
+
+    /// The PTY's controlling side, for handing it to another server.
+    #[cfg(unix)]
+    pub(crate) fn pty(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the descriptor stays open while the terminal holds its event loop.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.pty_fd) }
     }
 
     pub(crate) fn spawn(&self) -> &TerminalSpawn {
@@ -283,6 +436,8 @@ impl Terminal {
                 true
             }
             AlacEvent::Exit => {
+                // The loop has ended; its thread lets the PTY go as it finishes.
+                self.event_loop.take();
                 if self.exit.is_none() {
                     self.exited(TerminalExit {
                         code: None,
@@ -692,7 +847,9 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        self.kill();
+        if !self.detached {
+            self.kill();
+        }
     }
 }
 
@@ -898,6 +1055,444 @@ fn default_color(index: usize) -> [u8; 3] {
     }
 }
 
+/// The PTY a terminal's event loop reads: one this server started, or one handed over by the
+/// server before it, whose process isn't this server's child.
+struct TerminalPty {
+    file: PtyFile,
+    kind: PtyKind,
+}
+
+enum PtyKind {
+    Started(tty::Pty),
+    #[cfg(unix)]
+    Adopted(AdoptedPty),
+}
+
+/// The PTY's controlling side as the event loop reads and writes it. For a started terminal,
+/// a copy of `tty::Pty`'s descriptor.
+struct PtyFile {
+    file: File,
+    /// For an adopted PTY: told once the other side hangs up, which is how the process's end is
+    /// noticed without waiting for it.
+    hang_up: Option<(std::os::unix::net::UnixStream, bool)>,
+}
+
+impl io::Read for PtyFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let result = self.file.read(buffer);
+        let Some((hang_up, told)) = &mut self.hang_up else {
+            return result;
+        };
+        let hung_up = match &result {
+            Ok(0) => !buffer.is_empty(),
+            Ok(_) => false,
+            #[cfg(unix)]
+            Err(error) => error.raw_os_error() == Some(libc::EIO),
+            #[cfg(not(unix))]
+            Err(_) => false,
+        };
+        if !hung_up {
+            return result;
+        }
+        if !*told {
+            (&*hang_up).write_all(&[1]).log_err();
+            *told = true;
+        }
+        Ok(0)
+    }
+}
+
+impl io::Write for PtyFile {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl EventedReadWrite for TerminalPty {
+    type Reader = PtyFile;
+    type Writer = PtyFile;
+
+    unsafe fn register(
+        &mut self,
+        poll: &Arc<Poller>,
+        mut interest: PollEvent,
+        mode: PollMode,
+    ) -> io::Result<()> {
+        match &mut self.kind {
+            // SAFETY: the caller's.
+            PtyKind::Started(pty) => unsafe { pty.register(poll, interest, mode) },
+            #[cfg(unix)]
+            PtyKind::Adopted(adopted) => {
+                interest.key = PTY_READ_WRITE_TOKEN;
+                // SAFETY: both sources live as long as the event loop, which deregisters them.
+                unsafe {
+                    poll.add_with_mode(&self.file.file, interest, mode)?;
+                    poll.add_with_mode(
+                        &adopted.ended,
+                        PollEvent::readable(PTY_CHILD_EVENT_TOKEN),
+                        PollMode::Level,
+                    )
+                }
+            }
+        }
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &Arc<Poller>,
+        mut interest: PollEvent,
+        mode: PollMode,
+    ) -> io::Result<()> {
+        match &mut self.kind {
+            PtyKind::Started(pty) => pty.reregister(poll, interest, mode),
+            #[cfg(unix)]
+            PtyKind::Adopted(adopted) => {
+                interest.key = PTY_READ_WRITE_TOKEN;
+                poll.modify_with_mode(&self.file.file, interest, mode)?;
+                poll.modify_with_mode(
+                    &adopted.ended,
+                    PollEvent::readable(PTY_CHILD_EVENT_TOKEN),
+                    PollMode::Level,
+                )
+            }
+        }
+    }
+
+    fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+        match &mut self.kind {
+            PtyKind::Started(pty) => pty.deregister(poll),
+            #[cfg(unix)]
+            PtyKind::Adopted(adopted) => {
+                poll.delete(&self.file.file)?;
+                poll.delete(&adopted.ended)
+            }
+        }
+    }
+
+    fn reader(&mut self) -> &mut PtyFile {
+        &mut self.file
+    }
+
+    fn writer(&mut self) -> &mut PtyFile {
+        &mut self.file
+    }
+}
+
+impl EventedPty for TerminalPty {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        match &mut self.kind {
+            PtyKind::Started(pty) => pty.next_child_event(),
+            #[cfg(unix)]
+            PtyKind::Adopted(adopted) => {
+                let mut byte = [0u8; 1];
+                match (&adopted.ended).read(&mut byte) {
+                    // Its exit status went to the process that started it.
+                    Ok(read) if read > 0 => Some(ChildEvent::Exited(None)),
+                    Ok(_) => None,
+                    Err(error) => {
+                        if error.kind() != io::ErrorKind::WouldBlock {
+                            log::error!("failed to learn whether a terminal ended: {error}");
+                        }
+                        None
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl alacritty_terminal::event::OnResize for TerminalPty {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        match &mut self.kind {
+            PtyKind::Started(pty) => pty.on_resize(window_size),
+            #[cfg(unix)]
+            PtyKind::Adopted(_) => {
+                let size = libc::winsize {
+                    ws_row: window_size.num_lines,
+                    ws_col: window_size.num_cols,
+                    ws_xpixel: window_size.num_cols.saturating_mul(window_size.cell_width),
+                    ws_ypixel: window_size
+                        .num_lines
+                        .saturating_mul(window_size.cell_height),
+                };
+                let fd = std::os::fd::AsRawFd::as_raw_fd(&self.file.file);
+                // SAFETY: the descriptor is the PTY's, and `size` outlives the call.
+                if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size as *const libc::winsize) } < 0 {
+                    log::error!(
+                        "failed to resize a terminal: {}",
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A PTY handed over by another server. Its process was that server's child, so its end is
+/// noticed by the PTY hanging up or the process disappearing.
+#[cfg(unix)]
+struct AdoptedPty {
+    child_pid: Option<u32>,
+    /// Readable once the process may have ended.
+    ended: std::os::unix::net::UnixStream,
+    watching: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl AdoptedPty {
+    /// Also the side that tells `ended`, for the PTY's reader.
+    fn new(child_pid: Option<u32>) -> Result<(Self, std::os::unix::net::UnixStream)> {
+        let (tell, ended) =
+            std::os::unix::net::UnixStream::pair().context("watching a terminal's process")?;
+        ended
+            .set_nonblocking(true)
+            .context("watching a terminal's process")?;
+        let watching = Arc::new(AtomicBool::new(true));
+        if let Some(pid) = child_pid {
+            let tell = tell.try_clone().context("watching a terminal's process")?;
+            let watching = watching.clone();
+            std::thread::Builder::new()
+                .name("terminal-process".into())
+                .spawn(move || {
+                    while watching.load(Ordering::Acquire) {
+                        if !process_exists(pid) {
+                            (&tell).write_all(&[1]).log_err();
+                            return;
+                        }
+                        std::thread::sleep(ADOPTED_PROCESS_POLL);
+                    }
+                })
+                .context("watching a terminal's process")?;
+        }
+        Ok((
+            Self {
+                child_pid,
+                ended,
+                watching,
+            },
+            tell,
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AdoptedPty {
+    fn drop(&mut self) {
+        self.watching.store(false, Ordering::Release);
+        // Hangs up on the process, as `tty::Pty` does when dropped.
+        if let Some(pid) = self.child_pid
+            && process_exists(pid)
+        {
+            // SAFETY: only sends a signal.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+        }
+    }
+}
+
+/// Whether the process is there, even if it isn't this user's to signal (on macOS a terminal
+/// runs `login`, as root).
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn set_nonblocking(file: &File) -> Result<()> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+    // SAFETY: only reads and sets the descriptor's flags.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error()).context("setting up a terminal's PTY");
+        }
+    }
+    Ok(())
+}
+
+/// The screen and scrollback as escape sequences that draw them again in a new terminal of the
+/// same size (herdr hands its panes' screens over the same way): the normal screen with its
+/// history, then the alternate screen if it's showing, then the modes programs set.
+fn screen_replay<T: EventListener>(term: &mut Term<T>) -> String {
+    let mut replay = String::new();
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        let alternate = term.grid().clone();
+        // The normal screen is only reachable by swapping, and swapping back clears the
+        // alternate one, which is put back from the copy.
+        term.swap_alt();
+        write_grid(&mut replay, term.grid(), true);
+        term.swap_alt();
+        *term.grid_mut() = alternate;
+        replay.push_str("\x1b[?1049h");
+        write_grid(&mut replay, term.grid(), false);
+    } else {
+        write_grid(&mut replay, term.grid(), true);
+    }
+    let mode = *term.mode();
+    for (flag, set, on_by_default) in [
+        (TermMode::SHOW_CURSOR, "\x1b[?25", true),
+        (TermMode::APP_CURSOR, "\x1b[?1", false),
+        (TermMode::LINE_WRAP, "\x1b[?7", true),
+        (TermMode::MOUSE_REPORT_CLICK, "\x1b[?1000", false),
+        (TermMode::MOUSE_DRAG, "\x1b[?1002", false),
+        (TermMode::MOUSE_MOTION, "\x1b[?1003", false),
+        (TermMode::FOCUS_IN_OUT, "\x1b[?1004", false),
+        (TermMode::UTF8_MOUSE, "\x1b[?1005", false),
+        (TermMode::SGR_MOUSE, "\x1b[?1006", false),
+        (TermMode::ALTERNATE_SCROLL, "\x1b[?1007", true),
+        (TermMode::BRACKETED_PASTE, "\x1b[?2004", false),
+        (TermMode::INSERT, "\x1b[4", false),
+        (TermMode::LINE_FEED_NEW_LINE, "\x1b[20", false),
+    ] {
+        let on = mode.contains(flag);
+        if on != on_by_default {
+            replay.push_str(set);
+            replay.push(if on { 'h' } else { 'l' });
+        }
+    }
+    if mode.contains(TermMode::APP_KEYPAD) {
+        replay.push_str("\x1b=");
+    }
+    replay
+}
+
+/// Writes a grid's lines from the top-left of the screen, then puts the cursor and its pen
+/// back. With history, writing past the bottom scrolls the earlier lines into the new
+/// terminal's history.
+fn write_grid(replay: &mut String, grid: &Grid<Cell>, with_history: bool) {
+    let columns = grid.columns();
+    let screen_lines = grid.screen_lines() as i32;
+    let first = if with_history {
+        -(grid.history_size() as i32)
+    } else {
+        0
+    };
+    replay.push_str("\x1b[0m\x1b[H");
+    let mut pen = String::new();
+    for line in first..screen_lines {
+        let row = &grid[Line(line)];
+        let wraps = row[Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+        // A wrapped line is written whole, so the next one wraps onto a line of its own.
+        let end = if wraps {
+            columns
+        } else {
+            (0..columns)
+                .rev()
+                .find(|column| !is_default_blank(&row[Column(*column)]))
+                .map_or(0, |column| column + 1)
+        };
+        for column in 0..end {
+            let cell = &row[Column(column)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            write_cell(replay, &mut pen, cell);
+        }
+        if line < screen_lines - 1 && !wraps {
+            // New lines take the pen's background.
+            if !pen.is_empty() {
+                replay.push_str("\x1b[0m");
+                pen.clear();
+            }
+            replay.push_str("\r\n");
+        }
+    }
+    replay.push_str("\x1b[0m");
+    let cursor = &grid.cursor;
+    let row = cursor.point.line.0 + 1;
+    let column = cursor.point.column.0;
+    if cursor.input_needs_wrap && column + 1 == columns {
+        // Writing the last cell again leaves the cursor waiting to wrap, as it was.
+        replay.push_str(&format!("\x1b[{row};{}H", column + 1));
+        let cell = &grid[cursor.point];
+        if !cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::WIDE_CHAR)
+        {
+            let mut pen = String::new();
+            write_cell(replay, &mut pen, cell);
+        }
+    } else {
+        replay.push_str(&format!("\x1b[{row};{}H", column + 1));
+    }
+    replay.push_str(&cell_style(&cursor.template));
+}
+
+fn write_cell(replay: &mut String, pen: &mut String, cell: &Cell) {
+    let style = cell_style(cell);
+    if *pen != style {
+        replay.push_str(&style);
+        *pen = style;
+    }
+    replay.push(cell.c);
+    if let Some(zerowidth) = cell.zerowidth() {
+        replay.extend(zerowidth);
+    }
+}
+
+/// A blank a new terminal shows by itself.
+fn is_default_blank(cell: &Cell) -> bool {
+    cell.c == ' '
+        && cell.zerowidth().is_none()
+        && cell.bg == AlacColor::Named(alacritty_terminal::vte::ansi::NamedColor::Background)
+        && (cell.flags - Flags::WRAPLINE).is_empty()
+}
+
+/// The SGR sequence for the cell's colors and attributes, from a reset.
+fn cell_style(cell: &Cell) -> String {
+    let mut codes = vec!["0".to_string()];
+    for (flag, code) in [
+        (Flags::BOLD, "1"),
+        (Flags::DIM, "2"),
+        (Flags::ITALIC, "3"),
+        (Flags::UNDERLINE, "4"),
+        (Flags::DOUBLE_UNDERLINE, "4:2"),
+        (Flags::UNDERCURL, "4:3"),
+        (Flags::DOTTED_UNDERLINE, "4:4"),
+        (Flags::DASHED_UNDERLINE, "4:5"),
+        (Flags::INVERSE, "7"),
+        (Flags::HIDDEN, "8"),
+        (Flags::STRIKEOUT, "9"),
+    ] {
+        if cell.flags.contains(flag) {
+            codes.push(code.to_string());
+        }
+    }
+    codes.extend(color_code(cell.fg, 30, 90, 38));
+    codes.extend(color_code(cell.bg, 40, 100, 48));
+    if let Some(color) = cell.underline_color() {
+        codes.extend(color_code(color, 0, 0, 58));
+    }
+    format!("\x1b[{}m", codes.join(";"))
+}
+
+/// `None` for the default colors.
+fn color_code(
+    color: AlacColor,
+    base: usize,
+    bright_base: usize,
+    extended: usize,
+) -> Option<String> {
+    match color {
+        AlacColor::Named(named) => match named as usize {
+            index @ 0..=7 if base > 0 => Some((base + index).to_string()),
+            index @ 8..=15 if bright_base > 0 => Some((bright_base + index - 8).to_string()),
+            index @ 0..=15 => Some(format!("{extended};5;{index}")),
+            _ => None,
+        },
+        AlacColor::Indexed(index) => Some(format!("{extended};5;{index}")),
+        AlacColor::Spec(Rgb { r, g, b }) => Some(format!("{extended};2;{r};{g};{b}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -949,6 +1544,109 @@ mod tests {
                 Err(_) => panic!("timed out; the screen is:\n{}", terminal.screen_text()),
             }
         }
+    }
+
+    /// Every cell of the grid, history included, and the cursor.
+    fn grid_contents<T>(term: &Term<T>) -> (Vec<Vec<Cell>>, AlacPoint, bool) {
+        let grid = term.grid();
+        let lines = (-(grid.history_size() as i32)..grid.screen_lines() as i32)
+            .map(|line| {
+                (0..grid.columns())
+                    .map(|column| grid[Line(line)][Column(column)].clone())
+                    .collect()
+            })
+            .collect();
+        (lines, grid.cursor.point, grid.cursor.input_needs_wrap)
+    }
+
+    #[test]
+    fn screen_replays_draw_the_same_screen() {
+        let size = TerminalSize {
+            columns: 12,
+            screen_lines: 4,
+            ..TerminalSize::default()
+        };
+        let new_term = || {
+            Term::new(
+                Config {
+                    scrolling_history: SCROLLBACK_LINES,
+                    ..Config::default()
+                },
+                &size,
+                alacritty_terminal::event::VoidListener,
+            )
+        };
+        let mut processor: Processor = Processor::new();
+        let mut term = new_term();
+        processor.advance(
+            &mut term,
+            "one\r\n\x1b[1;31mred\x1b[0m \x1b[48;5;22mbg\x1b[0m\r\n\x1b[38;2;1;2;3mwide 漢字\x1b[0m\r\n\
+             a line long enough to wrap twice\r\n\x1b[4mtail\x1b[0m \x1b[?2004h\x1b[?1h"
+                .as_bytes(),
+        );
+        let normal = grid_contents(&term);
+        let mut replay: Processor = Processor::new();
+        let mut copy = new_term();
+        replay.advance(&mut copy, screen_replay(&mut term).as_bytes());
+        assert_eq!(grid_contents(&copy), normal);
+        assert_eq!(copy.mode(), term.mode());
+
+        // A program on the alternate screen, waiting to wrap at the end of a line.
+        processor.advance(&mut term, b"\x1b[?1049h\x1b[2;3Hmenu\x1b[4;9Hlast");
+        let alternate = grid_contents(&term);
+        assert!(alternate.2);
+        let mut replay: Processor = Processor::new();
+        let mut copy = new_term();
+        replay.advance(&mut copy, screen_replay(&mut term).as_bytes());
+        assert_eq!(grid_contents(&term), alternate, "the original is unchanged");
+        assert_eq!(grid_contents(&copy), alternate);
+        assert_eq!(copy.mode(), term.mode());
+        processor.advance(&mut term, b"\x1b[?1049l");
+        replay.advance(&mut copy, b"\x1b[?1049l");
+        assert_eq!(grid_contents(&copy).0, grid_contents(&term).0);
+    }
+
+    #[tokio::test]
+    async fn paused_terminals_are_adopted_with_their_process_and_screen() {
+        let (mut terminal, mut inbox) = start_sh(TerminalSize::default());
+        terminal.input(TerminalInput::Bytes(b"echo before-$$\n".to_vec()));
+        wait_for(&mut terminal, &mut inbox, |terminal| {
+            terminal.screen_text().contains("\nbefore-")
+        })
+        .await;
+        let pty = terminal.pty().try_clone_to_owned().expect("the PTY");
+        let handoff = terminal.pause().expect("pauses");
+        let screen = terminal.screen_text();
+        terminal.detach();
+
+        let (events, mut inbox) = futures::channel::mpsc::unbounded();
+        let mut adopted = Terminal::adopt(
+            handoff,
+            pty,
+            Arc::new(move |event| {
+                events.unbounded_send(event).ok();
+            }),
+        )
+        .expect("adopts");
+        assert_eq!(adopted.screen_text(), screen);
+        adopted.input(TerminalInput::Bytes(b"echo after-$$\n".to_vec()));
+        wait_for(&mut adopted, &mut inbox, |terminal| {
+            terminal.screen_text().contains("\nafter-")
+        })
+        .await;
+        let pid = |text: &str, prefix: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(prefix).map(str::to_string))
+        };
+        let text = adopted.screen_text();
+        assert_eq!(pid(&text, "after-"), pid(&text, "before-"));
+
+        // Its process isn't this one's child to wait for; the PTY hangs up.
+        adopted.input(TerminalInput::Bytes(b"exit\n".to_vec()));
+        wait_for(&mut adopted, &mut inbox, |terminal| {
+            terminal.exit().is_some()
+        })
+        .await;
     }
 
     #[tokio::test]

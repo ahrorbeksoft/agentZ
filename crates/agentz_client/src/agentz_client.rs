@@ -253,6 +253,8 @@ mod tests {
                 custom_agents,
                 agent_control: None,
                 terminal_shell: None,
+                listener: None,
+                handed_over: None,
             },
         )
         .expect("server starts")

@@ -408,6 +408,20 @@ impl SpaceStore {
             .ok_or_else(|| anyhow!("no such pane"))
     }
 
+    /// Writes the spaces now, and returns once they're written.
+    pub(crate) fn flush_saves(&self) {
+        if let Some(saver) = &self.saver {
+            saver.flush();
+        }
+    }
+
+    /// Stops writing the spaces: another process owns them now.
+    pub(crate) fn stop_saving(&mut self) {
+        if let Some(saver) = self.saver.take() {
+            saver.discard();
+        }
+    }
+
     fn changed(&mut self) {
         self.revision += 1;
         let Some(saver) = &self.saver else {

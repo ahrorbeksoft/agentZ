@@ -239,6 +239,7 @@ dependencies = [
  "log",
  "nix",
  "paths",
+ "polling",
  "projects",
  "regex",
  "registry",
@@ -4535,6 +4536,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

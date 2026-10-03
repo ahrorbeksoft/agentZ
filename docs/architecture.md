@@ -40,8 +40,8 @@ script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─►
   only for what's on screen. Client-only state stays in the app: theme, layout, which
   completions were seen, saved machines.
 - **Lifetimes.** The app starts this Mac's server on demand, detached; quitting the app leaves it
-  running. Settings › General › Restart Server ends it (and its agents); `agentz-server stop`
-  stops it for good. `proxy` starts a remote server detached, so a dropped SSH connection never
+  running. Settings › General › Restart Server ends it (and its agents), and Update Server hands
+  it over (below); `agentz-server stop` stops it for good. `proxy` starts a remote server detached, so a dropped SSH connection never
   stops agents (Zed's design).
 
 ### Protocol (`crates/agentz_protocol`)
@@ -117,7 +117,7 @@ Each entry: what it does, where it lives, and where it comes from.
   title that isn't the repository's name (renamed, in a subfolder, an agent CLI), the branch
   reads `repository/branch` (`sidebar::repository_branch`); workspace rows do the same. The
   repository is its main checkout's folder, so worktrees keep its name.
-- **Settings** (`settings_page.rs`, t3code's layout): General (Restart Server, start at login,
+- **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
   combining repositories), Appearance (Zed's theme modes), Agents (registry, per-agent login,
   defaults, environment, a machine picker), Machines, and a page per project (with Checkouts).
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
@@ -236,8 +236,22 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   `~/.agentz/server/<version>/` (skipped when the SHA-256 matches); `proxy` over stdio. States:
   Online, Reconnecting (backoff to 2 minutes), Attention (the error and the command to run).
 - **Linux servers**: static musl from `cargo zigbuild`, stripped (about 7 MB; 48 MB unstripped).
-- **Updates**: an older server keeps running beside the new binary; the title bar shows it and
-  Settings › Machines offers Restart Server…. Per-machine Stop Server.
+- **Updates**: an older server keeps running beside the new binary (over SSH told by the
+  installed SHA-256, on this Mac by the binary's modification time); the title bar shows it and
+  Settings › Machines offers Update Server (Restart Server… for servers without the
+  `hand_off` capability). Per-machine Stop Server.
+- **Server handoff** (`handoff.rs`, `server/hand_off.rs`, `terminals.rs`, herdr's live
+  handoff): `Request::HandOff` starts the installed binary as `run --handoff` with a socket pair
+  as its stdin, flushes `state.json` and `spaces.json`, pauses every terminal's event loop and
+  sends a JSON manifest (each terminal's key, spawn, size, title and its screen and scrollback
+  as escape sequences, `screen_replay`), then the listening socket and the PTYs over
+  `SCM_RIGHTS`. The new server adopts them (`Terminal::adopt`: the process isn't its child, so
+  its end is seen by the PTY hanging up or the pid disappearing), sends SIGWINCH so full-screen
+  programs redraw, and says it's ready; the old one commits, stops saving and exits without
+  hanging up on the terminals. Before the commit either side gives up and the old server
+  resumes its terminals. Agents end with the old server and load their sessions in the new
+  one; while turns run the server answers `TurnsRunning` and the app asks before stopping
+  them. Agents' own terminals end with them.
 - **Offline machines** stay visible, dimmed, with input disabled.
 - **Remote projects**: a path field completed from that machine (`directories.rs`, t3code's
   `filesystem.browse`).
@@ -258,8 +272,8 @@ since a thread's workspace is its checkout.
 
 - **Server** (`spaces.rs`, `server/space_requests.rs`): spaces rooted at a folder on one machine,
   with tabs of split-pane trees (`agentz_protocol::layout`, herdr's `TileLayout` with its tests).
-  Saved in `spaces.json` and restored after a restart: terminals as new shells in their folders,
-  threads reattached. A workspace is where most of its tabs are: each tab by its top-left pane's
+  Saved in `spaces.json` and restored after a restart: terminals as new shells in their folders
+  (after a handoff, the same ones), threads reattached. A workspace is where most of its tabs are: each tab by its top-left pane's
   folder (a shell's foreground process, as terminal threads are followed; a thread pane's
   terminal folder or checkout), a tie going to the earliest tab. That folder, not the one it was
   opened in, names it unless renamed, and its branch and ahead/behind are looked up every

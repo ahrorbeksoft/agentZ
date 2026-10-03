@@ -68,6 +68,9 @@ pub const CAPABILITY_MACHINE_ICON: &str = "machine_icon";
 /// [`ServerWelcome::capabilities`]: a thread's drawer holds several terminals
 /// ([`terminal::TerminalKey::DrawerTerminal`], [`Request::DrawerTerminals`]).
 pub const CAPABILITY_DRAWER_TERMINALS: &str = "drawer_terminals";
+/// [`ServerWelcome::capabilities`]: the server can hand its terminals to the binary installed
+/// now and exit ([`Request::HandOff`]), so updating it keeps them running.
+pub const CAPABILITY_HAND_OFF: &str = "hand_off";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -107,6 +110,10 @@ pub struct ServerWelcome {
     /// server is older.
     #[serde(default)]
     pub build: Option<String>,
+    /// When the binary the server runs was last modified, in milliseconds since the Unix epoch,
+    /// read as it started. A client next to a rebuilt binary can tell the server is older.
+    #[serde(default)]
+    pub binary_modified: Option<u64>,
     /// Set when the server refuses the client, e.g. for an unsupported protocol version.
     #[serde(default)]
     pub error: Option<String>,
@@ -403,6 +410,14 @@ pub enum Request {
 
     /// Ends the server, its agents and terminals.
     Shutdown,
+    /// Starts the server binary installed now and hands it the terminals, which keep running
+    /// with their screens, then ends this server and its agents. Agents start again in the new
+    /// server and load their sessions. While turns run it answers
+    /// [`Response::TurnsRunning`] instead, unless `stop_running_turns`.
+    HandOff {
+        #[serde(default)]
+        stop_running_turns: bool,
+    },
 
     /// The agent-control tools, as MCP tool definitions: [`Response::Tools`].
     ListTools,
@@ -543,6 +558,8 @@ pub enum Response {
     TerminalFrame(TerminalFrame),
     Directories(DirectoryListing),
     SpacePane(PaneLocation),
+    /// The titles of the threads whose turns are running.
+    TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.
     Message(String),
     /// From a newer version.

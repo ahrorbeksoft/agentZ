@@ -59,7 +59,7 @@ pub(super) struct Terminals {
     pub(super) running: HashMap<TerminalKey, RunningTerminal>,
     next_serial: u64,
     /// The last theme colors a client sent, for terminals started later.
-    palette: Option<Vec<[u8; 3]>>,
+    pub(super) palette: Option<Vec<[u8; 3]>>,
     /// Terminals whose screens may have changed since they were last sent.
     dirty: Vec<TerminalKey>,
     frames_sent_at: Option<Instant>,
@@ -236,23 +236,16 @@ impl Server {
         spawn: TerminalSpawn,
         size: TerminalSize,
     ) -> Result<()> {
+        if self.handing_off {
+            return Err(anyhow!("the server is being updated"));
+        }
         let serial = self.terminals.next_serial;
         self.terminals.next_serial += 1;
-        let inputs = self.inputs.clone();
-        let event_key = key.clone();
         let terminal = Terminal::start(
             spawn,
             size,
             self.terminals.palette.clone(),
-            Arc::new(move |event| {
-                inputs
-                    .unbounded_send(Input::Terminal {
-                        key: event_key.clone(),
-                        serial,
-                        event,
-                    })
-                    .ok();
-            }),
+            self.terminal_events(&key, serial),
         )?;
         let output_byte_limit = self
             .terminals
@@ -290,6 +283,120 @@ impl Server {
         self.terminal_changed(key);
         self.schedule_agent_detection(detect::TICK_NO_AGENT);
         Ok(())
+    }
+
+    /// Passes a terminal's events from its run `serial` on to the server.
+    fn terminal_events(
+        &self,
+        key: &TerminalKey,
+        serial: u64,
+    ) -> Arc<dyn Fn(AlacEvent) + Send + Sync> {
+        let inputs = self.inputs.clone();
+        let key = key.clone();
+        Arc::new(move |event| {
+            inputs
+                .unbounded_send(Input::Terminal {
+                    key: key.clone(),
+                    serial,
+                    event,
+                })
+                .ok();
+        })
+    }
+
+    /// Stops reading the terminals to hand them to a newer server: each one whose process
+    /// runs, with its PTY. Agents' terminals end with their agents.
+    #[cfg(unix)]
+    pub(super) fn pause_terminals(
+        &mut self,
+    ) -> Vec<(crate::handoff::HandedOffTerminal, std::os::fd::OwnedFd)> {
+        let mut paused = Vec::new();
+        for (key, running) in &mut self.terminals.running {
+            if matches!(key, TerminalKey::Agent { .. }) || running.terminal.exit().is_some() {
+                continue;
+            }
+            let pty = match running.terminal.pty().try_clone_to_owned() {
+                Ok(pty) => pty,
+                Err(error) => {
+                    log::error!("can't hand off a terminal: {error}");
+                    continue;
+                }
+            };
+            match running.terminal.pause() {
+                Ok(terminal) => paused.push((
+                    crate::handoff::HandedOffTerminal {
+                        key: key.clone(),
+                        terminal,
+                        output_byte_limit: running.output_byte_limit,
+                        released: running.released,
+                        folder: running.folder.clone(),
+                    },
+                    pty,
+                )),
+                Err(error) => log::error!("can't hand off a terminal: {error:#}"),
+            }
+        }
+        paused
+    }
+
+    /// The handoff failed: the terminals go on here.
+    pub(super) fn resume_terminals(&mut self, keys: &[TerminalKey]) {
+        for key in keys {
+            if let Some(running) = self.terminals.running.get_mut(key) {
+                running.terminal.resume();
+            }
+        }
+    }
+
+    /// The newer server runs the terminals now; their processes are left running.
+    pub(super) fn detach_terminals(&mut self, keys: &[TerminalKey]) {
+        for key in keys {
+            if let Some(running) = self.terminals.running.remove(key) {
+                running.terminal.detach();
+            }
+        }
+    }
+
+    /// Takes over the terminals the server before handed over.
+    #[cfg(unix)]
+    pub(super) fn adopt_terminals(&mut self, handed_over: crate::handoff::HandedOver) {
+        let crate::handoff::HandedOver { manifest, ptys } = handed_over;
+        self.terminals.palette = manifest.palette;
+        for (handed, pty) in manifest.terminals.into_iter().zip(ptys) {
+            let key = handed.key;
+            let serial = self.terminals.next_serial;
+            self.terminals.next_serial += 1;
+            let terminal =
+                match Terminal::adopt(handed.terminal, pty, self.terminal_events(&key, serial)) {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        log::error!("failed to take over a terminal: {error:#}");
+                        continue;
+                    }
+                };
+            let tracker = match key {
+                TerminalKey::Thread(_) | TerminalKey::Pane(_) => Some(AgentTracker::default()),
+                TerminalKey::Drawer(_)
+                | TerminalKey::DrawerTerminal { .. }
+                | TerminalKey::Agent { .. } => None,
+            };
+            self.terminals.running.insert(
+                key.clone(),
+                RunningTerminal {
+                    serial,
+                    terminal,
+                    output_byte_limit: handed.output_byte_limit,
+                    released: handed.released,
+                    content: 0,
+                    tracker,
+                    foreground_group: None,
+                    activity_recorded_at: None,
+                    folder: handed.folder,
+                },
+            );
+            self.terminal_changed(key);
+        }
+        self.schedule_agent_detection(detect::TICK_NO_AGENT);
     }
 
     pub(super) fn close_terminal(&mut self, key: &TerminalKey) {

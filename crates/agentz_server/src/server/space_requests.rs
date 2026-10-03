@@ -227,13 +227,20 @@ impl Server {
     }
 
     /// herdr's snapshot restore: terminal panes start again as new shells (or their commands)
-    /// in their folders. Thread panes show their threads, which are already back.
+    /// in their folders, unless the server before handed them over. Thread panes show their threads, which are already back.
     pub(super) fn restore_spaces(&mut self) {
         let panes: Vec<PaneId> = self
             .spaces
             .panes()
             .filter(|(_, pane)| matches!(pane.content, PaneContent::Terminal(_)))
             .map(|(_, pane)| pane.id)
+            // Handed over by the server before, still running.
+            .filter(|pane| {
+                !self
+                    .terminals
+                    .running
+                    .contains_key(&TerminalKey::Pane(*pane))
+            })
             .collect();
         for pane in panes {
             self.start_pane(pane);

@@ -1,5 +1,7 @@
 //! The state the server owns, and how requests and background results change it.
 
+#[cfg(unix)]
+mod hand_off;
 mod space_requests;
 mod terminal_requests;
 mod tools;
@@ -9,6 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
@@ -114,6 +117,13 @@ pub(crate) struct Server {
     custom_agents: BTreeMap<AgentId, CustomAgent>,
     agent_control: Option<AgentControl>,
     terminal_shell: Option<String>,
+    /// The socket clients connect to, for handing off.
+    #[cfg(unix)]
+    listener: Option<std::os::fd::RawFd>,
+    /// A handoff to a newer server is under way.
+    handing_off: bool,
+    /// Set once it's done, as the server stops.
+    handed_off: Arc<AtomicBool>,
     /// The MCP bridges' credentials, each given to one thread's agent. Dropped with the agent.
     tool_sessions: HashMap<String, ThreadId>,
     follow_ups: HashMap<ThreadId, VecDeque<FollowUp>>,
@@ -156,6 +166,7 @@ impl Server {
         config: ServerConfig,
         machine: MachineInfo,
         inputs: mpsc::UnboundedSender<Input>,
+        handed_off: Arc<AtomicBool>,
     ) -> Self {
         let data_dir = config.data_dir;
         let mut projects = ProjectStore::load(Some(data_dir.join("state.json")));
@@ -185,6 +196,10 @@ impl Server {
             custom_agents: config.custom_agents,
             agent_control: config.agent_control,
             terminal_shell: config.terminal_shell,
+            #[cfg(unix)]
+            listener: config.listener,
+            handing_off: false,
+            handed_off,
             tool_sessions: HashMap::default(),
             follow_ups: HashMap::default(),
             moving_threads: HashMap::default(),
@@ -215,6 +230,10 @@ impl Server {
         server.forward(registry_inbox, Input::Registry);
         server.registry_sent = server.registry_snapshot();
         server.refresh_repositories();
+        #[cfg(unix)]
+        if let Some(handed_over) = config.handed_over {
+            server.adopt_terminals(handed_over);
+        }
         server.restore_spaces();
         server.spawn_then(machine_kind::detect(), |server, detected| {
             server.machine_icon.detected = detected;
@@ -322,6 +341,12 @@ impl Server {
                 id,
                 request: Request::ThreadDiff { thread_id, scope },
             } => self.thread_diff(client, id, thread_id, scope),
+            #[cfg(unix)]
+            Input::Request {
+                client,
+                id,
+                request: Request::HandOff { stop_running_turns },
+            } => self.hand_off(client, id, stop_running_turns),
             Input::Request {
                 client,
                 id,
@@ -660,6 +685,7 @@ impl Server {
                 self.stopping = true;
                 Ok(Response::Ok)
             }
+            Request::HandOff { .. } => Err(anyhow!("this server can't hand off")),
             Request::ListTools => Ok(Response::Tools(tools::definitions())),
             Request::SetMachineIcon(icon) => {
                 machine_kind::save_choice(&self.data_dir.join("machine.json"), icon.clone())?;

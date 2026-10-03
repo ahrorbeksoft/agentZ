@@ -107,6 +107,8 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
                 socket: socket.clone(),
             }),
             terminal_shell: Some("/bin/sh".into()),
+            listener: None,
+            handed_over: None,
         },
     )
     .expect("server starts");

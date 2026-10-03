@@ -67,6 +67,8 @@ impl TestServer {
                 custom_agents,
                 agent_control: None,
                 terminal_shell: Some("/bin/sh".into()),
+                listener: None,
+                handed_over: None,
             },
         )
         .expect("server starts");

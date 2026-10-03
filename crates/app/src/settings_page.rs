@@ -37,7 +37,7 @@ use crate::project_info::{
 };
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
-use crate::server_client::{MachineStatus, ServerClient};
+use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
 use crate::thread_entity::AgentThread;
 
@@ -737,6 +737,18 @@ impl SettingsPage {
         let server_client = local.read(cx);
         let (server_description, is_connected): (SharedString, bool) =
             match (server_client.status(), server_client.connection()) {
+                (MachineStatus::Online, Some(connection)) if server_client.is_outdated() => {
+                    let welcome = connection.welcome();
+                    (
+                        format!(
+                            "agentz-server {}, pid {}, is older than the one installed. Update it \
+                             to use the new one; terminals keep running.",
+                            welcome.server_version, welcome.pid
+                        )
+                        .into(),
+                        true,
+                    )
+                }
                 (MachineStatus::Online, Some(connection)) => {
                     let welcome = connection.welcome();
                     (
@@ -760,6 +772,14 @@ impl SettingsPage {
                 _ => ("Connecting…".into(), false),
             };
         let is_stopped = *server_client.status() == MachineStatus::Stopped;
+        let update_button = (is_connected && server_client.can_update_server()).then(|| {
+            let local = local.clone();
+            Button::new("update-server", "Update Server")
+                .style(ButtonStyle::Outlined)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.update_server(local.clone(), window, cx)
+                }))
+        });
         let server_button = if is_stopped {
             let local = local.clone();
             Button::new("start-server", "Start Server")
@@ -791,7 +811,11 @@ impl SettingsPage {
                     render_row(
                         "Background server",
                         server_description,
-                        server_button.into_any_element(),
+                        h_flex()
+                            .gap_2()
+                            .children(update_button)
+                            .child(server_button)
+                            .into_any_element(),
                         cx,
                     ),
                     render_row(
@@ -902,6 +926,65 @@ impl SettingsPage {
             if answer.await == Ok(0) {
                 // The app starts the server again when the connection drops.
                 cx.update(|cx| Machines::local(cx).read(cx).send(Request::Shutdown, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Hands the server's terminals to the binary installed now. While turns run, asks first
+    /// whether to stop them.
+    fn update_server(
+        &mut self,
+        client: Entity<ServerClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let update = client.read(cx).update_server(false, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            let result = match update.await {
+                Ok(ServerUpdate::TurnsRunning(threads)) => {
+                    let detail = format!(
+                        "{} will stop: {}. Terminals keep running.",
+                        if threads.len() == 1 {
+                            "This thread's turn".to_string()
+                        } else {
+                            format!("These {} threads' turns", threads.len())
+                        },
+                        threads.join(", ")
+                    );
+                    let Ok(answer) = cx.update(|window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            "Stop the running turns and update?",
+                            Some(&detail),
+                            &["Update", "Cancel"],
+                            cx,
+                        )
+                    }) else {
+                        return;
+                    };
+                    if answer.await != Ok(0) {
+                        return;
+                    }
+                    let update = client.read_with(cx, |client, cx| client.update_server(true, cx));
+                    update.await
+                }
+                result => result,
+            };
+            if let Err(error) = result {
+                let detail = format!("{error:#}");
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Critical,
+                        "Couldn't update the server",
+                        Some(&detail),
+                        &["OK"],
+                        cx,
+                    )
+                });
+                if let Ok(answer) = answer {
+                    answer.await.ok();
+                }
             }
         })
         .detach();
@@ -1985,11 +2068,15 @@ impl SettingsPage {
                 match client.status() {
                     MachineStatus::Connecting => ("Connecting…".into(), Color::Muted),
                     MachineStatus::Online if client.is_outdated() => {
-                        hint = Some(
-                            "agentZ installed a newer agentz-server there. Restart the server \
-                             to use it; agents and terminals running there will stop."
-                                .into(),
-                        );
+                        hint = Some(if client.can_update_server() {
+                            "A newer agentz-server is installed there. Update the server to use \
+                             it; terminals keep running, and agents start again."
+                                .into()
+                        } else {
+                            "A newer agentz-server is installed there. Restart the server to \
+                             use it; agents and terminals running there will stop."
+                                .into()
+                        });
                         ("Connected · older server".into(), Color::Warning)
                     }
                     MachineStatus::Online => {
@@ -2078,6 +2165,15 @@ impl SettingsPage {
                     .filter(|client| client.read(cx).is_outdated()),
                 |controls, client| {
                     let name = label.clone();
+                    if client.read(cx).can_update_server() {
+                        return controls.child(
+                            Button::new(element_id("update"), "Update Server")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.update_server(client.clone(), window, cx)
+                                })),
+                        );
+                    }
                     controls.child(
                         Button::new(element_id("restart"), "Restart Server…")
                             .style(ButtonStyle::Outlined)

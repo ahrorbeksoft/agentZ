@@ -1597,7 +1597,7 @@ impl Server {
     }
 
     /// Whether the thread has a turn running, or messages from agents waiting to start one.
-    fn is_busy(&self, thread_id: ThreadId) -> bool {
+    pub(super) fn is_busy(&self, thread_id: ThreadId) -> bool {
         matches!(
             self.thread_status(thread_id),
             "running" | "waiting_for_approval" | "queued"

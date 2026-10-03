@@ -14,8 +14,8 @@ use agentz_protocol::layout::PaneId;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{
-    AgentSettingsChange, CAPABILITY_RELAY, ClientKind, ConnectionId, DirectoryListing, Event,
-    MachineIcon, MachineKind, Peers, RelayToolCall, Request, Response,
+    AgentSettingsChange, CAPABILITY_HAND_OFF, CAPABILITY_RELAY, ClientKind, ConnectionId,
+    DirectoryListing, Event, MachineIcon, MachineKind, Peers, RelayToolCall, Request, Response,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
@@ -66,6 +66,15 @@ pub enum MachineStatus {
     /// The user stopped the server. Connecting would start it again, so that waits until
     /// they ask.
     Stopped,
+}
+
+/// What came of asking a server to update.
+#[derive(Debug, PartialEq)]
+pub enum ServerUpdate {
+    /// The server installed now is taking over; the connection drops and comes back to it.
+    Started,
+    /// These threads' turns are running, and would stop.
+    TurnsRunning(Vec<String>),
 }
 
 pub enum ServerClientEvent {
@@ -195,6 +204,25 @@ impl ServerClient {
     /// installed now.
     pub fn restart_server(&self, cx: &App) {
         self.send(Request::Shutdown, cx);
+    }
+
+    /// Whether the server can update without ending its terminals ([`Self::update_server`]).
+    pub fn can_update_server(&self) -> bool {
+        self.has_capability(CAPABILITY_HAND_OFF)
+    }
+
+    /// Has the server hand its terminals to the binary installed now and exit, as herdr's
+    /// server handoff does. Agents start again in the new server and load their sessions. A
+    /// turn that's running stops only with `stop_running_turns`.
+    pub fn update_server(&self, stop_running_turns: bool, cx: &App) -> Task<Result<ServerUpdate>> {
+        let response = self.request(Request::HandOff { stop_running_turns });
+        cx.background_spawn(async move {
+            match response.await? {
+                Response::Ok => Ok(ServerUpdate::Started),
+                Response::TurnsRunning(threads) => Ok(ServerUpdate::TurnsRunning(threads)),
+                response => Err(anyhow!("unexpected response: {response:?}")),
+            }
+        })
     }
 
     /// Stops the machine's server, and its agents and terminals, until [`Self::retry`].
@@ -666,7 +694,10 @@ async fn connect(
     match transport {
         Transport::Local => connect_local(runtime)
             .await
-            .map(|(connection, events)| (connection, events, false))
+            .map(|(connection, events)| {
+                let is_outdated = local_server_is_outdated(&connection);
+                (connection, events, is_outdated)
+            })
             .map_err(|error| SshError {
                 message: format!("{error:#}"),
                 needs_attention: false,
@@ -704,6 +735,21 @@ async fn connect(
                 })
         }
     }
+}
+
+/// Whether the binary next to the app changed since the server started from it, as after
+/// `cargo build` or installing a new version.
+fn local_server_is_outdated(connection: &Connection) -> bool {
+    let Some(started_from) = connection.welcome().binary_modified else {
+        return false;
+    };
+    let installed = server_binary()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|modified| u64::try_from(modified.as_millis()).ok());
+    installed.is_some_and(|installed| installed != started_from)
 }
 
 /// Connects to this Mac's server, starting it first if nothing is listening.

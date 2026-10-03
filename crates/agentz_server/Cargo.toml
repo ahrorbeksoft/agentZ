@@ -33,6 +33,7 @@ gpui_shared_string.workspace = true
 http_client.workspace = true
 log.workspace = true
 paths.workspace = true
+polling.workspace = true
 projects.workspace = true
 registry.workspace = true
 regex.workspace = true
@@ -45,11 +46,9 @@ url.workspace = true
 util.workspace = true
 uuid.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-libc.workspace = true
-
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["hostname", "signal"] }
+libc.workspace = true
+nix = { workspace = true, features = ["hostname", "signal", "socket", "uio"] }
 
 [dev-dependencies]
 tempfile.workspace = true
