@@ -1234,11 +1234,20 @@ impl SpacesView {
                 }
                 None => faint_label(path.to_string()).truncate_middle(),
             })
+            // Unpushed commits in the theme's added color, unpulled ones in its deleted color.
             .when_some(git.as_ref().filter(|git| git.ahead > 0), |line, git| {
-                line.child(faint_label(format!("↑{}", git.ahead)))
+                line.child(
+                    Label::new(format!("↑{}", git.ahead))
+                        .size(LabelSize::Small)
+                        .color(Color::Created),
+                )
             })
             .when_some(git.as_ref().filter(|git| git.behind > 0), |line, git| {
-                line.child(faint_label(format!("↓{}", git.behind)))
+                line.child(
+                    Label::new(format!("↓{}", git.behind))
+                        .size(LabelSize::Small)
+                        .color(Color::Deleted),
+                )
             })
             .child(div().flex_1())
             .when_some(contents, |line, contents| {
