@@ -259,6 +259,7 @@ impl ProjectStore {
             .request(Request::CreateThread {
                 project_id,
                 agent_id,
+                workspace: Default::default(),
             });
         cx.background_spawn(async move {
             match response.await? {

@@ -141,6 +141,7 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
         .request(Request::CreateThread {
             project_id,
             agent_id: AgentId::new("mock"),
+            workspace: Default::default(),
         })
         .await
         .expect("create a thread")

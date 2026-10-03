@@ -18,7 +18,9 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025
 
 const INSTRUCTIONS: &str = "Tools for managing the threads of this agentZ project: list and read \
 threads, start new ones, message, wait for, interrupt, rename and archive them, read the changes \
-each thread made (agentz_thread_diff), and delegate tasks to child agents. A delegated task is \
+each thread made (agentz_thread_diff), work in git worktrees and copy-on-write pastures \
+(agentz_workspace_*, and workspaceStrategy when launching or delegating), and delegate tasks to \
+child agents. A delegated task is \
 child work owned by this thread: use delegate_task (see orchestrator_capabilities for agents and \
 models), keep each taskId, and use task_status or task_cancel to manage it. An async task's end is \
 announced to this thread, so end the turn instead of polling. agentz_thread_launch and \

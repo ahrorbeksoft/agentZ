@@ -436,6 +436,7 @@ mod tests {
             Request::CreateThread {
                 project_id,
                 agent_id: AgentId::new("mock"),
+                workspace: Default::default(),
             },
         )
         .await

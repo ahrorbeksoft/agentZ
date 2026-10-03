@@ -14,6 +14,8 @@
 //! stay with the user. Mutations take an optional `clientRequestId`, so a retry returns the
 //! first answer instead of doing the work again.
 
+mod workspaces;
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -30,6 +32,7 @@ use serde_json::{Map, Value, json};
 use util::ResultExt as _;
 
 use super::{ClientId, FollowUp, Input, Server};
+use workspaces::{Folder, Placement, workspace_strategy};
 
 const MAX_BATCH_THREADS: usize = 20;
 const MAX_PROMPT_CHARS: usize = 120_000;
@@ -134,9 +137,13 @@ enum Step {
     WaitForTask(ThreadId, Duration),
     /// Answer with this work's result, done off the server's task.
     Background(BoxFuture<'static, Result<Value, Failure>>),
+    /// Do this work off the server's task, then go on with its result on the server, as when
+    /// a launched thread's worktree has to be made first.
+    Then(BoxFuture<'static, Continuation>),
 }
 
 type Outcome = Result<Step, Failure>;
+type Continuation = Box<dyn FnOnce(&mut Server) -> Outcome + Send>;
 
 impl Server {
     /// Runs a tool and answers, now or once the thread it waits for is ready.
@@ -148,41 +155,65 @@ impl Server {
         name: String,
         arguments: Value,
     ) {
-        let outcome = self.resolve_caller(&caller).and_then(|caller| {
-            match self.run_tool(caller, &name, &arguments, false) {
-                Ok(step @ (Step::Wait(_) | Step::WaitForTask(..))) => {
-                    let (task, timeout) = match step {
-                        Step::WaitForTask(task, timeout) => (Some(task), timeout),
-                        Step::Wait(timeout) => (None, timeout),
-                        Step::Done(_) | Step::Background(_) => (None, Duration::ZERO),
-                    };
-                    let deadline = Instant::now() + timeout;
-                    self.pending_tool_calls.push(PendingToolCall {
-                        client,
-                        id,
-                        caller,
-                        name,
-                        arguments,
-                        task,
-                        deadline,
-                    });
-                    self.wake_at(deadline);
-                    Ok(None)
-                }
-                Ok(Step::Done(value)) => Ok(Some(value)),
-                Ok(Step::Background(work)) => {
-                    self.answer_in_background(client, id, work);
-                    Ok(None)
-                }
-                Err(failure) => Err(failure),
+        let caller = match self.resolve_caller(&caller) {
+            Ok(caller) => caller,
+            Err(failure) => {
+                self.send_changes();
+                return self.send_tool_result(client, id, tool_result(Err(failure)));
             }
-        });
-        self.send_changes();
-        let result = match outcome {
-            Ok(None) => return,
-            Ok(Some(value)) => tool_result(Ok(value)),
-            Err(failure) => tool_result(Err(failure)),
         };
+        let outcome = self.run_tool(caller, &name, &arguments, false);
+        self.settle_tool_call(client, id, caller, name, arguments, outcome);
+    }
+
+    /// Answers a call with its outcome, or has it wait, retry or go on in the background.
+    fn settle_tool_call(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        caller: Caller,
+        name: String,
+        arguments: Value,
+        outcome: Outcome,
+    ) {
+        let result = match outcome {
+            Ok(step @ (Step::Wait(_) | Step::WaitForTask(..))) => {
+                let (task, timeout) = match step {
+                    Step::WaitForTask(task, timeout) => (Some(task), timeout),
+                    Step::Wait(timeout) => (None, timeout),
+                    Step::Done(_) | Step::Background(_) | Step::Then(_) => (None, Duration::ZERO),
+                };
+                let deadline = Instant::now() + timeout;
+                self.pending_tool_calls.push(PendingToolCall {
+                    client,
+                    id,
+                    caller,
+                    name,
+                    arguments,
+                    task,
+                    deadline,
+                });
+                self.wake_at(deadline);
+                None
+            }
+            Ok(Step::Done(value)) => Some(tool_result(Ok(value))),
+            Ok(Step::Background(work)) => {
+                self.answer_in_background(client, id, work);
+                None
+            }
+            Ok(Step::Then(work)) => {
+                self.continue_in_background(client, id, caller, name, arguments, work);
+                None
+            }
+            Err(failure) => Some(tool_result(Err(failure))),
+        };
+        self.send_changes();
+        if let Some(result) = result {
+            self.send_tool_result(client, id, result);
+        }
+    }
+
+    fn send_tool_result(&self, client: ClientId, id: u64, result: ToolResult) {
         self.send(
             client,
             ServerMessage::Response {
@@ -190,6 +221,21 @@ impl Server {
                 result: Ok(agentz_protocol::Response::ToolResult(result)),
             },
         );
+    }
+
+    fn continue_in_background(
+        &self,
+        client: ClientId,
+        id: u64,
+        caller: Caller,
+        name: String,
+        arguments: Value,
+        work: BoxFuture<'static, Continuation>,
+    ) {
+        self.spawn_then(work, move |server, then| {
+            let outcome = then(server);
+            server.settle_tool_call(client, id, caller, name, arguments, outcome);
+        });
     }
 
     /// Retries the waiting calls, and returns the answers of those that are done.
@@ -218,6 +264,14 @@ impl Server {
                     answers.push((call.client, call.id, tool_result(Ok(value))))
                 }
                 Ok(Step::Background(work)) => self.answer_in_background(call.client, call.id, work),
+                Ok(Step::Then(work)) => self.continue_in_background(
+                    call.client,
+                    call.id,
+                    call.caller,
+                    call.name,
+                    call.arguments,
+                    work,
+                ),
                 Err(failure) => answers.push((call.client, call.id, tool_result(Err(failure)))),
             }
         }
@@ -415,16 +469,22 @@ impl Server {
             ToolCaller::Thread(thread_id) => *thread_id,
             ToolCaller::Directory(path) => {
                 let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-                let project = self
+                // A project's worktrees and pastures count as part of it.
+                let (project_id, _) = self
                     .projects
                     .projects()
                     .iter()
-                    .filter(|project| {
-                        path.starts_with(&project.path)
-                            || std::fs::canonicalize(&project.path)
-                                .is_ok_and(|project_path| path.starts_with(project_path))
+                    .flat_map(|project| {
+                        std::iter::once(&project.path)
+                            .chain(project.workspaces.iter().map(|workspace| &workspace.path))
+                            .map(move |folder| (project.id, folder))
                     })
-                    .max_by_key(|project| project.path.components().count())
+                    .filter(|(_, folder)| {
+                        path.starts_with(folder)
+                            || std::fs::canonicalize(folder)
+                                .is_ok_and(|folder| path.starts_with(folder))
+                    })
+                    .max_by_key(|(_, folder)| folder.components().count())
                     .ok_or_else(|| {
                         failure(
                             "capability_denied",
@@ -432,7 +492,7 @@ impl Server {
                         )
                     })?;
                 return Ok(Caller {
-                    project_id: project.id,
+                    project_id,
                     thread_id: None,
                 });
             }
@@ -481,8 +541,12 @@ impl Server {
             "agentz_thread_list" => self.thread_list(caller, &arguments),
             "agentz_thread_read" => self.thread_read(caller, &arguments, timed_out),
             "agentz_thread_launch" => {
-                let spec = self.launch_spec(caller, &arguments, "prompt")?;
-                Ok(Step::Done(self.launch(caller, spec)))
+                let mut spec = self.launch_spec(caller, &arguments, "prompt")?;
+                let placement = std::mem::take(&mut spec.placement);
+                self.with_folders(caller, vec![placement], move |server, folders| {
+                    let folder = folders.into_iter().next().unwrap_or(Folder::Default);
+                    Ok(Step::Done(server.launch(caller, spec, folder)))
+                })
             }
             "create_threads" => self.create_threads(caller, &arguments),
             "agentz_thread_send" => self.thread_send(caller, &arguments),
@@ -497,12 +561,34 @@ impl Server {
             }
             "task_cancel" => self.task_cancel(caller, &arguments),
             "agentz_thread_diff" => self.thread_diff_tool(caller, &arguments),
+            "agentz_workspace_status" => self.workspace_status(caller),
+            "agentz_workspace_list" => self.workspace_list(caller, &arguments),
+            "agentz_workspace_handoff" => self.workspace_handoff(caller, &arguments),
+            "agentz_workspace_sync" => self.workspace_sync(caller, &arguments),
+            "agentz_workspace_bring_back" => self.workspace_bring_back(caller, &arguments),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
-        if let (Some(key), Step::Done(value)) = (request_key, &step) {
-            self.tool_results.insert(key, value.clone());
-        }
-        Ok(step)
+        Ok(match (request_key, step) {
+            (Some(key), Step::Done(value)) => {
+                self.tool_results.insert(key, value.clone());
+                Step::Done(value)
+            }
+            // Remembered once the work is done.
+            (Some(key), Step::Then(work)) => Step::Then(
+                async move {
+                    let then = work.await;
+                    Box::new(move |server: &mut Server| {
+                        let outcome = then(server);
+                        if let Ok(Step::Done(value)) = &outcome {
+                            server.tool_results.insert(key, value.clone());
+                        }
+                        outcome
+                    }) as Continuation
+                }
+                .boxed(),
+            ),
+            (_, step) => step,
+        })
     }
 
     fn capabilities(&mut self, caller: Caller) -> Outcome {
@@ -574,7 +660,8 @@ impl Server {
                 "maxBatchThreads": MAX_BATCH_THREADS,
                 "incrementalThreadRead": true,
                 "appOwnedSubagents": true,
-                "diffs": false,
+                "diffs": true,
+                "workspaces": true,
                 "terminals": false,
             },
         })))
@@ -749,18 +836,25 @@ impl Server {
             )));
         }
         // All are checked before any is created.
-        let specs = requests
+        let mut specs = requests
             .iter()
             .map(|request| match request {
                 Value::Object(request) => self.launch_spec(caller, &Arguments(request), "prompt"),
                 _ => Err(invalid("Each thread must be an object.")),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let threads: Vec<Value> = specs
-            .into_iter()
-            .map(|spec| self.launch(caller, spec))
+        let placements = specs
+            .iter_mut()
+            .map(|spec| std::mem::take(&mut spec.placement))
             .collect();
-        Ok(Step::Done(json!({ "threads": threads })))
+        self.with_folders(caller, placements, move |server, folders| {
+            let threads: Vec<Value> = specs
+                .into_iter()
+                .zip(folders)
+                .map(|(spec, folder)| server.launch(caller, spec, folder))
+                .collect();
+            Ok(Step::Done(json!({ "threads": threads })))
+        })
     }
 
     fn launch_spec(
@@ -865,10 +959,11 @@ impl Server {
             model,
             mode,
             mode_option,
+            placement: workspace_strategy(arguments)?,
         })
     }
 
-    fn launch(&mut self, caller: Caller, spec: LaunchSpec) -> Value {
+    fn launch(&mut self, caller: Caller, spec: LaunchSpec, folder: Folder) -> Value {
         let Some(thread_id) = self.projects.add_thread(
             caller.project_id,
             projects::NEW_THREAD_TITLE,
@@ -876,6 +971,10 @@ impl Server {
         ) else {
             return json!({"error": "The project was removed."});
         };
+        // A launched thread doesn't inherit the caller's workspace, as in t3code.
+        if let Folder::Chosen(folder) = folder {
+            self.projects.set_thread_workspace(thread_id, folder);
+        }
         self.projects
             .set_thread_creator(thread_id, caller.creator());
         let model = spec.model.as_ref().map(|(_, value)| value.clone());
@@ -968,41 +1067,49 @@ impl Server {
                 })
                 .map(|thread| thread.id)
         });
-        let task = match existing {
-            Some(task) => task,
-            None => {
-                let spec = self.launch_spec(caller, arguments, "task")?;
-                let Some(prompt) = spec.prompt.clone() else {
-                    return Err(invalid("task is required."));
-                };
-                let agent_id = spec.agent_id.0.to_string();
-                let task = self
-                    .projects
-                    .add_subthread(
-                        Task {
-                            parent,
-                            prompt,
-                            role,
-                            client_request_id,
-                            outcome: None,
-                            delivered: false,
-                        },
-                        Some(agent_id),
-                    )
-                    .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
-                self.start_launched(task, ThreadCreator::Thread(parent), spec);
-                task
+        let answer = move |server: &mut Server, task: ThreadId| -> Outcome {
+            if wait {
+                server
+                    .wait_for_task(caller, task, false)
+                    .map(|step| match step {
+                        Step::Wait(_) => Step::WaitForTask(task, timeout),
+                        step => step,
+                    })
+            } else {
+                Ok(Step::Done(server.task_result(task, false, false)))
             }
         };
-        if wait {
-            self.wait_for_task(caller, task, false)
-                .map(|step| match step {
-                    Step::Wait(_) => Step::WaitForTask(task, timeout),
-                    step => step,
-                })
-        } else {
-            Ok(Step::Done(self.task_result(task, false, false)))
+        if let Some(task) = existing {
+            return answer(self, task);
         }
+        let mut spec = self.launch_spec(caller, arguments, "task")?;
+        let Some(prompt) = spec.prompt.clone() else {
+            return Err(invalid("task is required."));
+        };
+        let placement = std::mem::take(&mut spec.placement);
+        self.with_folders(caller, vec![placement], move |server, folders| {
+            let agent_id = spec.agent_id.0.to_string();
+            let task = server
+                .projects
+                .add_subthread(
+                    Task {
+                        parent,
+                        prompt,
+                        role,
+                        client_request_id,
+                        outcome: None,
+                        delivered: false,
+                    },
+                    Some(agent_id),
+                )
+                .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+            // Otherwise the task works where its parent does.
+            if let Some(Folder::Chosen(folder)) = folders.into_iter().next() {
+                server.projects.set_thread_workspace(task, folder);
+            }
+            server.start_launched(task, ThreadCreator::Thread(parent), spec);
+            answer(server, task)
+        })
     }
 
     /// `delegate_task`'s wait: the result once the task ends, or `waitTimedOut`.
@@ -1510,6 +1617,7 @@ struct LaunchSpec {
     /// room than its parent.
     mode: Option<acp::SessionModeId>,
     mode_option: Option<(acp::SessionConfigId, String)>,
+    placement: Placement,
 }
 
 /// Ends the tasks that were running when the server last stopped. Their parents are told once
@@ -1722,6 +1830,20 @@ pub(super) fn definitions() -> Value {
         "maxLength": 256,
         "description": "Stable idempotency key to reuse when retrying this mutation.",
     });
+    let workspace_strategy = |default: &str| {
+        json!({
+            "type": "object",
+            "description": format!("Where the thread works. {default} type=worktree or pasture makes a new one on a new branch (branch, default agentz/<short id>) from baseRef (default: the checkout's current branch); a pasture is a copy-on-write clone of the whole project folder, so dependencies, .env and caches come along. type=existing reuses one of the project's worktrees or pastures by path, from agentz_workspace_list. type=root is the project's own checkout."),
+            "properties": {
+                "type": {"type": "string", "enum": ["root", "worktree", "pasture", "existing"]},
+                "baseRef": {"type": "string", "maxLength": 256},
+                "branch": {"type": "string", "maxLength": 256},
+                "path": {"type": "string", "maxLength": 4096},
+            },
+            "required": ["type"],
+            "additionalProperties": false,
+        })
+    };
     let launch = json!({
         "type": "object",
         "properties": {
@@ -1729,6 +1851,7 @@ pub(super) fn definitions() -> Value {
             "title": {"type": "string", "maxLength": MAX_TITLE_CHARS, "description": "Optional concise title. Without it, the prompt names the thread."},
             "agentId": {"type": "string", "description": "An installed agent from orchestrator_capabilities. Defaults to this thread's agent."},
             "model": {"type": "string", "description": "A model id or name the agent advertises in orchestrator_capabilities. Defaults to this thread's model for the same agent, or the agent's default."},
+            "workspaceStrategy": workspace_strategy("Defaults to the project's own checkout, whatever this thread's workspace."),
         },
         "additionalProperties": false,
     });
@@ -1910,12 +2033,77 @@ pub(super) fn definitions() -> Value {
                     "model": {"type": "string", "description": "A model id or name the agent advertises. Defaults to this thread's model for the same agent, or the agent's default."},
                     "mode": {"type": "string", "enum": ["async", "wait"], "description": "Defaults to async. Use wait only when this turn needs the result before it can continue."},
                     "timeoutMs": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT.as_millis() as u64, "description": "How long mode=wait waits. It doesn't cancel the task."},
+                    "workspaceStrategy": workspace_strategy("Defaults to this thread's own folder, so parallel tasks that edit files should each get a worktree or pasture."),
                     "clientRequestId": client_request_id,
                 },
                 "required": ["task"],
                 "additionalProperties": false,
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
+        },
+        {
+            "name": "agentz_workspace_status",
+            "title": "Get this thread's workspace",
+            "description": "Report where this thread works: kind (checkout, worktree or pasture), whether it's attached to a worktree or pasture, its folder and branch, the branch it started from, and the project's own checkout. Call this before agentz_workspace_handoff to see whether a handoff is possible.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
+        },
+        {
+            "name": "agentz_workspace_list",
+            "title": "List branches and workspaces",
+            "description": "List the project repository's local branches, most recently committed first, with the checkouts each is checked out in, and the project's worktrees and pastures with the threads working in each. pastures tells whether new pastures are copy_on_write, a full_copy (slow and as big as the project) or unsupported here.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "maxLength": 256, "description": "Only branches whose name contains this."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                },
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
+        },
+        {
+            "name": "agentz_workspace_handoff",
+            "title": "Hand off this thread to a new workspace",
+            "description": "Move this thread into a new git worktree or pasture on a new branch (branch, default agentz/<short id>) from baseRef (default: the checkout's current branch). A worktree has only tracked files; a pasture is a copy-on-write clone of the whole project folder, with dependencies, .env and caches. To launch a separate agent in a new or existing workspace, use agentz_thread_launch or delegate_task with workspaceStrategy instead. The agent restarts in the new folder once this turn ends, with the conversation kept when the agent can load sessions, so call this as the last action of the turn. To keep working, pass continuationPrompt with the remaining work: it starts the next turn there. Uncommitted changes in the checkout don't come along to a worktree. Fails if this thread already works in a worktree or pasture.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["worktree", "pasture"]},
+                    "branch": {"type": "string", "maxLength": 256},
+                    "baseRef": {"type": "string", "maxLength": 256},
+                    "continuationPrompt": {"type": "string", "maxLength": MAX_PROMPT_CHARS},
+                    "clientRequestId": client_request_id,
+                },
+                "required": ["type"],
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+        },
+        {
+            "name": "agentz_workspace_sync",
+            "title": "Sync this pasture from the project",
+            "description": "For a thread in a pasture: fetch a branch from the project's checkout (default: the branch the pasture started from) and rebase the pasture's branch onto it, or merge with strategy=merge. Commit first: uncommitted changes to tracked files stop it. On conflicts the rebase or merge is undone and the conflicting files are named. Worktrees share the project's branches, so they don't need this.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "branch": {"type": "string", "maxLength": 256},
+                    "strategy": {"type": "string", "enum": ["rebase", "merge"]},
+                },
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": true},
+        },
+        {
+            "name": "agentz_workspace_bring_back",
+            "title": "Bring this pasture's branch to the project",
+            "description": "For a thread in a pasture: create a branch in the project's checkout (default: the pasture's branch) at the pasture's HEAD, or fast-forward it there, ready to review and push from there. Only committed work comes along. A branch the checkout has checked out can't be updated; sync first if the branch has moved on.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"branch": {"type": "string", "maxLength": 256}},
+                "additionalProperties": false,
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": true},
         },
         {
             "name": "task_status",

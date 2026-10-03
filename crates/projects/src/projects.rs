@@ -34,6 +34,9 @@ pub struct Project {
     /// An icon chosen in the project's settings, shown instead of the detected one.
     #[serde(default)]
     pub icon: Option<ProjectIcon>,
+    /// Worktrees and pastures made for its threads, oldest first.
+    #[serde(default)]
+    pub workspaces: Vec<Workspace>,
 }
 
 impl Project {
@@ -47,6 +50,41 @@ impl Project {
     pub fn folder_name(&self) -> SharedString {
         project_name(&self.path)
     }
+}
+
+/// How a [`Workspace`] shares the project's repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    /// A `git worktree`: its own branch and folder, sharing the project's `.git`.
+    Worktree,
+    /// cow's copy-on-write clone of the whole folder, `.git`, dependencies and `.env`
+    /// included, on its own branch.
+    Pasture,
+}
+
+impl WorkspaceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            WorkspaceKind::Worktree => "Worktree",
+            WorkspaceKind::Pasture => "Pasture",
+        }
+    }
+}
+
+/// A checkout of the project besides its own folder, where threads can work apart from it.
+/// It stays part of the project, never a project of its own.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Workspace {
+    pub kind: WorkspaceKind,
+    pub path: PathBuf,
+    /// The branch it was made with. Whoever works there may have switched since.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// What the branch started from.
+    #[serde(default)]
+    pub base: Option<String>,
+    pub created_at: SystemTime,
 }
 
 /// A project icon picked by the user, as in t3code's project settings.
@@ -96,6 +134,10 @@ pub struct Thread {
     /// lineage). Subthreads show in their parent rather than in the thread list.
     #[serde(default)]
     pub task: Option<Task>,
+    /// The worktree or pasture the thread works in, one of its project's workspaces. `None`
+    /// is the project's own folder.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
 }
 
 impl Thread {
@@ -418,6 +460,7 @@ impl ProjectStore {
             path,
             custom_name: None,
             icon: None,
+            workspaces: Vec::new(),
         });
         self.changed();
         id
@@ -486,19 +529,23 @@ impl ProjectStore {
             completed_at: None,
             created_by: None,
             task: None,
+            workspace: None,
         });
         self.changed();
         Some(id)
     }
 
-    /// Adds a subthread of `task.parent`, in the parent's project.
+    /// Adds a subthread of `task.parent`, in the parent's project and workspace.
     pub fn add_subthread(&mut self, task: Task, agent_id: Option<String>) -> Option<ThreadId> {
-        let project_id = self.thread(task.parent)?.project_id;
+        let parent_thread = self.thread(task.parent)?;
+        let project_id = parent_thread.project_id;
+        let workspace = parent_thread.workspace.clone();
         let parent = task.parent;
         let id = self.add_thread(project_id, NEW_THREAD_TITLE, agent_id)?;
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.created_by = Some(ThreadCreator::Thread(parent));
             thread.task = Some(task);
+            thread.workspace = workspace;
         }
         self.changed();
         Some(id)
@@ -624,6 +671,82 @@ impl ProjectStore {
             && thread.created_by != Some(creator)
         {
             thread.created_by = Some(creator);
+            self.changed();
+        }
+    }
+
+    /// Records a worktree or pasture made for the project's threads.
+    pub fn add_workspace(&mut self, project_id: ProjectId, workspace: Workspace) {
+        let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        else {
+            return;
+        };
+        project
+            .workspaces
+            .retain(|existing| existing.path != workspace.path);
+        project.workspaces.push(workspace);
+        self.changed();
+    }
+
+    /// Forgets a workspace that was removed from disk. Threads that worked there keep its path,
+    /// and fail to start until they move.
+    pub fn remove_workspace(&mut self, project_id: ProjectId, path: &Path) {
+        if let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        {
+            let count_before = project.workspaces.len();
+            project
+                .workspaces
+                .retain(|workspace| workspace.path != path);
+            if project.workspaces.len() != count_before {
+                self.changed();
+            }
+        }
+    }
+
+    pub fn workspace(&self, project_id: ProjectId, path: &Path) -> Option<&Workspace> {
+        self.project(project_id)?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.path == path)
+    }
+
+    /// The worktree or pasture the thread works in, if it isn't the project's own folder.
+    pub fn thread_workspace(&self, id: ThreadId) -> Option<&Workspace> {
+        let thread = self.thread(id)?;
+        self.workspace(thread.project_id, thread.workspace.as_deref()?)
+    }
+
+    /// Where the thread's agent works: its workspace, or its project's folder.
+    pub fn thread_folder(&self, id: ThreadId) -> Option<PathBuf> {
+        let thread = self.thread(id)?;
+        match &thread.workspace {
+            Some(path) => Some(path.clone()),
+            None => Some(self.project(thread.project_id)?.path.clone()),
+        }
+    }
+
+    /// Threads working in the folder: a workspace, or a project's own folder.
+    pub fn threads_in_folder(&self, folder: &Path) -> Vec<ThreadId> {
+        self.threads
+            .iter()
+            .filter(|thread| self.thread_folder(thread.id).as_deref() == Some(folder))
+            .map(|thread| thread.id)
+            .collect()
+    }
+
+    /// Moves the thread to one of its project's workspaces, or with `None` to the project's
+    /// own folder.
+    pub fn set_thread_workspace(&mut self, id: ThreadId, workspace: Option<PathBuf>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.workspace != workspace
+        {
+            thread.workspace = workspace;
             self.changed();
         }
     }
@@ -997,5 +1120,53 @@ mod tests {
         std::thread::sleep(SAVE_DEBOUNCE * 3);
         let saved = read_state(&state_path).expect("readable").expect("saved");
         assert_eq!(saved.projects.len(), 1);
+    }
+
+    #[test]
+    fn threads_work_in_workspaces() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let project_path = store.project(project).expect("project").path.clone();
+        let pasture = dir.path().join("pastures/demo/agentz-1");
+        store.add_workspace(
+            project,
+            Workspace {
+                kind: WorkspaceKind::Pasture,
+                path: pasture.clone(),
+                branch: Some("agentz/1".into()),
+                base: Some("main".into()),
+                created_at: SystemTime::now(),
+            },
+        );
+        let lead = store.add_thread(project, "Lead", None).expect("thread");
+        assert_eq!(store.thread_folder(lead), Some(project_path.clone()));
+        store.set_thread_workspace(lead, Some(pasture.clone()));
+        assert_eq!(store.thread_folder(lead), Some(pasture.clone()));
+        assert_eq!(
+            store.thread_workspace(lead).map(|workspace| workspace.kind),
+            Some(WorkspaceKind::Pasture)
+        );
+
+        let child = store
+            .add_subthread(
+                Task {
+                    parent: lead,
+                    prompt: "Help".into(),
+                    role: None,
+                    client_request_id: None,
+                    outcome: None,
+                    delivered: false,
+                },
+                None,
+            )
+            .expect("subthread");
+        assert_eq!(store.thread_folder(child), Some(pasture.clone()));
+        assert_eq!(store.threads_in_folder(&pasture), vec![lead, child]);
+        assert!(store.threads_in_folder(&project_path).is_empty());
+
+        store.remove_workspace(project, &pasture);
+        assert!(store.thread_workspace(lead).is_none());
+        assert_eq!(store.thread_folder(lead), Some(pasture), "keeps its folder");
     }
 }

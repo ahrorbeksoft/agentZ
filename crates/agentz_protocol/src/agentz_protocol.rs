@@ -15,6 +15,7 @@
 pub mod agents;
 pub mod diff;
 pub mod thread;
+pub mod workspace;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -29,12 +30,16 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::thread::{ThreadUpdate, ThreadView};
+use crate::workspace::{ProjectGit, WorkspaceChoice, WorkspaceRemoval};
 
 /// Bumped when a change can't be made compatibly.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// [`ServerWelcome::capabilities`]: the server answers [`Request::ThreadDiff`].
 pub const CAPABILITY_THREAD_DIFF: &str = "thread_diff";
+/// [`ServerWelcome::capabilities`]: threads can work in worktrees and pastures
+/// ([`Request::ProjectGit`], [`Request::RemoveWorkspace`] and the rest).
+pub const CAPABILITY_WORKSPACES: &str = "workspaces";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -146,10 +151,40 @@ pub enum Request {
     SetThreadOrder(ThreadOrder),
     ToggleArchivedExpanded,
 
-    /// Answered with [`Response::ThreadCreated`].
+    /// Answered with [`Response::ThreadCreated`], once its workspace is ready.
     CreateThread {
         project_id: ProjectId,
         agent_id: AgentId,
+        #[serde(default)]
+        workspace: WorkspaceChoice,
+    },
+    /// The project's branches and whether pastures work there: [`Response::ProjectGit`].
+    ProjectGit(ProjectId),
+    /// Deletes a worktree or pasture from disk, keeping its branch:
+    /// [`Response::WorkspaceRemoval`]. Refused while a running thread works there.
+    RemoveWorkspace {
+        project_id: ProjectId,
+        path: PathBuf,
+        /// Remove even with uncommitted changes or commits the project doesn't have.
+        force: bool,
+    },
+    /// cow's `sync`: brings a pasture up to date with a branch of the project's checkout
+    /// (the pasture's base by default), by rebase or merge. [`Response::Message`].
+    SyncWorkspace {
+        project_id: ProjectId,
+        path: PathBuf,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        merge: bool,
+    },
+    /// cow's `extract --branch`: makes the pasture's `HEAD` a branch of the project's checkout
+    /// (the pasture's branch name by default). [`Response::Message`].
+    BringBackWorkspace {
+        project_id: ProjectId,
+        path: PathBuf,
+        #[serde(default)]
+        branch: Option<String>,
     },
     /// The user's own title, which automatic titles no longer replace.
     RenameThread {
@@ -274,6 +309,10 @@ pub enum Response {
     Tools(serde_json::Value),
     ToolResult(ToolResult),
     ThreadDiff(ThreadDiff),
+    ProjectGit(ProjectGit),
+    WorkspaceRemoval(WorkspaceRemoval),
+    /// What a finished action did, to show the user.
+    Message(String),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),

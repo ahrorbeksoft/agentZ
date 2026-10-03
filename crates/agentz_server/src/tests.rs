@@ -9,13 +9,14 @@ use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, ThreadDiff};
 use agentz_protocol::thread::{Entry, ThreadView};
+use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, PROTOCOL_VERSION,
     Request, Response, ServerMessage, ServerWelcome, ToolCaller, ToolResult, read_message,
     write_message,
 };
 use futures::FutureExt as _;
-use projects::{ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId};
+use projects::{ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, WorkspaceKind};
 use registry::AgentCommand;
 use serde_json::{Value, json};
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
@@ -205,6 +206,7 @@ impl TestClient {
             .ok(Request::CreateThread {
                 project_id,
                 agent_id: AgentId::new("mock"),
+                workspace: Default::default(),
             })
             .await
         {
@@ -482,6 +484,7 @@ impl TestClient {
             .ok(Request::CreateThread {
                 project_id,
                 agent_id: AgentId::new("mock"),
+                workspace: Default::default(),
             })
             .await
         {
@@ -1415,4 +1418,220 @@ async fn turns_are_checkpointed_for_diffs() {
     })
     .await
     .expect("the checkpoints are removed");
+}
+
+async fn wait_for_file(path: &std::path::Path) {
+    tokio::time::timeout(TIMEOUT, async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} never appeared", path.display()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_work_in_worktrees_and_pastures() {
+    if tokio::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let repository = server.project_dir.path();
+    git(repository, &["init", "-q", "-b", "main"]).await;
+    git(repository, &["config", "user.name", "Test"]).await;
+    git(repository, &["config", "user.email", "test@example.com"]).await;
+    std::fs::write(repository.join("README.md"), "one\n").expect("a file");
+    git(repository, &["add", "."]).await;
+    git(repository, &["commit", "-q", "-m", "first"]).await;
+
+    let mut client = server.connect().await;
+    assert!(
+        client
+            .welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == agentz_protocol::CAPABILITY_WORKSPACES)
+    );
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(repository).await;
+    let Response::ProjectGit(project_git) = client.ok(Request::ProjectGit(project_id)).await else {
+        panic!("expected the project's git");
+    };
+    assert!(project_git.is_repository);
+    assert_eq!(project_git.branch.as_deref(), Some("main"));
+    assert_eq!(project_git.branches, vec!["main".to_string()]);
+
+    // A new thread in a new worktree works there, and its turns are checkpointed there.
+    let Response::ThreadCreated(thread) = client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: AgentId::new("mock"),
+            workspace: WorkspaceChoice::New {
+                kind: WorkspaceKind::Worktree,
+                base: None,
+                branch: Some("feature".into()),
+            },
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let worktree = client
+        .project_thread(thread)
+        .and_then(|thread| thread.workspace.clone())
+        .expect("the thread works in a workspace");
+    assert!(worktree.ends_with("feature"), "{}", worktree.display());
+    client.wait_until_ready(thread).await;
+    client.prompt_and_wait(thread, "write a.txt hi").await;
+    assert!(worktree.join("a.txt").exists());
+    assert!(!repository.join("a.txt").exists());
+    let diff = client.thread_diff(thread, DiffScope::All).await;
+    assert_eq!(diff_files(&diff), vec![("a.txt", FileChange::Added, 1, 0)]);
+
+    let status = client
+        .tool(thread, "agentz_workspace_status", json!({}))
+        .await;
+    assert_eq!(status["kind"], json!("worktree"));
+    assert_eq!(status["branch"], json!("feature"));
+    assert_eq!(status["baseRef"], json!("main"));
+    let list = client
+        .tool(thread, "agentz_workspace_list", json!({}))
+        .await;
+    assert_eq!(list["workspaces"][0]["threadIds"], json!([thread.0]));
+    let feature = list["branches"]
+        .as_array()
+        .and_then(|branches| branches.iter().find(|branch| branch["name"] == "feature"))
+        .expect("the worktree's branch is listed");
+    assert_eq!(feature["checkouts"][0]["kind"], json!("worktree"));
+
+    // A delegated task works where its parent does unless told otherwise; this one gets a
+    // worktree of its own, made before the call is answered.
+    let delegated = client
+        .tool(
+            thread,
+            "delegate_task",
+            json!({"task": "write b.txt hi", "workspaceStrategy": {"type": "worktree", "branch": "task"}}),
+        )
+        .await;
+    let task = ThreadId(delegated["taskId"].as_u64().expect("a task id"));
+    let task_folder = client
+        .project_thread(task)
+        .and_then(|thread| thread.workspace.clone())
+        .expect("the task works in a workspace");
+    assert!(task_folder.ends_with("task"), "{}", task_folder.display());
+    wait_for_file(&task_folder.join("b.txt")).await;
+    // A launched thread can join an existing worktree.
+    let launched = client
+        .tool(
+            thread,
+            "agentz_thread_launch",
+            json!({"workspaceStrategy": {"type": "existing", "path": worktree}}),
+        )
+        .await;
+    let launched = ThreadId(launched["threadId"].as_u64().expect("a thread id"));
+    assert_eq!(
+        client
+            .project_thread(launched)
+            .and_then(|thread| thread.workspace.clone()),
+        Some(worktree.clone())
+    );
+
+    // Removing asks first when work would be lost.
+    let Response::WorkspaceRemoval(removal) = client
+        .ok(Request::RemoveWorkspace {
+            project_id,
+            path: worktree.clone(),
+            force: false,
+        })
+        .await
+    else {
+        panic!("expected a removal");
+    };
+    assert!(matches!(removal, WorkspaceRemoval::NeedsConfirmation(_)));
+    let Response::WorkspaceRemoval(removal) = client
+        .ok(Request::RemoveWorkspace {
+            project_id,
+            path: worktree.clone(),
+            force: true,
+        })
+        .await
+    else {
+        panic!("expected a removal");
+    };
+    assert_eq!(removal, WorkspaceRemoval::Removed);
+    assert!(!worktree.exists());
+    assert!(
+        client.projects.as_ref().expect("projects").projects[0]
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.path != worktree)
+    );
+
+    // A thread in the checkout hands itself off, and its continuation runs in the new folder.
+    let root_thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(root_thread).await;
+    let handoff = client
+        .tool(
+            root_thread,
+            "agentz_workspace_handoff",
+            json!({"type": "worktree", "branch": "moved", "continuationPrompt": "write c.txt hi"}),
+        )
+        .await;
+    let moved = PathBuf::from(handoff["workspacePath"].as_str().expect("a path"));
+    wait_for_file(&moved.join("c.txt")).await;
+    assert!(!repository.join("c.txt").exists());
+    let again = client
+        .call_tool(
+            ToolCaller::Thread(root_thread),
+            "agentz_workspace_handoff",
+            json!({"type": "worktree"}),
+        )
+        .await;
+    assert_eq!(again.value["code"], json!("already_in_workspace"));
+
+    if cfg!(target_os = "macos") {
+        let Response::ThreadCreated(pasture_thread) = client
+            .ok(Request::CreateThread {
+                project_id,
+                agent_id: AgentId::new("mock"),
+                workspace: WorkspaceChoice::New {
+                    kind: WorkspaceKind::Pasture,
+                    base: None,
+                    branch: Some("grazing".into()),
+                },
+            })
+            .await
+        else {
+            panic!("expected a thread");
+        };
+        let pasture = client
+            .project_thread(pasture_thread)
+            .and_then(|thread| thread.workspace.clone())
+            .expect("the thread works in a pasture");
+        assert!(pasture.join("README.md").exists());
+        let brought = client
+            .tool(pasture_thread, "agentz_workspace_bring_back", json!({}))
+            .await;
+        assert!(
+            brought["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("grazing")),
+            "{brought}"
+        );
+        assert!(
+            git(repository, &["branch", "--list", "grazing"])
+                .await
+                .contains("grazing")
+        );
+    }
 }

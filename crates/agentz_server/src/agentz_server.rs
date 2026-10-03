@@ -8,7 +8,9 @@
 mod agent_settings;
 mod checkpoints;
 mod connection;
+mod git;
 mod server;
+mod workspaces;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -88,7 +90,10 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
         server_version: config.version.clone(),
         machine,
         pid: std::process::id(),
-        capabilities: vec![agentz_protocol::CAPABILITY_THREAD_DIFF.to_string()],
+        capabilities: vec![
+            agentz_protocol::CAPABILITY_THREAD_DIFF.to_string(),
+            agentz_protocol::CAPABILITY_WORKSPACES.to_string(),
+        ],
         error: None,
     };
     let (inputs, inbox) = mpsc::unbounded();

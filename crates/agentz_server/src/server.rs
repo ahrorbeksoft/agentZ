@@ -1,8 +1,10 @@
 //! The state the server owns, and how requests and background results change it.
 
 mod tools;
+mod workspace_requests;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -56,6 +58,8 @@ pub(crate) enum Input {
         id: u64,
         result: Result<Response, ErrorResponse>,
     },
+    /// Background work's result, applied to the server's state.
+    Run(Box<dyn FnOnce(&mut Server) + Send>),
     Shutdown,
 }
 
@@ -86,11 +90,15 @@ pub(crate) struct Server {
     runtime: tokio::runtime::Handle,
     inputs: mpsc::UnboundedSender<Input>,
     machine: MachineInfo,
+    data_dir: PathBuf,
     custom_agents: BTreeMap<AgentId, CustomAgent>,
     agent_control: Option<AgentControl>,
     /// The MCP bridges' credentials, each given to one thread's agent. Dropped with the agent.
     tool_sessions: HashMap<String, ThreadId>,
     follow_ups: HashMap<ThreadId, VecDeque<FollowUp>>,
+    /// Threads handed off to a new workspace, with their continuation prompts, whose agents
+    /// restart there once their turn ends.
+    moving_threads: HashMap<ThreadId, Option<String>>,
     /// Tool calls waiting for a thread, answered as soon as it's ready or their time is up.
     pending_tool_calls: Vec<PendingToolCall>,
     tool_results: ToolResults,
@@ -137,10 +145,12 @@ impl Server {
             runtime,
             inputs,
             machine,
+            data_dir,
             custom_agents: config.custom_agents,
             agent_control: config.agent_control,
             tool_sessions: HashMap::default(),
             follow_ups: HashMap::default(),
+            moving_threads: HashMap::default(),
             pending_tool_calls: Vec::new(),
             tool_results: ToolResults::default(),
             projects_revision_sent: projects.revision(),
@@ -227,6 +237,17 @@ impl Server {
             Input::Respond { client, id, result } => {
                 self.send(client, ServerMessage::Response { id, result })
             }
+            Input::Run(then) => then(self),
+            Input::Request {
+                client,
+                id,
+                request:
+                    request @ (Request::CreateThread { .. }
+                    | Request::ProjectGit(_)
+                    | Request::RemoveWorkspace { .. }
+                    | Request::SyncWorkspace { .. }
+                    | Request::BringBackWorkspace { .. }),
+            } => self.workspace_request(client, id, request),
             Input::Request {
                 client,
                 id,
@@ -331,22 +352,6 @@ impl Server {
                 Ok(Response::Ok)
             }
 
-            Request::CreateThread {
-                project_id,
-                agent_id,
-            } => {
-                let thread_id = self
-                    .projects
-                    .add_thread(
-                        project_id,
-                        projects::NEW_THREAD_TITLE,
-                        Some(agent_id.0.to_string()),
-                    )
-                    .context("no such project")?;
-                // Started now, so the agent is ready by the time the user has typed a prompt.
-                self.update_thread(ConnectionId::Thread(thread_id), |_| {})?;
-                Ok(Response::ThreadCreated(thread_id))
-            }
             Request::RenameThread { thread_id, title } => {
                 self.existing_thread(thread_id)?;
                 self.projects.set_custom_title(thread_id, title);
@@ -528,9 +533,17 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::ListTools => Ok(Response::Tools(tools::definitions())),
-            // Handled by `call_tool` and `thread_diff`, since they may answer later.
+            // Handled by `call_tool`, `thread_diff` and `workspace_request`, since they may answer
+            // later.
             Request::CallTool { .. } => Err(anyhow!("tool calls are handled separately")),
             Request::ThreadDiff { .. } => Err(anyhow!("diffs are handled separately")),
+            Request::CreateThread { .. }
+            | Request::ProjectGit(_)
+            | Request::RemoveWorkspace { .. }
+            | Request::SyncWorkspace { .. }
+            | Request::BringBackWorkspace { .. } => {
+                Err(anyhow!("workspace requests are handled separately"))
+            }
             Request::Unknown(request) => Err(anyhow!("unsupported request: {request}")),
         }
     }
@@ -541,15 +554,37 @@ impl Server {
             .context("the client disconnected")
     }
 
-    /// The thread's checkpoints, in its project's folder.
+    /// The thread's checkpoints, in the folder it works in.
     fn checkpoints(&self, thread_id: ThreadId) -> Option<Checkpoints> {
-        let thread = self.projects.thread(thread_id)?;
-        let project = self.projects.project(thread.project_id)?;
         Some(Checkpoints::new(
-            project.path.clone(),
+            self.projects.thread_folder(thread_id)?,
             &self.machine.id,
             thread_id,
         ))
+    }
+
+    /// Runs `work` off the server's task, then `then` with its result on it.
+    fn spawn_then<T: Send + 'static>(
+        &self,
+        work: impl Future<Output = T> + Send + 'static,
+        then: impl FnOnce(&mut Server, T) + Send + 'static,
+    ) {
+        let inputs = self.inputs.clone();
+        self.runtime.spawn(async move {
+            let result = work.await;
+            inputs
+                .unbounded_send(Input::Run(Box::new(move |server| then(server, result))))
+                .ok();
+        });
+    }
+
+    /// Answers a request, after sending what it changed.
+    fn respond(&mut self, client: ClientId, id: u64, result: Result<Response>) {
+        let result = result.map_err(|error| ErrorResponse {
+            message: format!("{error:#}"),
+        });
+        self.send_changes();
+        self.send(client, ServerMessage::Response { id, result });
     }
 
     fn delete_checkpoints(&self, threads: Vec<ThreadId>) {
@@ -630,10 +665,8 @@ impl Server {
         let thread = self.projects.thread(thread_id).context("no such thread")?;
         let cwd = self
             .projects
-            .project(thread.project_id)
-            .context("no such project")?
-            .path
-            .clone();
+            .thread_folder(thread_id)
+            .context("no such project")?;
         // Older builds saved a session for every new thread, even before its first prompt. An
         // untitled thread never got one, so the agent has nothing to load.
         let never_prompted = !thread.has_custom_title && thread.title == projects::NEW_THREAD_TITLE;
@@ -855,6 +888,7 @@ impl Server {
         let threads = &self.threads;
         self.tool_sessions
             .retain(|_, thread_id| threads.contains_key(thread_id));
+        self.move_threads();
         self.finish_tasks();
         let answers = self.answer_waiting_tool_calls();
         self.announce_finished_tasks();
