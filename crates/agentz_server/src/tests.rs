@@ -2861,6 +2861,25 @@ async fn a_drawer_holds_several_terminals() {
         vec![1, 2, 3]
     );
 
+    // What runs in front of a drawer terminal's shell is reported, for the hidden drawer's
+    // indicator.
+    let running = move |client: &TestClient| {
+        client
+            .projects
+            .as_ref()
+            .map(|projects| projects.drawer_commands.clone())
+            .unwrap_or_default()
+    };
+    let third = TerminalKey::drawer(thread_id, 3);
+    client.type_into(&third, "sleep 30\n").await;
+    client
+        .wait_until(move |client| running(client) == vec![(thread_id, 3, "sleep".to_string())])
+        .await;
+    client.type_into(&third, "\x03").await;
+    client
+        .wait_until(move |client| running(client).is_empty())
+        .await;
+
     client
         .ok(Request::CloseTerminal(TerminalKey::drawer(thread_id, 2)))
         .await;

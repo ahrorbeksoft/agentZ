@@ -1009,19 +1009,51 @@ impl AgentView {
                     .color(Color::Muted),
             )
             .child(div().flex_1())
-            .child(
-                IconButton::new("toggle-terminal-drawer", IconName::Terminal)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.is_drawer_open)
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action("Toggle Terminal", &ToggleTerminalDrawer, cx)
+            .child({
+                // With the drawer hidden, a dot says something still runs in its terminals.
+                let running: Vec<String> = if self.is_drawer_open {
+                    Vec::new()
+                } else {
+                    self.client
+                        .read(cx)
+                        .projects()
+                        .read(cx)
+                        .drawer_commands(self.thread_id)
+                        .map(|(_, command)| command.to_string())
+                        .collect()
+                };
+                let tooltip: SharedString = match running.as_slice() {
+                    [] => "Toggle Terminal".into(),
+                    [command] => format!("Toggle Terminal · {command} running").into(),
+                    commands => format!("Toggle Terminal · {} running", commands.join(", ")).into(),
+                };
+                div()
+                    .relative()
+                    .child(
+                        IconButton::new("toggle-terminal-drawer", IconName::Terminal)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(self.is_drawer_open)
+                            .tooltip(move |_, cx| {
+                                Tooltip::for_action(tooltip.clone(), &ToggleTerminalDrawer, cx)
+                            })
+                            // Directly: dispatched, the action would start wherever focus is,
+                            // which may be outside this view.
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
+                            })),
+                    )
+                    .when(!running.is_empty(), |button| {
+                        button.child(
+                            div()
+                                .absolute()
+                                .top(px(3.))
+                                .right(px(3.))
+                                .size_1p5()
+                                .rounded_full()
+                                .bg(Color::Accent.color(cx)),
+                        )
                     })
-                    // Directly: dispatched, the action would start wherever focus is, which may
-                    // be outside this view.
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
-                    })),
-            )
+            })
             .child(
                 IconButton::new("toggle-diff", IconName::Diff)
                     .icon_size(IconSize::Small)

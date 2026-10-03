@@ -749,3 +749,6 @@ Then the server:
   right once there are two, close by the trash button or the row's X, a shell that exits
   closes its terminal. Terminals still running are found again after an app restart.
   (Docking the panels by drag was started and dropped at the user's request.)
+- 2026-10-03: Terminals: Cmd-+/Cmd--/Cmd-0 size their font (saved); with a thread's drawer
+  hidden, a dot on its terminal button says something runs in it (the server watches drawer
+  terminals' foreground and sends `drawer_commands`).

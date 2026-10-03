@@ -302,9 +302,11 @@ impl Server {
                 self.projects.set_terminal_folder(*thread_id, None);
             }
             TerminalKey::Pane(pane) => self.spaces.set_pane_agent(*pane, None),
-            TerminalKey::Drawer(_)
-            | TerminalKey::DrawerTerminal { .. }
-            | TerminalKey::Agent { .. } => {}
+            TerminalKey::Drawer(thread_id) => self.projects.set_drawer_command(*thread_id, 1, None),
+            TerminalKey::DrawerTerminal { thread_id, number } => {
+                self.projects.set_drawer_command(*thread_id, *number, None)
+            }
+            TerminalKey::Agent { .. } => {}
         }
         for client in self.clients.values_mut() {
             if client.terminals.remove(key).is_some() {
@@ -375,13 +377,33 @@ impl Server {
         self.terminals.detection_scheduled = false;
         let now = Instant::now();
         let mut published = Vec::new();
-        // Terminal threads whose foreground changed, and the program now there unless it's
-        // the shell.
-        let mut foregrounds = Vec::new();
+        // Terminal threads' and drawer terminals' whose foreground changed, and the program
+        // now there unless it's the shell.
+        let mut foregrounds: Vec<(TerminalKey, Option<String>)> = Vec::new();
         // Terminal threads whose foreground moved to another folder.
         let mut folders = Vec::new();
         let mut next_tick: Option<Duration> = None;
         for (key, running) in &mut self.terminals.running {
+            // A drawer's terminals aren't watched for agents, only for what runs in them.
+            if matches!(
+                key,
+                TerminalKey::Drawer(_) | TerminalKey::DrawerTerminal { .. }
+            ) {
+                let group = if running.terminal.exit().is_some() {
+                    None
+                } else {
+                    running.terminal.foreground_process_group_id()
+                };
+                if group != running.foreground_group {
+                    running.foreground_group = group;
+                    foregrounds.push((key.clone(), foreground_program(group)));
+                }
+                if running.terminal.exit().is_none() {
+                    let tick = detect::TICK_NO_AGENT;
+                    next_tick = Some(next_tick.map_or(tick, |next| next.min(tick)));
+                }
+                continue;
+            }
             let Some(tracker) = &mut running.tracker else {
                 continue;
             };
@@ -389,24 +411,20 @@ impl Server {
                 if let Some(state) = tracker.exited() {
                     published.push((key.clone(), None, state));
                 }
-                if let TerminalKey::Thread(thread_id) = key
+                if let TerminalKey::Thread(_) = key
                     && running.foreground_group.take().is_some()
                 {
-                    foregrounds.push((*thread_id, None));
+                    foregrounds.push((key.clone(), None));
                 }
                 continue;
             }
             let mut update = None;
             let process_group_id = running.terminal.foreground_process_group_id();
-            if let TerminalKey::Thread(thread_id) = key
+            if let TerminalKey::Thread(_) = key
                 && process_group_id != running.foreground_group
             {
                 running.foreground_group = process_group_id;
-                let program = process_group_id
-                    .and_then(detect::process::group_leader)
-                    .filter(|leader| !detect::is_shell(leader))
-                    .map(|leader| leader.argv0.unwrap_or(leader.name));
-                foregrounds.push((*thread_id, program));
+                foregrounds.push((key.clone(), foreground_program(process_group_id)));
             }
             // The group's leader is the shell, or a program it started, which works where
             // the shell is.
@@ -455,15 +473,26 @@ impl Server {
             let tick = tracker.next_tick();
             next_tick = Some(next_tick.map_or(tick, |next| next.min(tick)));
         }
-        for (thread_id, program) in foregrounds {
-            // A thread started with a command runs it until it exits, whatever its shell
-            // shows in front.
-            let command = self
-                .projects
-                .thread(thread_id)
-                .and_then(|thread| thread.terminal.as_ref()?.command.clone());
-            self.projects
-                .set_terminal_command(thread_id, command.or(program));
+        for (key, program) in foregrounds {
+            match key {
+                TerminalKey::Thread(thread_id) => {
+                    // A thread started with a command runs it until it exits, whatever its
+                    // shell shows in front.
+                    let command = self
+                        .projects
+                        .thread(thread_id)
+                        .and_then(|thread| thread.terminal.as_ref()?.command.clone());
+                    self.projects
+                        .set_terminal_command(thread_id, command.or(program));
+                }
+                TerminalKey::Drawer(thread_id) => {
+                    self.projects.set_drawer_command(thread_id, 1, program)
+                }
+                TerminalKey::DrawerTerminal { thread_id, number } => {
+                    self.projects.set_drawer_command(thread_id, number, program)
+                }
+                TerminalKey::Agent { .. } | TerminalKey::Pane(_) => {}
+            }
         }
         for (thread_id, folder) in folders {
             self.refresh_terminal_folder(thread_id, folder.clone());
@@ -854,4 +883,12 @@ fn home_relative(path: &Path) -> String {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
     }
+}
+
+/// The program leading a terminal's foreground, unless that's the shell itself.
+fn foreground_program(group: Option<u32>) -> Option<String> {
+    group
+        .and_then(detect::process::group_leader)
+        .filter(|leader| !detect::is_shell(leader))
+        .map(|leader| leader.argv0.unwrap_or(leader.name))
 }

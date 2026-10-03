@@ -305,6 +305,9 @@ pub struct ProjectsSnapshot {
     pub terminal_commands: Vec<(ThreadId, String)>,
     /// Where each terminal thread's foreground process is.
     pub terminal_folders: Vec<(ThreadId, TerminalFolder)>,
+    /// Drawer terminals running a program in front of their shell: thread, terminal number,
+    /// program.
+    pub drawer_commands: Vec<(ThreadId, u32, String)>,
 }
 
 /// The folder a terminal's foreground process works in, and its git branch.
@@ -357,6 +360,8 @@ pub struct ProjectStore {
     terminal_commands: BTreeMap<ThreadId, String>,
     /// Where terminal threads' foreground processes are. Not persisted either.
     terminal_folders: BTreeMap<ThreadId, TerminalFolder>,
+    /// Drawer terminals running a program in front of their shell. Not persisted either.
+    drawer_commands: BTreeMap<(ThreadId, u32), String>,
     /// Counts changes, so the owner can tell whether a call changed anything.
     revision: u64,
     saver: Option<Saver<PersistedState>>,
@@ -387,6 +392,7 @@ impl ProjectStore {
             terminal_agents: BTreeMap::new(),
             terminal_commands: BTreeMap::new(),
             terminal_folders: BTreeMap::new(),
+            drawer_commands: BTreeMap::new(),
             revision: 0,
             saver: state_path.map(|path| Saver::new(path, "projects-saver")),
         };
@@ -602,6 +608,8 @@ impl ProjectStore {
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_folders
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
+        self.drawer_commands
+            .retain(|(thread_id, _), _| threads.iter().any(|thread| thread.id == *thread_id));
         if self.scope == ProjectScope::Project(id) {
             self.scope = ProjectScope::All;
         }
@@ -781,6 +789,8 @@ impl ProjectStore {
                 self.terminal_agents.remove(&id);
                 self.terminal_commands.remove(&id);
                 self.terminal_folders.remove(&id);
+                self.drawer_commands
+                    .retain(|(thread_id, _), _| *thread_id != id);
             }
             self.changed();
         }
@@ -993,6 +1003,27 @@ impl ProjectStore {
         }
     }
 
+    /// The thread's drawer terminals running a program in front of their shell, by number.
+    pub fn drawer_commands(&self, id: ThreadId) -> impl Iterator<Item = (u32, &str)> {
+        self.drawer_commands
+            .range((id, 0)..=(id, u32::MAX))
+            .map(|((_, number), command)| (*number, command.as_str()))
+    }
+
+    /// Records the program a drawer terminal runs in front of its shell, or that the shell is.
+    pub fn set_drawer_command(&mut self, id: ThreadId, number: u32, command: Option<String>) {
+        let changed = match command {
+            Some(command) if self.thread(id).is_some() => {
+                self.drawer_commands.insert((id, number), command.clone()) != Some(command)
+            }
+            Some(_) => false,
+            None => self.drawer_commands.remove(&(id, number)).is_some(),
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
     /// Where a terminal thread's foreground process is, if known.
     pub fn terminal_folder(&self, id: ThreadId) -> Option<&TerminalFolder> {
         self.terminal_folders.get(&id)
@@ -1053,6 +1084,11 @@ impl ProjectStore {
                 .iter()
                 .map(|(id, folder)| (*id, folder.clone()))
                 .collect(),
+            drawer_commands: self
+                .drawer_commands
+                .iter()
+                .map(|((id, number), command)| (*id, *number, command.clone()))
+                .collect(),
         }
     }
 
@@ -1074,6 +1110,11 @@ impl ProjectStore {
         this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
         this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
         this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
+        this.drawer_commands = snapshot
+            .drawer_commands
+            .into_iter()
+            .map(|(id, number, command)| ((id, number), command))
+            .collect();
         this
     }
 
