@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agentz_client::Connection;
+use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{ClientKind, ConnectionId, Event, Request, Response};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
@@ -17,6 +18,7 @@ use ui::SharedString;
 use crate::app_settings::AppSettingsStore;
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
+use crate::terminal_entity::Terminal;
 use crate::thread_entity::AgentThread;
 
 const MIN_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -36,6 +38,8 @@ pub struct ServerClient {
     status: ServerStatus,
     /// Open threads and account connections, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
+    /// Terminals a view shows, which get the server's frames.
+    terminals: HashMap<TerminalKey, WeakEntity<Terminal>>,
     /// Session events that arrived while the session snapshot was on its way.
     queued_session_events: Option<Vec<Event>>,
     _maintain_connection: Task<()>,
@@ -50,6 +54,7 @@ pub fn init(cx: &mut App) {
         connection: None,
         status: ServerStatus::Connecting,
         threads: HashMap::default(),
+        terminals: HashMap::default(),
         queued_session_events: None,
         _maintain_connection: cx.spawn(async move |this, cx| maintain_connection(this, cx).await),
     });
@@ -115,6 +120,17 @@ impl ServerClient {
         self.threads.insert(connection, thread);
     }
 
+    /// The terminal's copy, if a view still holds it.
+    pub(crate) fn terminal(&self, key: &TerminalKey) -> Option<Entity<Terminal>> {
+        self.terminals.get(key)?.upgrade()
+    }
+
+    pub(crate) fn register_terminal(&mut self, key: TerminalKey, terminal: WeakEntity<Terminal>) {
+        self.terminals
+            .retain(|_, terminal| terminal.upgrade().is_some());
+        self.terminals.insert(key, terminal);
+    }
+
     fn connected(&mut self, connection: Connection, cx: &mut Context<Self>) {
         log::info!(
             "connected to agentz-server {} (pid {})",
@@ -129,10 +145,18 @@ impl ServerClient {
             .values()
             .filter_map(|thread| thread.upgrade())
             .collect();
+        let terminals: Vec<_> = self
+            .terminals
+            .values()
+            .filter_map(|terminal| terminal.upgrade())
+            .collect();
         // Deferred: the threads read this client, which is being updated.
         cx.defer(move |cx| {
             for thread in threads {
                 thread.update(cx, |thread, cx| thread.reconnected(cx));
+            }
+            for terminal in terminals {
+                terminal.update(cx, |terminal, cx| terminal.reconnected(cx));
             }
         });
         cx.notify();
@@ -199,7 +223,16 @@ impl ServerClient {
                     thread.update(cx, |thread, cx| thread.closed(cx));
                 }
             }
-            Event::TerminalFrame { .. } | Event::TerminalClosed(_) => {}
+            Event::TerminalFrame { terminal, frame } => {
+                if let Some(terminal) = self.terminal(&terminal) {
+                    terminal.update(cx, |terminal, cx| terminal.apply_frame(frame, cx));
+                }
+            }
+            Event::TerminalClosed(key) => {
+                if let Some(terminal) = self.terminal(&key) {
+                    terminal.update(cx, |terminal, cx| terminal.closed(cx));
+                }
+            }
             Event::Unknown(event) => log::warn!("unknown event from the server: {event}"),
         }
     }

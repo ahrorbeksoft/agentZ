@@ -118,6 +118,9 @@ impl TerminalStyle {
     pub const HIDDEN: u16 = 1 << 7;
     /// A run of one double-width character, which covers two columns.
     pub const WIDE: u16 = 1 << 8;
+    /// A run of one character followed by the zero-width characters that combine with it,
+    /// which covers one column, or two with [`Self::WIDE`].
+    pub const COMBINING: u16 = 1 << 9;
 
     pub fn has(&self, flag: u16) -> bool {
         self.flags & flag != 0
@@ -260,6 +263,8 @@ pub enum TerminalInput {
     /// Starts or extends a selection; `None` clears it.
     Select(Option<TerminalSelectionUpdate>),
     SelectAll,
+    /// Clears the history and the screen but for the cursor's line, which moves to the top.
+    Clear,
     /// Whether the terminal has keyboard focus, for programs that asked to know.
     Focus(bool),
     /// The client's theme colors, numbered as [`TerminalColor::Named`] numbers them (0–268),
@@ -371,6 +376,8 @@ impl TerminalRun {
     pub fn columns(&self) -> usize {
         if self.style.has(TerminalStyle::WIDE) {
             2
+        } else if self.style.has(TerminalStyle::COMBINING) {
+            1
         } else {
             self.text.chars().count()
         }

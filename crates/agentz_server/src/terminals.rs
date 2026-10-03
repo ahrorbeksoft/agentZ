@@ -23,7 +23,9 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, SEMANTIC_ESCAPE_CHARS, Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{Color as AlacColor, CursorShape as AlacCursorShape, Rgb};
+use alacritty_terminal::vte::ansi::{
+    ClearMode, Color as AlacColor, CursorShape as AlacCursorShape, Handler as _, Rgb,
+};
 use anyhow::{Context as _, Result};
 use futures::channel::oneshot;
 
@@ -385,6 +387,10 @@ impl Terminal {
                 term.selection = Some(selection);
                 true
             }
+            TerminalInput::Clear => {
+                clear(&mut self.term.lock());
+                true
+            }
             TerminalInput::Focus(focused) => {
                 if self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
                     self.write(if focused {
@@ -500,8 +506,10 @@ impl Terminal {
             }
             let mut text = String::new();
             text.push(cell.c);
+            let mut style = style;
             if let Some(zerowidth) = cell.zerowidth() {
                 text.extend(zerowidth);
+                style.flags |= TerminalStyle::COMBINING;
             }
             let run = TerminalRun {
                 column: column as u16,
@@ -635,6 +643,24 @@ fn style_from_cell(cell: &alacritty_terminal::term::cell::Cell) -> TerminalStyle
         foreground: color_from_alacritty(cell.fg),
         background: color_from_alacritty(cell.bg),
         flags,
+    }
+}
+
+/// Zed's `InternalEvent::Clear`: drops the history and the screen, moving the cursor's line to
+/// the top.
+fn clear<T: EventListener>(term: &mut Term<T>) {
+    term.clear_screen(ClearMode::Saved);
+    let cursor = term.grid().cursor.point;
+    term.grid_mut().reset_region(..cursor.line);
+    let columns = term.grid().columns();
+    let line = term.grid()[cursor.line][..Column(columns)].to_vec();
+    for (column, cell) in line.into_iter().enumerate() {
+        term.grid_mut()[Line(0)][Column(column)] = cell;
+    }
+    term.grid_mut().cursor.point = AlacPoint::new(Line(0), cursor.column);
+    let new_cursor = term.grid().cursor.point;
+    if (new_cursor.line.0 as usize) < term.screen_lines().saturating_sub(1) {
+        term.grid_mut().reset_region((new_cursor.line + 1)..);
     }
 }
 

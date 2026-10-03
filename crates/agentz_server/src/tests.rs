@@ -1830,6 +1830,18 @@ async fn terminal_threads_stream_their_screens_to_watchers() {
         Response::Message("selected-word".into())
     );
 
+    // Clearing keeps only the prompt's line.
+    client
+        .ok(Request::TerminalInput {
+            terminal: key.clone(),
+            input: TerminalInput::Clear,
+        })
+        .await;
+    client
+        .wait_until(|client| !client.screen(&key).contains("selected-word"))
+        .await;
+    assert_eq!(client.screen(&key).trim(), "$");
+
     // The drawer under a thread is a shell in the thread's folder.
     let drawer = TerminalKey::Drawer(thread_id);
     client.subscribe_terminal(drawer.clone()).await;

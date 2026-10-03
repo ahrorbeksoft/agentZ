@@ -8,8 +8,7 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 7, terminals, in the app: port Zed's terminal element, then terminal threads,
-the thread terminal drawer and links from tool calls to their terminals.
+**Next:** Phase 8, terminal agent detection: port herdr's manifests and matcher.
 
 | Phase | Status |
 |---|---|
@@ -20,8 +19,8 @@ the thread terminal drawer and links from tool calls to their terminals.
 | 4. Subthreads | Done |
 | 5. Diffs | Done |
 | 6. Worktrees and pastures | Done |
-| 7. Terminals | In progress |
-| 8. Terminal agent detection | Not started |
+| 7. Terminals | Done |
+| 8. Terminal agent detection | In progress |
 | 9. Machines over SSH | Not started |
 | 10. Polish | Not started |
 
@@ -198,14 +197,17 @@ Then the server:
       by what owns them (terminal thread, drawer, agent command) and start on demand.
 - [x] Zed's key mappings (`mappings/keys.rs`) in `agentz_protocol::terminal_keys`, shared by the
       app and the terminal tools.
-- [ ] App: port `terminal_element.rs` and `mappings/mouse.rs` without the editor and workspace
-      dependencies.
-- [ ] Terminal threads: thread kind "terminal". New Thread › Terminal: a login shell, or an
-      agent CLI found on that machine's `PATH` (the server side and `TerminalPrograms` are done).
-- [ ] Thread terminal drawer under ACP threads (the server side is done).
+- [x] App: port `terminal_element.rs` and `mappings/mouse.rs` without the editor and workspace
+      dependencies. The app keeps a copy of each subscribed terminal's frame (`terminal_entity`),
+      and the view takes Zed's macOS terminal keymap, IME, mouse reporting, selection, scrolling,
+      Copy, Paste, Select All and Clear.
+- [x] Terminal threads: thread kind "terminal". New Thread › Terminal: a login shell, or an
+      agent CLI found on that machine's `PATH`. The thread view has the terminal's title, its
+      exit status and Restart.
+- [x] Thread terminal drawer under ACP threads: View › Terminal, `cmd-j` or the toolbar button.
 - [x] ACP client `terminal` capability backed by server terminals (Zed's non-interactive shell,
       no pagers, output cut from the start). Tool calls name their terminals.
-- [ ] Tool calls link to their live terminal in the app.
+- [x] Tool calls show their live terminal inline (up to 16 lines), open by default.
 - [x] `agentz_terminal_list`, `_start`, `_send` (text, keys, submit), `_read` (recent or
       visible) and `_wait` (for text or exit), after herdr's `pane` commands. The CLI reaches
       them through `agentz-server call`.

@@ -10,6 +10,11 @@ mod server_client;
 mod settings_page;
 mod shell;
 mod sidebar;
+mod terminal_element;
+mod terminal_entity;
+mod terminal_mouse;
+mod terminal_thread_view;
+mod terminal_view;
 mod thread_entity;
 
 use std::sync::Arc;
@@ -42,6 +47,8 @@ actions!(
         OpenSettings,
         /// Shows or hides the open thread's changes.
         ToggleDiff,
+        /// Opens or closes the terminal under the open thread.
+        ToggleTerminalDrawer,
     ]
 );
 
@@ -98,6 +105,7 @@ fn init_actions(cx: &mut App) {
         KeyBinding::new("secondary-n", NewThread, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-d", ToggleDiff, None),
+        KeyBinding::new("secondary-j", ToggleTerminalDrawer, None),
     ]);
     cx.set_menus([
         Menu::new("agentZ").items([
@@ -110,7 +118,10 @@ fn init_actions(cx: &mut App) {
             MenuItem::action("Open Folder…", OpenFolder),
             MenuItem::action("Switch Project…", ToggleProjectSwitcher),
         ]),
-        Menu::new("View").items([MenuItem::action("Changes", ToggleDiff)]),
+        Menu::new("View").items([
+            MenuItem::action("Changes", ToggleDiff),
+            MenuItem::action("Terminal", ToggleTerminalDrawer),
+        ]),
     ]);
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
@@ -145,6 +156,7 @@ fn main() {
             new_thread_modal::init(cx);
             agent_view::init(cx);
             sidebar::init(cx);
+            terminal_view::init(cx);
             settings_page::init(cx);
             project_store::init(cx);
             project_info::init(cx);

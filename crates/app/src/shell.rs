@@ -21,6 +21,7 @@ use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{ServerClient, ServerStatus};
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
+use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::{NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher};
 
@@ -30,8 +31,52 @@ const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 
 /// An open thread. Kept while the app runs so its agent keeps working in the background.
 struct OpenThread {
-    view: Entity<AgentView>,
-    _subscriptions: [Subscription; 1],
+    view: ThreadView,
+    _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone)]
+enum ThreadView {
+    Agent(Entity<AgentView>),
+    Terminal(Entity<TerminalThreadView>),
+}
+
+impl ThreadView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Agent(view) => view.focus_handle(cx),
+            Self::Terminal(view) => view.focus_handle(cx),
+        }
+    }
+
+    fn set_title(&self, title: SharedString, cx: &mut App) {
+        match self {
+            Self::Agent(view) => view.update(cx, |view, cx| view.set_title(title, cx)),
+            Self::Terminal(view) => view.update(cx, |view, cx| view.set_title(title, cx)),
+        }
+    }
+
+    fn set_archived(&self, is_archived: bool, cx: &mut App) {
+        if let Self::Agent(view) = self {
+            view.update(cx, |view, cx| view.set_archived(is_archived, cx));
+        }
+    }
+
+    fn set_diff_open(&self, is_diff_open: bool, cx: &mut App) {
+        match self {
+            Self::Agent(view) => view.update(cx, |view, cx| view.set_diff_open(is_diff_open, cx)),
+            Self::Terminal(view) => {
+                view.update(cx, |view, cx| view.set_diff_open(is_diff_open, cx))
+            }
+        }
+    }
+
+    fn into_any_element(self) -> AnyElement {
+        match self {
+            Self::Agent(view) => view.into_any_element(),
+            Self::Terminal(view) => view.into_any_element(),
+        }
+    }
 }
 
 pub struct Shell {
@@ -68,7 +113,7 @@ impl Shell {
                 let store = store.read(cx);
                 let is_live = |thread_id: ThreadId| store.thread(thread_id).is_some();
                 this.open_threads.retain(|thread_id, _| is_live(*thread_id));
-                let states: Vec<(Entity<AgentView>, SharedString, bool)> = this
+                let states: Vec<(ThreadView, SharedString, bool)> = this
                     .open_threads
                     .iter()
                     .filter_map(|(thread_id, open_thread)| {
@@ -92,10 +137,8 @@ impl Shell {
                     });
                 }
                 for (view, title, is_archived) in states {
-                    view.update(cx, |view, cx| {
-                        view.set_title(title, cx);
-                        view.set_archived(is_archived, cx);
-                    });
+                    view.set_title(title, cx);
+                    view.set_archived(is_archived, cx);
                 }
                 // Focus was in the closed thread's view. Without moving it here, actions such as
                 // New Thread would be dispatched from the window's root, above the shell's
@@ -241,9 +284,7 @@ impl Shell {
         }
         for (open_thread_id, open_thread) in &self.open_threads {
             let is_diff_open = thread_id == Some(*open_thread_id);
-            open_thread
-                .view
-                .update(cx, |view, cx| view.set_diff_open(is_diff_open, cx));
+            open_thread.view.set_diff_open(is_diff_open, cx);
         }
         cx.notify();
     }
@@ -372,6 +413,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<OpenThread> {
         let thread = self.store.read(cx).thread(thread_id)?.clone();
+        if let Some(command) = thread.terminal.clone() {
+            let title = SharedString::from(thread.title);
+            let view = cx.new(|cx| TerminalThreadView::new(thread_id, title, command, cx));
+            return Some(OpenThread {
+                view: ThreadView::Terminal(view),
+                _subscriptions: Vec::new(),
+            });
+        }
         let agent_id = thread.agent_id.clone().map(AgentId::new);
         let agent_thread = AgentThread::shared(thread_id, cx);
         let title = SharedString::from(thread.title);
@@ -393,8 +442,8 @@ impl Shell {
             },
         );
         Some(OpenThread {
-            view,
-            _subscriptions: [view_subscription],
+            view: ThreadView::Agent(view),
+            _subscriptions: vec![view_subscription],
         })
     }
 
@@ -630,7 +679,7 @@ impl Render for Shell {
                             .bg(main_background)
                             .map(|main| match (settings_page, active_view) {
                                 (Some(page), _) => main.child(page),
-                                (None, Some(view)) => main.child(view),
+                                (None, Some(view)) => main.child(view.into_any_element()),
                                 (None, None) => main.child(render_no_thread_selected()),
                             }),
                     )

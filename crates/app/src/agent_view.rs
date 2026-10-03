@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
 };
@@ -21,10 +22,13 @@ use ui::{
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
-use crate::ToggleDiff;
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
+use crate::terminal_element::TerminalMode;
+use crate::terminal_entity::Terminal;
+use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
+use crate::{ToggleDiff, ToggleTerminalDrawer};
 
 const KEY_CONTEXT: &str = "AgentComposer";
 
@@ -39,6 +43,10 @@ gpui::actions!(
 const MAX_CONTENT_WIDTH: Pixels = px(850.);
 /// Unchanged lines shown around an edit, like a diff editor's context.
 const DIFF_CONTEXT_LINES: usize = 3;
+/// t3code's default drawer height.
+const DRAWER_HEIGHT: Pixels = px(280.);
+/// The most lines of a command's terminal a tool call shows.
+const TOOL_TERMINAL_MAX_LINES: usize = 16;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -97,6 +105,11 @@ pub struct AgentView {
     agents_expanded: bool,
     /// Subthreads at any depth waiting for a permission answer, which is given here (t3code).
     blocked_subthreads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
+    /// The terminal under the thread, while it's open (t3code's drawer).
+    drawer: Option<Entity<TerminalView>>,
+    /// The terminals the agent runs its commands in, by the ids it got, shown in their tool
+    /// calls.
+    tool_terminals: HashMap<String, Entity<TerminalView>>,
     _subscriptions: Vec<Subscription>,
     _elapsed_refresh: Task<()>,
 }
@@ -172,6 +185,8 @@ impl AgentView {
             command_menu_dismissed_for: None,
             agents_expanded: true,
             blocked_subthreads: HashMap::default(),
+            drawer: None,
+            tool_terminals: HashMap::default(),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
@@ -527,6 +542,88 @@ impl AgentView {
         }
     }
 
+    /// Opens the thread's terminal under it and focuses it, or closes it.
+    fn toggle_terminal_drawer(
+        &mut self,
+        _: &ToggleTerminalDrawer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drawer.take().is_some() {
+            window.focus(&self.focus_handle(cx), cx);
+        } else {
+            let terminal = Terminal::shared(TerminalKey::Drawer(self.thread_id), cx);
+            let drawer = cx.new(|cx| TerminalView::new(terminal, TerminalMode::Scrollable, cx));
+            window.focus(&drawer.focus_handle(cx), cx);
+            self.drawer = Some(drawer);
+        }
+        cx.notify();
+    }
+
+    fn render_drawer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let drawer = self.drawer.clone()?;
+        let terminal = drawer.read(cx).terminal().clone();
+        let exit = terminal
+            .read(cx)
+            .frame()
+            .and_then(|frame| frame.exited.clone());
+        let colors = cx.theme().colors();
+        Some(
+            v_flex()
+                .h(DRAWER_HEIGHT)
+                .flex_none()
+                .border_t_1()
+                .border_color(colors.border)
+                .bg(colors.terminal_background)
+                .child(
+                    h_flex()
+                        .h(px(28.))
+                        .flex_none()
+                        .px_2()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::Terminal)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("Terminal")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .children(exit.map(|exit| {
+                            Label::new(match exit.code {
+                                Some(code) if code != 0 => format!("Exited with code {code}"),
+                                _ => "Exited".to_string(),
+                            })
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                        }))
+                        .child(div().flex_1())
+                        .child(
+                            IconButton::new("restart-drawer", IconName::RotateCw)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Restart Terminal"))
+                                .on_click(move |_, _, cx| {
+                                    terminal.update(cx, |terminal, cx| terminal.restart(cx))
+                                }),
+                        )
+                        .child(
+                            IconButton::new("close-drawer", IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(|_, cx| {
+                                    Tooltip::for_action("Close Terminal", &ToggleTerminalDrawer, cx)
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
+                                })),
+                        ),
+                )
+                .child(div().flex_1().min_h_0().pb_1().child(drawer))
+                .into_any_element(),
+        )
+    }
+
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
         if self.title != title {
             self.title = title;
@@ -552,6 +649,27 @@ impl AgentView {
                     }
                     if let Some(raw_input) = &tool_call.raw_input {
                         self.sync_markdown((index, RAW_INPUT_PART), raw_input, cx);
+                    }
+                    for terminal_id in &tool_call.terminals {
+                        if !self.tool_terminals.contains_key(terminal_id) {
+                            let terminal = Terminal::shared(
+                                TerminalKey::Agent {
+                                    thread_id: self.thread_id,
+                                    terminal_id: terminal_id.clone(),
+                                },
+                                cx,
+                            );
+                            let view = cx.new(|cx| {
+                                TerminalView::new(
+                                    terminal,
+                                    TerminalMode::Inline {
+                                        max_lines: TOOL_TERMINAL_MAX_LINES,
+                                    },
+                                    cx,
+                                )
+                            });
+                            self.tool_terminals.insert(terminal_id.clone(), view);
+                        }
                     }
                 }
                 Entry::Plan => {}
@@ -863,6 +981,17 @@ impl AgentView {
                     .color(Color::Muted),
             )
             .child(div().flex_1())
+            .child(
+                IconButton::new("toggle-terminal-drawer", IconName::Terminal)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.drawer.is_some())
+                    .tooltip(|_, cx| {
+                        Tooltip::for_action("Toggle Terminal", &ToggleTerminalDrawer, cx)
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleTerminalDrawer), cx)
+                    }),
+            )
             .child(
                 IconButton::new("toggle-diff", IconName::Diff)
                     .icon_size(IconSize::Small)
@@ -1187,11 +1316,13 @@ impl AgentView {
         let should_show_raw_input = !is_terminal_tool && !is_edit;
         let has_content = !tool_call.text.is_empty()
             || !tool_call.diffs.is_empty()
+            || !tool_call.terminals.is_empty()
             || (should_show_raw_input && tool_call.raw_input.is_some());
         let is_collapsible = has_content && !needs_confirmation;
         // Like Zed (with its default `expand_edit_card`), edits start open and everything else
         // starts collapsed; clicking flips that.
-        let open_by_default = is_edit;
+        // A command's live terminal starts open too, as Zed's terminal cards do.
+        let open_by_default = is_edit || !tool_call.terminals.is_empty();
         let is_open = needs_confirmation
             || open_by_default != self.toggled_tool_calls.contains(&tool_call.id);
         let header_group = SharedString::from(format!("tool-call-header-{index}"));
@@ -1335,6 +1466,22 @@ impl AgentView {
             }
             for diff in &tool_call.diffs {
                 output.push(render_diff(diff, cx));
+            }
+            for terminal_id in &tool_call.terminals {
+                if let Some(terminal) = self.tool_terminals.get(terminal_id) {
+                    output.push(
+                        div()
+                            .w_full()
+                            .py_1()
+                            .when(use_card_layout, |this| {
+                                this.border_t_1()
+                                    .border_color(Self::tool_card_border_color(cx))
+                            })
+                            .bg(cx.theme().colors().terminal_background)
+                            .child(terminal.clone())
+                            .into_any_element(),
+                    );
+                }
             }
             for part in 0..tool_call.text.len() {
                 let style = tool_output_style(is_terminal_tool, window, cx);
@@ -2752,6 +2899,7 @@ impl Render for AgentView {
             .when(is_subthread, |this| this.track_focus(&self.focus_handle))
             .size_full()
             .bg(panel_background)
+            .on_action(cx.listener(Self::toggle_terminal_drawer))
             .child(self.render_toolbar(cx))
             .children(self.render_restore_notice(cx))
             .child(
@@ -2814,6 +2962,7 @@ impl Render for AgentView {
                     this.child(self.render_message_editor(cx))
                 }
             })
+            .children(self.render_drawer(cx))
     }
 }
 

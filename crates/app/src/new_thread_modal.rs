@@ -1,5 +1,6 @@
 //! Starting a thread: pick the project (only when all projects are shown), then one of the
-//! installed agents, then for a git repository where it works (t3code's workspace menu): the
+//! installed agents or a terminal (a login shell, or an agent CLI found on the server's `PATH`),
+//! then for a git repository where it works (t3code's workspace menu): the
 //! checkout, a new pasture or worktree, or one of the project's existing ones. Installing
 //! agents lives in Settings › Agents.
 
@@ -7,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::terminal::{TerminalCommand, TerminalProgram};
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -41,6 +43,13 @@ enum Step {
     Workspace(ProjectId),
 }
 
+/// What the thread runs.
+#[derive(Clone, Debug, PartialEq)]
+enum Starter {
+    Agent(AgentId),
+    Terminal(TerminalCommand),
+}
+
 #[derive(Clone)]
 enum WorkspaceRow {
     Checkout,
@@ -61,13 +70,15 @@ pub struct NewThreadModal {
     /// Whether the project was left to pick here, so the agent step can go back to it.
     picks_project: bool,
     project_rows: Vec<ProjectId>,
-    agent_rows: Vec<AgentId>,
+    agent_rows: Vec<Starter>,
     workspace_rows: Vec<WorkspaceRow>,
     selected_index: usize,
     scroll_handle: ScrollHandle,
     /// Set by "New thread in this workspace", which skips the workspace step.
     preset_workspace: Option<PathBuf>,
-    agent: Option<AgentId>,
+    agent: Option<Starter>,
+    /// Agent CLIs New Thread offers to run in a terminal.
+    terminal_programs: Vec<TerminalProgram>,
     /// The project's repository, loaded when its agent step opens.
     git: Option<(ProjectId, ProjectGit)>,
     /// What a new worktree or pasture starts from, when not the checkout's branch.
@@ -129,9 +140,11 @@ impl NewThreadModal {
             base_branch: None,
             creating: None,
             error: None,
+            terminal_programs: Vec::new(),
             _load_git: Task::ready(()),
             _subscriptions: subscriptions,
         };
+        this.load_terminal_programs(cx);
         this.go_to(project_id.map_or(Step::Project, Step::Agent), cx);
         this
     }
@@ -178,7 +191,8 @@ impl NewThreadModal {
             }
             Step::Agent(_) => {
                 let registry = self.registry.read(cx);
-                self.agent_rows = registry
+                let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
+                let agents = registry
                     .agents()
                     .iter()
                     .filter(|agent| {
@@ -187,12 +201,23 @@ impl NewThreadModal {
                                 registry.install_state(agent.id()),
                                 InstallState::Installed { .. }
                             )
-                            && (query.is_empty()
-                                || agent.name().to_lowercase().contains(&query)
-                                || agent.id().0.to_lowercase().contains(&query))
+                            && (matches(agent.name()) || matches(&agent.id().0))
                     })
-                    .map(|agent| agent.id().clone())
-                    .collect();
+                    .map(|agent| Starter::Agent(agent.id().clone()));
+                let shell = matches("terminal shell")
+                    .then(|| Starter::Terminal(TerminalCommand::default()));
+                let programs = self
+                    .terminal_programs
+                    .iter()
+                    .filter(|program| {
+                        matches(&program.label) || matches(&program.command) || matches("terminal")
+                    })
+                    .map(|program| {
+                        Starter::Terminal(TerminalCommand {
+                            command: Some(program.command.clone()),
+                        })
+                    });
+                self.agent_rows = agents.chain(shell).chain(programs).collect();
             }
             Step::Workspace(project_id) => {
                 let store = self.projects.read(cx);
@@ -278,8 +303,8 @@ impl NewThreadModal {
                 }
             }
             Step::Agent(project_id) => {
-                if let Some(agent_id) = self.agent_rows.get(self.selected_index).cloned() {
-                    self.choose_agent(project_id, agent_id, cx);
+                if let Some(starter) = self.agent_rows.get(self.selected_index).cloned() {
+                    self.choose_agent(project_id, starter, cx);
                 }
             }
             Step::Workspace(project_id) => {
@@ -322,9 +347,9 @@ impl NewThreadModal {
                 this.git = Some((project_id, git));
                 if this.step == Step::Workspace(project_id)
                     && !is_repository
-                    && let Some(agent_id) = this.agent.clone()
+                    && let Some(starter) = this.agent.clone()
                 {
-                    this.start_thread(project_id, agent_id, WorkspaceChoice::Checkout, cx);
+                    this.start_thread(project_id, starter, WorkspaceChoice::Checkout, cx);
                 }
                 cx.notify();
             })
@@ -332,9 +357,23 @@ impl NewThreadModal {
         });
     }
 
+    fn load_terminal_programs(&mut self, cx: &mut Context<Self>) {
+        let programs = self.projects.read(cx).terminal_programs(cx);
+        cx.spawn(async move |this, cx| {
+            // An older server runs no terminals, and offers none.
+            let programs = programs.await.unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.terminal_programs = programs;
+                this.update_rows(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Asks where the thread works, unless that's settled: by "New thread in this workspace",
     /// or because the project isn't a git repository.
-    fn choose_agent(&mut self, project_id: ProjectId, agent_id: AgentId, cx: &mut Context<Self>) {
+    fn choose_agent(&mut self, project_id: ProjectId, starter: Starter, cx: &mut Context<Self>) {
         if let Some(path) = self.preset_workspace.clone() {
             let is_checkout = self
                 .projects
@@ -346,7 +385,7 @@ impl NewThreadModal {
             } else {
                 WorkspaceChoice::Existing(path)
             };
-            self.start_thread(project_id, agent_id, choice, cx);
+            self.start_thread(project_id, starter, choice, cx);
             return;
         }
         let is_repository = self
@@ -355,10 +394,10 @@ impl NewThreadModal {
             .filter(|(loaded, _)| *loaded == project_id)
             .map(|(_, git)| git.is_repository);
         if is_repository == Some(false) {
-            self.start_thread(project_id, agent_id, WorkspaceChoice::Checkout, cx);
+            self.start_thread(project_id, starter, WorkspaceChoice::Checkout, cx);
             return;
         }
-        self.agent = Some(agent_id);
+        self.agent = Some(starter);
         self.go_to(Step::Workspace(project_id), cx);
     }
 
@@ -368,7 +407,7 @@ impl NewThreadModal {
         row: WorkspaceRow,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.agent.clone() else {
+        let Some(starter) = self.agent.clone() else {
             return;
         };
         let choice = match row {
@@ -387,7 +426,7 @@ impl NewThreadModal {
             }
             WorkspaceRow::Existing(workspace) => WorkspaceChoice::Existing(workspace.path),
         };
-        self.start_thread(project_id, agent_id, choice, cx);
+        self.start_thread(project_id, starter, choice, cx);
     }
 
     fn pasture_support(&self) -> PastureSupport {
@@ -407,7 +446,7 @@ impl NewThreadModal {
     fn start_thread(
         &mut self,
         project_id: ProjectId,
-        agent_id: AgentId,
+        starter: Starter,
         workspace: WorkspaceChoice,
         cx: &mut Context<Self>,
     ) {
@@ -419,8 +458,11 @@ impl NewThreadModal {
             self.error = None;
             cx.notify();
         }
-        let created = self.projects.update(cx, |projects, cx| {
-            projects.create_thread(project_id, agent_id, workspace, cx)
+        let created = self.projects.update(cx, |projects, cx| match starter {
+            Starter::Agent(agent_id) => projects.create_thread(project_id, agent_id, workspace, cx),
+            Starter::Terminal(command) => {
+                projects.create_terminal_thread(project_id, command, workspace, cx)
+            }
         });
         cx.spawn(async move |this, cx| {
             let created = created.await;
@@ -479,6 +521,70 @@ impl NewThreadModal {
             .into_any_element()
     }
 
+    fn render_starter_row(
+        &self,
+        index: usize,
+        project_id: ProjectId,
+        starter: Starter,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match starter {
+            Starter::Agent(agent_id) => self.render_agent_row(index, project_id, agent_id, cx),
+            Starter::Terminal(command) => self.render_terminal_row(index, project_id, command, cx),
+        }
+    }
+
+    fn render_terminal_row(
+        &self,
+        index: usize,
+        project_id: ProjectId,
+        command: TerminalCommand,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (label, detail): (SharedString, SharedString) = match &command.command {
+            None => ("Terminal".into(), "A login shell".into()),
+            Some(name) => {
+                let label = self
+                    .terminal_programs
+                    .iter()
+                    .find(|program| &program.command == name)
+                    .map_or_else(|| name.clone(), |program| program.label.clone());
+                (label.into(), format!("{name}, in a terminal").into())
+            }
+        };
+        let id = SharedString::from(format!(
+            "new-thread-terminal-{}",
+            command.command.as_deref().unwrap_or("shell")
+        ));
+        ListItem::new(id)
+            .inset(true)
+            .spacing(ListItemSpacing::Sparse)
+            .toggle_state(index == self.selected_index)
+            .start_slot(
+                Icon::new(IconName::Terminal)
+                    .color(Color::Muted)
+                    .size(IconSize::Small),
+            )
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .child(div().flex_none().child(Label::new(label)))
+                    .child(
+                        div().min_w_0().child(
+                            Label::new(detail)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.choose_agent(project_id, Starter::Terminal(command.clone()), cx)
+            }))
+            .into_any_element()
+    }
+
     fn render_agent_row(
         &self,
         index: usize,
@@ -512,9 +618,9 @@ impl NewThreadModal {
                 .size(LabelSize::Small)
                 .color(Color::Muted)
         }))
-        .on_click(
-            cx.listener(move |this, _, _, cx| this.choose_agent(project_id, agent_id.clone(), cx)),
-        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.choose_agent(project_id, Starter::Agent(agent_id.clone()), cx)
+        }))
         .into_any_element()
     }
 
@@ -791,7 +897,7 @@ impl Render for NewThreadModal {
                 .clone()
                 .into_iter()
                 .enumerate()
-                .map(|(index, agent_id)| self.render_agent_row(index, project_id, agent_id, cx))
+                .map(|(index, starter)| self.render_starter_row(index, project_id, starter, cx))
                 .collect(),
             Step::Workspace(project_id) => self
                 .workspace_rows
