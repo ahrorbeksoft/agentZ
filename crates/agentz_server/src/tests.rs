@@ -49,7 +49,14 @@ impl TestServer {
     }
 
     fn start_with(data_dir: tempfile::TempDir, project_dir: tempfile::TempDir) -> Option<Self> {
-        let command = mock_agent()?;
+        Self::start_with_agent(data_dir, project_dir, mock_agent()?)
+    }
+
+    fn start_with_agent(
+        data_dir: tempfile::TempDir,
+        project_dir: tempfile::TempDir,
+        command: AgentCommand,
+    ) -> Option<Self> {
         let custom_agents = BTreeMap::from_iter([(
             AgentId::new("mock"),
             CustomAgent {
@@ -469,6 +476,88 @@ async fn accounts_log_in_and_close_with_their_client() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(closed);
+}
+
+/// Claude Agent and others log in by running a command in a terminal. It runs on the server's
+/// machine, where the agent keeps its login, and the agent restarts logged in once it exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_logins_run_on_the_server_and_restart_the_agent() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let login_file = data_dir.path().join("logged-in");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        login_file.to_string_lossy().into_owned(),
+    );
+    let Some(server) =
+        TestServer::start_with_agent(data_dir, tempfile::tempdir().expect("temp dir"), command)
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let Response::AccountOpened(account_id) =
+        client.ok(Request::OpenAccount(AgentId::new("mock"))).await
+    else {
+        panic!("expected an account");
+    };
+    let connection = ConnectionId::Account(account_id);
+    client.subscribe_thread(connection).await;
+    client
+        .wait_until(|client| client.thread(connection).logged_in() == Some(false))
+        .await;
+
+    let method_id = acp::AuthMethodId::new("mock-terminal-login");
+    client
+        .ok(Request::TerminalLogin {
+            connection,
+            method_id,
+        })
+        .await;
+    let key = TerminalKey::Login(connection);
+    client.subscribe_terminal(key.clone()).await;
+    client.wait_for_screen(&key, "Press Enter to log in").await;
+    client.type_into(&key, "\r").await;
+
+    client
+        .wait_until(|client| {
+            !client.terminals.contains_key(&key)
+                && client.thread(connection).logged_in() == Some(true)
+        })
+        .await;
+    assert!(login_file.exists());
+    assert_eq!(
+        client
+            .thread(connection)
+            .account_notice()
+            .map(|notice| notice.as_ref()),
+        Some("Logged in.")
+    );
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| match event {
+                Event::AgentSettings(settings) => {
+                    settings.get(&AgentId::new("mock")).is_some_and(|settings| {
+                        settings.login_method.as_deref() == Some("Log in in a terminal")
+                    })
+                }
+                _ => false,
+            })
+        })
+        .await;
+
+    // A method that doesn't run in a terminal is refused.
+    assert!(
+        client
+            .request(Request::TerminalLogin {
+                connection,
+                method_id: acp::AuthMethodId::new("mock-login"),
+            })
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -236,6 +236,24 @@ impl AgentThread {
         )
     }
 
+    /// The server's id for the connection, once it's open.
+    pub fn connection(&self) -> Option<ConnectionId> {
+        self.connection
+    }
+
+    /// Runs a terminal login method on the agent's machine, in [`TerminalKey::Login`].
+    ///
+    /// [`TerminalKey::Login`]: agentz_protocol::terminal::TerminalKey::Login
+    pub fn terminal_login(&mut self, method_id: acp::AuthMethodId, cx: &mut Context<Self>) {
+        self.request(
+            |connection| Request::TerminalLogin {
+                connection,
+                method_id,
+            },
+            cx,
+        )
+    }
+
     pub fn retry_session(&mut self, cx: &mut Context<Self>) {
         self.request(Request::RetrySession, cx)
     }

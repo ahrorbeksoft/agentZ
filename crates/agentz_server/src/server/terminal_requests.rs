@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::TerminalRequest;
 use agentz_protocol::terminal::{TerminalExit, TerminalKey};
-use agentz_protocol::{Event, Request, Response, ServerMessage};
+use agentz_protocol::{ConnectionId, Event, Request, Response, ServerMessage};
 use alacritty_terminal::event::Event as AlacEvent;
 use anyhow::{Context as _, Result, anyhow};
 use projects::ThreadId;
@@ -57,6 +57,8 @@ pub(super) struct RunningTerminal {
 #[derive(Default)]
 pub(super) struct Terminals {
     pub(super) running: HashMap<TerminalKey, RunningTerminal>,
+    /// The method each [`TerminalKey::Login`] terminal runs.
+    logins: HashMap<ConnectionId, acp::AuthMethodId>,
     next_serial: u64,
     /// The last theme colors a client sent, for terminals started later.
     pub(super) palette: Option<Vec<[u8; 3]>>,
@@ -170,6 +172,11 @@ impl Server {
             TerminalKey::Agent { .. } => {
                 return Err(anyhow!("an agent's terminal starts when the agent asks"));
             }
+            TerminalKey::Login(_) => {
+                return Err(anyhow!(
+                    "a login terminal starts when a login method is chosen"
+                ));
+            }
             TerminalKey::Pane(pane) => return self.pane_terminal_spawn(*pane),
         };
         let thread = self.projects.thread(thread_id).context("no such thread")?;
@@ -264,7 +271,8 @@ impl Server {
             }
             TerminalKey::Drawer(_)
             | TerminalKey::DrawerTerminal { .. }
-            | TerminalKey::Agent { .. } => None,
+            | TerminalKey::Agent { .. }
+            | TerminalKey::Login(_) => None,
         };
         self.terminals.running.insert(
             key.clone(),
@@ -314,10 +322,11 @@ impl Server {
     ) -> Vec<(crate::handoff::HandedOffTerminal, std::os::fd::OwnedFd)> {
         let mut paused = Vec::new();
         for (key, running) in &mut self.terminals.running {
+            // A login is quick to start again, and the new server wouldn't know its method.
             let ends_with_agent = matches!(
                 key,
                 TerminalKey::Agent { thread_id, .. } if !handed_threads.contains(thread_id)
-            );
+            ) || matches!(key, TerminalKey::Login(_));
             if ends_with_agent || running.terminal.exit().is_some() {
                 continue;
             }
@@ -388,7 +397,8 @@ impl Server {
                 TerminalKey::Thread(_) | TerminalKey::Pane(_) => Some(AgentTracker::default()),
                 TerminalKey::Drawer(_)
                 | TerminalKey::DrawerTerminal { .. }
-                | TerminalKey::Agent { .. } => None,
+                | TerminalKey::Agent { .. }
+                | TerminalKey::Login(_) => None,
             };
             self.terminals.running.insert(
                 key.clone(),
@@ -425,6 +435,9 @@ impl Server {
                 self.projects.set_drawer_command(*thread_id, *number, None)
             }
             TerminalKey::Agent { .. } => {}
+            TerminalKey::Login(connection) => {
+                self.terminals.logins.remove(connection);
+            }
         }
         for client in self.clients.values_mut() {
             if client.terminals.remove(key).is_some() {
@@ -464,6 +477,17 @@ impl Server {
                 TerminalKey::Pane(pane) => running.terminal.exit().is_some().then_some(pane),
                 _ => None,
             };
+            let logged_in = match key {
+                TerminalKey::Login(connection)
+                    if running
+                        .terminal
+                        .exit()
+                        .is_some_and(|exit| exit.code == Some(0)) =>
+                {
+                    Some(connection)
+                }
+                _ => None,
+            };
             if let Some(thread_id) = active_thread {
                 self.projects.record_thread_activity(thread_id);
             }
@@ -471,6 +495,9 @@ impl Server {
             // herdr closes a pane when its process ends.
             if let Some(pane) = pane_exited {
                 self.close_space_pane(pane);
+            }
+            if let Some(connection) = logged_in {
+                self.terminal_login_finished(connection);
             }
         }
     }
@@ -618,7 +645,7 @@ impl Server {
                 TerminalKey::DrawerTerminal { thread_id, number } => {
                     self.projects.set_drawer_command(thread_id, number, program)
                 }
-                TerminalKey::Agent { .. } | TerminalKey::Pane(_) => {}
+                TerminalKey::Agent { .. } | TerminalKey::Pane(_) | TerminalKey::Login(_) => {}
             }
         }
         for (thread_id, folder) in folders {
@@ -645,7 +672,8 @@ impl Server {
                 TerminalKey::Pane(pane) => self.publish_pane_agent(pane, agent, state),
                 TerminalKey::Drawer(_)
                 | TerminalKey::DrawerTerminal { .. }
-                | TerminalKey::Agent { .. } => {}
+                | TerminalKey::Agent { .. }
+                | TerminalKey::Login(_) => {}
             }
         }
         if let Some(next_tick) = next_tick {
@@ -718,6 +746,9 @@ impl Server {
             .keys()
             .filter(|key| match key {
                 TerminalKey::Pane(pane) => self.spaces.pane(*pane).is_none(),
+                TerminalKey::Login(ConnectionId::Account(account_id)) => {
+                    !self.accounts.contains_key(account_id)
+                }
                 key => key
                     .thread_id()
                     .is_none_or(|thread_id| self.projects.thread(thread_id).is_none()),
@@ -788,6 +819,50 @@ impl Server {
 }
 
 impl Server {
+    /// Runs one of a connection's terminal login methods, replacing a login already running.
+    /// It runs here rather than on the client's machine because the agent keeps its login
+    /// where it runs.
+    pub(super) fn start_terminal_login(
+        &mut self,
+        connection: ConnectionId,
+        method_id: acp::AuthMethodId,
+    ) -> Result<()> {
+        let thread = match connection {
+            ConnectionId::Thread(thread_id) => self.threads.get(&thread_id),
+            ConnectionId::Account(account_id) => self
+                .accounts
+                .get(&account_id)
+                .map(|account| &account.thread),
+        }
+        .context("the agent isn't running")?;
+        let command = thread
+            .terminal_auth_command(&method_id)
+            .context("the agent has no such terminal login")?;
+        let spawn = TerminalSpawn {
+            program: Some((command.path.to_string_lossy().into_owned(), command.args)),
+            cwd: thread.state.cwd.clone(),
+            env: command.env.into_iter().collect(),
+        };
+        self.terminals.logins.insert(connection, method_id);
+        self.start_terminal(
+            TerminalKey::Login(connection),
+            spawn,
+            TerminalSize::default(),
+        )
+    }
+
+    /// A login terminal exited successfully: it closes, and its agent restarts logged in.
+    fn terminal_login_finished(&mut self, connection: ConnectionId) {
+        let Some(method_id) = self.terminals.logins.get(&connection).cloned() else {
+            return;
+        };
+        self.close_terminal(&TerminalKey::Login(connection));
+        self.update_thread(connection, |thread| {
+            thread.terminal_login_finished(&method_id)
+        })
+        .log_err();
+    }
+
     /// Answers an agent's `terminal/*` request (ACP's client terminals, as Zed runs them).
     pub(super) fn agent_terminal_request(&mut self, thread_id: ThreadId, request: TerminalRequest) {
         match request {

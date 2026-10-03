@@ -385,6 +385,13 @@ pub enum Request {
         connection: ConnectionId,
         method_id: acp::AuthMethodId,
     },
+    /// Runs one of the agent's terminal login methods in [`TerminalKey::Login`] on the server's
+    /// machine, where the agent keeps its login. The agent restarts once the login exits
+    /// successfully.
+    TerminalLogin {
+        connection: ConnectionId,
+        method_id: acp::AuthMethodId,
+    },
     Reauthenticate(ConnectionId),
     Logout(ConnectionId),
     RetrySession(ConnectionId),

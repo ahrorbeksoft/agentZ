@@ -28,6 +28,8 @@ pub enum TerminalKey {
     },
     /// A terminal pane in the Workspaces view.
     Pane(PaneId),
+    /// Where an agent connection's terminal login runs ([`crate::Request::TerminalLogin`]).
+    Login(crate::ConnectionId),
 }
 
 impl TerminalKey {
@@ -46,7 +48,8 @@ impl TerminalKey {
             Self::Thread(thread_id) | Self::Drawer(thread_id) => Some(*thread_id),
             Self::DrawerTerminal { thread_id, .. } => Some(*thread_id),
             Self::Agent { thread_id, .. } => Some(*thread_id),
-            Self::Pane(_) => None,
+            Self::Login(crate::ConnectionId::Thread(thread_id)) => Some(*thread_id),
+            Self::Pane(_) | Self::Login(crate::ConnectionId::Account(_)) => None,
         }
     }
 }

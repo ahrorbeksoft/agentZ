@@ -604,6 +604,14 @@ impl Server {
                 self.update_thread(connection, |thread| thread.authenticate(method_id))?;
                 Ok(Response::Ok)
             }
+            Request::TerminalLogin {
+                connection,
+                method_id,
+            } => {
+                self.client(client)?;
+                self.start_terminal_login(connection, method_id)?;
+                Ok(Response::Ok)
+            }
             Request::Reauthenticate(connection) => {
                 self.update_thread(connection, |thread| thread.reauthenticate())?;
                 Ok(Response::Ok)

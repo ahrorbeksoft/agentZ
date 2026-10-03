@@ -145,6 +145,17 @@ Each entry: what it does, where it lives, and where it comes from.
   rather than server paths, so any client (a browser too) can draw them
   (`Icon::from_svg_markup`).
 - **Login state** comes from ACP only, through an empty session (see Pitfalls in `AGENTS.md`).
+- **Logging in** (`agent_thread`, `server/terminal_requests.rs`, `agent_view.rs`,
+  `settings_page.rs`; Zed's `terminal_auth_task`, t3code's `AcpRegistryAuth`): `agent` methods
+  are ACP's `authenticate`, and the agent opens the browser itself on its machine. `terminal`
+  methods, and older ones naming a command in `_meta["terminal-auth"]`
+  (`agentz_protocol::thread::terminal_login_command`), run on the agent's machine in a
+  `TerminalKey::Login` terminal (`Request::TerminalLogin`) that the thread's login callout or
+  the agent's settings page shows. That's where the agent keeps its login, so this works for
+  remote machines too. When it exits with 0 the server closes it, records the method, and
+  restarts the agent, which opens its session logged in. `initialize` advertises
+  `auth.terminal` and Zed's `_meta["terminal-auth"]`: without them Claude Agent offers no login
+  method at all, and Codex and Devin leave out their terminal ones.
 - **Background turns** (`agentz_server`, herdr): agents keep working when the app quits; the app
   reattaches with a snapshot, then live events.
 
@@ -237,7 +248,7 @@ Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
 - **Where they appear**: terminal threads (`terminal_thread_view.rs`, a login shell from New
   Thread); the thread's terminal drawer (`terminal_drawer.rs`, t3code's: Cmd-J, groups of up to
   four split terminals, a dot on its button while something runs with the drawer hidden); ACP
-  client terminals, shown live in tool calls.
+  client terminals, shown live in tool calls; terminal logins, under the login buttons.
 - **Agent detection** (`detect.rs`, `detect/`): herdr's manifests read the bottom of the screen;
   the foreground process (via `tcgetpgrp`, since a pane's `/usr/bin/login` runs as root) names
   the agent. Runs in workspace panes and terminal threads.

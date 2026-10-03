@@ -9,6 +9,7 @@ use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
+    logs_in_through_terminal,
 };
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
@@ -66,6 +67,8 @@ struct DraggedDrawerEdge;
 
 /// The most lines of a command's terminal a tool call shows.
 const TOOL_TERMINAL_MAX_LINES: usize = 16;
+/// Room for a login command's prompts, a URL and a pasted code.
+const LOGIN_TERMINAL_HEIGHT: Pixels = px(240.);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -145,6 +148,8 @@ pub struct AgentView {
     /// The terminals the agent runs its commands in, by the ids it got, shown in their tool
     /// calls.
     tool_terminals: HashMap<String, Entity<TerminalView>>,
+    /// Where a terminal login method runs, shown under the login callout.
+    login_terminal: Option<Entity<TerminalView>>,
     _subscriptions: Vec<Subscription>,
     _elapsed_refresh: Task<()>,
 }
@@ -239,6 +244,7 @@ impl AgentView {
             drawer_height: DRAWER_HEIGHT,
             drawer_full_screen: false,
             tool_terminals: HashMap::default(),
+            login_terminal: None,
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
@@ -2025,24 +2031,21 @@ impl AgentView {
         let agent_name = self.agent_name(cx);
         let methods = thread.auth_methods().to_vec();
         let auth_error = thread.auth_error().cloned();
-        let has_terminal_method = methods
-            .iter()
-            .any(|method| matches!(method, acp::AuthMethod::Terminal(_)));
+        let has_terminal_method = methods.iter().any(logs_in_through_terminal);
 
         let mut buttons = Vec::new();
         for (index, method) in methods.iter().enumerate().rev() {
-            let (method_id, name, description, is_terminal) = match method {
+            let is_terminal = logs_in_through_terminal(method);
+            let (method_id, name, description) = match method {
                 acp::AuthMethod::Agent(method) => (
                     method.id.clone(),
                     method.name.clone(),
                     method.description.clone(),
-                    false,
                 ),
                 acp::AuthMethod::Terminal(method) => (
                     method.id.clone(),
                     method.name.clone(),
                     method.description.clone(),
-                    true,
                 ),
                 _ => continue,
             };
@@ -2057,20 +2060,15 @@ impl AgentView {
                     .when_some(description, |button, description| {
                         button.tooltip(Tooltip::text(description))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         if is_terminal {
-                            let command = this.thread.read(cx).terminal_auth_command(&method_id);
-                            let cwd = this.thread.read(cx).cwd().clone();
-                            if let Some(command) = command {
-                                cx.background_spawn(async move {
-                                    if let Err(error) = open_in_terminal(&command, &cwd).await {
-                                        log::error!(
-                                            "couldn't open a terminal to log in: {error:#}"
-                                        );
-                                    }
-                                })
-                                .detach();
-                            }
+                            start_terminal_login(
+                                &this.thread,
+                                method_id.clone(),
+                                &mut this.login_terminal,
+                                window,
+                                cx,
+                            );
                         } else {
                             let method_id = method_id.clone();
                             this.thread
@@ -2111,6 +2109,7 @@ impl AgentView {
                         .description(description)
                         .actions_slot(h_flex().justify_end().flex_wrap().gap_1().children(buttons)),
                 )
+                .children(render_login_terminal(self.login_terminal.as_ref(), cx))
                 .into_any_element(),
         )
     }
@@ -3254,50 +3253,58 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
         )
 }
 
-/// Opens the system terminal running `command` in `cwd`, for agents that log in interactively.
-pub(crate) async fn open_in_terminal(
-    command: &agentz_protocol::agents::AgentCommand,
-    cwd: &std::path::Path,
-) -> anyhow::Result<()> {
-    fn shell_quote(text: &str) -> String {
-        format!("'{}'", text.replace('\'', "'\\''"))
-    }
-    let mut script = format!("cd {}", shell_quote(&cwd.to_string_lossy()));
-    script.push_str(" && env");
-    for (key, value) in &command.env {
-        script.push_str(&format!(" {}={}", key, shell_quote(value)));
-    }
-    script.push(' ');
-    script.push_str(&shell_quote(&command.path.to_string_lossy()));
-    for argument in &command.args {
-        script.push(' ');
-        script.push_str(&shell_quote(argument));
-    }
+/// Runs a terminal login method on the agent's machine and shows its terminal, reusing the
+/// view from an earlier attempt.
+pub(crate) fn start_terminal_login(
+    thread: &Entity<AgentThread>,
+    method_id: acp::AuthMethodId,
+    login_terminal: &mut Option<Entity<TerminalView>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(connection) = thread.read(cx).connection() else {
+        return;
+    };
+    thread.update(cx, |thread, cx| thread.terminal_login(method_id, cx));
+    let view = match login_terminal {
+        Some(view) => {
+            // The server started the login over in a new terminal.
+            let terminal = view.read(cx).terminal().clone();
+            terminal.update(cx, |terminal, cx| terminal.reconnected(cx));
+            view.clone()
+        }
+        None => {
+            let client = thread.read(cx).client().clone();
+            let terminal = Terminal::shared(&client, TerminalKey::Login(connection), cx);
+            let view = cx.new(|cx| TerminalView::new(terminal, TerminalMode::Scrollable, cx));
+            *login_terminal = Some(view.clone());
+            view
+        }
+    };
+    window.focus(&view.focus_handle(cx), cx);
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let apple_script_string = script.replace('\\', "\\\\").replace('"', "\\\"");
-        let status = smol::process::Command::new("osascript")
-            .args([
-                "-e",
-                "tell application \"Terminal\" to activate",
-                "-e",
-                &format!("tell application \"Terminal\" to do script \"{apple_script_string}\""),
-            ])
-            .status()
-            .await?;
-        anyhow::ensure!(status.success(), "osascript exited with {status}");
-        Ok(())
+/// A terminal login while it runs. The server closes it once the login succeeds; a failed one
+/// stays to show why.
+pub(crate) fn render_login_terminal(
+    login_terminal: Option<&Entity<TerminalView>>,
+    cx: &App,
+) -> Option<AnyElement> {
+    let view = login_terminal?;
+    if view.read(cx).terminal().read(cx).error().is_some() {
+        return None;
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let status = smol::process::Command::new("x-terminal-emulator")
-            .args(["-e", "sh", "-c", &script])
-            .status()
-            .await?;
-        anyhow::ensure!(status.success(), "the terminal exited with {status}");
-        Ok(())
-    }
+    Some(
+        div()
+            .mt_2()
+            .h(LOGIN_TERMINAL_HEIGHT)
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .overflow_hidden()
+            .child(view.clone())
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]

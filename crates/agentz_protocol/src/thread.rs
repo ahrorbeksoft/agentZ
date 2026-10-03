@@ -424,20 +424,67 @@ impl ThreadView {
             .state
             .auth_methods
             .iter()
-            .find_map(|method| match method {
-                acp::AuthMethod::Terminal(terminal) if &terminal.id == method_id => Some(terminal),
-                _ => None,
-            })?;
-        let mut auth_command = command.clone();
-        auth_command.args.extend(method.args.iter().cloned());
-        auth_command.env.extend(
-            method
+            .find(|method| method.id() == method_id)?;
+        terminal_login_command(command, method)
+    }
+}
+
+/// Whether the login method runs in a terminal rather than through ACP's `authenticate`.
+pub fn logs_in_through_terminal(method: &acp::AuthMethod) -> bool {
+    matches!(method, acp::AuthMethod::Terminal(_)) || meta_terminal_auth(method).is_some()
+}
+
+/// What a terminal login method runs, given the agent's own command. A `terminal` method runs
+/// the agent with its arguments and environment added. Agents from before terminal methods
+/// were stabilized name a command in `_meta["terminal-auth"]` instead, which Zed still reads.
+pub fn terminal_login_command(
+    agent: &AgentCommand,
+    method: &acp::AuthMethod,
+) -> Option<AgentCommand> {
+    if let acp::AuthMethod::Terminal(terminal) = method {
+        let mut command = agent.clone();
+        command.args.extend(terminal.args.iter().cloned());
+        command.env.extend(
+            terminal
                 .env
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        Some(auth_command)
+        return Some(command);
     }
+    let meta = meta_terminal_auth(method)?;
+    // A bare `node` or `opencode` means the program the agent itself runs from, which may not
+    // be on `PATH` (Zed swaps in its own Node the same way).
+    let path = if agent
+        .path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy() == meta.command)
+    {
+        agent.path.clone()
+    } else {
+        PathBuf::from(meta.command)
+    };
+    let mut env = agent.env.clone();
+    env.extend(meta.env);
+    Some(AgentCommand {
+        path,
+        args: meta.args,
+        env,
+    })
+}
+
+#[derive(Deserialize)]
+struct MetaTerminalAuth {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
+}
+
+fn meta_terminal_auth(method: &acp::AuthMethod) -> Option<MetaTerminalAuth> {
+    let value = method.meta()?.get("terminal-auth")?.clone();
+    serde_json::from_value(value).ok()
 }
 
 #[cfg(test)]
@@ -503,5 +550,50 @@ mod tests {
         assert_eq!(update.entry_count, 0);
         client.apply(update);
         assert_eq!(client, server);
+    }
+
+    #[test]
+    fn terminal_logins_run_the_agent_or_the_command_in_its_meta() {
+        let agent = AgentCommand {
+            path: PathBuf::from("/opt/agents/node"),
+            args: vec!["agent.js".into()],
+            env: [("KEY".to_string(), "agent".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let terminal = acp::AuthMethod::Terminal(
+            acp::AuthMethodTerminal::new("claude-ai-login", "Claude subscription")
+                .args(vec!["--cli".into(), "auth".into(), "login".into()])
+                .env(
+                    [("MODE".to_string(), "login".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+        );
+        assert!(logs_in_through_terminal(&terminal));
+        let command = terminal_login_command(&agent, &terminal).expect("a command");
+        assert_eq!(command.path, agent.path);
+        assert_eq!(command.args, ["agent.js", "--cli", "auth", "login"]);
+        assert_eq!(command.env["MODE"], "login");
+        assert_eq!(command.env["KEY"], "agent");
+
+        let meta = |command: &str| {
+            acp::AuthMethod::Agent(acp::AuthMethodAgent::new("login", "Log In").meta(
+                acp::Meta::from_iter([(
+                    "terminal-auth".to_string(),
+                    serde_json::json!({"label": "Log In", "command": command, "args": ["auth", "login"]}),
+                )]),
+            ))
+        };
+        let command = terminal_login_command(&agent, &meta("node")).expect("a command");
+        assert_eq!(command.path, agent.path);
+        assert_eq!(command.args, ["auth", "login"]);
+        let command = terminal_login_command(&agent, &meta("opencode")).expect("a command");
+        assert_eq!(command.path, PathBuf::from("opencode"));
+        assert!(logs_in_through_terminal(&meta("opencode")));
+
+        let browser = acp::AuthMethod::Agent(acp::AuthMethodAgent::new("chatgpt", "ChatGPT"));
+        assert!(!logs_in_through_terminal(&browser));
+        assert_eq!(terminal_login_command(&agent, &browser), None);
     }
 }

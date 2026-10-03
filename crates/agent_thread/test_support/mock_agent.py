@@ -11,12 +11,26 @@ writes the text and a newline to the file, relative to the session's folder, and
 "delete <path>" removes it. "terminal <command>" runs the command in a client
 terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
 and replies "Terminal <exit code>: <output>", then releases it.
+
+With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail with
+"authentication required"); "mock-login" creates it, and so does the terminal login
+"mock-terminal-login", offered to clients that support terminal logins: it runs this
+script with `--login`, which waits for Enter, then creates the file and exits.
 """
 import json
 import os
 import subprocess
 import sys
 import time
+
+LOGIN_FILE = os.environ.get("MOCK_LOGIN_FILE")
+
+if sys.argv[-1] == "--login":
+    print("Press Enter to log in to the mock agent.", flush=True)
+    sys.stdin.readline()
+    open(LOGIN_FILE, "w").close()
+    print("Logged in.", flush=True)
+    sys.exit(0)
 
 # Optional path where conversations are recorded so `session/load` can replay them.
 HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
@@ -156,14 +170,24 @@ for line in sys.stdin:
         outcome = message.get("result", {}).get("outcome", {})
         finish_prompt(request_id, session_id, prompt_text, outcome.get("optionId", "cancelled"))
     elif method == "initialize":
+        auth_methods = [{"id": "mock-login", "name": "Log In",
+                         "description": "Log in to the mock agent"}]
+        capabilities = message["params"].get("clientCapabilities", {})
+        if capabilities.get("auth", {}).get("terminal"):
+            auth_methods.append({"id": "mock-terminal-login", "name": "Log in in a terminal",
+                                 "type": "terminal", "args": ["--login"]})
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
                          "agentCapabilities": {"loadSession": HISTORY_PATH is not None,
                                                "auth": {"logout": {}}},
-                         "authMethods": [{"id": "mock-login", "name": "Log In",
-                                          "description": "Log in to the mock agent"}]}})
+                         "authMethods": auth_methods}})
     elif method in ("authenticate", "logout"):
+        if LOGIN_FILE and method == "authenticate":
+            open(LOGIN_FILE, "w").close()
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+    elif method in ("session/new", "session/load") and LOGIN_FILE and not os.path.exists(LOGIN_FILE):
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "error": {"code": -32000, "message": "Authentication required"}})
     elif method == "session/new":
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)

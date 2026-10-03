@@ -27,11 +27,11 @@ use util::ResultExt as _;
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::Request;
-use agentz_protocol::thread::ConnectionStatus;
+use agentz_protocol::thread::{ConnectionStatus, logs_in_through_terminal};
 
 use std::collections::BTreeMap;
 
-use crate::agent_view::{TOOLBAR_HEIGHT, open_in_terminal};
+use crate::agent_view::{TOOLBAR_HEIGHT, render_login_terminal, start_terminal_login};
 use crate::app_settings::{AppSettingsStore, MachineProfile, ThemeMode};
 use crate::machine_icon_picker::MachineIconPicker;
 use crate::project_info::{
@@ -42,6 +42,7 @@ use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
 use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
+use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
 
 const KEY_CONTEXT: &str = "SettingsPage";
@@ -1745,32 +1746,9 @@ impl SettingsPage {
         let account_agent_id = id.clone();
         let connection =
             cx.new(|cx| AgentThread::open_account(client.clone(), account_agent_id, name, cx));
-        let agent_id = id.0.to_string();
         // The server remembers the options and modes the agent offers, and logins made in
         // the panel.
-        let subscription = cx.observe(&connection, move |this, connection, cx| {
-            // A login started in Terminal counts once a check finds the agent logged in.
-            let logged_in = connection.read(cx).logged_in() == Some(true);
-            let finished_terminal_login = this
-                .account_mut()
-                .filter(|_| logged_in)
-                .and_then(|panel| panel.pending_terminal_method.take());
-            if let Some(method) = finished_terminal_login {
-                let method = method.to_string();
-                connection
-                    .read(cx)
-                    .client()
-                    .clone()
-                    .update(cx, |client, cx| {
-                        client.update_agent_settings(
-                            &agent_id,
-                            |agent| agent.login_method = Some(method),
-                            cx,
-                        )
-                    });
-            }
-            cx.notify();
-        });
+        let subscription = cx.observe(&connection, |_, _, cx| cx.notify());
         let env_rows = agent_settings
             .env
             .iter()
@@ -1779,8 +1757,7 @@ impl SettingsPage {
         let panel = AccountPanel {
             agent_id: id.clone(),
             connection,
-            terminal_hint: None,
-            pending_terminal_method: None,
+            login_terminal: None,
             env_rows,
             _subscriptions: [subscription],
         };
@@ -2107,18 +2084,17 @@ impl SettingsPage {
             ConnectionStatus::Failed(error) => (error.clone(), Color::Error),
             ConnectionStatus::Ready | ConnectionStatus::AuthRequired => {
                 for method in connection.auth_methods() {
-                    let (method_id, method_name, description, is_terminal) = match method {
+                    let is_terminal = logs_in_through_terminal(method);
+                    let (method_id, method_name, description) = match method {
                         acp::AuthMethod::Agent(method) => (
                             method.id.clone(),
                             method.name.clone(),
                             method.description.clone(),
-                            false,
                         ),
                         acp::AuthMethod::Terminal(method) => (
                             method.id.clone(),
                             method.name.clone(),
                             method.description.clone(),
-                            true,
                         ),
                         _ => continue,
                     };
@@ -2131,12 +2107,9 @@ impl SettingsPage {
                         .when_some(description, |button, description| {
                             button.tooltip(Tooltip::text(description))
                         })
-                        .on_click({
-                            let method_name: SharedString = method_name.clone().into();
-                            cx.listener(move |this, _, _, cx| {
-                                this.log_in(method_id.clone(), method_name.clone(), is_terminal, cx)
-                            })
-                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.log_in(method_id.clone(), is_terminal, window, cx)
+                        }))
                         .into_any_element(),
                     );
                 }
@@ -2146,7 +2119,6 @@ impl SettingsPage {
                             .style(ButtonStyle::Outlined)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(account) = this.account_mut() {
-                                    account.terminal_hint = None;
                                     account
                                         .connection
                                         .update(cx, |connection, cx| connection.logout(cx));
@@ -2157,8 +2129,6 @@ impl SettingsPage {
                 }
                 if let Some(error) = connection.auth_error() {
                     (error.clone(), Color::Error)
-                } else if let Some(hint) = &account.terminal_hint {
-                    (hint.clone(), Color::Muted)
                 } else if buttons.is_empty() {
                     (
                         format!("{agent_name} doesn't offer logging in or out from agentZ.").into(),
@@ -2231,7 +2201,6 @@ impl SettingsPage {
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(account) = this.account_mut() {
-                                        account.terminal_hint = None;
                                         account.connection.update(cx, |connection, cx| {
                                             connection.check_login(cx)
                                         });
@@ -2244,43 +2213,34 @@ impl SettingsPage {
             .when(!buttons.is_empty(), |panel| {
                 panel.child(h_flex().flex_wrap().gap_2().children(buttons))
             })
+            .children(render_login_terminal(account.login_terminal.as_ref(), cx))
             .into_any_element()
     }
 
-    /// Agent methods log in through the agent; terminal methods run the agent's login command
-    /// in Terminal, as a thread does.
+    /// Agent methods log in through the agent; terminal methods run in a terminal on the
+    /// agent's machine, as a thread's do.
     fn log_in(
         &mut self,
         method_id: acp::AuthMethodId,
-        method_name: SharedString,
         is_terminal: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(account) = self.account_mut() else {
             return;
         };
-        if !is_terminal {
-            account.terminal_hint = None;
+        if is_terminal {
+            start_terminal_login(
+                &account.connection,
+                method_id,
+                &mut account.login_terminal,
+                window,
+                cx,
+            );
+        } else {
             account
                 .connection
                 .update(cx, |connection, cx| connection.authenticate(method_id, cx));
-            return;
-        }
-        let command = account
-            .connection
-            .read(cx)
-            .terminal_auth_command(&method_id);
-        let cwd = account.connection.read(cx).cwd().clone();
-        if let Some(command) = command {
-            account.terminal_hint =
-                Some("Finish logging in in Terminal, then choose Check Again.".into());
-            account.pending_terminal_method = Some(method_name);
-            cx.background_spawn(async move {
-                if let Err(error) = open_in_terminal(&command, &cwd).await {
-                    log::error!("couldn't open a terminal to log in: {error:#}");
-                }
-            })
-            .detach();
         }
         cx.notify();
     }
@@ -2961,9 +2921,8 @@ struct AccountPanel {
     agent_id: AgentId,
     /// A session-less connection to the agent, alive only while the panel is open.
     connection: Entity<AgentThread>,
-    terminal_hint: Option<SharedString>,
-    /// A login method started in Terminal, credited once a check finds the agent logged in.
-    pending_terminal_method: Option<SharedString>,
+    /// Where a terminal login method runs, on the agent's machine.
+    login_terminal: Option<Entity<TerminalView>>,
     env_rows: Vec<EnvRow>,
     _subscriptions: [Subscription; 1],
 }

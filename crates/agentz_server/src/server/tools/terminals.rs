@@ -238,6 +238,7 @@ impl Server {
                 TerminalKey::Drawer(_) | TerminalKey::DrawerTerminal { .. } => "drawer",
                 TerminalKey::Agent { .. } => "agent_command",
                 TerminalKey::Pane(_) => "pane",
+                TerminalKey::Login(_) => "login",
             },
             "threadTitle": thread.map(|thread| thread.title.clone()),
             "command": thread

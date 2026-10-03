@@ -1024,6 +1024,25 @@ impl AgentThread {
         });
     }
 
+    /// A terminal login method exited successfully. The agent is restarted to pick up its new
+    /// login, as Zed and t3code do, and the session opens again.
+    pub fn terminal_login_finished(&mut self, method_id: &acp::AuthMethodId) {
+        let method_name = self
+            .view
+            .state
+            .auth_methods
+            .iter()
+            .find(|method| method.id() == method_id)
+            .map(|method| SharedString::from(method.name().to_string()));
+        if let Some(method_name) = method_name {
+            self.emit(AgentThreadEvent::LoggedIn(method_name));
+        }
+        if !self.opens_session {
+            self.view.state.account_notice = Some("Logged in.".into());
+        }
+        self.reload();
+    }
+
     /// Tries to open the session again, e.g. after logging in through a terminal.
     pub fn retry_session(&mut self) {
         if self.view.state.status == ConnectionStatus::AuthRequired {
@@ -1624,7 +1643,18 @@ async fn connect(
     let initialize = connection
         .send_request(
             acp::InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(acp::ClientCapabilities::new().terminal(supports_terminals))
+                .client_capabilities(
+                    acp::ClientCapabilities::new()
+                        .terminal(supports_terminals)
+                        // The server runs terminal logins itself (`TerminalKey::Login`). Agents
+                        // offer them only to clients that say so: Claude Agent offers no login
+                        // at all otherwise. The `_meta` flag is the older form, as Zed sends it.
+                        .auth(acp::AuthCapabilities::new().terminal(true))
+                        .meta(acp::Meta::from_iter([(
+                            "terminal-auth".to_string(),
+                            true.into(),
+                        )])),
+                )
                 .client_info(acp::Implementation::new("agentZ", version)),
         )
         .block_task()
@@ -2022,7 +2052,14 @@ mod tests {
             .wait_until(|account| account.status() == &ConnectionStatus::Ready)
             .await;
         assert!(account.thread.supports_logout());
-        assert_eq!(account.thread.auth_methods().len(), 1);
+        // The terminal login is offered because the client says it runs them.
+        let methods: Vec<&str> = account
+            .thread
+            .auth_methods()
+            .iter()
+            .map(|method| &*method.id().0)
+            .collect();
+        assert_eq!(methods, ["mock-login", "mock-terminal-login"]);
         assert_eq!(
             account.thread.logged_in(),
             Some(true),
