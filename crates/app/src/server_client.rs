@@ -68,6 +68,9 @@ pub struct ServerClient {
     transport: Transport,
     connection: Option<Connection>,
     status: MachineStatus,
+    /// The machine's server is older than the one installed there now, and keeps running
+    /// until the user restarts it.
+    is_outdated: bool,
     /// The copies of the server's session.
     projects: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
@@ -101,6 +104,7 @@ impl ServerClient {
                 transport,
                 connection: None,
                 status: MachineStatus::Connecting,
+                is_outdated: false,
                 projects,
                 registry,
                 agent_settings: BTreeMap::new(),
@@ -152,6 +156,16 @@ impl ServerClient {
 
     pub fn connection(&self) -> Option<&Connection> {
         self.connection.as_ref()
+    }
+
+    pub fn is_outdated(&self) -> bool {
+        self.is_outdated && self.is_online()
+    }
+
+    /// Stops the machine's server. The connection drops, and reconnecting starts the server
+    /// installed now.
+    pub fn restart_server(&self, cx: &App) {
+        self.send(Request::Shutdown, cx);
     }
 
     /// Tries again now instead of waiting out the backoff, as after fixing what needed
@@ -278,7 +292,7 @@ impl ServerClient {
         self.terminals.insert(key, terminal);
     }
 
-    fn connected(&mut self, connection: Connection, cx: &mut Context<Self>) {
+    fn connected(&mut self, connection: Connection, is_outdated: bool, cx: &mut Context<Self>) {
         log::info!(
             "connected to agentz-server {} on {} (pid {})",
             connection.welcome().server_version,
@@ -286,6 +300,7 @@ impl ServerClient {
             connection.welcome().pid
         );
         self.connection = Some(connection);
+        self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
         self.queued_session_events = Some(Vec::new());
         let threads: Vec<_> = self
@@ -396,11 +411,11 @@ async fn maintain_connection(
     let mut delay = min_delay;
     loop {
         let status = match connect(&runtime, &transport).await {
-            Ok((connection, mut events)) => {
+            Ok((connection, mut events, is_outdated)) => {
                 let connected_at = Instant::now();
                 let session = connection.request(Request::SubscribeSession);
                 if this
-                    .update(cx, |this, cx| this.connected(connection, cx))
+                    .update(cx, |this, cx| this.connected(connection, is_outdated, cx))
                     .is_err()
                 {
                     return;
@@ -472,16 +487,20 @@ async fn maintain_connection(
     }
 }
 
+/// The session, and whether the server is older than the one installed.
 async fn connect(
     runtime: &tokio::runtime::Handle,
     transport: &Transport,
-) -> Result<(Connection, agentz_client::Events), SshError> {
+) -> Result<(Connection, agentz_client::Events, bool), SshError> {
     match transport {
-        Transport::Local => connect_local(runtime).await.map_err(|error| SshError {
-            message: format!("{error:#}"),
-            needs_attention: false,
-            hint: None,
-        }),
+        Transport::Local => connect_local(runtime)
+            .await
+            .map(|(connection, events)| (connection, events, false))
+            .map_err(|error| SshError {
+                message: format!("{error:#}"),
+                needs_attention: false,
+                hint: None,
+            }),
         Transport::Ssh(target) => {
             let target = target.clone();
             runtime
@@ -505,6 +524,13 @@ async fn connect(
                     needs_attention: false,
                     hint: None,
                 })?
+                .map(|connected| {
+                    (
+                        connected.connection,
+                        connected.events,
+                        connected.is_outdated,
+                    )
+                })
         }
     }
 }

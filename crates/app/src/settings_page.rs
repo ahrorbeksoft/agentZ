@@ -748,6 +748,28 @@ impl SettingsPage {
         .detach();
     }
 
+    fn confirm_restart_remote_server(
+        &mut self,
+        client: Entity<ServerClient>,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Restart agentz-server on {name}?"),
+            Some("Agents and terminals running there will stop."),
+            &["Restart", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                cx.update(|cx| client.read(cx).restart_server(cx));
+            }
+        })
+        .detach();
+    }
+
     fn render_appearance(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let settings = self.app_settings.read(cx).settings().clone();
         let app_settings = self.app_settings.clone();
@@ -1773,6 +1795,14 @@ impl SettingsPage {
                 let client = client.read(cx);
                 match client.status() {
                     MachineStatus::Connecting => ("Connecting…".into(), Color::Muted),
+                    MachineStatus::Online if client.is_outdated() => {
+                        hint = Some(
+                            "agentZ installed a newer agentz-server there. Restart the server \
+                             to use it; agents and terminals running there will stop."
+                                .into(),
+                        );
+                        ("Connected · older server".into(), Color::Warning)
+                    }
                     MachineStatus::Online => {
                         if let Some(connection) = client.connection() {
                             let welcome = connection.welcome();
@@ -1801,13 +1831,31 @@ impl SettingsPage {
         let element_id = |action: &str| SharedString::from(format!("machine-{action}-{id_suffix}"));
         let controls = h_flex()
             .gap_2()
-            .when_some(client.filter(|_| !is_online), |controls, client| {
+            .when_some(client.clone().filter(|_| !is_online), |controls, client| {
                 controls.child(
                     Button::new(element_id("retry"), "Retry")
                         .style(ButtonStyle::Outlined)
                         .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry())),
                 )
             })
+            .when_some(
+                client.filter(|client| client.read(cx).is_outdated()),
+                |controls, client| {
+                    let name = label.clone();
+                    controls.child(
+                        Button::new(element_id("restart"), "Restart Server…")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_restart_remote_server(
+                                    client.clone(),
+                                    name.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                },
+            )
             .when(is_online && machine != MachineId::Local, |controls| {
                 controls.child(
                     Button::new(element_id("add-project"), "Add Project…")

@@ -89,6 +89,14 @@ pub fn load_custom_agents(data_dir: &Path) -> Result<BTreeMap<AgentId, CustomAge
     }
 }
 
+/// The hash the SSH installer wrote beside this binary. Read at start, because a newer
+/// install replaces the file while this server keeps running.
+fn installed_build() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    let hash = std::fs::read_to_string(executable.with_file_name("agentz-server.sha256")).ok()?;
+    Some(hash.trim().to_string()).filter(|hash| !hash.is_empty())
+}
+
 /// Starts the server on the runtime.
 pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<ServerHandle> {
     let machine = machine_info(&config.data_dir)?;
@@ -103,6 +111,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             agentz_protocol::CAPABILITY_TERMINALS.to_string(),
             agentz_protocol::CAPABILITY_BROWSE_DIRECTORIES.to_string(),
         ],
+        build: installed_build(),
         error: None,
     };
     let (inputs, inbox) = mpsc::unbounded();

@@ -82,7 +82,7 @@ fn main() {
     let result = match arguments.command.unwrap_or(Command::Run) {
         Command::Run => run(),
         Command::Start => start(),
-        Command::Proxy => start().and_then(|()| block_on(proxy())),
+        Command::Proxy => start().and_then(|()| run_proxy()),
         Command::Stop => block_on(stop()),
         Command::McpBridge => block_on(mcp_bridge::run(VERSION)),
         Command::Tools => block_on(tools()),
@@ -272,6 +272,18 @@ fn open_log(path: &Path) -> Result<std::fs::File> {
         .truncate(too_large)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))
+}
+
+fn run_proxy() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the runtime")?;
+    let result = runtime.block_on(proxy());
+    // Stdin is read on a blocking thread that only returns when the client sends more or
+    // hangs up. Waiting for it would keep the session open after the server has gone.
+    runtime.shutdown_background();
+    result
 }
 
 /// Copies stdin to the server and the server's messages to stdout.

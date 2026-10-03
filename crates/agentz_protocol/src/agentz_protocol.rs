@@ -85,6 +85,11 @@ pub struct ServerWelcome {
     pub pid: u32,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The SHA-256 recorded next to the binary when it was installed over SSH, read as the
+    /// server started. A client that has since installed another binary can tell the running
+    /// server is older.
+    #[serde(default)]
+    pub build: Option<String>,
     /// Set when the server refuses the client, e.g. for an unsupported protocol version.
     #[serde(default)]
     pub error: Option<String>,

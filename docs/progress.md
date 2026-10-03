@@ -8,8 +8,7 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 9: replacing an outdated running remote server (after asking), then
-repository identity and merged projects.
+**Next:** Phase 9: repository identity and merged projects.
 
 | Phase | Status |
 |---|---|
@@ -265,10 +264,14 @@ Then the server:
       machine in the switcher.
 - [ ] Agent control across machines: `delegate_task` and thread launch with a machine; listing
       covers every machine of a merged project.
-- [ ] Ask before replacing a running remote server.
+- [x] Ask before replacing a running remote server: the server reports the hash recorded
+      beside its binary when it started, the SSH client compares it with the one installed
+      now, and an older server shows an icon in the title bar and Restart Server… in
+      Settings › Machines.
 - [ ] Test against `t3-home` and `devbox1`, leaving their t3code and herdr installs alone.
   - [x] Install and reconnect: `AGENTZ_SSH_TEST_TARGET=<host> cargo test -p agentz_server --test
         ssh -- --ignored` (1–4 s; the second run reuses the server and uploads nothing).
+        `AGENTZ_SSH_TEST_RESTART=1` replaces an older running server (done on both).
 
 ## 10. Polish
 
@@ -505,6 +508,14 @@ Then the server:
     own branch with a worktree or pasture icon; the details popover shows the folder. Project
     Settings › Checkouts lists workspaces with their threads and removes them, asking again
     when the server reports work that would be lost.
+- **Machines (phase 9):**
+  - **A running server outlives its binary.** The installer renames the new binary into place,
+    so an older server keeps running and `proxy` (the new binary) connects to it. The server
+    reads `agentz-server.sha256` beside its executable at start and sends it as
+    `ServerWelcome::build`; a mismatch with the hash the client installed means it's older.
+  - **`proxy` must not wait for stdin when it exits.** Tokio reads stdin on a blocking thread,
+    and dropping the runtime waits for it, so the SSH session stayed open after the server
+    quit and the app never saw the disconnect. It now ends with `shutdown_background`.
 
 ## Open questions
 
@@ -569,3 +580,5 @@ Then the server:
   several machines at once: a client per machine, Settings › Machines, per-machine agents,
   offline dimming. Connected to `devbox1` and `t3-home`.
 - 2026-10-03: Phase 9: adding projects on other machines, with folder completion.
+- 2026-10-03: Phase 9: an older server left running on a machine is detected and replaced
+  only after the user confirms. Fixed `agentz-server proxy` lingering after its server quit.

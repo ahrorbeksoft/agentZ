@@ -716,36 +716,44 @@ impl Shell {
             .children(self.render_connection_status(cx))
     }
 
-    /// An icon for each machine that can't be reached, which opens Settings › Machines.
+    /// An icon for each machine that can't be reached or runs an older server, which opens
+    /// Settings › Machines.
     fn render_connection_status(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let machines = self.machines.read(cx);
         let mut icons = Vec::new();
         for client in machines.clients() {
             let client = client.read(cx);
-            let (error, color) = match client.status() {
-                MachineStatus::Connecting | MachineStatus::Online => continue,
-                MachineStatus::Reconnecting(error) => (error.clone(), Color::Muted),
-                MachineStatus::Attention { error, .. } => (error.clone(), Color::Warning),
-            };
-            let tooltip: SharedString = match client.machine() {
-                MachineId::Local => format!("Disconnected from agentz-server: {error}").into(),
-                MachineId::Remote(_) => {
-                    format!("Disconnected from {}: {error}", client.label()).into()
+            let (icon, tooltip, color): (IconName, SharedString, Color) = match client.status() {
+                MachineStatus::Connecting => continue,
+                MachineStatus::Online if client.is_outdated() => (
+                    IconName::ArrowCircle,
+                    format!("{} runs an older agentz-server", client.label()).into(),
+                    Color::Muted,
+                ),
+                MachineStatus::Online => continue,
+                MachineStatus::Reconnecting(error) | MachineStatus::Attention { error, .. } => {
+                    let color = match client.status() {
+                        MachineStatus::Attention { .. } => Color::Warning,
+                        _ => Color::Muted,
+                    };
+                    let tooltip = match client.machine() {
+                        MachineId::Local => format!("Disconnected from agentz-server: {error}"),
+                        MachineId::Remote(_) => {
+                            format!("Disconnected from {}: {error}", client.label())
+                        }
+                    };
+                    (IconName::Disconnected, tooltip.into(), color)
                 }
             };
             icons.push(
                 div()
                     .id(SharedString::from(format!(
-                        "disconnected-{}",
+                        "machine-status-{}",
                         client.machine().slug()
                     )))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .cursor_pointer()
-                    .child(
-                        Icon::new(IconName::Disconnected)
-                            .size(IconSize::Small)
-                            .color(color),
-                    )
+                    .child(Icon::new(icon).size(IconSize::Small).color(color))
                     .tooltip(Tooltip::text(tooltip))
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_machine_settings(window, cx)),

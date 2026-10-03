@@ -443,6 +443,15 @@ impl Ssh {
     }
 }
 
+/// A session with a machine's server.
+pub struct Connected {
+    pub connection: Connection,
+    pub events: Events,
+    /// The server was already running from an older binary than the one installed now. It
+    /// keeps running until someone stops it, since stopping it stops its agents.
+    pub is_outdated: bool,
+}
+
 /// Connects to the server on the machine: checks its platform, uploads `server_binary`'s
 /// choice when the installed server differs, and starts the proxy. Call it on the runtime.
 pub async fn connect(
@@ -450,7 +459,7 @@ pub async fn connect(
     version: &str,
     server_binary: impl FnOnce(RemotePlatform) -> Result<PathBuf>,
     client_kind: ClientKind,
-) -> Result<(Connection, Events), SshError> {
+) -> Result<Connected, SshError> {
     connect_inner(ssh, version, server_binary, client_kind)
         .await
         .map_err(|error| SshError::classify(ssh.target(), &error))
@@ -461,7 +470,7 @@ async fn connect_inner(
     version: &str,
     server_binary: impl FnOnce(RemotePlatform) -> Result<PathBuf>,
     client_kind: ClientKind,
-) -> Result<(Connection, Events)> {
+) -> Result<Connected> {
     let (platform, installed) = ssh.probe(version).await?;
     let path = server_binary(platform)?;
     let binary = tokio::fs::read(&path)
@@ -476,13 +485,26 @@ async fn connect_inner(
         ssh.install(version, binary, &hash).await?;
     }
     let stream = ssh.proxy(version).await?;
-    Connection::new(
+    let (connection, events) = Connection::new(
         &tokio::runtime::Handle::current(),
         stream,
         client_kind,
         version.to_string(),
     )
-    .await
+    .await?;
+    let is_outdated = connection.welcome().build.as_deref() != Some(hash.as_str());
+    if is_outdated {
+        log::info!(
+            "{} runs an older agentz-server (pid {})",
+            ssh.target(),
+            connection.welcome().pid
+        );
+    }
+    Ok(Connected {
+        connection,
+        events,
+        is_outdated,
+    })
 }
 
 /// `~/.agentz/server/<version>`, quoted for the remote shell with `$HOME` left to it.
