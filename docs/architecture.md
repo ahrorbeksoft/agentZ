@@ -256,9 +256,25 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   its end is seen by the PTY hanging up or the pid disappearing), sends SIGWINCH so full-screen
   programs redraw, and says it's ready; the old one commits, stops saving and exits without
   hanging up on the terminals. Before the commit either side gives up and the old server
-  resumes its terminals. Agents end with the old server and load their sessions in the new
-  one; while turns run the server answers `TurnsRunning` and the app asks before stopping
-  them. Agents' own terminals end with them.
+  resumes its terminals.
+- **Agent handoff** (`agent_thread/src/wire.rs`, `AgentThread::{pause, hand_off, adopt}`): an
+  agent's pipes run through a wire under the ACP SDK that notes what's unanswered either way
+  (the SDK's request ids are UUIDs, so connections can't clash). Handing off pauses each
+  thread's wire between lines, then sends a marker through the SDK; once the thread sees it,
+  everything read before is applied. A thread whose session is open, waiting on nothing but
+  its turn, goes in the manifest (its `ThreadView`, session, MCP token, the turn's request id,
+  the agent's unanswered requests and partial lines) with its stdin, stdout and stderr after
+  the PTYs, its ACP terminals too. The new server opens a new SDK connection on the pipes
+  without `initialize` or loading the session, receives the unanswered requests again (a
+  waiting permission shows again), and takes the turn's answer out of the wire, ending the
+  turn after what came before it (a second marker). It answers `A` for ready-with-agents; an
+  older server answers `R` and the agents end with the old one. Agents are killed by
+  `ProcessGuard` rather than `kill_on_drop`, so a released one outlives the old server; an
+  adopted one's end is seen by its stdout closing. Others (starting, logging in, or with
+  another request in flight, or not paused within 5 seconds) end with the old server and load
+  their sessions in the new one; `TurnsRunning` lists only their running turns. MCP bridges
+  reconnect when their connection closes; follow-ups go in the manifest. While handing off,
+  changes to a paused thread are refused.
 - **Offline machines** stay visible, dimmed, with input disabled.
 - **Remote projects**: a path field completed from that machine (`directories.rs`, t3code's
   `filesystem.browse`).

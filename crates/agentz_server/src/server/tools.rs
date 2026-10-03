@@ -290,6 +290,10 @@ impl Server {
                 self.follow_ups.remove(&thread_id);
                 continue;
             };
+            // Handed to the next server with the thread.
+            if thread.is_paused() {
+                continue;
+            }
             match thread.status() {
                 ConnectionStatus::Failed(_) => {
                     self.follow_ups.remove(&thread_id);

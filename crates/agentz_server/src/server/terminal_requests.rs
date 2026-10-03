@@ -305,14 +305,20 @@ impl Server {
     }
 
     /// Stops reading the terminals to hand them to a newer server: each one whose process
-    /// runs, with its PTY. Agents' terminals end with their agents.
+    /// runs, with its PTY. An agent's terminals go with it, or end with it when it isn't handed
+    /// over.
     #[cfg(unix)]
     pub(super) fn pause_terminals(
         &mut self,
+        handed_threads: &collections::HashSet<projects::ThreadId>,
     ) -> Vec<(crate::handoff::HandedOffTerminal, std::os::fd::OwnedFd)> {
         let mut paused = Vec::new();
         for (key, running) in &mut self.terminals.running {
-            if matches!(key, TerminalKey::Agent { .. }) || running.terminal.exit().is_some() {
+            let ends_with_agent = matches!(
+                key,
+                TerminalKey::Agent { thread_id, .. } if !handed_threads.contains(thread_id)
+            );
+            if ends_with_agent || running.terminal.exit().is_some() {
                 continue;
             }
             let pty = match running.terminal.pty().try_clone_to_owned() {
@@ -359,10 +365,14 @@ impl Server {
 
     /// Takes over the terminals the server before handed over.
     #[cfg(unix)]
-    pub(super) fn adopt_terminals(&mut self, handed_over: crate::handoff::HandedOver) {
-        let crate::handoff::HandedOver { manifest, ptys } = handed_over;
-        self.terminals.palette = manifest.palette;
-        for (handed, pty) in manifest.terminals.into_iter().zip(ptys) {
+    pub(super) fn adopt_terminals(
+        &mut self,
+        terminals: Vec<crate::handoff::HandedOffTerminal>,
+        palette: Option<Vec<[u8; 3]>>,
+        ptys: Vec<std::os::fd::OwnedFd>,
+    ) {
+        self.terminals.palette = palette;
+        for (handed, pty) in terminals.into_iter().zip(ptys) {
             let key = handed.key;
             let serial = self.terminals.next_serial;
             self.terminals.next_serial += 1;

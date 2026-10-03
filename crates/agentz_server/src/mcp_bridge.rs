@@ -29,7 +29,7 @@ new threads, never merely because they said subagent. When this project is also 
 
 pub(crate) async fn run(version: &str) -> Result<()> {
     let token = std::env::var("AGENTZ_MCP_TOKEN").context("AGENTZ_MCP_TOKEN isn't set")?;
-    let connection = crate::connect_for_tools(ClientKind::Mcp).await?;
+    let mut connection = crate::connect_for_tools(ClientKind::Mcp).await?;
 
     let (outgoing, mut outgoing_messages) = mpsc::unbounded::<Value>();
     let writer = tokio::spawn(async move {
@@ -89,64 +89,20 @@ pub(crate) async fn run(version: &str) -> Result<()> {
                 );
             }
             "ping" => send(&outgoing, result_response(id, json!({}))),
-            "tools/list" => {
-                let response = connection.request(Request::ListTools);
-                let outgoing = outgoing.clone();
-                tokio::spawn(async move {
-                    let message = match response.await {
-                        Ok(Response::Tools(tools)) => result_response(id, json!({"tools": tools})),
-                        Ok(response) => error_response(
-                            id,
-                            -32603,
-                            &format!("unexpected response: {response:?}"),
-                        ),
-                        Err(error) => error_response(id, -32603, &format!("{error:#}")),
-                    };
-                    send(&outgoing, message);
-                });
+            "tools/list" | "tools/call" if connection.is_closed() => {
+                // The server was updated: the new one listens on the same socket, and knows
+                // this bridge's credential.
+                match crate::connect_for_tools(ClientKind::Mcp).await {
+                    Ok(reconnected) => connection = reconnected,
+                    Err(error) => {
+                        send(&outgoing, error_response(id, -32603, &format!("{error:#}")));
+                        continue;
+                    }
+                }
+                handle(&connection, &outgoing, &token, id, &method, params);
             }
-            "tools/call" => {
-                let Some(name) = params["name"].as_str() else {
-                    send(&outgoing, error_response(id, -32602, "name is required"));
-                    continue;
-                };
-                let response = connection.request(Request::CallTool {
-                    caller: ToolCaller::Session(token.clone()),
-                    name: name.to_string(),
-                    arguments: params.get("arguments").cloned().unwrap_or(Value::Null),
-                });
-                let outgoing = outgoing.clone();
-                tokio::spawn(async move {
-                    let message = match response.await {
-                        Ok(Response::ToolResult(result)) => {
-                            let text = serde_json::to_string_pretty(&result.value)
-                                .unwrap_or_else(|_| result.value.to_string());
-                            let mut tool_result = json!({
-                                "content": [{"type": "text", "text": text}],
-                                "isError": result.is_error,
-                            });
-                            if result.value.is_object() {
-                                tool_result["structuredContent"] = result.value;
-                            }
-                            result_response(id, tool_result)
-                        }
-                        Ok(response) => error_response(
-                            id,
-                            -32603,
-                            &format!("unexpected response: {response:?}"),
-                        ),
-                        // MCP reports failures to run the tool as tool errors, so the agent
-                        // sees them.
-                        Err(error) => result_response(
-                            id,
-                            json!({
-                                "content": [{"type": "text", "text": format!("agentZ: {error:#}")}],
-                                "isError": true,
-                            }),
-                        ),
-                    };
-                    send(&outgoing, message);
-                });
+            "tools/list" | "tools/call" => {
+                handle(&connection, &outgoing, &token, id, &method, params)
             }
             _ => send(
                 &outgoing,
@@ -158,6 +114,75 @@ pub(crate) async fn run(version: &str) -> Result<()> {
     // process.
     writer.abort();
     Ok(())
+}
+
+/// Passes a `tools/list` or `tools/call` on to the server, answering when it does.
+fn handle(
+    connection: &agentz_client::Connection,
+    outgoing: &mpsc::UnboundedSender<Value>,
+    token: &str,
+    id: Value,
+    method: &str,
+    params: Value,
+) {
+    match method {
+        "tools/list" => {
+            let response = connection.request(Request::ListTools);
+            let outgoing = outgoing.clone();
+            tokio::spawn(async move {
+                let message = match response.await {
+                    Ok(Response::Tools(tools)) => result_response(id, json!({"tools": tools})),
+                    Ok(response) => {
+                        error_response(id, -32603, &format!("unexpected response: {response:?}"))
+                    }
+                    Err(error) => error_response(id, -32603, &format!("{error:#}")),
+                };
+                send(&outgoing, message);
+            });
+        }
+        "tools/call" => {
+            let Some(name) = params["name"].as_str() else {
+                send(outgoing, error_response(id, -32602, "name is required"));
+                return;
+            };
+            let response = connection.request(Request::CallTool {
+                caller: ToolCaller::Session(token.to_string()),
+                name: name.to_string(),
+                arguments: params.get("arguments").cloned().unwrap_or(Value::Null),
+            });
+            let outgoing = outgoing.clone();
+            tokio::spawn(async move {
+                let message = match response.await {
+                    Ok(Response::ToolResult(result)) => {
+                        let text = serde_json::to_string_pretty(&result.value)
+                            .unwrap_or_else(|_| result.value.to_string());
+                        let mut tool_result = json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": result.is_error,
+                        });
+                        if result.value.is_object() {
+                            tool_result["structuredContent"] = result.value;
+                        }
+                        result_response(id, tool_result)
+                    }
+                    Ok(response) => {
+                        error_response(id, -32603, &format!("unexpected response: {response:?}"))
+                    }
+                    // MCP reports failures to run the tool as tool errors, so the agent
+                    // sees them.
+                    Err(error) => result_response(
+                        id,
+                        json!({
+                            "content": [{"type": "text", "text": format!("agentZ: {error:#}")}],
+                            "isError": true,
+                        }),
+                    ),
+                };
+                send(&outgoing, message);
+            });
+        }
+        _ => {}
+    }
 }
 
 fn send(outgoing: &mpsc::UnboundedSender<Value>, message: Value) {

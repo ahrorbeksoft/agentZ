@@ -32,6 +32,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use gpui_shared_string::SharedString;
 use projects::{ProjectStore, ThreadCreator, ThreadId};
 use registry::{AgentRegistryStore, CommandFuture, RegistryMessage};
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use util::ResultExt as _;
 
@@ -86,7 +87,8 @@ pub(crate) enum Input {
 
 /// A message for a thread that was busy, sent once its turn ends: from an agent, or word that
 /// a task it delegated has ended.
-struct FollowUp {
+#[derive(Serialize, Deserialize)]
+pub(crate) struct FollowUp {
     text: String,
     from: ThreadCreator,
     /// The subthread whose end this announces.
@@ -122,6 +124,11 @@ pub(crate) struct Server {
     listener: Option<std::os::fd::RawFd>,
     /// A handoff to a newer server is under way.
     handing_off: bool,
+    /// One waiting for threads to pause, to go on once [`Self::pausing_threads`] is empty.
+    #[cfg(unix)]
+    pending_hand_off: Option<hand_off::PendingHandOff>,
+    /// Threads whose connections are pausing to hand their agents over.
+    pausing_threads: HashSet<ThreadId>,
     /// Set once it's done, as the server stops.
     handed_off: Arc<AtomicBool>,
     /// The MCP bridges' credentials, each given to one thread's agent. Dropped with the agent.
@@ -199,6 +206,9 @@ impl Server {
             #[cfg(unix)]
             listener: config.listener,
             handing_off: false,
+            #[cfg(unix)]
+            pending_hand_off: None,
+            pausing_threads: HashSet::default(),
             handed_off,
             tool_sessions: HashMap::default(),
             follow_ups: HashMap::default(),
@@ -232,7 +242,18 @@ impl Server {
         server.refresh_repositories();
         #[cfg(unix)]
         if let Some(handed_over) = config.handed_over {
-            server.adopt_terminals(handed_over);
+            let crate::handoff::HandedOver {
+                manifest,
+                ptys,
+                agent_pipes,
+            } = handed_over;
+            server.adopt_terminals(manifest.terminals, manifest.palette, ptys);
+            server.adopt_agents(manifest.agents, agent_pipes);
+            server.follow_ups = manifest
+                .follow_ups
+                .into_iter()
+                .map(|(thread_id, follow_ups)| (thread_id, follow_ups.into()))
+                .collect();
         }
         server.restore_spaces();
         server.spawn_then(machine_kind::detect(), |server, detected| {
@@ -893,6 +914,16 @@ impl Server {
     ) -> Result<R> {
         let thread = match connection {
             ConnectionId::Thread(thread_id) => {
+                // What's sent to it now would be lost with this server.
+                if self
+                    .threads
+                    .get(&thread_id)
+                    .is_some_and(AgentThread::is_paused)
+                {
+                    return Err(anyhow!(
+                        "agentZ is updating its server; try again in a moment"
+                    ));
+                }
                 if !self.threads.contains_key(&thread_id) {
                     let thread = self.start_thread(thread_id)?;
                     self.threads.insert(thread_id, thread);
@@ -973,30 +1004,39 @@ impl Server {
             }
             .boxed();
         }
-        let checkpoints = Checkpoints::new(cwd.clone(), &self.machine.id, thread_id);
-        let inputs = self.inputs.clone();
-        let terminal_host: agent_thread::TerminalHost = Arc::new(move |request| {
-            inputs
-                .unbounded_send(Input::AgentTerminal(thread_id, request))
-                .ok();
-        });
         let (mut agent_thread, inbox) = AgentThread::start(
             self.runtime.clone(),
             self.agent_name(&agent_id),
             command,
-            cwd,
+            cwd.clone(),
             previous_session,
-            Some(terminal_host),
+            Some(self.agent_terminal_host(thread_id)),
         );
         agent_thread.set_mcp_servers(mcp_servers);
-        agent_thread.set_turn_hook(Arc::new(move |point| {
-            let checkpoints = checkpoints.clone();
-            async move { checkpoints.on_turn(point).await }.boxed()
-        }));
+        agent_thread.set_turn_hook(self.turn_hook(cwd, thread_id));
         agent_thread.set_defaults(self.agent_settings.get(&agent_id).session_defaults());
         let connection = ConnectionId::Thread(thread_id);
         self.forward(inbox, move |message| Input::Thread(connection, message));
         Ok(agent_thread)
+    }
+
+    /// Runs the `terminal/*` requests of a thread's agent.
+    fn agent_terminal_host(&self, thread_id: ThreadId) -> agent_thread::TerminalHost {
+        let inputs = self.inputs.clone();
+        Arc::new(move |request| {
+            inputs
+                .unbounded_send(Input::AgentTerminal(thread_id, request))
+                .ok();
+        })
+    }
+
+    /// Takes a checkpoint as each of a thread's turns starts and ends.
+    fn turn_hook(&self, cwd: PathBuf, thread_id: ThreadId) -> agent_thread::TurnHook {
+        let checkpoints = Checkpoints::new(cwd, &self.machine.id, thread_id);
+        Arc::new(move |point| {
+            let checkpoints = checkpoints.clone();
+            async move { checkpoints.on_turn(point).await }.boxed()
+        })
     }
 
     /// The registry's agents, then the custom ones, which count as installed.
@@ -1072,6 +1112,7 @@ impl Server {
             return;
         };
         let events = thread.take_events();
+        let mut paused = false;
         let model = thread.model_name();
         let config_options = thread.config_options().to_vec();
         let modes = thread.modes().cloned();
@@ -1123,9 +1164,16 @@ impl Server {
                             .update(agent_id, |settings| settings.login_method = None);
                     }
                 }
+                (ConnectionId::Thread(_), AgentThreadEvent::Paused) => paused = true,
                 (ConnectionId::Account(_), _) => {}
             }
         }
+        #[cfg(unix)]
+        if paused && let ConnectionId::Thread(thread_id) = connection {
+            self.thread_paused(thread_id);
+        }
+        #[cfg(not(unix))]
+        let _ = paused;
 
         // Remembered so clients can name the model of threads that aren't open.
         if let (ConnectionId::Thread(thread_id), Some(model)) = (connection, model) {

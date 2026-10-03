@@ -7,17 +7,20 @@
 //! [`ThreadMessage`]s, which the thread's owner passes to [`AgentThread::handle`]. What the
 //! owner should hear about queues up as [`AgentThreadEvent`]s.
 
+mod wire;
+
 use std::collections::VecDeque;
 use std::future::Future;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
-use agent_client_protocol::{Agent, Client, ConnectionTo, Lines, Responder};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 pub use agentz_protocol::thread::{
     ConnectionStatus, ContextUsage, DiffLineKind, Entry, FileDiff, PermissionOption,
     PermissionRequest, PlanItem, SessionDefaults, SessionRestore, ThreadState, ThreadView,
@@ -26,12 +29,15 @@ pub use agentz_protocol::thread::{
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
-use futures::{FutureExt as _, StreamExt as _};
+use futures::{FutureExt as _, SinkExt as _};
 use gpui_shared_string::SharedString;
 use registry::AgentCommand;
 pub use registry::CommandFuture;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::task::JoinSet;
+
+use crate::wire::{ANSWER_MARKER_SESSION, PAUSE_MARKER_SESSION, Parked, Wire, marker_line};
 
 const STDERR_LINES_KEPT: usize = 20;
 
@@ -51,6 +57,9 @@ pub enum AgentThreadEvent {
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
     LoggedOut,
+    /// The connection paused after [`AgentThread::pause`], with everything the agent sent
+    /// before handled: the thread can be handed off.
+    Paused,
 }
 
 /// Work the owner does around every turn, such as taking checkpoints. The turn waits for it:
@@ -125,6 +134,14 @@ enum MessageKind {
         result: std::result::Result<(), agent_client_protocol::Error>,
     },
     PromptFinished(std::result::Result<acp::PromptResponse, agent_client_protocol::Error>),
+    /// The pause's marker made it through the SDK.
+    PauseMarker,
+    /// The answer to an adopted agent's prompt arrived, after what the agent sent before it.
+    AnswerMarker,
+    /// A pause that was called off finished; the connection resumes.
+    PauseCalledOff(Parked),
+    /// An adopted agent's new connection is ready.
+    Reconnected(ConnectionTo<Agent>),
 }
 
 #[derive(Clone)]
@@ -188,6 +205,82 @@ pub struct AgentThread {
     /// The agent process, its connection and requests in flight. Dropping the thread (or
     /// reloading it) aborts them, which also stops the agent.
     tasks: JoinSet<()>,
+    /// The agent's pipes under the SDK.
+    wire: Option<Wire>,
+    /// The agent's process, which [`Self::release`] leaves running.
+    process: Option<AgentProcess>,
+    /// Stops an adopted agent, which isn't this process's child, with the thread.
+    adopted_process: Option<ProcessGuard>,
+    /// A pause in progress (see [`Self::pause`]).
+    pausing: Option<Arc<Mutex<PauseSlot>>>,
+    /// An adopted agent's session, open once its new connection is.
+    pending_session: Option<acp::SessionId>,
+}
+
+/// The agent's process id, and whether stopping the thread stops it.
+#[derive(Clone)]
+struct AgentProcess {
+    pid: u32,
+    armed: Arc<AtomicBool>,
+}
+
+/// Kills the agent when dropped, unless disarmed: once it exited (its id may be reused) or
+/// was handed to another server.
+struct ProcessGuard(AgentProcess);
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if self.0.armed.swap(false, Ordering::SeqCst) {
+            kill(self.0.pid);
+        }
+    }
+}
+
+fn kill(pid: u32) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: only sends a signal to the agent's process.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        log::warn!(
+            "failed to stop the agent (pid {pid}): {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[derive(Default)]
+struct PauseSlot {
+    parked: Option<Parked>,
+    called_off: bool,
+}
+
+/// What a thread knew when its agent was handed to another server, to go on from there with
+/// [`AgentThread::adopt`].
+#[derive(Serialize, Deserialize)]
+pub struct AgentSnapshot {
+    view: ThreadView,
+    session_id: acp::SessionId,
+    previous_session: Option<acp::SessionId>,
+    pending_title: Option<String>,
+    mcp_servers: Vec<acp::McpServer>,
+    defaults: SessionDefaults,
+    stderr_lines: Vec<String>,
+    pid: u32,
+    /// The prompt the agent works on, by its JSON-RPC id.
+    prompt_id: Option<Value>,
+    /// Requests the agent waits on an answer to, as it sent them.
+    unanswered: Vec<String>,
+    stdout_rest: Vec<u8>,
+    stderr_rest: Vec<u8>,
+}
+
+/// A thread's agent, handed to another server: the snapshot and the agent's pipes.
+pub struct HandedOffAgent {
+    pub snapshot: AgentSnapshot,
+    pub stdin: OwnedFd,
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
 }
 
 impl std::ops::Deref for AgentThread {
@@ -285,6 +378,11 @@ impl AgentThread {
             messages,
             generation: 0,
             tasks: JoinSet::new(),
+            wire: None,
+            process: None,
+            adopted_process: None,
+            pausing: None,
+            pending_session: None,
         };
         (this, inbox)
     }
@@ -372,6 +470,8 @@ impl AgentThread {
         match message.kind {
             MessageKind::Connected(Ok((command, connected))) => {
                 self.view.state.command = Some(command);
+                self.wire = Some(connected.wire);
+                self.process = Some(connected.process);
                 self.connection = Some(connected.connection);
                 self.view.state.capabilities = connected.capabilities;
                 self.view.state.auth_methods = connected.auth_methods;
@@ -386,7 +486,43 @@ impl AgentThread {
             }
             MessageKind::Incoming(incoming) => self.handle_incoming(incoming),
             MessageKind::Stderr(line) => self.record_stderr(line),
-            MessageKind::Exited(message) => self.fail(message),
+            MessageKind::Exited(message) => {
+                // Its id may be reused now.
+                if let Some(guard) = &self.adopted_process {
+                    guard.0.armed.store(false, Ordering::SeqCst);
+                }
+                self.fail(message)
+            }
+            MessageKind::PauseMarker => {
+                let parked = self
+                    .pausing
+                    .as_ref()
+                    .and_then(|slot| lock_slot(slot).parked.take());
+                if let (Some(parked), Some(wire)) = (parked, &mut self.wire) {
+                    wire.park(parked);
+                    self.emit(AgentThreadEvent::Paused);
+                }
+            }
+            MessageKind::PauseCalledOff(parked) => {
+                if let (Some(wire), Some(runtime)) = (&mut self.wire, &self.runtime) {
+                    wire.park(parked);
+                    wire.resume(runtime);
+                }
+            }
+            MessageKind::Reconnected(connection) => self.reconnected(connection),
+            MessageKind::AnswerMarker => {
+                let Some(answer) = self.wire.as_ref().and_then(Wire::taken_answer) else {
+                    return;
+                };
+                let response = prompt_answer(answer);
+                let hook = self.turn_hook.clone();
+                self.spawn(async move {
+                    if let Some(hook) = hook {
+                        hook(TurnPoint::Ended).await;
+                    }
+                    MessageKind::PromptFinished(response)
+                });
+            }
             MessageKind::SessionOpened { connection, result } => {
                 self.session_opened(connection, result)
             }
@@ -468,6 +604,10 @@ impl AgentThread {
         };
         // Aborting the tasks stops the agent process along with its connection.
         self.tasks.abort_all();
+        self.wire = None;
+        self.process = None;
+        self.adopted_process = None;
+        self.pausing = None;
         self.generation += 1;
         self.connection = None;
         self.session = None;
@@ -481,6 +621,241 @@ impl AgentThread {
         self.view.state.status = ConnectionStatus::Connecting;
         self.set_working(false);
         self.connect_agent(futures::future::ready(Ok(command)).boxed());
+    }
+
+    /// Pauses the connection between messages, to hand the agent to another server with
+    /// [`Self::hand_off`]. [`AgentThreadEvent::Paused`] follows once everything the agent sent
+    /// before the pause has been handled, so the thread's state is complete. Returns whether
+    /// pausing started.
+    pub fn pause(&mut self) -> bool {
+        if self.pausing.is_some() {
+            return false;
+        }
+        let Some(wire) = &mut self.wire else {
+            return false;
+        };
+        if wire.is_paused() {
+            return false;
+        }
+        let paused = wire.pause();
+        let slot = Arc::new(Mutex::new(PauseSlot::default()));
+        self.pausing = Some(slot.clone());
+        let sender = self.sender();
+        self.spawn_task(async move {
+            let Some(parked) = paused.await else {
+                return;
+            };
+            let mut pause = lock_slot(&slot);
+            if pause.called_off {
+                drop(pause);
+                sender.send(MessageKind::PauseCalledOff(parked)).ok();
+                return;
+            }
+            let incoming = parked.incoming();
+            pause.parked = Some(parked);
+            drop(pause);
+            // Behind every line the agent sent before the pause, the SDK passes this on last.
+            incoming
+                .unbounded_send(Ok(marker_line(PAUSE_MARKER_SESSION)))
+                .ok();
+        });
+        true
+    }
+
+    /// Whether the connection is paused or pausing: what's sent to the agent waits.
+    pub fn is_paused(&self) -> bool {
+        self.pausing.is_some() || self.wire.as_ref().is_some_and(Wire::is_paused)
+    }
+
+    /// Whether the thread could be handed off once paused: its session is open, and it isn't
+    /// starting or ending a turn, or waiting on the agent for anything but the turn.
+    pub fn can_hand_off(&self) -> bool {
+        self.view.state.status == ConnectionStatus::Ready
+            && self.session.is_some()
+            && (self.process.is_some() || self.adopted_process.is_some())
+            && self.queued_prompts.is_empty()
+            && self.wire.as_ref().is_some_and(|wire| {
+                wire.prompt_in_flight()
+                    .is_ok_and(|prompt| prompt.is_some() == self.is_working())
+            })
+    }
+
+    /// What another server needs to take over the paused agent with [`Self::adopt`]. Fails
+    /// when the thread can't be handed off as it is; then [`Self::resume`] it. Until
+    /// [`Self::release`], this thread still runs the agent.
+    pub fn hand_off(&mut self) -> Result<HandedOffAgent> {
+        anyhow::ensure!(self.can_hand_off(), "the agent is busy with something else");
+        let session_id = self
+            .session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .context("the session isn't open")?;
+        let pid = self.process.as_ref().map(|process| process.pid);
+        let pid = pid.or_else(|| self.adopted_process.as_ref().map(|guard| guard.0.pid));
+        let pid = pid.context("the agent's process is unknown")?;
+        let wire = self
+            .wire
+            .as_mut()
+            .context("the agent isn't connected")?
+            .hand_off()?;
+        anyhow::ensure!(
+            wire.prompt_id.is_some() == self.is_working(),
+            "the turn is starting or ending"
+        );
+        let mut view = self.view.clone();
+        // The new connection is asked again, which shows them again.
+        view.state.permission_requests.clear();
+        Ok(HandedOffAgent {
+            snapshot: AgentSnapshot {
+                view,
+                session_id,
+                previous_session: self.previous_session.clone(),
+                pending_title: self.pending_title.clone(),
+                mcp_servers: self.mcp_servers.clone(),
+                defaults: self.defaults.clone(),
+                stderr_lines: self.stderr_lines.iter().cloned().collect(),
+                pid,
+                prompt_id: wire.prompt_id,
+                unanswered: wire.unanswered,
+                stdout_rest: wire.stdout_rest,
+                stderr_rest: wire.stderr_rest,
+            },
+            stdin: wire.stdin,
+            stdout: wire.stdout,
+            stderr: wire.stderr,
+        })
+    }
+
+    /// Goes on after a pause, as when handing off failed.
+    pub fn resume(&mut self) {
+        if let Some(slot) = self.pausing.take() {
+            let mut pause = lock_slot(&slot);
+            pause.called_off = true;
+            if let (Some(parked), Some(wire)) = (pause.parked.take(), &mut self.wire) {
+                wire.park(parked);
+            }
+        }
+        if let (Some(wire), Some(runtime)) = (&mut self.wire, &self.runtime) {
+            wire.resume(runtime);
+        }
+    }
+
+    /// Leaves the agent running when the thread is dropped: another server took it over.
+    pub fn release(&mut self) {
+        if let Some(process) = &self.process {
+            process.armed.store(false, Ordering::SeqCst);
+        }
+        if let Some(guard) = &self.adopted_process {
+            guard.0.armed.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Takes over an agent another server handed off (see [`Self::hand_off`]): a new
+    /// connection on its pipes goes on with the open session and the turn in progress, without
+    /// starting the agent again.
+    pub fn adopt(
+        runtime: tokio::runtime::Handle,
+        snapshot: AgentSnapshot,
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+        terminal_host: Option<TerminalHost>,
+    ) -> Result<(Self, ThreadInbox)> {
+        let process = AgentProcess {
+            pid: snapshot.pid,
+            armed: Arc::new(AtomicBool::new(true)),
+        };
+        let (mut this, inbox) = Self::new(
+            Some(runtime.clone()),
+            snapshot.view.state.agent_name.clone(),
+            ConnectionStatus::Connecting,
+            snapshot.view.state.cwd.clone(),
+        );
+        // Stops the agent if adopting fails below.
+        this.adopted_process = Some(ProcessGuard(process));
+        let is_working = snapshot.view.is_working();
+        this.view = snapshot.view;
+        // Ready once the new connection is.
+        this.view.state.status = ConnectionStatus::Connecting;
+        this.previous_session = snapshot.previous_session;
+        this.pending_title = snapshot.pending_title;
+        this.mcp_servers = snapshot.mcp_servers;
+        this.defaults = snapshot.defaults;
+        this.stderr_lines = snapshot.stderr_lines.into();
+        this.terminal_host = terminal_host.clone();
+        if is_working {
+            this.emit(AgentThreadEvent::WorkingChanged(true));
+        }
+
+        let sender = this.sender();
+        let (incoming, incoming_lines) = mpsc::unbounded();
+        let (outgoing_lines, outgoing) = mpsc::unbounded();
+        let on_stderr = stderr_reporter(sender.clone());
+        let on_exit: Arc<dyn Fn() + Send + Sync> = {
+            let sender = sender.clone();
+            Arc::new(move || {
+                sender
+                    .send(MessageKind::Exited("The agent exited.".to_string()))
+                    .ok();
+            })
+        };
+        let mut wire = Wire::new(
+            &runtime,
+            stdin,
+            stdout,
+            stderr,
+            (snapshot.stdout_rest, snapshot.stderr_rest),
+            incoming,
+            outgoing,
+            on_stderr,
+            Some(on_exit),
+        )?;
+        if let Some(id) = &snapshot.prompt_id {
+            wire.take_answer(id);
+        }
+        wire.receive_again(snapshot.unanswered);
+        wire.resume(&runtime);
+        this.wire = Some(wire);
+
+        let session_id = snapshot.session_id;
+        let transport = transport(outgoing_lines, incoming_lines);
+        let (connection_future, connection) = client_connection(transport, sender, terminal_host);
+        let sender = this.sender();
+        this.spawn_task(async move {
+            let mut connection_tasks = JoinSet::new();
+            connection_tasks.spawn(connection_future);
+            match connection.await {
+                Ok(connection) => {
+                    sender.send(MessageKind::Reconnected(connection)).ok();
+                }
+                Err(_) => {
+                    sender
+                        .send(MessageKind::Exited(
+                            "The agent's connection closed.".to_string(),
+                        ))
+                        .ok();
+                }
+            }
+            while connection_tasks.join_next().await.is_some() {}
+        });
+        this.session = None;
+        this.pending_session = Some(session_id);
+        Ok((this, inbox))
+    }
+
+    fn reconnected(&mut self, connection: ConnectionTo<Agent>) {
+        let Some(session_id) = self.pending_session.take() else {
+            return;
+        };
+        self.connection = Some(connection.clone());
+        self.session = Some(Session {
+            connection,
+            session_id,
+        });
+        self.view.state.status = ConnectionStatus::Ready;
+        for prompt in std::mem::take(&mut self.queued_prompts) {
+            self.send_to_agent(prompt);
+        }
     }
 
     /// Zed's "Reauthenticate": shows the agent's login methods again.
@@ -1189,6 +1564,8 @@ async fn connect(
     terminal_host: Option<TerminalHost>,
     agent_tasks: &mut JoinSet<()>,
 ) -> Result<Connected> {
+    // Stopped by `ProcessGuard` rather than on drop, so a handed-off agent can outlive this
+    // process.
     let mut child = tokio::process::Command::new(&command.path)
         .args(&command.args)
         .envs(&command.env)
@@ -1196,142 +1573,50 @@ async fn connect(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("starting {}", command.path.display()))?;
+    let process = AgentProcess {
+        pid: child.id().context("the agent exited at once")?,
+        armed: Arc::new(AtomicBool::new(true)),
+    };
+    let guard = ProcessGuard(process.clone());
     let stdin = child.stdin.take().context("agent has no stdin")?;
     let stdout = child.stdout.take().context("agent has no stdout")?;
     let stderr = child.stderr.take().context("agent has no stderr")?;
-
-    let incoming_lines = lines(stdout).boxed();
-    let outgoing_lines = Box::pin(futures::sink::unfold(
-        stdin,
-        async move |mut writer, line: String| {
-            let mut bytes = line.into_bytes();
-            bytes.push(b'\n');
-            writer.write_all(&bytes).await?;
-            writer.flush().await?;
-            Ok::<_, std::io::Error>(writer)
-        },
-    ));
-
-    let (connection_sender, connection_receiver) = oneshot::channel();
-    let supports_terminals = terminal_host.is_some();
-    let host = move |request: TerminalRequest| match &terminal_host {
-        Some(host) => host(request),
-        None => refuse_terminal_request(request),
-    };
-    let host = Arc::new(host);
-    let connection_future = {
-        let notification_sender = sender.clone();
-        let permission_sender = sender.clone();
-        let (create_host, output_host, wait_host, kill_host, release_host) = (
-            host.clone(),
-            host.clone(),
-            host.clone(),
-            host.clone(),
-            host.clone(),
-        );
-        Client
-            .builder()
-            .name("agentZ")
-            .on_receive_notification(
-                async move |notification: acp::SessionNotification, _connection| {
-                    notification_sender
-                        .send(MessageKind::Incoming(Incoming::Notification(notification)))
-                        .ok();
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_notification!(),
-            )
-            .on_receive_request(
-                async move |request: acp::RequestPermissionRequest,
-                            responder: Responder<acp::RequestPermissionResponse>,
-                            _connection| {
-                    if let Err(message) = permission_sender.send(MessageKind::Incoming(
-                        Incoming::Permission(request, responder),
-                    )) && let MessageKind::Incoming(Incoming::Permission(_, responder)) =
-                        *message
-                    {
-                        responder.respond(acp::RequestPermissionResponse::new(
-                            acp::RequestPermissionOutcome::Cancelled,
-                        ))?;
-                    }
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .on_receive_request(
-                async move |request: acp::CreateTerminalRequest, responder, _connection| {
-                    create_host(TerminalRequest::Create(request, responder));
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .on_receive_request(
-                async move |request: acp::TerminalOutputRequest, responder, _connection| {
-                    output_host(TerminalRequest::Output(request, responder));
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .on_receive_request(
-                async move |request: acp::WaitForTerminalExitRequest, responder, _connection| {
-                    wait_host(TerminalRequest::WaitForExit(request, responder));
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .on_receive_request(
-                async move |request: acp::KillTerminalRequest, responder, _connection| {
-                    kill_host(TerminalRequest::Kill(request, responder));
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .on_receive_request(
-                async move |request: acp::ReleaseTerminalRequest, responder, _connection| {
-                    release_host(TerminalRequest::Release(request, responder));
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .connect_with(
-                Lines::new(outgoing_lines, incoming_lines),
-                move |connection: ConnectionTo<Agent>| async move {
-                    connection_sender.send(connection).ok();
-                    // Keep the connection open until the transport closes.
-                    futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
-                },
-            )
-    };
-
-    agent_tasks.spawn(async move {
-        if let Err(error) = connection_future.await {
-            log::error!("ACP connection error: {error:?}");
-        }
-    });
     agent_tasks.spawn({
         let sender = sender.clone();
         async move {
-            let mut stderr_lines = lines(stderr).boxed();
-            while let Some(Ok(line)) = stderr_lines.next().await {
-                log::warn!("agent stderr: {line}");
-                if sender.send(MessageKind::Stderr(line)).is_err() {
-                    break;
-                }
-            }
+            let message = match child.wait().await {
+                Ok(status) => format!("The agent exited ({status})."),
+                Err(error) => format!("The agent stopped: {error}"),
+            };
+            // Its id may be reused now.
+            guard.0.armed.store(false, Ordering::SeqCst);
+            sender.send(MessageKind::Exited(message)).ok();
         }
     });
-    agent_tasks.spawn(async move {
-        let message = match child.wait().await {
-            Ok(status) => format!("The agent exited ({status})."),
-            Err(error) => format!("The agent stopped: {error}"),
-        };
-        sender.send(MessageKind::Exited(message)).ok();
-    });
 
-    let connection = connection_receiver
+    let (incoming, incoming_lines) = mpsc::unbounded();
+    let (outgoing_lines, outgoing) = mpsc::unbounded();
+    let runtime = tokio::runtime::Handle::current();
+    let mut wire = Wire::new(
+        &runtime,
+        stdin.into_owned_fd()?,
+        stdout.into_owned_fd()?,
+        stderr.into_owned_fd()?,
+        (Vec::new(), Vec::new()),
+        incoming,
+        outgoing,
+        stderr_reporter(sender.clone()),
+        None,
+    )?;
+    wire.resume(&runtime);
+
+    let supports_terminals = terminal_host.is_some();
+    let transport = transport(outgoing_lines, incoming_lines);
+    let (connection_future, connection) = client_connection(transport, sender, terminal_host);
+    agent_tasks.spawn(connection_future);
+    let connection = connection
         .await
         .map_err(|_| anyhow!("the agent closed the connection before it was ready"))?;
 
@@ -1355,21 +1640,159 @@ async fn connect(
         capabilities: initialize_response.agent_capabilities,
         auth_methods: initialize_response.auth_methods,
         agent_info: initialize_response.agent_info,
+        wire,
+        process,
     })
 }
 
-/// The lines of an agent's output stream.
-fn lines(
-    reader: impl tokio::io::AsyncRead + Send + Unpin + 'static,
-) -> impl futures::Stream<Item = std::io::Result<String>> + Send + 'static {
-    futures::stream::unfold(
-        tokio::io::BufReader::new(reader).lines(),
-        async |mut lines| match lines.next_line().await {
-            Ok(Some(line)) => Some((Ok(line), lines)),
-            Ok(None) => None,
-            Err(error) => Some((Err(error), lines)),
-        },
-    )
+type Transport = agent_client_protocol::Lines<
+    futures::sink::SinkMapErr<mpsc::UnboundedSender<String>, fn(mpsc::SendError) -> std::io::Error>,
+    mpsc::UnboundedReceiver<std::io::Result<String>>,
+>;
+
+/// Lines over the channels the wire passes them through.
+fn transport(
+    outgoing: mpsc::UnboundedSender<String>,
+    incoming: mpsc::UnboundedReceiver<std::io::Result<String>>,
+) -> Transport {
+    let to_io_error: fn(mpsc::SendError) -> std::io::Error = std::io::Error::other;
+    agent_client_protocol::Lines::new(outgoing.sink_map_err(to_io_error), incoming)
+}
+
+/// The client side of an ACP connection on `transport`. Run the future for as long as the
+/// connection lasts; the connection itself arrives once it's set up.
+fn client_connection(
+    transport: Transport,
+    sender: MessageSender,
+    terminal_host: Option<TerminalHost>,
+) -> (
+    BoxFuture<'static, ()>,
+    oneshot::Receiver<ConnectionTo<Agent>>,
+) {
+    let (connection_sender, connection_receiver) = oneshot::channel();
+    let host = move |request: TerminalRequest| match &terminal_host {
+        Some(host) => host(request),
+        None => refuse_terminal_request(request),
+    };
+    let host = Arc::new(host);
+    let notification_sender = sender.clone();
+    let permission_sender = sender;
+    let (create_host, output_host, wait_host, kill_host, release_host) = (
+        host.clone(),
+        host.clone(),
+        host.clone(),
+        host.clone(),
+        host.clone(),
+    );
+    let connection_future = Client
+        .builder()
+        .name("agentZ")
+        .on_receive_notification(
+            async move |notification: acp::SessionNotification, _connection| {
+                let message = match &*notification.session_id.0 {
+                    PAUSE_MARKER_SESSION => MessageKind::PauseMarker,
+                    ANSWER_MARKER_SESSION => MessageKind::AnswerMarker,
+                    _ => MessageKind::Incoming(Incoming::Notification(notification)),
+                };
+                notification_sender.send(message).ok();
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: acp::RequestPermissionRequest,
+                        responder: Responder<acp::RequestPermissionResponse>,
+                        _connection| {
+                if let Err(message) = permission_sender.send(MessageKind::Incoming(
+                    Incoming::Permission(request, responder),
+                )) && let MessageKind::Incoming(Incoming::Permission(_, responder)) = *message
+                {
+                    responder.respond(acp::RequestPermissionResponse::new(
+                        acp::RequestPermissionOutcome::Cancelled,
+                    ))?;
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::CreateTerminalRequest, responder, _connection| {
+                create_host(TerminalRequest::Create(request, responder));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::TerminalOutputRequest, responder, _connection| {
+                output_host(TerminalRequest::Output(request, responder));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::WaitForTerminalExitRequest, responder, _connection| {
+                wait_host(TerminalRequest::WaitForExit(request, responder));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::KillTerminalRequest, responder, _connection| {
+                kill_host(TerminalRequest::Kill(request, responder));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::ReleaseTerminalRequest, responder, _connection| {
+                release_host(TerminalRequest::Release(request, responder));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(
+            transport,
+            move |connection: ConnectionTo<Agent>| async move {
+                connection_sender.send(connection).ok();
+                // Keep the connection open until the transport closes.
+                futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
+            },
+        );
+    let connection_future = async move {
+        if let Err(error) = connection_future.await {
+            log::error!("ACP connection error: {error:?}");
+        }
+    }
+    .boxed();
+    (connection_future, connection_receiver)
+}
+
+/// Keeps the agent's last stderr lines for errors, and logs them.
+fn stderr_reporter(sender: MessageSender) -> Arc<dyn Fn(String) + Send + Sync> {
+    Arc::new(move |line: String| {
+        log::warn!("agent stderr: {line}");
+        sender.send(MessageKind::Stderr(line)).ok();
+    })
+}
+
+/// The answer to a prompt, as the SDK would have parsed it.
+fn prompt_answer(
+    answer: Value,
+) -> std::result::Result<acp::PromptResponse, agent_client_protocol::Error> {
+    if let Some(error) = answer.get("error") {
+        return Err(
+            serde_json::from_value(error.clone()).unwrap_or_else(|error| {
+                agent_client_protocol::Error::internal_error().data(error.to_string())
+            }),
+        );
+    }
+    serde_json::from_value(answer.get("result").cloned().unwrap_or(Value::Null))
+        .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
+}
+
+fn lock_slot(slot: &Mutex<PauseSlot>) -> std::sync::MutexGuard<'_, PauseSlot> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn select_offers(select: &acp::SessionConfigSelect, value: &acp::SessionConfigValueId) -> bool {
@@ -1390,6 +1813,8 @@ struct Connected {
     capabilities: acp::AgentCapabilities,
     auth_methods: Vec<acp::AuthMethod>,
     agent_info: Option<acp::Implementation>,
+    wire: Wire,
+    process: AgentProcess,
 }
 
 struct SessionSetup {
@@ -1486,6 +1911,7 @@ fn is_auth_required(error: &agent_client_protocol::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
 
     #[test]
     fn diff_line_counts() {
@@ -1840,6 +2266,145 @@ mod tests {
             second.thread.entries()[1],
             Entry::AgentMessage("Echo: hello".into())
         );
+    }
+
+    /// Pauses the thread, hands its agent to a new thread as another server would, and
+    /// drops the old one.
+    async fn hand_to_new_thread(mut old: TestThread) -> TestThread {
+        old.update(|thread| assert!(thread.pause(), "pausing starts"));
+        old.wait_until(|thread| thread.wire.as_ref().is_some_and(Wire::is_paused))
+            .await;
+        assert!(
+            old.events
+                .iter()
+                .any(|event| matches!(event, AgentThreadEvent::Paused))
+        );
+        let handed_off = old.thread.hand_off().expect("the thread can be handed off");
+        old.thread.release();
+        // As the snapshot crosses to the other server.
+        let snapshot: AgentSnapshot =
+            serde_json::from_str(&serde_json::to_string(&handed_off.snapshot).unwrap()).unwrap();
+        drop(old);
+        TestThread::new(
+            AgentThread::adopt(
+                tokio::runtime::Handle::current(),
+                snapshot,
+                handed_off.stdin,
+                handed_off.stdout,
+                handed_off.stderr,
+                None,
+            )
+            .expect("the agent is adopted"),
+        )
+    }
+
+    fn agent_text(thread: &AgentThread) -> String {
+        thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::AgentMessage(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A turn streaming when its agent is handed off goes on and ends on the new connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hands_off_a_turn_in_progress() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("slow".into()));
+        thread
+            .wait_until(|thread| agent_text(thread).contains("One"))
+            .await;
+        assert!(thread.thread.can_hand_off());
+
+        let mut thread = hand_to_new_thread(thread).await;
+        assert!(thread.thread.is_working(), "the turn goes on");
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert!(
+            thread
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentThreadEvent::WorkingChanged(true)))
+        );
+        assert_eq!(agent_text(&thread.thread), "One two three four five");
+        assert_eq!(
+            thread.thread.last_stop_reason(),
+            Some(&acp::StopReason::EndTurn)
+        );
+
+        // The new connection works like any other.
+        thread.update(|thread| thread.send("hello".into()));
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert!(agent_text(&thread.thread).ends_with("Echo: hello"));
+    }
+
+    /// A permission request the agent waits on is asked again on the new connection, which
+    /// answers it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hands_off_a_waiting_permission_request() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("permission".into()));
+        thread
+            .wait_until(|thread| !thread.state.permission_requests.is_empty())
+            .await;
+
+        let mut thread = hand_to_new_thread(thread).await;
+        thread
+            .wait_until(|thread| !thread.state.permission_requests.is_empty())
+            .await;
+        assert_eq!(thread.thread.state.permission_requests.len(), 1);
+        thread.update(|thread| {
+            thread.respond_to_permission(
+                &acp::ToolCallId::new("call-2"),
+                acp::PermissionOptionId::new("allow"),
+            )
+        });
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert!(
+            agent_text(&thread.thread).ends_with("(chose allow)"),
+            "{:?} {:?} {:?}",
+            thread.thread.entries(),
+            thread.thread.turn_error(),
+            thread.thread.status()
+        );
+    }
+
+    /// A pause that's called off loses nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumes_after_a_pause() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("slow".into()));
+        thread
+            .wait_until(|thread| agent_text(thread).contains("One"))
+            .await;
+        thread.update(|thread| assert!(thread.pause()));
+        thread
+            .wait_until(|thread| thread.wire.as_ref().is_some_and(Wire::is_paused))
+            .await;
+        thread.update(AgentThread::resume);
+        assert!(!thread.thread.is_paused());
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert_eq!(agent_text(&thread.thread), "One two three four five");
     }
 
     fn which_python() -> Option<PathBuf> {

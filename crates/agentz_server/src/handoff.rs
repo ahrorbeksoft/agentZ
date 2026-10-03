@@ -1,9 +1,10 @@
-//! Handing the terminals to a newly installed server, so updating the server keeps them running
-//! with their screens (herdr's live handoff). The old server starts the new binary with one end
-//! of a socket pair as its stdin, sends it a manifest, then the listening socket and each
-//! terminal's PTY as file descriptors. The new server takes them over and says it's ready; the
-//! old one says to commit, and exits without ending the terminals' processes. Until the commit
-//! either side can give up, and the old server carries on as before.
+//! Handing the terminals and agents to a newly installed server, so updating the server keeps
+//! them running (herdr's live handoff, extended to ACP agents). The old server starts the new
+//! binary with one end of a socket pair as its stdin, sends it a manifest, then the listening
+//! socket, each terminal's PTY and each agent's pipes as file descriptors. The new server takes
+//! them over and says it's ready; the old one says to commit, and exits without ending the
+//! terminals' or agents' processes. Until the commit either side can give up, and the old
+//! server carries on as before.
 
 use std::io::{IoSlice, IoSliceMut, Read as _, Write as _};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
@@ -12,14 +13,19 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use agent_thread::AgentSnapshot;
 use agentz_protocol::terminal::TerminalKey;
 use anyhow::{Context as _, Result, anyhow, bail};
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
+use projects::ThreadId;
 use serde::{Deserialize, Serialize};
 
 use crate::terminals::TerminalHandoff;
 
 const READY: u8 = b'R';
+/// Ready, having taken over the agents too. A server from before agents were handed off answers
+/// [`READY`] and ignores them, so they end with the old server, as they did then.
+const READY_WITH_AGENTS: u8 = b'A';
 const COMMIT: u8 = b'C';
 /// The new server loads the state before it's ready, which may take a while on a busy machine.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -33,6 +39,29 @@ pub(crate) struct Manifest {
     pub terminals: Vec<HandedOffTerminal>,
     #[serde(default)]
     pub palette: Option<Vec<[u8; 3]>>,
+    /// In the order their pipes follow the PTYs.
+    #[serde(default)]
+    pub agents: Vec<HandedOffThread>,
+    /// Messages for threads to send their agents when their turns end.
+    #[serde(default)]
+    pub follow_ups: Vec<(ThreadId, Vec<crate::server::FollowUp>)>,
+}
+
+/// A thread whose agent the new server goes on talking to.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct HandedOffThread {
+    pub thread_id: ThreadId,
+    pub agent: AgentSnapshot,
+    /// The credential its agent's MCP bridge calls the server's tools with.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// An agent's stdin, stdout and stderr.
+pub(crate) struct AgentPipes {
+    pub stdin: OwnedFd,
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,10 +76,11 @@ pub(crate) struct HandedOffTerminal {
     pub folder: Option<PathBuf>,
 }
 
-/// The terminals a new server takes over, each with its PTY.
+/// The terminals and agents a new server takes over, each with its PTY or pipes.
 pub struct HandedOver {
     pub(crate) manifest: Manifest,
     pub(crate) ptys: Vec<OwnedFd>,
+    pub(crate) agent_pipes: Vec<AgentPipes>,
 }
 
 /// The new server's side of the handoff, to say when it's ready.
@@ -85,18 +115,34 @@ pub fn receive(connection: UnixStream) -> Result<(UnixListener, HandedOver, Take
         .iter()
         .map(|_| receive_fd(&connection).context("receiving a terminal"))
         .collect::<Result<Vec<_>>>()?;
+    let agent_pipes = manifest
+        .agents
+        .iter()
+        .map(|_| {
+            Ok(AgentPipes {
+                stdin: receive_fd(&connection).context("receiving an agent")?,
+                stdout: receive_fd(&connection).context("receiving an agent")?,
+                stderr: receive_fd(&connection).context("receiving an agent")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok((
         listener,
-        HandedOver { manifest, ptys },
+        HandedOver {
+            manifest,
+            ptys,
+            agent_pipes,
+        },
         Takeover { connection },
     ))
 }
 
 impl Takeover {
-    /// Tells the old server the terminals are taken over, and waits for it to let them go.
+    /// Tells the old server the terminals and agents are taken over, and waits for it to let
+    /// them go.
     pub fn ready(self) -> Result<()> {
         (&self.connection)
-            .write_all(&[READY])
+            .write_all(&[READY_WITH_AGENTS])
             .context("telling the old server")?;
         self.connection
             .set_read_timeout(Some(COMMIT_TIMEOUT))
@@ -121,8 +167,9 @@ impl Handover {
     }
 }
 
-/// Starts `executable` to take over, and sends it the listening socket and the terminals.
-/// Returns once it's ready. A new server that isn't is stopped.
+/// Starts `executable` to take over, and sends it the listening socket, the terminals and the
+/// agents. Returns once it's ready, with whether it took the agents. A new server that isn't
+/// ready is stopped.
 #[allow(
     clippy::disallowed_methods,
     reason = "runs on a blocking thread, and the new server's stdin must be the socket"
@@ -132,7 +179,8 @@ pub(crate) fn send(
     listener: OwnedFd,
     manifest: &Manifest,
     ptys: Vec<OwnedFd>,
-) -> Result<Handover> {
+    agent_pipes: Vec<AgentPipes>,
+) -> Result<(Handover, bool)> {
     let manifest = serde_json::to_vec(manifest).context("encoding the handoff's manifest")?;
     let (connection, theirs) = UnixStream::pair().context("connecting to the new server")?;
     let mut child = std::process::Command::new(executable)
@@ -151,6 +199,11 @@ pub(crate) fn send(
         for pty in &ptys {
             send_fd(&connection, pty.as_fd()).context("sending a terminal")?;
         }
+        for pipes in &agent_pipes {
+            for pipe in [&pipes.stdin, &pipes.stdout, &pipes.stderr] {
+                send_fd(&connection, pipe.as_fd()).context("sending an agent")?;
+            }
+        }
         connection
             .set_read_timeout(Some(READY_TIMEOUT))
             .context("waiting for the new server")?;
@@ -158,13 +211,14 @@ pub(crate) fn send(
         (&connection)
             .read_exact(&mut answer)
             .context("the new server didn't take over; see its log")?;
-        if answer[0] != READY {
-            bail!("the new server answered {:?}", answer[0]);
+        match answer[0] {
+            READY => Ok(false),
+            READY_WITH_AGENTS => Ok(true),
+            answer => bail!("the new server answered {answer:?}"),
         }
-        Ok(())
     })();
     match result {
-        Ok(()) => Ok(Handover { connection }),
+        Ok(took_agents) => Ok((Handover { connection }, took_agents)),
         Err(error) => {
             if child.try_wait().ok().flatten().is_none() {
                 child.kill().ok();
