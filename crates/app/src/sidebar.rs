@@ -49,8 +49,6 @@ pub fn init(cx: &mut App) {
 pub enum SidebarEvent {
     OpenThread(ThreadKey),
     OpenProjectSettings(ProjectKey),
-    /// New Thread, working in this folder: a project's own, or one of its workspaces.
-    NewThreadIn(ProjectKey, PathBuf),
 }
 
 /// An element id for a thread's row, unique across machines.
@@ -447,8 +445,8 @@ impl Sidebar {
         .detach();
     }
 
-    /// Rename, Archive or Unarchive, New Thread Here, the pasture's actions, Project Settings,
-    /// and Delete, each with its icon.
+    /// Rename, Archive or Unarchive, the pasture's actions, Project Settings, and Delete, each
+    /// with its icon.
     fn thread_menu(
         &self,
         machine: MachineId,
@@ -474,7 +472,6 @@ impl Sidebar {
             .as_ref()
             .and_then(|checkout| checkout.workspace.as_ref())
             .is_some_and(|workspace| workspace.kind == WorkspaceKind::Pasture);
-        let folder = checkout.map(|checkout| checkout.folder);
         // Where a terminal is, when that's in no project yet.
         let new_project = is_terminal
             .then(|| {
@@ -489,19 +486,8 @@ impl Sidebar {
         move |window, cx| {
             let sidebar = sidebar.clone();
             let title = title.clone();
-            let folder = folder.clone();
             let new_project = new_project.clone();
             ContextMenu::build(window, cx, move |menu, _, _| {
-                let new_thread_here = folder.clone().map(|folder| {
-                    let sidebar = sidebar.clone();
-                    move |_: &mut Window, cx: &mut App| {
-                        sidebar
-                            .update(cx, |_, cx| {
-                                cx.emit(SidebarEvent::NewThreadIn(project_id, folder.clone()))
-                            })
-                            .ok();
-                    }
-                });
                 let pasture_action = |action: PastureAction| {
                     let sidebar = sidebar.clone();
                     move |window: &mut Window, cx: &mut App| {
@@ -607,14 +593,6 @@ impl Sidebar {
                         .icon_color(Color::Muted)
                         .handler(toggle_archived),
                 )
-                .when_some(new_thread_here, |menu, handler| {
-                    menu.item(
-                        ContextMenuEntry::new("New Thread Here")
-                            .icon(IconName::Plus)
-                            .icon_color(Color::Muted)
-                            .handler(handler),
-                    )
-                })
                 .when(is_pasture, |menu| {
                     menu.separator()
                         .item(

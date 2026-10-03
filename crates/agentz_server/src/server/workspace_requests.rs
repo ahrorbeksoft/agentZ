@@ -64,6 +64,28 @@ impl Server {
                     move |server, git| server.respond(client, id, Ok(Response::ProjectGit(git))),
                 );
             }
+            Request::CreateWorkspace {
+                project_id,
+                kind,
+                base,
+                branch,
+            } => match self
+                .prepare_workspace(project_id, WorkspaceChoice::New { kind, base, branch })
+            {
+                Ok(PreparedWorkspace::Create(work)) => {
+                    self.spawn_then(work, move |server, workspace| {
+                        let folder = workspace
+                            .map(|workspace| server.adopt_workspace(project_id, workspace));
+                        server.respond(client, id, folder.map(Response::WorkspaceCreated));
+                    })
+                }
+                Ok(PreparedWorkspace::Ready(_)) => self.respond(
+                    client,
+                    id,
+                    Err(anyhow!("expected a new workspace to be made")),
+                ),
+                Err(error) => self.respond(client, id, Err(error)),
+            },
             Request::RemoveWorkspace {
                 project_id,
                 path,

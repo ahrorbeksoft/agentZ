@@ -14,7 +14,9 @@ use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Context, EventEmitter, Task, WeakEntity};
-use projects::{ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder};
+use projects::{
+    ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder, WorkspaceKind,
+};
 use util::ResultExt as _;
 
 use crate::machines::MachineId;
@@ -308,6 +310,29 @@ impl ProjectStore {
             Request::ProjectGit(project_id),
             |response| match response {
                 Response::ProjectGit(git) => Some(git),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// Makes a worktree or pasture with no thread in it, resolving to its folder.
+    pub fn create_workspace(
+        &self,
+        project_id: ProjectId,
+        kind: WorkspaceKind,
+        branch: Option<String>,
+        cx: &App,
+    ) -> Task<Result<PathBuf>> {
+        self.request(
+            Request::CreateWorkspace {
+                project_id,
+                kind,
+                base: None,
+                branch,
+            },
+            |response| match response {
+                Response::WorkspaceCreated(folder) => Some(folder),
                 _ => None,
             },
             cx,

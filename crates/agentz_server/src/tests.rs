@@ -1847,6 +1847,42 @@ async fn threads_work_in_worktrees_and_pastures() {
         .await;
     assert_eq!(again.value["code"], json!("already_in_workspace"));
 
+    // A worktree made with no thread, for a terminal, is one of the project's for later threads.
+    let Response::WorkspaceCreated(empty) = client
+        .ok(Request::CreateWorkspace {
+            project_id,
+            kind: WorkspaceKind::Worktree,
+            base: None,
+            branch: Some("shell".into()),
+        })
+        .await
+    else {
+        panic!("expected the workspace's folder");
+    };
+    assert!(empty.ends_with("shell"), "{}", empty.display());
+    assert!(empty.join("README.md").exists());
+    assert!(matches!(
+        client
+            .ok(Request::CreateTerminalThread {
+                project_id,
+                command: TerminalCommand::default(),
+                workspace: WorkspaceChoice::Existing(empty.clone()),
+            })
+            .await,
+        Response::ThreadCreated(_)
+    ));
+    assert!(
+        client
+            .request(Request::CreateWorkspace {
+                project_id,
+                kind: WorkspaceKind::Worktree,
+                base: None,
+                branch: Some("shell".into()),
+            })
+            .await
+            .is_err()
+    );
+
     if cfg!(target_os = "macos") {
         let Response::ThreadCreated(pasture_thread) = client
             .ok(Request::CreateThread {

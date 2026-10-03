@@ -202,8 +202,9 @@ t3code's workspace model, herdr's folder layout and safe removal, cow's pastures
   bring their branch back (cow's `sync` and `extract`).
 - **Handoff** (`agentz_workspace_handoff`) moves a thread after its turn: the agent restarts in the
   new folder, with `session/load` when it can.
-- **UI**: New Thread's Workspace step (`new_thread_modal.rs`), card markers, thread menu (New
-  Thread Here, Sync, Bring Branch), Project Settings › Checkouts. Removing asks again when work
+- **UI**: New Thread's Workspace step (`new_thread_modal.rs`), card markers, thread menu (Sync,
+  Bring Branch), a workspace row's New Worktree and Open Worktree… (`worktree_modal.rs`, below),
+  Project Settings › Checkouts. Removing asks again when work
   would be lost; branches are kept; a workspace in use can't be removed.
 - Left out of cow: symlinked dependency folders, jj, orientation files.
 
@@ -269,6 +270,12 @@ since a thread's workspace is its checkout.
   counts and the machine's icon, laid out as the sidebar's shell rows, with the thread cards'
   details popover on hover (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
+- **Row menu**: Rename, Close, and in a project New Worktree and Open Worktree… (herdr's
+  worktree overlays, `worktree_modal.rs`). New Worktree names the branch (herdr's generated
+  `agentz/<adjective>-<noun>-<hex>` by default), makes a worktree or a pasture of it from the
+  checkout's branch (`Request::CreateWorkspace`, no thread in it), and opens it as a new
+  workspace with a shell; Open Worktree… picks one of the project's worktrees and pastures the
+  same way.
 - **Keys** (Mac-style, in the `Workspaces` context, all with Cmd so terminals never get them):
   Cmd-T, Cmd-}/Cmd-{, Cmd-D/Cmd-Shift-D, Cmd-W, Cmd-Shift-Enter, Cmd-Option-arrows, Cmd-Shift-N.
 - A terminal shown in two places takes the size of the view last interacted with (herdr).

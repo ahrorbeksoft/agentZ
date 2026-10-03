@@ -28,6 +28,7 @@ use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
+use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
     NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher, ToggleSidebar,
     ToggleTerminalDrawer,
@@ -117,6 +118,7 @@ pub struct Shell {
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
     add_project_modal: Option<(Entity<AddProjectModal>, Vec<Subscription>)>,
+    worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
@@ -152,6 +154,12 @@ impl Shell {
                     } => {
                         this.open_new_thread_modal(*project, folder.clone(), window, cx);
                         this.thread_target = Some(*pane);
+                    }
+                    SpacesViewEvent::NewWorktree(project) => {
+                        this.open_worktree_modal(*project, WorktreeModalMode::New, window, cx)
+                    }
+                    SpacesViewEvent::OpenWorktree(project) => {
+                        this.open_worktree_modal(*project, WorktreeModalMode::Open, window, cx)
                     }
                 },
             ),
@@ -226,9 +234,6 @@ impl Shell {
                 SidebarEvent::OpenProjectSettings(project_id) => {
                     this.open_project_settings(*project_id, window, cx)
                 }
-                SidebarEvent::NewThreadIn(project_id, folder) => {
-                    this.open_new_thread_modal(Some(*project_id), Some(folder.clone()), window, cx)
-                }
             }),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
             // With the theme mode set to System, the theme follows macOS's appearance.
@@ -264,6 +269,7 @@ impl Shell {
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
             add_project_modal: None,
+            worktree_modal: None,
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
@@ -656,8 +662,9 @@ impl Shell {
     fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let had_new_thread_modal = self.new_thread_modal.take().is_some();
         let had_add_project_modal = self.add_project_modal.take().is_some();
+        let had_worktree_modal = self.worktree_modal.take().is_some();
         self.thread_target = None;
-        if had_new_thread_modal || had_add_project_modal {
+        if had_new_thread_modal || had_add_project_modal || had_worktree_modal {
             self.focus_main(window, cx);
             cx.notify();
         }
@@ -724,6 +731,31 @@ impl Shell {
             }),
         ];
         self.add_project_modal = Some((modal, subscriptions));
+        cx.notify();
+    }
+
+    fn open_worktree_modal(
+        &mut self,
+        project: ProjectKey,
+        mode: WorktreeModalMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modal = cx.new(|cx| WorktreeModal::new(project, mode, window, cx));
+        let subscriptions = vec![
+            cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            }),
+            cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
+                WorktreeModalEvent::Open { project, folder } => {
+                    this.dismiss_modal(window, cx);
+                    this.spaces_view.update(cx, |view, cx| {
+                        view.open_space_at(*project, folder.clone(), window, cx)
+                    });
+                }
+            }),
+        ];
+        self.worktree_modal = Some((modal, subscriptions));
         cx.notify();
     }
 
@@ -1130,6 +1162,11 @@ impl Render for Shell {
                     .map(|(modal, _)| AnyView::from(modal.clone()))
                     .or_else(|| {
                         self.add_project_modal
+                            .as_ref()
+                            .map(|(modal, _)| AnyView::from(modal.clone()))
+                    })
+                    .or_else(|| {
+                        self.worktree_modal
                             .as_ref()
                             .map(|(modal, _)| AnyView::from(modal.clone()))
                     }),

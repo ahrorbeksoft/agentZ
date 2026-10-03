@@ -24,8 +24,8 @@ use gpui::{
 use projects::ThreadId;
 use text_input::{TextInput, TextInputEvent};
 use ui::{
-    ContextMenu, PopoverMenu, PopoverMenuHandle, Tab as TabItem, TabBar, TabPosition, Tooltip,
-    WithScrollbar as _, prelude::*, right_click_menu,
+    ContextMenu, ContextMenuEntry, PopoverMenu, PopoverMenuHandle, Tab as TabItem, TabBar,
+    TabPosition, Tooltip, WithScrollbar as _, prelude::*, right_click_menu,
 };
 
 use crate::OpenSettings;
@@ -139,6 +139,10 @@ pub enum SpacesViewEvent {
         project: Option<ProjectKey>,
         folder: Option<PathBuf>,
     },
+    /// New Worktree from a workspace in the project.
+    NewWorktree(ProjectKey),
+    /// Open Worktree… from a workspace in the project.
+    OpenWorktree(ProjectKey),
 }
 
 #[derive(Clone)]
@@ -708,6 +712,26 @@ impl SpacesView {
         );
     }
 
+    /// A new workspace with a shell in one of the project's folders.
+    pub fn open_space_at(
+        &mut self,
+        project: ProjectKey,
+        folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(
+            project.machine,
+            SpaceRequest::CreateSpace {
+                folder,
+                project_id: Some(project.project),
+                content: new_shell(),
+            },
+            window,
+            cx,
+        );
+    }
+
     fn new_tab_in(&mut self, key: SpaceKey, window: &mut Window, cx: &mut Context<Self>) {
         self.request(
             key.machine,
@@ -1153,6 +1177,16 @@ impl SpacesView {
             Some(project) => render_project_icon(project, project_info.as_ref(), px(16.), cx),
             None => render_folder_icon(),
         };
+        // The worktree actions need the project the workspace is in.
+        let worktree_project = project.as_ref().map(|project| {
+            (
+                ProjectKey {
+                    machine,
+                    project: project.id,
+                },
+                !project.workspaces.is_empty(),
+            )
+        });
         let details = ThreadDetails {
             title: label.clone(),
             project: project.map(|project| (project, project_info)),
@@ -1377,13 +1411,6 @@ impl SpacesView {
                             .ok();
                         }
                     };
-                    let new_tab = {
-                        let this = this.clone();
-                        move |window: &mut Window, cx: &mut App| {
-                            this.update(cx, |this, cx| this.new_tab_in(key, window, cx))
-                                .ok();
-                        }
-                    };
                     let close = {
                         let this = this.clone();
                         move |window: &mut Window, cx: &mut App| {
@@ -1391,10 +1418,48 @@ impl SpacesView {
                                 .ok();
                         }
                     };
-                    menu.entry("Rename", None, rename)
-                        .entry("New Tab", Some(Box::new(NewTab)), new_tab)
-                        .separator()
-                        .entry("Close Workspace", None, close)
+                    let worktree_event = |event: fn(ProjectKey) -> SpacesViewEvent| {
+                        let this = this.clone();
+                        move |project: ProjectKey| {
+                            let this = this.clone();
+                            move |_: &mut Window, cx: &mut App| {
+                                this.update(cx, |_, cx| cx.emit(event(project))).ok();
+                            }
+                        }
+                    };
+                    let new_worktree = worktree_event(SpacesViewEvent::NewWorktree);
+                    let open_worktree = worktree_event(SpacesViewEvent::OpenWorktree);
+                    menu.item(
+                        ContextMenuEntry::new("Rename")
+                            .icon(IconName::Pencil)
+                            .icon_color(Color::Muted)
+                            .handler(rename),
+                    )
+                    .item(
+                        ContextMenuEntry::new("Close")
+                            .icon(IconName::Close)
+                            .icon_color(Color::Muted)
+                            .handler(close),
+                    )
+                    .when_some(
+                        worktree_project,
+                        |menu, (project, has_worktrees)| {
+                            menu.separator()
+                                .item(
+                                    ContextMenuEntry::new("New Worktree")
+                                        .icon(IconName::GitWorktree)
+                                        .icon_color(Color::Muted)
+                                        .handler(new_worktree(project)),
+                                )
+                                .item(
+                                    ContextMenuEntry::new("Open Worktree…")
+                                        .icon(IconName::FolderOpen)
+                                        .icon_color(Color::Muted)
+                                        .disabled(!has_worktrees)
+                                        .handler(open_worktree(project)),
+                                )
+                        },
+                    )
                 })
             })
             .into_any_element()

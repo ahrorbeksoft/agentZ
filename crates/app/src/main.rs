@@ -22,6 +22,7 @@ mod terminal_mouse;
 mod terminal_thread_view;
 mod terminal_view;
 mod thread_entity;
+mod worktree_modal;
 
 use std::sync::Arc;
 
@@ -185,6 +186,7 @@ fn main() {
             new_space_picker::init(cx);
             spaces_view::init(cx);
             add_project_modal::init(cx);
+            worktree_modal::init(cx);
             agent_view::init(cx);
             sidebar::init(cx);
             terminal_view::init(cx);

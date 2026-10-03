@@ -26,7 +26,9 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
-use projects::{ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId, ThreadOrder};
+use projects::{
+    ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId, ThreadOrder, WorkspaceKind,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -288,6 +290,18 @@ pub enum Request {
     CloseTerminal(TerminalKey),
     /// The project's branches and whether pastures work there: [`Response::ProjectGit`].
     ProjectGit(ProjectId),
+    /// A worktree or pasture on a new branch, with no thread in it yet:
+    /// [`Response::WorkspaceCreated`] with its folder.
+    CreateWorkspace {
+        project_id: ProjectId,
+        kind: WorkspaceKind,
+        /// What the branch starts from: the checkout's current branch by default.
+        #[serde(default)]
+        base: Option<String>,
+        /// `agentz/<short id>` by default.
+        #[serde(default)]
+        branch: Option<String>,
+    },
     /// Deletes a worktree or pasture from disk, keeping its branch:
     /// [`Response::WorkspaceRemoval`]. Refused while a running thread works there.
     RemoveWorkspace {
@@ -518,6 +532,7 @@ pub enum Response {
     ThreadDiff(ThreadDiff),
     ProjectGit(ProjectGit),
     WorkspaceRemoval(WorkspaceRemoval),
+    WorkspaceCreated(PathBuf),
     TerminalPrograms(Vec<TerminalProgram>),
     DrawerTerminals(Vec<u32>),
     TerminalFrame(TerminalFrame),
