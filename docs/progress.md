@@ -263,10 +263,11 @@ Then the server:
   - [x] branch shown per checkout (each card's checkout line);
   - [x] project name and icon shared by the group (images only by this Mac's checkouts);
   - [x] the chosen project stays chosen when grouping changes.
-- [ ] New Thread: Project → Machine (only when the project is on several machines; defaults to
-      the last used one) → Agent on that machine.
-- [ ] UI: machine icon on remote cards, machine line in the details popover, projects grouped by
-      machine in the switcher.
+- [x] New Thread: Project → Machine (only when the project is combined from several
+      checkouts, on any machines; defaults to the one with the newest thread; offline ones
+      disabled) → Agent on that machine. With one project shown, it opens on the machine step.
+- [x] UI: machine icon on remote cards, machine line in the details popover, projects grouped by
+      machine in the switcher (combined ones under "On several machines", first).
 - [ ] Agent control across machines: `delegate_task` and thread launch with a machine; listing
       covers every machine of a merged project.
 - [x] Ask before replacing a running remote server: the server reports the hash recorded

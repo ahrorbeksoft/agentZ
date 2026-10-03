@@ -397,6 +397,19 @@ impl Machines {
         Some(labels.join(", ").into())
     }
 
+    /// The checkout of the group whose newest thread is newest, which New Thread offers first.
+    pub fn last_used_member(&self, group: &ProjectGroup, cx: &App) -> Option<ProjectKey> {
+        self.threads_where(cx, |machine, thread| {
+            group.contains(machine, thread.project_id)
+        })
+        .into_iter()
+        .max_by_key(|(_, thread)| thread.created_at.or(thread.last_activity_at))
+        .map(|(machine, thread)| ProjectKey {
+            machine,
+            project: thread.project_id,
+        })
+    }
+
     /// Whether every machine the group is on is unreachable.
     pub fn is_group_offline(&self, group: &ProjectGroup, cx: &App) -> bool {
         group

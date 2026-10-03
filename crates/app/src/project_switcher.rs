@@ -1,5 +1,6 @@
 //! The project picker behind the title bar's project button, modeled on Zed's recent-projects
-//! popover: search, "All projects", the projects with their icons, and Open Folder.
+//! popover: search, "All projects", the projects with their icons, and Open Folder. With other
+//! machines, projects are listed under their machine, and combined ones above them.
 
 use std::rc::Rc;
 
@@ -50,6 +51,8 @@ pub struct ProjectSwitcher {
     open_project_settings: Rc<dyn Fn(ProjectKey, &mut Window, &mut App)>,
     search: Entity<TextInput>,
     entries: Vec<Entry>,
+    /// The heading each project entry is listed under.
+    sections: Vec<SharedString>,
     /// Byte positions of the search's letters in each entry's name, for highlighting.
     match_positions: Vec<Vec<usize>>,
     selected_index: usize,
@@ -87,6 +90,7 @@ impl ProjectSwitcher {
             open_project_settings: Rc::new(open_project_settings),
             search,
             entries: Vec::new(),
+            sections: Vec::new(),
             match_positions: Vec::new(),
             selected_index: 0,
             scroll_handle: ScrollHandle::new(),
@@ -108,12 +112,33 @@ impl ProjectSwitcher {
         let machines = self.machines.read(cx);
 
         let mut entries = Vec::new();
+        let mut sections = Vec::new();
         let mut match_positions = Vec::new();
         if let Some(positions) = fuzzy_match(&query, ALL_PROJECTS_LABEL) {
             entries.push(Entry::AllProjects);
+            sections.push(SharedString::default());
             match_positions.push(positions);
         }
-        for group in machines.project_groups(cx) {
+        let mut groups = machines.project_groups(cx);
+        let section = |group: &crate::machines::ProjectGroup| -> (usize, SharedString) {
+            if !machines.has_remotes() {
+                return (0, "Projects".into());
+            }
+            match group.machines().as_slice() {
+                [machine] => (
+                    1 + machines
+                        .clients()
+                        .iter()
+                        .position(|client| client.read(cx).machine() == *machine)
+                        .unwrap_or(usize::MAX - 1),
+                    machines.label(*machine, cx),
+                ),
+                _ => (0, "On several machines".into()),
+            }
+        };
+        // Stable, so each section keeps the projects' order.
+        groups.sort_by_cached_key(|group| section(group).0);
+        for group in groups {
             let positions = fuzzy_match(&query, &group.name()).or_else(|| {
                 // A match on the path or machine alone has nothing in the name to highlight.
                 group
@@ -131,12 +156,14 @@ impl ProjectSwitcher {
                     .then(Vec::new)
             });
             if let Some(positions) = positions {
+                sections.push(section(&group).1);
                 entries.push(Entry::Project(group.key));
                 match_positions.push(positions);
             }
         }
 
         self.entries = entries;
+        self.sections = sections;
         self.match_positions = match_positions;
         self.selected_index = self
             .selected_index
@@ -152,16 +179,22 @@ impl ProjectSwitcher {
         }
     }
 
-    /// Keeps the selected row in view. The list's children are its rows plus the "Projects"
-    /// header just before the first project.
+    /// Whether the entry is the first of its section, under a heading.
+    fn starts_section(&self, index: usize) -> bool {
+        matches!(self.entries.get(index), Some(Entry::Project(_)))
+            && (index == 0
+                || !matches!(self.entries.get(index - 1), Some(Entry::Project(_)))
+                || self.sections.get(index - 1) != self.sections.get(index))
+    }
+
+    /// Keeps the selected row in view. The list's children are its rows plus a heading before
+    /// each section.
     fn scroll_to_selection(&self) {
-        let header_before = self.entries.first() == Some(&Entry::AllProjects)
-            && matches!(
-                self.entries.get(self.selected_index),
-                Some(Entry::Project(_))
-            );
+        let headings = (0..=self.selected_index)
+            .filter(|index| self.starts_section(*index))
+            .count();
         self.scroll_handle
-            .scroll_to_item(self.selected_index + usize::from(header_before));
+            .scroll_to_item(self.selected_index + headings);
     }
 
     fn select_previous(
@@ -250,7 +283,10 @@ impl ProjectSwitcher {
                     .read(cx)
                     .info(machine, project.id);
                 let name = group.name();
-                let machine_label = machines.group_machines_label(&group, cx);
+                // A project on one machine is under that machine's heading.
+                let machine_label = (group.machines().len() > 1)
+                    .then(|| machines.group_machines_label(&group, cx))
+                    .flatten();
                 let path: SharedString = group
                     .members
                     .iter()
@@ -322,20 +358,14 @@ impl Render for ProjectSwitcher {
         let has_projects = !self.machines.read(cx).project_groups(cx).is_empty();
         let mut rows = Vec::with_capacity(self.entries.len() + 1);
         for (index, entry) in self.entries.clone().into_iter().enumerate() {
-            let is_first_project = matches!(entry, Entry::Project(_))
-                && !matches!(
-                    index
-                        .checked_sub(1)
-                        .and_then(|previous| self.entries.get(previous)),
-                    Some(Entry::Project(_))
-                );
-            if is_first_project {
+            if self.starts_section(index) {
+                let title = self.sections.get(index).cloned().unwrap_or_default();
                 rows.push(
                     v_flex()
                         .w_full()
                         .gap_1()
                         .when(index > 0, |this| this.mt_1().child(Divider::horizontal()))
-                        .child(ListSubHeader::new("Projects").inset(true))
+                        .child(ListSubHeader::new(title).inset(true))
                         .into_any_element(),
                 );
             }
