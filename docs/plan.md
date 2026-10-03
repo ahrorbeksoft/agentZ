@@ -549,9 +549,10 @@ area. Every agent shows up here:
 
 - **Sidebar, top: workspaces.** Search, and a **+** button. Rows follow herdr's space rows:
   rolled-up state icon and name, then branch and ahead/behind.
-- **Sidebar, bottom: agents.** Every agent, in the slim one-line style of the Archived shelf.
+- **Sidebar, bottom: agents.** Every agent on every machine (the user's choice; herdr lists only
+  agents in panes), in the slim one-line style of the Archived shelf.
   Rows follow herdr's agent rows: state icon, machine (only with several machines), workspace,
-  tab, agent. Clicking one focuses its pane.
+  tab, agent. Clicking one focuses its pane. An agent that isn't in any pane opens in Agents.
 - **The + picker** creates a workspace rooted at one of:
   - a project (one of its checkouts, worktrees or pastures, on any machine);
   - a machine's home folder (`~` on Local, `t3-home`, `devbox1`, …).
@@ -569,12 +570,18 @@ area. Every agent shows up here:
   An ACP thread in a pane is the same thread as in Agents, shown at the pane's size there and
   full screen there. Any size or shape works in a pane.
 - **Mouse first**, as herdr is: click to focus, drag borders, right-click menus. Keyboard
-  bindings cover herdr's actions (new tab, split right/down, move between panes, zoom, close,
-  next/previous tab, new workspace, goto picker). As a GUI app, agentZ uses direct chords
-  instead of herdr's terminal prefix. See the open question on which chords.
+  bindings cover herdr's actions with Mac-style direct shortcuts (the user's choice), not
+  herdr's terminal prefix. For example:
+  - Cmd-T new tab, Cmd-Shift-] / Cmd-Shift-[ next/previous tab;
+  - Cmd-D split right, Cmd-Shift-D split down;
+  - Cmd-W close pane, Cmd-Shift-Enter zoom;
+  - Cmd-Option-arrows move between panes;
+  - Cmd-Shift-N new workspace, and a goto picker.
 
-**Where the state lives** follows herdr's runtime/client rule: workspaces, tabs and the pane
-tree are shared session state.
+  Exact keys must not clash with keys a terminal pane needs.
+
+**Where the state lives** follows herdr's runtime/client rule, confirmed by the user:
+workspaces, tabs and the pane tree are shared session state.
 
 - They live in the server of the workspace's machine, are saved, and come back after a server
   restart. herdr's "snapshot restore": terminal panes come back as new shells in their saved

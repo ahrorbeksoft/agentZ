@@ -319,9 +319,10 @@ Then the server:
   - [ ] **+** picker: a project checkout, worktree or pasture, or a machine's home folder;
   - [ ] rows with rolled-up state, name, branch and ahead/behind.
 - [ ] Agents list at the bottom of the sidebar:
+  - [ ] every agent on every machine;
   - [ ] slim rows like the Archived shelf;
   - [ ] state, machine, workspace, tab, agent;
-  - [ ] clicking a row focuses its pane.
+  - [ ] clicking a row focuses its pane, or opens it in Agents when it isn't in one.
 - [ ] Tabs: new, rename, close, reorder, next/previous.
 - [ ] Panes:
   - [ ] split right/down;
@@ -331,7 +332,14 @@ Then the server:
 - [ ] A pane can hold a shell, an agent CLI, or an ACP thread (new or existing). The thread is
       the same one shown in Agents.
 - [ ] A terminal shown in two places follows the size of the view last interacted with.
-- [ ] Keyboard chords for herdr's actions (see open questions).
+- [ ] Mac-style shortcuts for herdr's actions, for example:
+  - [ ] Cmd-T new tab;
+  - [ ] Cmd-D / Cmd-Shift-D split right/down;
+  - [ ] Cmd-W close pane;
+  - [ ] Cmd-Option-arrows move between panes;
+  - [ ] Cmd-Shift-N new workspace.
+
+  None may clash with keys terminal panes need.
 - [ ] Tests: the pane tree (split, close, resize, swap), save and restore, and a headless UI
       test of the layout.
 
@@ -573,14 +581,6 @@ Then the server:
 
 ## Open questions
 
-- **Workspaces view details.** The user's wishes, as written in the plan, rest on some
-  assumptions. Confirm or correct them before phase 11:
-  - **Keyboard chords:** iTerm/Zed-style direct chords (for example Cmd-T new tab, Cmd-D split
-    right, Cmd-Shift-D split down, Cmd-W close pane), or herdr's Ctrl-B prefix?
-  - **Agents list scope:** every agent on every machine, or only those in workspaces? herdr
-    lists the agents in panes.
-  - **Server-side workspaces:** shared and restored after restarts, as herdr does them?
-
 - **Default for new workspaces.** Should New Thread's workspace step suggest a pasture (cow's
   argument: instant, dependencies ready) or a worktree (t3code and herdr) when both are
   possible? The plan offers both, with the current checkout as the default.
@@ -651,3 +651,7 @@ Then the server:
 - 2026-10-03: Finished phase 9.
 - 2026-10-03: Added phase 11, the Workspaces view (herdr's workspaces, tabs and panes) next to
   the Agents view, at the user's request.
+- 2026-10-03: The user settled phase 11's questions:
+  - Mac-style direct shortcuts;
+  - the agents list shows every agent on every machine;
+  - workspaces live on the server and are restored after restarts.
