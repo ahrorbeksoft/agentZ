@@ -23,6 +23,7 @@ use ui::{
 };
 
 use crate::ToggleDiff;
+use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::server_client::ServerClient;
 
 pub const DIFF_PANEL_WIDTH: Pixels = px(520.);
@@ -343,7 +344,7 @@ impl DiffPanel {
             !files.is_empty() && files.iter().all(|file| self.collapsed.contains(&file.path))
         });
         h_flex()
-            .h(px(36.))
+            .h(TOOLBAR_HEIGHT)
             .flex_none()
             .px_2()
             .gap_1()

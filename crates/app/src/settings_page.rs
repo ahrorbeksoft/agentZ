@@ -29,7 +29,7 @@ use agentz_protocol::{CAPABILITY_MACHINE_ICON, MachineKind, Request};
 
 use std::collections::BTreeMap;
 
-use crate::agent_view::open_in_terminal;
+use crate::agent_view::{TOOLBAR_HEIGHT, open_in_terminal};
 use crate::app_settings::{AppSettingsStore, MachineProfile, ThemeMode};
 use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfoStore, automatic_monogram, monogram_swatch, render_project_icon,
@@ -612,12 +612,15 @@ impl SettingsPage {
             .border_color(colors.border)
             .bg(colors.panel_background)
             .child(
+                // Shaped like the search rows atop the other views' sidebars.
                 h_flex()
-                    .h(px(40.))
+                    .h(TOOLBAR_HEIGHT)
                     .flex_none()
                     .pl_3()
                     .pr_2()
                     .justify_between()
+                    .border_b_1()
+                    .border_color(colors.border)
                     .child(Label::new("Settings").weight(gpui::FontWeight::MEDIUM))
                     .child(
                         IconButton::new("close-settings", IconName::Close)
