@@ -240,13 +240,13 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   installed SHA-256, on this Mac by the binary's modification time); the title bar shows it and
   Settings › Machines offers Update Server (Restart Server… for servers without the
   `hand_off` capability).
-- **Machines settings** (`settings_page.rs`, `machine_modal.rs`, t3code's `ConnectionsSettings.tsx`
-  and `EnvironmentRow`): one row per machine with its icon, name, and one line of transport,
-  status and (when an update is installed) the server's version; the update button, another
-  machine's switch (connect or not; Remove… is separate) and a row menu with the Icon submenu
-  (`machine_icon_menu`, t3code's `EnvironmentIconMenu`), Retry Now, Add Project…, Edit… and
-  Restart Server… for this Mac. A switched-off row dims. The section header has Update All and
-  Add Machine, which opens the Add/Edit dialog. Servers aren't stopped from the app.
+- **Machines settings** (`settings_page.rs`, `machine_modal.rs`, `machine_icon_picker.rs`,
+  t3code's `ConnectionsSettings.tsx` and `EnvironmentRow`): one row per machine with its icon,
+  name, and one line of transport, status and (when an update is installed) the server's
+  version; then icon buttons for Update Server, Retry Now (while offline), Restart Server… (this
+  Mac), Edit… and Remove…, and another machine's switch (connect or not). The icon opens a grid
+  of the machine kinds (t3code's `EnvironmentIconMenu` as tiles). A switched-off row dims. The
+  section header has Update All and Add Machine, which opens the Add/Edit dialog. Servers aren't stopped from the app.
 - **Server handoff** (`handoff.rs`, `server/hand_off.rs`, `terminals.rs`, herdr's live
   handoff): `Request::HandOff` starts the installed binary as `run --handoff` with a socket pair
   as its stdin, flushes `state.json` and `spaces.json`, pauses every terminal's event loop and
@@ -285,7 +285,7 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   primary remote are one project; modes `repository`, `repository_path`, `separate`. New Thread
   then asks which checkout.
 - **Machine icons** (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`): detected from
-  the hardware, or chosen in the row menu's Icon submenu in Settings › Machines.
+  the hardware, or chosen by clicking the machine's icon in Settings › Machines.
 - **Start at login** (`login_item.rs`): a launch agent that runs `agentz-server start` once.
 
 ### Workspaces view

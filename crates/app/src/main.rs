@@ -3,6 +3,7 @@ mod agent_view;
 mod app_settings;
 mod diff_panel;
 mod login_item;
+mod machine_icon_picker;
 mod machine_modal;
 mod machines;
 mod new_space_picker;

@@ -4,9 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::machines::{
-    GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey, machine_kind_icon,
-};
+use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::workspace::WorkspaceRemoval;
@@ -18,19 +16,20 @@ use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, ContextMenuEntry, DropdownMenu, IconPosition, PopoverMenu, Switch, Tooltip,
-    WithScrollbar as _, prelude::*,
+    ContextMenu, DropdownMenu, IconPosition, PopoverMenu, Switch, Tooltip, WithScrollbar as _,
+    prelude::*,
 };
 use util::ResultExt as _;
 
 use agent_client_protocol::schema::v1 as acp;
+use agentz_protocol::Request;
 use agentz_protocol::thread::ConnectionStatus;
-use agentz_protocol::{CAPABILITY_MACHINE_ICON, MachineKind, Request};
 
 use std::collections::BTreeMap;
 
 use crate::agent_view::{TOOLBAR_HEIGHT, open_in_terminal};
 use crate::app_settings::{AppSettingsStore, MachineProfile, ThemeMode};
+use crate::machine_icon_picker::MachineIconPicker;
 use crate::project_info::{
     MONOGRAM_COLORS, ProjectInfoStore, automatic_monogram, monogram_swatch, render_project_icon,
     workspace_icon,
@@ -1982,9 +1981,10 @@ impl SettingsPage {
         )]
     }
 
-    /// t3code's `EnvironmentRow`: the machine's icon, its name over one line of how it's
-    /// reached, its status and (when there's an update) its server's version, then the
-    /// update button, another machine's switch and the row menu. A switched-off row dims.
+    /// t3code's `EnvironmentRow`: the machine's icon (which opens the icon picker), its name
+    /// over one line of how it's reached, its status and (when there's an update) its server's
+    /// version, then its actions as buttons and another machine's switch. A switched-off row
+    /// dims.
     fn render_machine_row(
         &self,
         profile: Option<&MachineProfile>,
@@ -2060,7 +2060,7 @@ impl SettingsPage {
                         this.update_server(client.clone(), window, cx)
                     }))
             });
-        // Another machine's switch connects to it or not; Remove… is in the menu.
+        // Another machine's switch connects to it or not; Remove… is its own button.
         let switch = profile.map(|profile| {
             let id = profile.id;
             let tooltip = if profile.enabled {
@@ -2080,110 +2080,64 @@ impl SettingsPage {
                     ),
                 )
         });
-        let options_menu = {
-            let this = cx.entity().downgrade();
-            let profile = profile.cloned();
-            let name = label.clone();
-            PopoverMenu::new(element_id("options"))
-                .menu(move |window, cx| {
-                    let this = this.clone();
-                    let client = client.clone();
-                    let profile = profile.clone();
-                    let name = name.clone();
-                    Some(ContextMenu::build(window, cx, move |menu, _, cx| {
-                        let menu = machine_icon_menu(menu, client.clone(), current_icon, cx);
-                        let retry = client
-                            .clone()
-                            .filter(|client| !client.read(cx).is_online())
-                            .map(|client| {
-                                move |_: &mut Window, cx: &mut App| {
-                                    client.update(cx, |client, _| client.retry())
-                                }
-                            });
-                        let menu = menu.when_some(retry, |menu, retry| {
-                            menu.item(
-                                ContextMenuEntry::new("Retry Now")
-                                    .icon(IconName::RotateCw)
-                                    .icon_color(Color::Muted)
-                                    .handler(retry),
-                            )
-                        });
-                        let Some(profile) = profile.clone() else {
-                            let restart = {
-                                let this = this.clone();
-                                move |window: &mut Window, cx: &mut App| {
-                                    this.update(cx, |this, cx| {
-                                        this.confirm_restart_server(window, cx)
-                                    })
-                                    .log_err();
-                                }
-                            };
-                            return menu.when(is_online, |menu| {
-                                menu.item(
-                                    ContextMenuEntry::new("Restart Server…")
-                                        .icon(IconName::ArrowCircle)
-                                        .icon_color(Color::Muted)
-                                        .handler(restart),
-                                )
-                            });
-                        };
-                        let edit = {
-                            let this = this.clone();
-                            let profile = profile.clone();
-                            move |_: &mut Window, cx: &mut App| {
-                                this.update(cx, |_, cx| {
-                                    cx.emit(SettingsPageEvent::EditMachine(Some(profile.clone())))
-                                })
-                                .log_err();
-                            }
-                        };
-                        let remove = {
-                            let this = this.clone();
-                            move |window: &mut Window, cx: &mut App| {
-                                this.update(cx, |this, cx| {
-                                    this.confirm_remove_machine(
-                                        profile.id,
-                                        name.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .log_err();
-                            }
-                        };
-                        menu.item(
-                            ContextMenuEntry::new("Edit…")
-                                .icon(IconName::Pencil)
-                                .icon_color(Color::Muted)
-                                .handler(edit),
-                        )
-                        .separator()
-                        .item(
-                            ContextMenuEntry::new("Remove…")
-                                .icon(IconName::Trash)
-                                .icon_color(Color::Muted)
-                                .handler(remove),
-                        )
-                    }))
-                })
-                .trigger_with_tooltip(
-                    IconButton::new(element_id("options-trigger"), IconName::Ellipsis)
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted),
-                    Tooltip::text("Machine Options"),
+        let retry_button = client
+            .clone()
+            .filter(|client| !client.read(cx).is_online())
+            .map(|client| {
+                IconButton::new(element_id("retry"), IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Retry Now"))
+                    .on_click(move |_, _, cx| client.update(cx, |client, _| client.retry()))
+            });
+        let restart_button = (profile.is_none() && is_online).then(|| {
+            IconButton::new(element_id("restart"), IconName::ArrowCircle)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Restart Server…"))
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.confirm_restart_server(window, cx)),
                 )
-                .anchor(gpui::Anchor::TopRight)
-        };
+        });
+        let edit_button = profile.map(|profile| {
+            let profile = profile.clone();
+            IconButton::new(element_id("edit"), IconName::Pencil)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Edit…"))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(SettingsPageEvent::EditMachine(Some(profile.clone())))
+                }))
+        });
+        let remove_button = profile.map(|profile| {
+            let id = profile.id;
+            let name = label.clone();
+            IconButton::new(element_id("remove"), IconName::Trash)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Remove…"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.confirm_remove_machine(id, name.clone(), window, cx)
+                }))
+        });
+        let icon_picker = PopoverMenu::new(element_id("icon"))
+            .menu(move |window, cx| {
+                let client = client.clone();
+                Some(cx.new(|cx| MachineIconPicker::new(client, window, cx)))
+            })
+            .trigger_with_tooltip(
+                IconButton::new(element_id("icon-trigger"), current_icon)
+                    .icon_size(IconSize::Medium)
+                    .icon_color(Color::Muted),
+                Tooltip::text("Change Icon"),
+            )
+            .anchor(gpui::Anchor::TopLeft);
         h_flex()
             .px_4()
             .py_2p5()
             .gap_3()
             .when(!is_enabled, |row| row.opacity(0.6))
-            .child(
-                Icon::new(current_icon)
-                    .size(IconSize::Medium)
-                    .color(Color::Muted),
-            )
+            .child(icon_picker)
             .child(
                 v_flex()
                     .flex_1()
@@ -2211,8 +2165,11 @@ impl SettingsPage {
                     .flex_none()
                     .gap_1()
                     .children(update_button)
-                    .children(switch)
-                    .child(options_menu),
+                    .children(retry_button)
+                    .children(restart_button)
+                    .children(edit_button)
+                    .children(remove_button)
+                    .children(switch),
             )
             .into_any_element()
     }
@@ -2738,105 +2695,6 @@ impl Render for SettingsPage {
                     .vertical_scrollbar_for(&self.content_scroll, window, cx),
             )
     }
-}
-
-/// t3code's Icon submenu: the machine kinds, with the one its server detected marked. The
-/// server keeps the choice, so it's locked until a server that can is connected.
-fn machine_icon_menu(
-    menu: ContextMenu,
-    client: Option<Entity<ServerClient>>,
-    current_icon: IconName,
-    cx: &App,
-) -> ContextMenu {
-    let lock = match client.as_ref().map(|client| client.read(cx)) {
-        Some(client) if client.is_online() => {
-            if client.has_capability(CAPABILITY_MACHINE_ICON) {
-                None
-            } else if client.is_outdated() {
-                Some("Its server is too old to keep an icon. Update it to choose one.")
-            } else {
-                Some("Its server is too old to keep an icon.")
-            }
-        }
-        _ => Some("Connect to this machine to change its icon."),
-    };
-    let icon = client
-        .as_ref()
-        .map(|client| client.read(cx).machine_icon().clone())
-        .unwrap_or_default();
-    menu.submenu_with_icon("Icon", current_icon, move |mut menu, _, _| {
-        // Wrapped: Zed places a submenu as if it were at most 200px wide, so a wider one
-        // would cover its parent menu.
-        if let Some(lock) = lock {
-            menu = menu
-                .custom_entry(
-                    move |_, _| {
-                        div()
-                            .max_w(px(180.))
-                            .child(Label::new(lock).size(LabelSize::Small).color(Color::Muted))
-                            .into_any_element()
-                    },
-                    |_, _| {},
-                )
-                .selectable(false)
-                .separator();
-        }
-        let current = icon.kind();
-        let detected = icon.detected.clone().unwrap_or(MachineKind::Server);
-        // Zed's entries draw their icon as the check mark, so each kind draws its own row:
-        // its icon, its name, "detected" and the check, as t3code's radio items do.
-        for kind in MachineKind::ALL {
-            let is_current = kind == current;
-            let is_detected = kind == detected;
-            let is_locked = lock.is_some();
-            let row_kind = kind.clone();
-            let client = client.clone();
-            menu = menu
-                .custom_entry(
-                    move |_, _| {
-                        let color = if is_locked {
-                            Color::Disabled
-                        } else {
-                            Color::Default
-                        };
-                        h_flex()
-                            .w_full()
-                            .gap_1p5()
-                            .child(
-                                Icon::new(machine_kind_icon(&row_kind))
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(Label::new(row_kind.label()).color(color))
-                            .when(is_detected, |row| {
-                                row.child(
-                                    Label::new("detected")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                            })
-                            .child(div().flex_1().min_w_4())
-                            .child(
-                                div()
-                                    .child(
-                                        Icon::new(IconName::Check)
-                                            .size(IconSize::Small)
-                                            .color(Color::Accent),
-                                    )
-                                    .when(!is_current, |check| check.invisible()),
-                            )
-                            .into_any_element()
-                    },
-                    move |_, cx| {
-                        if let Some(client) = &client {
-                            client.read(cx).choose_machine_icon(kind.clone(), cx)
-                        }
-                    },
-                )
-                .selectable(!is_locked);
-        }
-        menu
-    })
 }
 
 #[cfg(test)]
