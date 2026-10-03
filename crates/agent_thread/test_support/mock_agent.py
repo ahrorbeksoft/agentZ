@@ -3,8 +3,9 @@
 It answers initialize and session/new, and replies to every prompt by streaming
 "Echo: <prompt>" and a completed tool call, then ending the turn. A prompt of
 "permission" first asks the client for permission and reports the chosen option.
-A prompt of "mcp" starts the first stdio MCP server given in session/new, calls
-its first tool, and replies "MCP: <tool result>". A prompt of "slow" streams
+A prompt of "mcp" starts the first stdio MCP server given in session/new (or
+session/load), calls its first tool, and replies "MCP: <tool result>"; "mcp <tool>
+<json arguments>" calls that tool instead. A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart.
 """
 import json
@@ -82,7 +83,7 @@ def finish_prompt(request_id, session_id, prompt_text, chosen=None):
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
-def call_first_mcp_tool():
+def call_mcp_tool(name=None, arguments=None):
     """Speaks MCP's stdio transport (newline-delimited JSON-RPC) to the first stdio server."""
     server = next((s for s in mcp_servers if "command" in s), None)
     if server is None:
@@ -104,7 +105,8 @@ def call_first_mcp_tool():
         process.stdin.write(json.dumps({"jsonrpc": "2.0",
                                         "method": "notifications/initialized"}) + "\n")
         tools = request(2, "tools/list", {})["result"]["tools"]
-        result = request(3, "tools/call", {"name": tools[0]["name"], "arguments": {}})["result"]
+        result = request(3, "tools/call", {"name": name or tools[0]["name"],
+                                           "arguments": arguments or {}})["result"]
         return "".join(block.get("text", "") for block in result["content"])
     finally:
         process.stdin.close()
@@ -138,6 +140,7 @@ for line in sys.stdin:
                 {"name": "compact", "description": "Summarize the conversation to free up context",
                  "input": {"hint": "optional focus"}}]}}})
     elif method == "session/load":
+        mcp_servers = message["params"].get("mcpServers", [])
         session_id = message["params"]["sessionId"]
         for payload in load_history():
             send({"jsonrpc": "2.0", "method": "session/update",
@@ -160,9 +163,12 @@ for line in sys.stdin:
                              "options": [
                                  {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
                                  {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}})
-        elif prompt_text == "mcp":
+        elif prompt_text == "mcp" or prompt_text.startswith("mcp "):
+            parts = prompt_text.split(" ", 2)
+            name = parts[1] if len(parts) > 1 else None
+            arguments = json.loads(parts[2]) if len(parts) > 2 else None
             update(params["sessionId"], text_chunk("agent_message_chunk",
-                                                   "MCP: " + call_first_mcp_tool()))
+                                                   "MCP: " + call_mcp_tool(name, arguments)))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "slow":
             for word in ["One", " two", " three", " four", " five"]:

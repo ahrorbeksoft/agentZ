@@ -175,6 +175,7 @@ dependencies = [
  "futures",
  "gpui_shared_string",
  "log",
+ "projects",
  "registry",
  "serde_json",
  "tempfile",
@@ -220,8 +221,10 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "agent_thread",
+ "agentz_client",
  "agentz_protocol",
  "anyhow",
+ "chrono",
  "clap",
  "collections",
  "env_logger",

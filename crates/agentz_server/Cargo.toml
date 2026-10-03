@@ -19,8 +19,10 @@ workspace = true
 [dependencies]
 agent-client-protocol.workspace = true
 agent_thread.workspace = true
+agentz_client.workspace = true
 agentz_protocol.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 collections.workspace = true
 env_logger.workspace = true
@@ -43,4 +45,4 @@ nix = { workspace = true, features = ["hostname"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "time"] }

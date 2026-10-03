@@ -20,6 +20,7 @@ use ui::{
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
+use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::thread_entity::AgentThread;
 
@@ -555,12 +556,38 @@ impl AgentView {
         match entry {
             Entry::UserMessage(_) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                // Messages from other threads' agents are marked, as t3code marks
+                // `createdBy: agent`.
+                let sent_by = self.thread.read(cx).prompt_sender(index).map(|sender| {
+                    format!(
+                        "Sent by {}",
+                        ProjectStore::global(cx).read(cx).describe_creator(sender)
+                    )
+                });
                 v_flex()
                     .id(("user-message", index))
                     .pt_2()
                     .pb_3()
                     .px_2()
                     .w_full()
+                    .when_some(sent_by, |this, sent_by| {
+                        this.child(
+                            h_flex()
+                                .px_1()
+                                .pb_1()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Sparkle)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(sent_by)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .py_3()

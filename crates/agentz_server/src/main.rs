@@ -10,16 +10,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentz_protocol::{
-    ClientHello, ClientKind, ClientMessage, PROTOCOL_VERSION, Request, ServerMessage,
-    ServerWelcome, read_message, write_message,
+    ClientHello, ClientKind, ClientMessage, PROTOCOL_VERSION, Request, Response, ServerMessage,
+    ServerWelcome, ToolCaller, read_message, write_message,
 };
-use agentz_server::ServerConfig;
+use agentz_server::{AgentControl, ServerConfig};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use futures::FutureExt as _;
+use projects::ThreadId;
 use reqwest_client::ReqwestClient;
 use tokio::net::{UnixListener, UnixStream};
 use util::ResultExt as _;
+
+mod mcp_bridge;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,6 +51,24 @@ enum Command {
     Proxy,
     /// Asks the running server to stop its agents and exit.
     Stop,
+    /// Serves the agent-control tools to an agent over MCP's stdio transport. agentZ gives it
+    /// to every agent session, with its credential in `AGENTZ_MCP_TOKEN`.
+    McpBridge,
+    /// Prints the agent-control tools, as MCP tool definitions in JSON.
+    Tools,
+    /// Calls an agent-control tool and prints its JSON result, for agents without MCP and for
+    /// scripts. The tools manage the threads of the caller's project: the thread in
+    /// `AGENTZ_THREAD_ID` (set for agentZ's agents), or else the project containing the current
+    /// directory.
+    Call {
+        /// A tool name from `tools`, such as `agentz_thread_list`.
+        tool: String,
+        /// The tool's arguments as a JSON object.
+        arguments: Option<String>,
+        /// Call as this thread instead of `AGENTZ_THREAD_ID`.
+        #[arg(long)]
+        thread: Option<u64>,
+    },
 }
 
 fn main() {
@@ -63,6 +84,13 @@ fn main() {
         Command::Start => start(),
         Command::Proxy => start().and_then(|()| block_on(proxy())),
         Command::Stop => block_on(stop()),
+        Command::McpBridge => block_on(mcp_bridge::run(VERSION)),
+        Command::Tools => block_on(tools()),
+        Command::Call {
+            tool,
+            arguments,
+            thread,
+        } => block_on(call(tool, arguments, thread)),
     };
     if let Err(error) = result {
         log::error!("{error:#}");
@@ -124,6 +152,10 @@ async fn serve(socket: &Path) -> Result<()> {
             custom_agents: agentz_server::load_custom_agents(paths::data_dir())
                 .log_err()
                 .unwrap_or_default(),
+            agent_control: Some(AgentControl {
+                executable: std::env::current_exe().context("finding this executable")?,
+                socket: socket.to_path_buf(),
+            }),
         },
     )?;
     log::info!(
@@ -254,6 +286,89 @@ async fn proxy() -> Result<()> {
         copied = tokio::io::copy(&mut stdin, &mut to_server) => copied?,
         copied = tokio::io::copy(&mut from_server, &mut stdout) => copied?,
     };
+    Ok(())
+}
+
+/// The socket of the server the tools come from: the one that started the calling agent, or
+/// else this user's.
+fn control_socket() -> std::path::PathBuf {
+    std::env::var_os("AGENTZ_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(paths::server_socket)
+}
+
+pub(crate) async fn connect_for_tools(
+    client_kind: ClientKind,
+) -> Result<agentz_client::Connection> {
+    let socket = control_socket();
+    let (connection, mut events) = agentz_client::connect_local(
+        &tokio::runtime::Handle::current(),
+        &socket,
+        client_kind,
+        VERSION.to_string(),
+    )
+    .await
+    .context("agentZ's server isn't running")?;
+    // Answers are delivered while the events are taken.
+    tokio::spawn(async move { while events.next().await.is_some() {} });
+    Ok(connection)
+}
+
+async fn tools() -> Result<()> {
+    let connection = connect_for_tools(ClientKind::Cli).await?;
+    match connection.request(Request::ListTools).await? {
+        Response::Tools(tools) => print_json(&tools),
+        response => bail!("unexpected response: {response:?}"),
+    }
+}
+
+async fn call(tool: String, arguments: Option<String>, thread: Option<u64>) -> Result<()> {
+    let arguments = match arguments {
+        Some(arguments) => {
+            serde_json::from_str(&arguments).context("the arguments must be a JSON object")?
+        }
+        None => serde_json::Value::Object(Default::default()),
+    };
+    let thread = match thread {
+        Some(thread) => Some(thread),
+        None => match std::env::var("AGENTZ_THREAD_ID") {
+            Ok(thread) => Some(
+                thread
+                    .parse()
+                    .context("AGENTZ_THREAD_ID isn't a thread id")?,
+            ),
+            Err(_) => None,
+        },
+    };
+    let caller = match thread {
+        Some(thread) => ToolCaller::Thread(ThreadId(thread)),
+        None => {
+            ToolCaller::Directory(std::env::current_dir().context("finding the current directory")?)
+        }
+    };
+    let connection = connect_for_tools(ClientKind::Cli).await?;
+    let response = connection
+        .request(Request::CallTool {
+            caller,
+            name: tool,
+            arguments,
+        })
+        .await?;
+    match response {
+        Response::ToolResult(result) => {
+            print_json(&result.value)?;
+            if result.is_error {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        response => bail!("unexpected response: {response:?}"),
+    }
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(value).context("encoding the result")?;
+    println!("{text}");
     Ok(())
 }
 

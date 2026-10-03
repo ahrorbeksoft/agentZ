@@ -543,6 +543,12 @@ impl Sidebar {
             .map(|time| format_relative_time(time, SystemTime::now()));
         let group_name = SharedString::from(format!("thread-card-{}", thread.id.0));
         let title = SharedString::from(thread.title);
+        let started_by = thread.created_by.map(|creator| {
+            format!(
+                "Started by {}",
+                self.store.read(cx).describe_creator(creator)
+            )
+        });
 
         let status = match thread_status {
             Some(ThreadStatus::Working) => h_flex()
@@ -724,6 +730,19 @@ impl Sidebar {
                                 )
                             },
                         ))
+                        .when_some(started_by, |this, started_by| {
+                            this.child(
+                                div()
+                                    .id(("thread-started-by", thread_id.0))
+                                    .flex_none()
+                                    .tooltip(Tooltip::text(started_by))
+                                    .child(
+                                        Icon::new(IconName::Sparkle)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Custom(faint_text)),
+                                    ),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_none()

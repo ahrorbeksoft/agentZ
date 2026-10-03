@@ -1,6 +1,8 @@
 //! The state the server owns, and how requests and background results change it.
 
-use std::collections::BTreeMap;
+mod tools;
+
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1 as acp;
@@ -9,20 +11,21 @@ use agentz_protocol::agents::{
     AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
 use agentz_protocol::{
-    AgentSettingsChange, ConnectionId, ErrorResponse, Event, Request, Response, ServerMessage,
-    SessionSnapshot,
+    AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineInfo, Request, Response,
+    ServerMessage, SessionSnapshot,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use futures::channel::mpsc;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui_shared_string::SharedString;
-use projects::{ProjectStore, ThreadId};
+use projects::{ProjectStore, ThreadCreator, ThreadId};
 use registry::{AgentRegistryStore, CommandFuture, RegistryMessage};
 use tokio::task::JoinSet;
 
 use crate::agent_settings::AgentSettingsStore;
-use crate::{CustomAgent, ServerConfig};
+use crate::{AgentControl, CustomAgent, ServerConfig};
+use tools::{PendingToolCall, ToolResults};
 
 const MAX_THREAD_TITLE_CHARS: usize = 48;
 
@@ -41,7 +44,15 @@ pub(crate) enum Input {
     Disconnected(ClientId),
     Registry(RegistryMessage),
     Thread(ConnectionId, ThreadMessage),
+    /// A waiting tool call's timeout has passed.
+    ToolDeadline,
     Shutdown,
+}
+
+/// A message an agent sent to a thread that was busy, sent once its turn ends.
+struct FollowUp {
+    text: String,
+    from: ThreadCreator,
 }
 
 struct Client {
@@ -61,7 +72,15 @@ struct Account {
 pub(crate) struct Server {
     runtime: tokio::runtime::Handle,
     inputs: mpsc::UnboundedSender<Input>,
+    machine: MachineInfo,
     custom_agents: BTreeMap<AgentId, CustomAgent>,
+    agent_control: Option<AgentControl>,
+    /// The MCP bridges' credentials, each given to one thread's agent. Dropped with the agent.
+    tool_sessions: HashMap<String, ThreadId>,
+    follow_ups: HashMap<ThreadId, VecDeque<FollowUp>>,
+    /// Tool calls waiting for a thread, answered as soon as it's ready or their time is up.
+    pending_tool_calls: Vec<PendingToolCall>,
+    tool_results: ToolResults,
     projects: ProjectStore,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
@@ -84,6 +103,7 @@ impl Server {
     pub(crate) fn new(
         runtime: tokio::runtime::Handle,
         config: ServerConfig,
+        machine: MachineInfo,
         inputs: mpsc::UnboundedSender<Input>,
     ) -> Self {
         let data_dir = config.data_dir;
@@ -102,7 +122,13 @@ impl Server {
         let mut server = Self {
             runtime,
             inputs,
+            machine,
             custom_agents: config.custom_agents,
+            agent_control: config.agent_control,
+            tool_sessions: HashMap::default(),
+            follow_ups: HashMap::default(),
+            pending_tool_calls: Vec::new(),
+            tool_results: ToolResults::default(),
             projects_revision_sent: projects.revision(),
             registry_sent: RegistrySnapshot::default(),
             agent_settings_revision_sent: agent_settings.revision(),
@@ -172,6 +198,16 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request:
+                    Request::CallTool {
+                        caller,
+                        name,
+                        arguments,
+                    },
+            } => self.call_tool(client, id, caller, name, arguments),
+            Input::Request {
+                client,
+                id,
                 request,
             } => {
                 let result = self
@@ -194,6 +230,8 @@ impl Server {
                 self.registry_changed = true;
             }
             Input::Shutdown => self.stopping = true,
+            // The waiting calls are checked once this batch is handled.
+            Input::ToolDeadline => {}
             Input::Thread(connection, message) => {
                 let thread = match connection {
                     ConnectionId::Thread(id) => self.threads.get_mut(&id),
@@ -448,6 +486,9 @@ impl Server {
                 self.stopping = true;
                 Ok(Response::Ok)
             }
+            Request::ListTools => Ok(Response::Tools(tools::definitions())),
+            // Handled by `call_tool`, since it may answer later.
+            Request::CallTool { .. } => Err(anyhow!("tool calls are handled separately")),
             Request::Unknown(request) => Err(anyhow!("unsupported request: {request}")),
         }
     }
@@ -514,7 +555,41 @@ impl Server {
                 "This thread has no agent.",
             ));
         };
-        let command = self.agent_command(&agent_id, true);
+        let mut command = self.agent_command(&agent_id, true);
+        let mut mcp_servers = Vec::new();
+        if let Some(control) = self.agent_control.clone() {
+            let token = uuid::Uuid::new_v4().to_string();
+            self.tool_sessions.insert(token.clone(), thread_id);
+            mcp_servers.push(acp::McpServer::Stdio(
+                acp::McpServerStdio::new("agentz", &control.executable)
+                    .args(vec!["mcp-bridge".into()])
+                    .env(vec![
+                        acp::EnvVariable::new(
+                            "AGENTZ_SOCKET",
+                            control.socket.to_string_lossy().into_owned(),
+                        ),
+                        acp::EnvVariable::new("AGENTZ_MCP_TOKEN", token),
+                    ]),
+            ));
+            // For agents without MCP, which can still run the CLI from their shell tool, as
+            // herdr's `HERDR_*` variables allow.
+            command = async move {
+                let mut command = command.await?;
+                command.env.extend([
+                    (
+                        "AGENTZ_BIN_PATH".to_string(),
+                        control.executable.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "AGENTZ_SOCKET".to_string(),
+                        control.socket.to_string_lossy().into_owned(),
+                    ),
+                    ("AGENTZ_THREAD_ID".to_string(), thread_id.0.to_string()),
+                ]);
+                Ok(command)
+            }
+            .boxed();
+        }
         let (mut agent_thread, inbox) = AgentThread::start(
             self.runtime.clone(),
             self.agent_name(&agent_id),
@@ -522,6 +597,7 @@ impl Server {
             cwd,
             previous_session,
         );
+        agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_defaults(self.agent_settings.get(&agent_id).session_defaults());
         let connection = ConnectionId::Thread(thread_id);
         self.forward(inbox, move |message| Input::Thread(connection, message));
@@ -678,6 +754,11 @@ impl Server {
         let projects = &self.projects;
         self.threads
             .retain(|thread_id, _| projects.thread(*thread_id).is_some());
+        let threads = &self.threads;
+        self.tool_sessions
+            .retain(|_, thread_id| threads.contains_key(thread_id));
+        self.send_follow_ups();
+        let answers = self.answer_waiting_tool_calls();
         for (thread_id, thread) in &self.threads {
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());
@@ -739,6 +820,17 @@ impl Server {
                     );
                 }
             }
+        }
+
+        // After the changes, as for any other response.
+        for (client, id, result) in answers {
+            self.send(
+                client,
+                ServerMessage::Response {
+                    id,
+                    result: Ok(Response::ToolResult(result)),
+                },
+            );
         }
     }
 

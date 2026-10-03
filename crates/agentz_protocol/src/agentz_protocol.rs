@@ -45,8 +45,10 @@ pub struct ClientHello {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClientKind {
     App,
-    /// `agentz-server` itself, e.g. for `stop`.
+    /// `agentz-server` itself, e.g. for `stop` or `call`.
     Cli,
+    /// `agentz-server mcp-bridge`, started by an agent.
+    Mcp,
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -203,9 +205,38 @@ pub enum Request {
     /// Ends the server, its agents and terminals.
     Shutdown,
 
+    /// The agent-control tools, as MCP tool definitions: [`Response::Tools`].
+    ListTools,
+    /// Runs an agent-control tool for the caller: [`Response::ToolResult`]. Tools that wait
+    /// answer when they're done.
+    CallTool {
+        caller: ToolCaller,
+        name: String,
+        arguments: serde_json::Value,
+    },
+
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
+}
+
+/// Who is calling a tool, which decides the project it may manage.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ToolCaller {
+    /// The credential the MCP bridge got with its agent's session.
+    Session(String),
+    /// A thread, as the CLI knows it from `AGENTZ_THREAD_ID`.
+    Thread(ThreadId),
+    /// A directory inside a project, as the CLI run elsewhere knows it.
+    Directory(PathBuf),
+}
+
+/// A tool's answer: its result, or for a failure `{"code", "message"}` with t3code's failure
+/// codes. The MCP bridge wraps it as a `tools/call` result.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub value: serde_json::Value,
+    pub is_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -230,6 +261,8 @@ pub enum Response {
     ThreadCreated(ThreadId),
     ProjectAdded(ProjectId),
     AccountOpened(u64),
+    Tools(serde_json::Value),
+    ToolResult(ToolResult),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -359,7 +392,7 @@ mod tests {
         let message: ServerMessage =
             serde_json::from_str(r#"{"Event":{"Novel":[1]}}"#).expect("decodes");
         assert!(matches!(message, ServerMessage::Event(Event::Unknown(_))));
-        let kind: ClientKind = serde_json::from_str(r#""Mcp""#).expect("decodes");
+        let kind: ClientKind = serde_json::from_str(r#""Telepathy""#).expect("decodes");
         assert!(matches!(kind, ClientKind::Unknown(_)));
     }
 

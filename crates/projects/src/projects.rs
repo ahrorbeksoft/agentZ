@@ -89,6 +89,19 @@ pub struct Thread {
     /// displayed this completion.
     #[serde(default)]
     pub completed_at: Option<SystemTime>,
+    /// Who started the thread, when it wasn't the user.
+    #[serde(default)]
+    pub created_by: Option<ThreadCreator>,
+}
+
+/// An agent that started a thread or sent it a message, as opposed to the user (t3code's
+/// `createdBy: agent`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ThreadCreator {
+    /// Another thread's agent, through MCP or the CLI.
+    Thread(ThreadId),
+    /// The CLI run outside any thread, e.g. by an agent in a terminal or a script.
+    Command,
 }
 
 /// How threads (and, in "All projects", the projects themselves) are ordered.
@@ -405,6 +418,7 @@ impl ProjectStore {
             has_custom_title: false,
             model: None,
             completed_at: None,
+            created_by: None,
         });
         self.changed();
         Some(id)
@@ -462,6 +476,15 @@ impl ProjectStore {
         if self.threads.len() != count_before {
             self.working_threads.remove(&id);
             self.blocked_threads.remove(&id);
+            self.changed();
+        }
+    }
+
+    pub fn set_thread_creator(&mut self, id: ThreadId, creator: ThreadCreator) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.created_by != Some(creator)
+        {
+            thread.created_by = Some(creator);
             self.changed();
         }
     }

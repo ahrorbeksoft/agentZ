@@ -10,7 +10,9 @@ use agentz_protocol::agents::AgentId;
 use agentz_protocol::{Request, Response};
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
-use projects::{ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId, ThreadOrder};
+use projects::{
+    ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder,
+};
 use util::ResultExt as _;
 
 use crate::server_client::ServerClient;
@@ -117,6 +119,18 @@ impl ProjectStore {
             .get(&id.0)
             .is_none_or(|viewed| *viewed < completed_at);
         is_unseen.then_some(ThreadStatus::Completed)
+    }
+
+    /// Who an agent-started thread or agent-sent message came from, to follow "Started by" or
+    /// "Sent by".
+    pub fn describe_creator(&self, creator: ThreadCreator) -> String {
+        match creator {
+            ThreadCreator::Thread(id) => match self.store.thread(id) {
+                Some(thread) => format!("the agent in “{}”", thread.title),
+                None => "an agent in a deleted thread".to_string(),
+            },
+            ThreadCreator::Command => "the agentZ CLI".to_string(),
+        }
     }
 
     /// The most pressing status among the project's threads that aren't archived.

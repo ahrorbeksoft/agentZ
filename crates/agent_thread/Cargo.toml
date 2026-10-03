@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 agent-client-protocol.workspace = true
 agentz_protocol.workspace = true
+projects.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 gpui_shared_string.workspace = true

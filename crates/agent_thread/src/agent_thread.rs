@@ -127,6 +127,8 @@ pub struct AgentThread {
     session: Option<Session>,
     pending_title: Option<String>,
     queued_prompts: Vec<String>,
+    /// Given to the agent with every session it opens.
+    mcp_servers: Vec<acp::McpServer>,
     stderr_lines: VecDeque<String>,
     /// False for a connection made only to log in or out (from settings), which never opens a
     /// session.
@@ -223,6 +225,7 @@ impl AgentThread {
             session: None,
             pending_title: None,
             queued_prompts: Vec::new(),
+            mcp_servers: Vec::new(),
             stderr_lines: VecDeque::new(),
             opens_session: true,
             defaults: SessionDefaults::default(),
@@ -233,6 +236,12 @@ impl AgentThread {
             tasks: JoinSet::new(),
         };
         (this, inbox)
+    }
+
+    /// MCP servers for the agent to start with its sessions. Set it right after starting: the
+    /// session opens once the agent has connected.
+    pub fn set_mcp_servers(&mut self, mcp_servers: Vec<acp::McpServer>) {
+        self.mcp_servers = mcp_servers;
     }
 
     /// The events since the last call, oldest first.
@@ -399,6 +408,7 @@ impl AgentThread {
         self.connection = None;
         self.session = None;
         self.view.entries.clear();
+        self.view.state.prompts_from_agents.clear();
         self.view.state.plan.clear();
         self.cancel_permission_requests();
         self.queued_prompts.clear();
@@ -502,6 +512,7 @@ impl AgentThread {
             self.view.state.capabilities.clone(),
             self.view.state.cwd.clone(),
             self.previous_session.clone(),
+            self.mcp_servers.clone(),
         );
         self.spawn(async move {
             MessageKind::SessionOpened {
@@ -697,6 +708,15 @@ impl AgentThread {
             // Sent once the user has logged in and the session opens.
             ConnectionStatus::AuthRequired => self.queued_prompts.push(text),
             ConnectionStatus::Failed(_) => {}
+        }
+    }
+
+    /// Sends a message an agent wrote, marked as coming from it.
+    pub fn send_from(&mut self, text: String, from: projects::ThreadCreator) {
+        let index = self.view.entries.len();
+        self.send(text);
+        if self.view.entries.len() > index {
+            self.view.state.prompts_from_agents.push((index, from));
         }
     }
 
@@ -1231,15 +1251,16 @@ async fn open_session(
     capabilities: acp::AgentCapabilities,
     cwd: PathBuf,
     previous_session: Option<acp::SessionId>,
+    mcp_servers: Vec<acp::McpServer>,
 ) -> std::result::Result<SessionSetup, agent_client_protocol::Error> {
     let had_previous_session = previous_session.is_some();
     if let Some(session_id) = previous_session {
         if capabilities.load_session {
             match connection
-                .send_request(acp::LoadSessionRequest::new(
-                    session_id.clone(),
-                    cwd.clone(),
-                ))
+                .send_request(
+                    acp::LoadSessionRequest::new(session_id.clone(), cwd.clone())
+                        .mcp_servers(mcp_servers.clone()),
+                )
                 .block_task()
                 .await
             {
@@ -1261,10 +1282,10 @@ async fn open_session(
             }
         } else if capabilities.session_capabilities.resume.is_some() {
             match connection
-                .send_request(acp::ResumeSessionRequest::new(
-                    session_id.clone(),
-                    cwd.clone(),
-                ))
+                .send_request(
+                    acp::ResumeSessionRequest::new(session_id.clone(), cwd.clone())
+                        .mcp_servers(mcp_servers.clone()),
+                )
                 .block_task()
                 .await
             {
@@ -1288,7 +1309,7 @@ async fn open_session(
     }
 
     let new_session = connection
-        .send_request(acp::NewSessionRequest::new(cwd))
+        .send_request(acp::NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
         .block_task()
         .await?;
     Ok(SessionSetup {

@@ -8,15 +8,15 @@ Tracks [plan.md](plan.md). When you finish a step:
 
 Note anything that changed the plan under **Findings**, and update the plan itself.
 
-**Next:** Phase 3, agent control: `agentz-server mcp-bridge`, injected into every ACP session,
-and the first tools.
+**Next:** Phase 4, subthreads: `delegate_task`, `task_status` and `task_cancel`, lineage, and
+the Agents control.
 
 | Phase | Status |
 |---|---|
 | 0. Spike | Done |
 | 1. Local server split | Done |
 | 2. Attention states and notifications | Done |
-| 3. Agent control (MCP and CLI) | Not started |
+| 3. Agent control (MCP and CLI) | Done |
 | 4. Subthreads | Not started |
 | 5. Diffs | Not started |
 | 6. Worktrees and pastures | Not started |
@@ -97,29 +97,33 @@ Then the server:
 
 ## 3. Agent control (MCP and CLI)
 
-- [ ] `agentz-server mcp-bridge`: a stdio MCP server that talks to the server socket, with a
+- [x] `agentz-server mcp-bridge`: a stdio MCP server that talks to the server socket, with a
       per-session credential in its environment.
-- [ ] Inject it into every ACP `session/new` and `session/load`. Revoke the credential when the
+- [x] Inject it into every ACP `session/new` and `session/load`. Revoke the credential when the
       session closes.
-- [ ] Tools:
-  - [ ] `orchestrator_capabilities`: agents, models, modes, login state, machines;
-  - [ ] `agentz_thread_list` and `agentz_thread_read` (messages and activity views,
+- [x] Tools:
+  - [x] `orchestrator_capabilities`: agents, models, modes, machines. Login state is left out:
+        ACP can't report it without starting the agent;
+  - [x] `agentz_thread_list` and `agentz_thread_read` (messages and activity views,
         incremental);
-  - [ ] `agentz_thread_launch` and `create_threads`;
-  - [ ] `agentz_thread_send` (auto/queue/restart), `agentz_thread_wait`,
+  - [x] `agentz_thread_launch` and `create_threads`;
+  - [x] `agentz_thread_send` (auto/queue/restart), `agentz_thread_wait`,
         `agentz_thread_interrupt`;
-  - [ ] `agentz_thread_update` (rename) and `agentz_thread_organize` (archive, unarchive).
-- [ ] Policy:
-  - [ ] project scope;
-  - [ ] no permission escalation;
-  - [ ] no delete, and no answering permissions;
-  - [ ] `clientRequestId` idempotency;
-  - [ ] typed failures.
-- [ ] Threads and messages created by agents are marked `createdBy: agent`, and the UI shows it.
-- [ ] `agentz` CLI with `--json`, covering the same operations. Put `AGENTZ_SOCKET` and
-      `AGENTZ_THREAD_ID` in agentZ terminals.
-- [ ] Mock agent: scripted MCP tool calls. End-to-end tests.
-- [ ] Document the tools for agents, like t3code's orchestration instructions.
+  - [x] `agentz_thread_update` (rename) and `agentz_thread_organize` (archive, unarchive).
+- [x] Policy:
+  - [x] project scope;
+  - [x] no permission escalation: agentZ has no permission modes yet, so launched threads get
+        the agent's own defaults;
+  - [x] no delete, and no answering permissions;
+  - [x] `clientRequestId` idempotency;
+  - [x] typed failures.
+- [x] Threads and messages created by agents are marked `createdBy: agent`, and the UI shows it.
+- [x] CLI: `agentz-server call <tool> [json]` (JSON output, exit 1 on a failure) and
+      `agentz-server tools`. Agents get `AGENTZ_SOCKET`, `AGENTZ_THREAD_ID` and
+      `AGENTZ_BIN_PATH` in their environment. agentZ terminals get them in phase 7.
+- [x] Mock agent: scripted MCP tool calls. End-to-end tests.
+- [x] Document the tools for agents, like t3code's orchestration instructions (the tool
+      descriptions and the bridge's MCP instructions).
 
 ## 4. Subthreads
 
@@ -459,3 +463,5 @@ Then the server:
   of projects, the registry, agent settings and threads) (1f20235).
 - 2026-10-03: Finished phase 1: the reattach test, Settings › Restart Server, and `AGENTS.md`.
 - 2026-10-03: Finished phase 2: attention states, viewed completions, notifications.
+- 2026-10-03: Finished phase 3: the MCP bridge in every session, the thread tools with t3code's
+  policy, `agentz-server call`, and "Started by" / "Sent by" marks in the sidebar and thread.

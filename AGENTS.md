@@ -33,11 +33,11 @@ agentZ's own crates (everything else in `crates/` is copied from Zed):
 | Crate | What it is |
 |---|---|
 | `crates/app` | The application (`agentz` binary), a GPUI client of the server. See the modules below. |
-| `crates/agentz_server` | The background server (`agentz-server` binary, GPUI-free, tokio). One task (`server.rs`) owns the projects, the registry, agent settings and the running threads, so agents keep working when the app quits. `main.rs` has `run`, `start`, `proxy` and `stop`. |
+| `crates/agentz_server` | The background server (`agentz-server` binary, GPUI-free, tokio). One task (`server.rs`) owns the projects, the registry, agent settings and the running threads, so agents keep working when the app quits. `server/tools.rs` has the agent-control tools (t3code's orchestrator MCP, `agentz_` for `t3_`). `main.rs` has `run`, `start`, `proxy`, `stop`, and for agents `mcp-bridge` (`mcp_bridge.rs`, the stdio MCP server every session gets), `tools` and `call <tool> [json]`. |
 | `crates/agentz_protocol` | The wire format (length-prefixed JSON) and the types the server and clients share: requests, responses, events, thread views and updates, registry and agent settings. |
 | `crates/agentz_client` | A connection to the server: requests answered through futures, events in order, and starting a local server. |
 | `crates/agent_thread` | One ACP connection and session, run by the server: process, protocol, entries, permissions, config options, login/logout, reload. `test_support/mock_agent.py` is a scripted ACP agent for tests. |
-| `crates/projects` | `ProjectStore`: projects (custom name and icon), threads (title, agent, session id, model, archived), scope, thread order. Saved to `state.json`. |
+| `crates/projects` | `ProjectStore`: projects (custom name and icon), threads (title, agent, session id, model, archived, created by an agent), scope, thread order. Saved to `state.json`. |
 | `crates/registry` | `AgentRegistryStore`: fetches the ACP Registry, installs, updates and uninstalls agents (binary archives, or npm via the system `npm`), and builds the command to start one. |
 | `crates/paths` | Data locations. `AGENTZ_DATA_DIR` overrides the data directory. |
 | `crates/text_input` | The single-line text field (cursor blink, selection, IME). |
@@ -124,11 +124,14 @@ From Zed's guidelines, which this code follows:
 
 - **Unit and integration:** `agent_thread` tests drive the real mock agent process (login, logout,
   reload, defaults, history replay). Extend the mock when you need a protocol feature; it speaks
-  JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp`, `slow` and
-  `demo` script different turns (see its docstring).
+  JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp` (or
+  `mcp <tool> <json>`), `slow` and `demo` script different turns (see its docstring).
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.
+- **Agent control:** `agentz_server` tests call the tools as a thread (`Request::CallTool`) for
+  their behavior and policy; `tests/agent_control.rs` has the mock agent call them through the
+  real `mcp-bridge`, and runs `call` as a thread's shell would.
 - **The app against a scratch server:** set `AGENTZ_DATA_DIR` to a temporary directory and put
   the mock agent in its `agents/custom.json`. The app starts a server for that directory. Stop it
   afterwards with `AGENTZ_DATA_DIR=<dir> ./target/debug/agentz-server stop`.

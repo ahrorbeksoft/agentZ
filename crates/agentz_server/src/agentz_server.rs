@@ -36,6 +36,18 @@ pub struct ServerConfig {
     pub shell_environment_ready: ShellEnvironmentReady,
     /// Agents started from a fixed command rather than from the registry.
     pub custom_agents: BTreeMap<AgentId, CustomAgent>,
+    /// How agents reach the agent-control tools. `None` leaves them out.
+    pub agent_control: Option<AgentControl>,
+}
+
+/// What agents are given to manage threads: the `agentz` MCP server in every session, and the
+/// environment for the CLI.
+#[derive(Clone, Debug)]
+pub struct AgentControl {
+    /// The `agentz-server` binary, run as `mcp-bridge` and `call`.
+    pub executable: PathBuf,
+    /// The socket the bridge and the CLI connect to.
+    pub socket: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -83,7 +95,12 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
     let server = {
         // The stores spawn their background work onto the runtime as they're created.
         let _guard = runtime.enter();
-        Server::new(runtime.clone(), config, inputs.clone())
+        Server::new(
+            runtime.clone(),
+            config,
+            welcome.machine.clone(),
+            inputs.clone(),
+        )
     };
     runtime.spawn(async move {
         server.run(inbox).await;

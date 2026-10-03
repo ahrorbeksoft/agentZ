@@ -8,6 +8,7 @@ use gpui_shared_string::SharedString;
 use serde::{Deserialize, Serialize};
 
 use crate::agents::AgentCommand;
+use projects::ThreadCreator;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum ConnectionStatus {
@@ -207,6 +208,10 @@ pub struct ThreadState {
     /// Whether the agent let a session open (logged in) or asked for a login. ACP has no way to
     /// ask directly, so this is the closest status there is. `None` until known.
     pub logged_in: Option<bool>,
+    /// User messages that an agent sent (through MCP or the CLI) rather than the user, by
+    /// entry index, in order. A list rather than a map: integer map keys don't survive serde's
+    /// buffering of the protocol's untagged fallbacks.
+    pub prompts_from_agents: Vec<(usize, ThreadCreator)>,
 }
 
 /// A thread's state and entries, with the read API both the server's thread and the clients'
@@ -268,6 +273,15 @@ impl ThreadView {
 
     pub fn agent_name(&self) -> &SharedString {
         &self.state.agent_name
+    }
+
+    /// The agent that sent the user message at `index`, if one did.
+    pub fn prompt_sender(&self, index: usize) -> Option<ThreadCreator> {
+        self.state
+            .prompts_from_agents
+            .iter()
+            .find(|(prompt_index, _)| *prompt_index == index)
+            .map(|(_, sender)| *sender)
     }
 
     pub fn status(&self) -> &ConnectionStatus {

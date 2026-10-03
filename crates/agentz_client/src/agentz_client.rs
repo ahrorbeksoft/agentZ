@@ -249,6 +249,7 @@ mod tests {
                 http_client: Arc::new(http_client::BlockedHttpClient),
                 shell_environment_ready: futures::future::ready(()).boxed().shared(),
                 custom_agents,
+                agent_control: None,
             },
         )
         .expect("server starts")
