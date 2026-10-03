@@ -12,8 +12,8 @@ use agentz_protocol::thread::{
 use collections::{HashMap, HashSet};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyBinding, MouseButton, Point, ScrollHandle, Subscription, Task,
-    Window, WindowHandle, pulsating_between,
+    FocusHandle, Focusable, Hsla, KeyBinding, ScrollHandle, Subscription, Task, Window,
+    pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{TaskEnd, ThreadId};
@@ -23,7 +23,6 @@ use ui::{
     SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
 };
 
-use crate::detached_panel::{self, DetachedPanel};
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
@@ -57,22 +56,6 @@ pub(crate) const RESIZE_EDGE_SIZE: Pixels = px(6.);
 /// The drawer's top edge, being dragged to resize it.
 struct DraggedDrawerEdge;
 
-/// The drawer, dragged by its header.
-struct DraggedDrawer;
-
-/// What follows the mouse while a panel is dragged by its header.
-pub(crate) struct DraggedLabel(pub SharedString);
-
-impl Render for DraggedLabel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .elevation_2(cx)
-            .child(Label::new(self.0.clone()).size(LabelSize::Small))
-    }
-}
 /// The most lines of a command's terminal a tool call shows.
 const TOOL_TERMINAL_MAX_LINES: usize = 16;
 
@@ -142,10 +125,6 @@ pub struct AgentView {
     drawer_height: Pixels,
     /// The drawer fills the thread's area.
     drawer_full_screen: bool,
-    /// The drawer moved into its own window, which puts it back when closed.
-    drawer_window: Option<(WindowHandle<DetachedPanel>, Subscription)>,
-    /// Where a drag of the drawer's header left the window, to open it there when let go.
-    drawer_drag_out: Option<Point<Pixels>>,
     /// The terminals the agent runs its commands in, by the ids it got, shown in their tool
     /// calls.
     tool_terminals: HashMap<String, Entity<TerminalView>>,
@@ -166,12 +145,6 @@ impl AgentView {
         let registry = client.read(cx).registry().clone();
         let composer = cx.new(|cx| TextInput::new("Message the agent…", cx));
         let subscriptions = vec![
-            // A detached drawer's window goes with the thread's view.
-            cx.on_release(|this: &mut Self, cx| {
-                if let Some((handle, _)) = this.drawer_window.take() {
-                    detached_panel::close(handle, cx);
-                }
-            }),
             cx.observe(&thread, |this, _, cx| {
                 // Only follow new output if the user hasn't scrolled up to read.
                 let follow = this.is_scrolled_to_bottom();
@@ -239,8 +212,6 @@ impl AgentView {
             drawer: None,
             drawer_height: DRAWER_HEIGHT,
             drawer_full_screen: false,
-            drawer_window: None,
-            drawer_drag_out: None,
             tool_terminals: HashMap::default(),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
@@ -603,9 +574,6 @@ impl AgentView {
     ) {
         if self.drawer.take().is_some() {
             self.drawer_full_screen = false;
-            if let Some((handle, _)) = self.drawer_window.take() {
-                detached_panel::close(handle, cx);
-            }
             window.focus(&self.focus_handle(cx), cx);
         } else {
             let terminal = Terminal::shared(&self.client, TerminalKey::Drawer(self.thread_id), cx);
@@ -616,47 +584,9 @@ impl AgentView {
         cx.notify();
     }
 
-    /// Moves the drawer into a window of its own, at `origin` on screen when a drag let go
-    /// there. Closing the window brings it back.
-    fn detach_drawer(
-        &mut self,
-        origin: Option<Point<Pixels>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(drawer) = self.drawer.clone() else {
-            return;
-        };
-        if self.drawer_window.is_some() {
-            return;
-        }
-        let title = SharedString::from(format!("Terminal — {}", self.title));
-        let Some((handle, panel)) =
-            DetachedPanel::open(title, drawer.clone().into(), origin, window, cx)
-        else {
-            return;
-        };
-        let closed = cx.observe_release(&panel, |this, _, cx| {
-            this.drawer_window = None;
-            cx.notify();
-        });
-        self.drawer_window = Some((handle, closed));
-        self.drawer_full_screen = false;
-        handle
-            .update(cx, |_, window, cx| {
-                window.focus(&drawer.focus_handle(cx), cx);
-            })
-            .ok();
-        cx.notify();
-    }
-
-    /// The drawer under the conversation, or filling the thread's area. A detached drawer
-    /// shows in its own window instead.
+    /// The drawer under the conversation, or filling the thread's area.
     fn render_drawer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let drawer = self.drawer.clone()?;
-        if self.drawer_window.is_some() {
-            return None;
-        }
         let terminal = drawer.read(cx).terminal().clone();
         let exit = terminal
             .read(cx)
@@ -665,16 +595,10 @@ impl AgentView {
         let colors = cx.theme().colors();
         let is_full_screen = self.drawer_full_screen;
         let header = h_flex()
-            .id("drawer-header")
             .h(px(28.))
             .flex_none()
             .px_2()
             .gap_1p5()
-            .cursor_grab()
-            // Dragged out of the window, it opens in one of its own.
-            .on_drag(DraggedDrawer, |_, _, _, cx| {
-                cx.new(|_| DraggedLabel("Terminal".into()))
-            })
             .child(
                 Icon::new(IconName::Terminal)
                     .size(IconSize::XSmall)
@@ -701,14 +625,6 @@ impl AgentView {
                     .on_click(move |_, _, cx| {
                         terminal.update(cx, |terminal, cx| terminal.restart(cx))
                     }),
-            )
-            .child(
-                IconButton::new("detach-drawer", IconName::ArrowUpRight)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("Open in a Window"))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.detach_drawer(None, window, cx)),
-                    ),
             )
             .child(
                 IconButton::new(
@@ -3068,8 +2984,7 @@ impl Render for AgentView {
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
 
         let is_subthread = self.parent(cx).is_some();
-        let is_drawer_full_screen =
-            self.drawer_full_screen && self.drawer.is_some() && self.drawer_window.is_none();
+        let is_drawer_full_screen = self.drawer_full_screen && self.drawer.is_some();
 
         v_flex()
             // Otherwise clicking the conversation would take focus from the message editor.
@@ -3089,30 +3004,6 @@ impl Render for AgentView {
                     }
                 }),
             )
-            .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<DraggedDrawer>, window, _| {
-                    let position = event.event.position;
-                    let size = window.viewport_size();
-                    let is_outside = position.x < px(0.)
-                        || position.y < px(0.)
-                        || position.x > size.width
-                        || position.y > size.height;
-                    this.drawer_drag_out = is_outside.then_some(position);
-                }),
-            )
-            // Let go outside the window, the dragged drawer opens in its own there.
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    if let Some(position) = this.drawer_drag_out.take() {
-                        let origin = window.bounds().origin + position;
-                        cx.defer_in(window, move |this, window, cx| {
-                            this.detach_drawer(Some(origin), window, cx)
-                        });
-                    }
-                }),
-            )
-            .capture_any_mouse_up(cx.listener(|this, _, _, _| this.drawer_drag_out = None))
             .child(self.render_toolbar(cx))
             // A full-screen terminal hides the conversation and the composer.
             .when(!is_drawer_full_screen, |this| {

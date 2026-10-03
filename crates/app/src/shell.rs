@@ -5,9 +5,8 @@ use crate::project_store::ThreadStatus;
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
-    AnyView, AnyWindowHandle, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle,
-    Focusable, MouseButton, PathPromptOptions, Point, Subscription, SystemNotification, Window,
-    WindowControlArea, WindowHandle,
+    AnyView, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable,
+    MouseButton, PathPromptOptions, Subscription, SystemNotification, Window, WindowControlArea,
 };
 use projects::Thread;
 use ui::{
@@ -19,8 +18,7 @@ use util::ResultExt as _;
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
 use crate::app_settings::AppSettingsStore;
-use crate::detached_panel::{self, DetachedPanel};
-use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent, DraggedDiffPanel};
+use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
@@ -131,17 +129,6 @@ pub struct Shell {
     diff_width: Pixels,
     /// The panel fills the thread's area.
     diff_full_screen: bool,
-    /// The panel moved into its own window, which follows the active thread and puts the panel
-    /// back when closed.
-    diff_window: Option<(
-        WindowHandle<DetachedPanel>,
-        Entity<DetachedPanel>,
-        Subscription,
-    )>,
-    /// Where a drag of the panel's header left the window, to open it there when let go.
-    diff_drag_out: Option<Point<Pixels>>,
-    /// The main window, for what events must open from it.
-    window: AnyWindowHandle,
     should_move_window: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -284,9 +271,6 @@ impl Shell {
             _diff_panel_events: None,
             diff_width: DIFF_PANEL_WIDTH,
             diff_full_screen: false,
-            diff_window: None,
-            diff_drag_out: None,
-            window: window.window_handle(),
             should_move_window: false,
             _subscriptions: subscriptions,
         }
@@ -390,11 +374,8 @@ impl Shell {
 
     /// Shows the active thread's changes when they're wanted, and tells the views.
     fn sync_diff_panel(&mut self, cx: &mut Context<Self>) {
-        // A detached panel stays up while the main window shows something else.
         let thread_id = self.active_thread.filter(|_| {
-            self.show_diff
-                && (self.diff_window.is_some()
-                    || (self.settings_page.is_none() && self.view == MainView::Agents))
+            self.show_diff && self.settings_page.is_none() && self.view == MainView::Agents
         });
         match thread_id {
             Some(key) => {
@@ -420,23 +401,9 @@ impl Shell {
                 self._diff_panel_events = None;
             }
         }
-        match (&self.diff_panel, &self.diff_window) {
-            (Some(panel), Some((_, detached, _))) => {
-                let content = panel.clone().into();
-                detached.update(cx, |detached, cx| detached.set_content(content, cx));
-            }
-            (None, Some(_)) => {
-                if let Some((handle, _, _)) = self.diff_window.take() {
-                    detached_panel::close(handle, cx);
-                }
-            }
-            _ => {}
-        }
-        let (is_full_screen, is_detached) = (self.diff_full_screen, self.diff_window.is_some());
+        let is_full_screen = self.diff_full_screen;
         if let Some(panel) = &self.diff_panel {
-            panel.update(cx, |panel, cx| {
-                panel.set_layout(is_full_screen, is_detached, cx)
-            });
+            panel.update(cx, |panel, cx| panel.set_full_screen(is_full_screen, cx));
         }
         for (open_thread_id, open_thread) in &self.open_threads {
             let is_diff_open = thread_id == Some(*open_thread_id);
@@ -455,55 +422,9 @@ impl Shell {
             DiffPanelEvent::Close => {
                 self.show_diff = false;
                 self.diff_full_screen = false;
-                if let Some((handle, _, _)) = self.diff_window.take() {
-                    detached_panel::close(handle, cx);
-                }
             }
             DiffPanelEvent::ToggleFullScreen => self.diff_full_screen = !self.diff_full_screen,
-            DiffPanelEvent::Detach => {
-                // Opening a window needs this one, which events don't carry.
-                let shell = cx.entity().downgrade();
-                let window = self.window;
-                cx.defer(move |cx| {
-                    window
-                        .update(cx, |_, window, cx| {
-                            shell
-                                .update(cx, |this, cx| this.detach_diff_panel(None, window, cx))
-                                .ok();
-                        })
-                        .ok();
-                });
-                return;
-            }
         }
-        self.sync_diff_panel(cx);
-    }
-
-    /// Moves the panel into a window of its own, at `origin` on screen when a drag let go
-    /// there. Closing the window brings it back.
-    fn detach_diff_panel(
-        &mut self,
-        origin: Option<Point<Pixels>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(panel) = self.diff_panel.clone() else {
-            return;
-        };
-        if self.diff_window.is_some() {
-            return;
-        }
-        let Some((handle, detached)) =
-            DetachedPanel::open("Changes".into(), panel.into(), origin, window, cx)
-        else {
-            return;
-        };
-        let closed = cx.observe_release(&detached, |this, _, cx| {
-            this.diff_window = None;
-            this.sync_diff_panel(cx);
-        });
-        self.diff_window = Some((handle, detached, closed));
-        self.diff_full_screen = false;
         self.sync_diff_panel(cx);
     }
 
@@ -1068,11 +989,8 @@ impl Render for Shell {
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
-        // Inline unless detached; filling the thread's area when full screen.
-        let diff_panel = self
-            .diff_panel
-            .clone()
-            .filter(|_| self.diff_window.is_none());
+        // Beside the thread, or filling its area when full screen.
+        let diff_panel = self.diff_panel.clone();
         let is_diff_full_screen = self.diff_full_screen && diff_panel.is_some();
         let border = cx.theme().colors().border;
         let active_view = self
@@ -1102,30 +1020,6 @@ impl Render for Shell {
                     }
                 }),
             )
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<DraggedDiffPanel>, window, _| {
-                    let position = event.event.position;
-                    let size = window.viewport_size();
-                    let is_outside = position.x < px(0.)
-                        || position.y < px(0.)
-                        || position.x > size.width
-                        || position.y > size.height;
-                    this.diff_drag_out = is_outside.then_some(position);
-                },
-            ))
-            // Let go outside the window, the dragged panel opens in its own there.
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    if let Some(position) = this.diff_drag_out.take() {
-                        let origin = window.bounds().origin + position;
-                        cx.defer_in(window, move |this, window, cx| {
-                            this.detach_diff_panel(Some(origin), window, cx)
-                        });
-                    }
-                }),
-            )
-            .capture_any_mouse_up(cx.listener(|this, _, _, _| this.diff_drag_out = None))
             .relative()
             .size_full()
             .bg(background)

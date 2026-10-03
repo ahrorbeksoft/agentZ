@@ -1,7 +1,6 @@
 mod add_project_modal;
 mod agent_view;
 mod app_settings;
-mod detached_panel;
 mod diff_panel;
 mod login_item;
 mod machines;
