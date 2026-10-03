@@ -287,12 +287,6 @@ impl TerminalDrawer {
                     .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx))),
             )
             .child(
-                IconButton::new("drawer-close-terminal", IconName::Trash)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("Close Terminal"))
-                    .on_click(cx.listener(move |this, _, _, cx| this.close_terminal(active, cx))),
-            )
-            .child(
                 IconButton::new(
                     "drawer-full-screen",
                     if self.is_full_screen {
@@ -310,6 +304,12 @@ impl TerminalDrawer {
                 .on_click(
                     cx.listener(|_, _, _, cx| cx.emit(TerminalDrawerEvent::ToggleFullScreen)),
                 ),
+            )
+            .child(
+                IconButton::new("drawer-close-terminal", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Close Terminal"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.close_terminal(active, cx))),
             )
     }
 
