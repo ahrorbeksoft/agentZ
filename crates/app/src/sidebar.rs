@@ -730,7 +730,31 @@ impl Sidebar {
         let is_renaming = self.renaming_thread == Some(thread_id);
         let thread_status = store.read(cx).thread_status(thread.id);
         let icon = thread_agent_icon(self.machines.read(cx), machine, &thread, cx);
-        let details = self.thread_details(machine, &thread, project.as_ref(), cx);
+        // A terminal thread is described by where it is now, which may not be where it
+        // started: that folder's project, or the folder itself outside every project.
+        let folder = store.read(cx).terminal_folder(thread.id).cloned();
+        let (project, folder_name) = match &folder {
+            Some(folder) => match project_at(store.read(cx).projects(), &folder.path) {
+                Some(project) => (Some(project.clone()), None),
+                None => (None, Some(folder_name(&folder.path))),
+            },
+            None => (project, None),
+        };
+        let mut details = self.thread_details(machine, &thread, project.as_ref(), cx);
+        let checkout = self.thread_checkout(machine, &thread, cx);
+        let (branch, checkout) = match &folder {
+            Some(folder) => (
+                folder.branch.clone(),
+                checkout.filter(|checkout| folder.path.starts_with(&checkout.folder)),
+            ),
+            None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
+        };
+        if folder.is_some() {
+            details.branch = branch.clone().map(SharedString::from);
+            if checkout.is_none() {
+                details.workspace = None;
+            }
+        }
         let machines = self.machines.read(cx);
         // With one project selected, every card would repeat it, so the project line goes and
         // the status moves next to the title.
@@ -742,7 +766,6 @@ impl Sidebar {
                 machines.label(machine, cx),
             )
         });
-        let checkout = self.thread_checkout(machine, &thread, cx);
         let faint_text = cx.theme().colors().text_muted.opacity(0.4);
         let time = thread
             .last_activity_at
@@ -874,18 +897,27 @@ impl Sidebar {
                 .h_5()
                 .min_w_0()
                 .gap_1p5()
-                .child(self.render_project_icon(machine, project.as_ref(), cx))
+                .child(match &folder_name {
+                    Some(_) => render_folder_icon(),
+                    None => self.render_project_icon(machine, project.as_ref(), cx),
+                })
                 .child(
                     h_flex()
                         .flex_1()
                         .min_w_0()
                         .gap_1()
-                        .children(project.as_ref().map(|project| {
-                            Label::new(project.name())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate()
-                        }))
+                        .children(
+                            project
+                                .as_ref()
+                                .map(|project| project.name())
+                                .or(folder_name.clone())
+                                .map(|name| {
+                                    Label::new(name)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate()
+                                }),
+                        )
                         .children(
                             machine_label
                                 .map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
@@ -910,99 +942,100 @@ impl Sidebar {
             (None, title_line)
         };
 
-        let card = v_flex()
-            .id(thread_element_id("thread-card", thread_id))
-            .group(group_name)
-            .on_hover(
-                cx.listener(move |this, hovered, _, cx| {
+        let card =
+            v_flex()
+                .id(thread_element_id("thread-card", thread_id))
+                .group(group_name)
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
-                }),
-            )
-            .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-            .relative()
-            .w_full()
-            .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
-            .px_2p5()
-            .py_2()
-            .rounded_md()
-            .when(is_active, |card| card.bg(selected_background))
-            .when(!is_renaming, |card| {
-                card.cursor_pointer()
-                    .hover(|card| card.bg(hover_background))
-                    .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
-            })
-            // Readable while its machine is unreachable, but plainly not live.
-            .when(is_offline, |card| card.opacity(0.5))
-            .children(project_line)
-            .child(title_line)
-            .child(
-                h_flex()
-                    .mt_0p5()
-                    .min_w_0()
-                    .gap_1p5()
-                    .child(h_flex().flex_1().min_w_0().gap_1().when_some(
-                        checkout,
-                        |this, checkout| {
-                            let branch = checkout.branch();
-                            this.children(render_checkout_marker(thread_id, &checkout, faint_text))
+                }))
+                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+                .relative()
+                .w_full()
+                .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
+                .px_2p5()
+                .py_2()
+                .rounded_md()
+                .when(is_active, |card| card.bg(selected_background))
+                .when(!is_renaming, |card| {
+                    card.cursor_pointer()
+                        .hover(|card| card.bg(hover_background))
+                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
+                })
+                // Readable while its machine is unreachable, but plainly not live.
+                .when(is_offline, |card| card.opacity(0.5))
+                .children(project_line)
+                .child(title_line)
+                .child(
+                    h_flex()
+                        .mt_0p5()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .children(checkout.as_ref().and_then(|checkout| {
+                                    render_checkout_marker(thread_id, checkout, faint_text)
+                                }))
                                 .children(branch.map(|branch| {
                                     Label::new(branch)
                                         .size(LabelSize::Small)
                                         .color(Color::Custom(faint_text))
                                         .truncate_middle()
-                                }))
-                        },
-                    ))
-                    .when(subthreads.0 > 0, |this| {
-                        let (count, running) = subthreads;
-                        let tooltip = match (count, running) {
-                            (1, 0) => "1 agent".to_string(),
-                            (count, 0) => format!("{count} agents"),
-                            (count, running) => format!("{count} agents, {running} running"),
-                        };
-                        let color = if running > 0 {
-                            Color::Accent
-                        } else {
-                            Color::Custom(faint_text)
-                        };
-                        this.child(
-                            h_flex()
-                                .id(thread_element_id("thread-agents", thread_id))
-                                .flex_none()
-                                .gap_0p5()
-                                .tooltip(Tooltip::text(tooltip))
-                                .child(
-                                    Icon::new(IconName::UserGroup)
-                                        .size(IconSize::XSmall)
-                                        .color(color),
-                                )
-                                .child(
-                                    Label::new(count.to_string())
-                                        .size(LabelSize::XSmall)
-                                        .color(color),
-                                ),
+                                })),
                         )
-                    })
-                    .when_some(started_by, |this, started_by| {
-                        this.child(
+                        .when(subthreads.0 > 0, |this| {
+                            let (count, running) = subthreads;
+                            let tooltip = match (count, running) {
+                                (1, 0) => "1 agent".to_string(),
+                                (count, 0) => format!("{count} agents"),
+                                (count, running) => format!("{count} agents, {running} running"),
+                            };
+                            let color = if running > 0 {
+                                Color::Accent
+                            } else {
+                                Color::Custom(faint_text)
+                            };
+                            this.child(
+                                h_flex()
+                                    .id(thread_element_id("thread-agents", thread_id))
+                                    .flex_none()
+                                    .gap_0p5()
+                                    .tooltip(Tooltip::text(tooltip))
+                                    .child(
+                                        Icon::new(IconName::UserGroup)
+                                            .size(IconSize::XSmall)
+                                            .color(color),
+                                    )
+                                    .child(
+                                        Label::new(count.to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(color),
+                                    ),
+                            )
+                        })
+                        .when_some(started_by, |this, started_by| {
+                            this.child(
+                                div()
+                                    .id(thread_element_id("thread-started-by", thread_id))
+                                    .flex_none()
+                                    .tooltip(Tooltip::text(started_by))
+                                    .child(
+                                        Icon::new(IconName::Sparkle)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Custom(faint_text)),
+                                    ),
+                            )
+                        })
+                        .child(
                             div()
-                                .id(thread_element_id("thread-started-by", thread_id))
                                 .flex_none()
-                                .tooltip(Tooltip::text(started_by))
-                                .child(
-                                    Icon::new(IconName::Sparkle)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Custom(faint_text)),
-                                ),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .opacity(0.6)
-                            .child(icon.size(IconSize::Small).color(Color::Muted)),
-                    ),
-            );
+                                .opacity(0.6)
+                                .child(icon.size(IconSize::Small).color(Color::Muted)),
+                        ),
+                );
 
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
@@ -1090,17 +1123,7 @@ impl Sidebar {
             // The project the shell is in, or a plain folder outside every project.
             Some(folder) => match project_at(store.read(cx).projects(), &folder.path) {
                 Some(project) => self.render_project_icon(machine, Some(project), cx),
-                // In a slot as wide as a project's icon, so titles line up.
-                None => h_flex()
-                    .size_4()
-                    .flex_none()
-                    .justify_center()
-                    .child(
-                        Icon::new(IconName::Folder)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element(),
+                None => render_folder_icon(),
             },
             None => self.render_project_icon(machine, project.as_ref(), cx),
         };
@@ -1954,6 +1977,30 @@ pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElem
         .size_1p5()
         .rounded_full()
         .bg(color.color(cx))
+}
+
+/// A folder outside every project, in a slot as wide as a project's icon so names line up.
+fn render_folder_icon() -> AnyElement {
+    h_flex()
+        .size_4()
+        .flex_none()
+        .justify_center()
+        .child(
+            Icon::new(IconName::Folder)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
+fn folder_name(folder: &Path) -> SharedString {
+    folder
+        .file_name()
+        .map_or_else(
+            || folder.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+        .into()
 }
 
 /// The project a folder is in: the deepest whose folder, worktree or pasture holds it.

@@ -729,3 +729,5 @@ Then the server:
   shells included) and wherever machines are listed. A shell's details follow its folder.
 - 2026-10-03: Fixed an agent CLI that exits while idle staying detected (its terminal thread
   stayed a "Claude Code" card, a pane kept its agent): leaving is now always reported.
+- 2026-10-03: A terminal thread's card follows its current folder too: that folder's project
+  (or the folder), branch, and details.

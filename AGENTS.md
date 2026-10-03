@@ -79,9 +79,11 @@ Data lives in `~/Library/Application Support/agentZ/`:
   pkill -f "target/debug/agentz$"
   # Only after changing the server. This ends turns in progress.
   ./target/debug/agentz-server stop
-  python3 -c 'import subprocess; subprocess.Popen(["./target/debug/agentz"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)'
+  python3 -c 'import os, subprocess; env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") and k != "AI_AGENT"}; subprocess.Popen(["./target/debug/agentz"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)'
   ```
-  Relaunch the user's app this way after each change you ship. A plain `nohup … & disown` can be
+  Relaunch the user's app this way after each change you ship. Your own session's variables
+  (`CLAUDECODE`, `CLAUDE_CODE_*`, …) must not reach it: the server it starts passes them to
+  every terminal, and a `claude` run there then thinks it's your child session. A plain `nohup … & disown` can be
   killed along with the shell that started it; `start_new_session` avoids that. The server keeps
   running when the app quits, and logs to `logs/server.log` in the data directory.
 - **Check:**
