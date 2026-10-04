@@ -22,8 +22,8 @@ Notes for whoever continues:
 | 2 | 9 | Focus: accent outline | done |
 | 3 | 7 | Unnamed tabs named by what runs, Cmd-1…9 in tooltips | done |
 | 4 | 12 | Empty state: minimal | done |
-| 5 | 1 | Rows: full-color icons, agent icons, `~` paths, machine only with remotes | not started |
-| 6 | 3A | Agents list: herdr's two-line rows | not started |
+| 5 | 1 | Rows: full-color icons, agent icons, `~` paths, machine only with remotes | done |
+| 6 | 3A | Agents list: herdr's two-line rows | done |
 | 7 | 5 | Row menu: New Tab, Copy Path, Reveal in Finder, New Thread Here | not started |
 | 8 | 2 | Worktree groups (herdr), collapse toggle | not started |
 | 9 | 15 | Delete Worktree Checkout…; fuller New Worktree dialog | not started |

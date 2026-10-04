@@ -942,6 +942,7 @@ mod tests {
                             command: None,
                         }),
                         agent: state.map(|state| PaneAgent {
+                            registry_agent: None,
                             name: "Codex".to_string(),
                             state,
                         }),

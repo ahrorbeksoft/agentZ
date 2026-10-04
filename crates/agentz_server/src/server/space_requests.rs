@@ -374,6 +374,7 @@ impl Server {
         state: AgentState,
     ) {
         let agent = agent.map(|agent| PaneAgent {
+            registry_agent: terminal_programs::registry_agent(agent.label()).map(Into::into),
             name: terminal_programs::label(agent.label())
                 .unwrap_or(agent.label())
                 .to_string(),

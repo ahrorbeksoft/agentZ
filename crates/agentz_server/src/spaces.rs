@@ -639,6 +639,7 @@ mod tests {
             store.set_pane_agent(
                 location.pane,
                 Some(PaneAgent {
+                    registry_agent: None,
                     name: "Claude Code".into(),
                     state: agentz_protocol::spaces::PaneAgentState::Working,
                 }),

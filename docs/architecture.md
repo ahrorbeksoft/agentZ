@@ -400,7 +400,8 @@ Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
   client terminals, shown live in tool calls; terminal logins, under the login buttons.
 - **Agent detection** (`detect.rs`, `detect/`): herdr's manifests read the bottom of the screen;
   the foreground process (via `tcgetpgrp`, since a pane's `/usr/bin/login` runs as root) names
-  the agent. Runs in workspace panes and terminal threads.
+  the agent. Each agent CLI maps to the ACP Registry agent whose icon stands for it
+  (`terminal_programs::registry_agent`, `PaneAgent::registry_agent`). Runs in workspace panes and terminal threads.
 
 ### Machines over SSH
 
@@ -479,9 +480,12 @@ since a thread's workspace is its checkout.
   opened in, names it unless renamed, and its branch and ahead/behind are looked up every
   5 seconds and whenever a pane `cd`s or tabs change (`Space::current`, not saved).
 - **App** (`spaces_view.rs`, `new_space_picker.rs`): the sidebar of spaces (search, **+**,
-  rename, reorder) with the agents in panes below; each row shows the icon of the project the folder is in (a folder icon outside every
-  project) and the folder's name, then the branch (or the path outside git), terminal and agent
-  counts and the machine's icon, laid out as the sidebar's shell rows, with the thread cards'
+  rename, reorder) with the agents in panes below, as herdr's two-line agent rows (state and
+  machine · workspace › tab, then the agent's icon and name); each row shows the icon of the
+  project the folder is in (a folder icon outside every project) and the folder's name, then
+  the branch (or the path outside git), its agents by their icons (up to three, then +N), the
+  terminal count, and the machine's icon once there are remote machines, laid out as the
+  sidebar's shell rows, with the thread cards'
   details popover on hover (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
   An ACP thread's pane has one header: the thread's title, agent and toolbar buttons

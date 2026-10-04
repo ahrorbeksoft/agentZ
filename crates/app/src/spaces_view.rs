@@ -29,6 +29,7 @@ use ui::{
 };
 
 use crate::OpenSettings;
+use crate::agent_icons::agent_icon;
 use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
@@ -36,9 +37,9 @@ use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_store::ThreadStatus;
 use crate::sidebar::{
-    ARCHIVED_ROW_HEIGHT, DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover,
-    render_folder_icon, render_footer_item, render_status_dot, render_status_pill,
-    repository_branch, thread_agent_icon,
+    DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover, render_folder_icon,
+    render_footer_item, render_status_dot, render_status_pill, repository_branch,
+    thread_agent_icon,
 };
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -51,6 +52,10 @@ const RENAME_KEY_CONTEXT: &str = "WorkspacesRename";
 const SEARCH_KEY_CONTEXT: &str = "WorkspacesSearch";
 /// The grab area of a split's border. The line drawn in its middle is a pixel wide.
 const DIVIDER_SIZE: Pixels = px(5.);
+/// An agent row's second line starts past the first's state slot.
+const AGENT_ROW_INDENT: Pixels = px(14.);
+/// How many agents a workspace row shows by icon before counting the rest.
+const MAX_ROW_AGENT_ICONS: usize = 3;
 /// The area panes are laid out in to find their neighbors. Only the proportions matter.
 const NAVIGATION_AREA: Rect = Rect::new(0, 0, 10_000, 10_000);
 
@@ -1267,6 +1272,8 @@ impl SpacesView {
             .into();
         let (terminals, agents) = self.space_contents(machine, space, cx);
         let contents = contents_label(terminals, agents);
+        let agent_icons = self.space_agent_icons(machine, space, cx);
+        let has_remotes = self.machines.read(cx).has_remotes();
         // The project the workspace is in now, if any: its icon stands for the workspace.
         let project = self
             .machines
@@ -1327,15 +1334,7 @@ impl SpacesView {
             .relative()
             .h_6()
             .gap_2p5()
-            .child(
-                div()
-                    .flex_none()
-                    .when(!is_active, |this| {
-                        this.opacity(0.4)
-                            .group_hover(group_name.clone(), |this| this.opacity(1.))
-                    })
-                    .child(icon),
-            )
+            .child(div().flex_none().child(icon))
             .child(if is_renaming {
                 self.render_rename_input(cx)
             } else {
@@ -1420,21 +1419,32 @@ impl SpacesView {
                                 this.space_hovered(key, true, cx);
                             }
                         }))
+                        // The agents by their own icons, a few at most; shells by count.
+                        .children(agent_icons.iter().take(MAX_ROW_AGENT_ICONS).cloned().map(
+                            |icon| icon.size(IconSize::XSmall).color(Color::Custom(faint_text)),
+                        ))
+                        .when(agent_icons.len() > MAX_ROW_AGENT_ICONS, |this| {
+                            this.child(
+                                Label::new(format!("+{}", agent_icons.len() - MAX_ROW_AGENT_ICONS))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Custom(faint_text)),
+                            )
+                        })
                         .when(terminals > 0, |this| {
                             this.child(count_badge(IconName::Terminal, terminals))
-                        })
-                        .when(agents > 0, |this| {
-                            this.child(count_badge(IconName::UserGroup, agents))
                         }),
                 )
             })
-            .child(
-                div().flex_none().opacity(0.6).child(
-                    Icon::new(machine_icon)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                ),
-            );
+            // Which machine, once there's more than one.
+            .when(has_remotes, |line| {
+                line.child(
+                    div().flex_none().opacity(0.6).child(
+                        Icon::new(machine_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            });
 
         let row =
             v_flex()
@@ -1649,6 +1659,35 @@ impl SpacesView {
         (terminals, agents)
     }
 
+    /// The icons of the agents in a workspace's panes, each thread once.
+    fn space_agent_icons(&self, machine: MachineId, space: &Space, cx: &App) -> Vec<Icon> {
+        let store = self.machines.read(cx).projects(machine, cx);
+        let store = store.as_ref().map(|store| store.read(cx));
+        let mut threads = HashSet::default();
+        let mut icons = Vec::new();
+        for pane in space.tabs.iter().flat_map(|tab| &tab.panes) {
+            match &pane.content {
+                PaneContent::Terminal(_) if pane.agent.is_some() => {
+                    icons.push(pane_agent_icon(pane, cx))
+                }
+                PaneContent::Thread(thread_id) if threads.insert(*thread_id) => {
+                    let Some(thread) = store.and_then(|store| store.thread(*thread_id)) else {
+                        continue;
+                    };
+                    let has_agent_cli =
+                        store.is_some_and(|store| store.terminal_agent(*thread_id).is_some());
+                    if thread.terminal.is_none() {
+                        icons.push(thread_agent_icon(thread, cx));
+                    } else if has_agent_cli {
+                        icons.push(Icon::new(IconName::ZedAgent));
+                    }
+                }
+                PaneContent::Terminal(_) | PaneContent::Thread(_) | PaneContent::Unknown(_) => {}
+            }
+        }
+        icons
+    }
+
     /// The agents in panes on every machine, in workspace and tab order as herdr lists them:
     /// agent CLIs found in terminal panes, and agent threads. A terminal thread is no agent.
     fn agent_entries(&self, cx: &App) -> Vec<AgentEntry> {
@@ -1758,8 +1797,8 @@ impl SpacesView {
             )
     }
 
-    /// The Archived shelf's slim row, with herdr's agent tokens: state, agent, then machine,
-    /// workspace and tab.
+    /// herdr's default agent row: the state and where it is (machine, workspace, tab), then
+    /// the agent below.
     fn render_agent_row(
         &self,
         index: usize,
@@ -1777,13 +1816,13 @@ impl SpacesView {
             None => format!("{} › {}", entry.space, entry.tab),
         };
 
-        h_flex()
+        v_flex()
             .id(ElementId::Name(format!("workspace-agent-{index}").into()))
             .debug_selector(|| format!("agent-row-{index}"))
-            .h(ARCHIVED_ROW_HEIGHT)
             .w_full()
             .px_2()
-            .gap_2()
+            .py_1()
+            .gap_0p5()
             .rounded_md()
             .cursor_pointer()
             .when(is_active, |row| row.bg(colors.ghost_element_selected))
@@ -1791,27 +1830,37 @@ impl SpacesView {
                 row.hover(|row| row.bg(colors.ghost_element_hover))
             })
             .when(is_offline, |row| row.opacity(0.5))
-            .child(render_state_slot(entry.status, cx))
-            .child(entry.icon.size(IconSize::Small).color(Color::Muted))
             .child(
-                div().flex_1().min_w_0().child(
-                    Label::new(entry.title)
-                        .size(LabelSize::Small)
-                        .color(if is_active {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        })
-                        .truncate(),
-                ),
+                h_flex()
+                    .gap_2()
+                    .child(render_state_slot(entry.status, cx))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(location)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    ),
             )
             .child(
-                div().min_w_0().max_w(px(120.)).child(
-                    Label::new(location)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate(),
-                ),
+                h_flex()
+                    // Under the location, past the state's slot.
+                    .pl(AGENT_ROW_INDENT)
+                    .gap_2()
+                    .child(entry.icon.size(IconSize::Small).color(Color::Muted))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(entry.title)
+                                .size(LabelSize::Small)
+                                .color(if is_active {
+                                    Color::Default
+                                } else {
+                                    Color::Muted
+                                })
+                                .truncate(),
+                        ),
+                    ),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.focus_pane(pane, window, cx)))
             .into_any_element()
@@ -1857,7 +1906,7 @@ impl SpacesView {
                     let (space, _, _) = self.find_pane(key, cx)?;
                     Some(pane_folder_label(&space, folder).into())
                 });
-                (Icon::new(IconName::Terminal), title.into(), folder)
+                (pane_agent_icon(pane, cx), title.into(), folder)
             }
             PaneContent::Thread(thread_id) => {
                 let machines = self.machines.read(cx);
@@ -1927,7 +1976,7 @@ impl SpacesView {
                     .color(Color::Muted)
                     .key_binding(
                         ui::KeyBinding::for_action_in(&NewWorkspace, &self.focus_handle, cx)
-                            .size(rems_from_px(12.)),
+                            .size(rems_from_px(12_f32)),
                     )
                     .on_click(
                         cx.listener(|this, _, window, cx| this.new_space_handle.show(window, cx)),
@@ -2748,6 +2797,16 @@ fn contents_label(terminals: usize, agents: usize) -> Option<String> {
 }
 
 /// A tab's name, or its number, as herdr numbers unnamed tabs.
+/// A terminal pane's icon: its agent CLI's, as the ACP Registry draws that agent, or a terminal.
+fn pane_agent_icon(pane: &Pane, cx: &App) -> Icon {
+    pane.agent
+        .as_ref()
+        .and_then(|agent| agent.registry_agent.clone())
+        .and_then(|agent| agent_icon(&AgentId::new(agent), cx))
+        .map(Icon::from_svg_markup)
+        .unwrap_or_else(|| Icon::new(IconName::Terminal))
+}
+
 /// Where a pane is: within its workspace's folder as "storefront/src", elsewhere as its
 /// path.
 fn pane_folder_label(space: &Space, folder: &SpaceFolder) -> String {
@@ -2825,6 +2884,7 @@ mod tests {
         let mut agent_pane = pane(
             5,
             Some(PaneAgent {
+                registry_agent: None,
                 name: "Claude Code".to_string(),
                 state: PaneAgentState::Working,
             }),

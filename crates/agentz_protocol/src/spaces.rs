@@ -197,6 +197,9 @@ pub struct PaneAgent {
     /// As herdr names it, such as "Claude Code".
     pub name: String,
     pub state: PaneAgentState,
+    /// The ACP Registry agent whose icon stands for it, such as `claude-acp`.
+    #[serde(default)]
+    pub registry_agent: Option<String>,
 }
 
 /// herdr's agent states.
