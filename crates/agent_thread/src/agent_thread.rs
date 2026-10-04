@@ -61,9 +61,11 @@ pub enum AgentThreadEvent {
     ConfigOptionChanged(acp::SessionConfigId, acp::SessionConfigOptionValue),
     /// The user changed the session's mode; Zed keeps it as the agent's default.
     ModeChanged(acp::SessionModeId),
-    /// The conversation this thread continued went to the agent with its first message, or
-    /// the user dropped it.
-    HandoffDone,
+    /// The conversation this thread continues, from the given thread, went to the agent with
+    /// its first message.
+    HandoffSent(projects::ThreadId),
+    /// The user started the thread without the conversation it would have brought.
+    HandoffDropped,
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
     /// The agent is logged out: agentZ logged it out, or it asked for a login.
@@ -221,7 +223,7 @@ pub struct AgentThread {
     queued_prompts: Vec<String>,
     /// The conversation this thread continues, taken from [`ThreadState::handoff`] by the first
     /// message, to go with it once that's sent.
-    handoff_to_send: Option<String>,
+    handoff_to_send: Option<PendingHandoff>,
     /// Given to the agent with every session it opens.
     mcp_servers: Vec<acp::McpServer>,
     terminal_host: Option<TerminalHost>,
@@ -1273,8 +1275,16 @@ impl AgentThread {
     /// Starts without the conversation the thread would have brought.
     pub fn drop_handoff(&mut self) {
         if self.view.state.handoff.take().is_some() || self.handoff_to_send.take().is_some() {
-            self.emit(AgentThreadEvent::HandoffDone);
+            self.emit(AgentThreadEvent::HandoffDropped);
         }
+    }
+
+    /// Whether the user has sent a message, or queued one.
+    pub fn has_user_message(&self) -> bool {
+        self.view
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::UserMessage(_)))
     }
 
     /// The agent tried to open a page in a browser while logging in, and agentZ's `xdg-open`
@@ -1430,7 +1440,7 @@ impl AgentThread {
         }
         self.view.entries.push(Entry::UserMessage(text.clone()));
         if let Some(handoff) = self.view.state.handoff.take() {
-            self.handoff_to_send = Some(handoff.text);
+            self.handoff_to_send = Some(handoff);
         }
         self.view.state.turn_error = None;
         match self.view.state.status {
@@ -1486,15 +1496,15 @@ impl AgentThread {
             {
                 acp::ContentBlock::Resource(acp::EmbeddedResource::new(
                     acp::EmbeddedResourceResource::TextResourceContents(
-                        acp::TextResourceContents::new(handoff, "agentz://handoff")
+                        acp::TextResourceContents::new(handoff.text, "agentz://handoff")
                             .mime_type("text/markdown".to_string()),
                     ),
                 ))
             } else {
-                acp::ContentBlock::Text(acp::TextContent::new(handoff))
+                acp::ContentBlock::Text(acp::TextContent::new(handoff.text))
             };
             prompt.insert(0, block);
-            self.emit(AgentThreadEvent::HandoffDone);
+            self.emit(AgentThreadEvent::HandoffSent(handoff.from));
         }
         let Some(session) = &self.session else {
             return;

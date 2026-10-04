@@ -529,6 +529,17 @@ impl Shell {
             };
             self.open_threads.insert(thread_id, open_thread);
         }
+        // A thread made to continue another is a draft until its first message: leaving it
+        // closes it, and the server removes it once no window has it open.
+        if let Some(previous) = self.active_thread.filter(|previous| *previous != thread_id)
+            && let Some(OpenThread {
+                view: ThreadView::Agent(view),
+                ..
+            }) = self.open_threads.get(&previous)
+            && view.read(cx).is_unsent_continuation(cx)
+        {
+            self.open_threads.remove(&previous);
+        }
         self.active_thread = Some(thread_id);
         // A subthread isn't in the sidebar, so its top-level thread is highlighted.
         let sidebar_thread = ThreadKey {

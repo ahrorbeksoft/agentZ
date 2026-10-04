@@ -413,22 +413,24 @@ async fn continues_threads_with_another_agent() {
         .path()
         .join(format!("handoffs/{}.json", new_id.0));
     assert!(saved.exists());
-    client
-        .wait_until(|client| {
-            client.projects.as_ref().is_some_and(|projects| {
-                projects
-                    .threads
-                    .iter()
-                    .any(|thread| thread.id == new_id && thread.continued_from == Some(thread_id))
-            })
-        })
-        .await;
+    let continued_from = |client: &TestClient| {
+        client
+            .projects
+            .as_ref()
+            .and_then(|projects| projects.threads.iter().find(|thread| thread.id == new_id))
+            .and_then(|thread| thread.continued_from)
+    };
+    // A draft, which links to the old thread only once its first message goes.
+    assert_eq!(continued_from(&client), None);
 
     client
         .ok(Request::Prompt {
             connection: new,
             text: "next".into(),
         })
+        .await;
+    client
+        .wait_until(|client| continued_from(client) == Some(thread_id))
         .await;
     client
         .wait_until(|client| {
@@ -441,6 +443,75 @@ async fn continues_threads_with_another_agent() {
     // Only the user's words are their message.
     assert!(matches!(thread.entries().first(), Some(Entry::UserMessage(text)) if text == "next"));
     assert!(!saved.exists());
+}
+
+/// A continuation nobody sends anything in is removed once the user leaves it, as t3code drops
+/// a draft. One whose context was dropped is a new thread like any other, and stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn removes_continuations_left_unsent() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let old = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(old).await;
+    client
+        .ok(Request::Prompt {
+            connection: old,
+            text: "build the page".into(),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(old);
+            !thread.is_working() && agent_text(thread) == "Echo: build the page"
+        })
+        .await;
+    let mut continuations = Vec::new();
+    for _ in 0..2 {
+        match client
+            .ok(Request::ContinueThread {
+                thread_id,
+                agent_id: AgentId::new("mock"),
+            })
+            .await
+        {
+            Response::ThreadCreated(thread_id) => continuations.push(thread_id),
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+    let [left, kept] = continuations[..] else {
+        panic!("expected two threads");
+    };
+    let thread_exists = |client: &TestClient, thread_id: ThreadId| {
+        client
+            .projects
+            .as_ref()
+            .is_some_and(|projects| projects.threads.iter().any(|thread| thread.id == thread_id))
+    };
+    for thread_id in [left, kept] {
+        client
+            .subscribe_thread(ConnectionId::Thread(thread_id))
+            .await;
+    }
+    client
+        .ok(Request::DropHandoff(ConnectionId::Thread(kept)))
+        .await;
+    for thread_id in [left, kept] {
+        client
+            .ok(Request::UnsubscribeThread(ConnectionId::Thread(thread_id)))
+            .await;
+    }
+    client
+        .wait_until(|client| !thread_exists(client, left))
+        .await;
+    assert!(thread_exists(&client, kept));
+    assert!(thread_exists(&client, thread_id));
+    let handoffs = server.data_dir.path().join("handoffs");
+    assert!(!handoffs.join(format!("{}.json", left.0)).exists());
+    assert!(!handoffs.join(format!("{}.json", kept.0)).exists());
 }
 
 /// The point of the server: a turn keeps going without a client, and the next client sees

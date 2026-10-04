@@ -167,10 +167,21 @@ pub(crate) struct Server {
     machine_icon_sent: MachineIcon,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
+    /// Threads made to continue another whose first message hasn't gone: when each is removed
+    /// unless a client has it open (see [`Self::sweep_unsent_continuations`]).
+    unsent_continuations: HashMap<ThreadId, Option<Instant>>,
+    /// When a sweep of them is due.
+    continuation_sweep_at: Option<Instant>,
     stopping: bool,
     /// Pass the stores' and threads' background results on to `inputs`.
     forwarders: JoinSet<()>,
 }
+
+/// How long a continuation that hasn't sent its first message may go unwatched, once the user
+/// leaves it, before it's removed: long enough for a view to be rebuilt.
+const LEAVE_GRACE: Duration = Duration::from_secs(3);
+/// The same, for one just made or found at start: the client opening it may be far away.
+const OPEN_GRACE: Duration = Duration::from_secs(60);
 
 impl Server {
     pub(crate) fn new(
@@ -250,6 +261,8 @@ impl Server {
             clients: HashMap::default(),
             registry_changed: false,
             changed_connections: HashSet::default(),
+            unsent_continuations: HashMap::default(),
+            continuation_sweep_at: None,
             stopping: false,
             forwarders: JoinSet::new(),
         };
@@ -272,6 +285,13 @@ impl Server {
                 .collect();
         }
         server.restore_spaces();
+        let opened_by = Instant::now() + OPEN_GRACE;
+        for thread_id in continuations::list(&server.data_dir) {
+            server
+                .unsent_continuations
+                .insert(thread_id, Some(opened_by));
+        }
+        server.sweep_unsent_continuations();
         server.spawn_then(machine_kind::detect(), |server, detected| {
             server.machine_icon.detected = detected;
         });
@@ -446,6 +466,7 @@ impl Server {
                 self.relays.client_gone(client);
                 // Nobody is left to see an account panel's agent.
                 self.accounts.retain(|_, account| account.owner != client);
+                self.sweep_unsent_continuations();
             }
             Input::Registry(message) => {
                 self.registry.handle(message);
@@ -494,10 +515,12 @@ impl Server {
                 self.client(client)?
                     .threads
                     .insert(connection, view.clone());
+                self.sweep_unsent_continuations();
                 Ok(Response::Thread(view))
             }
             Request::UnsubscribeThread(connection) => {
                 self.client(client)?.threads.remove(&connection);
+                self.sweep_unsent_continuations();
                 Ok(Response::Ok)
             }
 
@@ -564,12 +587,7 @@ impl Server {
             }
             Request::DeleteThread(thread_id) => {
                 self.existing_thread(thread_id)?;
-                let threads = self.projects.thread_and_subthreads(thread_id);
-                for thread_id in &threads {
-                    continuations::remove(&self.data_dir, *thread_id).log_err();
-                }
-                self.delete_checkpoints(threads);
-                self.projects.delete_thread(thread_id);
+                self.delete_thread(thread_id);
                 Ok(Response::Ok)
             }
             Request::ContinueThread {
@@ -1177,6 +1195,81 @@ impl Server {
 
     /// The command that starts the agent, with the environment from its settings. Threads
     /// opened right after launch wait for the registry to load.
+    /// Removes the thread, its subthreads, and what they kept: their checkpoints and any
+    /// conversation waiting to go with a first message. Their agents stop with the next changes.
+    fn delete_thread(&mut self, thread_id: ThreadId) {
+        let threads = self.projects.thread_and_subthreads(thread_id);
+        for thread_id in &threads {
+            self.unsent_continuations.remove(thread_id);
+            continuations::remove(&self.data_dir, *thread_id).log_err();
+        }
+        self.delete_checkpoints(threads);
+        self.projects.delete_thread(thread_id);
+    }
+
+    /// A thread made to continue another stays a draft until its first message goes, and is
+    /// removed once the user leaves it, as t3code drops a draft: when no client has had it open
+    /// for a moment. A message queued while the agent waits for a login keeps it.
+    pub(super) fn sweep_unsent_continuations(&mut self) {
+        if self.unsent_continuations.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let watched: HashSet<ThreadId> = self
+            .clients
+            .values()
+            .flat_map(|client| client.threads.keys())
+            .filter_map(|connection| match connection {
+                ConnectionId::Thread(thread_id) => Some(*thread_id),
+                ConnectionId::Account(_) => None,
+            })
+            .collect();
+        let mut expired = Vec::new();
+        let mut next_due: Option<Instant> = None;
+        for (thread_id, due) in &mut self.unsent_continuations {
+            if watched.contains(thread_id) {
+                *due = None;
+                continue;
+            }
+            let due = *due.get_or_insert(now + LEAVE_GRACE);
+            if due <= now {
+                expired.push(*thread_id);
+            } else {
+                next_due = Some(next_due.map_or(due, |next| next.min(due)));
+            }
+        }
+        for thread_id in expired {
+            self.unsent_continuations.remove(&thread_id);
+            if self
+                .threads
+                .get(&thread_id)
+                .is_some_and(AgentThread::has_user_message)
+            {
+                continue;
+            }
+            if self.projects.thread(thread_id).is_some() {
+                log::info!("removing thread {} that continued nothing", thread_id.0);
+                self.delete_thread(thread_id);
+            } else {
+                continuations::remove(&self.data_dir, thread_id).log_err();
+            }
+        }
+        if let Some(due) = next_due
+            && self
+                .continuation_sweep_at
+                .is_none_or(|scheduled| scheduled > due)
+        {
+            self.continuation_sweep_at = Some(due);
+            self.spawn_then(
+                tokio::time::sleep(due.saturating_duration_since(now)),
+                |server, ()| {
+                    server.continuation_sweep_at = None;
+                    server.sweep_unsent_continuations();
+                },
+            );
+        }
+    }
+
     fn agent_command(&mut self, agent_id: &AgentId, when_loaded: bool) -> CommandFuture {
         let command = match self.custom_agents.get(agent_id) {
             Some(agent) => futures::future::ready(Ok(agent.command.clone())).boxed(),
@@ -1304,7 +1397,15 @@ impl Server {
                     }
                 }
                 (ConnectionId::Thread(_), AgentThreadEvent::Paused) => paused = true,
-                (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffDone) => {
+                // Sent, the thread is no draft but the continuation of the other.
+                (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffSent(from)) => {
+                    self.projects.set_continued_from(thread_id, from);
+                    self.unsent_continuations.remove(&thread_id);
+                    continuations::remove(&self.data_dir, thread_id).log_err();
+                }
+                // Dropped, it's a new thread like any other.
+                (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffDropped) => {
+                    self.unsent_continuations.remove(&thread_id);
                     continuations::remove(&self.data_dir, thread_id).log_err();
                 }
                 (ConnectionId::Account(_), _) => {}

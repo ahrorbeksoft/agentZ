@@ -3225,10 +3225,20 @@ impl AgentView {
         Some((from.id, from.title.clone().into(), name, icon))
     }
 
+    /// A thread made to continue another, which is a draft until its first message is sent.
+    pub(crate) fn is_unsent_continuation(&self, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        thread.pending_handoff().is_some()
+            && !thread
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Entry::UserMessage(_)))
+    }
+
     /// The title of the thread this one continues, until its first message is sent.
     fn continued_title(&self, cx: &App) -> Option<SharedString> {
-        self.thread.read(cx).pending_handoff()?;
-        self.continued_from(cx).map(|(_, title, _, _)| title)
+        let handoff = self.thread.read(cx).pending_handoff()?;
+        Some(handoff.from_title.clone().into())
     }
 
     /// A thread's agent, by name, and its icon.
@@ -3360,14 +3370,15 @@ impl AgentView {
     /// the composer: a click shows exactly what goes to the agent, × starts without it.
     fn render_handoff_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let handoff = self.thread.read(cx).pending_handoff()?.clone();
-        let (_, title, agent_name, icon) = self.continued_from(cx).unwrap_or_else(|| {
-            (
-                self.thread_id,
-                "Another thread".into(),
-                "Agent".into(),
-                Icon::new(IconName::Sparkle),
-            )
-        });
+        let title = SharedString::from(handoff.from_title.clone());
+        let agent_name = SharedString::from(handoff.from_agent.clone());
+        let icon = {
+            let store = self.store.read(cx);
+            store
+                .thread(handoff.from)
+                .map(|from| self.thread_agent(from, cx).1)
+                .unwrap_or_else(|| Icon::new(IconName::Sparkle))
+        };
         let colors = cx.theme().colors().clone();
         let messages = match handoff.messages {
             1 => "1 message".to_string(),

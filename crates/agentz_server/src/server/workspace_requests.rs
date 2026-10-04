@@ -2,6 +2,7 @@
 //! back to change its state.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
@@ -13,7 +14,7 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use projects::{ProjectId, ThreadId, Workspace, WorkspaceKind};
 
-use super::{ClientId, Server};
+use super::{ClientId, OPEN_GRACE, Server};
 use crate::continuations;
 use crate::workspaces::{self, NewWorkspace};
 use util::ResultExt as _;
@@ -274,7 +275,7 @@ impl Server {
             .clone()
             .map(|agent_id| self.agent_name(&AgentId::new(agent_id)))
             .unwrap_or_else(|| running.agent_name().clone());
-        let handoff = handoff(running, &from_agent, &thread.title);
+        let handoff = handoff(running, thread_id, &from_agent, &thread.title);
         anyhow::ensure!(
             handoff.messages > 0,
             "the thread has no conversation to continue yet"
@@ -289,11 +290,14 @@ impl Server {
         };
         let new_thread =
             self.create_thread_in(thread.project_id, NewThread::Agent(agent_id), folder)?;
-        self.projects.set_continued_from(new_thread, thread_id);
+        // A draft until its first message goes, which links it to this thread.
+        self.unsent_continuations
+            .insert(new_thread, Some(Instant::now() + OPEN_GRACE));
         continuations::save(&self.data_dir, new_thread, &handoff).log_err();
         self.update_thread(ConnectionId::Thread(new_thread), |thread| {
             thread.set_handoff(Some(handoff))
         })?;
+        self.sweep_unsent_continuations();
         Ok(new_thread)
     }
 

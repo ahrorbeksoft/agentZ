@@ -645,6 +645,10 @@ const HANDOFF_TOOL_LIMIT: usize = 20;
 /// ("Continue with another agent").
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingHandoff {
+    /// The thread it continues, which this one links to once it's sent.
+    pub from: projects::ThreadId,
+    pub from_title: String,
+    pub from_agent: String,
     pub text: String,
     /// How many messages (the user's and the agent's) the conversation had.
     pub messages: usize,
@@ -653,7 +657,12 @@ pub struct PendingHandoff {
 /// A thread's conversation for another agent to continue: the user's messages, the agent's
 /// replies with the tools it used, and the plan, as t3code's deterministic handoff
 /// summarizes. The first message (the goal) and the latest ones are kept when it's long.
-pub fn handoff(view: &ThreadView, agent_name: &str, title: &str) -> PendingHandoff {
+pub fn handoff(
+    view: &ThreadView,
+    from: projects::ThreadId,
+    agent_name: &str,
+    title: &str,
+) -> PendingHandoff {
     enum Part {
         User(String),
         Agent { text: String, tools: Vec<String> },
@@ -769,7 +778,13 @@ pub fn handoff(view: &ThreadView, agent_name: &str, title: &str) -> PendingHando
         title = attribute(title),
         body = body.join("\n\n"),
     );
-    PendingHandoff { text, messages }
+    PendingHandoff {
+        from,
+        from_title: title.to_string(),
+        from_agent: agent_name.to_string(),
+        text,
+        messages,
+    }
 }
 
 /// A user message without the handoff it began with, as an agent may replay it.
@@ -935,7 +950,12 @@ mod tests {
                 status: acp::PlanEntryStatus::Pending,
             },
         ];
-        let handoff = handoff(&view, "Claude Agent", "Checkout \"page\"");
+        let handoff = handoff(
+            &view,
+            projects::ThreadId(1),
+            "Claude Agent",
+            "Checkout \"page\"",
+        );
         assert_eq!(handoff.messages, 2);
         assert!(
             handoff
@@ -970,7 +990,7 @@ mod tests {
                 "y".repeat(2_000)
             )));
         }
-        let handoff = handoff(&view, "Codex", "Long");
+        let handoff = handoff(&view, projects::ThreadId(1), "Codex", "Long");
         assert_eq!(handoff.messages, 81);
         assert!(
             handoff

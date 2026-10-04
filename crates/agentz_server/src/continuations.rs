@@ -1,6 +1,7 @@
 //! The conversations threads continue with another agent ("Continue with another agent"), kept
 //! in `handoffs/<thread id>.json` until each goes with its thread's first message, so a restart
-//! of the server doesn't lose one.
+//! of the server doesn't lose one. Until then the thread is a draft, removed once the user leaves
+//! it ([`crate::server`]'s `sweep_unsent_continuations`).
 
 use std::path::{Path, PathBuf};
 
@@ -42,4 +43,18 @@ pub(crate) fn remove(data_dir: &Path, thread_id: ThreadId) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
     }
+}
+
+/// The threads whose conversation waits for their first message.
+pub(crate) fn list(data_dir: &Path) -> Vec<ThreadId> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("handoffs")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            let id = name.to_str()?.strip_suffix(".json")?.parse().ok()?;
+            Some(ThreadId(id))
+        })
+        .collect()
 }

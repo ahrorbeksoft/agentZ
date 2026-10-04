@@ -150,16 +150,23 @@ Each entry: what it does, where it lives, and where it comes from.
 - **Continue with another agent** (`agentz_protocol::thread::handoff`, `Request::ContinueThread`,
   `server/workspace_requests.rs`, `continuations.rs`; t3code's context handoff, Zed's New Thread
   from Summary): a thread keeps its agent, since each agent replays only its own sessions.
-  Instead the menu starts a thread with another installed agent in the same workspace
-  (`Thread::continued_from`), and agentZ writes the old conversation for it: the user's
-  messages, the agent's replies with the tools it used, and the plan, in tags, keeping the
-  first message and the latest ones within 40,000 characters. It waits in
-  `handoffs/<thread id>.json` and shows as a chip in the composer (the user's choice of two
+  Instead the menu starts a thread with another installed agent in the same workspace, and
+  agentZ writes the old conversation for it: the user's messages, the agent's replies with the
+  tools it used, and the plan, in tags, keeping the first message and the latest ones within
+  40,000 characters. It waits in `handoffs/<thread id>.json` and shows as a chip in the composer (the user's choice of two
   designs): a click previews exactly what goes, × drops it (`Request::DropHandoff`). It goes
   with the first message as an embedded resource (`agentz://handoff`), or as text to agents
   without `embeddedContext`, and a replayed first message shows without it
-  (`without_handoff`). The new thread opens with a "Continued from" divider, and the old one
-  ends with a "Continued in" card (also the user's choice).
+  (`without_handoff`). Sent, it links the threads (`Thread::continued_from`): the new thread
+  opens with a "Continued from" divider, and the old one ends with a "Continued in" card (also
+  the user's choice).
+- **Unsent continuations are drafts** (`Server::sweep_unsent_continuations`, `Shell::open_thread`;
+  t3code drops a draft thread it never sent): the user chose to remove one when they leave it.
+  The shell closes a draft it moves away from (other views keep threads open), and the server
+  deletes a continuation that hasn't sent its first message once no client has had it open for
+  3 seconds (60 after it's made, or found at start, for a far client to open it). Quitting
+  counts as leaving; Settings and Workspaces don't. A message queued for a login keeps it, and
+  dropping the context makes it an ordinary new thread.
 - **Agent registry** (`registry`, `registry_store.rs`): install, update, uninstall from the ACP
   Registry, binary archives or npm.
 - **Agent icons** (`agent_icons.rs`, `registry`): each server downloads the registry's icons,
