@@ -8,10 +8,30 @@ use agentz_protocol::terminal::{
 use agentz_protocol::{Request, Response};
 use anyhow::{Result, anyhow};
 use collections::HashMap;
-use gpui::{App, AppContext as _, ClipboardItem, Context, Entity, EntityId, SharedString, Task};
+use gpui::{
+    App, AppContext as _, ClipboardItem, Context, Entity, EntityId, Global, SharedString, Task,
+};
 
 use crate::server_client::ServerClient;
 use crate::terminal_element::terminal_palette;
+
+struct HeldSizes(bool);
+
+impl Global for HeldSizes {}
+
+/// Keeps every terminal at the size it has while `held`, whatever size its views draw it
+/// at; released, each takes its view's size the next time it's drawn. A pane dragged around
+/// its tab is shown in each layout it would make, and its program shouldn't redraw for every
+/// place it passes.
+pub fn hold_sizes(held: bool, cx: &mut App) {
+    if sizes_held(cx) != held {
+        cx.set_global(HeldSizes(held));
+    }
+}
+
+pub fn sizes_held(cx: &App) -> bool {
+    cx.try_global::<HeldSizes>().is_some_and(|held| held.0)
+}
 
 /// The grid the view lays out, as the server needs it to size the PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,7 +204,7 @@ impl Terminal {
         if self.sizing_view.is_none() {
             self.sizing_view = Some(view);
         }
-        if self.sizing_view == Some(view) {
+        if self.sizing_view == Some(view) && !sizes_held(cx) {
             self.send_size(size, cx);
         }
     }

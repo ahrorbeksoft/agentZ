@@ -541,10 +541,20 @@ since a thread's workspace is its checkout.
   dragging, and letting go anywhere, even past the window's edge, leaves it there
   (`SpaceRequest::MoveTab`; the bar keeps that order until the server's arrives). Held near an
   end of a bar with more tabs than fit, it scrolls the bar.
-  Dragging a pane's header over another pane of its tab works as Zed's pane drop targets
-  (`pane_drop_edge`): near an edge (a fifth of the pane's shorter side), that half lights up
-  and dropping splits the pane there with the dragged one (`SpaceRequest::MovePane`,
-  `TileLayout::move_pane`); in the middle, all of it lights up and dropping swaps the two.
+  Dragging a pane's header (in a tab of several panes, not zoomed) shows the result as it goes
+  (`PaneDrag`): the tab is laid out as dropping it would leave it, the pane itself dimmed to
+  45% at the size it would get, and the layout jumps from one result to the next. A small copy
+  follows just past the pointer: its header and the top of its terminal's screen, drawn small
+  (`terminal_element::TerminalThumbnail`; just the header for a thread). Over another pane, Zed's
+  drop targets decide (`pane_drop_edge`): near an edge (a fifth of the pane's shorter side) it
+  splits that pane (`SpaceRequest::MovePane`, `TileLayout::move_pane`), in the middle the two
+  swap. They're aimed at the panes as shown, but the tab only ever shows one move from its own
+  tree, the one letting go sends (`find_pane_drop`): swapping with the pane now in its old place
+  puts it back, and a place no one move makes changes nothing. Over the pane itself nothing
+  changes, and out of the tab it goes back where it was, where letting go leaves it. The tab
+  keeps the dropped layout until the server's arrives. Terminals keep their size while a pane
+  is dragged, cut to the place they're shown in, and take their new size once it's dropped
+  (`terminal_entity::hold_sizes`).
   An ACP thread's pane has one header: the thread's title, agent and toolbar buttons
   (`AgentView::render_toolbar_buttons`) beside the pane's own, so its toolbar is hidden there.
   A terminal pane's header names what runs there (its agent, the command it was opened with,
