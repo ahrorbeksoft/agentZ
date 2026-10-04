@@ -253,6 +253,7 @@ pub enum IconName {
     Square,
     SquareDot,
     SquareMinus,
+    SquarePen,
     SquarePlus,
     SquareSplitHorizontal,
     SquareSplitVertical,

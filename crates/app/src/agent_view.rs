@@ -1,6 +1,7 @@
 //! The conversation with one agent. Layout, spacing and colors follow Zed's agent thread view
 //! (`agent_ui::conversation_view::thread_view`).
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
@@ -8,11 +9,12 @@ use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::agents::InstallState;
 use agentz_protocol::diff::DiffScope;
-use agentz_protocol::terminal::TerminalKey;
+use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
     without_handoff,
 };
+use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
@@ -21,7 +23,7 @@ use gpui::{
     Subscription, Task, Window, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use projects::{ProjectId, TaskEnd, ThreadId};
+use projects::{ProjectId, TaskEnd, ThreadId, WorkspaceKind};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
@@ -34,6 +36,7 @@ use crate::agent_icons::agent_icon;
 use crate::agent_login::{AgentLogin, LoginLayout};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
+use crate::machines::{Machines, ProjectKey, ThreadKey};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
@@ -103,9 +106,28 @@ pub enum AgentViewEvent {
     Confirm(ConfirmRequest),
     /// The header's project was clicked: a new thread in it, as in t3code.
     NewThreadInProject(ProjectId),
+    /// The new thread was made again with another agent, checkout or machine, or as a
+    /// terminal: show `thread` in its place, with `text` in its composer. This one is deleted
+    /// right after.
+    Replaced {
+        thread: ThreadKey,
+        text: SharedString,
+    },
+    /// Manage Agents, from the new thread's agent picker: Settings › Agents.
+    OpenAgentSettings,
+}
+
+/// What a new thread is made again to run, from its agent picker.
+#[derive(Clone)]
+enum Starter {
+    Agent(AgentId),
+    /// A login shell, as the thread's terminal.
+    Terminal,
 }
 
 const COMPOSER_PLACEHOLDER: &str = "Message the agent…";
+/// How long typing pauses before what's typed is kept on the server.
+const UNSENT_TEXT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 /// The most subthreads the Agents control lists before it scrolls.
 const MAX_AGENT_ROWS_SHOWN: usize = 6;
@@ -180,6 +202,20 @@ pub struct AgentView {
     /// Why "Continue with another agent" didn't start a thread.
     continue_error: Option<SharedString>,
     _continuing: Task<()>,
+    /// The project's repository, for the new thread screen's checkout picker. Asked for the
+    /// first time that screen shows.
+    draft_git: Option<ProjectGit>,
+    _draft_git_load: Option<Task<()>>,
+    /// What's being made in place of the new thread, from its pickers.
+    replacing: Option<SharedString>,
+    /// Why the new thread couldn't be made again with what was picked.
+    replace_error: Option<SharedString>,
+    _replacing: Task<()>,
+    /// What the server was last told is typed in the composer (t3code's composer draft).
+    saved_unsent_text: Option<String>,
+    /// The server's copy as last seen, to notice when it's discarded elsewhere.
+    observed_unsent_text: Option<String>,
+    _save_unsent_text: Task<()>,
     _subscriptions: Vec<Subscription>,
     _elapsed_refresh: Task<()>,
 }
@@ -223,6 +259,7 @@ impl AgentView {
             cx.observe(&store, |this, _, cx| {
                 this.sync_blocked_subthreads(cx);
                 this.load_changed_files(false, cx);
+                this.follow_discarded_unsent_text(cx);
                 cx.notify();
             }),
             // Whether messages can be sent follows the machine's connection.
@@ -231,9 +268,13 @@ impl AgentView {
                 cx.notify();
             }),
         ];
+        // What's typed is saved as the view closes, when the user leaves the thread.
+        cx.on_release(|this, cx| this.save_unsent_text_now(cx))
+            .detach();
         let mut subscriptions = subscriptions;
         subscriptions.push(cx.subscribe(&composer, |this, _, _: &TextInputEvent, cx| {
             this.command_menu_index = 0;
+            this.save_unsent_text(cx);
             cx.notify();
         }));
         // Keeps the elapsed-time label ticking while the agent works.
@@ -295,9 +336,28 @@ impl AgentView {
             handoff_expanded: false,
             continue_error: None,
             _continuing: Task::ready(()),
+            draft_git: None,
+            _draft_git_load: None,
+            replacing: None,
+            replace_error: None,
+            _replacing: Task::ready(()),
+            saved_unsent_text: None,
+            observed_unsent_text: None,
+            _save_unsent_text: Task::ready(()),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
+        let unsent_text = this
+            .store
+            .read(cx)
+            .thread(thread_id)
+            .and_then(|thread| thread.unsent_text.clone());
+        if let Some(text) = &unsent_text {
+            this.composer
+                .update(cx, |composer, cx| composer.set_text(text.clone(), cx));
+        }
+        this.saved_unsent_text = unsent_text.clone();
+        this.observed_unsent_text = unsent_text;
         this.sync_markdowns(cx);
         let thread = this.thread.clone();
         sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
@@ -1381,8 +1441,9 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// The branch the thread works on, marked as a worktree or pasture's.
-    fn render_branch(&self, cx: &App) -> Option<AnyElement> {
+    /// The branch the thread works on, the icon of its worktree or pasture (a branch's in the
+    /// project's own folder), and its folder.
+    fn thread_branch(&self, cx: &App) -> Option<(SharedString, IconName, PathBuf)> {
         let store = self.store.read(cx);
         let thread = store.thread(self.thread_id)?;
         let folder = store.thread_folder(self.thread_id)?;
@@ -1401,6 +1462,12 @@ impl AgentView {
         let icon = workspace.as_ref().map_or(IconName::GitBranch, |workspace| {
             workspace_icon(workspace.kind)
         });
+        Some((branch.into(), icon, folder))
+    }
+
+    /// The branch the thread works on, marked as a worktree or pasture's.
+    fn render_branch(&self, cx: &App) -> Option<AnyElement> {
+        let (branch, icon, folder) = self.thread_branch(cx)?;
         Some(
             h_flex()
                 .id("thread-header-branch")
@@ -2495,6 +2562,12 @@ impl AgentView {
                 .severity(Severity::Error)
                 .icon(IconName::XCircle)
                 .title(error.clone())
+        } else if let Some(error) = &self.replace_error {
+            Callout::new()
+                .severity(Severity::Error)
+                .icon(IconName::XCircle)
+                .title("Couldn't start the thread that way")
+                .description(error.clone())
         } else {
             return None;
         };
@@ -3225,11 +3298,24 @@ impl AgentView {
         Some((from.id, from.title.clone().into(), name, icon))
     }
 
-    /// A thread made to continue another, which is a draft until its first message is sent.
-    pub(crate) fn is_unsent_continuation(&self, cx: &App) -> bool {
-        let thread = self.thread.read(cx);
-        thread.pending_handoff().is_some()
-            && !thread
+    /// A plain draft with nothing typed, which New Thread opens again rather than making
+    /// another, as t3code does.
+    pub(crate) fn is_untouched_draft(&self, cx: &App) -> bool {
+        self.is_draft(cx)
+            && self.typed_text(cx).is_none()
+            && self.replacing.is_none()
+            && self.thread.read(cx).pending_handoff().is_none()
+    }
+
+    /// A new thread nothing has been sent in yet (t3code's draft thread).
+    pub(crate) fn is_draft(&self, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_some_and(|thread| thread.is_draft)
+            && !self
+                .thread
+                .read(cx)
                 .entries()
                 .iter()
                 .any(|entry| matches!(entry, Entry::UserMessage(_)))
@@ -3461,7 +3547,7 @@ impl AgentView {
         )
     }
 
-    fn render_message_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_message_editor(&self, style: ComposerStyle, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
         let agent_name = self.agent_name(cx);
@@ -3514,11 +3600,15 @@ impl AgentView {
             .on_action(cx.listener(Self::select_next_command))
             .on_action(cx.listener(Self::accept_slash_command))
             .on_action(cx.listener(Self::select_previous_command))
-            .py_2()
-            .bg(colors.editor_background)
             .justify_center()
-            .border_t_1()
-            .border_color(colors.border)
+            .map(|this| match style {
+                ComposerStyle::Bar => this
+                    .py_2()
+                    .bg(colors.editor_background)
+                    .border_t_1()
+                    .border_color(colors.border),
+                ComposerStyle::Card => this.w_full(),
+            })
             .child(
                 v_flex()
                     .w_full()
@@ -3526,6 +3616,14 @@ impl AgentView {
                     .min_w_0()
                     .px_2()
                     .gap_2()
+                    .when(style == ComposerStyle::Card, |this| {
+                        this.p_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .shadow_md()
+                    })
                     // A draft can still be typed, but the composer reads as waiting on the login.
                     .when(needs_login, |this| this.opacity(0.55))
                     .children(self.render_handoff_chip(cx))
@@ -3536,6 +3634,7 @@ impl AgentView {
                             .pt_1()
                             .pr_2p5()
                             .text_ui(cx)
+                            .when(style == ComposerStyle::Card, |this| this.min_h(px(44.)))
                             .child(self.composer.clone())
                             .children(self.render_command_menu(cx)),
                     )
@@ -3543,8 +3642,8 @@ impl AgentView {
                         h_flex()
                             .w_full()
                             .justify_between()
-                            .child(
-                                h_flex()
+                            .child(match style {
+                                ComposerStyle::Bar => h_flex()
                                     .gap_1()
                                     .px_1()
                                     .child(
@@ -3556,8 +3655,10 @@ impl AgentView {
                                         Label::new(agent_name)
                                             .size(LabelSize::Small)
                                             .color(Color::Muted),
-                                    ),
-                            )
+                                    )
+                                    .into_any_element(),
+                                ComposerStyle::Card => self.render_agent_picker(cx),
+                            })
                             .child(
                                 h_flex()
                                     .min_w_0()
@@ -3569,7 +3670,696 @@ impl AgentView {
                             ),
                     ),
             )
+            .into_any_element()
     }
+
+    /// The new thread screen (t3code's): a headline, the composer as a card, and under it
+    /// where the thread works. Until the first message, the agent, checkout and machine can
+    /// still change.
+    fn render_new_thread(&self, cx: &mut Context<Self>) -> AnyElement {
+        let headline: SharedString = match self.continued_title(cx) {
+            Some(title) => format!("Continue “{title}”").into(),
+            None => "What should we work on?".into(),
+        };
+        v_flex()
+            .id("new-thread")
+            .debug_selector(|| "new-thread".into())
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .px_4()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(NEW_THREAD_WIDTH)
+                    .gap_6()
+                    .child(
+                        div()
+                            .text_center()
+                            .text_2xl()
+                            .text_color(cx.theme().colors().text)
+                            .child(headline),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(self.render_message_editor(ComposerStyle::Card, cx))
+                            .child(self.render_new_thread_strip(cx))
+                            .children(self.render_errors(cx)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The agent, in the new thread's composer: a menu of the machine's installed agents.
+    fn render_agent_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.weak_entity();
+        let registry = self.registry.clone();
+        let current_agent = self.agent_id.clone();
+        let is_continuation = self.thread.read(cx).pending_handoff().is_some();
+        PopoverMenu::new("new-thread-agent")
+            .menu(move |window, cx| {
+                let agents: Vec<(AgentId, SharedString)> = {
+                    let registry = registry.read(cx);
+                    registry
+                        .agents()
+                        .iter()
+                        .filter(|agent| {
+                            agent.supports_current_platform()
+                                && matches!(
+                                    registry.install_state(agent.id()),
+                                    InstallState::Installed { .. }
+                                )
+                        })
+                        .map(|agent| (agent.id().clone(), agent.name().clone()))
+                        .collect()
+                };
+                let view = view.clone();
+                let current_agent = current_agent.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for (agent_id, name) in &agents {
+                        let view = view.clone();
+                        let render_id = agent_id.clone();
+                        let agent_id = agent_id.clone();
+                        let name = name.clone();
+                        let is_current = current_agent.as_ref() == Some(&agent_id);
+                        menu = menu.custom_entry(
+                            move |_, cx| {
+                                h_flex()
+                                    .w_full()
+                                    .gap_1p5()
+                                    .child(
+                                        agent_icon(&render_id, cx)
+                                            .map(Icon::from_svg_markup)
+                                            .unwrap_or_else(|| Icon::new(IconName::Sparkle))
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(div().flex_1().child(Label::new(name.clone())))
+                                    .when(is_current, |row| {
+                                        row.child(
+                                            Icon::new(IconName::Check)
+                                                .size(IconSize::Small)
+                                                .color(Color::Accent),
+                                        )
+                                    })
+                                    .into_any_element()
+                            },
+                            move |_, cx| {
+                                let starter = Starter::Agent(agent_id.clone());
+                                view.update(cx, |view, cx| {
+                                    view.change_new_thread_starter(starter, cx)
+                                })
+                                .log_err();
+                            },
+                        );
+                    }
+                    menu = menu.separator();
+                    // A continuation brings a conversation, which only an agent can take.
+                    if !is_continuation {
+                        let view = view.clone();
+                        menu = menu.item(
+                            ContextMenuEntry::new("Terminal")
+                                .icon(IconName::Terminal)
+                                .icon_color(Color::Muted)
+                                .handler(move |_, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.change_new_thread_starter(Starter::Terminal, cx)
+                                    })
+                                    .log_err();
+                                }),
+                        );
+                    }
+                    menu.item(
+                        ContextMenuEntry::new("Manage Agents…")
+                            .icon(IconName::Settings)
+                            .icon_color(Color::Muted)
+                            .handler(move |_, cx| {
+                                view.update(cx, |_, cx| cx.emit(AgentViewEvent::OpenAgentSettings))
+                                    .log_err();
+                            }),
+                    )
+                }))
+            })
+            .trigger_with_tooltip(
+                picker_chip(
+                    "new-thread-agent-trigger",
+                    self.agent_icon(cx),
+                    self.agent_name(cx),
+                )
+                .disabled(self.replacing.is_some()),
+                Tooltip::text("Change Agent"),
+            )
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)))
+            .into_any_element()
+    }
+
+    /// Under the new thread's composer: its checkout and machine, and its branch.
+    fn render_new_thread_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let left = match &self.replacing {
+            Some(status) => h_flex()
+                .h(px(22.))
+                .px_1p5()
+                .child(
+                    Label::new(status.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .with_animation(
+                            "new-thread-replacing",
+                            Animation::new(Duration::from_secs(2))
+                                .repeat()
+                                .with_easing(pulsating_between(0.4, 0.8)),
+                            |label, delta| label.alpha(delta),
+                        ),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .gap_1()
+                .child(self.render_checkout_picker(cx))
+                .children(self.render_machine_picker(cx))
+                .into_any_element(),
+        };
+        let branch = self.thread_branch(cx).map(|(branch, _, folder)| {
+            h_flex()
+                .id("new-thread-branch")
+                .min_w_0()
+                .h(px(22.))
+                .px_1p5()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::GitBranch)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(branch)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .tooltip(Tooltip::text(folder.display().to_string()))
+        });
+        h_flex()
+            .w_full()
+            .justify_between()
+            .gap_2()
+            .child(left)
+            .children(branch)
+            .into_any_element()
+    }
+
+    /// Where the new thread works: the project's own folder, a new worktree or pasture, or
+    /// one of its worktrees and pastures.
+    fn render_checkout_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let machine = store.machine();
+        let current = store
+            .thread(self.thread_id)
+            .and_then(|thread| thread.workspace.clone());
+        let (icon, label) = match store.thread_workspace(self.thread_id) {
+            Some(workspace) => (workspace_icon(workspace.kind), workspace.kind.label()),
+            None => (IconName::Folder, "Local"),
+        };
+        let existing: Vec<(PathBuf, WorkspaceKind, SharedString)> = {
+            let heads = ProjectInfoStore::global(cx).read(cx);
+            store
+                .thread(self.thread_id)
+                .and_then(|thread| store.project(thread.project_id))
+                .map(|project| project.workspaces.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|workspace| {
+                    let branch = heads
+                        .workspace_head(machine, &workspace.path)
+                        .map(|head| head.branch.clone())
+                        .or_else(|| workspace.branch.clone())
+                        .unwrap_or_else(|| workspace.kind.label().to_string());
+                    (workspace.path, workspace.kind, branch.into())
+                })
+                .collect()
+        };
+        // Until the repository is read, a new worktree or pasture is offered and the server
+        // says if it can't be made.
+        let is_repository = self.draft_git.as_ref().is_none_or(|git| git.is_repository);
+        let pasture_unsupported = matches!(
+            self.draft_git.as_ref().map(|git| &git.pastures),
+            Some(PastureSupport::Unsupported(_))
+        );
+        if !is_repository && existing.is_empty() {
+            return static_chip("new-thread-checkout", Icon::new(icon), label.into())
+                .tooltip(Tooltip::text(
+                    "Not a git repository: threads work in its folder",
+                ))
+                .into_any_element();
+        }
+        let chip = picker_chip("new-thread-checkout-trigger", Icon::new(icon), label.into());
+        let view = cx.weak_entity();
+        PopoverMenu::new("new-thread-checkout")
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let current = current.clone();
+                let existing = existing.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let choose = |choice: WorkspaceChoice| {
+                        let view = view.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            view.update(cx, |view, cx| {
+                                view.change_new_thread_checkout(choice.clone(), cx)
+                            })
+                            .log_err();
+                        }
+                    };
+                    menu = menu
+                        .header("Where It Works")
+                        .item(
+                            ContextMenuEntry::new("Local checkout")
+                                .icon(IconName::Folder)
+                                .icon_color(Color::Muted)
+                                .toggleable(IconPosition::End, current.is_none())
+                                .handler(choose(WorkspaceChoice::Checkout)),
+                        )
+                        .item(
+                            ContextMenuEntry::new("New worktree")
+                                .icon(workspace_icon(WorkspaceKind::Worktree))
+                                .icon_color(Color::Muted)
+                                .disabled(!is_repository)
+                                .handler(choose(WorkspaceChoice::New {
+                                    kind: WorkspaceKind::Worktree,
+                                    base: None,
+                                    branch: None,
+                                })),
+                        )
+                        .item(
+                            ContextMenuEntry::new("New pasture")
+                                .icon(workspace_icon(WorkspaceKind::Pasture))
+                                .icon_color(Color::Muted)
+                                .disabled(!is_repository || pasture_unsupported)
+                                .handler(choose(WorkspaceChoice::New {
+                                    kind: WorkspaceKind::Pasture,
+                                    base: None,
+                                    branch: None,
+                                })),
+                        );
+                    if !existing.is_empty() {
+                        menu = menu.separator().header("Existing");
+                        for (path, kind, branch) in &existing {
+                            menu = menu.item(
+                                ContextMenuEntry::new(branch.clone())
+                                    .icon(workspace_icon(*kind))
+                                    .icon_color(Color::Muted)
+                                    .toggleable(IconPosition::End, current.as_ref() == Some(path))
+                                    .handler(choose(WorkspaceChoice::Existing(path.clone()))),
+                            );
+                        }
+                    }
+                    menu
+                }))
+            })
+            .trigger_with_tooltip(chip, Tooltip::text("Where the Thread Works"))
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)))
+            .into_any_element()
+    }
+
+    /// The machine the new thread runs on, with the project's checkouts on other machines to
+    /// move it to. Shown only when there are other machines, and not in a workspace pane,
+    /// which belongs to its machine.
+    fn render_machine_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let machines = Machines::global(cx).read(cx);
+        if !machines.has_remotes() || !self.shows_toolbar {
+            return None;
+        }
+        let store = self.store.read(cx);
+        let machine = store.machine();
+        let project_id = store.thread(self.thread_id)?.project_id;
+        let agent_id = self.agent_id.clone()?;
+        let agent_name = self.agent_name(cx);
+        let members = machines
+            .group_of(machine, project_id, cx)
+            .map(|group| group.members)
+            .unwrap_or_default();
+        let icon = Icon::new(machines.machine_icon(machine, cx));
+        let label = machines.label(machine, cx);
+        if members.len() < 2 {
+            return Some(static_chip("new-thread-machine", icon, label).into_any_element());
+        }
+        // Each checkout of the project, and whether the thread can move there.
+        let rows: Vec<(ProjectKey, IconName, SharedString, bool)> = members
+            .iter()
+            .map(|(member_machine, project)| {
+                let mut label = machines.label(*member_machine, cx).to_string();
+                // Two checkouts on one machine are told apart by folder.
+                if members
+                    .iter()
+                    .filter(|(other, _)| other == member_machine)
+                    .count()
+                    > 1
+                {
+                    label = format!("{label} · {}", project.path.display());
+                }
+                let client = machines.client(*member_machine, cx);
+                let is_usable = match &client {
+                    Some(client) if client.read(cx).is_online() => {
+                        let registry = client.read(cx).registry().read(cx);
+                        let is_installed = matches!(
+                            registry.install_state(&agent_id),
+                            InstallState::Installed { .. }
+                        );
+                        if !is_installed {
+                            label = format!("{label} · {agent_name} isn't installed");
+                        }
+                        is_installed
+                    }
+                    _ => {
+                        label = format!("{label} · offline");
+                        false
+                    }
+                };
+                (
+                    ProjectKey {
+                        machine: *member_machine,
+                        project: project.id,
+                    },
+                    machines.machine_icon(*member_machine, cx),
+                    label.into(),
+                    is_usable,
+                )
+            })
+            .collect();
+        let chip = picker_chip("new-thread-machine-trigger", icon, label);
+        let current = ProjectKey {
+            machine,
+            project: project_id,
+        };
+        let view = cx.weak_entity();
+        Some(
+            PopoverMenu::new("new-thread-machine")
+                .menu(move |window, cx| {
+                    let view = view.clone();
+                    let rows = rows.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for (project, icon, label, is_usable) in &rows {
+                            let view = view.clone();
+                            let project = *project;
+                            menu = menu.item(
+                                ContextMenuEntry::new(label.clone())
+                                    .icon(*icon)
+                                    .icon_color(Color::Muted)
+                                    .toggleable(IconPosition::End, project == current)
+                                    .disabled(!is_usable)
+                                    .handler(move |_, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.change_new_thread_machine(project, cx)
+                                        })
+                                        .log_err();
+                                    }),
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .trigger_with_tooltip(chip, Tooltip::text("Machine"))
+                .anchor(gpui::Anchor::TopLeft)
+                .offset(gpui::point(px(0.), px(4.)))
+                .into_any_element(),
+        )
+    }
+
+    /// Asks for the project's repository once, for the checkout picker.
+    fn load_new_thread_git(&mut self, cx: &mut Context<Self>) {
+        if self._draft_git_load.is_some() {
+            return;
+        }
+        let Some(project_id) = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .map(|thread| thread.project_id)
+        else {
+            return;
+        };
+        let git = self.store.read(cx).project_git(project_id, cx);
+        self._draft_git_load = Some(cx.spawn(async move |this, cx| {
+            // An older server, or one that can't read the repository, offers only the checkout.
+            let git = git.await.unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.draft_git = Some(git);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Where the thread works now, as a choice for a thread made in its place.
+    fn current_workspace_choice(&self, cx: &App) -> WorkspaceChoice {
+        match self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .and_then(|thread| thread.workspace.clone())
+        {
+            Some(path) => WorkspaceChoice::Existing(path),
+            None => WorkspaceChoice::Checkout,
+        }
+    }
+
+    fn current_project(&self, cx: &App) -> Option<ProjectKey> {
+        let store = self.store.read(cx);
+        Some(ProjectKey {
+            machine: store.machine(),
+            project: store.thread(self.thread_id)?.project_id,
+        })
+    }
+
+    fn change_new_thread_starter(&mut self, starter: Starter, cx: &mut Context<Self>) {
+        if let Starter::Agent(agent_id) = &starter
+            && self.agent_id.as_ref() == Some(agent_id)
+        {
+            return;
+        }
+        let Some(project) = self.current_project(cx) else {
+            return;
+        };
+        let workspace = self.current_workspace_choice(cx);
+        self.replace_new_thread(project, starter, workspace, cx);
+    }
+
+    fn change_new_thread_checkout(&mut self, workspace: WorkspaceChoice, cx: &mut Context<Self>) {
+        if workspace == self.current_workspace_choice(cx) {
+            return;
+        }
+        let (Some(project), Some(agent_id)) = (self.current_project(cx), self.agent_id.clone())
+        else {
+            return;
+        };
+        self.replace_new_thread(project, Starter::Agent(agent_id), workspace, cx);
+    }
+
+    /// The thread moves to the project's checkout on another machine, in its own folder there.
+    fn change_new_thread_machine(&mut self, project: ProjectKey, cx: &mut Context<Self>) {
+        if Some(project) == self.current_project(cx) {
+            return;
+        }
+        let Some(agent_id) = self.agent_id.clone() else {
+            return;
+        };
+        self.replace_new_thread(
+            project,
+            Starter::Agent(agent_id),
+            WorkspaceChoice::Checkout,
+            cx,
+        );
+    }
+
+    /// ACP can't change a session's agent or folder, so the new thread is made again with
+    /// what was picked, shown in its place, and this one is deleted. A continuation stays one,
+    /// in the workspace of the thread it continues.
+    fn replace_new_thread(
+        &mut self,
+        project: ProjectKey,
+        starter: Starter,
+        workspace: WorkspaceChoice,
+        cx: &mut Context<Self>,
+    ) {
+        if self.replacing.is_some() {
+            return;
+        }
+        let Some(store) = Machines::global(cx).read(cx).projects(project.machine, cx) else {
+            return;
+        };
+        let continued_from = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .and_then(|thread| thread.continued_from)
+            .filter(|_| project.machine == self.store.read(cx).machine());
+        self.replacing = Some(match &workspace {
+            WorkspaceChoice::New { kind, .. } => {
+                format!("Making a {}…", kind.label().to_lowercase()).into()
+            }
+            _ => "Starting…".into(),
+        });
+        self.replace_error = None;
+        cx.notify();
+        let created = store.update(cx, |store, cx| match (starter, continued_from) {
+            (Starter::Agent(agent_id), Some(from)) => store.continue_thread(from, agent_id, cx),
+            (Starter::Agent(agent_id), None) => {
+                store.create_thread(project.project, agent_id, workspace, cx)
+            }
+            (Starter::Terminal, _) => store.create_terminal_thread(
+                project.project,
+                TerminalCommand::default(),
+                workspace,
+                cx,
+            ),
+        });
+        self._replacing = cx.spawn(async move |this, cx| {
+            let created = created.await;
+            this.update(cx, |this, cx| {
+                this.replacing = None;
+                match created {
+                    Ok(thread) => {
+                        let text = this.composer.read(cx).text().clone();
+                        cx.emit(AgentViewEvent::Replaced {
+                            thread: ThreadKey {
+                                machine: project.machine,
+                                thread,
+                            },
+                            text,
+                        });
+                        // After the event: a workspace pane shows the new thread before this
+                        // one is deleted, which would close the pane.
+                        this.forget_unsent_text(cx);
+                        let store = this.store.clone();
+                        let old = this.thread_id;
+                        cx.defer(move |cx| {
+                            store.update(cx, |store, cx| store.delete_thread(old, cx))
+                        });
+                    }
+                    Err(error) => {
+                        log::error!("couldn't make the new thread again: {error:#}");
+                        this.replace_error = Some(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
+    /// What was typed in a thread this one replaced.
+    pub(crate) fn set_composer_text(&mut self, text: SharedString, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_text(text, cx));
+    }
+
+    fn typed_text(&self, cx: &App) -> Option<String> {
+        let text = self.composer.read(cx).text();
+        (!text.trim().is_empty()).then(|| text.to_string())
+    }
+
+    /// Keeps what's typed on the thread's machine once typing pauses, so it's there after the
+    /// user leaves the thread or quits, as t3code keeps composer drafts. Emptied, as sending
+    /// does, it's saved at once.
+    fn save_unsent_text(&mut self, cx: &mut Context<Self>) {
+        let text = self.typed_text(cx);
+        if text == self.saved_unsent_text {
+            self._save_unsent_text = Task::ready(());
+            return;
+        }
+        if text.is_none() {
+            self.save_unsent_text_now(cx);
+            return;
+        }
+        self._save_unsent_text = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(UNSENT_TEXT_SAVE_DELAY).await;
+            this.update(cx, |this, cx| this.save_unsent_text_now(cx))
+                .log_err();
+        });
+    }
+
+    fn save_unsent_text_now(&mut self, cx: &mut App) {
+        self._save_unsent_text = Task::ready(());
+        let text = self.typed_text(cx);
+        if text == self.saved_unsent_text {
+            return;
+        }
+        self.saved_unsent_text = text.clone();
+        self.store
+            .read(cx)
+            .set_unsent_text(self.thread_id, text, cx);
+    }
+
+    /// Empties the composer when its text was discarded elsewhere, such as from the sidebar.
+    fn follow_discarded_unsent_text(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.read(cx).thread(self.thread_id) else {
+            return;
+        };
+        let current = thread.unsent_text.clone();
+        if current == self.observed_unsent_text {
+            return;
+        }
+        // Only a change from what was seen counts: a save of this view's own may not be back.
+        self.observed_unsent_text = current.clone();
+        if current.is_none() && self.saved_unsent_text.is_some() {
+            self.saved_unsent_text = None;
+            self._save_unsent_text = Task::ready(());
+            self.composer
+                .update(cx, |composer, cx| composer.set_text("", cx));
+        }
+    }
+
+    /// Forgets the composer's text without saving it, for a thread that's going away.
+    fn forget_unsent_text(&mut self, cx: &App) {
+        self._save_unsent_text = Task::ready(());
+        self.saved_unsent_text = self.typed_text(cx);
+    }
+}
+
+/// How the composer is drawn: along the bottom of a conversation, or as a card in the middle
+/// of the new thread screen.
+#[derive(Clone, Copy, PartialEq)]
+enum ComposerStyle {
+    Bar,
+    Card,
+}
+
+/// The new thread screen's column, narrower than a conversation, as in t3code.
+const NEW_THREAD_WIDTH: Pixels = px(680.);
+
+/// A borderless button that opens one of the new thread's pickers.
+fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike {
+    ButtonLike::new(id)
+        .style(ButtonStyle::Subtle)
+        .size(ButtonSize::Compact)
+        .child(
+            chip_content(icon, label).child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            ),
+        )
+}
+
+/// A picker's chip when there's nothing else to pick.
+fn static_chip(id: &'static str, icon: Icon, label: SharedString) -> gpui::Stateful<Div> {
+    chip_content(icon, label).id(id).h(px(22.)).px_1p5()
+}
+
+fn chip_content(icon: Icon, label: SharedString) -> Div {
+    h_flex()
+        .min_w_0()
+        .gap_1()
+        .child(icon.size(IconSize::XSmall).color(Color::Muted))
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .truncate(),
+        )
 }
 
 fn render_plan_entries(plan: &[PlanItem], _window: &Window, cx: &App) -> AnyElement {
@@ -3704,6 +4494,23 @@ impl Render for AgentView {
         let is_subthread = self.parent(cx).is_some();
         let is_drawer_full_screen =
             self.drawer_full_screen && self.is_drawer_open && self.drawer.is_some();
+        // A thread that never had a session has no history to load, so it shows the new
+        // thread screen while its agent starts too.
+        let is_never_opened = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_some_and(|thread| thread.session_id.is_none());
+        let is_new_thread = !has_rows
+            && self.queued_messages.is_empty()
+            && (!is_connecting || is_never_opened)
+            && !needs_login
+            && !is_subthread
+            && !self.is_archived
+            && self.client.read(cx).is_online();
+        if is_new_thread {
+            self.load_new_thread_git(cx);
+        }
 
         v_flex()
             // Otherwise clicking the conversation would take focus from the message editor.
@@ -3726,8 +4533,11 @@ impl Render for AgentView {
             .when(self.shows_toolbar, |this| {
                 this.child(self.render_toolbar(cx))
             })
+            .when(!is_drawer_full_screen && is_new_thread, |this| {
+                this.child(self.render_new_thread(cx))
+            })
             // A full-screen terminal hides the conversation and the composer.
-            .when(!is_drawer_full_screen, |this| {
+            .when(!is_drawer_full_screen && !is_new_thread, |this| {
                 this.children(self.render_restore_notice(cx))
                     .child(
                         // Each row is a direct child of the scrolled element, so rows can be scrolled to
@@ -3815,7 +4625,7 @@ impl Render for AgentView {
                         } else if !self.client.read(cx).is_online() {
                             this.child(self.render_offline_notice(cx))
                         } else {
-                            this.child(self.render_message_editor(cx))
+                            this.child(self.render_message_editor(ComposerStyle::Bar, cx))
                         }
                     })
             })
@@ -4016,7 +4826,116 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::humanize_token_count;
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::{TestAppContext, VisualTestContext};
+    use projects::{Project, ProjectsSnapshot};
+
+    use super::*;
+    use crate::machines::MachineId;
+
+    fn thread(id: u64, session_id: Option<&str>) -> projects::Thread {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "project_id": 1,
+            "title": "New thread",
+            "agent_id": "mock",
+            "session_id": session_id,
+        }))
+        .expect("a thread")
+    }
+
+    fn snapshot(unsent_text: Option<&str>) -> ProjectsSnapshot {
+        let mut typed = thread(3, None);
+        typed.is_draft = true;
+        typed.unsent_text = unsent_text.map(str::to_string);
+        ProjectsSnapshot {
+            projects: vec![Project {
+                id: ProjectId(1),
+                path: "/tmp/demo".into(),
+                custom_name: None,
+                icon: None,
+                workspaces: Vec::new(),
+                repository: None,
+            }],
+            threads: vec![thread(1, None), thread(2, Some("session")), typed],
+            ..Default::default()
+        }
+    }
+
+    fn open(
+        thread_id: u64,
+        is_archived: bool,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AgentView>, &mut VisualTestContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| client.set_online_for_test(cx));
+            let projects = client.read(cx).projects().clone();
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(snapshot(Some("Fix the login")), cx)
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let thread_id = ThreadId(thread_id);
+            let thread = AgentThread::shared(&client, thread_id, cx);
+            let mut view = AgentView::new(
+                thread_id,
+                thread,
+                "New thread".into(),
+                Some(AgentId::new("mock")),
+                cx,
+            );
+            view.set_archived(is_archived, cx);
+            view
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    #[gpui::test]
+    fn a_thread_without_messages_opens_on_the_new_thread_screen(cx: &mut TestAppContext) {
+        let (_, cx) = open(1, false, cx);
+        assert!(cx.debug_bounds("new-thread").is_some());
+    }
+
+    /// An archived thread takes no messages, so there's nothing to start.
+    #[gpui::test]
+    fn an_archived_thread_shows_its_conversation(cx: &mut TestAppContext) {
+        let (_, cx) = open(2, true, cx);
+        assert!(cx.debug_bounds("new-thread").is_none());
+    }
+
+    #[gpui::test]
+    fn unsent_text_comes_back_and_goes_when_discarded(cx: &mut TestAppContext) {
+        let (view, cx) = open(3, false, cx);
+        let composer_text = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| view.composer.read(cx).text().to_string())
+        };
+        assert_eq!(composer_text(cx), "Fix the login");
+        assert!(view.read_with(cx, |view, cx| view.is_draft(cx)));
+        assert!(!view.read_with(cx, |view, cx| view.is_untouched_draft(cx)));
+
+        // Another window's save leaves this composer alone; a discard empties it.
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        store.update(cx, |store, cx| {
+            store.set_snapshot(snapshot(Some("Fix the login page")), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(composer_text(cx), "Fix the login");
+        store.update(cx, |store, cx| store.set_snapshot(snapshot(None), cx));
+        cx.run_until_parked();
+        assert_eq!(composer_text(cx), "");
+        assert!(view.read_with(cx, |view, cx| view.is_untouched_draft(cx)));
+    }
 
     #[test]
     fn token_counts() {

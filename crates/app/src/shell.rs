@@ -2,11 +2,13 @@ use std::path::PathBuf;
 
 use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey};
 use crate::project_store::ThreadStatus;
-use agentz_protocol::agents::AgentId;
+use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::workspace::WorkspaceChoice;
 use collections::HashMap;
 use gpui::{
     AnyView, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable,
-    MouseButton, PathPromptOptions, Subscription, SystemNotification, Window, WindowControlArea,
+    MouseButton, PathPromptOptions, Subscription, SystemNotification, Task, Window,
+    WindowControlArea,
 };
 use projects::Thread;
 use ui::{
@@ -117,6 +119,8 @@ pub struct Shell {
     spaces_view: Entity<SpacesView>,
     /// The pane New Thread's thread goes in, when it was asked for from one.
     thread_target: Option<PaneKey>,
+    /// A draft New Thread is making, so another press doesn't make a second.
+    _starting_draft: Option<Task<()>>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
     add_project_modal: Option<(Entity<AddProjectModal>, Vec<Subscription>)>,
@@ -155,10 +159,15 @@ impl Shell {
                         pane,
                         project,
                         folder,
-                    } => {
-                        this.open_new_thread_modal(*project, folder.clone(), window, cx);
-                        this.thread_target = Some(*pane);
-                    }
+                    } => match project {
+                        Some(project) => {
+                            this.start_draft(*project, folder.clone(), Some(*pane), window, cx)
+                        }
+                        None => {
+                            this.open_new_thread_modal(window, cx);
+                            this.thread_target = Some(*pane);
+                        }
+                    },
                     SpacesViewEvent::Worktree {
                         machine,
                         folder,
@@ -175,6 +184,7 @@ impl Shell {
                     SpacesViewEvent::Confirm(request) => {
                         this.open_confirm_dialog(request.clone(), window, cx)
                     }
+                    SpacesViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
                 },
             ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
@@ -280,6 +290,7 @@ impl Shell {
             sidebar,
             spaces_view,
             thread_target: None,
+            _starting_draft: None,
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
             add_project_modal: None,
@@ -309,63 +320,165 @@ impl Shell {
             .cloned()
     }
 
+    /// A draft in the shown project, as t3code's New Thread opens one; with several shown, the
+    /// modal asks which first.
     fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
         let machines = self.machines.read(cx);
-        let groups = machines.visible_groups(cx);
         if machines.project_groups(cx).is_empty() {
             window.dispatch_action(Box::new(OpenFolder), cx);
             return;
         }
-        // With all projects shown, the modal asks for the project first, unless there's only
-        // one to choose.
-        let project = match groups.as_slice() {
-            [group] if group.members.len() == 1 => {
-                group.primary().map(|(machine, project)| ProjectKey {
-                    machine,
-                    project: project.id,
-                })
-            }
+        let project = match machines.visible_groups(cx).as_slice() {
+            [group] => machines.new_thread_member(group, cx),
             _ => None,
         };
-        self.open_new_thread_modal(project, None, window, cx);
+        match project {
+            Some(project) => self.start_draft(project, None, None, window, cx),
+            None => self.open_new_thread_modal(window, cx),
+        }
     }
 
-    fn open_new_thread_modal(
-        &mut self,
-        project: Option<ProjectKey>,
-        workspace: Option<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let modal = cx.new(|cx| NewThreadModal::new(project, workspace, window, cx));
+    fn open_new_thread_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let modal = cx.new(|cx| NewThreadModal::new(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&modal, window, |this, _, _: &DismissEvent, window, cx| {
                 this.dismiss_modal(window, cx);
             }),
             cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
-                NewThreadModalEvent::ThreadCreated(thread_id) => {
-                    let target = this.thread_target.take();
+                NewThreadModalEvent::ProjectChosen(project) => {
+                    let pane = this.thread_target.take();
                     this.dismiss_modal(window, cx);
-                    match target {
-                        Some(pane) if pane.machine == thread_id.machine => {
-                            this.spaces_view.update(cx, |view, cx| {
-                                view.show_thread_in_pane(pane, thread_id.thread, cx)
-                            })
-                        }
-                        _ => this.open_thread(*thread_id, window, cx),
-                    }
-                }
-                NewThreadModalEvent::OpenAgentSettings => {
-                    this.dismiss_modal(window, cx);
-                    this.open_settings(&OpenSettings, window, cx);
-                    if let Some((page, _)) = &this.settings_page {
-                        page.update(cx, |page, cx| page.show_agents(window, cx));
-                    }
+                    this.start_draft(*project, None, pane, window, cx);
                 }
             }),
         ];
         self.new_thread_modal = Some((modal, subscriptions));
         cx.notify();
+    }
+
+    /// Opens a draft in the project, working in `folder` (one of its workspaces, or its own
+    /// folder): the one open already with nothing typed, as t3code reuses an untouched draft,
+    /// or else a new one with the agent used last. Without an agent installed, Settings ›
+    /// Agents opens instead.
+    fn start_draft(
+        &mut self,
+        project: ProjectKey,
+        folder: Option<PathBuf>,
+        pane: Option<PaneKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self.machines.read(cx).projects(project.machine, cx) else {
+            return;
+        };
+        let workspace = folder.filter(|folder| {
+            store
+                .read(cx)
+                .project(project.project)
+                .is_none_or(|project| project.path != *folder)
+        });
+        let untouched = self.open_threads.iter().find_map(|(key, open_thread)| {
+            let ThreadView::Agent(view) = &open_thread.view else {
+                return None;
+            };
+            let thread = store.read(cx).thread(key.thread)?;
+            (key.machine == project.machine
+                && thread.project_id == project.project
+                && thread.workspace == workspace
+                && thread.terminal.is_none()
+                && view.read(cx).is_untouched_draft(cx))
+            .then_some(*key)
+        });
+        if let Some(draft) = untouched {
+            self.show_new_thread(draft, pane, window, cx);
+            return;
+        }
+        let Some(agent_id) = self.default_agent(project.machine, cx) else {
+            self.open_agent_settings(window, cx);
+            return;
+        };
+        if self._starting_draft.is_some() {
+            return;
+        }
+        let choice = workspace.map_or(WorkspaceChoice::Checkout, WorkspaceChoice::Existing);
+        let created = store.update(cx, |store, cx| {
+            store.create_thread(project.project, agent_id, choice, cx)
+        });
+        self._starting_draft = Some(cx.spawn_in(window, async move |this, cx| {
+            let created = created.await;
+            this.update_in(cx, |this, window, cx| {
+                this._starting_draft = None;
+                match created {
+                    Ok(thread) => {
+                        let draft = ThreadKey {
+                            machine: project.machine,
+                            thread,
+                        };
+                        this.show_new_thread(draft, pane, window, cx);
+                    }
+                    Err(error) => log::error!("couldn't start a thread: {error:#}"),
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    /// Shows a thread just started: in the pane it was asked for from, or on its own.
+    fn show_new_thread(
+        &mut self,
+        thread: ThreadKey,
+        pane: Option<PaneKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match pane {
+            Some(pane) if pane.machine == thread.machine => {
+                self.spaces_view.update(cx, |view, cx| {
+                    view.show_thread_in_pane(pane, thread.thread, cx)
+                })
+            }
+            _ => self.open_thread(thread, window, cx),
+        }
+    }
+
+    /// The agent a new draft starts with: that of the machine's newest thread, as t3code
+    /// carries the user's last choice, or else the first installed.
+    fn default_agent(&self, machine: MachineId, cx: &App) -> Option<AgentId> {
+        let client = self.machines.read(cx).client(machine, cx)?;
+        let client = client.read(cx);
+        let registry = client.registry().read(cx);
+        let is_installed = |agent_id: &AgentId| {
+            matches!(
+                registry.install_state(agent_id),
+                InstallState::Installed { .. }
+            )
+        };
+        let last_used = client
+            .projects()
+            .read(cx)
+            .threads()
+            .iter()
+            .filter(|thread| thread.terminal.is_none() && thread.task.is_none())
+            .filter_map(|thread| {
+                let agent_id = AgentId::new(thread.agent_id.clone()?);
+                is_installed(&agent_id).then_some((thread.created_at, thread.id, agent_id))
+            })
+            .max_by_key(|(created_at, thread_id, _)| (*created_at, *thread_id))
+            .map(|(_, _, agent_id)| agent_id);
+        last_used.or_else(|| {
+            registry
+                .agents()
+                .iter()
+                .find(|agent| agent.supports_current_platform() && is_installed(agent.id()))
+                .map(|agent| agent.id().clone())
+        })
+    }
+
+    fn open_agent_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(&OpenSettings, window, cx);
+        if let Some((page, _)) = &self.settings_page {
+            page.update(cx, |page, cx| page.show_agents(window, cx));
+        }
     }
 
     /// Cmd-J with focus outside the thread view (the Changes panel, the sidebar): the open
@@ -529,14 +642,14 @@ impl Shell {
             };
             self.open_threads.insert(thread_id, open_thread);
         }
-        // A thread made to continue another is a draft until its first message: leaving it
-        // closes it, and the server removes it once no window has it open.
+        // A new thread is a draft until its first message: leaving it closes it, saving what's
+        // typed, and the server removes it once no window has it open, unless something is.
         if let Some(previous) = self.active_thread.filter(|previous| *previous != thread_id)
             && let Some(OpenThread {
                 view: ThreadView::Agent(view),
                 ..
             }) = self.open_threads.get(&previous)
-            && view.read(cx).is_unsent_continuation(cx)
+            && view.read(cx).is_draft(cx)
         {
             self.open_threads.remove(&previous);
         }
@@ -687,15 +800,28 @@ impl Shell {
                 AgentViewEvent::Confirm(request) => {
                     this.open_confirm_dialog(request.clone(), window, cx)
                 }
-                AgentViewEvent::NewThreadInProject(project) => this.open_new_thread_modal(
-                    Some(ProjectKey {
+                AgentViewEvent::NewThreadInProject(project) => this.start_draft(
+                    ProjectKey {
                         machine: key.machine,
                         project: *project,
-                    }),
+                    },
+                    None,
                     None,
                     window,
                     cx,
                 ),
+                AgentViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
+                AgentViewEvent::Replaced { thread, text } => {
+                    this.open_thread(*thread, window, cx);
+                    if let Some(OpenThread {
+                        view: ThreadView::Agent(view),
+                        ..
+                    }) = this.open_threads.get(thread)
+                    {
+                        let text = text.clone();
+                        view.update(cx, |view, cx| view.set_composer_text(text, cx));
+                    }
+                }
             },
         );
         Some(OpenThread {
@@ -1076,45 +1202,73 @@ impl Shell {
             )
     }
 
-    /// An icon for each machine that can't be reached or runs an older server, which opens
-    /// Settings › Machines.
+    /// Each machine that can't be reached or runs an older server, by its own icon with a dot
+    /// for what it needs: accent for an update, warning for attention, dim while it
+    /// reconnects. A click opens Settings › Machines.
     fn render_connection_status(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let colors = cx.theme().colors();
+        let title_bar_background = colors.title_bar_background;
+        let accent = colors.text_accent;
+        let disabled = colors.icon_disabled;
+        let warning = cx.theme().status().warning;
         let machines = self.machines.read(cx);
         let mut icons = Vec::new();
         for client in machines.clients() {
             let client = client.read(cx);
-            let (icon, tooltip, color): (IconName, SharedString, Color) = match client.status() {
+            let label = client.label().clone();
+            let (summary, detail, dot, icon_color) = match client.status() {
                 MachineStatus::Connecting => continue,
                 MachineStatus::Online if client.is_outdated() => (
-                    IconName::ArrowCircle,
-                    format!("{} runs an older agentz-server", client.label()).into(),
+                    "Update available",
+                    "Runs an older agentz-server".to_string(),
+                    accent,
                     Color::Muted,
                 ),
                 MachineStatus::Online => continue,
-                MachineStatus::Reconnecting(error) | MachineStatus::Attention { error, .. } => {
-                    let color = match client.status() {
-                        MachineStatus::Attention { .. } => Color::Warning,
-                        _ => Color::Muted,
-                    };
-                    let tooltip = match client.machine() {
-                        MachineId::Local => format!("Disconnected from agentz-server: {error}"),
-                        MachineId::Remote(_) => {
-                            format!("Disconnected from {}: {error}", client.label())
-                        }
-                    };
-                    (IconName::Disconnected, tooltip.into(), color)
-                }
+                MachineStatus::Reconnecting(error) => (
+                    "Reconnecting…",
+                    format!("Disconnected: {error}"),
+                    disabled,
+                    Color::Disabled,
+                ),
+                MachineStatus::Attention { error, .. } => (
+                    "Needs attention",
+                    format!("Disconnected: {error}"),
+                    warning,
+                    Color::Muted,
+                ),
             };
+            let title: SharedString = format!("{label} · {summary}").into();
+            let detail: SharedString = detail.into();
             icons.push(
                 div()
                     .id(SharedString::from(format!(
                         "machine-status-{}",
                         client.machine().slug()
                     )))
+                    .relative()
+                    .p_0p5()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .cursor_pointer()
-                    .child(Icon::new(icon).size(IconSize::Small).color(color))
-                    .tooltip(Tooltip::text(tooltip))
+                    .child(
+                        Icon::new(machines.machine_icon(client.machine(), cx))
+                            .size(IconSize::Small)
+                            .color(icon_color),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .right_0()
+                            .size(px(7.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(title_bar_background)
+                            .bg(dot),
+                    )
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta(title.clone(), None, detail.clone(), cx)
+                    })
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_machine_settings(window, cx)),
                     )
@@ -1409,7 +1563,7 @@ mod modal_tests {
         });
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
         shell.update_in(cx, |shell, window, cx| {
-            shell.open_new_thread_modal(None, None, window, cx)
+            shell.open_new_thread_modal(window, cx)
         });
         cx.run_until_parked();
         assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_some()));
@@ -1425,7 +1579,7 @@ mod modal_tests {
         cx.run_until_parked();
         assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
         shell.update_in(cx, |shell, window, cx| {
-            shell.open_new_thread_modal(None, None, window, cx)
+            shell.open_new_thread_modal(window, cx)
         });
         // Well away from the modal, which sits at the top middle.
         cx.simulate_click(point(px(20.), px(500.)), Modifiers::none());

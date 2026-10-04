@@ -151,6 +151,8 @@ pub enum SpacesViewEvent {
     },
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
+    /// Manage Agents, from a new thread's agent picker.
+    OpenAgentSettings,
 }
 
 #[derive(Clone)]
@@ -255,6 +257,9 @@ pub struct SpacesView {
     layouts: HashMap<TabKey, TileLayout>,
     zoomed: HashSet<TabKey>,
     panes: HashMap<PaneKey, OpenPane>,
+    /// What was typed in a new thread that another replaced in its pane, for the
+    /// replacement's composer once the pane shows it.
+    replaced_composer_texts: HashMap<ThreadKey, SharedString>,
     /// A pane the server is making, focused once it arrives.
     pending_focus: Option<PaneKey>,
     split_override: Option<SplitOverride>,
@@ -308,6 +313,7 @@ impl SpacesView {
             layouts: HashMap::default(),
             zoomed: HashSet::default(),
             panes: HashMap::default(),
+            replaced_composer_texts: HashMap::default(),
             pending_focus: None,
             split_override: None,
             renaming: None,
@@ -633,6 +639,11 @@ impl SpacesView {
                     let agent_id = thread.agent_id.clone().map(AgentId::new);
                     let agent_thread = AgentThread::shared(&client, thread_id, cx);
                     let is_archived = thread.archived_at.is_some();
+                    let machine = key.machine;
+                    let composer_text = self.replaced_composer_texts.remove(&ThreadKey {
+                        machine,
+                        thread: thread_id,
+                    });
                     let view = cx.new(|cx| {
                         let mut view = AgentView::new(
                             thread_id,
@@ -643,10 +654,12 @@ impl SpacesView {
                         );
                         view.set_archived(is_archived, cx);
                         view.hide_toolbar(cx);
+                        if let Some(text) = composer_text {
+                            view.set_composer_text(text, cx);
+                        }
                         view
                     });
-                    let machine = key.machine;
-                    let subscription = cx.subscribe(&view, move |_, _, event, cx| match event {
+                    let subscription = cx.subscribe(&view, move |this, _, event, cx| match event {
                         AgentViewEvent::Unarchive => {
                             store.update(cx, |store, cx| store.unarchive_thread(thread_id, cx))
                         }
@@ -661,6 +674,17 @@ impl SpacesView {
                         }
                         // A pane shows its own header, without the thread's project.
                         AgentViewEvent::NewThreadInProject(_) => {}
+                        // A pane holds threads of its own machine only.
+                        AgentViewEvent::Replaced { thread, text } if thread.machine == machine => {
+                            this.replaced_composer_texts.insert(*thread, text.clone());
+                            this.show_thread_in_pane(key, thread.thread, cx);
+                        }
+                        AgentViewEvent::Replaced { thread, .. } => {
+                            cx.emit(SpacesViewEvent::OpenThread(*thread))
+                        }
+                        AgentViewEvent::OpenAgentSettings => {
+                            cx.emit(SpacesViewEvent::OpenAgentSettings)
+                        }
                     });
                     (PaneView::Agent(view), vec![subscription])
                 }

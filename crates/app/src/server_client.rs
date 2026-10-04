@@ -486,6 +486,13 @@ impl ServerClient {
         client
     }
 
+    /// Reads as connected, though a test client has no connection.
+    #[cfg(test)]
+    pub fn set_online_for_test(&mut self, cx: &mut Context<Self>) {
+        self.status = MachineStatus::Online;
+        cx.notify();
+    }
+
     fn connected(&mut self, connection: Connection, is_outdated: bool, cx: &mut Context<Self>) {
         log::info!(
             "connected to agentz-server {} on {} (pid {})",

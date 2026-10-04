@@ -8,8 +8,8 @@ use crate::project_store::{ProjectStore, ThreadStatus};
 use agentz_protocol::agents::AgentId;
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, Focusable as _,
-    FontWeight, Hsla, KeyBinding, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored,
-    deferred, svg,
+    FontWeight, Hsla, KeyBinding, PromptLevel, ScrollHandle, Stateful, Subscription, Task, Window,
+    anchored, deferred, svg,
 };
 use projects::{Project, Thread, Workspace, WorkspaceKind};
 use text_input::{TextInput, TextInputEvent};
@@ -86,6 +86,9 @@ pub struct Sidebar {
     machines: Entity<Machines>,
     project_info: Entity<ProjectInfoStore>,
     active_thread: Option<ThreadKey>,
+    /// The open draft's row as it was when the draft was opened. Like t3code, the row doesn't
+    /// repaint while you type in it, and a draft never left has none.
+    frozen_draft: Option<(ThreadKey, Thread)>,
     search: Entity<TextInput>,
     /// The highlighted search result, which Enter opens.
     search_index: usize,
@@ -140,6 +143,7 @@ impl Sidebar {
             machines,
             project_info,
             active_thread: None,
+            frozen_draft: None,
             search,
             search_index: 0,
             search_scroll: ScrollHandle::new(),
@@ -157,6 +161,13 @@ impl Sidebar {
     }
 
     pub fn set_active_thread(&mut self, thread: Option<ThreadKey>, cx: &mut Context<Self>) {
+        if self.active_thread != thread {
+            self.frozen_draft = thread.and_then(|key| {
+                let store = self.store(key.machine, cx)?;
+                let thread = store.read(cx).thread(key.thread)?;
+                (thread.is_draft && thread.unsent_text.is_some()).then(|| (key, thread.clone()))
+            });
+        }
         self.active_thread = thread;
         cx.notify();
     }
@@ -777,6 +788,8 @@ impl Sidebar {
         };
         let is_active = self.active_thread == Some(thread_id);
         let is_renaming = self.renaming_thread == Some(thread_id);
+        // The open thread's composer shows its text already.
+        let has_unsent_text = thread.unsent_text.is_some() && !is_active;
         let thread_status = store.read(cx).thread_status(thread.id);
         let icon = thread_agent_icon(&thread, cx);
         // Which machine it runs on, just before the agent.
@@ -904,21 +917,36 @@ impl Sidebar {
                     this.thread_hovered(thread_id, true, cx);
                 }
             }))
-            .on_click(move |_, _, cx| {
-                cx.stop_propagation();
-                store.update(cx, |store, cx| store.archive_thread(thread_id.thread, cx));
+            .on_click({
+                let store = store.clone();
+                move |_, _, cx| {
+                    cx.stop_propagation();
+                    store.update(cx, |store, cx| store.archive_thread(thread_id.thread, cx));
+                }
             });
+        let discard_button = has_unsent_text.then(|| {
+            render_discard_draft_button(thread_id, store.clone(), cx)
+                // The details would sit beside the button, so they give way to it.
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    if *hovered {
+                        this.hide_details(cx);
+                    } else if this.hovered_thread == Some(thread_id) {
+                        this.thread_hovered(thread_id, true, cx);
+                    }
+                }))
+        });
 
         // Terminals aren't archived: a shell or an agent CLI is deleted when done with.
-        let is_archivable = !is_renaming && thread.terminal.is_none();
-        // The status yields to the Archive button on hover.
+        let is_archivable = thread.terminal.is_none();
+        let has_hover_buttons = !is_renaming && (is_archivable || has_unsent_text);
+        // The status yields to the Archive and Discard buttons on hover.
         let status_slot = div()
             .flex_none()
-            .when(is_archivable, |this| {
+            .when(has_hover_buttons, |this| {
                 this.group_hover(group_name.clone(), |this| this.invisible())
             })
             .child(status);
-        let archive_slot = is_archivable.then(|| {
+        let hover_buttons = has_hover_buttons.then(|| {
             // Centered on its line, like t3code's Settle button.
             h_flex()
                 .absolute()
@@ -926,7 +954,17 @@ impl Sidebar {
                 .bottom_0()
                 .right_0()
                 .visible_on_hover(group_name.clone())
-                .child(archive_button)
+                .children(discard_button)
+                .when(is_archivable, |this| this.child(archive_button))
+        });
+        // The same pen as the draft rows, so both kinds of unsent work read the same way.
+        let unsent_marker = has_unsent_text.then(|| {
+            div()
+                .id(thread_element_id("unsent-text", thread_id))
+                .debug_selector(|| format!("unsent-text-{}", thread_id.thread.0))
+                .flex_none()
+                .tooltip(Tooltip::text("Unsent draft"))
+                .child(render_draft_pen())
         });
         let title_element = if is_renaming {
             self.render_rename_input(cx)
@@ -947,6 +985,7 @@ impl Sidebar {
                 .h_5()
                 .min_w_0()
                 .gap_1p5()
+                .children(unsent_marker)
                 .child(match &folder_name {
                     Some(_) => render_folder_icon(),
                     None => self.render_project_icon(machine, project.as_ref(), cx),
@@ -974,7 +1013,7 @@ impl Sidebar {
                         ),
                 )
                 .child(status_slot)
-                .children(archive_slot);
+                .children(hover_buttons);
             let title_line = h_flex().mt_1().min_w_0().child(title_element);
             (Some(project_line), title_line)
         } else {
@@ -983,18 +1022,20 @@ impl Sidebar {
                 .relative()
                 .min_w_0()
                 .gap_1p5()
+                .children(unsent_marker)
                 .child(title_element)
                 .children(
                     machine_label.map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
                 )
                 .child(status_slot)
-                .children(archive_slot);
+                .children(hover_buttons);
             (None, title_line)
         };
 
         let card =
             v_flex()
                 .id(thread_element_id("thread-card", thread_id))
+                .debug_selector(|| format!("thread-card-{}", thread_id.thread.0))
                 .group(group_name)
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
@@ -1106,6 +1147,103 @@ impl Sidebar {
             })
             .menu(menu)
             .into_any_element()
+    }
+
+    /// t3code's draft row: a new thread with something typed and nothing sent, as its project
+    /// and the first line of the text, on a warning tint.
+    fn render_draft_row(
+        &self,
+        store: &Entity<ProjectStore>,
+        thread: Thread,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let machine = store.read(cx).machine();
+        let thread_id = ThreadKey {
+            machine,
+            thread: thread.id,
+        };
+        let is_active = self.active_thread == Some(thread_id);
+        let project = store.read(cx).project(thread.project_id).cloned();
+        let machines = self.machines.read(cx);
+        let is_offline = !machines.is_online(machine, cx);
+        let machine_label = (machine != MachineId::Local).then(|| {
+            (
+                machines.machine_icon(machine, cx),
+                machines.label(machine, cx),
+            )
+        });
+        let preview = thread
+            .unsent_text
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let tint = Color::Warning.color(cx);
+        let selected_background = cx.theme().colors().ghost_element_selected;
+        let group_name =
+            SharedString::from(format!("draft-row-{}-{}", machine.slug(), thread.id.0));
+        let row = v_flex()
+            .id(thread_element_id("draft-row", thread_id))
+            .debug_selector(|| format!("draft-row-{}", thread_id.thread.0))
+            .group(group_name.clone())
+            .w_full()
+            .h(CARD_HEIGHT)
+            .px_2p5()
+            .py_2()
+            .rounded_md()
+            .cursor_pointer()
+            .map(|row| {
+                if is_active {
+                    row.bg(selected_background)
+                } else {
+                    row.bg(tint.opacity(0.04))
+                        .hover(|row| row.bg(tint.opacity(0.08)))
+                }
+            })
+            .when(is_offline, |row| row.opacity(0.5))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::OpenThread(thread_id))))
+            .child(
+                h_flex()
+                    .h_5()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(render_draft_pen())
+                    .child(self.render_project_icon(machine, project.as_ref(), cx))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .children(project.as_ref().map(|project| {
+                                Label::new(project.name())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate()
+                            }))
+                            .children(
+                                machine_label.map(|(icon, label)| {
+                                    render_machine_tag(icon, label, is_offline)
+                                }),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .h_full()
+                            .flex_none()
+                            .visible_on_hover(group_name)
+                            .child(render_discard_draft_button(thread_id, store.clone(), cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_0p5()
+                    .min_w_0()
+                    .child(Label::new(preview).weight(FontWeight::MEDIUM).truncate()),
+            );
+        div().py_0p5().child(row).into_any_element()
     }
 
     /// t3code's shelf header: a label, a rule, and a chevron.
@@ -1552,9 +1690,40 @@ impl Sidebar {
             return self.render_search_results(window, cx);
         }
         let machines = self.machines.read(cx);
+        let drafts = machines.typed_drafts(cx);
         let active = machines.active_threads(cx);
         let archived = machines.archived_threads(cx);
         let is_archived_expanded = machines.archived_expanded(cx);
+
+        // t3code's draft block: interrupted new threads, one click away above the rest.
+        let mut draft_rows = Vec::with_capacity(drafts.len());
+        for (machine, thread) in drafts {
+            let key = ThreadKey {
+                machine,
+                thread: thread.id,
+            };
+            let thread = if self.active_thread == Some(key) {
+                match &self.frozen_draft {
+                    Some((frozen_key, frozen)) if *frozen_key == key => frozen.clone(),
+                    _ => continue,
+                }
+            } else {
+                thread
+            };
+            if let Some(store) = self.store(machine, cx) {
+                draft_rows.push(self.render_draft_row(&store, thread, cx));
+            }
+        }
+        if !draft_rows.is_empty() {
+            draft_rows.push(
+                div()
+                    .mx_2p5()
+                    .my_1p5()
+                    .h_px()
+                    .bg(cx.theme().colors().border_variant.opacity(0.6))
+                    .into_any_element(),
+            );
+        }
 
         let mut rows = Vec::with_capacity(active.len());
         for (machine, thread) in active {
@@ -1638,6 +1807,7 @@ impl Sidebar {
             .pt_1()
             .pb_2()
             .overflow_y_scroll()
+            .children(draft_rows)
             .children(rows)
             .when(!shelf.is_empty(), |list| {
                 // Like t3code, the shelf rests at the bottom while the list is short.
@@ -1831,6 +2001,48 @@ fn render_checkout_marker(
     )
 }
 
+/// t3code's pen for unsent work.
+fn render_draft_pen() -> Icon {
+    Icon::new(IconName::SquarePen)
+        .size(IconSize::XSmall)
+        .color(Color::Warning)
+}
+
+/// t3code's Discard draft button: a muted × that brightens under the mouse. Clearing the
+/// text is all it takes; the server removes a draft left with none.
+fn render_discard_draft_button(
+    thread_id: ThreadKey,
+    store: Entity<ProjectStore>,
+    cx: &App,
+) -> Stateful<Div> {
+    let muted_text = cx.theme().colors().text_muted;
+    let bright_text = cx.theme().colors().text;
+    let group_name = SharedString::from(format!(
+        "discard-draft-{}-{}",
+        thread_id.machine.slug(),
+        thread_id.thread.0
+    ));
+    h_flex()
+        .id(thread_element_id("discard-draft", thread_id))
+        .group(group_name.clone())
+        .h_full()
+        .px_1()
+        .cursor_pointer()
+        .tooltip(Tooltip::text("Discard draft"))
+        .child(
+            svg()
+                .path(IconName::Close.path())
+                .size(IconSize::XSmall.rems())
+                .flex_none()
+                .text_color(muted_text)
+                .group_hover(group_name, |this| this.text_color(bright_text)),
+        )
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            store.read(cx).set_unsent_text(thread_id.thread, None, cx);
+        })
+}
+
 /// Which machine a thread is on, after its project's name, when it isn't this Mac.
 fn render_machine_tag(icon: IconName, label: SharedString, is_offline: bool) -> AnyElement {
     h_flex()
@@ -1997,6 +2209,142 @@ mod tests {
             format_relative_time(now + Duration::from_secs(60), now),
             "now"
         );
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use projects::{Project, ProjectId, ProjectsSnapshot, Thread, ThreadId};
+    use serde_json::json;
+
+    use super::Sidebar;
+    use crate::machines::{MachineId, ThreadKey};
+    use crate::project_store::ProjectStore;
+    use crate::server_client::ServerClient;
+
+    fn thread(id: u64, is_draft: bool, unsent_text: Option<&str>) -> Thread {
+        serde_json::from_value(json!({
+            "id": id,
+            "project_id": 1,
+            "title": format!("Thread {id}"),
+            "agent_id": "mock",
+            "is_draft": is_draft,
+            "unsent_text": unsent_text,
+        }))
+        .expect("a thread")
+    }
+
+    fn show(store: &Entity<ProjectStore>, threads: Vec<Thread>, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            store.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![Project {
+                            id: ProjectId(1),
+                            path: "/tmp/demo".into(),
+                            custom_name: None,
+                            icon: None,
+                            workspaces: Vec::new(),
+                            repository: None,
+                        }],
+                        threads,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    fn open(sidebar: &Entity<Sidebar>, thread: u64, cx: &mut VisualTestContext) {
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_active_thread(
+                Some(ThreadKey {
+                    machine: MachineId::Local,
+                    thread: ThreadId(thread),
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn drafts_list_above_threads_once_something_is_typed(cx: &mut TestAppContext) {
+        let store = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let store = client.read(cx).projects().clone();
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            store
+        });
+        let (sidebar, cx) = cx.add_window_view(|_, cx| Sidebar::new(cx));
+        let shown =
+            |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
+        show(
+            &store,
+            vec![
+                thread(1, true, Some("Fix the login\nand the logout")),
+                thread(2, true, None),
+                thread(3, false, Some("Half typed")),
+                thread(4, false, None),
+            ],
+            cx,
+        );
+        // A draft is a row once something is typed, and never a card.
+        assert!(shown("draft-row-1", cx));
+        assert!(!shown("thread-card-1", cx));
+        assert!(!shown("draft-row-2", cx));
+        assert!(!shown("thread-card-2", cx));
+        // A thread with unsent text is marked with the pen, unless it's open.
+        assert!(shown("unsent-text-3", cx));
+        assert!(!shown("unsent-text-4", cx));
+        open(&sidebar, 3, cx);
+        assert!(!shown("unsent-text-3", cx));
+
+        // The open draft keeps its row.
+        open(&sidebar, 1, cx);
+        assert!(shown("draft-row-1", cx));
+
+        // A draft typed in without leaving it has no row until it's left.
+        open(&sidebar, 2, cx);
+        show(
+            &store,
+            vec![
+                thread(1, true, Some("Fix the login")),
+                thread(2, true, Some("New idea")),
+                thread(3, false, Some("Half typed")),
+                thread(4, false, None),
+            ],
+            cx,
+        );
+        assert!(!shown("draft-row-2", cx));
+        open(&sidebar, 4, cx);
+        assert!(shown("draft-row-2", cx));
+
+        // Its first message makes it a thread.
+        show(
+            &store,
+            vec![
+                thread(1, true, Some("Fix the login")),
+                thread(2, false, None),
+                thread(3, false, Some("Half typed")),
+                thread(4, false, None),
+            ],
+            cx,
+        );
+        assert!(!shown("draft-row-2", cx));
+        assert!(shown("thread-card-2", cx));
     }
 }
 

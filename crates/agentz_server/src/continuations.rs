@@ -1,7 +1,7 @@
 //! The conversations threads continue with another agent ("Continue with another agent"), kept
 //! in `handoffs/<thread id>.json` until each goes with its thread's first message, so a restart
 //! of the server doesn't lose one. Until then the thread is a draft, removed once the user leaves
-//! it ([`crate::server`]'s `sweep_unsent_continuations`).
+//! it empty ([`crate::server`]'s `sweep_drafts`).
 
 use std::path::{Path, PathBuf};
 

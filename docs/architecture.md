@@ -101,8 +101,12 @@ Each entry: what it does, where it lives, and where it comes from.
 ### Window, sidebar and settings
 
 - **Window** (`shell.rs`): title bar with the sidebar toggle (Cmd-B), project switcher,
-  disconnected icon, and Agents | Workspaces tabs; the sidebar; the open thread or settings; the
-  diff panel; modals, which close on a press outside them.
+  connection status, and Agents | Workspaces tabs; the sidebar; the open thread or settings; the
+  diff panel; modals, which close on a press outside them. The connection status
+  (`Shell::render_connection_status`, the user's choice of designs) is each machine that can't
+  be reached or runs an older server, by its own icon with a dot: accent for an update,
+  warning for attention, dim while it reconnects. Its tooltip says which and why, and a click
+  opens Settings › Machines.
 - **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
   `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
   favicons or monograms, git branches. The switcher is Zed's recent-projects popover.
@@ -112,6 +116,14 @@ Each entry: what it does, where it lives, and where it comes from.
   shelf, title search, context menu. Automatic titles (the first prompt, the agent, a shell's
   folder, a terminal's agent CLI) keep updating under the user's own (`Thread::automatic_title`),
   which shows while set; clearing it shows the automatic one again, as with workspaces.
+- **Draft rows** (`sidebar.rs`, `Machines::typed_drafts`; t3code's `SidebarDraftBlock`): drafts
+  (below, under Agent threads) aren't cards. One with text typed in it is a row above the cards,
+  newest first, with t3code's pen, its project, and the first line of the text on a warning
+  tint, and × (Discard draft) on hover. The open draft's row is the one it had when opened
+  (`Sidebar::frozen_draft`), so it doesn't repaint as you type, and a draft never left has
+  none. A thread with unsent text that isn't open gets the pen before its project ("Unsent
+  draft") and a Discard draft × beside Archive. Discarding clears the text
+  (`Request::SetUnsentText` with none), and the server then removes a draft no one has open.
 - **Shells shelf** (`sidebar.rs`): terminal threads, named after their current folder, under the
   project that folder is in; one becomes a thread card while an agent CLI runs in it. Under a
   title that isn't the repository's name (renamed, in a subfolder, an agent CLI), the branch
@@ -160,13 +172,30 @@ Each entry: what it does, where it lives, and where it comes from.
   (`without_handoff`). Sent, it links the threads (`Thread::continued_from`): the new thread
   opens with a "Continued from" divider, and the old one ends with a "Continued in" card (also
   the user's choice).
-- **Unsent continuations are drafts** (`Server::sweep_unsent_continuations`, `Shell::open_thread`;
-  t3code drops a draft thread it never sent): the user chose to remove one when they leave it.
-  The shell closes a draft it moves away from (other views keep threads open), and the server
-  deletes a continuation that hasn't sent its first message once no client has had it open for
-  3 seconds (60 after it's made, or found at start, for a far client to open it). Quitting
-  counts as leaving; Settings and Workspaces don't. A message queued for a login keeps it, and
-  dropping the context makes it an ordinary new thread.
+- **New Thread** (`Shell::new_thread`, `Shell::start_draft`, `new_thread_modal.rs`; t3code's
+  `useHandleNewThread`, the user's choice): opens a draft right away in the shown project, or
+  asks which project first when several are shown (the modal is only that picker). It reuses
+  the open draft of that project and workspace while nothing is typed in it, and otherwise
+  starts one with the agent of the machine's newest thread (else the first installed; with
+  none, Settings › Agents opens). The new thread screen (`AgentView::render_new_thread`, the
+  user's choice of designs) is "What should we work on?" over the composer, with the agent
+  picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
+  Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
+  existing one), the machine picker and the branch. Changing any of them replaces the draft
+  with a new one.
+- **Drafts** (`Thread::is_draft`, `Thread::unsent_text`, `Server::sweep_drafts`,
+  `Shell::open_thread`; t3code's draft threads and composer drafts): every new agent thread is
+  a draft until its first message, so its agent starts at once, but it isn't in the thread
+  list. What's typed in any thread's composer is kept on its machine (`Request::SetUnsentText`,
+  half a second after typing pauses, and as the view closes) and comes back when it's opened,
+  as t3code keeps composer drafts; a discard from elsewhere empties the composer
+  (`AgentView::follow_discarded_unsent_text`). The shell closes a draft it moves away from
+  (other views keep threads open), and the server deletes a draft with nothing typed once no
+  client has had it open for 3 seconds (60 after it's made, or found at start, for a far
+  client to open it). Quitting counts as leaving; Settings and Workspaces don't. A draft with
+  text stays, as a draft row in the sidebar. The first message makes it a thread
+  (`ThreadEvent::FirstPrompt`). A continuation is a draft too: a message queued for a login
+  keeps it, and dropping the context makes it an ordinary draft.
 - **Agent registry** (`registry`, `registry_store.rs`): install, update, uninstall from the ACP
   Registry, binary archives or npm.
 - **Agent icons** (`agent_icons.rs`, `registry`): each server downloads the registry's icons,
@@ -329,7 +358,7 @@ t3code's workspace model, herdr's folder layout and safe removal, cow's pastures
   bring their branch back (cow's `sync` and `extract`).
 - **Handoff** (`agentz_workspace_handoff`) moves a thread after its turn: the agent restarts in the
   new folder, with `session/load` when it can.
-- **UI**: New Thread's Workspace step (`new_thread_modal.rs`), card markers, thread menu (Sync,
+- **UI**: the new thread screen's checkout picker (`agent_view.rs`), card markers, thread menu (Sync,
   Bring Branch), a workspace row's New Worktree and Open Worktree… (`worktree_modal.rs`, below),
   Project Settings › Checkouts. Removing asks again when work
   would be lost; branches are kept; a workspace in use can't be removed.

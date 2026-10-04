@@ -531,6 +531,23 @@ impl Machines {
         })
     }
 
+    /// The checkout New Thread starts in: the one used last while its machine is online, or
+    /// else the first online one. The draft's machine picker moves it to another.
+    pub fn new_thread_member(&self, group: &ProjectGroup, cx: &App) -> Option<ProjectKey> {
+        self.last_used_member(group, cx)
+            .filter(|member| self.is_online(member.machine, cx))
+            .or_else(|| {
+                group
+                    .members
+                    .iter()
+                    .find(|(machine, _)| self.is_online(*machine, cx))
+                    .map(|(machine, project)| ProjectKey {
+                        machine: *machine,
+                        project: project.id,
+                    })
+            })
+    }
+
     /// Whether every machine the group is on is unreachable.
     pub fn is_group_offline(&self, group: &ProjectGroup, cx: &App) -> bool {
         group
@@ -608,12 +625,14 @@ impl Machines {
     }
 
     /// Unarchived top-level threads of the visible projects, newest or latest active first.
-    /// Shells aren't threads until an agent CLI runs in them.
+    /// Shells aren't threads until an agent CLI runs in them, nor drafts until their first
+    /// message.
     pub fn active_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let groups = self.visible_groups(cx);
         let mut threads = self.threads_where(cx, |machine, thread| {
             thread.archived_at.is_none()
                 && thread.task.is_none()
+                && !thread.is_draft
                 && !self.is_shell(machine, thread, cx)
                 && self.is_thread_visible(&groups, machine, thread, cx)
         });
@@ -628,6 +647,21 @@ impl Machines {
                 .then(b_machine.cmp(a_machine))
                 .then(b.id.cmp(&a.id))
         });
+        threads
+    }
+
+    /// Drafts of the visible projects with something typed in them, newest first: the
+    /// sidebar lists them above the threads, as t3code does.
+    pub fn typed_drafts(&self, cx: &App) -> Vec<(MachineId, Thread)> {
+        let groups = self.visible_groups(cx);
+        let mut threads = self.threads_where(cx, |machine, thread| {
+            thread.is_draft
+                && thread.unsent_text.is_some()
+                && thread.archived_at.is_none()
+                && thread.task.is_none()
+                && self.is_thread_visible(&groups, machine, thread, cx)
+        });
+        threads.sort_by_key(|(_, thread)| std::cmp::Reverse((thread.created_at, thread.id)));
         threads
     }
 

@@ -353,6 +353,11 @@ pub enum Request {
     ArchiveThread(ThreadId),
     UnarchiveThread(ThreadId),
     DeleteThread(ThreadId),
+    /// What's typed in the thread's composer and not sent ([`projects::Thread::unsent_text`]).
+    SetUnsentText {
+        thread_id: ThreadId,
+        text: Option<String>,
+    },
     /// The thread's changes from its checkpoints: [`Response::ThreadDiff`].
     ThreadDiff {
         thread_id: ThreadId,

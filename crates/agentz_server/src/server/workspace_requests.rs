@@ -215,7 +215,8 @@ impl Server {
     }
 
     /// Adds a thread working in `folder` (the project's own with `None`) and starts its agent
-    /// or terminal, so it's ready by the time the user has typed something.
+    /// or terminal, so it's ready by the time the user has typed something. An agent's thread
+    /// is a draft until its first message ([`Self::sweep_drafts`]).
     pub(super) fn create_thread_in(
         &mut self,
         project_id: ProjectId,
@@ -236,7 +237,11 @@ impl Server {
         self.projects.set_thread_workspace(thread_id, folder);
         match new {
             NewThread::Agent(_) => {
+                self.projects.set_draft(thread_id, true);
+                self.draft_due
+                    .insert(thread_id, Instant::now() + OPEN_GRACE);
                 self.update_thread(ConnectionId::Thread(thread_id), |_| {})?;
+                self.sweep_drafts();
             }
             NewThread::Terminal(_) => {
                 self.ensure_terminal(&TerminalKey::Thread(thread_id))?;
@@ -290,14 +295,11 @@ impl Server {
         };
         let new_thread =
             self.create_thread_in(thread.project_id, NewThread::Agent(agent_id), folder)?;
-        // A draft until its first message goes, which links it to this thread.
-        self.unsent_continuations
-            .insert(new_thread, Some(Instant::now() + OPEN_GRACE));
+        // Its first message links it to this thread.
         continuations::save(&self.data_dir, new_thread, &handoff).log_err();
         self.update_thread(ConnectionId::Thread(new_thread), |thread| {
             thread.set_handoff(Some(handoff))
         })?;
-        self.sweep_unsent_continuations();
         Ok(new_thread)
     }
 

@@ -445,10 +445,10 @@ async fn continues_threads_with_another_agent() {
     assert!(!saved.exists());
 }
 
-/// A continuation nobody sends anything in is removed once the user leaves it, as t3code drops
-/// a draft. One whose context was dropped is a new thread like any other, and stays.
+/// A new thread is a draft until its first message, as in t3code: one left with nothing typed
+/// is removed, and one with typed text stays until that's cleared.
 #[tokio::test(flavor = "multi_thread")]
-async fn removes_continuations_left_unsent() {
+async fn removes_drafts_left_empty() {
     let Some(server) = TestServer::start() else {
         return;
     };
@@ -457,6 +457,19 @@ async fn removes_continuations_left_unsent() {
     let thread_id = client.create_thread(&server).await;
     let old = ConnectionId::Thread(thread_id);
     client.subscribe_thread(old).await;
+    let thread = |client: &TestClient, thread_id: ThreadId| {
+        client
+            .projects
+            .as_ref()
+            .and_then(|projects| {
+                projects
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == thread_id)
+            })
+            .cloned()
+    };
+    assert!(thread(&client, thread_id).is_some_and(|thread| thread.is_draft));
     client
         .ok(Request::Prompt {
             connection: old,
@@ -465,53 +478,89 @@ async fn removes_continuations_left_unsent() {
         .await;
     client
         .wait_until(|client| {
-            let thread = client.thread(old);
-            !thread.is_working() && agent_text(thread) == "Echo: build the page"
+            let view = client.thread(old);
+            !view.is_working() && agent_text(view) == "Echo: build the page"
         })
         .await;
-    let mut continuations = Vec::new();
+    assert!(thread(&client, thread_id).is_some_and(|thread| !thread.is_draft));
+
+    let Response::ThreadCreated(continuation) = client
+        .ok(Request::ContinueThread {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let project_id = thread(&client, thread_id)
+        .expect("the thread exists")
+        .project_id;
+    let mut drafts = vec![continuation];
     for _ in 0..2 {
         match client
-            .ok(Request::ContinueThread {
-                thread_id,
+            .ok(Request::CreateThread {
+                project_id,
                 agent_id: AgentId::new("mock"),
+                workspace: Default::default(),
             })
             .await
         {
-            Response::ThreadCreated(thread_id) => continuations.push(thread_id),
+            Response::ThreadCreated(thread_id) => drafts.push(thread_id),
             response => panic!("unexpected response: {response:?}"),
         }
     }
-    let [left, kept] = continuations[..] else {
-        panic!("expected two threads");
+    let [continuation, left, typed] = drafts[..] else {
+        panic!("expected three threads");
     };
-    let thread_exists = |client: &TestClient, thread_id: ThreadId| {
-        client
-            .projects
-            .as_ref()
-            .is_some_and(|projects| projects.threads.iter().any(|thread| thread.id == thread_id))
-    };
-    for thread_id in [left, kept] {
+    for thread_id in drafts.iter().copied() {
         client
             .subscribe_thread(ConnectionId::Thread(thread_id))
             .await;
     }
     client
-        .ok(Request::DropHandoff(ConnectionId::Thread(kept)))
+        .ok(Request::SetUnsentText {
+            thread_id: typed,
+            text: Some("fix the header".into()),
+        })
         .await;
-    for thread_id in [left, kept] {
+    client
+        .ok(Request::SetUnsentText {
+            thread_id,
+            text: Some("and the footer".into()),
+        })
+        .await;
+    for thread_id in drafts.iter().copied() {
         client
             .ok(Request::UnsubscribeThread(ConnectionId::Thread(thread_id)))
             .await;
     }
     client
-        .wait_until(|client| !thread_exists(client, left))
+        .wait_until(|client| {
+            thread(client, continuation).is_none() && thread(client, left).is_none()
+        })
         .await;
-    assert!(thread_exists(&client, kept));
-    assert!(thread_exists(&client, thread_id));
+    let typed_thread = thread(&client, typed).expect("typed text keeps a draft");
+    assert!(typed_thread.is_draft);
+    assert_eq!(typed_thread.unsent_text.as_deref(), Some("fix the header"));
+    assert_eq!(
+        thread(&client, thread_id).and_then(|thread| thread.unsent_text),
+        Some("and the footer".into())
+    );
     let handoffs = server.data_dir.path().join("handoffs");
-    assert!(!handoffs.join(format!("{}.json", left.0)).exists());
-    assert!(!handoffs.join(format!("{}.json", kept.0)).exists());
+    assert!(!handoffs.join(format!("{}.json", continuation.0)).exists());
+
+    // Cleared, the draft goes like any other left empty.
+    client
+        .ok(Request::SetUnsentText {
+            thread_id: typed,
+            text: None,
+        })
+        .await;
+    client
+        .wait_until(|client| thread(client, typed).is_none())
+        .await;
+    assert!(thread(&client, thread_id).is_some());
 }
 
 /// The point of the server: a turn keeps going without a client, and the next client sees

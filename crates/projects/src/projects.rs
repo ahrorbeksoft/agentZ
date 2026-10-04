@@ -197,6 +197,14 @@ pub struct Thread {
     /// first message.
     #[serde(default)]
     pub continued_from: Option<ThreadId>,
+    /// A thread the user started and hasn't sent anything in yet: t3code's draft thread. It's
+    /// left out of the thread list, and removed once the user leaves it with nothing typed.
+    #[serde(default)]
+    pub is_draft: bool,
+    /// What's typed in the thread's composer and not sent yet (t3code's composer draft), kept
+    /// while the user is elsewhere.
+    #[serde(default)]
+    pub unsent_text: Option<String>,
 }
 
 /// An agent's session to add as a thread: [`ProjectStore::add_imported_thread`].
@@ -678,6 +686,8 @@ impl ProjectStore {
             workspace: None,
             terminal: None,
             continued_from: None,
+            is_draft: false,
+            unsent_text: None,
         });
         self.changed();
         Some(id)
@@ -959,6 +969,26 @@ impl ProjectStore {
             && thread.workspace != workspace
         {
             thread.workspace = workspace;
+            self.changed();
+        }
+    }
+
+    pub fn set_draft(&mut self, id: ThreadId, is_draft: bool) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.is_draft != is_draft
+        {
+            thread.is_draft = is_draft;
+            self.changed();
+        }
+    }
+
+    /// Keeps what's typed in the thread's composer; blank text is none.
+    pub fn set_unsent_text(&mut self, id: ThreadId, text: Option<String>) {
+        let text = text.filter(|text| !text.trim().is_empty());
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.unsent_text != text
+        {
+            thread.unsent_text = text;
             self.changed();
         }
     }
