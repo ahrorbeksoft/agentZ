@@ -199,7 +199,11 @@ Each entry: what it does, where it lives, and where it comes from.
   (`ThreadEvent::FirstPrompt`). A continuation is a draft too: a message queued for a login
   keeps it, and dropping the context makes it an ordinary draft.
 - **Agent registry** (`registry`, `registry_store.rs`): install, update, uninstall from the ACP
-  Registry, binary archives or npm.
+  Registry, binary archives or npm. An npm agent installs the registry's exact version, and
+  Zed's range (`0.0.0 - <version>`) only when npm refuses it, as under a min-release-age
+  policy: npm resolves a range to the `latest` tag when that fits, and Grok's registry version
+  is tagged `alpha`. An agent's stderr loses its terminal colors before it's logged or shown in
+  an error.
 - **Agent icons** (`agent_icons.rs`, `registry`): each server downloads the registry's icons,
   and its listings name each one by a SHA-256 of its SVG. Every machine reads the same
   registry, so the app keeps one cache for all of them. It fetches an icon once

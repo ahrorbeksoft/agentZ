@@ -30,7 +30,7 @@ use tokio::task::JoinSet;
 use url::Url;
 use util::ResultExt as _;
 
-use crate::node_runtime::NodeRuntime;
+use crate::node_runtime::{Node, NodeRuntime};
 
 pub use agentz_protocol::agents::{
     AgentCommand, AgentIcon, AgentId, AgentListing, IconId, InstallState, RegistryAgentMetadata,
@@ -956,30 +956,41 @@ async fn install_npx_agent(
         std::fs::write(&manifest_path, "{\"private\": true}\n")
             .with_context(|| format!("writing {}", manifest_path.display()))?;
     }
+    install_npm_package(&node, &install_dir, &agent.package).await
+}
 
-    let (_, package_spec) = bounded_npm_package_spec(&agent.package);
-    let output = node
-        .npm(
-            "install",
-            &[
-                package_spec.as_str(),
-                "--save-exact",
-                "--no-fund",
-                "--no-audit",
-            ],
-        )
-        .current_dir(&install_dir)
-        .output()
-        .await
-        .context("running npm install")?;
-    if !output.status.success() {
-        bail!(
-            "npm install {} failed: {}",
-            agent.package,
+/// Installs the registry's exact version, and the bounded range only when npm refuses that.
+/// npm resolves a range to the `latest` dist-tag whenever `latest` satisfies it, so with the range
+/// alone a package whose newest release sits under another tag (Grok's under `alpha`) never gets
+/// past `latest`, and shows an update that installing doesn't bring.
+async fn install_npm_package(node: &Node, install_dir: &Path, package: &str) -> Result<()> {
+    let (_, bounded_spec) = bounded_npm_package_spec(package);
+    let mut specs = vec![package.to_string()];
+    if bounded_spec != package {
+        specs.push(bounded_spec);
+    }
+    let mut last_error = None;
+    for spec in specs {
+        let output = node
+            .npm(
+                "install",
+                &[spec.as_str(), "--save-exact", "--no-fund", "--no-audit"],
+            )
+            .current_dir(install_dir)
+            .output()
+            .await
+            .context("running npm install")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let error = anyhow!(
+            "npm install {spec} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
+        log::info!("{error:#}");
+        last_error = Some(error);
     }
-    Ok(())
+    Err(last_error.unwrap_or_else(|| anyhow!("nothing to install for {package}")))
 }
 
 async fn agent_command(
@@ -1296,6 +1307,53 @@ mod tests {
         assert_eq!(
             bounded_npm_package_spec("agent"),
             ("agent", "agent".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_installs_the_registry_version_and_the_range_only_when_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let calls = dir.path().join("calls");
+        let refuse_exact = dir.path().join("refuse-exact");
+        // With `refuse-exact` present it refuses exact versions, as npm does under a
+        // min-release-age policy.
+        let fake_npm = dir.path().join("npm");
+        std::fs::write(
+            &fake_npm,
+            format!(
+                "#!/bin/sh\necho \"$2\" >> '{calls}'\ncase \"$2\" in *' - '*) exit 0 ;; esac\n\
+                 if [ -f '{refuse_exact}' ]; then echo 'No matching version' >&2; exit 1; fi\n",
+                calls = calls.display(),
+                refuse_exact = refuse_exact.display(),
+            ),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake_npm, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let node = Node::System {
+            node: PathBuf::from("/usr/bin/false"),
+            npm: fake_npm,
+        };
+        let recorded_calls = || {
+            let recorded = std::fs::read_to_string(&calls).expect("calls");
+            std::fs::remove_file(&calls).expect("clear calls");
+            recorded.lines().map(str::to_string).collect::<Vec<_>>()
+        };
+
+        install_npm_package(&node, dir.path(), "@scope/agent@1.2.3")
+            .await
+            .expect("install");
+        assert_eq!(recorded_calls(), vec!["@scope/agent@1.2.3"]);
+
+        std::fs::write(&refuse_exact, "").expect("write");
+        install_npm_package(&node, dir.path(), "@scope/agent@1.2.3")
+            .await
+            .expect("install through the range");
+        assert_eq!(
+            recorded_calls(),
+            vec!["@scope/agent@1.2.3", "@scope/agent@0.0.0 - 1.2.3"]
         );
     }
 
