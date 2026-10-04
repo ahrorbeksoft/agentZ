@@ -2413,7 +2413,42 @@ struct SessionSetup {
 
 /// Opens the thread's session: loads or resumes `previous_session` when the agent supports it
 /// (in that order, like Zed), otherwise starts a new one.
+///
+/// If the agent can't open a session with the given MCP servers, it is opened without them.
+/// Factory Droid 0.233.0's `acp-daemon` fails every session that has any: it passes them on to
+/// its worker as `--mcp-servers`, an option the worker doesn't have.
 async fn open_session(
+    connection: ConnectionTo<Agent>,
+    capabilities: acp::AgentCapabilities,
+    cwd: PathBuf,
+    previous_session: Option<acp::SessionId>,
+    mcp_servers: Vec<acp::McpServer>,
+) -> std::result::Result<SessionSetup, agent_client_protocol::Error> {
+    if mcp_servers.is_empty() {
+        return open_session_with(connection, capabilities, cwd, previous_session, mcp_servers)
+            .await;
+    }
+    match open_session_with(
+        connection.clone(),
+        capabilities.clone(),
+        cwd.clone(),
+        previous_session.clone(),
+        mcp_servers,
+    )
+    .await
+    {
+        Err(error) if !is_auth_required(&error) => {
+            log::warn!(
+                "couldn't open a session with MCP servers, opening it without them: {}",
+                error_message(&error)
+            );
+            open_session_with(connection, capabilities, cwd, previous_session, Vec::new()).await
+        }
+        result => result,
+    }
+}
+
+async fn open_session_with(
     connection: ConnectionTo<Agent>,
     capabilities: acp::AgentCapabilities,
     cwd: PathBuf,
@@ -2750,6 +2785,26 @@ mod tests {
         account
             .wait_until(|account| account.logged_in() == Some(true))
             .await;
+    }
+
+    /// An agent that fails sessions given MCP servers, as Factory Droid 0.233.0 does, still
+    /// gets a session, without them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opens_a_session_without_mcp_servers_the_agent_rejects() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        command.env.insert("MOCK_REJECT_MCP".into(), "1".into());
+        let mut thread = start(command, None);
+        thread.update(|thread| {
+            thread.set_mcp_servers(vec![acp::McpServer::Stdio(acp::McpServerStdio::new(
+                "agentz", "/bin/cat",
+            ))])
+        });
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(thread.thread.session.is_some());
     }
 
     /// A browser login that asks the client to open a URL, as Codex's device code login does,

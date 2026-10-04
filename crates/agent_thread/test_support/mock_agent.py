@@ -36,6 +36,9 @@ A prompt of "form" asks the client to fill in a form (a session elicitation) and
 
 It supports `session/close`, and with MOCK_CLOSED_FILE set, notes each closed session there.
 
+With MOCK_REJECT_MCP set, `session/new` and `session/load` fail when given any MCP server, as
+Factory Droid 0.233.0's do.
+
 With MOCK_SESSIONS_FILE set, it lists the sessions in that file (`session/list`, two to a
 page): a JSON array of ACP session infos, each with an optional "history" of session updates
 that `session/load` replays for it. Listing needs a login, as sessions do.
@@ -367,6 +370,11 @@ for line in sys.stdin:
     elif method in ("session/new", "session/load", "session/list") and not logged_in():
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32000, "message": "\n\nYour code: MOCK-1234\n\nClick Log In."}})
+    elif (method in ("session/new", "session/load") and os.environ.get("MOCK_REJECT_MCP")
+          and message["params"].get("mcpServers")):
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "error": {"code": -32603, "message": "Internal error", "data": {
+                  "details": "Droid process exited unexpectedly (exit code 1)"}}})
     elif method == "session/new":
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)
