@@ -20,13 +20,17 @@ Picked on the design board (`design/workspaces/`, see `design/README.md`). Each 
 
 **Comment on A:** but if it is opened inside the this worktree we should hide from here (like herdr)
 
-## 3. Agents list: A. Two lines, herdr's default
+## 3. Agents list: A. Two lines, herdr's default + also E. "Needs you" strip on top
 
 *Sidebar*
 
 **Today:** An "Agents" section under the workspaces: one slim row per agent in a pane (agent CLIs and ACP threads), with its state dot, name and "machine · workspace › tab". Clicking focuses its pane.
 
 **A. Two lines, herdr's default** (from herdr rows): herdr's default agent layout: the state and where it is on top (machine, workspace, tab), the agent's icon and name below.
+
+**Also take from E. "Needs you" strip on top** (from new): No list at the bottom. Agents waiting on you show in a tinted strip above the workspaces, with a Go button; working and done ones show in their workspace's row (pairs with rows E).
+
+**Comment on E:** Keep A's list at the bottom and add E's "Needs you" strip on top, as an attention signal (the user's pick on Getting your attention)
 
 ## 4. Collapsed sidebar: A. Hidden (today)
 
@@ -136,7 +140,7 @@ Picked on the design board (`design/workspaces/`, see `design/README.md`). Each 
 
 **B. Command palette** (from Zed / t3code command palette): Cmd-K mixes places (workspaces, tabs, panes) with actions (Split Right, New Worktree…, Rename Tab), each with its shortcut.
 
-## 17. Getting your attention: C. Badges on the view switch + also E. An inbox
+## 17. Getting your attention: C. Badges on the view switch
 
 *Navigation and attention*
 
@@ -144,9 +148,7 @@ Picked on the design board (`design/workspaces/`, see `design/README.md`). Each 
 
 **C. Badges on the view switch** (from macOS dock badges): The Agents | Workspaces switch shows a count on the view you're not in when something there needs you, colored by the most urgent state.
 
-**Also take from E. An inbox** (from GitHub notifications): A bell in the sidebar header with a count; it opens a list of what happened (asked for approval, finished, failed) across both views, with Go and Mark All Read.
-
-**Comment on C:** i picked E too
+**Comment on C:** i picked E too [clarified: E from the Agents list topic, the "Needs you" strip on top, not this page's inbox]
 
 ## 18. Terminal pane features: B. Find in the terminal
 

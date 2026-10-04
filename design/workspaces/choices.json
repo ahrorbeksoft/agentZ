@@ -33,9 +33,13 @@
       "picks": [],
       "none": false,
       "comments": {
-        "A": ""
+        "A": "",
+        "E": "Keep A's list at the bottom and add E's \"Needs you\" strip on top, as an attention signal (the user's pick on Getting your attention)"
       },
-      "note": ""
+      "note": "",
+      "also": [
+        "E"
+      ]
     },
     "collapsed": {
       "pick": "A",
@@ -142,12 +146,10 @@
       "picks": [],
       "none": false,
       "comments": {
-        "C": "i picked E too"
+        "C": "i picked E too [clarified: E from the Agents list topic, the \"Needs you\" strip on top, not this page's inbox]"
       },
       "note": "",
-      "also": [
-        "E"
-      ]
+      "also": []
     },
     "termfeat": {
       "pick": null,
