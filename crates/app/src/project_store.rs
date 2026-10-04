@@ -225,6 +225,20 @@ impl ProjectStore {
         self.send(Request::ToggleArchivedExpanded, cx)
     }
 
+    pub fn toggle_workspaces_expanded(&mut self, cx: &mut Context<Self>) {
+        self.send(Request::ToggleWorkspacesExpanded, cx)
+    }
+
+    /// Makes a Workspaces thread one of the project its folder is in, adding the folder as a
+    /// project when it's in none.
+    pub fn move_to_agents(&mut self, id: ThreadId, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.request(
+            Request::MoveToAgents(id),
+            |response| matches!(response, Response::Ok).then_some(()),
+            cx,
+        )
+    }
+
     pub fn set_thread_order(&mut self, order: ThreadOrder, cx: &mut Context<Self>) {
         self.send(Request::SetThreadOrder(order), cx)
     }
@@ -285,6 +299,29 @@ impl ProjectStore {
         self.request(
             Request::CreateThread {
                 project_id,
+                agent_id,
+                workspace,
+            },
+            |response| match response {
+                Response::ThreadCreated(thread_id) => Some(thread_id),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// A thread started in a workspace pane, working in `folder` or in a new worktree or
+    /// pasture of its repository. Resolves once it's in this copy.
+    pub fn create_workspaces_thread(
+        &mut self,
+        folder: PathBuf,
+        agent_id: AgentId,
+        workspace: WorkspaceChoice,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ThreadId>> {
+        self.request(
+            Request::CreateWorkspacesThread {
+                folder,
                 agent_id,
                 workspace,
             },

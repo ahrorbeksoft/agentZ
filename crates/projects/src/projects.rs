@@ -21,6 +21,13 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 #[serde(transparent)]
 pub struct ProjectId(pub u64);
 
+impl ProjectId {
+    /// Where threads started in a workspace pane belong: no project of the user's, so they're
+    /// listed in the sidebar's Workspaces section rather than among the project's threads.
+    /// Each works in its [`Thread::workspace`], any folder on its machine.
+    pub const WORKSPACES: ProjectId = ProjectId(u64::MAX);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ThreadId(pub u64);
@@ -186,10 +193,15 @@ pub struct Thread {
     /// lineage). Subthreads show in their parent rather than in the thread list.
     #[serde(default)]
     pub task: Option<Task>,
-    /// The worktree or pasture the thread works in, one of its project's workspaces. `None`
-    /// is the project's own folder.
+    /// The worktree or pasture the thread works in, one of its project's workspaces, or
+    /// another folder inside the project. `None` is the project's own folder. A Workspaces
+    /// thread ([`ProjectId::WORKSPACES`]) always has one, any folder.
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    /// The folder a Workspaces thread was started in, when it works in a worktree or pasture
+    /// made from that folder's repository, so its draft can go back there.
+    #[serde(default)]
+    pub started_in: Option<PathBuf>,
     /// Set on a terminal thread, which runs this instead of an ACP agent.
     #[serde(default)]
     pub terminal: Option<TerminalCommand>,
@@ -226,6 +238,17 @@ impl Thread {
     /// The thread that delegated this one, for a subthread.
     pub fn parent(&self) -> Option<ThreadId> {
         self.task.as_ref().map(|task| task.parent)
+    }
+
+    /// Started in a workspace pane, so listed in the Workspaces section.
+    pub fn in_workspaces(&self) -> bool {
+        self.project_id == ProjectId::WORKSPACES
+    }
+
+    /// For a Workspaces thread, the folder it was started in, which may differ from the
+    /// worktree or pasture it works in.
+    pub fn starting_folder(&self) -> Option<&PathBuf> {
+        self.started_in.as_ref().or(self.workspace.as_ref())
     }
 }
 
@@ -328,6 +351,7 @@ pub struct ProjectsSnapshot {
     pub scope: ProjectScope,
     pub thread_order: ThreadOrder,
     pub archived_expanded: bool,
+    pub workspaces_expanded: bool,
     pub working_threads: Vec<ThreadId>,
     /// Threads waiting for the user to answer a permission request.
     pub blocked_threads: Vec<ThreadId>,
@@ -376,6 +400,8 @@ struct PersistedState {
     thread_order: ThreadOrder,
     #[serde(default)]
     archived_expanded: bool,
+    #[serde(default)]
+    workspaces_expanded: bool,
 }
 
 pub struct ProjectStore {
@@ -386,6 +412,8 @@ pub struct ProjectStore {
     thread_order: ThreadOrder,
     /// Whether the sidebar's Archived shelf is open.
     archived_expanded: bool,
+    /// Whether the sidebar's Workspaces section is open.
+    workspaces_expanded: bool,
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
@@ -426,6 +454,7 @@ impl ProjectStore {
             scope: state.scope,
             thread_order: state.thread_order,
             archived_expanded: state.archived_expanded,
+            workspaces_expanded: state.workspaces_expanded,
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
             awaiting_input_threads: HashSet::default(),
@@ -445,8 +474,9 @@ impl ProjectStore {
         if let Some(highest_id) = highest_id {
             this.next_id = this.next_id.max(highest_id + 1);
         }
-        this.threads
-            .retain(|thread| this.projects.iter().any(|p| p.id == thread.project_id));
+        this.threads.retain(|thread| {
+            thread.in_workspaces() || this.projects.iter().any(|p| p.id == thread.project_id)
+        });
         if let ProjectScope::Project(id) = this.scope
             && this.project(id).is_none()
         {
@@ -496,6 +526,15 @@ impl ProjectStore {
 
     pub fn toggle_archived_expanded(&mut self) {
         self.archived_expanded = !self.archived_expanded;
+        self.changed();
+    }
+
+    pub fn workspaces_expanded(&self) -> bool {
+        self.workspaces_expanded
+    }
+
+    pub fn toggle_workspaces_expanded(&mut self) {
+        self.workspaces_expanded = !self.workspaces_expanded;
         self.changed();
     }
 
@@ -664,7 +703,9 @@ impl ProjectStore {
         title: impl Into<String>,
         agent_id: Option<String>,
     ) -> Option<ThreadId> {
-        self.project(project_id)?;
+        if project_id != ProjectId::WORKSPACES {
+            self.project(project_id)?;
+        }
         let id = ThreadId(self.allocate_id());
         let now = SystemTime::now();
         let title = title.into();
@@ -684,6 +725,7 @@ impl ProjectStore {
             created_by: None,
             task: None,
             workspace: None,
+            started_in: None,
             terminal: None,
             continued_from: None,
             is_draft: false,
@@ -938,10 +980,49 @@ impl ProjectStore {
             .find(|workspace| workspace.path == path)
     }
 
-    /// The worktree or pasture the thread works in, if it isn't the project's own folder.
+    /// The worktree or pasture the thread works in, if it isn't the project's own folder. A
+    /// Workspaces thread's is any project's.
     pub fn thread_workspace(&self, id: ThreadId) -> Option<&Workspace> {
         let thread = self.thread(id)?;
-        self.workspace(thread.project_id, thread.workspace.as_deref()?)
+        let path = thread.workspace.as_deref()?;
+        if thread.in_workspaces() {
+            return self
+                .projects
+                .iter()
+                .flat_map(|project| &project.workspaces)
+                .find(|workspace| workspace.path == path);
+        }
+        self.workspace(thread.project_id, path)
+    }
+
+    /// The project a thread is listed under: its own, or for a Workspaces thread the one its
+    /// folder is in, if any.
+    pub fn thread_project(&self, id: ThreadId) -> Option<ProjectId> {
+        let thread = self.thread(id)?;
+        if !thread.in_workspaces() {
+            return Some(thread.project_id);
+        }
+        project_at(&self.projects, thread.workspace.as_deref()?).map(|project| project.id)
+    }
+
+    /// Makes a Workspaces thread, with its subthreads, a thread of the project, still working
+    /// in its folder.
+    pub fn move_thread_to_project(&mut self, id: ThreadId, project_id: ProjectId) {
+        let Some(project_path) = self.project(project_id).map(|project| project.path.clone())
+        else {
+            return;
+        };
+        let ids = self.thread_and_subthreads(id);
+        for thread in &mut self.threads {
+            if ids.contains(&thread.id) {
+                thread.project_id = project_id;
+                thread.started_in = None;
+                if thread.workspace.as_ref() == Some(&project_path) {
+                    thread.workspace = None;
+                }
+            }
+        }
+        self.changed();
     }
 
     /// Where the thread's agent works: its workspace, or its project's folder.
@@ -969,6 +1050,15 @@ impl ProjectStore {
             && thread.workspace != workspace
         {
             thread.workspace = workspace;
+            self.changed();
+        }
+    }
+
+    pub fn set_started_in(&mut self, id: ThreadId, folder: Option<PathBuf>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.started_in != folder
+        {
+            thread.started_in = folder;
             self.changed();
         }
     }
@@ -1240,6 +1330,7 @@ impl ProjectStore {
             scope: self.scope,
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
+            workspaces_expanded: self.workspaces_expanded,
             working_threads,
             blocked_threads,
             awaiting_input_threads,
@@ -1276,6 +1367,7 @@ impl ProjectStore {
                 scope: snapshot.scope,
                 thread_order: snapshot.thread_order,
                 archived_expanded: snapshot.archived_expanded,
+                workspaces_expanded: snapshot.workspaces_expanded,
             },
             None,
         );
@@ -1325,6 +1417,7 @@ impl ProjectStore {
             scope: self.scope,
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
+            workspaces_expanded: self.workspaces_expanded,
         });
     }
 }
@@ -1423,6 +1516,20 @@ impl<T> Drop for Saver<T> {
             log::error!("a saver thread panicked");
         }
     }
+}
+
+/// The project a folder is in: the deepest whose folder, worktree or pasture holds it.
+pub fn project_at<'a>(projects: &'a [Project], folder: &Path) -> Option<&'a Project> {
+    projects
+        .iter()
+        .flat_map(|project| {
+            std::iter::once(&project.path)
+                .chain(project.workspaces.iter().map(|workspace| &workspace.path))
+                .filter(|root| folder.starts_with(root))
+                .map(move |root| (root.components().count(), project))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, project)| project)
 }
 
 fn project_name(path: &Path) -> SharedString {
@@ -1675,6 +1782,91 @@ mod tests {
         store.remove_workspace(project, &pasture);
         assert!(store.thread_workspace(lead).is_none());
         assert_eq!(store.thread_folder(lead), Some(pasture), "keeps its folder");
+    }
+
+    #[test]
+    fn workspaces_threads_work_in_any_folder_until_moved_to_a_project() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let project_folder = dir.path().join("storefront");
+        let outside = dir.path().join("docs");
+        std::fs::create_dir_all(project_folder.join("src")).expect("create project");
+        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let project = store.add_project(project_folder);
+        let project_path = store.project(project).expect("project").path.clone();
+        let worktree = dir.path().join("worktrees/storefront/agentz-1");
+        store.add_workspace(
+            project,
+            Workspace {
+                kind: WorkspaceKind::Worktree,
+                path: worktree.clone(),
+                branch: Some("agentz/1".into()),
+                base: None,
+                created_at: SystemTime::now(),
+            },
+        );
+
+        let in_src = store
+            .add_thread(ProjectId::WORKSPACES, NEW_THREAD_TITLE, None)
+            .expect("thread");
+        store.set_thread_workspace(in_src, Some(project_path.join("src")));
+        let in_worktree = store
+            .add_thread(ProjectId::WORKSPACES, NEW_THREAD_TITLE, None)
+            .expect("thread");
+        store.set_thread_workspace(in_worktree, Some(worktree));
+        let in_docs = store
+            .add_thread(ProjectId::WORKSPACES, NEW_THREAD_TITLE, None)
+            .expect("thread");
+        store.set_thread_workspace(in_docs, Some(outside.clone()));
+
+        assert!(store.threads_for(project).next().is_none(), "not listed");
+        assert_eq!(store.thread_folder(in_src), Some(project_path.join("src")));
+        assert_eq!(store.thread_project(in_src), Some(project));
+        assert_eq!(store.thread_project(in_worktree), Some(project));
+        assert_eq!(
+            store.thread_workspace(in_worktree).map(|w| w.kind),
+            Some(WorkspaceKind::Worktree)
+        );
+        assert_eq!(store.thread_project(in_docs), None);
+
+        // They outlive a restart, and so does whether the section is open.
+        assert!(!store.workspaces_expanded());
+        store.toggle_workspaces_expanded();
+        drop(store);
+        let mut store = ProjectStore::load(Some(state_path));
+        assert_eq!(store.threads().len(), 3);
+        assert!(store.workspaces_expanded());
+
+        let child = store
+            .add_subthread(
+                Task {
+                    parent: in_src,
+                    prompt: "Help".into(),
+                    role: None,
+                    client_request_id: None,
+                    outcome: None,
+                    delivered: false,
+                },
+                None,
+            )
+            .expect("subthread");
+        assert!(store.thread(child).is_some_and(Thread::in_workspaces));
+        store.move_thread_to_project(in_src, project);
+        for id in [in_src, child] {
+            let thread = store.thread(id).expect("thread");
+            assert_eq!(thread.project_id, project);
+            assert_eq!(store.thread_folder(id), Some(project_path.join("src")));
+        }
+        assert_eq!(
+            store.threads_for(project).map(|t| t.id).collect::<Vec<_>>(),
+            vec![in_src]
+        );
+
+        let docs = store.add_project(outside.clone());
+        store.move_thread_to_project(in_docs, docs);
+        let thread = store.thread(in_docs).expect("thread");
+        assert_eq!(thread.workspace, None, "works in the project's own folder");
+        assert_eq!(store.thread_folder(in_docs), Some(outside));
     }
 
     #[test]

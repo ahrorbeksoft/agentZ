@@ -9,7 +9,7 @@ use agentz_protocol::ConnectionId;
 use agentz_protocol::workspace::{PastureSupport, WorkspaceChoice};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
-use projects::{ThreadCreator, ThreadId, Workspace, WorkspaceKind};
+use projects::{ProjectId, ThreadCreator, ThreadId, Workspace, WorkspaceKind};
 use serde_json::{Value, json};
 use util::ResultExt as _;
 
@@ -179,9 +179,11 @@ impl Server {
             .projects
             .thread_folder(thread_id)
             .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
-        let root = self
-            .project_path(caller.project_id)
-            .map_err(|_| failure("project_not_found", "This thread's project was removed."))?;
+        // A thread started in a workspace pane has no project, so no root.
+        let root = match caller.project_id {
+            ProjectId::WORKSPACES => None,
+            project_id => Some(self.caller_project_path(project_id)?),
+        };
         Ok(Step::Background(
             async move {
                 let branch = workspaces::current_branch(&folder).await.ok().flatten();
@@ -207,9 +209,7 @@ impl Server {
             .number("limit")?
             .unwrap_or(DEFAULT_BRANCH_LIMIT)
             .clamp(1, 1_000) as usize;
-        let root = self
-            .project_path(caller.project_id)
-            .map_err(|_| failure("project_not_found", "This thread's project was removed."))?;
+        let root = self.caller_project_path(caller.project_id)?;
         let data_dir = self.data_dir.clone();
         let workspaces: Vec<(Workspace, Vec<ThreadId>)> = self
             .projects
@@ -388,6 +388,17 @@ impl Server {
             .bring_back_workspace(caller.project_id, &path, branch)
             .map_err(|error| invalid(format!("{error:#}")))?;
         Ok(message_in_background(work))
+    }
+
+    fn caller_project_path(&self, project_id: ProjectId) -> Result<PathBuf, Failure> {
+        if project_id == ProjectId::WORKSPACES {
+            return Err(failure(
+                "project_not_found",
+                "This thread was started in a workspace pane, and belongs to no project.",
+            ));
+        }
+        self.project_path(project_id)
+            .map_err(|_| failure("project_not_found", "This thread's project was removed."))
     }
 
     fn calling_pasture(&self, caller: Caller) -> Result<PathBuf, Failure> {

@@ -54,8 +54,9 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// settings. Read from this Mac's disk, so only this Mac's projects have any.
 pub struct ProjectInfoStore {
     info: HashMap<ProjectId, ProjectInfo>,
-    /// The branches of the projects' worktrees and pastures, by folder.
-    workspace_heads: HashMap<PathBuf, GitHead>,
+    /// The branches of the projects' worktrees and pastures, and of other folders threads work
+    /// in, by folder: `None` outside git, so it isn't read again until the next refresh.
+    workspace_heads: HashMap<PathBuf, Option<GitHead>>,
     refresh: Task<()>,
     _projects_subscription: Subscription,
 }
@@ -75,10 +76,8 @@ pub fn init(cx: &mut App) {
                 || current
                     .iter()
                     .any(|project| !this.info.contains_key(&project.id))
-                || current
-                    .iter()
-                    .flat_map(|project| &project.workspaces)
-                    .any(|workspace| !this.workspace_heads.contains_key(&workspace.path));
+                || head_folders(projects.read(cx))
+                    .any(|folder| !this.workspace_heads.contains_key(folder));
             if is_stale {
                 this.refresh = ProjectInfoStore::refresh_loop(projects, cx);
             }
@@ -105,10 +104,11 @@ impl ProjectInfoStore {
         }
     }
 
-    /// The branch checked out in a project's worktree or pasture.
+    /// The branch checked out in a project's worktree or pasture, or another folder a thread
+    /// works in.
     pub fn workspace_head(&self, machine: MachineId, folder: &Path) -> Option<&GitHead> {
         match machine {
-            MachineId::Local => self.workspace_heads.get(folder),
+            MachineId::Local => self.workspace_heads.get(folder)?.as_ref(),
             MachineId::Remote(_) => None,
         }
     }
@@ -122,12 +122,8 @@ impl ProjectInfoStore {
                         .iter()
                         .map(|project| (project.id, project.path.clone()))
                         .collect();
-                    let folders: Vec<PathBuf> = projects
-                        .projects()
-                        .iter()
-                        .flat_map(|project| &project.workspaces)
-                        .map(|workspace| workspace.path.clone())
-                        .collect();
+                    let folders: collections::HashSet<PathBuf> =
+                        head_folders(projects).cloned().collect();
                     (roots, folders)
                 });
                 let (info, workspace_heads) = cx
@@ -138,9 +134,9 @@ impl ProjectInfoStore {
                             .collect::<HashMap<_, _>>();
                         let heads = folders
                             .into_iter()
-                            .filter_map(|folder| {
-                                let head = read_git_head(&folder)?;
-                                Some((folder, head))
+                            .map(|folder| {
+                                let head = read_git_head(&folder);
+                                (folder, head)
                             })
                             .collect::<HashMap<_, _>>();
                         (info, heads)
@@ -160,6 +156,22 @@ impl ProjectInfoStore {
             }
         })
     }
+}
+
+/// The folders whose branches are kept besides the projects': their worktrees and pastures, and
+/// where threads work outside their project's own folder.
+fn head_folders(projects: &ProjectStore) -> impl Iterator<Item = &PathBuf> {
+    projects
+        .projects()
+        .iter()
+        .flat_map(|project| &project.workspaces)
+        .map(|workspace| &workspace.path)
+        .chain(
+            projects
+                .threads()
+                .iter()
+                .filter_map(|thread| thread.workspace.as_ref()),
+        )
 }
 
 /// Well-known favicon paths, checked in order (t3code's list).

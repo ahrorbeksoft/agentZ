@@ -131,6 +131,16 @@ Each entry: what it does, where it lives, and where it comes from.
   title that isn't the repository's name (renamed, in a subfolder, an agent CLI), the branch
   reads `repository/branch` (`sidebar::repository_branch`); workspace rows do the same. The
   repository is its main checkout's folder, so worktrees keep its name.
+- **Workspaces shelf** (`sidebar.rs`, `Machines::workspaces_threads`; the user's picks in
+  `design/pane-threads/`): threads started in workspace panes, above Archived and like its rows
+  (the icon of the project the folder is in, or a folder's; title; last activity), closed at
+  first with its count and remembered by this Mac's server
+  (`Request::ToggleWorkspacesExpanded`). Under a project, those whose folder is in it. They get
+  no card, mark or waiting count in the Agents view; their panes show what they do. The row
+  menu is Rename, Move to Agents and Delete…: Move to Agents (`Request::MoveToAgents`) makes it
+  a thread of the project its folder is in, still working there, and outside every project
+  first asks "Add “~/docs” as a project?". Search finds them, and labels them and archived
+  threads in faint text.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
   combining repositories), Appearance (Zed's theme modes), Agents, Machines, and a page per
   project (with Checkouts).
@@ -163,7 +173,8 @@ Each entry: what it does, where it lives, and where it comes from.
   the menu the first opened; the field takes focus after the menu's delayed focus). Then the
   branch with its worktree or pasture icon, the changes as +added −removed (the Diff icon when
   none), Terminal, and "⋯" with the agent's options. A workspace pane keeps its own header with
-  the same buttons.
+  the same buttons. A Workspaces thread has its folder (icon and name, the path in its
+  tooltip) where the project goes, and no Archive.
 - **Continue with another agent** (`agentz_protocol::thread::handoff`, `Request::ContinueThread`,
   `server/workspace_requests.rs`, `continuations.rs`; t3code's context handoff, Zed's New Thread
   from Summary): a thread keeps its agent, since each agent replays only its own sessions.
@@ -528,6 +539,16 @@ since a thread's workspace is its checkout.
   project's is recorded as its workspace). Open
   Worktree… lists the repository's other checkouts (`Request::RepositoryCheckouts`: `git worktree
   list`, then a project's pastures). Either opens as a new workspace with a shell.
+- **Threads in panes**: a pane's New Thread… and Split › New Thread… start a draft of a
+  Workspaces thread (`ProjectId::WORKSPACES`, `Request::CreateWorkspacesThread`), working where
+  the pane is (its shell's current folder, else the workspace's), in no project. Under its
+  composer the folder is a chip (`AgentView::render_folder_picker`); in git it's a menu of
+  Current checkout, New worktree and New pasture, made from the folder's repository
+  (`workspaces::create_from`; a project's is recorded as its workspace), and the thread
+  remembers the folder it was started in (`Thread::started_in`). It has no Terminal starter or
+  machine picker. Closing the pane keeps the thread, and the pane menu's Show Thread lists it.
+  The server's tools treat its folder as a project's path (`orchestrator_capabilities` has no
+  project).
 - **Tabs**: a tab the user hasn't named takes the title of its focused pane (what runs there),
   in muted text; a rename left unchanged keeps it automatic.
 - **Closing** a pane, tab or workspace asks first while a terminal there runs something in

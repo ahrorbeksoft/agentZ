@@ -162,17 +162,14 @@ impl PaneKey {
 pub enum SpacesViewEvent {
     /// Show the thread in Agents.
     OpenThread(ThreadKey),
-    /// New Thread, to be shown in the pane once it's made.
     /// New Thread Here: a draft in the project, in this checkout, shown in the Agents view.
     NewThread {
         project: ProjectKey,
         folder: PathBuf,
     },
-    NewThreadInPane {
-        pane: PaneKey,
-        project: Option<ProjectKey>,
-        folder: Option<PathBuf>,
-    },
+    /// New Thread…: a Workspaces thread working in `folder`, to be shown in the pane once it's
+    /// made.
+    NewThreadInPane { pane: PaneKey, folder: PathBuf },
     /// New Worktree or Open Worktree… from a workspace in a git repository.
     Worktree {
         machine: MachineId,
@@ -860,7 +857,8 @@ impl SpacesView {
         );
     }
 
-    /// Splits with a shell, then starts a thread in the new pane, as New Thread… does.
+    /// Splits with a shell, then starts a thread in the new pane, as New Thread… does, working
+    /// where the split pane is.
     fn split_with_thread(
         &mut self,
         pane: PaneKey,
@@ -869,6 +867,9 @@ impl SpacesView {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.machines.read(cx).client(pane.machine, cx) else {
+            return;
+        };
+        let Some(folder) = self.pane_folder(pane, cx) else {
             return;
         };
         let response = client
@@ -880,14 +881,14 @@ impl SpacesView {
             }));
         cx.spawn_in(window, async move |this, cx| match response.await {
             Ok(Response::SpacePane(location)) => {
-                this.update(cx, |this, cx| {
-                    this.new_thread_in_pane(
-                        PaneKey {
+                this.update(cx, |_, cx| {
+                    cx.emit(SpacesViewEvent::NewThreadInPane {
+                        pane: PaneKey {
                             machine: pane.machine,
                             pane: location.pane,
                         },
-                        cx,
-                    )
+                        folder,
+                    })
                 })
                 .ok();
             }
@@ -3290,12 +3291,16 @@ impl SpacesView {
         };
         move |window, cx| {
             let this = this.clone();
-            let machines = Machines::global(cx);
-            let threads: Vec<(ThreadId, SharedString)> = machines
-                .read(cx)
-                .active_threads(cx)
+            let machines = Machines::global(cx).read(cx);
+            // Threads started in panes too, so a closed pane's thread can be shown again.
+            let mut threads = machines.active_threads(cx);
+            threads.extend(machines.workspaces_threads(cx));
+            threads.retain(|(machine, thread)| *machine == key.machine && thread.task.is_none());
+            threads.sort_by_key(|(_, thread)| {
+                std::cmp::Reverse(thread.last_activity_at.or(thread.created_at))
+            });
+            let threads: Vec<(ThreadId, SharedString)> = threads
                 .into_iter()
-                .filter(|(machine, thread)| *machine == key.machine && thread.task.is_none())
                 .take(20)
                 .map(|(_, thread)| (thread.id, thread.title.into()))
                 .collect();
@@ -3394,20 +3399,36 @@ impl SpacesView {
         }
     }
 
-    /// New Thread, for the pane's workspace's project and folder.
+    /// New Thread… in a pane: a Workspaces thread, working where the pane is.
     fn new_thread_in_pane(&mut self, pane: PaneKey, cx: &mut Context<Self>) {
-        let Some((space, _, _)) = self.find_pane(pane, cx) else {
-            return;
+        if let Some(folder) = self.pane_folder(pane, cx) {
+            cx.emit(SpacesViewEvent::NewThreadInPane { pane, folder });
+        }
+    }
+
+    /// Where the pane is: its shell's current folder, or its thread's, or else the workspace's.
+    fn pane_folder(&self, pane: PaneKey, cx: &App) -> Option<PathBuf> {
+        let (space, _, pane_state) = self.find_pane(pane, cx)?;
+        let content_folder = || match &pane_state.content {
+            PaneContent::Terminal(terminal) => {
+                Some(terminal.folder.clone()).filter(|folder| !folder.as_os_str().is_empty())
+            }
+            PaneContent::Thread(thread) => self
+                .machines
+                .read(cx)
+                .projects(pane.machine, cx)?
+                .read(cx)
+                .thread_folder(*thread),
+            PaneContent::Unknown(_) => None,
         };
-        let project = space.project_id.map(|project| ProjectKey {
-            machine: pane.machine,
-            project,
-        });
-        cx.emit(SpacesViewEvent::NewThreadInPane {
-            pane,
-            project,
-            folder: project.map(|_| space.folder.clone()),
-        });
+        Some(
+            pane_state
+                .folder
+                .as_ref()
+                .map(|folder| folder.path.clone())
+                .or_else(content_folder)
+                .unwrap_or_else(|| space.current_folder().to_path_buf()),
+        )
     }
 }
 
@@ -3906,6 +3927,40 @@ mod tests {
         cx.run_until_parked();
         let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
         assert_eq!(focused.map(|pane| pane.pane), Some(PaneId(3)));
+    }
+
+    #[gpui::test]
+    fn a_new_thread_in_a_pane_works_where_the_pane_is(cx: &mut TestAppContext) {
+        // A shell that went to src, the agent in /tmp/demo, and an unknown pane.
+        let mut state = spaces();
+        state.spaces[0].folder = PathBuf::from("/tmp/workspace");
+        let panes = &mut state.spaces[0].tabs[0].panes;
+        panes[0].content = new_shell();
+        panes[0].folder = Some(SpaceFolder {
+            path: PathBuf::from("/tmp/workspace/src"),
+            display_path: "/tmp/workspace/src".to_string(),
+        });
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        let folder = |pane: u64, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                view.pane_folder(
+                    PaneKey {
+                        machine: MachineId::Local,
+                        pane: PaneId(pane),
+                    },
+                    cx,
+                )
+            })
+        };
+        assert_eq!(folder(3, cx), Some(PathBuf::from("/tmp/workspace/src")));
+        assert_eq!(folder(5, cx), Some(PathBuf::from("/tmp/demo")));
+        assert_eq!(folder(4, cx), Some(PathBuf::from("/tmp/workspace")));
     }
 
     #[gpui::test]

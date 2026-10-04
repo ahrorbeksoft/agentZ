@@ -5,11 +5,11 @@
 //! Views of a single thread hold that thread's machine. The sidebar, the project switcher and
 //! New Thread show every machine's projects together, as t3code shows its environments.
 
-use std::path::Path;
 use std::time::SystemTime;
 
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription};
+pub use projects::project_at;
 use projects::{Project, ProjectId, Thread, ThreadId, ThreadOrder};
 use serde::{Deserialize, Serialize};
 use ui::{IconName, SharedString};
@@ -624,6 +624,14 @@ impl Machines {
             .archived_expanded()
     }
 
+    pub fn workspaces_expanded(&self, cx: &App) -> bool {
+        self.clients[0]
+            .read(cx)
+            .projects()
+            .read(cx)
+            .workspaces_expanded()
+    }
+
     /// Unarchived top-level threads of the visible projects, newest or latest active first.
     /// Shells aren't threads until an agent CLI runs in them, nor drafts until their first
     /// message.
@@ -633,6 +641,7 @@ impl Machines {
             thread.archived_at.is_none()
                 && thread.task.is_none()
                 && !thread.is_draft
+                && !thread.in_workspaces()
                 && !self.is_shell(machine, thread, cx)
                 && self.is_thread_visible(&groups, machine, thread, cx)
         });
@@ -659,9 +668,27 @@ impl Machines {
                 && thread.unsent_text.is_some()
                 && thread.archived_at.is_none()
                 && thread.task.is_none()
+                && !thread.in_workspaces()
                 && self.is_thread_visible(&groups, machine, thread, cx)
         });
         threads.sort_by_key(|(_, thread)| std::cmp::Reverse((thread.created_at, thread.id)));
+        threads
+    }
+
+    /// Threads started in a workspace pane, latest active first, for the sidebar's Workspaces
+    /// section: under a project, those whose folder is in it.
+    pub fn workspaces_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
+        let groups = self.visible_groups(cx);
+        let mut threads = self.threads_where(cx, |machine, thread| {
+            thread.in_workspaces()
+                && thread.archived_at.is_none()
+                && thread.task.is_none()
+                && !thread.is_draft
+                && self.is_thread_visible(&groups, machine, thread, cx)
+        });
+        threads.sort_by_key(|(_, thread)| {
+            std::cmp::Reverse(thread.last_activity_at.or(thread.created_at))
+        });
         threads
     }
 
@@ -672,6 +699,7 @@ impl Machines {
         let mut threads = self.threads_where(cx, |machine, thread| {
             thread.archived_at.is_none()
                 && thread.task.is_none()
+                && !thread.in_workspaces()
                 && self.is_shell(machine, thread, cx)
                 && self.is_thread_visible(&groups, machine, thread, cx)
         });
@@ -681,8 +709,9 @@ impl Machines {
         threads
     }
 
-    /// The project a thread is listed under. A terminal thread belongs to where it is now:
-    /// the project its folder is in, or none outside every project.
+    /// The project a thread is listed under. A terminal thread belongs to where it is now,
+    /// and a Workspaces thread to where it works: the project its folder is in, or none
+    /// outside every project.
     pub fn thread_project(
         &self,
         machine: MachineId,
@@ -693,6 +722,9 @@ impl Machines {
             return Some(thread.project_id);
         };
         let store = store.read(cx);
+        if thread.in_workspaces() {
+            return store.thread_project(thread.id);
+        }
         match store.terminal_folder(thread.id) {
             Some(folder) => project_at(store.projects(), &folder.path).map(|project| project.id),
             None => Some(thread.project_id),
@@ -1137,18 +1169,4 @@ pub fn machine_kind_icon(kind: &MachineKind) -> IconName {
         MachineKind::MacMini => IconName::MacMini,
         MachineKind::MacStudio => IconName::MacStudio,
     }
-}
-
-/// The project a folder is in: the deepest whose folder, worktree or pasture holds it.
-pub fn project_at<'a>(projects: &'a [Project], folder: &Path) -> Option<&'a Project> {
-    projects
-        .iter()
-        .flat_map(|project| {
-            std::iter::once(&project.path)
-                .chain(project.workspaces.iter().map(|workspace| &workspace.path))
-                .filter(|root| folder.starts_with(root))
-                .map(move |root| (root.components().count(), project))
-        })
-        .max_by_key(|(depth, _)| *depth)
-        .map(|(_, project)| project)
 }

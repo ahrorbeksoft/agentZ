@@ -617,10 +617,23 @@ impl Server {
     }
 
     fn capabilities(&mut self, caller: Caller) -> Outcome {
-        let project = self
-            .projects
-            .project(caller.project_id)
-            .ok_or_else(|| failure("orchestration_error", "The project was removed."))?;
+        // A thread started in a workspace pane belongs to no project, and works in its folder.
+        let (project_id, project_name, project_path) =
+            match self.projects.project(caller.project_id) {
+                Some(project) => (
+                    Some(project.id.0),
+                    Some(project.name().to_string()),
+                    project.path.clone(),
+                ),
+                None if caller.project_id == ProjectId::WORKSPACES => {
+                    let folder = caller
+                        .thread_id
+                        .and_then(|thread_id| self.projects.thread_folder(thread_id))
+                        .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+                    (None, None, folder)
+                }
+                None => return Err(failure("orchestration_error", "The project was removed.")),
+            };
         let caller_thread = caller
             .thread_id
             .and_then(|thread_id| self.projects.thread(thread_id));
@@ -665,9 +678,9 @@ impl Server {
             .collect();
         Ok(Step::Done(json!({
             "currentThreadId": caller.thread_id.map(|thread_id| thread_id.0),
-            "projectId": project.id.0,
-            "projectName": project.name().as_ref(),
-            "projectPath": project.path,
+            "projectId": project_id,
+            "projectName": project_name,
+            "projectPath": project_path,
             "agentId": caller_agent,
             "agentName": caller_agent_name,
             "model": caller_thread.and_then(|thread| thread.model.clone()),
@@ -996,8 +1009,18 @@ impl Server {
         ) else {
             return json!({"error": "The project was removed."});
         };
-        // A launched thread doesn't inherit the caller's workspace, as in t3code.
-        if let Folder::Chosen(folder) = folder {
+        // A launched thread doesn't inherit the caller's workspace, as in t3code. Outside every
+        // project there's no checkout to start in, so it works where the caller does.
+        let folder = match folder {
+            Folder::Chosen(folder) => Some(folder),
+            Folder::Default if caller.project_id == ProjectId::WORKSPACES => Some(
+                caller
+                    .thread_id
+                    .and_then(|thread_id| self.projects.thread_folder(thread_id)),
+            ),
+            Folder::Default => None,
+        };
+        if let Some(folder) = folder {
             self.projects.set_thread_workspace(thread_id, folder);
         }
         self.projects

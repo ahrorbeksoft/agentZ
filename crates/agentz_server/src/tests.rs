@@ -2676,6 +2676,135 @@ async fn threads_work_in_worktrees_and_pastures() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_started_in_panes_work_in_any_folder() {
+    if tokio::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let repository = std::fs::canonicalize(server.project_dir.path()).expect("a resolved path");
+    git(&repository, &["init", "-q", "-b", "main"]).await;
+    git(&repository, &["config", "user.name", "Test"]).await;
+    git(&repository, &["config", "user.email", "test@example.com"]).await;
+    std::fs::create_dir_all(repository.join("src")).expect("a folder");
+    std::fs::write(repository.join("src/main.rs"), "fn main() {}\n").expect("a file");
+    git(&repository, &["add", "."]).await;
+    git(&repository, &["commit", "-q", "-m", "first"]).await;
+
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(&repository).await;
+    let create = |folder: PathBuf, workspace| Request::CreateWorkspacesThread {
+        folder,
+        agent_id: AgentId::new("mock"),
+        workspace,
+    };
+    let new_worktree = || WorkspaceChoice::New {
+        kind: WorkspaceKind::Worktree,
+        base: None,
+        branch: None,
+    };
+
+    // It works in the folder it was started in, inside a project but not one of its threads.
+    let src = repository.join("src");
+    let Response::ThreadCreated(in_src) = client
+        .ok(create(src.clone(), WorkspaceChoice::Checkout))
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let thread = client.project_thread(in_src).expect("the thread");
+    assert_eq!(thread.project_id, ProjectId::WORKSPACES);
+    assert_eq!(thread.workspace.as_ref(), Some(&src));
+    client.wait_until_ready(in_src).await;
+    client.prompt_and_wait(in_src, "write a.txt hi").await;
+    assert!(src.join("a.txt").exists());
+    let capabilities = client
+        .tool(in_src, "orchestrator_capabilities", json!({}))
+        .await;
+    assert_eq!(capabilities["projectId"], Value::Null);
+    assert_eq!(capabilities["projectPath"], json!(src));
+
+    // Or in a new worktree of the folder's repository, which is the project's.
+    let Response::ThreadCreated(in_worktree) = client.ok(create(src.clone(), new_worktree())).await
+    else {
+        panic!("expected a thread");
+    };
+    let thread = client.project_thread(in_worktree).expect("the thread");
+    let worktree = thread.workspace.clone().expect("a worktree");
+    assert_eq!(thread.started_in.as_ref(), Some(&src));
+    assert!(worktree.join("src/main.rs").exists());
+    let project = |client: &TestClient| {
+        client
+            .projects
+            .as_ref()
+            .and_then(|projects| projects.projects.iter().find(|p| p.id == project_id))
+            .cloned()
+            .expect("the project")
+    };
+    assert!(
+        project(&client)
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.path == worktree)
+    );
+
+    // Moved to the Agents list, it's a thread of the project its folder is in, still there.
+    client.ok(Request::MoveToAgents(in_src)).await;
+    let thread = client.project_thread(in_src).expect("the thread");
+    assert_eq!(thread.project_id, project_id);
+    assert_eq!(thread.workspace.as_ref(), Some(&src));
+    assert!(client.request(Request::MoveToAgents(in_src)).await.is_err());
+
+    // Outside every project, moving it adds its folder as a project.
+    let docs = tempfile::tempdir().expect("a folder");
+    let docs = std::fs::canonicalize(docs.path()).expect("a resolved path");
+    let Response::ThreadCreated(in_docs) = client
+        .ok(create(docs.clone(), WorkspaceChoice::Checkout))
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    assert!(
+        client
+            .request(create(docs.clone(), new_worktree()))
+            .await
+            .is_err(),
+        "a folder outside git has no worktrees"
+    );
+    client.wait_until_ready(in_docs).await;
+    client.prompt_and_wait(in_docs, "hello").await;
+    client.ok(Request::MoveToAgents(in_docs)).await;
+    let projects = client.projects.clone().expect("projects");
+    let docs_project = projects
+        .projects
+        .iter()
+        .find(|project| project.path == docs)
+        .expect("the folder is a project");
+    let thread = client.project_thread(in_docs).expect("the thread");
+    assert_eq!(thread.project_id, docs_project.id);
+    assert_eq!(thread.workspace, None);
+
+    assert!(!projects.workspaces_expanded);
+    client.ok(Request::ToggleWorkspacesExpanded).await;
+    assert!(
+        client
+            .projects
+            .as_ref()
+            .is_some_and(|p| p.workspaces_expanded)
+    );
+}
+
 impl TestClient {
     async fn subscribe_terminal(&mut self, key: TerminalKey) {
         match self.ok(Request::SubscribeTerminal(key.clone())).await {

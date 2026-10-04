@@ -4,13 +4,14 @@ use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, Thr
 use crate::project_store::ThreadStatus;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::workspace::WorkspaceChoice;
+use anyhow::Result;
 use collections::HashMap;
 use gpui::{
     AnyView, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable,
     MouseButton, PathPromptOptions, Subscription, SystemNotification, Task, Window,
     WindowControlArea,
 };
-use projects::Thread;
+use projects::{Thread, ThreadId};
 use ui::{
     ButtonLike, PopoverMenu, PopoverMenuHandle, ToggleButtonGroup, ToggleButtonGroupSize,
     ToggleButtonSimple, Tooltip, prelude::*,
@@ -118,8 +119,6 @@ pub struct Shell {
     view: MainView,
     sidebar: Entity<Sidebar>,
     spaces_view: Entity<SpacesView>,
-    /// The pane New Thread's thread goes in, when it was asked for from one.
-    thread_target: Option<PaneKey>,
     /// A draft New Thread is making, so another press doesn't make a second.
     _starting_draft: Option<Task<()>>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
@@ -156,21 +155,11 @@ impl Shell {
                 window,
                 |this, _, event, window, cx| match event {
                     SpacesViewEvent::OpenThread(thread) => this.open_thread(*thread, window, cx),
-                    SpacesViewEvent::NewThreadInPane {
-                        pane,
-                        project,
-                        folder,
-                    } => match project {
-                        Some(project) => {
-                            this.start_draft(*project, folder.clone(), Some(*pane), window, cx)
-                        }
-                        None => {
-                            this.open_new_thread_modal(window, cx);
-                            this.thread_target = Some(*pane);
-                        }
-                    },
+                    SpacesViewEvent::NewThreadInPane { pane, folder } => {
+                        this.start_pane_draft(*pane, folder.clone(), window, cx)
+                    }
                     SpacesViewEvent::NewThread { project, folder } => {
-                        this.start_draft(*project, Some(folder.clone()), None, window, cx)
+                        this.start_draft(*project, Some(folder.clone()), window, cx)
                     }
                     SpacesViewEvent::Worktree {
                         machine,
@@ -293,7 +282,6 @@ impl Shell {
             view: MainView::Agents,
             sidebar,
             spaces_view,
-            thread_target: None,
             _starting_draft: None,
             switcher_handle: PopoverMenuHandle::default(),
             new_thread_modal: None,
@@ -364,7 +352,7 @@ impl Shell {
             _ => None,
         };
         match project {
-            Some(project) => self.start_draft(project, None, None, window, cx),
+            Some(project) => self.start_draft(project, None, window, cx),
             None => self.open_new_thread_modal(window, cx),
         }
     }
@@ -377,9 +365,8 @@ impl Shell {
             }),
             cx.subscribe_in(&modal, window, |this, _, event, window, cx| match event {
                 NewThreadModalEvent::ProjectChosen(project) => {
-                    let pane = this.thread_target.take();
                     this.dismiss_modal(window, cx);
-                    this.start_draft(*project, None, pane, window, cx);
+                    this.start_draft(*project, None, window, cx);
                 }
             }),
         ];
@@ -395,7 +382,6 @@ impl Shell {
         &mut self,
         project: ProjectKey,
         folder: Option<PathBuf>,
-        pane: Option<PaneKey>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -421,7 +407,7 @@ impl Shell {
             .then_some(*key)
         });
         if let Some(draft) = untouched {
-            self.show_new_thread(draft, pane, window, cx);
+            self.open_thread(draft, window, cx);
             return;
         }
         let Some(agent_id) = self.default_agent(project.machine, cx) else {
@@ -435,16 +421,49 @@ impl Shell {
         let created = store.update(cx, |store, cx| {
             store.create_thread(project.project, agent_id, choice, cx)
         });
+        self.show_draft_when_made(project.machine, created, None, window, cx);
+    }
+
+    /// New Thread… in a pane: a draft of a Workspaces thread working in `folder`, shown in the
+    /// pane, with the agent used last.
+    fn start_pane_draft(
+        &mut self,
+        pane: PaneKey,
+        folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self.machines.read(cx).projects(pane.machine, cx) else {
+            return;
+        };
+        let Some(agent_id) = self.default_agent(pane.machine, cx) else {
+            self.open_agent_settings(window, cx);
+            return;
+        };
+        if self._starting_draft.is_some() {
+            return;
+        }
+        let created = store.update(cx, |store, cx| {
+            store.create_workspaces_thread(folder, agent_id, WorkspaceChoice::Checkout, cx)
+        });
+        self.show_draft_when_made(pane.machine, created, Some(pane), window, cx);
+    }
+
+    fn show_draft_when_made(
+        &mut self,
+        machine: MachineId,
+        created: Task<Result<ThreadId>>,
+        pane: Option<PaneKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self._starting_draft = Some(cx.spawn_in(window, async move |this, cx| {
             let created = created.await;
             this.update_in(cx, |this, window, cx| {
                 this._starting_draft = None;
                 match created {
                     Ok(thread) => {
-                        let draft = ThreadKey {
-                            machine: project.machine,
-                            thread,
-                        };
+                        let draft = ThreadKey { machine, thread };
                         this.show_new_thread(draft, pane, window, cx);
                     }
                     Err(error) => log::error!("couldn't start a thread: {error:#}"),
@@ -753,7 +772,10 @@ impl Shell {
             ThreadStatus::AwaitingInput => "Waiting for your input",
             ThreadStatus::Working | ThreadStatus::Completed => "Finished",
         };
-        let mut body = match store.project(thread.project_id) {
+        let project = store
+            .thread_project(thread.id)
+            .and_then(|project| store.project(project));
+        let mut body = match project {
             Some(project) => format!("{} · {caption}", project.name()),
             None => caption.to_string(),
         };
@@ -837,7 +859,6 @@ impl Shell {
                         project: *project,
                     },
                     None,
-                    None,
                     window,
                     cx,
                 ),
@@ -867,7 +888,6 @@ impl Shell {
         let had_worktree_modal = self.worktree_modal.take().is_some();
         let had_machine_modal = self.machine_modal.take().is_some();
         let had_confirm_dialog = self.confirm_dialog.take().is_some();
-        self.thread_target = None;
         if had_new_thread_modal
             || had_add_project_modal
             || had_worktree_modal

@@ -74,6 +74,14 @@ impl ThreadCheckout {
     }
 }
 
+/// The shelves of one-line rows under the thread cards.
+#[derive(Clone, Copy, PartialEq)]
+enum Shelf {
+    Shells,
+    Workspaces,
+    Archived,
+}
+
 #[derive(Clone, Copy)]
 enum PastureAction {
     Sync,
@@ -263,8 +271,8 @@ impl Sidebar {
         self.search.read(cx).text().trim().to_lowercase()
     }
 
-    /// t3code's search results: every matching thread, active, then shells, then archived, in
-    /// one list.
+    /// t3code's search results: every matching thread, active, then shells, then Workspaces
+    /// threads, then archived, in one list.
     fn search_results(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let query = self.search_query(cx);
         let machines = self.machines.read(cx);
@@ -272,6 +280,7 @@ impl Sidebar {
             .active_threads(cx)
             .into_iter()
             .chain(machines.shell_threads(cx))
+            .chain(machines.workspaces_threads(cx))
             .chain(machines.archived_threads(cx))
             .filter(|(_, thread)| matches_query(thread, &query))
             .collect()
@@ -392,6 +401,33 @@ impl Sidebar {
         }
     }
 
+    /// The project a thread's row shows: its own, or for a Workspaces thread the one its
+    /// folder is in, if any.
+    fn row_project(&self, machine: MachineId, thread: &Thread, cx: &App) -> Option<Project> {
+        let store = self.store(machine, cx)?;
+        let store = store.read(cx);
+        let project_id = if thread.in_workspaces() {
+            store.thread_project(thread.id)?
+        } else {
+            thread.project_id
+        };
+        store.project(project_id).cloned()
+    }
+
+    /// The row's project icon, or a folder's for a Workspaces thread outside every project.
+    fn render_row_icon(
+        &self,
+        machine: MachineId,
+        thread: &Thread,
+        project: Option<&Project>,
+        cx: &App,
+    ) -> AnyElement {
+        if project.is_none() && thread.in_workspaces() {
+            return render_folder_icon();
+        }
+        self.render_project_icon(machine, project, cx)
+    }
+
     fn thread_checkout(
         &self,
         machine: MachineId,
@@ -403,7 +439,7 @@ impl Sidebar {
         let folder = store.thread_folder(thread.id)?;
         let workspace = store.thread_workspace(thread.id).cloned();
         let project_info = self.project_info.read(cx);
-        let head = if workspace.is_some() {
+        let head = if thread.workspace.is_some() {
             project_info.workspace_head(machine, &folder).cloned()
         } else {
             project_info
@@ -459,7 +495,7 @@ impl Sidebar {
     }
 
     /// Rename, Archive or Unarchive, the pasture's actions, Project Settings, and Delete, each
-    /// with its icon.
+    /// with its icon. A Workspaces thread's has Rename, Move to Agents and Delete.
     fn thread_menu(
         &self,
         machine: MachineId,
@@ -480,6 +516,7 @@ impl Sidebar {
             project: thread.project_id,
         };
         let title = SharedString::from(thread.title.clone());
+        let in_workspaces = thread.in_workspaces();
         let checkout = self.thread_checkout(machine, thread, cx);
         let is_pasture = checkout
             .as_ref()
@@ -568,6 +605,29 @@ impl Sidebar {
                         .icon_color(Color::Muted)
                         .handler(rename),
                 );
+                if in_workspaces {
+                    let sidebar = sidebar.clone();
+                    return menu
+                        .item(
+                            ContextMenuEntry::new("Move to Agents")
+                                .icon(IconName::ArrowRight)
+                                .icon_color(Color::Muted)
+                                .handler(move |window, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.move_to_agents(thread_id, window, cx)
+                                        })
+                                        .ok();
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            ContextMenuEntry::new("Delete…")
+                                .icon(IconName::Trash)
+                                .icon_color(Color::Muted)
+                                .handler(delete),
+                        );
+                }
                 if is_terminal {
                     let add_project = new_project.clone().map(|path| {
                         let sidebar = sidebar.clone();
@@ -637,6 +697,55 @@ impl Sidebar {
                 )
             })
         }
+    }
+
+    /// Makes a Workspaces thread one of the project its folder is in. Outside every project,
+    /// it asks to add the folder as one first.
+    fn move_to_agents(&mut self, key: ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = self.store(key.machine, cx) else {
+            return;
+        };
+        let new_project = {
+            let store = store.read(cx);
+            store
+                .thread_project(key.thread)
+                .is_none()
+                .then(|| store.thread_folder(key.thread))
+                .flatten()
+        };
+        let answer = new_project.map(|folder| {
+            window.prompt(
+                PromptLevel::Info,
+                &format!("Add “{}” as a project?", compact_path(&folder)),
+                Some("Threads in the Agents list belong to a project."),
+                &["Add Project", "Cancel"],
+                cx,
+            )
+        });
+        cx.spawn_in(window, async move |_, cx| {
+            if let Some(answer) = answer
+                && answer.await != Ok(0)
+            {
+                return;
+            }
+            let moved = store.update(cx, |store, cx| store.move_to_agents(key.thread, cx));
+            if let Err(error) = moved.await {
+                let detail = format!("{error:#}");
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Critical,
+                        "Couldn't move the thread",
+                        Some(&detail),
+                        &["OK"],
+                        cx,
+                    )
+                });
+                if let Ok(answer) = answer {
+                    answer.await.ok();
+                }
+            }
+        })
+        .detach();
     }
 
     /// Adds a folder on the machine as a project.
@@ -1258,6 +1367,7 @@ impl Sidebar {
         let rule_color = cx.theme().colors().border_variant;
         h_flex()
             .id(id)
+            .debug_selector(|| id.into())
             .h_8()
             .mx_0p5()
             .px_2()
@@ -1289,14 +1399,17 @@ impl Sidebar {
 
     /// t3code's slim row for parked threads: the project's icon, dimmed until hovered, and for
     /// an archived thread a way back on hover. A shell's row adds where it works, and shows
-    /// what runs in it in place of its last activity.
+    /// what runs in it in place of its last activity. A Workspaces thread's is one line, like
+    /// an archived one's, with the icon of the project its folder is in.
     fn render_slim_row(
         &self,
         store: &Entity<ProjectStore>,
         thread: Thread,
-        is_archived: bool,
+        shelf: Shelf,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let is_archived = shelf == Shelf::Archived;
+        let is_shell = shelf == Shelf::Shells;
         let colors = cx.theme().colors();
         let hover_background = colors.ghost_element_hover;
         let selected_background = colors.ghost_element_selected;
@@ -1308,9 +1421,9 @@ impl Sidebar {
         let is_active = self.active_thread == Some(thread_id);
         let is_renaming = self.renaming_thread == Some(thread_id);
         let is_offline = !self.machines.read(cx).is_online(machine, cx);
-        let project = store.read(cx).project(thread.project_id).cloned();
+        let project = self.row_project(machine, &thread, cx);
         // Where a shell is now, once its server has said.
-        let folder = (!is_archived)
+        let folder = is_shell
             .then(|| store.read(cx).terminal_folder(thread.id).cloned())
             .flatten();
         let project_icon = match &folder {
@@ -1319,7 +1432,7 @@ impl Sidebar {
                 Some(project) => self.render_project_icon(machine, Some(project), cx),
                 None => render_folder_icon(),
             },
-            None => self.render_project_icon(machine, project.as_ref(), cx),
+            None => self.render_row_icon(machine, &thread, project.as_ref(), cx),
         };
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let time = if is_archived {
@@ -1328,9 +1441,13 @@ impl Sidebar {
             thread.last_activity_at.or(thread.created_at)
         }
         .map(|time| format_relative_time(time, SystemTime::now()));
-        let prefix = if is_archived { "archived" } else { "shell" };
+        let prefix = match shelf {
+            Shelf::Shells => "shell",
+            Shelf::Workspaces => "workspaces",
+            Shelf::Archived => "archived",
+        };
         let machine_icon = Icon::new(self.machines.read(cx).machine_icon(machine, cx));
-        let running = (!is_archived)
+        let running = is_shell
             .then(|| {
                 store
                     .read(cx)
@@ -1339,7 +1456,7 @@ impl Sidebar {
             })
             .flatten();
         let faint_text = colors.text_muted.opacity(0.4);
-        let checkout = (!is_archived)
+        let checkout = is_shell
             .then(|| self.thread_checkout(machine, &thread, cx))
             .flatten();
         // The branch where the shell is, and the worktree or pasture marker while it's in its
@@ -1352,7 +1469,7 @@ impl Sidebar {
             None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
         };
         let detail_line =
-            (!is_archived).then(|| {
+            is_shell.then(|| {
                 // Under the title, past the icon and the gap.
                 h_flex()
                     .pl(px(26.))
@@ -1390,8 +1507,8 @@ impl Sidebar {
 
         let main_line = h_flex()
             .relative()
-            .when(is_archived, |line| line.h_full())
-            .when(!is_archived, |line| line.h_6())
+            .when(!is_shell, |line| line.h_full())
+            .when(is_shell, |line| line.h_6())
             .gap_2p5()
             .child(
                 div()
@@ -1464,14 +1581,15 @@ impl Sidebar {
         let row =
             v_flex()
                 .id(thread_element_id(&format!("{prefix}-thread"), thread_id))
+                .debug_selector(|| format!("{prefix}-row-{}", thread_id.thread.0))
                 .group(group_name)
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
                 }))
                 .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
                 .relative()
-                .when(is_archived, |row| row.h(ARCHIVED_ROW_HEIGHT))
-                .when(!is_archived, |row| row.py_1p5())
+                .when(!is_shell, |row| row.h(ARCHIVED_ROW_HEIGHT))
+                .when(is_shell, |row| row.py_1p5())
                 .w_full()
                 .px_2p5()
                 .rounded_md()
@@ -1488,7 +1606,7 @@ impl Sidebar {
         // The details popover stays hidden while the thread's menu is open.
         let details_popover =
             (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
-        let menu = self.thread_menu(machine, &thread, is_archived, !is_archived, cx);
+        let menu = self.thread_menu(machine, &thread, is_archived, is_shell, cx);
         right_click_menu(thread_element_id(
             &format!("{prefix}-thread-menu"),
             thread_id,
@@ -1587,20 +1705,28 @@ impl Sidebar {
             machine,
             thread: thread.id,
         };
-        let project = self
-            .store(machine, cx)
-            .and_then(|store| store.read(cx).project(thread.project_id).cloned());
+        let project = self.row_project(machine, &thread, cx);
+        let icon = self.render_row_icon(machine, &thread, project.as_ref(), cx);
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
         let is_highlighted = index == self.search_index;
         let is_active = self.active_thread == Some(thread_id);
         let time = thread
             .last_activity_at
             .map(|time| format_relative_time(time, SystemTime::now()));
+        let list = if thread.archived_at.is_some() {
+            Some("Archived")
+        } else if thread.in_workspaces() {
+            Some("Workspaces")
+        } else {
+            None
+        };
+        let faint_text = colors.text_muted.opacity(0.4);
         div()
             .relative()
             .child(
                 h_flex()
                     .id(thread_element_id("search-result", thread_id))
+                    .debug_selector(|| format!("search-result-{}", thread_id.thread.0))
                     .min_h(px(36.))
                     .px_2p5()
                     .py_1()
@@ -1613,7 +1739,7 @@ impl Sidebar {
                     .when(!is_highlighted && !is_active, |row| {
                         row.hover(|row| row.bg(hover_background))
                     })
-                    .child(self.render_project_icon(machine, project.as_ref(), cx))
+                    .child(icon)
                     .child(
                         div().flex_1().min_w_0().child(
                             Label::new(thread.title)
@@ -1623,6 +1749,15 @@ impl Sidebar {
                                 }),
                         ),
                     )
+                    .children(list.map(|list| {
+                        div()
+                            .debug_selector(|| format!("search-list-{list}-{}", thread_id.thread.0))
+                            .child(
+                                Label::new(list)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Custom(faint_text)),
+                            )
+                    }))
                     .children(
                         time.map(|time| {
                             Label::new(time).size(LabelSize::Small).color(Color::Muted)
@@ -1766,7 +1901,32 @@ impl Sidebar {
             if self.shells_expanded {
                 for (machine, thread) in shells {
                     if let Some(store) = self.store(machine, cx) {
-                        shelf.push(self.render_slim_row(&store, thread, false, cx));
+                        shelf.push(self.render_slim_row(&store, thread, Shelf::Shells, cx));
+                    }
+                }
+            }
+        }
+        // Threads started in workspace panes, quiet here: their panes show what they're doing.
+        let workspaces_threads = self.machines.read(cx).workspaces_threads(cx);
+        if !workspaces_threads.is_empty() {
+            let is_expanded = self.machines.read(cx).workspaces_expanded(cx);
+            shelf.push(Self::render_shelf_header(
+                "workspaces-shelf-toggle",
+                "Workspaces",
+                workspaces_threads.len(),
+                is_expanded,
+                |this, cx| {
+                    // Kept by this Mac's server, as Archived's is.
+                    if let Some(store) = this.store(MachineId::Local, cx) {
+                        store.update(cx, |store, cx| store.toggle_workspaces_expanded(cx));
+                    }
+                },
+                cx,
+            ));
+            if is_expanded {
+                for (machine, thread) in workspaces_threads {
+                    if let Some(store) = self.store(machine, cx) {
+                        shelf.push(self.render_slim_row(&store, thread, Shelf::Workspaces, cx));
                     }
                 }
             }
@@ -1790,7 +1950,7 @@ impl Sidebar {
                 let hidden_count = archived_count.saturating_sub(self.archived_shown);
                 for (machine, thread) in archived.into_iter().take(self.archived_shown) {
                     if let Some(store) = self.store(machine, cx) {
-                        shelf.push(self.render_slim_row(&store, thread, true, cx));
+                        shelf.push(self.render_slim_row(&store, thread, Shelf::Archived, cx));
                     }
                 }
                 if hidden_count > 0 {
@@ -2234,7 +2394,7 @@ mod view_tests {
     use serde_json::json;
 
     use super::Sidebar;
-    use crate::machines::{MachineId, ThreadKey};
+    use crate::machines::{MachineId, Machines, Scope, ThreadKey};
     use crate::project_store::ProjectStore;
     use crate::server_client::ServerClient;
 
@@ -2251,6 +2411,15 @@ mod view_tests {
     }
 
     fn show(store: &Entity<ProjectStore>, threads: Vec<Thread>, cx: &mut VisualTestContext) {
+        show_with(store, threads, false, cx)
+    }
+
+    fn show_with(
+        store: &Entity<ProjectStore>,
+        threads: Vec<Thread>,
+        workspaces_expanded: bool,
+        cx: &mut VisualTestContext,
+    ) {
         cx.update(|_, cx| {
             store.update(cx, |store, cx| {
                 store.set_snapshot(
@@ -2264,6 +2433,7 @@ mod view_tests {
                             repository: None,
                         }],
                         threads,
+                        workspaces_expanded,
                         ..Default::default()
                     },
                     cx,
@@ -2271,6 +2441,39 @@ mod view_tests {
             })
         });
         cx.run_until_parked();
+    }
+
+    /// A thread started in a workspace pane, working in `folder`.
+    fn workspaces_thread(id: u64, folder: &str) -> Thread {
+        let mut thread = thread(id, false, None);
+        thread.project_id = ProjectId::WORKSPACES;
+        thread.workspace = Some(folder.into());
+        thread
+    }
+
+    fn new_sidebar(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Sidebar>,
+        Entity<ProjectStore>,
+        &mut VisualTestContext,
+    ) {
+        let store = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let store = client.read(cx).projects().clone();
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            store
+        });
+        let (sidebar, cx) = cx.add_window_view(|_, cx| Sidebar::new(cx));
+        (sidebar, store, cx)
     }
 
     fn open(sidebar: &Entity<Sidebar>, thread: u64, cx: &mut VisualTestContext) {
@@ -2287,22 +2490,60 @@ mod view_tests {
     }
 
     #[gpui::test]
-    fn drafts_list_above_threads_once_something_is_typed(cx: &mut TestAppContext) {
-        let store = cx.update(|cx| {
-            crate::init_for_test(cx);
-            let client = ServerClient::new_for_test(
-                MachineId::Local,
-                "This Mac".into(),
-                SpacesSnapshot::default(),
-                cx,
-            );
-            let store = client.read(cx).projects().clone();
-            crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
-            crate::sidebar::init(cx);
-            store
+    fn threads_started_in_panes_list_in_the_workspaces_shelf(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let shown =
+            |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
+        let threads = || {
+            vec![
+                thread(1, false, None),
+                workspaces_thread(2, "/tmp/demo/src"),
+                workspaces_thread(3, "/tmp/docs"),
+            ]
+        };
+        // Not among the cards, and closed at first.
+        show(&store, threads(), cx);
+        assert!(shown("thread-card-1", cx));
+        assert!(!shown("thread-card-2", cx));
+        assert!(shown("workspaces-shelf-toggle", cx));
+        assert!(!shown("workspaces-row-2", cx));
+
+        show_with(&store, threads(), true, cx);
+        assert!(shown("workspaces-row-2", cx));
+        assert!(shown("workspaces-row-3", cx));
+
+        // Search finds them, named as Workspaces threads.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .search
+                .update(cx, |search, cx| search.set_text("Thread", cx))
         });
-        let (sidebar, cx) = cx.add_window_view(|_, cx| Sidebar::new(cx));
+        cx.run_until_parked();
+        assert!(shown("search-result-1", cx));
+        assert!(!shown("search-list-Workspaces-1", cx));
+        assert!(shown("search-list-Workspaces-2", cx));
+        assert!(shown("search-list-Workspaces-3", cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .search
+                .update(cx, |search, cx| search.set_text("", cx))
+        });
+
+        // Under a project, only those whose folder is in it.
+        cx.update(|_, cx| {
+            let key = Machines::global(cx).read(cx).project_groups(cx)[0]
+                .key
+                .clone();
+            Machines::set_scope(Scope::Group(key), cx);
+        });
+        cx.run_until_parked();
+        assert!(shown("workspaces-row-2", cx));
+        assert!(!shown("workspaces-row-3", cx));
+    }
+
+    #[gpui::test]
+    fn drafts_list_above_threads_once_something_is_typed(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
         let shown =
             |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
         show(

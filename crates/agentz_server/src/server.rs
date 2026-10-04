@@ -439,6 +439,7 @@ impl Server {
                 request:
                     request @ (Request::CreateThread { .. }
                     | Request::CreateTerminalThread { .. }
+                    | Request::CreateWorkspacesThread { .. }
                     | Request::ProjectGit(_)
                     | Request::RepositoryCheckouts(_)
                     | Request::CreateWorkspace { .. }
@@ -582,6 +583,14 @@ impl Server {
             }
             Request::ToggleArchivedExpanded => {
                 self.projects.toggle_archived_expanded();
+                Ok(Response::Ok)
+            }
+            Request::ToggleWorkspacesExpanded => {
+                self.projects.toggle_workspaces_expanded();
+                Ok(Response::Ok)
+            }
+            Request::MoveToAgents(thread_id) => {
+                self.move_to_agents(thread_id)?;
                 Ok(Response::Ok)
             }
 
@@ -873,6 +882,7 @@ impl Server {
             | Request::CloseTerminal(_)) => self.terminal_request(client, request),
             Request::CreateThread { .. }
             | Request::CreateTerminalThread { .. }
+            | Request::CreateWorkspacesThread { .. }
             | Request::ProjectGit(_)
             | Request::RepositoryCheckouts(_)
             | Request::CreateWorkspace { .. }
@@ -1039,6 +1049,29 @@ impl Server {
             .thread(thread_id)
             .map(|_| ())
             .context("no such thread")
+    }
+
+    fn move_to_agents(&mut self, thread_id: ThreadId) -> Result<()> {
+        let thread = self.projects.thread(thread_id).context("no such thread")?;
+        anyhow::ensure!(
+            thread.in_workspaces(),
+            "the thread is already in the Agents list"
+        );
+        let folder = self
+            .projects
+            .thread_folder(thread_id)
+            .context("the thread has no folder")?;
+        let project_id = match self.projects.thread_project(thread_id) {
+            Some(project_id) => project_id,
+            None => {
+                anyhow::ensure!(folder.is_dir(), "{} was removed", folder.display());
+                let project_id = self.projects.add_project(folder);
+                self.refresh_repositories();
+                project_id
+            }
+        };
+        self.projects.move_thread_to_project(thread_id, project_id);
+        Ok(())
     }
 
     /// Changes a connection's agent thread, starting a thread's agent if it isn't running.

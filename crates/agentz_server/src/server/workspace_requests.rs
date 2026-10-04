@@ -57,6 +57,11 @@ impl Server {
                 NewThread::Terminal(command),
                 workspace,
             ),
+            Request::CreateWorkspacesThread {
+                folder,
+                agent_id,
+                workspace,
+            } => self.create_workspaces_thread(client, id, folder, agent_id, workspace),
             Request::ProjectGit(project_id) => {
                 let repo = match self.project_path(project_id) {
                     Ok(repo) => repo,
@@ -103,19 +108,8 @@ impl Server {
                         workspaces::create_from(&folder, kind, base, branch, data_dir).await
                     },
                     move |server, created| {
-                        // A project's worktree is one of its workspaces, for its threads.
-                        let folder = created.map(|(repo, workspace)| {
-                            let project_id = server
-                                .projects
-                                .projects()
-                                .iter()
-                                .find(|project| project.path == repo)
-                                .map(|project| project.id);
-                            match project_id {
-                                Some(project_id) => server.adopt_workspace(project_id, workspace),
-                                None => workspace.path,
-                            }
-                        });
+                        let folder = created
+                            .map(|(repo, workspace)| server.adopt_repository_workspace(&repo, workspace));
                         server.respond(client, id, folder.map(Response::WorkspaceCreated));
                     },
                 );
@@ -174,22 +168,103 @@ impl Server {
         }
     }
 
-    /// Checks the choice now; a new workspace is made by the returned work.
+    /// A Workspaces thread started from `folder`: working there, or in a worktree or pasture of
+    /// its repository, which remembers `folder`.
+    fn create_workspaces_thread(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        folder: PathBuf,
+        agent_id: AgentId,
+        workspace: WorkspaceChoice,
+    ) {
+        let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
+        if !folder.is_dir() {
+            let error = anyhow!("{} isn't a folder here", folder.display());
+            return self.respond(client, id, Err(error));
+        }
+        let new = NewThread::Agent(agent_id);
+        let start = {
+            let folder = folder.clone();
+            move |server: &mut Server, path: PathBuf| {
+                let started_in = (path != folder).then_some(folder);
+                let thread_id = server.create_thread_in(ProjectId::WORKSPACES, new, Some(path))?;
+                server.projects.set_started_in(thread_id, started_in);
+                anyhow::Ok(thread_id)
+            }
+        };
+        let path = match workspace {
+            WorkspaceChoice::Checkout => folder,
+            WorkspaceChoice::Existing(path) => path,
+            WorkspaceChoice::New { kind, base, branch } => {
+                let data_dir = self.data_dir.clone();
+                return self.spawn_then(
+                    async move {
+                        workspaces::create_from(&folder, kind, base, branch, data_dir).await
+                    },
+                    move |server, created| {
+                        let result = created.and_then(|(repo, workspace)| {
+                            let path = server.adopt_repository_workspace(&repo, workspace);
+                            start(server, path)
+                        });
+                        server.respond(client, id, result.map(Response::ThreadCreated));
+                    },
+                );
+            }
+        };
+        let result = if path.is_dir() {
+            start(self, path)
+        } else {
+            Err(anyhow!("{} was removed", path.display()))
+        };
+        self.respond(client, id, result.map(Response::ThreadCreated));
+    }
+
+    /// Records a worktree or pasture made from a repository as one of the workspaces of the
+    /// project at the repository's main checkout, if there's one, for its threads. Returns its
+    /// folder.
+    fn adopt_repository_workspace(&mut self, repo: &Path, workspace: Workspace) -> PathBuf {
+        let project_id = self
+            .projects
+            .projects()
+            .iter()
+            .find(|project| project.path == repo)
+            .map(|project| project.id);
+        match project_id {
+            Some(project_id) => self.adopt_workspace(project_id, workspace),
+            None => workspace.path,
+        }
+    }
+
+    /// Checks the choice now; a new workspace is made by the returned work. A Workspaces
+    /// thread's is any existing folder.
     pub(super) fn prepare_workspace(
         &self,
         project_id: ProjectId,
         choice: WorkspaceChoice,
     ) -> Result<PreparedWorkspace> {
+        if project_id == ProjectId::WORKSPACES {
+            let WorkspaceChoice::Existing(path) = choice else {
+                anyhow::bail!(
+                    "a thread started in a workspace pane belongs to no project, so it has no \
+                     checkout of its own; name a folder"
+                );
+            };
+            anyhow::ensure!(path.is_dir(), "{} was removed", path.display());
+            return Ok(PreparedWorkspace::Ready(Some(path)));
+        }
         let repo = self.project_path(project_id)?;
         match choice {
             WorkspaceChoice::Checkout => Ok(PreparedWorkspace::Ready(None)),
             WorkspaceChoice::Existing(path) if path == repo => Ok(PreparedWorkspace::Ready(None)),
+            // A thread moved from the Workspaces section may work in a folder inside the project.
             WorkspaceChoice::Existing(path) => {
-                self.projects
-                    .workspace(project_id, &path)
-                    .with_context(|| {
-                        format!("{} isn't one of the project's workspaces", path.display())
-                    })?;
+                anyhow::ensure!(
+                    projects::project_at(self.projects.projects(), &path)
+                        .is_some_and(|project| project.id == project_id),
+                    "{} isn't one of the project's workspaces",
+                    path.display()
+                );
                 anyhow::ensure!(path.exists(), "{} was removed", path.display());
                 Ok(PreparedWorkspace::Ready(Some(path)))
             }
@@ -298,6 +373,7 @@ impl Server {
         };
         let new_thread =
             self.create_thread_in(thread.project_id, NewThread::Agent(agent_id), folder)?;
+        self.projects.set_started_in(new_thread, thread.started_in);
         // Its first message links it to this thread.
         continuations::save(&self.data_dir, new_thread, &handoff).log_err();
         self.update_thread(ConnectionId::Thread(new_thread), |thread| {

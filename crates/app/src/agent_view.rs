@@ -23,7 +23,7 @@ use gpui::{
     Subscription, Task, Window, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use projects::{ProjectId, TaskEnd, ThreadId, WorkspaceKind};
+use projects::{ProjectId, TaskEnd, Thread, ThreadId, WorkspaceKind};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
@@ -39,6 +39,7 @@ use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{Machines, ProjectKey, ThreadKey};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
+use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
 use crate::terminal_drawer::{TerminalDrawer, TerminalDrawerEvent};
@@ -1213,6 +1214,11 @@ impl AgentView {
             .thread(self.thread_id)
             .and_then(|thread| store.project(thread.project_id))
             .cloned();
+        // A Workspaces thread has no project: its folder stands in.
+        let folder = project
+            .is_none()
+            .then(|| store.thread_folder(self.thread_id))
+            .flatten();
         let title = if self.renaming {
             self.render_rename_input(cx)
         } else {
@@ -1226,6 +1232,7 @@ impl AgentView {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .children(project.map(|project| self.render_project_crumb(&project, cx)))
+            .children(folder.map(render_folder_crumb))
             .child(h_flex().flex_1().min_w_0().child(title))
             .children(self.render_branch(cx))
             .child(self.render_toolbar_buttons(cx))
@@ -1280,7 +1287,7 @@ impl AgentView {
     }
 
     /// The title as the trigger of the thread's menu: Rename, Continue with Another Agent,
-    /// Archive and Delete.
+    /// Archive and Delete. A Workspaces thread isn't archived.
     fn render_title_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.weak_entity();
         let thread_id = self.thread_id;
@@ -1288,6 +1295,11 @@ impl AgentView {
         let registry = self.registry.clone();
         let current_agent = self.agent_id.clone();
         let is_archived = self.is_archived;
+        let in_workspaces = self
+            .store
+            .read(cx)
+            .thread(thread_id)
+            .is_some_and(Thread::in_workspaces);
         // A draft has no conversation to continue, and its agent picker changes the agent.
         let is_draft = self.is_draft(cx);
         let title = self.title.clone();
@@ -1397,20 +1409,22 @@ impl AgentView {
                         );
                     }
                     menu.separator()
-                        .item(
-                            ContextMenuEntry::new(if is_archived {
-                                "Unarchive"
-                            } else {
-                                "Archive"
-                            })
-                            .icon(if is_archived {
-                                IconName::Undo
-                            } else {
-                                IconName::Archive
-                            })
-                            .icon_color(Color::Muted)
-                            .handler(archive),
-                        )
+                        .when(!in_workspaces, |menu| {
+                            menu.item(
+                                ContextMenuEntry::new(if is_archived {
+                                    "Unarchive"
+                                } else {
+                                    "Archive"
+                                })
+                                .icon(if is_archived {
+                                    IconName::Undo
+                                } else {
+                                    IconName::Archive
+                                })
+                                .icon_color(Color::Muted)
+                                .handler(archive),
+                            )
+                        })
                         .item(
                             ContextMenuEntry::new("Delete…")
                                 .icon(IconName::Trash)
@@ -1458,7 +1472,7 @@ impl AgentView {
         let workspace = store.thread_workspace(self.thread_id).cloned();
         let machine = store.machine();
         let info = ProjectInfoStore::global(cx).read(cx);
-        let head = if workspace.is_some() {
+        let head = if thread.workspace.is_some() {
             info.workspace_head(machine, &folder).cloned()
         } else {
             info.info(machine, thread.project_id)
@@ -3745,7 +3759,10 @@ impl AgentView {
         let view = cx.weak_entity();
         let registry = self.registry.clone();
         let current_agent = self.agent_id.clone();
-        let is_continuation = self.thread.read(cx).pending_handoff().is_some();
+        // A continuation brings a conversation, which only an agent can take, and a Workspaces
+        // draft sits in a workspace, beside its shells.
+        let offers_terminal =
+            self.thread.read(cx).pending_handoff().is_none() && !self.in_workspaces(cx);
         PopoverMenu::new("new-thread-agent")
             .menu(move |window, cx| {
                 let agents: Vec<(AgentId, SharedString)> = {
@@ -3804,8 +3821,7 @@ impl AgentView {
                         );
                     }
                     menu = menu.separator();
-                    // A continuation brings a conversation, which only an agent can take.
-                    if !is_continuation {
+                    if offers_terminal {
                         let view = view.clone();
                         menu = menu.item(
                             ContextMenuEntry::new("Terminal")
@@ -3863,6 +3879,7 @@ impl AgentView {
                         ),
                 )
                 .into_any_element(),
+            None if self.in_workspaces(cx) => self.render_folder_picker(cx),
             None => h_flex()
                 .gap_1()
                 .child(self.render_checkout_picker(cx))
@@ -4011,6 +4028,90 @@ impl AgentView {
             .into_any_element()
     }
 
+    /// Where a Workspaces thread works: the folder it was started in, shown as its path, or a
+    /// new worktree or pasture of that folder's repository.
+    fn render_folder_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let (Some(thread), Some(folder)) = (
+            store.thread(self.thread_id),
+            store.thread_folder(self.thread_id),
+        ) else {
+            return div().into_any_element();
+        };
+        let in_starting_folder = thread.started_in.is_none();
+        let icon = store
+            .thread_workspace(self.thread_id)
+            .filter(|_| !in_starting_folder)
+            .map_or(IconName::Folder, |workspace| workspace_icon(workspace.kind));
+        let label: SharedString = compact_path(&folder).into();
+        let tooltip = folder.display().to_string();
+        // Offered only once the folder is known to be in git.
+        let is_repository = self.draft_git.as_ref().is_some_and(|git| git.is_repository);
+        if !is_repository {
+            return static_chip("new-thread-folder", Icon::new(icon), label)
+                .debug_selector(|| "new-thread-folder".into())
+                .tooltip(Tooltip::text(tooltip))
+                .into_any_element();
+        }
+        let pasture_unsupported = matches!(
+            self.draft_git.as_ref().map(|git| &git.pastures),
+            Some(PastureSupport::Unsupported(_))
+        );
+        let chip = picker_chip("new-thread-folder-trigger", Icon::new(icon), label);
+        let view = cx.weak_entity();
+        let menu = PopoverMenu::new("new-thread-folder")
+            .menu(move |window, cx| {
+                let view = view.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let choose = |choice: WorkspaceChoice| {
+                        let view = view.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            view.update(cx, |view, cx| {
+                                view.change_new_thread_checkout(choice.clone(), cx)
+                            })
+                            .log_err();
+                        }
+                    };
+                    menu.header("Where It Works")
+                        .item(
+                            ContextMenuEntry::new("Current checkout")
+                                .icon(IconName::Folder)
+                                .icon_color(Color::Muted)
+                                .toggleable(IconPosition::End, in_starting_folder)
+                                .handler(choose(WorkspaceChoice::Checkout)),
+                        )
+                        .item(
+                            ContextMenuEntry::new("New worktree")
+                                .icon(workspace_icon(WorkspaceKind::Worktree))
+                                .icon_color(Color::Muted)
+                                .handler(choose(WorkspaceChoice::New {
+                                    kind: WorkspaceKind::Worktree,
+                                    base: None,
+                                    branch: None,
+                                })),
+                        )
+                        .item(
+                            ContextMenuEntry::new("New pasture")
+                                .icon(workspace_icon(WorkspaceKind::Pasture))
+                                .icon_color(Color::Muted)
+                                .disabled(pasture_unsupported)
+                                .handler(choose(WorkspaceChoice::New {
+                                    kind: WorkspaceKind::Pasture,
+                                    base: None,
+                                    branch: None,
+                                })),
+                        )
+                }))
+            })
+            .trigger_with_tooltip(chip, Tooltip::text(tooltip))
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)));
+        div()
+            .debug_selector(|| "new-thread-folder-menu".into())
+            .child(menu)
+            .into_any_element()
+    }
+
     /// The machine the new thread runs on, with the project's checkouts on other machines to
     /// move it to. Shown only when there are other machines, and not in a workspace pane,
     /// which belongs to its machine.
@@ -4120,15 +4221,20 @@ impl AgentView {
         if self._draft_git_load.is_some() {
             return;
         }
-        let Some(project_id) = self
-            .store
-            .read(cx)
-            .thread(self.thread_id)
-            .map(|thread| thread.project_id)
-        else {
+        let store = self.store.read(cx);
+        let Some(thread) = store.thread(self.thread_id) else {
             return;
         };
-        let git = self.store.read(cx).project_git(project_id, cx);
+        let git = if thread.in_workspaces() {
+            let Some(folder) = thread.starting_folder().cloned() else {
+                return;
+            };
+            let checkouts = store.repository_checkouts(folder, cx);
+            // Outside git, the server answers with an error.
+            cx.spawn(async move |_, _| anyhow::Ok(checkouts.await?.git))
+        } else {
+            store.project_git(thread.project_id, cx)
+        };
         self._draft_git_load = Some(cx.spawn(async move |this, cx| {
             // An older server, or one that can't read the repository, offers only the checkout.
             let git = git.await.unwrap_or_default();
@@ -4140,17 +4246,27 @@ impl AgentView {
         }));
     }
 
-    /// Where the thread works now, as a choice for a thread made in its place.
+    /// Where the thread works now, as a choice for a thread made in its place. A Workspaces
+    /// thread's checkout is the folder it was started in.
     fn current_workspace_choice(&self, cx: &App) -> WorkspaceChoice {
-        match self
-            .store
-            .read(cx)
-            .thread(self.thread_id)
-            .and_then(|thread| thread.workspace.clone())
-        {
-            Some(path) => WorkspaceChoice::Existing(path),
+        let store = self.store.read(cx);
+        let Some(thread) = store.thread(self.thread_id) else {
+            return WorkspaceChoice::Checkout;
+        };
+        match &thread.workspace {
+            Some(_) if thread.in_workspaces() && thread.started_in.is_none() => {
+                WorkspaceChoice::Checkout
+            }
+            Some(path) => WorkspaceChoice::Existing(path.clone()),
             None => WorkspaceChoice::Checkout,
         }
+    }
+
+    fn in_workspaces(&self, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_some_and(Thread::in_workspaces)
     }
 
     fn current_project(&self, cx: &App) -> Option<ProjectKey> {
@@ -4223,6 +4339,12 @@ impl AgentView {
             .thread(self.thread_id)
             .and_then(|thread| thread.continued_from)
             .filter(|_| project.machine == self.store.read(cx).machine());
+        let starting_folder = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .filter(|thread| thread.in_workspaces())
+            .and_then(|thread| thread.starting_folder().cloned());
         self.replacing = Some(match &workspace {
             WorkspaceChoice::New { kind, .. } => {
                 format!("Making a {}…", kind.label().to_lowercase()).into()
@@ -4233,9 +4355,10 @@ impl AgentView {
         cx.notify();
         let created = store.update(cx, |store, cx| match (starter, continued_from) {
             (Starter::Agent(agent_id), Some(from)) => store.continue_thread(from, agent_id, cx),
-            (Starter::Agent(agent_id), None) => {
-                store.create_thread(project.project, agent_id, workspace, cx)
-            }
+            (Starter::Agent(agent_id), None) => match starting_folder {
+                Some(folder) => store.create_workspaces_thread(folder, agent_id, workspace, cx),
+                None => store.create_thread(project.project, agent_id, workspace, cx),
+            },
             (Starter::Terminal, _) => store.create_terminal_thread(
                 project.project,
                 TerminalCommand::default(),
@@ -4356,6 +4479,42 @@ enum ComposerStyle {
 
 /// The new thread screen's column, narrower than a conversation, as in t3code.
 const NEW_THREAD_WIDTH: Pixels = px(680.);
+
+/// A Workspaces thread's folder where a project thread's title bar has its project. It isn't a
+/// link: there's no project to start a thread in.
+fn render_folder_crumb(folder: PathBuf) -> AnyElement {
+    let name = folder.file_name().map_or_else(
+        || folder.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    h_flex()
+        .flex_none()
+        .gap_1()
+        .child(
+            h_flex()
+                .id("thread-header-folder")
+                .debug_selector(|| "thread-header-folder".into())
+                .gap_1p5()
+                .px_1()
+                .py_0p5()
+                .child(
+                    Icon::new(IconName::Folder)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div().max_w(px(160.)).child(
+                        Label::new(name)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+                )
+                .tooltip(Tooltip::text(folder.display().to_string())),
+        )
+        .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+        .into_any_element()
+}
 
 /// A borderless button that opens one of the new thread's pickers.
 fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike {
@@ -4875,6 +5034,10 @@ mod tests {
         let mut typed = thread(3, None);
         typed.is_draft = true;
         typed.unsent_text = unsent_text.map(str::to_string);
+        let mut workspaces_draft = thread(4, None);
+        workspaces_draft.project_id = ProjectId::WORKSPACES;
+        workspaces_draft.workspace = Some("/tmp/docs".into());
+        workspaces_draft.is_draft = true;
         ProjectsSnapshot {
             projects: vec![Project {
                 id: ProjectId(1),
@@ -4884,7 +5047,12 @@ mod tests {
                 workspaces: Vec::new(),
                 repository: None,
             }],
-            threads: vec![thread(1, None), thread(2, Some("session")), typed],
+            threads: vec![
+                thread(1, None),
+                thread(2, Some("session")),
+                typed,
+                workspaces_draft,
+            ],
             ..Default::default()
         }
     }
@@ -4932,6 +5100,25 @@ mod tests {
     fn a_thread_without_messages_opens_on_the_new_thread_screen(cx: &mut TestAppContext) {
         let (_, cx) = open(1, false, cx);
         assert!(cx.debug_bounds("new-thread").is_some());
+    }
+
+    #[gpui::test]
+    fn a_workspaces_draft_works_in_its_folder(cx: &mut TestAppContext) {
+        let (view, cx) = open(4, false, cx);
+        assert!(cx.debug_bounds("thread-header-folder").is_some());
+        assert!(cx.debug_bounds("new-thread-folder").is_some());
+        assert!(cx.debug_bounds("new-thread-folder-menu").is_none());
+        // In git, it can start in a new worktree or pasture instead.
+        view.update(cx, |view, cx| {
+            view.draft_git = Some(ProjectGit {
+                is_repository: true,
+                ..Default::default()
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread-folder").is_none());
+        assert!(cx.debug_bounds("new-thread-folder-menu").is_some());
     }
 
     /// An archived thread takes no messages, so there's nothing to start.

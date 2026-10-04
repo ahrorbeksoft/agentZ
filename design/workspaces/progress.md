@@ -46,6 +46,7 @@ Notes for whoever continues:
 | 12 | 17 | Badge on the Agents / Workspaces switch | done |
 | 13 | 13 | New workspace picker: Recent first, Open marks | done |
 | 14 | 11 | Split menu: Shell, New Thread | done (a15a4bd, 07b7f86; agent CLIs dropped after) |
+| — | — | Threads started in panes (above; designs in `design/pane-threads/`) | done |
 | 15 | 10 | Drag a pane: edges split, middle swaps | not started |
 | 16 | 18 | Find in terminal (Cmd-F) | not started |
 | 17 | 19E | Shortcut sheet (Cmd-/), by focus | not started |

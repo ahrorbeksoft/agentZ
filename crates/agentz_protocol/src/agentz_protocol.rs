@@ -265,6 +265,7 @@ pub enum Request {
     SetScope(ProjectScope),
     SetThreadOrder(ThreadOrder),
     ToggleArchivedExpanded,
+    ToggleWorkspacesExpanded,
 
     /// Answered with [`Response::ThreadCreated`], once its workspace is ready.
     CreateThread {
@@ -273,6 +274,19 @@ pub enum Request {
         #[serde(default)]
         workspace: WorkspaceChoice,
     },
+    /// A thread started in a workspace pane ([`ProjectId::WORKSPACES`]), from `folder`, any
+    /// folder. [`WorkspaceChoice::Checkout`] works in `folder` itself; a new worktree or pasture
+    /// is made from the repository `folder` is in, and an existing one is any folder.
+    /// [`Response::ThreadCreated`], once that's made.
+    CreateWorkspacesThread {
+        folder: PathBuf,
+        agent_id: AgentId,
+        #[serde(default)]
+        workspace: WorkspaceChoice,
+    },
+    /// Makes a Workspaces thread one of the project its folder is in, adding the folder as a
+    /// project when it's in none (the user agreed first).
+    MoveToAgents(ThreadId),
     /// A thread that runs a terminal instead of an agent: [`Response::ThreadCreated`].
     CreateTerminalThread {
         project_id: ProjectId,
