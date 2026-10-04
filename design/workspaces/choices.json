@@ -1,0 +1,163 @@
+{
+  "topics": {
+    "spacefeat": {
+      "pick": null,
+      "picks": [
+        "D",
+        "E"
+      ],
+      "none": false,
+      "comments": {
+        "E": "based on the focus, too"
+      },
+      "note": ""
+    },
+    "rows": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "organize": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": "but if it is opened inside the this worktree we should hide from here (like herdr)"
+      },
+      "note": ""
+    },
+    "agents": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": ""
+      },
+      "note": ""
+    },
+    "collapsed": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "actions": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": ""
+      },
+      "note": ""
+    },
+    "details": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": ""
+      },
+      "note": ""
+    },
+    "tabs": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "panehead": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "focus": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "dnd": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "newpane": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "empty": {
+      "pick": "E",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "newspace": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "layouts": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "worktrees": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": "p picked c too but from that remove the open with thing"
+      },
+      "note": "",
+      "also": [
+        "C"
+      ]
+    },
+    "goto": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": ""
+    },
+    "attention": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "C": "i picked E too"
+      },
+      "note": "",
+      "also": [
+        "E"
+      ]
+    },
+    "termfeat": {
+      "pick": null,
+      "picks": [
+        "B"
+      ],
+      "none": false,
+      "comments": {},
+      "note": ""
+    }
+  },
+  "updated": "2026-10-04T12:59:38.198Z"
+}
