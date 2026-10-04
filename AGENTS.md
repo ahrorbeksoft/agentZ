@@ -89,7 +89,7 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   pick from: a round on the local design board (`design/README.md`), with the current state
   screenshotted beside them. A round's `design/<round>/decisions.md` is the spec: build what
   was picked, with the user's comments, and nothing more. The Workspaces round
-  (`design/workspaces/`) is decided.
+  (`design/workspaces/`) is decided; `progress.md` there tracks what's built and what's next.
 - **Commit after each finished change** with a clear, imperative message that explains why, and
   push it (`git push origin main`) right after.
 - Answer briefly and plainly. Say what you couldn't verify.
