@@ -1913,18 +1913,22 @@ impl SpacesView {
             .into_any_element()
     }
 
+    /// Zed's empty pane: what's missing, and the shortcut that makes one.
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
-            .gap_2()
-            .child(
-                Label::new("Workspaces put terminals and threads side by side").color(Color::Muted),
-            )
+            .gap_1()
+            .child(Label::new("No workspaces").color(Color::Muted))
             .child(
                 Button::new("start-workspace", "New Workspace")
-                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .key_binding(
+                        ui::KeyBinding::for_action_in(&NewWorkspace, &self.focus_handle, cx)
+                            .size(rems_from_px(12.)),
+                    )
                     .on_click(
                         cx.listener(|this, _, window, cx| this.new_space_handle.show(window, cx)),
                     ),
