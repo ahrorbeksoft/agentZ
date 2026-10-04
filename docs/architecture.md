@@ -531,16 +531,18 @@ since a thread's workspace is its checkout.
   commit, the path, its worktrees; `SpaceGit::{upstream, changes, last_commit}`) or the thread
   cards' details popover outside it (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, close. Which tab shows, focus and zoom are client-only.
-  A dragged workspace row lifts, as t3code's sidebar rows do: an opaque copy with a shadow is
-  held where it was grabbed (`SpaceDrag`, drawn by the view rather than GPUI's drag view), its
-  own place dims, and the row under it is shaded; dropping it there takes that row's place
-  (`SpaceRequest::MoveSpace`).
   A dragged tab slides along its bar, raised (a lighter background, full-strength text, a
   shadow) and held in the bar however far the pointer strays (`TabDrag`): once its edge passes
   the middle of the next tab, that tab slides over into its place, so the order changes while
   dragging, and letting go anywhere, even past the window's edge, leaves it there
   (`SpaceRequest::MoveTab`; the bar keeps that order until the server's arrives). Held near an
   end of a bar with more tabs than fit, it scrolls the bar.
+  A dragged workspace row does the same up and down the list (`SpaceDrag`; both slide with
+  `SlideDrag`): raised (opaque in the selected row's color, with a shadow), held in the list
+  however far left or right the pointer goes, and among its machine's rows. A group's parent
+  takes its worktrees and pastures along, folded or not, and they don't drag themselves
+  (herdr's block move). Letting go sends a `SpaceRequest::MoveSpace` for each workspace that
+  moves (`move_block`), and the list keeps that order until the server's arrives.
   Dragging a pane's header (in a tab of several panes, not zoomed) shows the result as it goes
   (`PaneDrag`): the tab is laid out as dropping it would leave it, the pane itself dimmed to
   45% at the size it would get, and the layout jumps from one result to the next. A small copy

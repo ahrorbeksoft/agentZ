@@ -4,6 +4,7 @@
 //! window's, as herdr keeps them per client. In code they're spaces, since a thread's
 //! workspace is its checkout.
 
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -257,8 +258,138 @@ impl Render for DraggedSplit {
     }
 }
 
-/// A workspace row being dragged. The view draws the row lifted itself (`SpaceDrag`), so
-/// nothing is drawn for it at the pointer.
+/// An item sliding along a bar or a list while dragged: the order shown meanwhile, with the
+/// dragged item where it would land, and the items moving over to make room for it.
+struct SlideDrag<T> {
+    item: T,
+    order: Vec<T>,
+    /// Each item's length along the bar or list when the drag started, with any gap after it.
+    lengths: HashMap<T, Pixels>,
+    /// How far into the item the pointer holds it.
+    grab: Pixels,
+    pointer: Pixels,
+    /// The items sliding over: how far from their new place they started, and when.
+    slides: HashMap<T, (Pixels, Instant)>,
+    is_scrolling: bool,
+    _scroll: Task<()>,
+}
+
+impl<T: Copy + Eq + Hash> SlideDrag<T> {
+    fn new(
+        item: T,
+        order: Vec<T>,
+        lengths: HashMap<T, Pixels>,
+        grab: Pixels,
+        pointer: Pixels,
+    ) -> Self {
+        Self {
+            item,
+            order,
+            lengths,
+            grab,
+            pointer,
+            slides: HashMap::default(),
+            is_scrolling: false,
+            _scroll: Task::ready(()),
+        }
+    }
+
+    fn length(&self, item: T) -> Pixels {
+        self.lengths.get(&item).copied().unwrap_or_default()
+    }
+
+    /// Where the pointer holds the dragged item's start, wherever that is.
+    fn held_start(&self) -> Pixels {
+        self.pointer - self.grab
+    }
+
+    /// The dragged item's start: held where it was grabbed, between `start` and `end`.
+    fn start(&self, start: Pixels, end: Pixels) -> Pixels {
+        let last = (end - self.length(self.item)).max(start);
+        self.held_start().clamp(start, last)
+    }
+
+    /// Moves the dragged item, its start `start` from the first item's, past each item whose
+    /// middle its edge has crossed, and slides that item into the place it left.
+    fn reorder(&mut self, start: Pixels) {
+        let length = self.length(self.item);
+        let Some(mut index) = self.order.iter().position(|item| *item == self.item) else {
+            return;
+        };
+        loop {
+            let place = self.order[..index]
+                .iter()
+                .fold(px(0.), |place, item| place + self.length(*item));
+            if let Some(&next) = self.order.get(index + 1)
+                && start + length > place + length + self.length(next) / 2.
+            {
+                self.order.swap(index, index + 1);
+                self.slide(next, length);
+                index += 1;
+                continue;
+            }
+            if index > 0 {
+                let previous = self.order[index - 1];
+                if start < place - self.length(previous) / 2. {
+                    self.order.swap(index - 1, index);
+                    self.slide(previous, -length);
+                    index -= 1;
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    /// Starts `item` sliding to its new place, `by` from it; one already sliding starts from
+    /// where it is.
+    fn slide(&mut self, item: T, by: Pixels) {
+        let now = Instant::now();
+        let from = self.offset(item, now);
+        self.slides.insert(item, (from + by, now));
+    }
+
+    /// How far `item` is from its place at `now`.
+    fn offset(&self, item: T, now: Instant) -> Pixels {
+        self.slides
+            .get(&item)
+            .map_or(px(0.), |(from, started)| slide_offset(*from, *started, now))
+    }
+}
+
+/// How long an item takes to slide over for a dragged one.
+const SLIDE_DURATION: Duration = Duration::from_millis(150);
+/// How near an end of a bar or list a dragged item scrolls it, and how far each step.
+const DRAG_SCROLL_EDGE: Pixels = px(24.);
+const DRAG_SCROLL_STEP: Pixels = px(6.);
+const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How far a sliding item is from its place at `now`, easing out.
+fn slide_offset(from: Pixels, started: Instant, now: Instant) -> Pixels {
+    let progress =
+        now.saturating_duration_since(started).as_secs_f32() / SLIDE_DURATION.as_secs_f32();
+    from * (1. - progress.min(1.)).powi(3)
+}
+
+/// Which way a bar or list scrolls for an item dragged from `start` to `end` along it: toward
+/// the end of `view` it's held near, while there's more to see there (1 toward the start).
+fn drag_scroll_direction(
+    (start, end): (Pixels, Pixels),
+    (view_start, view_end): (Pixels, Pixels),
+    offset: Pixels,
+    max_offset: Pixels,
+) -> Option<f32> {
+    if start < view_start + DRAG_SCROLL_EDGE && offset < px(0.) {
+        Some(1.)
+    } else if end > view_end - DRAG_SCROLL_EDGE && offset > -max_offset {
+        Some(-1.)
+    } else {
+        None
+    }
+}
+
+/// A workspace row being dragged. The view draws it raised (`SpaceDrag`), so nothing is drawn
+/// for it at the pointer.
 #[derive(Clone, Copy, PartialEq)]
 struct DraggedSpace(SpaceKey);
 
@@ -268,17 +399,98 @@ impl Render for DraggedSpace {
     }
 }
 
-/// The workspace row being dragged: where in it the pointer holds it, and its width once
-/// known.
-#[derive(Clone, Copy)]
+/// A workspace row sliding up and down its machine's rows while dragged. A group's parent
+/// takes its worktrees along, and they don't drag themselves (herdr's).
 struct SpaceDrag {
-    space: SpaceKey,
-    grab: Point<Pixels>,
-    width: Option<Pixels>,
+    machine: MachineId,
+    /// The machine's workspaces in the order the list showed them when the drag started.
+    spaces: Vec<SpaceId>,
+    /// The rows that move together, by the workspace leading them: a row, or a group's, with
+    /// every workspace in it, folded or not, in `spaces`' order.
+    blocks: HashMap<SpaceId, Vec<SpaceId>>,
+    /// Where the dragged rows' place was in `slide.order` when the drag started.
+    start: usize,
+    /// The top of the machine's first row in the list, scrolled to its top.
+    top: Pixels,
+    left: Pixels,
+    width: Pixels,
+    slide: SlideDrag<SpaceId>,
 }
 
-/// How strongly a dragged workspace's own row still shows.
-const DRAGGED_ROW_OPACITY: f32 = 0.5;
+impl SpaceDrag {
+    fn block(&self) -> &[SpaceId] {
+        self.blocks
+            .get(&self.slide.item)
+            .map_or(&[], |block| block.as_slice())
+    }
+
+    /// The first workspace of the rows after the dragged ones, which the dragged ones go
+    /// before; none when they're last.
+    fn before(&self) -> Option<SpaceId> {
+        let index = self
+            .slide
+            .order
+            .iter()
+            .position(|lead| *lead == self.slide.item)?;
+        let next = self.slide.order.get(index + 1)?;
+        self.blocks.get(next)?.first().copied()
+    }
+
+    /// The machine's workspaces in the order the list shows them.
+    fn shown(&self) -> Vec<SpaceId> {
+        let mut spaces = self.spaces.clone();
+        move_block(&mut spaces, self.block(), self.before());
+        spaces
+    }
+
+    /// The dragged rows' top: held where they were grabbed, among the machine's rows and in
+    /// the list as it's scrolled.
+    fn held_top(&self, list: Bounds<Pixels>, offset: Pixels) -> Pixels {
+        let first = self.top + offset;
+        let length = self
+            .slide
+            .order
+            .iter()
+            .fold(px(0.), |length, lead| length + self.slide.length(*lead));
+        self.slide
+            .start(list.top().max(first), list.bottom().min(first + length))
+    }
+}
+
+/// Moves `block`'s workspaces, in their order, to just before `before` (after the others
+/// without it), as the server does with each move this returns.
+fn move_block(
+    spaces: &mut Vec<SpaceId>,
+    block: &[SpaceId],
+    before: Option<SpaceId>,
+) -> Vec<SpaceRequest> {
+    let mut moves = Vec::new();
+    for space in block {
+        let Some(from) = spaces.iter().position(|id| id == space) else {
+            continue;
+        };
+        spaces.remove(from);
+        let index = before
+            .and_then(|before| spaces.iter().position(|id| *id == before))
+            .unwrap_or(spaces.len());
+        spaces.insert(index, *space);
+        if index != from {
+            moves.push(SpaceRequest::MoveSpace {
+                space: *space,
+                index,
+            });
+        }
+    }
+    moves
+}
+
+/// The order a dropped row left its machine's workspaces in, shown until the server moves
+/// them.
+struct DroppedSpaceOrder {
+    machine: MachineId,
+    spaces: Vec<SpaceId>,
+    _expire: Task<()>,
+}
 
 /// A tab being dragged along its bar. The view draws it (`TabDrag`), so nothing is drawn for it
 /// at the pointer.
@@ -294,90 +506,17 @@ impl Render for DraggedTab {
     }
 }
 
-/// A tab sliding along its bar while dragged: the order the bar shows meanwhile, with the
-/// dragged tab where it would land, and the tabs moving over to make room for it.
+/// A tab sliding along its bar while dragged.
 struct TabDrag {
     space: SpaceKey,
-    tab: TabId,
-    order: Vec<TabId>,
-    /// Each tab's width when the drag started.
-    widths: HashMap<TabId, Pixels>,
-    /// Where across the tab the pointer holds it.
-    grab: Pixels,
-    pointer: Pixels,
-    /// The tabs sliding over: how far from their new place they started, and when.
-    slides: HashMap<TabId, (Pixels, Instant)>,
-    is_scrolling: bool,
-    _scroll: Task<()>,
+    slide: SlideDrag<TabId>,
 }
 
 impl TabDrag {
-    fn width(&self, tab: TabId) -> Pixels {
-        self.widths.get(&tab).copied().unwrap_or_default()
-    }
-
     /// The dragged tab's left edge: held where it was grabbed, within the bar.
     fn left(&self, bar: Bounds<Pixels>) -> Pixels {
-        let right_most = (bar.right() - self.width(self.tab)).max(bar.left());
-        (self.pointer - self.grab).clamp(bar.left(), right_most)
+        self.slide.start(bar.left(), bar.right())
     }
-
-    /// Moves the dragged tab, its left edge `left` from the bar's first tab, past each tab
-    /// whose middle its edge has crossed, and slides that tab into the place it left.
-    fn reorder(&mut self, left: Pixels) {
-        let width = self.width(self.tab);
-        let Some(mut index) = self.order.iter().position(|tab| *tab == self.tab) else {
-            return;
-        };
-        loop {
-            let start = self.order[..index]
-                .iter()
-                .fold(px(0.), |start, tab| start + self.width(*tab));
-            if let Some(&next) = self.order.get(index + 1)
-                && left + width > start + width + self.width(next) / 2.
-            {
-                self.order.swap(index, index + 1);
-                self.slide(next, width);
-                index += 1;
-                continue;
-            }
-            if index > 0 {
-                let previous = self.order[index - 1];
-                if left < start - self.width(previous) / 2. {
-                    self.order.swap(index - 1, index);
-                    self.slide(previous, -width);
-                    index -= 1;
-                    continue;
-                }
-            }
-            break;
-        }
-    }
-
-    /// Starts `tab` sliding to its new place, `by` from it; one already sliding starts from
-    /// where it is.
-    fn slide(&mut self, tab: TabId, by: Pixels) {
-        let now = Instant::now();
-        let from = self
-            .slides
-            .get(&tab)
-            .map_or(px(0.), |(from, started)| slide_offset(*from, *started, now));
-        self.slides.insert(tab, (from + by, now));
-    }
-}
-
-/// How long a tab takes to slide over for a dragged one.
-const TAB_SLIDE_DURATION: Duration = Duration::from_millis(150);
-/// How near an end of the bar a dragged tab scrolls it, and how far each step.
-const TAB_SCROLL_EDGE: Pixels = px(24.);
-const TAB_SCROLL_STEP: Pixels = px(6.);
-const TAB_SCROLL_INTERVAL: Duration = Duration::from_millis(16);
-
-/// How far a sliding tab is from its place at `now`, easing out.
-fn slide_offset(from: Pixels, started: Instant, now: Instant) -> Pixels {
-    let progress =
-        now.saturating_duration_since(started).as_secs_f32() / TAB_SLIDE_DURATION.as_secs_f32();
-    from * (1. - progress.min(1.)).powi(3)
 }
 
 /// The order a dropped tab left the bar in, shown until the server moves the tab.
@@ -585,6 +724,7 @@ pub struct SpacesView {
     pane_drag: Option<PaneDrag>,
     dropped_pane_tree: Option<DroppedPaneTree>,
     space_drag: Option<SpaceDrag>,
+    dropped_space_order: Option<DroppedSpaceOrder>,
     /// The visible tab bar's tabs, which a dragged tab is measured against and scrolls.
     tab_scroll: ScrollHandle,
     tab_drag: Option<TabDrag>,
@@ -651,6 +791,7 @@ impl SpacesView {
             pane_drag: None,
             dropped_pane_tree: None,
             space_drag: None,
+            dropped_space_order: None,
             tab_scroll: ScrollHandle::new(),
             tab_drag: None,
             dropped_tab_order: None,
@@ -814,6 +955,17 @@ impl SpacesView {
                 .map(|(_, space)| space.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>());
             if order.is_none_or(|order| order == dropped.order) {
                 self.dropped_tab_order = None;
+            }
+        }
+        // A dropped row's order gives way once the server has moved its workspaces.
+        if let Some(dropped) = &self.dropped_space_order {
+            let order: Vec<SpaceId> = spaces
+                .iter()
+                .filter(|(machine, _)| *machine == dropped.machine)
+                .map(|(_, space)| space.id)
+                .collect();
+            if order == dropped.spaces {
+                self.dropped_space_order = None;
             }
         }
 
@@ -1819,13 +1971,40 @@ impl SpacesView {
         }
     }
 
-    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+    /// Every workspace in the order the list shows them: while a row is dragged, or after it's
+    /// dropped until the server has moved it, its machine's in that order.
+    fn shown_spaces(&self, cx: &App) -> Vec<(MachineId, Space)> {
+        let mut spaces = self.all_spaces(cx);
+        let (machine, order) = match (&self.space_drag, &self.dropped_space_order) {
+            (Some(drag), _) => (drag.machine, drag.shown()),
+            (_, Some(dropped)) => (dropped.machine, dropped.spaces.clone()),
+            _ => return spaces,
+        };
+        // The machine's workspaces take each other's places in the list.
+        let places: Vec<usize> = (0..spaces.len())
+            .filter(|index| spaces[*index].0 == machine)
+            .collect();
+        let mut theirs: Vec<Space> = places
+            .iter()
+            .map(|index| spaces[*index].1.clone())
+            .collect();
+        theirs.sort_by_key(|space| {
+            order
+                .iter()
+                .position(|id| *id == space.id)
+                .unwrap_or(usize::MAX)
+        });
+        for (index, space) in places.into_iter().zip(theirs) {
+            spaces[index].1 = space;
+        }
+        spaces
+    }
+
+    /// The sidebar's rows: the workspaces in their groups, or those the search matches.
+    fn sidebar_entries(&self, cx: &App) -> Vec<SpaceEntry> {
         let query = self.search.read(cx).text().trim().to_lowercase();
-        let has_remotes = self.machines.read(cx).has_remotes();
-        let spaces = self.all_spaces(cx);
-        let has_spaces = !spaces.is_empty();
-        let entries = if query.is_empty() {
+        let spaces = self.shown_spaces(cx);
+        if query.is_empty() {
             space_entries(
                 spaces,
                 |machine, space| self.group_membership(machine, space, cx),
@@ -1838,26 +2017,68 @@ impl SpacesView {
                 .into_iter()
                 .filter(|entry| matches_space(&entry.space, &query))
                 .collect()
-        };
+        }
+    }
+
+    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let has_remotes = self.machines.read(cx).has_remotes();
+        let has_spaces = self
+            .machines
+            .read(cx)
+            .clients()
+            .iter()
+            .any(|client| !client.read(cx).spaces().spaces.is_empty());
+        let entries = self.sidebar_entries(cx);
+        let drag = self.space_drag.as_ref();
+        // Which dragged rows each workspace's row moves with.
+        let leads: HashMap<SpaceId, SpaceId> = drag
+            .map(|drag| {
+                drag.blocks
+                    .iter()
+                    .flat_map(|(lead, block)| block.iter().map(|space| (*space, *lead)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let now = Instant::now();
+        let mut is_sliding = false;
+        let mut raised_rows = Vec::new();
         let rows: Vec<AnyElement> = entries
             .iter()
-            .map(|entry| self.render_space_row(entry, false, cx))
+            .map(|entry| {
+                let row = self.render_space_row(entry, false, cx);
+                let Some((drag, lead)) = drag
+                    .filter(|drag| drag.machine == entry.machine)
+                    .zip(leads.get(&entry.space.id))
+                else {
+                    return row;
+                };
+                if *lead == drag.slide.item {
+                    raised_rows.push(self.render_space_row(entry, true, cx));
+                    // Its place in the list, kept while it's held above.
+                    return div()
+                        .debug_selector(|| "dragged-row-place".into())
+                        .invisible()
+                        .child(row)
+                        .into_any_element();
+                }
+                let offset = drag.slide.offset(*lead, now);
+                is_sliding |= offset != px(0.);
+                div().relative().top(offset).child(row).into_any_element()
+            })
             .collect();
-        // The dragged row, lifted out of the list and held where it was grabbed.
-        let lifted_row = self.space_drag.and_then(|drag| {
-            let width = drag.width?;
-            let entry = entries.iter().find(|entry| {
-                entry.machine == drag.space.machine && entry.space.id == drag.space.space
-            })?;
-            Some(
-                deferred(
-                    anchored()
-                        .position(window.mouse_position() - drag.grab)
-                        .snap_to_window()
-                        .child(div().w(width).child(self.render_space_row(entry, true, cx))),
-                )
-                .with_priority(1),
+        if is_sliding {
+            window.request_animation_frame();
+        }
+        // Raised above the list, in it however far left or right the pointer goes.
+        let raised_rows = drag.filter(|_| !raised_rows.is_empty()).map(|drag| {
+            let top = drag.held_top(self.sidebar_scroll.bounds(), self.sidebar_scroll.offset().y);
+            deferred(
+                anchored()
+                    .position(gpui::point(drag.left, top))
+                    .child(render_raised_rows(raised_rows, drag.width, cx)),
             )
+            .with_priority(1)
         });
 
         v_flex()
@@ -1874,6 +2095,11 @@ impl SpacesView {
                     .id("workspaces-scroll")
                     .flex_1()
                     .min_h_0()
+                    .on_drag_move(cx.listener(
+                        |this, event: &DragMoveEvent<DraggedSpace>, _, cx| {
+                            this.drag_space(event.event.position.y, cx)
+                        },
+                    ))
                     .child(
                         v_flex()
                             .id("workspaces-list")
@@ -1895,7 +2121,7 @@ impl SpacesView {
                     )
                     .vertical_scrollbar_for(&self.sidebar_scroll, window, cx),
             )
-            .children(lifted_row)
+            .children(raised_rows)
             .child(self.render_agents(has_remotes, window, cx))
             .child(render_footer_item(
                 "workspaces-open-settings",
@@ -1982,21 +2208,21 @@ impl SpacesView {
     }
 
     /// herdr's space row: the rolled-up state and name, then the branch and ahead/behind.
-    /// `lifted` is the copy that follows the pointer while the row is dragged (t3code's).
+    /// `raised` is the copy held above the list while the row is dragged, which only shows.
     fn render_space_row(
         &self,
         entry: &SpaceEntry,
-        lifted: bool,
+        raised: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (machine, index, space) = (entry.machine, entry.index, &entry.space);
+        let (machine, space) = (entry.machine, &entry.space);
         let key = SpaceKey {
             machine,
             space: space.id,
         };
         let colors = cx.theme().colors().clone();
         let is_active = self.active_space == Some(key);
-        let is_dragged = self.space_drag.is_some_and(|drag| drag.space == key);
+        let is_dragging = self.space_drag.is_some();
         let label: SharedString = row_label(entry).into();
         // A folded group's parent stands for the whole group (herdr).
         let collapsed_group = entry
@@ -2028,7 +2254,7 @@ impl SpacesView {
                     .filter_map(|pane| self.pane_status(machine, pane, cx)),
             ),
         };
-        let is_renaming = !lifted && self.renaming == Some(RenameTarget::Space(key));
+        let is_renaming = !raised && self.renaming == Some(RenameTarget::Space(key));
         let machine_icon = self.machines.read(cx).machine_icon(machine, cx);
         let machine_label = self.machines.read(cx).label(machine, cx);
         let git = space.git.clone();
@@ -2096,10 +2322,13 @@ impl SpacesView {
             contents: contents.clone().map(Into::into),
         };
         // In git, the checkout at a glance; elsewhere, the general details.
-        let details_popover = (self.details_space == Some(key)).then(|| match &git {
-            Some(git) => render_card_popover(self.render_git_glance(entry, git, &label, &path, cx)),
-            None => render_details_popover(details, cx),
-        });
+        let details_popover =
+            (self.details_space == Some(key) && !is_dragging).then(|| match &git {
+                Some(git) => {
+                    render_card_popover(self.render_git_glance(entry, git, &label, &path, cx))
+                }
+                None => render_details_popover(details, cx),
+            });
         let id = format!("workspace-{}-{}", machine.slug(), space.id.0);
 
         let faint_text = colors.text_muted.opacity(0.4);
@@ -2137,7 +2366,7 @@ impl SpacesView {
                     )
                     .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
-                    .when(!lifted, |button| {
+                    .when(!raised, |button| {
                         button
                             .tooltip(Tooltip::text(if is_collapsed {
                                 "Show Worktrees"
@@ -2210,7 +2439,7 @@ impl SpacesView {
                         .flex_none()
                         .gap_1p5()
                         // The tooltip says it already, so the details give way to it.
-                        .when(!lifted, |this| {
+                        .when(!raised, |this| {
                             this.tooltip(Tooltip::text(contents))
                                 .debug_selector({
                                     let id = format!("{id}-contents");
@@ -2253,115 +2482,11 @@ impl SpacesView {
                 )
             });
 
-        if lifted {
-            // Opaque: the selected row's color over the sidebar's own.
-            return div()
-                .debug_selector(|| "lifted-row".into())
-                .rounded_md()
-                .bg(colors.panel_background)
-                .shadow(vec![
-                    BoxShadow::new(px(0.), px(10.), gpui::black().opacity(0.55))
-                        .blur_radius(px(24.)),
-                ])
-                .child(
-                    v_flex()
-                        .px_2p5()
-                        .py_1p5()
-                        .rounded_md()
-                        .bg(colors.ghost_element_selected)
-                        .child(main_line)
-                        .child(detail_line),
-                )
-                .into_any_element();
-        }
-        let row =
-            v_flex()
-                .id(ElementId::Name(id.clone().into()))
-                .debug_selector({
-                    let id = id.clone();
-                    move || id
-                })
-                .group(group_name)
-                .mx_1()
-                // A worktree sits under its parent.
-                .when(entry.child.is_some(), |row| row.ml(CHILD_ROW_INDENT))
-                .px_2p5()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .when(is_active, |row| row.bg(colors.ghost_element_selected))
-                .hover(|row| row.bg(colors.ghost_element_hover))
-                .when(is_dragged, |row| row.opacity(DRAGGED_ROW_OPACITY))
-                .child(main_line)
-                .child(detail_line)
-                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    this.space_hovered(key, *hovered, cx)
-                }))
-                .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    if event.click_count() == 2 {
-                        let label = this
-                            .space(key, cx)
-                            .map(|space| space.label())
-                            .unwrap_or_default();
-                        this.start_renaming(RenameTarget::Space(key), label.into(), window, cx);
-                    } else {
-                        this.activate_space(key, window, cx);
-                    }
-                }))
-                .on_drag(DraggedSpace(key), {
-                    let this = cx.entity().downgrade();
-                    move |dragged, grab, _, cx| {
-                        this.update(cx, |this, cx| {
-                            this.space_drag = Some(SpaceDrag {
-                                space: dragged.0,
-                                grab,
-                                width: None,
-                            });
-                            cx.notify();
-                        })
-                        .ok();
-                        cx.new(|_| *dragged)
-                    }
-                })
-                // The lifted copy is as wide as the row.
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<DraggedSpace>, _, cx| {
-                        let width = event.bounds.size.width;
-                        if event.drag(cx).0 == key
-                            && let Some(drag) = this.space_drag.as_mut()
-                            && drag.space == key
-                            && drag.width != Some(width)
-                        {
-                            drag.width = Some(width);
-                            cx.notify();
-                        }
-                    },
-                ))
-                .drag_over::<DraggedSpace>(move |style, dragged, _, cx| {
-                    if dragged.0.machine == machine && dragged.0 != key {
-                        style.bg(cx.theme().colors().drop_target_background)
-                    } else {
-                        style
-                    }
-                })
-                .on_drop(cx.listener(move |this, dragged: &DraggedSpace, _, cx| {
-                    if dragged.0.machine == machine && dragged.0 != key {
-                        this.send(
-                            machine,
-                            SpaceRequest::MoveSpace {
-                                space: dragged.0.space,
-                                index,
-                            },
-                            cx,
-                        );
-                    }
-                }));
-
         // herdr's tree lines from the parent to each worktree: ├ for one with more below,
         // └ for the last.
         let connector = entry.child.map(|is_last| {
-            let line = colors.border;
+            // The border's color is the raised rows' own.
+            let line = if raised { faint_text } else { colors.border };
             div()
                 .absolute()
                 .top_0()
@@ -2381,6 +2506,73 @@ impl SpacesView {
                 )
                 .into_any_element()
         });
+        if raised {
+            // Laid out as the row is; the raised rows' background is drawn around it.
+            return div()
+                .relative()
+                .when_some(connector, |this, connector| this.child(connector))
+                .child(
+                    v_flex()
+                        .mx_1()
+                        .when(entry.child.is_some(), |row| row.ml(CHILD_ROW_INDENT))
+                        .px_2p5()
+                        .py_1p5()
+                        .child(main_line)
+                        .child(detail_line),
+                )
+                .into_any_element();
+        }
+        let row = v_flex()
+            .id(ElementId::Name(id.clone().into()))
+            .debug_selector({
+                let id = id.clone();
+                move || id
+            })
+            .group(group_name)
+            .mx_1()
+            // A worktree sits under its parent.
+            .when(entry.child.is_some(), |row| row.ml(CHILD_ROW_INDENT))
+            .px_2p5()
+            .py_1p5()
+            .rounded_md()
+            .cursor_pointer()
+            .when(is_active, |row| row.bg(colors.ghost_element_selected))
+            // Rows pass under the pointer while one is dragged.
+            .when(!is_dragging, |row| {
+                row.hover(|row| row.bg(colors.ghost_element_hover))
+            })
+            .child(main_line)
+            .child(detail_line)
+            .on_hover(
+                cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.space_hovered(key, *hovered, cx)
+                }),
+            )
+            .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if event.click_count() == 2 {
+                    let label = this
+                        .space(key, cx)
+                        .map(|space| space.label())
+                        .unwrap_or_default();
+                    this.start_renaming(RenameTarget::Space(key), label.into(), window, cx);
+                } else {
+                    this.activate_space(key, window, cx);
+                }
+            }))
+            // A worktree stays under its parent, which takes it along (herdr).
+            .when(entry.child.is_none(), |row| {
+                row.on_drag(DraggedSpace(key), {
+                    let this = cx.entity().downgrade();
+                    move |dragged, _, window, cx| {
+                        let pointer = window.mouse_position().y;
+                        this.update(cx, |this, cx| this.start_space_drag(dragged.0, pointer, cx))
+                            .ok();
+                        cx.new(|_| *dragged)
+                    }
+                })
+            });
+
         // A worktree or pasture in a group can be deleted from its row (herdr).
         let deletable = entry
             .child
@@ -3516,7 +3708,7 @@ impl SpacesView {
     /// until the server has moved it, in that order.
     fn shown_tabs<'a>(&self, space_key: SpaceKey, space: &'a Space) -> Vec<&'a Tab> {
         let order = match (&self.tab_drag, &self.dropped_tab_order) {
-            (Some(drag), _) if drag.space == space_key => &drag.order,
+            (Some(drag), _) if drag.space == space_key => &drag.slide.order,
             (_, Some(dropped)) if dropped.space == space_key => &dropped.order,
             _ => return space.tabs.iter().collect(),
         };
@@ -3554,14 +3746,7 @@ impl SpacesView {
         self.dropped_tab_order = None;
         self.tab_drag = Some(TabDrag {
             space: dragged.space,
-            tab: dragged.tab,
-            order,
-            widths,
-            grab,
-            pointer,
-            slides: HashMap::default(),
-            is_scrolling: false,
-            _scroll: Task::ready(()),
+            slide: SlideDrag::new(dragged.tab, order, widths, grab, pointer),
         });
         cx.notify();
     }
@@ -3573,49 +3758,45 @@ impl SpacesView {
         let Some(drag) = self.tab_drag.as_mut() else {
             return;
         };
-        drag.pointer = pointer;
+        drag.slide.pointer = pointer;
         let left = drag.left(bar);
-        drag.reorder(left - first_tab);
-        if !drag.is_scrolling && self.tab_scroll_direction().is_some() {
-            self.scroll_tabs_while_held(cx);
+        drag.slide.reorder(left - first_tab);
+        if !drag.slide.is_scrolling && self.tab_scroll_direction().is_some() {
+            let task = Self::scroll_while_held(Self::scroll_tabs_step, cx);
+            if let Some(drag) = self.tab_drag.as_mut() {
+                drag.slide.is_scrolling = true;
+                drag.slide._scroll = task;
+            }
         }
         cx.notify();
     }
 
-    /// Which way the bar scrolls for the dragged tab: toward the end it's held near, while
-    /// there's more to see there (1 toward the start).
     fn tab_scroll_direction(&self) -> Option<f32> {
         let drag = self.tab_drag.as_ref()?;
         let bar = self.tab_scroll.bounds();
-        let offset = self.tab_scroll.offset().x;
-        let left = drag.pointer - drag.grab;
-        if left < bar.left() + TAB_SCROLL_EDGE && offset < px(0.) {
-            Some(1.)
-        } else if left + drag.width(drag.tab) > bar.right() - TAB_SCROLL_EDGE
-            && offset > -self.tab_scroll.max_offset().x
-        {
-            Some(-1.)
-        } else {
-            None
-        }
+        let left = drag.slide.held_start();
+        drag_scroll_direction(
+            (left, left + drag.slide.length(drag.slide.item)),
+            (bar.left(), bar.right()),
+            self.tab_scroll.offset().x,
+            self.tab_scroll.max_offset().x,
+        )
     }
 
-    fn scroll_tabs_while_held(&mut self, cx: &mut Context<Self>) {
-        let task = cx.spawn(async move |this, cx| {
+    /// Takes `step` every little while, until it says it's done.
+    fn scroll_while_held(
+        step: fn(&mut Self, &mut Context<Self>) -> bool,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(TAB_SCROLL_INTERVAL).await;
-                let scrolled = this
-                    .update(cx, |this, cx| this.scroll_tabs_step(cx))
-                    .unwrap_or(false);
+                cx.background_executor().timer(DRAG_SCROLL_INTERVAL).await;
+                let scrolled = this.update(cx, |this, cx| step(this, cx)).unwrap_or(false);
                 if !scrolled {
                     break;
                 }
             }
-        });
-        if let Some(drag) = self.tab_drag.as_mut() {
-            drag.is_scrolling = true;
-            drag._scroll = task;
-        }
+        })
     }
 
     fn scroll_tabs_step(&mut self, cx: &mut Context<Self>) -> bool {
@@ -3624,14 +3805,14 @@ impl SpacesView {
             return false;
         };
         let Some(direction) = direction else {
-            drag.is_scrolling = false;
+            drag.slide.is_scrolling = false;
             return false;
         };
-        let pointer = drag.pointer;
+        let pointer = drag.slide.pointer;
         let offset = self.tab_scroll.offset();
         let max = self.tab_scroll.max_offset().x;
         self.tab_scroll.set_offset(gpui::point(
-            (offset.x + TAB_SCROLL_STEP * direction).clamp(-max, px(0.)),
+            (offset.x + DRAG_SCROLL_STEP * direction).clamp(-max, px(0.)),
             offset.y,
         ));
         // The tabs pass under the held one.
@@ -3644,28 +3825,22 @@ impl SpacesView {
         let Some(drag) = self
             .tab_drag
             .take()
-            .filter(|drag| drag.space == dragged.space && drag.tab == dragged.tab)
+            .filter(|drag| drag.space == dragged.space && drag.slide.item == dragged.tab)
         else {
             return;
         };
         cx.notify();
-        let Some(index) = drag.order.iter().position(|tab| *tab == drag.tab) else {
+        let tab = drag.slide.item;
+        let Some(index) = drag.slide.order.iter().position(|id| *id == tab) else {
             return;
         };
         let Some(space) = self.space(drag.space, cx) else {
             return;
         };
-        if space.tabs.get(index).map(|tab| tab.id) == Some(drag.tab) {
+        if space.tabs.get(index).map(|tab| tab.id) == Some(tab) {
             return;
         }
-        self.send(
-            drag.space.machine,
-            SpaceRequest::MoveTab {
-                tab: drag.tab,
-                index,
-            },
-            cx,
-        );
+        self.send(drag.space.machine, SpaceRequest::MoveTab { tab, index }, cx);
         let expire = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DROPPED_TIMEOUT).await;
             this.update(cx, |this, cx| {
@@ -3676,7 +3851,171 @@ impl SpacesView {
         });
         self.dropped_tab_order = Some(DroppedTabOrder {
             space: drag.space,
-            order: drag.order,
+            order: drag.slide.order,
+            _expire: expire,
+        });
+    }
+
+    /// Picks up the workspace's row, with its group's when it leads one, as the list last
+    /// drew them.
+    fn start_space_drag(&mut self, space: SpaceKey, pointer: Pixels, cx: &mut Context<Self>) {
+        let machine = space.machine;
+        let entries = self.sidebar_entries(cx);
+        let shown: Vec<Space> = self
+            .shown_spaces(cx)
+            .into_iter()
+            .filter(|(candidate, _)| *candidate == machine)
+            .map(|(_, space)| space)
+            .collect();
+        let spaces: Vec<SpaceId> = shown.iter().map(|space| space.id).collect();
+        // The rows that move together: each with the rows under it, and a group's parents.
+        let mut order = Vec::new();
+        let mut blocks: HashMap<SpaceId, Vec<SpaceId>> = HashMap::default();
+        let mut rows: Vec<(SpaceId, usize, usize)> = Vec::new();
+        let mut group = None;
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.machine != machine {
+                continue;
+            }
+            let joins = entry.child.is_some() || (entry.group.is_some() && entry.group == group);
+            if joins && let Some(last) = rows.last_mut() {
+                last.2 = index;
+                continue;
+            }
+            group = entry.group.clone();
+            let block = match &entry.group {
+                Some((_, main)) => shown
+                    .iter()
+                    .filter(|space| {
+                        self.group_membership(machine, space, cx)
+                            .is_some_and(|(candidate, _)| candidate == *main)
+                    })
+                    .map(|space| space.id)
+                    .collect(),
+                None => vec![entry.space.id],
+            };
+            order.push(entry.space.id);
+            blocks.insert(entry.space.id, block);
+            rows.push((entry.space.id, index, index));
+        }
+        let Some(start) = rows.iter().position(|(_, first, last)| {
+            entries[*first..=*last]
+                .iter()
+                .any(|entry| entry.space.id == space.space)
+        }) else {
+            return;
+        };
+        let bounds = |index: usize| self.sidebar_scroll.bounds_for_item(index);
+        let gap = match (bounds(0), bounds(1)) {
+            (Some(first), Some(second)) => second.top() - first.bottom(),
+            _ => px(0.),
+        };
+        let mut lengths = HashMap::default();
+        for (lead, first, last) in &rows {
+            let (Some(top), Some(bottom)) = (bounds(*first), bounds(*last)) else {
+                return;
+            };
+            let end = bounds(last + 1).map_or(bottom.bottom() + gap, |next| next.top());
+            lengths.insert(*lead, end - top.top());
+        }
+        let (Some(first), Some(dragged)) = (bounds(rows[0].1), bounds(rows[start].1)) else {
+            return;
+        };
+        let offset = self.sidebar_scroll.offset().y;
+        let grab = pointer - (dragged.top() + offset);
+        self.dropped_space_order = None;
+        self.hide_details(cx);
+        self.space_drag = Some(SpaceDrag {
+            machine,
+            spaces,
+            blocks,
+            start,
+            top: first.top(),
+            left: first.left(),
+            width: first.size.width,
+            slide: SlideDrag::new(rows[start].0, order, lengths, grab, pointer),
+        });
+        cx.notify();
+    }
+
+    /// The dragged rows follow the pointer up and down the list, and the others make room
+    /// for them.
+    fn drag_space(&mut self, pointer: Pixels, cx: &mut Context<Self>) {
+        let list = self.sidebar_scroll.bounds();
+        let offset = self.sidebar_scroll.offset().y;
+        let Some(drag) = self.space_drag.as_mut() else {
+            return;
+        };
+        drag.slide.pointer = pointer;
+        let top = drag.held_top(list, offset);
+        drag.slide.reorder(top - (drag.top + offset));
+        if !drag.slide.is_scrolling && self.space_scroll_direction().is_some() {
+            let task = Self::scroll_while_held(Self::scroll_spaces_step, cx);
+            if let Some(drag) = self.space_drag.as_mut() {
+                drag.slide.is_scrolling = true;
+                drag.slide._scroll = task;
+            }
+        }
+        cx.notify();
+    }
+
+    fn space_scroll_direction(&self) -> Option<f32> {
+        let drag = self.space_drag.as_ref()?;
+        let list = self.sidebar_scroll.bounds();
+        let top = drag.slide.held_start();
+        drag_scroll_direction(
+            (top, top + drag.slide.length(drag.slide.item)),
+            (list.top(), list.bottom()),
+            self.sidebar_scroll.offset().y,
+            self.sidebar_scroll.max_offset().y,
+        )
+    }
+
+    fn scroll_spaces_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let direction = self.space_scroll_direction();
+        let Some(drag) = self.space_drag.as_mut() else {
+            return false;
+        };
+        let Some(direction) = direction else {
+            drag.slide.is_scrolling = false;
+            return false;
+        };
+        let pointer = drag.slide.pointer;
+        let offset = self.sidebar_scroll.offset();
+        let max = self.sidebar_scroll.max_offset().y;
+        self.sidebar_scroll.set_offset(gpui::point(
+            offset.x,
+            (offset.y + DRAG_SCROLL_STEP * direction).clamp(-max, px(0.)),
+        ));
+        // The rows pass under the held ones.
+        self.drag_space(pointer, cx);
+        true
+    }
+
+    /// Letting go leaves the rows where they are.
+    fn drop_space(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.space_drag.take() else {
+            return;
+        };
+        cx.notify();
+        if drag.slide.order.get(drag.start) == Some(&drag.slide.item) {
+            return;
+        }
+        let mut spaces = drag.spaces.clone();
+        for request in move_block(&mut spaces, drag.block(), drag.before()) {
+            self.send(drag.machine, request, cx);
+        }
+        let expire = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DROPPED_TIMEOUT).await;
+            this.update(cx, |this, cx| {
+                this.dropped_space_order = None;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.dropped_space_order = Some(DroppedSpaceOrder {
+            machine: drag.machine,
+            spaces,
             _expire: expire,
         });
     }
@@ -3708,16 +4047,13 @@ impl SpacesView {
                 let element = self.render_tab(space_key, index, tab, selected, count, cx);
                 match drag {
                     // Its place in the bar, kept while it's held above.
-                    Some(drag) if drag.tab == tab.id => div()
+                    Some(drag) if drag.slide.item == tab.id => div()
                         .debug_selector(|| "dragged-tab-place".into())
                         .invisible()
                         .child(element)
                         .into_any_element(),
                     Some(drag) => {
-                        let offset = drag
-                            .slides
-                            .get(&tab.id)
-                            .map_or(px(0.), |(from, started)| slide_offset(*from, *started, now));
+                        let offset = drag.slide.offset(tab.id, now);
                         is_sliding |= offset != px(0.);
                         div()
                             .relative()
@@ -3734,7 +4070,7 @@ impl SpacesView {
         }
         // Raised above the bar, in it however far up or down the pointer goes.
         let raised_tab = drag.and_then(|drag| {
-            let index = shown.iter().position(|tab| tab.id == drag.tab)?;
+            let index = shown.iter().position(|tab| tab.id == drag.slide.item)?;
             let bar = self.tab_scroll.bounds();
             Some(
                 deferred(
@@ -3744,7 +4080,7 @@ impl SpacesView {
                             space_key,
                             index,
                             shown[index],
-                            drag.width(drag.tab),
+                            drag.slide.length(drag.slide.item),
                             cx,
                         )),
                 )
@@ -4652,19 +4988,22 @@ impl Render for SpacesView {
                     );
                 }
             }))
-            // A dragged tab stays in its bar, so it's dropped wherever the pointer is, even
-            // past the window's edge, where it's held to scroll the bar.
+            // A dragged tab stays in its bar, and a dragged row in its list, so they're dropped
+            // wherever the pointer is, even past the window's edge, where they're held to
+            // scroll.
             .on_drop(cx.listener(|this, dragged: &DraggedTab, _, cx| this.drop_tab(*dragged, cx)))
+            .on_drop(cx.listener(|this, _: &DraggedSpace, _, cx| this.drop_space(cx)))
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if let Some(drag) = &this.tab_drag {
                         let dragged = DraggedTab {
                             space: drag.space,
-                            tab: drag.tab,
+                            tab: drag.slide.item,
                         };
                         this.drop_tab(dragged, cx);
                     }
+                    this.drop_space(cx);
                 }),
             )
             .when(!is_sidebar_hidden, |view| {
@@ -4679,6 +5018,37 @@ impl Render for SpacesView {
                     .child(main),
             )
     }
+}
+
+/// Dragged workspace rows, raised: opaque in the selected row's color, with a shadow.
+fn render_raised_rows(rows: Vec<AnyElement>, width: Pixels, cx: &App) -> impl IntoElement {
+    let colors = cx.theme().colors();
+    div()
+        .debug_selector(|| "raised-rows".into())
+        .relative()
+        .w(width)
+        .child(
+            // As wide as a row, which sits in from the list's sides.
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_1()
+                .right_1()
+                .rounded_md()
+                .bg(colors.panel_background)
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(10.), gpui::black().opacity(0.55))
+                        .blur_radius(px(24.)),
+                ])
+                .child(
+                    div()
+                        .size_full()
+                        .rounded_md()
+                        .bg(colors.ghost_element_selected),
+                ),
+        )
+        .child(v_flex().gap_0p5().children(rows))
 }
 
 /// A split's border: a line in the middle of a strip that drags.
@@ -4841,8 +5211,6 @@ enum GroupRole {
 struct SpaceEntry {
     machine: MachineId,
     space: Space,
-    /// Its place among its machine's workspaces, for reordering.
-    index: usize,
     /// Under its group's parent, and whether it's the group's last child.
     child: Option<bool>,
     /// The group a parent's toggle folds.
@@ -4859,19 +5227,15 @@ fn space_entries(
     collapsed: &HashSet<GroupKey>,
     active: Option<SpaceKey>,
 ) -> Vec<SpaceEntry> {
-    let mut index_in_machine: HashMap<MachineId, usize> = HashMap::default();
     let members: Vec<(SpaceEntry, Option<(GroupKey, GroupRole)>)> = spaces
         .into_iter()
         .map(|(machine, space)| {
-            let index = index_in_machine.entry(machine).or_default();
             let entry = SpaceEntry {
                 machine,
-                index: *index,
                 child: None,
                 group: None,
                 space,
             };
-            *index += 1;
             let member =
                 membership(machine, &entry.space).map(|(main, role)| ((machine, main), role));
             (entry, member)
@@ -5338,25 +5702,33 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn a_dragged_workspace_row_lifts_and_takes_the_place_of_the_row_it_is_dropped_on(
-        cx: &mut TestAppContext,
-    ) {
-        let mut state = spaces();
-        state.spaces.push(Space {
-            id: SpaceId(7),
-            name: Some("second".to_string()),
-            folder: PathBuf::from("/tmp/second"),
+    /// A workspace of one shell, `name`, in its own folder.
+    fn named_space(id: u64, name: &str) -> Space {
+        Space {
+            id: SpaceId(id),
+            name: Some(name.to_string()),
+            folder: PathBuf::from(format!("/tmp/{name}")),
             project_id: None,
             tabs: vec![Tab {
-                id: TabId(8),
+                id: TabId(id + 1000),
                 name: None,
-                root: Node::Pane(PaneId(9)),
-                panes: vec![pane(9, None)],
+                root: Node::Pane(PaneId(id + 2000)),
+                panes: vec![pane(id + 2000, None)],
             }],
             git: None,
             current: None,
-        });
+        }
+    }
+
+    /// The workspaces' window, and the client whose requests it records.
+    fn sidebar_with(
+        state: SpacesSnapshot,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<SpacesView>,
+        Entity<ServerClient>,
+        &mut gpui::VisualTestContext,
+    ) {
         let client = cx.update(|cx| {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
@@ -5367,48 +5739,232 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
         cx.run_until_parked();
-        let none = gpui::Modifiers::none();
-        let first = cx
-            .debug_bounds("workspace-local-1")
-            .expect("the first row is drawn");
-        let second = cx
-            .debug_bounds("workspace-local-7")
-            .expect("the second row is drawn");
-        assert!(cx.debug_bounds("lifted-row").is_none());
+        (view, client, cx)
+    }
 
-        // The drag starts once the pointer has moved a little, where it holds the row.
-        let grab = gpui::point(px(30.), px(10.));
-        cx.simulate_mouse_down(first.origin + grab, MouseButton::Left, none);
-        cx.simulate_mouse_move(first.origin + grab, MouseButton::Left, none);
-        let grab = grab + gpui::point(px(0.), px(8.));
-        cx.simulate_mouse_move(first.origin + grab, MouseButton::Left, none);
-        cx.simulate_mouse_move(second.center(), MouseButton::Left, none);
-        // A copy of the row, held where it was grabbed.
-        let lifted = cx.debug_bounds("lifted-row").expect("the row lifts");
-        let offset = lifted.origin - (second.center() - grab);
-        assert!(
-            f32::from(offset.x).abs() <= 1. && f32::from(offset.y).abs() <= 1.,
-            "the copy is {offset:?} off"
-        );
-        assert_eq!(lifted.size, first.size);
-
-        cx.simulate_mouse_up(second.center(), MouseButton::Left, none);
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("lifted-row").is_none());
-        let sent: Vec<Request> = client.read_with(cx, |client, _| {
+    fn sent_space_requests(
+        client: &Entity<ServerClient>,
+        cx: &gpui::VisualTestContext,
+    ) -> Vec<Request> {
+        client.read_with(cx, |client, _| {
             client
                 .sent_for_test()
                 .into_iter()
                 .filter(|request| matches!(request, Request::Spaces(_)))
                 .collect()
-        });
+        })
+    }
+
+    fn bounds(cx: &mut gpui::VisualTestContext, name: &'static str) -> Bounds<Pixels> {
+        cx.debug_bounds(name)
+            .unwrap_or_else(|| panic!("{name} is drawn"))
+    }
+
+    #[gpui::test]
+    fn a_dragged_workspace_row_slides_up_and_down_the_list_and_stays_where_it_is_let_go(
+        cx: &mut TestAppContext,
+    ) {
+        let mut state = spaces();
+        state.spaces.push(named_space(7, "second"));
+        state.spaces.push(named_space(11, "third"));
+        let (_, client, cx) = sidebar_with(state, cx);
+        let none = gpui::Modifiers::none();
+        let first = bounds(cx, "workspace-local-1");
+        let second = bounds(cx, "workspace-local-7");
+        let third = bounds(cx, "workspace-local-11");
+        let step = second.top() - first.top();
+        assert_eq!(third.top() - second.top(), step);
+
+        // The first row goes down until its top passes the middle of the second's place, the
+        // pointer far off to the side.
+        let down = first.origin + gpui::point(px(30.), px(10.));
+        cx.simulate_mouse_down(down, MouseButton::Left, none);
+        let start = down + gpui::point(px(0.), px(4.));
+        cx.simulate_mouse_move(start, MouseButton::Left, none);
+        let pointer = start + gpui::point(px(300.), step / 2. + px(2.));
+        cx.simulate_mouse_move(pointer, MouseButton::Left, none);
+        cx.simulate_mouse_move(pointer, MouseButton::Left, none);
+        let raised = bounds(cx, "raised-rows");
+        let place = bounds(cx, "dragged-row-place");
+        assert!(f32::from(raised.top() - (first.top() + step / 2. + px(2.))).abs() <= 1.);
+        // It stays in the list, as wide as its place there, which is where the second was.
         assert_eq!(
-            sent,
+            (raised.left(), raised.size.width),
+            (place.left(), place.size.width)
+        );
+        assert_eq!(place.top(), second.top());
+        // Held far below, it stops at the last place.
+        cx.simulate_mouse_move(
+            pointer + gpui::point(px(0.), px(500.)),
+            MouseButton::Left,
+            none,
+        );
+        assert!(f32::from(bounds(cx, "raised-rows").top() - third.top()).abs() <= 1.);
+        assert_eq!(bounds(cx, "dragged-row-place").top(), third.top());
+        cx.simulate_mouse_move(pointer, MouseButton::Left, none);
+        assert_eq!(bounds(cx, "dragged-row-place").top(), second.top());
+
+        cx.simulate_mouse_up(pointer, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("raised-rows").is_none());
+        assert_eq!(
+            sent_space_requests(&client, cx),
             [Request::Spaces(SpaceRequest::MoveSpace {
                 space: SpaceId(1),
                 index: 1,
             })]
         );
+        // It stays there while the server moves it.
+        assert_eq!(bounds(cx, "workspace-local-1").top(), second.top());
+    }
+
+    #[gpui::test]
+    fn a_group_parent_takes_its_worktrees_along_and_they_stay_under_it(cx: &mut TestAppContext) {
+        let git = |checkout: &str| SpaceGit {
+            branch: Some("main".to_string()),
+            checkout: Some(PathBuf::from(checkout)),
+            main_checkout: Some(PathBuf::from("/repo")),
+            ..SpaceGit::default()
+        };
+        let mut state = spaces();
+        state.spaces[0].git = Some(git("/repo"));
+        state.spaces.push(Space {
+            git: Some(git("/repo-feature")),
+            ..named_space(7, "feature")
+        });
+        state.spaces.push(named_space(11, "other"));
+        let (_, client, cx) = sidebar_with(state, cx);
+        let none = gpui::Modifiers::none();
+        let parent = bounds(cx, "workspace-local-1");
+        let worktree = bounds(cx, "workspace-local-7");
+        let other = bounds(cx, "workspace-local-11");
+        assert!(
+            worktree.left() > parent.left(),
+            "the worktree sits under its parent"
+        );
+
+        // The worktree doesn't drag.
+        let down = worktree.origin + gpui::point(px(30.), px(10.));
+        cx.simulate_mouse_down(down, MouseButton::Left, none);
+        cx.simulate_mouse_move(down + gpui::point(px(0.), px(8.)), MouseButton::Left, none);
+        cx.simulate_mouse_move(other.center(), MouseButton::Left, none);
+        assert!(cx.debug_bounds("raised-rows").is_none());
+        cx.simulate_mouse_up(
+            other.center() + gpui::point(px(400.), px(0.)),
+            MouseButton::Left,
+            none,
+        );
+        cx.run_until_parked();
+
+        // The parent takes it below the other row.
+        let step = other.top() - worktree.top();
+        let down = parent.origin + gpui::point(px(30.), px(10.));
+        cx.simulate_mouse_down(down, MouseButton::Left, none);
+        let start = down + gpui::point(px(0.), px(4.));
+        cx.simulate_mouse_move(start, MouseButton::Left, none);
+        let pointer = start + gpui::point(px(0.), step / 2. + px(2.));
+        cx.simulate_mouse_move(pointer, MouseButton::Left, none);
+        cx.simulate_mouse_move(pointer, MouseButton::Left, none);
+        let raised = bounds(cx, "raised-rows");
+        assert!(f32::from(raised.size.height - (worktree.bottom() - parent.top())).abs() <= 1.);
+        cx.simulate_mouse_up(pointer, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(
+            sent_space_requests(&client, cx),
+            [
+                Request::Spaces(SpaceRequest::MoveSpace {
+                    space: SpaceId(1),
+                    index: 2,
+                }),
+                Request::Spaces(SpaceRequest::MoveSpace {
+                    space: SpaceId(7),
+                    index: 2,
+                }),
+            ]
+        );
+        assert_eq!(bounds(cx, "workspace-local-11").top(), parent.top());
+        assert_eq!(
+            bounds(cx, "workspace-local-7").top() - bounds(cx, "workspace-local-1").top(),
+            worktree.top() - parent.top()
+        );
+    }
+
+    #[gpui::test]
+    fn a_row_held_at_the_end_of_a_full_list_scrolls_it(cx: &mut TestAppContext) {
+        let mut state = spaces();
+        for id in 10..60 {
+            state.spaces.push(named_space(id, &format!("space {id}")));
+        }
+        let (view, client, cx) = sidebar_with(state, cx);
+        let none = gpui::Modifiers::none();
+        let first = cx
+            .debug_bounds("workspace-local-1")
+            .expect("the first row is drawn");
+        let (list, visible) = view.read_with(cx, |view, _| {
+            let list = view.sidebar_scroll.bounds();
+            let visible = (0..view.sidebar_scroll.children_count())
+                .filter(|index| {
+                    view.sidebar_scroll
+                        .bounds_for_item(*index)
+                        .is_some_and(|row| row.bottom() <= list.bottom())
+                })
+                .count();
+            (list, visible)
+        });
+        assert!(
+            visible < 51,
+            "the rows overflow the list, which shows {visible}"
+        );
+
+        cx.simulate_mouse_down(first.center(), MouseButton::Left, none);
+        let start = first.center() + gpui::point(px(0.), px(4.));
+        cx.simulate_mouse_move(start, MouseButton::Left, none);
+        let held = gpui::point(first.center().x, list.bottom() + px(40.));
+        cx.simulate_mouse_move(held, MouseButton::Left, none);
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.sidebar_scroll.offset().y) < px(0.));
+        // The raised row stays at the bottom while the rows pass under it.
+        let raised = cx.debug_bounds("raised-rows").expect("the row is raised");
+        // Short of it by the gap after a row.
+        let short = list.bottom() - raised.bottom();
+        assert!(short >= px(0.) && short <= px(4.), "{short:?} short");
+
+        cx.simulate_mouse_up(held, MouseButton::Left, none);
+        cx.run_until_parked();
+        let sent = sent_space_requests(&client, cx);
+        let [Request::Spaces(SpaceRequest::MoveSpace { space, index })] = sent.as_slice() else {
+            panic!("one workspace moves: {sent:?}");
+        };
+        assert_eq!(*space, SpaceId(1));
+        assert!(
+            *index >= visible,
+            "moved to {index} of the {visible} shown at first"
+        );
+    }
+
+    #[test]
+    fn a_moved_block_goes_before_the_rows_after_it_as_the_server_moves_it() {
+        let ids = |ids: &[u64]| ids.iter().copied().map(SpaceId).collect::<Vec<_>>();
+        // A group whose worktree comes after another row goes before the last one.
+        let mut spaces = ids(&[1, 2, 3, 4]);
+        let moves = move_block(&mut spaces, &ids(&[1, 3]), Some(SpaceId(4)));
+        assert_eq!(spaces, ids(&[2, 1, 3, 4]));
+        let mut server = ids(&[1, 2, 3, 4]);
+        for request in moves {
+            let SpaceRequest::MoveSpace { space, index } = request else {
+                panic!("only workspaces move: {request:?}");
+            };
+            let from = server
+                .iter()
+                .position(|id| *id == space)
+                .expect("it's there");
+            let space = server.remove(from);
+            server.insert(index.min(server.len()), space);
+        }
+        assert_eq!(server, spaces);
+        // Already in place, nothing moves.
+        assert!(move_block(&mut spaces, &ids(&[2]), Some(SpaceId(1))).is_empty());
     }
 
     #[gpui::test]
