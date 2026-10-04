@@ -20,7 +20,7 @@ Notes for whoever continues:
 |---|---|---|---|
 | 1 | 8 | Pane header: title first, folder as detail, buttons on hover | done |
 | 2 | 9 | Focus: accent outline | done |
-| 3 | 7 | Unnamed tabs named by what runs, Cmd-1…9 in tooltips | not started |
+| 3 | 7 | Unnamed tabs named by what runs, Cmd-1…9 in tooltips | done |
 | 4 | 12 | Empty state: minimal | not started |
 | 5 | 1 | Rows: full-color icons, agent icons, `~` paths, machine only with remotes | not started |
 | 6 | 3A | Agents list: herdr's two-line rows | not started |

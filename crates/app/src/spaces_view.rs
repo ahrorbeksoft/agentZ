@@ -17,7 +17,7 @@ use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
+    Action, AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Subscription, Task,
     Window, actions, relative,
 };
@@ -84,6 +84,11 @@ actions!(
     ]
 );
 
+/// Shows the workspace's tab at this position, counting from 1.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = workspaces, no_json)]
+pub struct ActivateTab(pub usize);
+
 /// Mac-style keys for herdr's actions. A terminal pane needs none of them: they all hold Cmd,
 /// which terminals don't receive.
 pub fn init(cx: &mut App) {
@@ -101,6 +106,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-right", ActivatePaneRight, context),
         KeyBinding::new("cmd-alt-up", ActivatePaneUp, context),
         KeyBinding::new("cmd-alt-down", ActivatePaneDown, context),
+        KeyBinding::new("cmd-1", ActivateTab(1), context),
+        KeyBinding::new("cmd-2", ActivateTab(2), context),
+        KeyBinding::new("cmd-3", ActivateTab(3), context),
+        KeyBinding::new("cmd-4", ActivateTab(4), context),
+        KeyBinding::new("cmd-5", ActivateTab(5), context),
+        KeyBinding::new("cmd-6", ActivateTab(6), context),
+        KeyBinding::new("cmd-7", ActivateTab(7), context),
+        KeyBinding::new("cmd-8", ActivateTab(8), context),
+        KeyBinding::new("cmd-9", ActivateTab(9), context),
         KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(SEARCH_KEY_CONTEXT)),
@@ -904,7 +918,8 @@ impl SpacesView {
         cx.notify();
     }
 
-    /// An empty name names the workspace after its folder again, or numbers the tab.
+    /// An empty name names the workspace after its folder again, and the tab after what runs
+    /// in it.
     fn finish_renaming(&mut self, keep: bool, cx: &mut Context<Self>) {
         let Some(target) = self.renaming.take() else {
             return;
@@ -984,6 +999,53 @@ impl SpacesView {
             window,
             cx,
         );
+    }
+
+    fn activate_tab_at(
+        &mut self,
+        action: &ActivateTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((space_key, space, _)) = self.visible_tab(cx) else {
+            return;
+        };
+        let Some(tab) = action
+            .0
+            .checked_sub(1)
+            .and_then(|index| space.tabs.get(index))
+        else {
+            return;
+        };
+        let tab = TabKey {
+            machine: space_key.machine,
+            tab: tab.id,
+        };
+        self.activate_tab(tab, window, cx);
+    }
+
+    /// What an unnamed tab is called: what runs in its focused pane.
+    fn automatic_tab_label(&self, machine: MachineId, tab: &Tab, cx: &App) -> SharedString {
+        let tab_key = TabKey {
+            machine,
+            tab: tab.id,
+        };
+        let focused = self
+            .layouts
+            .get(&tab_key)
+            .map_or(tab.root.first_pane(), TileLayout::focused);
+        let Some(pane) = tab.pane(focused) else {
+            return SharedString::default();
+        };
+        let (_, title, _) = self.pane_title(
+            PaneKey {
+                machine,
+                pane: pane.id,
+            },
+            pane,
+            cx,
+        );
+        title
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -1912,7 +1974,12 @@ impl SpacesView {
             machine,
             tab: tab.id,
         };
-        let label: SharedString = tab_label(tab, index).into();
+        // A name the user gave wins; otherwise the tab says what runs in it.
+        let label: SharedString = match &tab.name {
+            Some(name) => name.clone().into(),
+            None => self.automatic_tab_label(machine, tab, cx),
+        };
+        let is_automatic = tab.name.is_none();
         let status = rolled_up(
             tab.panes
                 .iter()
@@ -1958,18 +2025,28 @@ impl SpacesView {
             } else {
                 Label::new(label.clone())
                     .size(LabelSize::Small)
+                    .when(is_automatic, |label| label.color(Color::Muted))
                     .into_any_element()
+            })
+            .when(index < 9, |item| {
+                let label = label.clone();
+                item.tooltip(move |_, cx| {
+                    Tooltip::for_action(label.clone(), &ActivateTab(index + 1), cx)
+                })
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.click_count() == 2 {
                     let name = this
                         .space(space_key, cx)
                         .and_then(|space| {
-                            let index = space.tabs.iter().position(|tab| tab.id == tab_key.tab)?;
-                            Some(tab_label(&space.tabs[index], index))
+                            let tab = space.tabs.iter().find(|tab| tab.id == tab_key.tab)?;
+                            Some(match &tab.name {
+                                Some(name) => name.clone().into(),
+                                None => this.automatic_tab_label(machine, tab, cx),
+                            })
                         })
                         .unwrap_or_default();
-                    this.start_renaming(RenameTarget::Tab(tab_key), name.into(), window, cx);
+                    this.start_renaming(RenameTarget::Tab(tab_key), name, window, cx);
                 } else {
                     this.activate_tab(tab_key, window, cx);
                 }
@@ -2527,6 +2604,7 @@ impl Render for SpacesView {
             .on_action(cx.listener(Self::new_workspace))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::activate_tab_at))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::split_down))
