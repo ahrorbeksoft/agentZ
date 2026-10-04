@@ -12,7 +12,10 @@ use crate::agent_icons::agent_icon;
 use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey, ThreadKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
-use agentz_protocol::agents::{AgentId, AgentListing, AgentSession, AgentSessions, InstallState};
+use agentz_protocol::agents::{
+    AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
+    InstallState,
+};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
@@ -23,9 +26,9 @@ use projects::{Project, ProjectIcon, ProjectId, ThreadId, ThreadOrder, Workspace
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, DropdownMenu, IconButtonShape, IconPosition, PopoverMenu, ScrollableHandle as _,
-    Switch, TintColor, ToggleButtonGroup, ToggleButtonGroupSize, ToggleButtonGroupStyle,
-    ToggleButtonSimple, Tooltip, WithScrollbar as _, prelude::*,
+    ContextMenu, ContextMenuEntry, DropdownMenu, IconButtonShape, IconPosition, PopoverMenu,
+    ScrollableHandle as _, Switch, TintColor, ToggleButtonGroup, ToggleButtonGroupSize,
+    ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -41,6 +44,7 @@ use crate::app_settings::{AppSettingsStore, MachineProfile, ThemeMode};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{
     ActionButton, ActionStyle, account_badge, avatar, icon_tile, spinner, status_badge, status_dot,
+    text_field,
 };
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machine_icon_picker::MachineIconPicker;
@@ -99,6 +103,8 @@ enum AgentsPage {
     Registry,
     /// One agent's settings, with the connection made to log in or out.
     Agent(AccountPanel),
+    /// Zed's Add Custom Agent form, which also changes one.
+    CustomAgent(CustomAgentForm),
 }
 
 /// Zed's filter on the ACP Registry page.
@@ -1111,6 +1117,7 @@ impl SettingsPage {
             // Laid out by `render_registry` instead, as its list scrolls on its own.
             AgentsPage::Registry => Vec::new(),
             AgentsPage::Agent(_) => self.render_agent_page(window, cx),
+            AgentsPage::CustomAgent(_) => self.render_custom_agent_form(window, cx),
         }
     }
 
@@ -1147,38 +1154,20 @@ impl SettingsPage {
                         .color(Color::Muted),
                 )
                 .into_any_element(),
-            AgentsPage::Registry => h_flex()
-                .min_w_0()
-                .ml_neg_1p5()
-                .gap_1()
-                .child(
-                    div().debug_selector(|| "agents-back".into()).child(
-                        IconButton::new("agents-back", IconName::ArrowLeft)
-                            .icon_size(IconSize::Small)
-                            .shape(IconButtonShape::Square)
-                            .tooltip(Tooltip::text("Back to Agents"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_agents_page(AgentsPage::Installed, window, cx)
-                            })),
-                    ),
-                )
-                .child(
-                    Headline::new("Agents")
-                        .size(HeadlineSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Headline::new("/")
-                        .size(HeadlineSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(Headline::new("ACP Registry").size(HeadlineSize::Small))
-                .into_any_element(),
+            AgentsPage::Registry => self.render_breadcrumb("ACP Registry", cx),
+            AgentsPage::CustomAgent(form) => self.render_breadcrumb(
+                if form.agent_id.is_some() {
+                    "Configure Custom Agent"
+                } else {
+                    "Add Custom Agent"
+                },
+                cx,
+            ),
         };
         let machine = if !self.machines.read(cx).has_remotes() {
             None
-        } else if let AgentsPage::Agent(_) = self.agents_page {
-            // An agent's page belongs to the machine it was opened on.
+        } else if let AgentsPage::Agent(_) | AgentsPage::CustomAgent(_) = self.agents_page {
+            // An agent's page, or its form, belongs to the machine it was opened on.
             let machines = self.machines.read(cx);
             Some(
                 h_flex()
@@ -1200,6 +1189,41 @@ impl SettingsPage {
             .justify_between()
             .child(heading)
             .children(machine)
+            .into_any_element()
+    }
+
+    /// Zed's sub-page heading: a back button and "Agents / `title`".
+    fn render_breadcrumb(&self, title: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .min_w_0()
+            .ml_neg_1p5()
+            .gap_1()
+            .child(
+                div().debug_selector(|| "agents-back".into()).child(
+                    IconButton::new("agents-back", IconName::ArrowLeft)
+                        .icon_size(IconSize::Small)
+                        .shape(IconButtonShape::Square)
+                        .tooltip(Tooltip::text("Back"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let AgentsPage::CustomAgent(_) = this.agents_page {
+                                this.close_custom_agent_form(window, cx)
+                            } else {
+                                this.show_agents_page(AgentsPage::Installed, window, cx)
+                            }
+                        })),
+                ),
+            )
+            .child(
+                Headline::new("Agents")
+                    .size(HeadlineSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Headline::new("/")
+                    .size(HeadlineSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Headline::new(title).size(HeadlineSize::Small))
             .into_any_element()
     }
 
@@ -1228,22 +1252,53 @@ impl SettingsPage {
                 cx,
             ));
         }
-        let add = Button::new("agents-add", "Add Agent")
-            .style(ButtonStyle::Subtle)
-            .label_size(LabelSize::Small)
-            .color(Color::Muted)
-            .start_icon(
-                Icon::new(IconName::Plus)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
+        let page = cx.weak_entity();
+        let add = PopoverMenu::new("agents-add-menu")
+            .trigger(
+                Button::new("agents-add", "Add Agent")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
             )
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.show_agents_page(AgentsPage::Registry, window, cx)
-            }));
+            .anchor(gpui::Anchor::TopRight)
+            .menu(move |window, cx| {
+                let page = page.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let registry_page = page.clone();
+                    menu.entry("Install from Registry", None, move |window, cx| {
+                        registry_page
+                            .update(cx, |page, cx| {
+                                page.show_agents_page(AgentsPage::Registry, window, cx)
+                            })
+                            .log_err();
+                    })
+                    .entry("Add Custom Agent", None, move |window, cx| {
+                        page.update(cx, |page, cx| page.open_custom_agent_form(None, window, cx))
+                            .log_err();
+                    })
+                    .separator()
+                    .header("Learn More")
+                    .item(
+                        ContextMenuEntry::new("ACP Docs")
+                            .icon(IconName::ArrowUpRight)
+                            .icon_color(Color::Muted)
+                            .icon_position(IconPosition::End)
+                            .handler(|_, cx| cx.open_url("https://agentclientprotocol.com/")),
+                    )
+                }))
+            });
         vec![render_section_with_actions(
             "Installed",
             rows,
-            add.into_any_element(),
+            div()
+                .debug_selector(|| "agents-add".into())
+                .child(add)
+                .into_any_element(),
             cx,
         )]
     }
@@ -1343,7 +1398,10 @@ impl SettingsPage {
                     RegistryFilter::Installed => is_installed,
                     RegistryFilter::NotInstalled => !is_installed,
                 };
-                agent.supports_current_platform() && matches_query && matches_filter
+                !agent.is_custom()
+                    && agent.supports_current_platform()
+                    && matches_query
+                    && matches_filter
             })
             .collect();
         matches.sort_by_cached_key(|(_, agent)| agent.name().to_lowercase());
@@ -1731,6 +1789,7 @@ impl SettingsPage {
         };
         let menu_name = name.clone();
         let menu_id = id.clone();
+        let is_custom = listing.is_some_and(AgentListing::is_custom);
         let page = cx.weak_entity();
         let menu = PopoverMenu::new("agent-menu")
             .menu(move |window, cx| {
@@ -1738,7 +1797,21 @@ impl SettingsPage {
                 let id = menu_id.clone();
                 let name = menu_name.clone();
                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                    menu.entry(format!("Uninstall {name}…"), None, move |window, cx| {
+                    let menu = if is_custom {
+                        let page = page.clone();
+                        let id = id.clone();
+                        menu.entry("Configure…", None, move |window, cx| {
+                            page.update(cx, |page, cx| {
+                                let listing = page.registry(cx).read(cx).agent(&id).cloned();
+                                page.open_custom_agent_form(listing.as_ref(), window, cx)
+                            })
+                            .log_err();
+                        })
+                    } else {
+                        menu
+                    };
+                    let verb = if is_custom { "Remove" } else { "Uninstall" };
+                    menu.entry(format!("{verb} {name}…"), None, move |window, cx| {
                         page.update(cx, |page, cx| {
                             page.confirm_uninstall(&id, &name, window, cx)
                         })
@@ -1942,30 +2015,18 @@ impl SettingsPage {
         self.show_agents_page(AgentsPage::Agent(panel), window, cx);
     }
 
+    /// A variable on the Environment tab, saved as it's typed.
     fn new_env_row(&self, key: &str, value: &str, cx: &mut Context<Self>) -> EnvRow {
-        let key_input = cx.new(|cx| {
-            let mut input = TextInput::new("NAME", cx);
-            input.set_text(key.to_string(), cx);
-            input
-        });
-        let value_input = cx.new(|cx| {
-            let mut input = TextInput::new("value", cx);
-            input.set_text(value.to_string(), cx);
-            input
-        });
-        let subscriptions = [
-            cx.subscribe(&key_input, |this, _, _: &TextInputEvent, cx| {
+        let mut row = new_variable_row(key, value, cx);
+        row._subscriptions = vec![
+            cx.subscribe(&row.key, |this, _, _: &TextInputEvent, cx| {
                 this.save_env(cx)
             }),
-            cx.subscribe(&value_input, |this, _, _: &TextInputEvent, cx| {
+            cx.subscribe(&row.value, |this, _, _: &TextInputEvent, cx| {
                 this.save_env(cx)
             }),
         ];
-        EnvRow {
-            key: key_input,
-            value: value_input,
-            _subscriptions: subscriptions,
-        }
+        row
     }
 
     /// Writes the panel's variables to the agent's settings; rows without a name are skipped.
@@ -1986,6 +2047,296 @@ impl SettingsPage {
         client.update(cx, |client, cx| {
             client.update_agent_settings(&agent_id, |agent| agent.env = env, cx)
         });
+    }
+
+    /// Opens Add Custom Agent, or the form for the custom agent given, filled in from it.
+    fn open_custom_agent_form(
+        &mut self,
+        agent: Option<&AgentListing>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let command = agent
+            .and_then(|agent| agent.custom_command.clone())
+            .unwrap_or_default();
+        // Its own variables, and those its Environment tab added, which win when it starts.
+        let mut env: BTreeMap<String, String> = command.env.into_iter().collect();
+        if let Some(agent) = agent {
+            env.extend(
+                self.agents_client(cx)
+                    .read(cx)
+                    .agent_settings(&agent.id().0)
+                    .env,
+            );
+        }
+        let path = command.path.to_string_lossy().into_owned();
+        let name_text = agent
+            .map(|agent| agent.name().to_string())
+            .unwrap_or_default();
+        let name = new_text_input("My Agent", &name_text, cx);
+        let form = CustomAgentForm {
+            agent_id: agent.map(|agent| agent.id().clone()),
+            name: name.clone(),
+            command: new_text_input("/path/to/agent", &path, cx),
+            args: new_text_input("--flag value", &command.args.join(" "), cx),
+            env: env
+                .iter()
+                .map(|(key, value)| new_variable_row(key, value, cx))
+                .collect(),
+            error: None,
+            saving: None,
+        };
+        self.show_agents_page(AgentsPage::CustomAgent(form), window, cx);
+        window.focus(&name.focus_handle(cx), cx);
+    }
+
+    /// Back to where the form was opened from: the agent's page, or the installed agents.
+    fn close_custom_agent_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let AgentsPage::CustomAgent(form) = &self.agents_page else {
+            return;
+        };
+        let listing = form
+            .agent_id
+            .as_ref()
+            .and_then(|id| self.registry(cx).read(cx).agent(id).cloned());
+        match listing {
+            Some(agent) => self.open_agent(agent.id(), agent.name(), window, cx),
+            None => self.show_agents_page(AgentsPage::Installed, window, cx),
+        }
+    }
+
+    /// Sends the form to the server, which starts the agent to check it before keeping it.
+    fn save_custom_agent_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let registry = self.registry(cx);
+        let AgentsPage::CustomAgent(form) = &mut self.agents_page else {
+            return;
+        };
+        if form.saving.is_some() {
+            return;
+        }
+        let path = form.command.read(cx).text().trim().to_string();
+        if path.is_empty() {
+            form.error = Some("Command is required.".into());
+            cx.notify();
+            return;
+        }
+        let mut env = collections::HashMap::default();
+        for row in &form.env {
+            let key = row.key.read(cx).text().trim().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            if env
+                .insert(key.clone(), row.value.read(cx).text().to_string())
+                .is_some()
+            {
+                form.error = Some(format!("Duplicate environment variable \"{key}\".").into());
+                cx.notify();
+                return;
+            }
+        }
+        let change = CustomAgentChange {
+            agent_id: form.agent_id.clone(),
+            name: form.name.read(cx).text().trim().to_string(),
+            command: AgentCommand {
+                path: path.into(),
+                args: form
+                    .args
+                    .read(cx)
+                    .text()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                env,
+            },
+        };
+        let save = registry.read(cx).save_custom_agent(change, cx);
+        form.error = None;
+        form.saving = Some(cx.spawn_in(window, async move |this, cx| {
+            let saved = save.await;
+            this.update_in(cx, |this, window, cx| {
+                let AgentsPage::CustomAgent(form) = &mut this.agents_page else {
+                    return;
+                };
+                form.saving = None;
+                match saved {
+                    Ok(_) => this.show_agents_page(AgentsPage::Installed, window, cx),
+                    Err(error) => {
+                        form.error = Some(format!("{error:#}").into());
+                        cx.notify();
+                    }
+                }
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// Zed's custom agent form: its name, the command that starts it with its arguments, and
+    /// its environment, then Cancel and Save.
+    fn render_custom_agent_form(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let AgentsPage::CustomAgent(form) = &self.agents_page else {
+            return Vec::new();
+        };
+        let field = |input: &Entity<TextInput>, cx: &App| {
+            text_field(input, false, window, cx)
+                .font_buffer(cx)
+                .text_size(rems_from_px(12_f32))
+        };
+        let agent = render_section(
+            "Agent",
+            vec![
+                render_row(
+                    "Name",
+                    "Optional. Left blank, it's the name the agent gives itself.",
+                    div()
+                        .w(px(320.))
+                        .child(text_field(&form.name, false, window, cx))
+                        .into_any_element(),
+                    cx,
+                ),
+                render_row(
+                    "Command",
+                    "Required. Path to the executable that launches the agent.",
+                    div()
+                        .w(px(320.))
+                        .child(field(&form.command, cx))
+                        .into_any_element(),
+                    cx,
+                ),
+                render_row(
+                    "Arguments",
+                    "Space-separated arguments passed to the command.",
+                    div()
+                        .w(px(320.))
+                        .child(field(&form.args, cx))
+                        .into_any_element(),
+                    cx,
+                ),
+            ],
+            cx,
+        );
+
+        let mut variables: Vec<AnyElement> = form
+            .env
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                h_flex()
+                    .px_4()
+                    .py_2()
+                    .gap_2()
+                    .child(div().w(px(180.)).child(field(&row.key, cx)))
+                    .child(Label::new("=").color(Color::Muted))
+                    .child(div().flex_1().min_w_0().child(field(&row.value, cx)))
+                    .child(
+                        IconButton::new(("custom-agent-remove-env", index), IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Remove Variable"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let AgentsPage::CustomAgent(form) = &mut this.agents_page
+                                    && index < form.env.len()
+                                {
+                                    form.env.remove(index);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        if variables.is_empty() {
+            variables.push(
+                div()
+                    .px_4()
+                    .py_3()
+                    .child(Label::new("No variables.").color(Color::Muted))
+                    .into_any_element(),
+            );
+        }
+        let add_variable = Button::new("custom-agent-add-env", "Add Variable")
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .start_icon(
+                Icon::new(IconName::Plus)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                let row = new_variable_row("", "", cx);
+                // So the new name can be typed straight away.
+                window.focus(&row.key.focus_handle(cx), cx);
+                if let AgentsPage::CustomAgent(form) = &mut this.agents_page {
+                    form.env.push(row);
+                }
+                cx.notify();
+            }));
+        let environment = v_flex()
+            .gap_2()
+            .child(render_section_with_actions(
+                "Environment Variables",
+                variables,
+                add_variable.into_any_element(),
+                cx,
+            ))
+            .child(
+                Label::new("Environment variables provided to the agent process.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .into_any_element();
+
+        let error = form.error.clone().map(|error| {
+            h_flex()
+                .debug_selector(|| "custom-agent-error".into())
+                .gap_2()
+                .items_start()
+                .child(
+                    Icon::new(IconName::XCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
+                )
+                .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                .into_any_element()
+        });
+        let is_saving = form.saving.is_some();
+        let actions = h_flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                div().debug_selector(|| "custom-agent-cancel".into()).child(
+                    ActionButton::new("custom-agent-cancel", "Cancel")
+                        .style(ActionStyle::Ghost)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_custom_agent_form(window, cx)
+                        })),
+                ),
+            )
+            .child(
+                div().debug_selector(|| "custom-agent-save".into()).child(
+                    // The server starts the agent to check it, which takes a moment.
+                    ActionButton::new(
+                        "custom-agent-save",
+                        if is_saving { "Starting…" } else { "Save" },
+                    )
+                    .style(ActionStyle::Primary)
+                    .disabled(is_saving)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.save_custom_agent_form(window, cx)),
+                    ),
+                ),
+            )
+            .into_any_element();
+        [agent, environment]
+            .into_iter()
+            .chain(error)
+            .chain([actions])
+            .collect()
     }
 
     /// Zed's per-agent defaults: what a new session starts with. Choosing a setting in a thread
@@ -3008,15 +3359,30 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) {
         let registry = self.registry(cx);
+        let is_custom = registry
+            .read(cx)
+            .agent(id)
+            .is_some_and(AgentListing::is_custom);
+        let (verb, again) = if is_custom {
+            ("Remove", "added")
+        } else {
+            ("Uninstall", "installed")
+        };
         let id = id.clone();
         let page = cx.weak_entity();
         cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
             icon: IconName::Trash,
-            title: format!("Uninstall {name}?").into(),
-            message: "Threads that use it can't continue until it's installed again.".into(),
-            confirm_label: "Uninstall".into(),
+            title: format!("{verb} {name}?").into(),
+            message: format!("Threads that use it can't continue until it's {again} again.").into(),
+            confirm_label: verb.into(),
             on_confirm: Rc::new(move |window, cx| {
-                registry.update(cx, |registry, cx| registry.uninstall(&id, cx));
+                registry.update(cx, |registry, cx| {
+                    if is_custom {
+                        registry.remove_custom_agent(&id, cx)
+                    } else {
+                        registry.uninstall(&id, cx)
+                    }
+                });
                 page.update(cx, |page, cx| {
                     if page.account().is_some_and(|panel| panel.agent_id == id) {
                         page.show_agents_page(AgentsPage::Installed, window, cx);
@@ -3736,7 +4102,36 @@ struct AccountPanel {
 struct EnvRow {
     key: Entity<TextInput>,
     value: Entity<TextInput>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: Vec<Subscription>,
+}
+
+struct CustomAgentForm {
+    /// The agent being changed; `None` adds one.
+    agent_id: Option<AgentId>,
+    name: Entity<TextInput>,
+    command: Entity<TextInput>,
+    /// Split on spaces, as Zed's form does.
+    args: Entity<TextInput>,
+    env: Vec<EnvRow>,
+    error: Option<SharedString>,
+    /// The server is starting the agent to check it.
+    saving: Option<Task<()>>,
+}
+
+fn new_text_input(placeholder: &str, text: &str, cx: &mut App) -> Entity<TextInput> {
+    cx.new(|cx| {
+        let mut input = TextInput::new(placeholder.to_string(), cx);
+        input.set_text(text.to_string(), cx);
+        input
+    })
+}
+
+fn new_variable_row(key: &str, value: &str, cx: &mut App) -> EnvRow {
+    EnvRow {
+        key: new_text_input("NAME", key, cx),
+        value: new_text_input("value", value, cx),
+        _subscriptions: Vec::new(),
+    }
 }
 
 /// What a login method logs in with, from its name: "Log in with Google" gives "Google", "Use an
@@ -4271,6 +4666,7 @@ mod tests {
             },
             supports_current_platform: true,
             install_state,
+            custom_command: None,
         }
     }
 
@@ -4438,6 +4834,174 @@ mod tests {
         // Scrolling re-renders the page every frame, so building all 200 cards made it lag.
         assert!(cx.debug_bounds("registry-card-agent-100").is_some());
         assert!(cx.debug_bounds("registry-card-agent-299").is_none());
+    }
+
+    #[gpui::test]
+    fn custom_agents_are_added_and_configured_from_a_form(cx: &mut TestAppContext) {
+        let mut custom = listing(
+            "custom-opencode",
+            "OpenCode 2",
+            InstallState::Installed {
+                version: "2.0.21".into(),
+                update_available: false,
+            },
+        );
+        custom.custom_command = Some(AgentCommand {
+            path: "/opt/opencode/bin/opencode".into(),
+            args: vec!["acp".into(), "--quiet".into()],
+            env: [("OPENCODE_LOG".to_string(), "debug".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![
+                            listing(
+                                "claude",
+                                "Claude Agent",
+                                InstallState::Installed {
+                                    version: "2.0.0".into(),
+                                    update_available: false,
+                                },
+                            ),
+                            custom,
+                        ],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agents-add").is_some());
+        assert!(cx.debug_bounds("agent-row-custom-opencode").is_some());
+        let form_error = |page: &Entity<SettingsPage>, cx: &mut gpui::VisualTestContext| {
+            page.read_with(cx, |page, _| match &page.agents_page {
+                AgentsPage::CustomAgent(form) => form.error.as_ref().map(|error| error.to_string()),
+                _ => None,
+            })
+        };
+
+        // Add Custom Agent starts on the name, which may stay blank, but needs a command.
+        page.update_in(cx, |page, window, cx| {
+            page.open_custom_agent_form(None, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_input("My Agent");
+        page.read_with(cx, |page, cx| {
+            let AgentsPage::CustomAgent(form) = &page.agents_page else {
+                panic!("the form is open");
+            };
+            assert_eq!(form.name.read(cx).text().as_ref(), "My Agent");
+        });
+        let save = cx
+            .debug_bounds("custom-agent-save")
+            .expect("the form has Save");
+        cx.simulate_click(save.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            form_error(&page, cx).as_deref(),
+            Some("Command is required.")
+        );
+        assert!(cx.debug_bounds("custom-agent-error").is_some());
+
+        // The server starts the agent to check it; its answer shows in the form.
+        page.update(cx, |page, cx| {
+            if let AgentsPage::CustomAgent(form) = &page.agents_page {
+                form.command
+                    .update(cx, |input, cx| input.set_text("/bin/agent", cx));
+            }
+        });
+        cx.run_until_parked();
+        // The error moved it down.
+        let save = cx
+            .debug_bounds("custom-agent-save")
+            .expect("the form has Save");
+        cx.simulate_click(save.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            form_error(&page, cx).is_some_and(|error| error.contains("not connected")),
+            "a failed save says why"
+        );
+        let back = cx
+            .debug_bounds("agents-back")
+            .expect("the form has a way back");
+        cx.simulate_click(back.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("agent-row-claude").is_some());
+
+        // The ACP Registry lists only the registry's agents.
+        page.update_in(cx, |page, window, cx| {
+            page.show_agents_page(AgentsPage::Registry, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("registry-card-claude").is_some());
+        assert!(cx.debug_bounds("registry-card-custom-opencode").is_none());
+
+        // Configuring a custom agent fills the form in from it, and Cancel goes back to its page.
+        page.update_in(cx, |page, window, cx| {
+            page.show_agents_page(AgentsPage::Installed, window, cx)
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("agent-row-custom-opencode")
+            .expect("the custom agent is listed");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        assert_eq!(agent_page_id(&page, cx).as_deref(), Some("custom-opencode"));
+        page.update_in(cx, |page, window, cx| {
+            let listing = page
+                .registry(cx)
+                .read(cx)
+                .agent(&AgentId::new("custom-opencode".to_string()))
+                .cloned();
+            page.open_custom_agent_form(listing.as_ref(), window, cx)
+        });
+        cx.run_until_parked();
+        page.read_with(cx, |page, cx| {
+            let AgentsPage::CustomAgent(form) = &page.agents_page else {
+                panic!("the form is open");
+            };
+            assert_eq!(
+                form.agent_id.as_ref().map(|id| id.0.as_ref()),
+                Some("custom-opencode")
+            );
+            assert_eq!(form.name.read(cx).text().as_ref(), "OpenCode 2");
+            assert_eq!(
+                form.command.read(cx).text().as_ref(),
+                "/opt/opencode/bin/opencode"
+            );
+            assert_eq!(form.args.read(cx).text().as_ref(), "acp --quiet");
+            let env: Vec<(String, String)> = form
+                .env
+                .iter()
+                .map(|row| {
+                    (
+                        row.key.read(cx).text().to_string(),
+                        row.value.read(cx).text().to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(env, [("OPENCODE_LOG".to_string(), "debug".to_string())]);
+        });
+        let cancel = cx
+            .debug_bounds("custom-agent-cancel")
+            .expect("the form has Cancel");
+        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+        assert_eq!(agent_page_id(&page, cx).as_deref(), Some("custom-opencode"));
     }
 
     fn agent_session(id: &str, project_id: Option<ProjectId>, hours_ago: u64) -> AgentSession {

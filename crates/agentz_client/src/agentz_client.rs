@@ -293,6 +293,7 @@ mod tests {
                 args: vec![script.to_string_lossy().into_owned()],
                 env: Default::default(),
             },
+            info: None,
         })
     }
 

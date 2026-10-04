@@ -85,6 +85,20 @@ pub struct AgentListing {
     pub metadata: RegistryAgentMetadata,
     pub supports_current_platform: bool,
     pub install_state: InstallState,
+    /// How a custom agent starts, to edit it. `None` for the registry's agents.
+    #[serde(default)]
+    pub custom_command: Option<AgentCommand>,
+}
+
+/// A custom agent as Settings › Agents adds or changes it ([`crate::Request::SaveCustomAgent`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CustomAgentChange {
+    /// `None` adds one.
+    pub agent_id: Option<AgentId>,
+    /// Blank takes the name the agent gives itself.
+    pub name: String,
+    /// Its `env` becomes the agent's settings' environment.
+    pub command: AgentCommand,
 }
 
 impl AgentListing {
@@ -110,6 +124,10 @@ impl AgentListing {
 
     pub fn supports_current_platform(&self) -> bool {
         self.supports_current_platform
+    }
+
+    pub fn is_custom(&self) -> bool {
+        self.custom_command.is_some()
     }
 }
 

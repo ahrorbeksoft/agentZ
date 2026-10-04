@@ -100,6 +100,7 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
                 CustomAgent {
                     name: "Mock".into(),
                     command,
+                    info: None,
                 },
             )]),
             agent_control: Some(AgentControl {

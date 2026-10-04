@@ -3,9 +3,10 @@
 
 use std::ops::Deref;
 
-use agentz_protocol::Request;
-use agentz_protocol::agents::{AgentId, RegistrySnapshot};
-use gpui::{App, Context, WeakEntity};
+use agentz_protocol::agents::{AgentId, CustomAgentChange, RegistrySnapshot};
+use agentz_protocol::{Request, Response};
+use anyhow::{Result, anyhow};
+use gpui::{App, AppContext as _, Context, Task, WeakEntity};
 
 use crate::server_client::ServerClient;
 
@@ -58,5 +59,24 @@ impl AgentRegistryStore {
 
     pub fn uninstall(&mut self, id: &AgentId, cx: &mut Context<Self>) {
         self.send(Request::UninstallAgent(id.clone()), cx)
+    }
+
+    /// Adds or changes a custom agent. The server starts the agent to check it first, so this
+    /// takes as long as the agent takes to start.
+    pub fn save_custom_agent(&self, change: CustomAgentChange, cx: &App) -> Task<Result<AgentId>> {
+        let Some(client) = self.client.upgrade() else {
+            return Task::ready(Err(anyhow!("the machine was removed")));
+        };
+        let response = client.read(cx).request(Request::SaveCustomAgent(change));
+        cx.background_spawn(async move {
+            match response.await? {
+                Response::CustomAgentSaved(id) => Ok(id),
+                response => Err(anyhow!("unexpected response: {response:?}")),
+            }
+        })
+    }
+
+    pub fn remove_custom_agent(&mut self, id: &AgentId, cx: &mut Context<Self>) {
+        self.send(Request::RemoveCustomAgent(id.clone()), cx)
     }
 }

@@ -352,6 +352,8 @@ for line in sys.stdin:
             session_capabilities["list"] = {}
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
+                         "agentInfo": {"name": "mock-agent", "title": "Mock Agent",
+                                       "version": "1.2.3"},
                          "agentCapabilities": {
                              "loadSession": HISTORY_PATH is not None or SESSIONS_FILE is not None,
                              "sessionCapabilities": session_capabilities,

@@ -35,7 +35,7 @@ use futures::channel::mpsc;
 use gpui_shared_string::SharedString;
 use http_client::HttpClient;
 use registry::{AgentCommand, ShellEnvironmentReady};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub use agent_settings::AgentSettingsStore;
@@ -76,10 +76,13 @@ pub struct AgentControl {
     pub socket: PathBuf,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CustomAgent {
     pub name: SharedString,
     pub command: AgentCommand,
+    /// What the agent said it is (ACP's `agentInfo`) when it was last saved from Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<agent_client_protocol::schema::v1::Implementation>,
 }
 
 /// A running server. Cloning it is cheap.
@@ -96,7 +99,7 @@ pub struct ServerHandle {
 /// Reads `agents/custom.json`: agent ids, each with a `name` and a `command` (`path`, `args`,
 /// `env`).
 pub fn load_custom_agents(data_dir: &Path) -> Result<BTreeMap<AgentId, CustomAgent>> {
-    let path = data_dir.join("agents").join("custom.json");
+    let path = custom_agents_path(data_dir);
     match std::fs::read(&path) {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
@@ -104,6 +107,10 @@ pub fn load_custom_agents(data_dir: &Path) -> Result<BTreeMap<AgentId, CustomAge
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+fn custom_agents_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("agents").join("custom.json")
 }
 
 /// The hash the SSH installer wrote beside this binary. Read at start, because a newer

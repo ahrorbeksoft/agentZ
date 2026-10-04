@@ -30,7 +30,7 @@ pub use agentz_protocol::thread::{
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
-use futures::{FutureExt as _, SinkExt as _};
+use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use gpui_shared_string::SharedString;
 use registry::AgentCommand;
 pub use registry::CommandFuture;
@@ -2581,6 +2581,8 @@ const MAX_SESSION_LIST_PAGES: usize = 100;
 
 /// How long listing an agent's sessions may take, starting the agent included.
 const LIST_SESSIONS_TIMEOUT: Duration = Duration::from_secs(60);
+const AGENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+const STDERR_DRAIN: Duration = Duration::from_millis(200);
 
 /// What an agent says about the sessions it keeps, from ACP's `session/list`.
 #[derive(Debug)]
@@ -2590,6 +2592,62 @@ pub enum SessionListing {
     Unsupported,
     /// The agent wants a login first.
     LoggedOut,
+}
+
+/// Starts the agent only to initialize it, for what it says it is (ACP's `agentInfo`), and
+/// stops it. An agent that doesn't start fails with the last lines it printed.
+pub async fn agent_info(command: AgentCommand) -> Result<Option<acp::Implementation>> {
+    let (messages, mut inbox) = mpsc::unbounded();
+    let sender = MessageSender {
+        sender: messages,
+        generation: 0,
+    };
+    // Stops the agent when dropped.
+    let mut agent_tasks = JoinSet::new();
+    let connecting = connect(
+        command,
+        std::env::temp_dir(),
+        sender,
+        None,
+        &mut agent_tasks,
+    );
+    let deadline = tokio::time::sleep(AGENT_INFO_TIMEOUT);
+    tokio::pin!(connecting, deadline);
+    let mut stderr = VecDeque::new();
+    let mut failure = None;
+    loop {
+        tokio::select! {
+            connected = &mut connecting, if failure.is_none() => match connected {
+                Ok(connected) => return Ok(connected.agent_info),
+                Err(error) => {
+                    failure = Some(error);
+                    deadline.as_mut().reset(tokio::time::Instant::now() + STDERR_DRAIN);
+                }
+            },
+            Some(message) = inbox.next() => match message.kind {
+                MessageKind::Stderr(line) => {
+                    if stderr.len() == STDERR_LINES_KEPT {
+                        stderr.pop_front();
+                    }
+                    stderr.push_back(line);
+                }
+                // An agent that exits before it reads `initialize` leaves the request
+                // unanswered. What it printed last may still be on its way.
+                MessageKind::Exited(exited) if failure.is_none() => {
+                    failure = Some(anyhow!(exited));
+                    deadline.as_mut().reset(tokio::time::Instant::now() + STDERR_DRAIN);
+                }
+                _ => {}
+            },
+            () = &mut deadline => break,
+        }
+    }
+    let error = failure.unwrap_or_else(|| anyhow!("the agent didn't answer `initialize` in time"));
+    let printed = Vec::from(stderr).join("\n");
+    if printed.trim().is_empty() {
+        return Err(error);
+    }
+    Err(anyhow!("{error:#}\n\n{}", printed.trim()))
 }
 
 /// The agent's sessions, every page of them, as Zed's thread import collects them. The agent
@@ -2645,7 +2703,6 @@ pub async fn list_sessions(command: CommandFuture) -> Result<SessionListing> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt as _;
 
     #[test]
     fn diff_line_counts() {

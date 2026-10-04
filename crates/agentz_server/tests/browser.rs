@@ -114,6 +114,7 @@ async fn remote_agents_hand_their_login_pages_to_the_clients() {
                 CustomAgent {
                     name: "Mock".into(),
                     command,
+                    info: None,
                 },
             )]),
             agent_control: Some(AgentControl {

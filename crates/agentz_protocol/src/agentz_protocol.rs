@@ -34,7 +34,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::agents::{
-    AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, IconId, RegistrySnapshot,
+    AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, CustomAgentChange, IconId,
+    RegistrySnapshot,
 };
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
@@ -454,6 +455,11 @@ pub enum Request {
     },
     InstallAgent(AgentId),
     UninstallAgent(AgentId),
+    /// Adds a custom agent, run from a command rather than the registry, or changes one. The
+    /// server starts it once, only to initialize it, to check that it runs and to learn what
+    /// it calls itself (ACP's `agentInfo`): [`Response::CustomAgentSaved`].
+    SaveCustomAgent(CustomAgentChange),
+    RemoveCustomAgent(AgentId),
     /// The registry's icons by id, answered with [`Response::AgentIcons`], leaving out those
     /// this machine doesn't have.
     AgentIcons(Vec<IconId>),
@@ -629,6 +635,7 @@ pub enum Response {
     AgentIcons(Vec<AgentIcon>),
     AgentSessions(AgentSessions),
     ThreadsImported(Vec<ThreadId>),
+    CustomAgentSaved(AgentId),
     /// The titles of the threads whose turns are running.
     TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.

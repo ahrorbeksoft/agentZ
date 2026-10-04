@@ -1,5 +1,6 @@
 //! The state the server owns, and how requests and background results change it.
 
+mod custom_agents;
 #[cfg(unix)]
 mod hand_off;
 mod session_requests;
@@ -423,6 +424,11 @@ impl Server {
                 id,
                 request: Request::ListAgentSessions(agent_id),
             } => self.list_agent_sessions(client, id, agent_id),
+            Input::Request {
+                client,
+                id,
+                request: Request::SaveCustomAgent(change),
+            } => self.save_custom_agent(client, id, change),
             Input::Respond { client, id, result } => {
                 self.send(client, ServerMessage::Response { id, result })
             }
@@ -791,6 +797,8 @@ impl Server {
                 self.registry_changed = true;
                 Ok(Response::Ok)
             }
+            Request::SaveCustomAgent(_) => Err(anyhow!("saving an agent is handled separately")),
+            Request::RemoveCustomAgent(agent_id) => self.remove_custom_agent(&agent_id),
             Request::AgentIcons(ids) => Ok(Response::AgentIcons(
                 ids.iter()
                     .filter_map(|id| self.registry.icon(id).cloned())
@@ -1179,22 +1187,26 @@ impl Server {
         let mut snapshot = self.registry.snapshot();
         snapshot
             .agents
-            .extend(self.custom_agents.iter().map(|(id, agent)| AgentListing {
-                metadata: RegistryAgentMetadata {
-                    id: id.clone(),
-                    name: agent.name.clone(),
-                    description: "A custom agent".into(),
-                    version: "custom".into(),
-                    repository: None,
-                    website: None,
-                    license_url: None,
-                    icon: None,
-                },
-                supports_current_platform: true,
-                install_state: InstallState::Installed {
-                    version: "custom".into(),
-                    update_available: false,
-                },
+            .extend(self.custom_agents.iter().map(|(id, agent)| {
+                let version: SharedString = custom_agents::custom_agent_version(agent).into();
+                AgentListing {
+                    metadata: RegistryAgentMetadata {
+                        id: id.clone(),
+                        name: agent.name.clone(),
+                        description: "A custom agent".into(),
+                        version: version.clone(),
+                        repository: None,
+                        website: None,
+                        license_url: None,
+                        icon: self.custom_agent_icon(agent),
+                    },
+                    supports_current_platform: true,
+                    install_state: InstallState::Installed {
+                        version,
+                        update_available: false,
+                    },
+                    custom_command: Some(agent.command.clone()),
+                }
             }));
         snapshot
     }

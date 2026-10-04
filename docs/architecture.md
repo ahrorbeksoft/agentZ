@@ -86,7 +86,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `spaces.json` | server | Workspaces view: spaces, tabs, pane trees |
 | `agents/settings.json` | server | Per-agent env, defaults and known options |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
-| `agents/custom.json` | user | Agents run from a fixed command (the mock agent for tests) |
+| `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests) |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
@@ -138,8 +138,9 @@ Each entry: what it does, where it lives, and where it comes from.
   menu with Uninstall. Below it are Account, Defaults (for new threads), Environment and Threads
   tabs (Threads is described under Agent threads).
   Account is a card: the login methods while logged out, or the account the agent reported
-  with Change Account and Log Out (both described under Agent threads). Add Agent opens the ACP Registry
-  page, which has search, an All / Installed / Not Installed filter, and a card for each agent.
+  with Change Account and Log Out (both described under Agent threads). Add Agent is Zed's
+  menu: Install from Registry, Add Custom Agent, and the ACP docs. The ACP Registry
+  page has search, an All / Installed / Not Installed filter, and a card for each registry agent.
   As in Zed, the cards are a `uniform_list` below a pinned search bar: scrolling re-renders the
   page every frame, and laying out every card held it to about 6 fps. A sub-page has Zed's back button and breadcrumb. With more than one machine, a machine
   picker sits in the header. Registry icons are single-color (`currentColor`), so they are
@@ -204,6 +205,18 @@ Each entry: what it does, where it lives, and where it comes from.
   policy: npm resolves a range to the `latest` tag when that fits, and Grok's registry version
   is tagged `alpha`. An agent's stderr loses its terminal colors before it's logged or shown in
   an error.
+- **Custom agents** (`server/custom_agents.rs`, `Request::SaveCustomAgent`, the custom agent
+  form in `settings_page.rs`; Zed's Add Custom Agent form): agents run from a command, such as
+  one installed outside the registry, kept per machine in `agents/custom.json` and live at
+  once. The form has an optional name, the command, space-separated arguments (as in Zed) and
+  variables, which become the agent's Environment tab. Saving starts the agent once, only to
+  initialize it: one that doesn't start isn't kept, and the form shows why with its stderr. A
+  blank name takes the one in ACP's `agentInfo` (its title, else its name), which is also
+  kept to show its version, and its icon: the registry agent whose name or id matches, since
+  ACP has no icons. A name an installed agent already has is refused, as pickers would show
+  two alike. The id (`custom-<name>`) is fixed when it's added, since threads keep it. A custom
+  agent's "⋯" menu has Configure… (the form, filled in) and Remove; the ACP Registry page
+  leaves them out.
 - **Agent icons** (`agent_icons.rs`, `registry`): each server downloads the registry's icons,
   and its listings name each one by a SHA-256 of its SVG. Every machine reads the same
   registry, so the app keeps one cache for all of them. It fetches an icon once

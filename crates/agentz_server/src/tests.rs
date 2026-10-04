@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::agents::{AgentId, AgentSessions};
+use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::layout::{Direction, Node};
 use agentz_protocol::spaces::{
@@ -62,6 +62,7 @@ impl TestServer {
             CustomAgent {
                 name: "Mock".into(),
                 command,
+                info: None,
             },
         )]);
         let handle = crate::start(
@@ -865,6 +866,111 @@ async fn lists_and_imports_an_agents_sessions() {
     client
         .wait_until(|client| agent_text(client.thread(connection)) == "Fixed it earlier.")
         .await;
+}
+
+/// Custom agents are added, changed and removed while the server runs. Saving starts the agent
+/// once: its name fills a blank one, its version shows, and one that doesn't start says why.
+#[tokio::test(flavor = "multi_thread")]
+async fn custom_agents_are_saved_after_they_start() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let Some(mut mock) = mock_agent() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let session = async |client: &mut TestClient| match client.ok(Request::SubscribeSession).await {
+        Response::Session(session) => session,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let save = |agent_id: Option<&AgentId>, name: &str, command: &AgentCommand| {
+        Request::SaveCustomAgent(CustomAgentChange {
+            agent_id: agent_id.cloned(),
+            name: name.to_string(),
+            command: command.clone(),
+        })
+    };
+
+    mock.env.insert("TOKEN".into(), "secret".into());
+    let Response::CustomAgentSaved(agent_id) = client.ok(save(None, " ", &mock)).await else {
+        panic!("expected a saved agent");
+    };
+    assert_eq!(agent_id, AgentId::new("custom-mock-agent"));
+    let snapshot = session(&mut client).await;
+    let listing = snapshot.registry.agent(&agent_id).expect("listed");
+    assert_eq!(listing.name().as_ref(), "Mock Agent");
+    assert_eq!(listing.version().as_ref(), "1.2.3");
+    let command = listing.custom_command.clone().expect("a custom agent");
+    assert_eq!(command.path, mock.path);
+    assert!(
+        command.env.is_empty(),
+        "the environment is the agent's settings'"
+    );
+    assert_eq!(
+        snapshot.agent_settings[&agent_id].env.get("TOKEN"),
+        Some(&"secret".to_string())
+    );
+    let stored = crate::load_custom_agents(server.data_dir.path()).expect("custom.json");
+    assert_eq!(stored[&agent_id].name.as_ref(), "Mock Agent");
+
+    // Two installed agents by one name would look the same in pickers.
+    let taken = client
+        .request(save(None, "mock", &mock))
+        .await
+        .expect_err("the name is taken");
+    assert!(
+        taken.message.contains("already called mock"),
+        "{}",
+        taken.message
+    );
+
+    let broken = AgentCommand {
+        path: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "echo 'no such column: project_id' >&2; exit 3".into(),
+        ],
+        env: Default::default(),
+    };
+    let failed = client
+        .request(save(None, "Broken", &broken))
+        .await
+        .expect_err("it doesn't start");
+    assert!(
+        failed.message.starts_with("It didn't start"),
+        "{}",
+        failed.message
+    );
+    assert!(
+        failed.message.contains("no such column: project_id"),
+        "{}",
+        failed.message
+    );
+
+    // Its id stays, since threads keep it.
+    let Response::CustomAgentSaved(renamed) =
+        client.ok(save(Some(&agent_id), "Renamed", &mock)).await
+    else {
+        panic!("expected a saved agent");
+    };
+    assert_eq!(renamed, agent_id);
+    let snapshot = session(&mut client).await;
+    assert_eq!(
+        snapshot
+            .registry
+            .agent(&agent_id)
+            .map(|agent| agent.name().to_string()),
+        Some("Renamed".to_string())
+    );
+
+    client
+        .ok(Request::RemoveCustomAgent(agent_id.clone()))
+        .await;
+    let snapshot = session(&mut client).await;
+    assert!(snapshot.registry.agent(&agent_id).is_none());
+    assert!(snapshot.registry.agent(&AgentId::new("mock")).is_some());
+    let stored = crate::load_custom_agents(server.data_dir.path()).expect("custom.json");
+    assert!(!stored.contains_key(&agent_id));
 }
 
 /// Codex's device-code login asks the client to open a URL (an elicitation) while
