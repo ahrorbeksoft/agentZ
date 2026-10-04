@@ -503,7 +503,10 @@ since a thread's workspace is its checkout.
   branch as its name (without `agentz/`). A group shows once it has both. The parent's ▾/▸
   folds it to the active worktree (client-only) and then shows the group's most urgent state.
   Closing a group's only parent closes its worktrees' workspaces too; checkouts and branches
-  stay.
+  stay. A worktree's or pasture's row has Delete Worktree Checkout… (herdr's): it asks, removes
+  it safely (`Request::RemoveWorkspace`, which takes any linked worktree, not only a project's),
+  asks again before forcing when work would be lost, and closes the workspace; the branch
+  stays.
 - **Row menu**: New Tab, Rename, Copy Path, Reveal in Finder (this Mac), New Thread Here (in a
   project: a draft in the checkout the workspace is in, in the Agents view), Close Workspace,
   and in a git repository (a project or not) New Worktree… and Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch

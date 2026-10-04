@@ -36,6 +36,8 @@ use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ThreadStatus;
+use crate::project_switcher::compact_path;
+use crate::settings_page::remove_workspace;
 use crate::sidebar::{
     DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover, render_folder_icon,
     render_footer_item, render_status_dot, render_status_pill, repository_branch,
@@ -46,6 +48,7 @@ use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
 use crate::worktree_modal::WorktreeModalMode;
+use agentz_protocol::workspace::WorkspaceRemoval;
 
 const KEY_CONTEXT: &str = "Workspaces";
 const RENAME_KEY_CONTEXT: &str = "WorkspacesRename";
@@ -1659,6 +1662,10 @@ impl SpacesView {
                 )
                 .into_any_element()
         });
+        // A worktree or pasture in a group can be deleted from its row (herdr).
+        let deletable = entry
+            .child
+            .and_then(|_| self.checkout_to_delete(machine, space, cx));
         let this = cx.entity().downgrade();
         let folder = space.current_folder().to_path_buf();
         // New Thread Here starts in the checkout the workspace is in.
@@ -1677,6 +1684,7 @@ impl SpacesView {
                 let worktree_source = worktree_source.clone();
                 let folder = folder.clone();
                 let thread_target = thread_target.clone();
+                let deletable = deletable.clone();
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     let new_tab = {
                         let this = this.clone();
@@ -1794,6 +1802,20 @@ impl SpacesView {
                                     .handler(worktree(WorktreeModalMode::Open, source)),
                             )
                     })
+                    .when_some(deletable.clone(), |menu, checkout| {
+                        let this = this.clone();
+                        menu.item(
+                            ContextMenuEntry::new("Delete Worktree Checkout…")
+                                .icon(IconName::Trash)
+                                .icon_color(Color::Muted)
+                                .handler(move |window, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.delete_checkout(key, checkout.clone(), window, cx)
+                                    })
+                                    .ok();
+                                }),
+                        )
+                    })
                     .separator()
                     .item(
                         ContextMenuEntry::new("Close Workspace")
@@ -1841,6 +1863,119 @@ impl SpacesView {
             GroupRole::Parent
         };
         Some((git.main_checkout.clone()?, role))
+    }
+
+    /// The worktree or pasture a workspace is in, which Delete Worktree Checkout removes.
+    fn checkout_to_delete(&self, machine: MachineId, space: &Space, cx: &App) -> Option<PathBuf> {
+        let folder = space.current_folder();
+        let pasture = self
+            .machines
+            .read(cx)
+            .projects(machine, cx)
+            .and_then(|store| {
+                store.read(cx).projects().iter().find_map(|project| {
+                    project
+                        .workspaces
+                        .iter()
+                        .find(|workspace| {
+                            workspace.kind == projects::WorkspaceKind::Pasture
+                                && folder.starts_with(&workspace.path)
+                        })
+                        .map(|workspace| workspace.path.clone())
+                })
+            });
+        pasture.or_else(|| {
+            let git = space.git.as_ref().filter(|git| git.is_linked_worktree())?;
+            git.checkout.clone()
+        })
+    }
+
+    /// herdr's Delete worktree checkout: asks, removes it safely, asks again before forcing
+    /// when it has changes, and closes its workspace. The branch stays.
+    fn delete_checkout(
+        &mut self,
+        key: SpaceKey,
+        checkout: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self.machines.read(cx).projects(key.machine, cx) else {
+            return;
+        };
+        let Some(space) = self.space(key, cx) else {
+            return;
+        };
+        let branch = space.git.as_ref().and_then(|git| git.branch.clone());
+        let name = checkout
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let detail = match &branch {
+            Some(branch) => format!(
+                "Its folder {} is deleted from disk, and its workspace closes. The branch {branch} stays.",
+                compact_path(&checkout)
+            ),
+            None => format!(
+                "Its folder {} is deleted from disk, and its workspace closes.",
+                compact_path(&checkout)
+            ),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete the {name} checkout?"),
+            Some(&detail),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let removal = remove_workspace(&store, checkout.clone(), false, cx).await;
+            let result = match removal {
+                Ok(WorkspaceRemoval::NeedsConfirmation(reason)) => {
+                    let Ok(answer) = cx.update(|window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            &format!("Delete the {name} checkout anyway?"),
+                            Some(&reason),
+                            &["Delete Anyway", "Cancel"],
+                            cx,
+                        )
+                    }) else {
+                        return;
+                    };
+                    if answer.await != Ok(0) {
+                        return;
+                    }
+                    remove_workspace(&store, checkout, true, cx).await
+                }
+                removal => removal,
+            };
+            match result {
+                Ok(WorkspaceRemoval::Removed) => {
+                    this.update(cx, |this, cx| {
+                        this.send(key.machine, SpaceRequest::CloseSpace(key.space), cx)
+                    })
+                    .ok();
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if let Ok(answer) = cx.update(|window, cx| {
+                        window.prompt(
+                            PromptLevel::Critical,
+                            &format!("Couldn't delete the {name} checkout"),
+                            Some(&format!("{error:#}")),
+                            &["OK"],
+                            cx,
+                        )
+                    }) {
+                        answer.await.ok();
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     fn toggle_group(&mut self, group: GroupKey, cx: &mut Context<Self>) {

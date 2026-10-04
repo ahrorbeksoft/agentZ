@@ -319,10 +319,9 @@ pub enum Request {
         #[serde(default)]
         branch: Option<String>,
     },
-    /// Deletes a worktree or pasture from disk, keeping its branch:
-    /// [`Response::WorkspaceRemoval`]. Refused while a running thread works there.
+    /// Deletes a project's worktree or pasture, or any linked worktree, from disk, keeping its
+    /// branch: [`Response::WorkspaceRemoval`]. Refused while a running thread works there.
     RemoveWorkspace {
-        project_id: ProjectId,
         path: PathBuf,
         /// Remove even with uncommitted changes or commits the project doesn't have.
         force: bool,

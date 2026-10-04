@@ -2,7 +2,7 @@
 //! back to change its state.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
@@ -115,11 +115,9 @@ impl Server {
                     },
                 );
             }
-            Request::RemoveWorkspace {
-                project_id,
-                path,
-                force,
-            } => self.remove_workspace(client, id, project_id, path, force),
+            Request::RemoveWorkspace { path, force } => {
+                self.remove_workspace(client, id, path, force)
+            }
             Request::SyncWorkspace {
                 project_id,
                 path,
@@ -312,43 +310,62 @@ impl Server {
             .clone())
     }
 
-    fn remove_workspace(
-        &mut self,
-        client: ClientId,
-        id: u64,
-        project_id: ProjectId,
-        path: PathBuf,
-        force: bool,
-    ) {
-        let prepared = (|| {
-            let repo = self.project_path(project_id)?;
-            let workspace = self
-                .projects
-                .workspace(project_id, &path)
-                .cloned()
-                .with_context(|| {
-                    format!("{} isn't one of the project's workspaces", path.display())
-                })?;
-            anyhow::ensure!(
-                !self
-                    .projects
-                    .threads_in_folder(&path)
-                    .into_iter()
-                    .any(|thread_id| self.projects.is_thread_working(thread_id)),
-                "a thread is working there; stop it before removing the {}",
-                workspace.kind.label().to_lowercase()
+    /// A project's worktree or pasture, or any linked worktree (herdr's Delete worktree
+    /// checkout), found from the folder alone.
+    fn remove_workspace(&mut self, client: ClientId, id: u64, path: PathBuf, force: bool) {
+        if self
+            .projects
+            .threads_in_folder(&path)
+            .into_iter()
+            .any(|thread_id| self.projects.is_thread_working(thread_id))
+        {
+            return self.respond(
+                client,
+                id,
+                Err(anyhow!(
+                    "a thread is working there; stop it before removing it"
+                )),
             );
-            Ok((repo, workspace))
-        })();
-        let (repo, workspace) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return self.respond(client, id, Err(error)),
-        };
+        }
+        let project_workspace = self.projects.projects().iter().find_map(|project| {
+            let workspace = project
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.path == path)?;
+            Some((project.id, project.path.clone(), workspace.clone()))
+        });
+        let project_id = project_workspace
+            .as_ref()
+            .map(|(project_id, _, _)| *project_id);
+        let removing = path.clone();
         self.spawn_then(
-            async move { workspaces::remove(&repo, &workspace, force).await },
+            async move {
+                let (repo, workspace) = match project_workspace {
+                    Some((_, repo, workspace)) => (repo, workspace),
+                    None => {
+                        let repo = workspaces::main_checkout(&removing).await?;
+                        anyhow::ensure!(
+                            repo != removing,
+                            "{} is a repository's main checkout, not a worktree",
+                            removing.display()
+                        );
+                        let workspace = Workspace {
+                            kind: WorkspaceKind::Worktree,
+                            path: removing,
+                            branch: None,
+                            base: None,
+                            created_at: SystemTime::now(),
+                        };
+                        (repo, workspace)
+                    }
+                };
+                workspaces::remove(&repo, &workspace, force).await
+            },
             move |server, removal| {
                 if let Ok(WorkspaceRemoval::Removed) = &removal {
-                    server.projects.remove_workspace(project_id, &path);
+                    if let Some(project_id) = project_id {
+                        server.projects.remove_workspace(project_id, &path);
+                    }
                     // Their agents would be left in a deleted folder.
                     for thread_id in server.projects.threads_in_folder(&path) {
                         server.threads.remove(&thread_id);

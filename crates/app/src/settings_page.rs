@@ -422,7 +422,6 @@ impl SettingsPage {
     /// Asks first, then asks again when the server finds work that removing would lose.
     fn confirm_remove_workspace(
         &mut self,
-        project_id: ProjectId,
         workspace: &Workspace,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -451,7 +450,7 @@ impl SettingsPage {
             if answer.await != Ok(0) {
                 return;
             }
-            let removal = remove_workspace(&store, project_id, path.clone(), false, cx).await;
+            let removal = remove_workspace(&store, path.clone(), false, cx).await;
             let failure = match removal {
                 Ok(WorkspaceRemoval::NeedsConfirmation(reason)) => {
                     let answer = cx.update(|window, cx| {
@@ -469,9 +468,7 @@ impl SettingsPage {
                     if answer.await != Ok(0) {
                         return;
                     }
-                    remove_workspace(&store, project_id, path, true, cx)
-                        .await
-                        .err()
+                    remove_workspace(&store, path, true, cx).await.err()
                 }
                 Ok(_) => None,
                 Err(error) => Some(error),
@@ -502,7 +499,6 @@ impl SettingsPage {
         project: &Project,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let project_id = project.id;
         let Some(store) = self.machines.read(cx).projects(machine, cx) else {
             return div().into_any_element();
         };
@@ -556,7 +552,7 @@ impl SettingsPage {
                         Button::new(("remove-workspace", index), "Remove…")
                             .style(ButtonStyle::Outlined)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_remove_workspace(project_id, &workspace, window, cx)
+                                this.confirm_remove_workspace(&workspace, window, cx)
                             })),
                     )
                     .into_any_element()
@@ -4020,17 +4016,14 @@ impl SettingsPage {
     }
 }
 
-async fn remove_workspace(
+pub(crate) async fn remove_workspace(
     store: &Entity<ProjectStore>,
-    project_id: ProjectId,
     path: PathBuf,
     force: bool,
     cx: &mut gpui::AsyncWindowContext,
 ) -> anyhow::Result<WorkspaceRemoval> {
     store
-        .read_with(cx, |store, cx| {
-            store.remove_workspace(project_id, path, force, cx)
-        })
+        .read_with(cx, |store, cx| store.remove_workspace(path, force, cx))
         .await
 }
 

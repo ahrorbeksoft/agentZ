@@ -2476,7 +2476,6 @@ async fn threads_work_in_worktrees_and_pastures() {
     // Removing asks first when work would be lost.
     let Response::WorkspaceRemoval(removal) = client
         .ok(Request::RemoveWorkspace {
-            project_id,
             path: worktree.clone(),
             force: false,
         })
@@ -2487,7 +2486,6 @@ async fn threads_work_in_worktrees_and_pastures() {
     assert!(matches!(removal, WorkspaceRemoval::NeedsConfirmation(_)));
     let Response::WorkspaceRemoval(removal) = client
         .ok(Request::RemoveWorkspace {
-            project_id,
             path: worktree.clone(),
             force: true,
         })
@@ -2502,6 +2500,39 @@ async fn threads_work_in_worktrees_and_pastures() {
             .workspaces
             .iter()
             .all(|workspace| workspace.path != worktree)
+    );
+
+    // Any linked worktree goes too, one the project never made (herdr's Delete worktree
+    // checkout), keeping its branch.
+    let outside = tempfile::tempdir().expect("tempdir");
+    let linked = outside.path().join("linked");
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            &linked.to_string_lossy(),
+        ],
+    )
+    .await;
+    let Response::WorkspaceRemoval(removal) = client
+        .ok(Request::RemoveWorkspace {
+            path: linked.clone(),
+            force: false,
+        })
+        .await
+    else {
+        panic!("expected a removal");
+    };
+    assert_eq!(removal, WorkspaceRemoval::Removed);
+    assert!(!linked.exists());
+    assert!(
+        git(&repository, &["branch", "--list", "linked"])
+            .await
+            .contains("linked")
     );
 
     // A thread in the checkout hands itself off, and its continuation runs in the new folder.

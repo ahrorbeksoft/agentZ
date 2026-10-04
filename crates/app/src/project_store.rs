@@ -429,17 +429,12 @@ impl ProjectStore {
     /// Removes a worktree or pasture; without `force`, work it would lose is reported first.
     pub fn remove_workspace(
         &self,
-        project_id: ProjectId,
         path: PathBuf,
         force: bool,
         cx: &App,
     ) -> Task<Result<WorkspaceRemoval>> {
         self.request(
-            Request::RemoveWorkspace {
-                project_id,
-                path,
-                force,
-            },
+            Request::RemoveWorkspace { path, force },
             |response| match response {
                 Response::WorkspaceRemoval(removal) => Some(removal),
                 _ => None,
