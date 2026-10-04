@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{ConnectionStatus, handoff};
-use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
+use agentz_protocol::workspace::{RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{ConnectionId, Request, Response};
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
@@ -82,6 +82,11 @@ impl Server {
                             .await
                     },
                     move |server, checkouts| {
+                        let data_dir = super::terminal_requests::home_relative(&server.data_dir);
+                        let checkouts = checkouts.map(|checkouts| RepositoryCheckouts {
+                            data_dir,
+                            ..checkouts
+                        });
                         server.respond(client, id, checkouts.map(Response::RepositoryCheckouts))
                     },
                 );

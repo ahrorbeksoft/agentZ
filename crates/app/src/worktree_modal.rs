@@ -13,7 +13,10 @@ use gpui::{
 };
 use projects::WorkspaceKind;
 use text_input::{TextInput, TextInputEvent};
-use ui::{CommonAnimationExt as _, ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};
+use ui::{
+    CommonAnimationExt as _, ContextMenu, ListItem, ListItemSpacing, PopoverMenu,
+    WithScrollbar as _, prelude::*,
+};
 
 use crate::machines::{MachineId, Machines, project_at};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
@@ -56,6 +59,8 @@ pub struct WorktreeModal {
     mode: WorktreeModalMode,
     projects: Option<Entity<ProjectStore>>,
     input: Entity<TextInput>,
+    /// What the new branch starts from; what the workspace has checked out when unset.
+    base: Option<String>,
     /// Loaded when the modal opens, or why it couldn't be.
     repository: Option<Result<RepositoryCheckouts, SharedString>>,
     /// What [`WorktreeModalMode::Open`] lists: the checkouts besides the workspace's own.
@@ -128,6 +133,7 @@ impl WorktreeModal {
             mode,
             projects,
             input,
+            base: None,
             repository: None,
             rows: Vec::new(),
             selected_index: 0,
@@ -255,10 +261,13 @@ impl WorktreeModal {
             cx.notify();
             return;
         }
-        let created =
-            projects
-                .read(cx)
-                .create_workspace(self.folder.clone(), kind, Some(branch.clone()), cx);
+        let created = projects.read(cx).create_workspace(
+            self.folder.clone(),
+            kind,
+            self.base.clone(),
+            Some(branch.clone()),
+            cx,
+        );
         self.creating =
             Some(format!("Making the {} for {branch}…", kind.label().to_lowercase()).into());
         self.error = None;
@@ -467,18 +476,102 @@ impl WorktreeModal {
                 .into_any_element();
         }
         let hint = match self.mode {
-            WorktreeModalMode::New => {
-                let base = self
-                    .checkouts()
-                    .and_then(|repository| repository.git.branch.clone())
-                    .unwrap_or_else(|| "HEAD".to_string());
-                format!("The branch starts from {base} · Enter makes it and opens a terminal there")
-            }
-            WorktreeModalMode::Open => "Enter opens a terminal there".to_string(),
+            WorktreeModalMode::New => "Enter makes it and opens a terminal there",
+            WorktreeModalMode::Open => "Enter opens a terminal there",
         };
         footer
             .child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))
             .into_any_element()
+    }
+}
+
+impl WorktreeModal {
+    /// The branch the new one starts from.
+    fn base_branch(&self) -> String {
+        self.base
+            .clone()
+            .or_else(|| self.checkouts()?.git.branch.clone())
+            .unwrap_or_else(|| "HEAD".to_string())
+    }
+
+    /// Where the selected kind would be made: the server's data folder, the kind's folder,
+    /// the repository, and the branch with `/` as `-` (`workspaces::create`).
+    fn location(&self, cx: &App) -> Option<String> {
+        let repository = self.checkouts()?;
+        let name = repository.checkouts.first()?.path.file_name()?;
+        let folder = match new_row_kind(self.selected_index) {
+            WorkspaceKind::Worktree => "worktrees",
+            WorkspaceKind::Pasture => "pastures",
+        };
+        let branch = self.input.read(cx).text().trim().replace('/', "-");
+        Some(format!(
+            "{}/{folder}/{}/{branch}",
+            repository.data_dir,
+            name.to_string_lossy()
+        ))
+    }
+
+    /// New Worktree's second line: the base branch, which can be changed, and where the
+    /// checkout goes.
+    fn render_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border_variant = cx.theme().colors().border_variant;
+        let branches = self
+            .checkouts()
+            .map(|repository| repository.git.branches.clone())
+            .unwrap_or_default();
+        let this = cx.entity().downgrade();
+        h_flex()
+            .px_3()
+            .py_1()
+            .gap_2()
+            .border_b_1()
+            .border_color(border_variant)
+            .child(
+                Label::new("From")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                PopoverMenu::new("worktree-modal-base")
+                    .trigger(
+                        Button::new("worktree-modal-base-button", self.base_branch())
+                            .label_size(LabelSize::Small)
+                            .end_icon(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .menu(move |window, cx| {
+                        let this = this.clone();
+                        let branches = branches.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for branch in &branches {
+                                let this = this.clone();
+                                let choice = branch.clone();
+                                menu = menu.entry(branch.clone(), None, move |_, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.base = Some(choice.clone());
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                });
+                            }
+                            menu
+                        }))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .children(self.location(cx).map(|location| {
+                        Label::new(format!("in {location}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate_middle()
+                    })),
+            )
     }
 }
 
@@ -569,6 +662,9 @@ impl Render for WorktreeModal {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .child(self.render_header(cx))
+            .when(self.mode == WorktreeModalMode::New, |modal| {
+                modal.child(self.render_details(cx))
+            })
             .child(
                 div()
                     .id("worktree-modal-rows-scroll")
@@ -665,6 +761,7 @@ mod tests {
                             Some(WorkspaceKind::Pasture),
                         ),
                     ],
+                    data_dir: "~/.agentz".to_string(),
                 }),
                 cx,
             )

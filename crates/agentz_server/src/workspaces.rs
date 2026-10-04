@@ -565,7 +565,11 @@ pub(crate) async fn repository_checkouts(
             kind: Some(WorkspaceKind::Pasture),
         });
     }
-    Ok(RepositoryCheckouts { git, checkouts })
+    Ok(RepositoryCheckouts {
+        git,
+        checkouts,
+        data_dir: String::new(),
+    })
 }
 
 /// The repository's checkouts as `git worktree list` has them, the main one first. Bare and

@@ -45,6 +45,10 @@ pub struct RepositoryCheckouts {
     /// The main checkout first, then its worktrees (`git worktree list`), then the pastures
     /// of the project it is, if any.
     pub checkouts: Vec<Checkout>,
+    /// Where the server makes worktrees and pastures (its data folder), as its user writes it:
+    /// `~/.agentz`.
+    #[serde(default)]
+    pub data_dir: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

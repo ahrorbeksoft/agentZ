@@ -408,6 +408,7 @@ impl ProjectStore {
         &self,
         folder: PathBuf,
         kind: WorkspaceKind,
+        base: Option<String>,
         branch: Option<String>,
         cx: &App,
     ) -> Task<Result<PathBuf>> {
@@ -415,7 +416,7 @@ impl ProjectStore {
             Request::CreateWorkspace {
                 folder,
                 kind,
-                base: None,
+                base,
                 branch,
             },
             |response| match response {
