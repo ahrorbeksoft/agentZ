@@ -2,49 +2,27 @@
 
 Picked on the design board (`design/dragging/`, see `design/README.md`). Each section is the spec for that part: build the picked option as described, with the comments applied. Generated from `choices.json`; don't edit by hand.
 
-## 1. What follows the pointer when you drag a pane: Not decided yet
+## 1. The tab shows the result as you drag: Not decided yet
 
 *Panes*
 
-**Today:** Dragging a pane's header carries a small label with its title ("Shell"). It used to stay where the label started, far from the pointer when you grabbed the header by its far end (the screenshot); since the last fix it sits just past the pointer. The half it would split off, or all of the pane for a swap, is shaded.
+**Today:** Today a small label follows the pointer, the pane stays where it is, and the spot it would take is shaded (the screenshot). In all of these, the tab shows the result while you drag instead: the pane leaves its place, and the other panes move to make room for it where it would land, so what you see is what you get when you let go. The small preview of the pane follows the pointer. Pointing at its new place changes nothing; pointing at another pane moves it there (near an edge it splits that pane, in the middle the two swap); back over its own place, everything is as it was. Here npm run dev goes to Claude Code's right edge, swaps with it, swaps back and goes home. The options differ in what fills its place while you drag.
 
-## 2. The whole pane, slightly dimmed: Not decided yet
-
-*Panes*
-
-**Today:** Nothing like it today. If you pick F in the first topic, these are the ways it could look. npm run dev, grabbed by its header, is over Claude Code's right edge, so dropping puts it on the right of Claude Code. D and E show the drop themselves, in place of the shading of "Where the pane will land".
-
-## 3. The pane you're moving, while you drag: Not decided yet
+## 2. How the panes move to the new layout: Not decided yet
 
 *Panes*
 
-**Today:** It stays exactly as it was, focused (clicking its header to start the drag focuses it). Shown here with the small preview (B above).
+**Today:** Nothing moves today. The same drag as in the topic before, shown with its D (icon and name); only the way the panes get from one layout to the next differs.
 
-## 4. Where the pane will land: Not decided yet
-
-*Panes*
-
-**Today:** As in Zed: near an edge (a fifth of the pane's shorter side), the half the dragged pane would take is shaded gray; in the middle, all of the pane is, and dropping swaps the two. Shown here with the small preview.
-
-## 5. What follows the pointer when you drag a tab: Not decided yet
+## 3. The tab slides along the bar: B. Slides, raised
 
 *Tabs*
 
-**Today:** The same small label as for panes follows the pointer, and the tab it's over is shaded; dropping puts the dragged tab in that tab's place. Here server (docker compose up beside a shell) is dragged onto agents.
+**Today:** Today the tab's name follows the pointer in a small label and the tab under it is shaded; letting go puts it in that tab's place. In all of these, the tab itself moves instead, only sideways: it stays in the bar however far up or down the pointer goes. As its edge passes the middle of the next tab, that tab slides over into its old place, so the order changes while you drag, and letting go leaves it where it is. When there are more tabs than fit, holding it near an end scrolls the bar. Each one moves: server slides left past agents and back.
 
-## 6. The tab slides along the bar: Not decided yet
+**B. Slides, raised** (from Zed dragged tab (a copy held where you grabbed it), kept in the bar): As A, and the tab is raised while you hold it: a lighter background, full-strength text and a shadow, so it stands apart from the tabs it passes.
 
-*Tabs*
-
-**Today:** Nothing like it today. If you pick F in the first Tabs topic, these are the ways it could look. Each one moves: server slides left past agents, which moves over to take its place, then back. In all of them the tab stays in the bar however far up or down the pointer goes, letting go leaves it where it is, and there are more tabs than fit.
-
-## 7. Where the tab will land: Not decided yet
-
-*Tabs*
-
-**Today:** The tab under the pointer is shaded gray, and the dragged tab takes its place. The tab you're moving stays as it is. Shown here with the small preview of the tab. If the tab slides along the bar (F in the first Tabs topic), the order changes as you drag and that settles this topic: it's C.
-
-## 8. Dragging a workspace row: Not decided yet
+## 4. Dragging a workspace row: Not decided yet
 
 *Sidebar*
 
