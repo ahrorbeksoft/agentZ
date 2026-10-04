@@ -511,8 +511,10 @@ since a thread's workspace is its checkout.
   project: a draft in the checkout the workspace is in, in the Agents view), Close Workspace,
   and in a git repository (a project or not) New Worktree… and Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch
   (herdr's generated `agentz/<adjective>-<noun>-<hex>` by default) and makes a worktree or a
-  pasture of the repository's main checkout from what the workspace has checked out
-  (`Request::CreateWorkspace`, no thread in it; a project's is recorded as its workspace). Open
+  pasture of the repository's main checkout from what the workspace has checked out, or a
+  branch picked in the dialog, which also says where it will be made (the server's data
+  folder, `RepositoryCheckouts::data_dir`) (`Request::CreateWorkspace`, no thread in it; a
+  project's is recorded as its workspace). Open
   Worktree… lists the repository's other checkouts (`Request::RepositoryCheckouts`: `git worktree
   list`, then a project's pastures). Either opens as a new workspace with a shell.
 - **Tabs**: a tab the user hasn't named takes the title of its focused pane (what runs there),
