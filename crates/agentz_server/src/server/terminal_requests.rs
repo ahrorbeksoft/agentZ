@@ -78,9 +78,6 @@ impl Server {
         request: Request,
     ) -> Result<Response> {
         match request {
-            Request::TerminalPrograms => {
-                Ok(Response::TerminalPrograms(terminal_programs::find_on_path()))
-            }
             Request::DrawerTerminals(thread) => {
                 let mut numbers: Vec<u32> = self
                     .terminals

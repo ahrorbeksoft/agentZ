@@ -2,8 +2,6 @@
 //! `terminal` crate (`Content`, `Modes`, `Cursor`), cut down to what crosses the wire: lines of
 //! styled runs rather than cells, and only the lines that changed.
 
-use std::path::PathBuf;
-
 use projects::ThreadId;
 use serde::{Deserialize, Serialize};
 
@@ -52,16 +50,6 @@ impl TerminalKey {
             Self::Pane(_) | Self::Login(crate::ConnectionId::Account(_)) => None,
         }
     }
-}
-
-/// An agent CLI found on the server's `PATH`, for New Thread › Terminal.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalProgram {
-    /// The command's name, such as `claude`.
-    pub command: String,
-    /// What New Thread shows, such as "Claude Code".
-    pub label: String,
-    pub path: PathBuf,
 }
 
 /// The terminal modes a client needs to turn keys, mouse and paste into bytes (Zed's `Modes`,

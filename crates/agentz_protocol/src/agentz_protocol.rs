@@ -39,9 +39,7 @@ use crate::agents::{
 };
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
-use crate::terminal::{
-    TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalProgram,
-};
+use crate::terminal::{TerminalCommand, TerminalFrame, TerminalInput, TerminalKey};
 use crate::thread::{ThreadUpdate, ThreadView};
 use crate::workspace::{ProjectGit, RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval};
 
@@ -282,8 +280,6 @@ pub enum Request {
         #[serde(default)]
         workspace: WorkspaceChoice,
     },
-    /// Agent CLIs on the server's `PATH`: [`Response::TerminalPrograms`].
-    TerminalPrograms,
     /// The numbers of the thread's drawer terminals running now:
     /// [`Response::DrawerTerminals`].
     DrawerTerminals(ThreadId),
@@ -626,7 +622,6 @@ pub enum Response {
     WorkspaceRemoval(WorkspaceRemoval),
     WorkspaceCreated(PathBuf),
     RepositoryCheckouts(RepositoryCheckouts),
-    TerminalPrograms(Vec<TerminalProgram>),
     DrawerTerminals(Vec<u32>),
     TerminalFrame(TerminalFrame),
     Directories(DirectoryListing),

@@ -864,8 +864,7 @@ impl Server {
             Request::ThreadDiff { .. } | Request::RestoreCheckpoint { .. } => {
                 Err(anyhow!("diffs are handled separately"))
             }
-            request @ (Request::TerminalPrograms
-            | Request::DrawerTerminals(_)
+            request @ (Request::DrawerTerminals(_)
             | Request::SubscribeTerminal(_)
             | Request::UnsubscribeTerminal(_)
             | Request::TerminalInput { .. }

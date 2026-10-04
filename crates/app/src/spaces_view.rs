@@ -15,7 +15,7 @@ use agentz_protocol::spaces::{
     Pane, PaneContent, PaneTerminal, Space, SpaceFolder, SpaceGit, SpaceId, SpaceRequest, Tab,
     TabId,
 };
-use agentz_protocol::terminal::{TerminalKey, TerminalProgram};
+use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
@@ -309,9 +309,6 @@ pub struct SpacesView {
     collapsed_groups: HashSet<GroupKey>,
     /// Workspaces by when they were last used here, most recent first, for New Workspace.
     recent_spaces: Vec<SpaceKey>,
-    /// Each machine's agent CLIs, for the split menu.
-    programs: HashMap<MachineId, Vec<TerminalProgram>>,
-    programs_requested: HashSet<MachineId>,
     /// The row whose counts are under the mouse, which show a tooltip instead of the details.
     hovered_contents: Option<SpaceKey>,
     is_visible: bool,
@@ -365,8 +362,6 @@ impl SpacesView {
             hovered_space: None,
             collapsed_groups: HashSet::default(),
             recent_spaces: Vec::new(),
-            programs: HashMap::default(),
-            programs_requested: HashSet::default(),
             hovered_contents: None,
             is_visible: false,
             _subscriptions: subscriptions,
@@ -434,10 +429,6 @@ impl SpacesView {
     /// Follows the servers' spaces: drops what's gone, and notices agents finishing.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let spaces = self.all_spaces(cx);
-        let machines: HashSet<MachineId> = spaces.iter().map(|(machine, _)| *machine).collect();
-        for machine in machines {
-            self.load_programs(machine, cx);
-        }
         let mut live_spaces = HashSet::default();
         let mut live_tabs = HashSet::default();
         let mut live_panes: HashMap<PaneKey, Pane> = HashMap::default();
@@ -857,23 +848,12 @@ impl SpacesView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.split_with(pane, direction, new_shell(), window, cx);
-    }
-
-    fn split_with(
-        &mut self,
-        pane: PaneKey,
-        direction: Direction,
-        content: PaneContent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         self.request(
             pane.machine,
             SpaceRequest::SplitPane {
                 pane: pane.pane,
                 direction,
-                content,
+                content: new_shell(),
             },
             window,
             cx,
@@ -913,26 +893,6 @@ impl SpacesView {
             }
             Ok(_) => {}
             Err(error) => log::error!("splitting for a thread failed: {error:#}"),
-        })
-        .detach();
-    }
-
-    /// The agent CLIs on each machine's `PATH`, asked for once, for the split menu.
-    fn load_programs(&mut self, machine: MachineId, cx: &mut Context<Self>) {
-        if !self.programs_requested.insert(machine) {
-            return;
-        }
-        let Some(client) = self.machines.read(cx).client(machine, cx) else {
-            return;
-        };
-        let response = client.read(cx).request(Request::TerminalPrograms);
-        cx.spawn(async move |this, cx| {
-            if let Ok(Response::TerminalPrograms(programs)) = response.await {
-                this.update(cx, |this, _| {
-                    this.programs.insert(machine, programs);
-                })
-                .ok();
-            }
         })
         .detach();
     }
@@ -3104,8 +3064,6 @@ impl SpacesView {
             .map(|open| open.view.clone());
         let split_menu = {
             let this = cx.entity().downgrade();
-            let programs = self.programs.get(&key.machine).cloned().unwrap_or_default();
-            let machine_label = self.machines.read(cx).label(key.machine, cx);
             PopoverMenu::new(key.element_id("pane-split"))
                 .trigger_with_tooltip(
                     IconButton::new(key.element_id("pane-split-button"), IconName::Split)
@@ -3115,16 +3073,11 @@ impl SpacesView {
                 .anchor(gpui::Anchor::TopRight)
                 .menu(move |window, cx| {
                     let this = this.clone();
-                    let programs = programs.clone();
-                    let machine_label = machine_label.clone();
                     Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                        // Each way to split: a shell, an agent CLI on the machine, or a
-                        // thread.
+                        // Each way to split: a shell or a thread.
                         let choices = move |direction: Direction| {
                             let this = this.clone();
-                            let programs = programs.clone();
-                            let machine_label = machine_label.clone();
-                            move |mut menu: ContextMenu,
+                            move |menu: ContextMenu,
                                   _: &mut Window,
                                   _: &mut Context<ContextMenu>| {
                                 let action: Box<dyn Action> = match direction {
@@ -3132,45 +3085,25 @@ impl SpacesView {
                                     Direction::Vertical => Box::new(SplitDown),
                                 };
                                 let shell = this.clone();
-                                menu = menu.entry("Shell", Some(action), move |window, cx| {
+                                let thread = this.clone();
+                                menu.entry("Shell", Some(action), move |window, cx| {
                                     shell
                                         .update(cx, |this, cx| {
-                                            this.split_with(key, direction, new_shell(), window, cx)
+                                            this.split(key, direction, window, cx)
                                         })
                                         .ok();
-                                });
-                                if !programs.is_empty() {
-                                    menu = menu.header(format!("Agent CLIs on {machine_label}"));
-                                    for program in &programs {
-                                        let this = this.clone();
-                                        let command = program.command.clone();
-                                        menu = menu.entry(
-                                            program.label.clone(),
-                                            None,
-                                            move |window, cx| {
-                                                let content = PaneContent::Terminal(PaneTerminal {
-                                                    folder: PathBuf::new(),
-                                                    command: Some(command.clone()),
-                                                });
-                                                this.update(cx, |this, cx| {
-                                                    this.split_with(
-                                                        key, direction, content, window, cx,
-                                                    )
-                                                })
-                                                .ok();
-                                            },
-                                        );
-                                    }
-                                }
-                                let thread = this.clone();
-                                menu.separator()
-                                    .entry("New Thread…", None, move |window, cx| {
+                                })
+                                .entry(
+                                    "New Thread…",
+                                    None,
+                                    move |window, cx| {
                                         thread
                                             .update(cx, |this, cx| {
                                                 this.split_with_thread(key, direction, window, cx)
                                             })
                                             .ok();
-                                    })
+                                    },
+                                )
                             }
                         };
                         menu.submenu("Split Right", choices(Direction::Horizontal))

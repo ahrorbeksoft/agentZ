@@ -15,6 +15,8 @@ Notes for whoever continues:
 - §3 is A plus E's "Needs you" strip (the user's "E too" on §17 meant §3's E).
 - §15 is A plus C's dialog, without C's "Open with".
 - §19E: the sheet shows the shortcuts for what's focused (terminal, thread, sidebar) too.
+- §11: after it was built, the user dropped the agent CLIs: Split Right and Split Down offer a
+  shell or a new thread, and nothing scans the machine for agent CLIs.
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -31,7 +33,7 @@ Notes for whoever continues:
 | 11 | 3E | "Needs you" strip on top of the sidebar | done |
 | 12 | 17 | Badge on the Agents / Workspaces switch | done |
 | 13 | 13 | New workspace picker: Recent first, Open marks | done |
-| 14 | 11 | Split menu: Shell, agent CLIs on the machine, New Thread | done (a15a4bd; Cmd-D fixed in the next commit) |
+| 14 | 11 | Split menu: Shell, New Thread | done (a15a4bd, 07b7f86; agent CLIs dropped after) |
 | 15 | 10 | Drag a pane: edges split, middle swaps | not started |
 | 16 | 18 | Find in terminal (Cmd-F) | not started |
 | 17 | 19E | Shortcut sheet (Cmd-/), by focus | not started |
