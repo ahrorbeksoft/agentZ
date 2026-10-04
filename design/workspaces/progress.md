@@ -17,6 +17,18 @@ Notes for whoever continues:
 - §19E: the sheet shows the shortcuts for what's focused (terminal, thread, sidebar) too.
 - §11: after it was built, the user dropped the agent CLIs: Split Right and Split Down offer a
   shell or a new thread, and nothing scans the machine for agent CLIs.
+- Threads started in a pane (the user's decisions after §11):
+  - Every thread started in a pane (New Thread…, Split › New Thread…) is a Workspaces thread,
+    even in a project's folder. It works in the shell's current folder, else the workspace's.
+  - The Agents sidebar lists them in a "Workspaces" section just above Archived, styled like
+    it. Under All projects it lists all of them; under a project, those whose folder is in it.
+  - In the Agents sidebar they don't ask for attention: no state marks, not counted on the
+    switch. In the Workspaces view they show their state like any other agent.
+  - Closing the pane leaves the thread in that section.
+  - Move to Agents on its row (like Unarchive) makes it a thread of the project its folder is
+    in. Outside every project it first asks to add the folder as a project.
+  - Search covers the scope's threads, its Workspaces threads and its archived threads; under
+    All projects, every thread.
 
 | Order | § | Item | Status |
 |---|---|---|---|
