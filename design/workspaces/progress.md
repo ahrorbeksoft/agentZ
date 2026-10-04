@@ -51,7 +51,7 @@ Notes for whoever continues:
 | — | — | Threads started in panes (above; designs in `design/pane-threads/`) | done |
 | 15 | 10 | Drag a pane: edges split, middle swaps | done (6da7f7a) |
 | 16 | 18 | Find in terminal (Cmd-F) | done (defd471) |
-| 17 | 19E | Shortcut sheet (Cmd-/), by focus | done |
-| 18 | 16 | Command palette (Cmd-K) | not started |
+| 17 | 19E | Shortcut sheet (Cmd-/), by focus | done (df4e01b) |
+| 18 | 16 | Command palette (Cmd-K) | done (the user split it in two, Zed's keys: Cmd-Shift-P for actions, Cmd-P to go to workspaces, tabs, panes and threads, in both views) |
 | 19 | 14 | Save a tab as a layout | not started |
 | 20 | 19D | Notes pane (needs a multi-line editor) | not started |

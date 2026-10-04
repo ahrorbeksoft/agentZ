@@ -23,8 +23,8 @@ use crate::terminal_view::{
     SelectNextMatch, SelectPreviousMatch,
 };
 use crate::{
-    NewThread, OpenFolder, OpenSettings, Quit, ShowShortcuts, ToggleDiff, ToggleProjectSwitcher,
-    ToggleSidebar, ToggleTerminalDrawer, shell, sidebar,
+    GoTo, NewThread, OpenFolder, OpenSettings, Quit, ShowShortcuts, ToggleCommandPalette,
+    ToggleDiff, ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer, shell, sidebar,
 };
 
 const KEY_CONTEXT: &str = "ShortcutSheet";
@@ -197,15 +197,18 @@ fn shortcut_groups(context_stack: &[KeyContext], cx: &App) -> Vec<ShortcutGroup>
         let mut general = vec![
             entry("New Thread…", &NewThread),
             entry("Open Folder…", &OpenFolder),
-            entry("Switch Project…", &ToggleProjectSwitcher),
             entry("Toggle Sidebar", &ToggleSidebar),
         ];
-        // The open thread's panels, which the Workspaces view doesn't show.
+        // The project switcher and the open thread's panels, which the Workspaces view
+        // doesn't show.
         if !in_workspaces {
+            general.push(entry("Switch Project…", &ToggleProjectSwitcher));
             general.push(entry("Toggle Changes", &ToggleDiff));
             general.push(entry("Toggle Terminal", &ToggleTerminalDrawer));
         }
         general.extend([
+            entry("Command Palette", &ToggleCommandPalette),
+            entry("Go To…", &GoTo),
             entry("Show Shortcuts", &ShowShortcuts),
             entry("Settings…", &OpenSettings),
             entry("Quit agentZ", &Quit),

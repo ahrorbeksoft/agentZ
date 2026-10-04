@@ -7,8 +7,8 @@ use agentz_protocol::workspace::WorkspaceChoice;
 use anyhow::Result;
 use collections::HashMap;
 use gpui::{
-    AnyView, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable,
-    MouseButton, PathPromptOptions, Subscription, SystemNotification, Task, Window,
+    AnyView, App, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, MouseButton, PathPromptOptions, Subscription, SystemNotification, Task, Window,
     WindowControlArea,
 };
 use projects::{Thread, ThreadId};
@@ -21,8 +21,10 @@ use util::ResultExt as _;
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
 use crate::app_settings::{AppSettingsStore, MachineProfile, is_sidebar_hidden};
+use crate::command_palette::CommandPalette;
 use crate::confirm_dialog::{ConfirmDialog, ConfirmRequest};
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
+use crate::go_to_picker::{GoToPicker, Place, thread_places};
 use crate::machine_modal::MachineModal;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
@@ -36,8 +38,8 @@ use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
-    NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleDiff, ToggleProjectSwitcher,
-    ToggleSidebar, ToggleTerminalDrawer,
+    GoTo, NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleCommandPalette, ToggleDiff,
+    ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer,
 };
 
 pub const KEY_CONTEXT: &str = "Shell";
@@ -114,8 +116,17 @@ impl ThreadView {
     }
 }
 
-struct OpenShortcutSheet {
-    sheet: Entity<ShortcutSheet>,
+/// The modals opened over whatever has focus, which give it back when they close.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OverlayKind {
+    ShortcutSheet,
+    CommandPalette,
+    GoTo,
+}
+
+struct Overlay {
+    kind: OverlayKind,
+    view: AnyView,
     /// What had focus, which gets it back, as Zed's modal layer gives it back.
     previous_focus: Option<FocusHandle>,
     _subscription: Subscription,
@@ -135,7 +146,7 @@ pub struct Shell {
     worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
     machine_modal: Option<(Entity<MachineModal>, Subscription)>,
     confirm_dialog: Option<(Entity<ConfirmDialog>, Subscription)>,
-    shortcut_sheet: Option<OpenShortcutSheet>,
+    overlay: Option<Overlay>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
@@ -298,7 +309,7 @@ impl Shell {
             worktree_modal: None,
             machine_modal: None,
             confirm_dialog: None,
-            shortcut_sheet: None,
+            overlay: None,
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
@@ -898,10 +909,10 @@ impl Shell {
         let had_worktree_modal = self.worktree_modal.take().is_some();
         let had_machine_modal = self.machine_modal.take().is_some();
         let had_confirm_dialog = self.confirm_dialog.take().is_some();
-        let shortcut_sheet = self.shortcut_sheet.take();
-        if let Some(focus) = shortcut_sheet
+        let overlay = self.overlay.take();
+        if let Some(focus) = overlay
             .as_ref()
-            .and_then(|sheet| sheet.previous_focus.clone())
+            .and_then(|overlay| overlay.previous_focus.clone())
         {
             window.focus(&focus, cx);
             cx.notify();
@@ -910,41 +921,148 @@ impl Shell {
             || had_worktree_modal
             || had_machine_modal
             || had_confirm_dialog
-            || shortcut_sheet.is_some()
+            || overlay.is_some()
         {
             self.focus_main(window, cx);
             cx.notify();
         }
     }
 
-    /// Opens the shortcut sheet for what's focused, or closes it.
-    fn toggle_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shortcut_sheet.is_some() {
-            self.dismiss_modal(window, cx);
-            return;
-        }
-        // Another modal shows first, so the sheet would take its focus unseen.
+    /// Whether an overlay of `kind` may open. Its key closes it when it's open, and it takes
+    /// another overlay's place, focus given back first, as Zed's modals replace each other.
+    fn make_room_for(
+        &mut self,
+        kind: OverlayKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Another modal shows first, so the overlay would take its focus unseen.
         if self.new_thread_modal.is_some()
             || self.add_project_modal.is_some()
             || self.worktree_modal.is_some()
             || self.machine_modal.is_some()
             || self.confirm_dialog.is_some()
         {
+            return false;
+        }
+        match self.overlay_kind() {
+            Some(open) => {
+                self.dismiss_modal(window, cx);
+                open != kind
+            }
+            None => true,
+        }
+    }
+
+    fn open_overlay<V: Render + EventEmitter<DismissEvent>>(
+        &mut self,
+        kind: OverlayKind,
+        view: Entity<V>,
+        previous_focus: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription =
+            cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            });
+        self.overlay = Some(Overlay {
+            kind,
+            view: view.into(),
+            previous_focus,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn overlay_kind(&self) -> Option<OverlayKind> {
+        self.overlay.as_ref().map(|overlay| overlay.kind)
+    }
+
+    /// Opens the shortcut sheet for what's focused, or closes it.
+    fn toggle_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.make_room_for(OverlayKind::ShortcutSheet, window, cx) {
             return;
         }
         let context_stack = window.context_stack();
         let previous_focus = window.focused(cx);
         let sheet = cx.new(|cx| ShortcutSheet::new(context_stack, window, cx));
-        let subscription =
-            cx.subscribe_in(&sheet, window, |this, _, _: &DismissEvent, window, cx| {
-                this.dismiss_modal(window, cx);
-            });
-        self.shortcut_sheet = Some(OpenShortcutSheet {
+        self.open_overlay(
+            OverlayKind::ShortcutSheet,
             sheet,
             previous_focus,
-            _subscription: subscription,
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the command palette for what's focused, or closes it.
+    fn toggle_command_palette(
+        &mut self,
+        _: &ToggleCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.make_room_for(OverlayKind::CommandPalette, window, cx) {
+            return;
+        }
+        let Some(previous_focus) = window.focused(cx) else {
+            return;
+        };
+        let palette = {
+            let previous_focus = previous_focus.clone();
+            cx.new(|cx| CommandPalette::new(previous_focus, window, cx))
+        };
+        self.open_overlay(
+            OverlayKind::CommandPalette,
+            palette,
+            Some(previous_focus),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens Go To, the view on screen's places first, or closes it.
+    fn toggle_go_to(&mut self, _: &GoTo, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.make_room_for(OverlayKind::GoTo, window, cx) {
+            return;
+        }
+        let workspaces = self.spaces_view.read(cx).places(cx);
+        let threads = thread_places(cx);
+        let places = match self.view {
+            MainView::Workspaces => workspaces.into_iter().chain(threads).collect(),
+            MainView::Agents => threads.into_iter().chain(workspaces).collect(),
+        };
+        let previous_focus = window.focused(cx);
+        let shell = cx.entity().downgrade();
+        let picker = cx.new(|cx| {
+            GoToPicker::new(
+                places,
+                move |place, window, cx| {
+                    shell
+                        .update(cx, |shell, cx| shell.go_to(place, window, cx))
+                        .ok();
+                },
+                window,
+                cx,
+            )
         });
-        cx.notify();
+        self.open_overlay(OverlayKind::GoTo, picker, previous_focus, window, cx);
+    }
+
+    /// Shows the place in its view and focuses it.
+    fn go_to(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        if let Place::Thread(thread) = place {
+            self.open_thread(thread, window, cx);
+            return;
+        }
+        self.set_view(MainView::Workspaces, window, cx);
+        self.spaces_view.update(cx, |view, cx| match place {
+            Place::Space(space) => view.activate_space(space, window, cx),
+            Place::Tab(tab) => view.activate_tab(tab, window, cx),
+            Place::Pane(pane) => view.focus_pane(pane, window, cx),
+            Place::Thread(_) => {}
+        });
     }
 
     /// Focus goes back to what the main area shows.
@@ -1450,13 +1568,20 @@ impl Render for Shell {
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_folder))
-            .on_action(cx.listener(Self::toggle_project_switcher))
             .on_action(cx.listener(Self::new_thread))
             .on_action(cx.listener(Self::open_settings))
-            .on_action(cx.listener(Self::toggle_diff))
             .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(Self::toggle_terminal_drawer))
+            // The Agents view's title bar and thread, which Workspaces doesn't show, so the
+            // command palette leaves them out there.
+            .when(self.view == MainView::Agents, |shell| {
+                shell
+                    .on_action(cx.listener(Self::toggle_project_switcher))
+                    .on_action(cx.listener(Self::toggle_diff))
+                    .on_action(cx.listener(Self::toggle_terminal_drawer))
+            })
             .on_action(cx.listener(Self::toggle_shortcuts))
+            .on_action(cx.listener(Self::toggle_command_palette))
+            .on_action(cx.listener(Self::toggle_go_to))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDiffEdge>, _, cx| {
                     let available = event.bounds.size.width - SIDEBAR_WIDTH - MIN_THREAD_WIDTH;
@@ -1564,11 +1689,7 @@ impl Render for Shell {
                             .as_ref()
                             .map(|(dialog, _)| AnyView::from(dialog.clone()))
                     })
-                    .or_else(|| {
-                        self.shortcut_sheet
-                            .as_ref()
-                            .map(|open| AnyView::from(open.sheet.clone()))
-                    }),
+                    .or_else(|| self.overlay.as_ref().map(|overlay| overlay.view.clone())),
                 |shell, modal| {
                     shell.child(
                         div()
@@ -1761,7 +1882,9 @@ mod modal_tests {
         });
         cx.run_until_parked();
         let is_open = |cx: &mut gpui::VisualTestContext| {
-            shell.read_with(cx, |shell, _| shell.shortcut_sheet.is_some())
+            shell.read_with(cx, |shell, _| {
+                shell.overlay_kind() == Some(OverlayKind::ShortcutSheet)
+            })
         };
 
         cx.simulate_keystrokes("cmd-/");
@@ -1782,6 +1905,165 @@ mod modal_tests {
         assert!(is_open(cx));
         cx.simulate_keystrokes("cmd-/");
         assert!(!is_open(cx));
+    }
+
+    /// A project with a thread, and its workspace with two tabs of one pane each.
+    fn init_places(cx: &mut TestAppContext) {
+        use agentz_protocol::layout::{Node, PaneId};
+        use agentz_protocol::spaces::{Pane, PaneContent, Space, SpaceId, Tab, TabId};
+
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let tab = |tab: u64, pane: u64| Tab {
+                id: TabId(tab),
+                name: None,
+                root: Node::Pane(PaneId(pane)),
+                panes: vec![Pane::new(
+                    PaneId(pane),
+                    PaneContent::Unknown(serde_json::Value::Null),
+                )],
+            };
+            let spaces = SpacesSnapshot {
+                spaces: vec![Space {
+                    id: SpaceId(1),
+                    name: None,
+                    folder: "/tmp/demo".into(),
+                    project_id: None,
+                    tabs: vec![tab(2, 3), tab(6, 7)],
+                    git: None,
+                    current: None,
+                }],
+            };
+            let client =
+                ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces, cx);
+            let projects = client.read(cx).projects().clone();
+            let thread: projects::Thread = serde_json::from_value(serde_json::json!({
+                "id": 5,
+                "project_id": 1,
+                "title": "Fix the login",
+                "agent_id": "mock",
+            }))
+            .expect("a thread");
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![Project {
+                            id: ProjectId(1),
+                            path: "/tmp/demo".into(),
+                            custom_name: None,
+                            icon: None,
+                            workspaces: Vec::new(),
+                            repository: None,
+                        }],
+                        threads: vec![thread],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            crate::command_palette::init(cx);
+            crate::go_to_picker::init(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn cmd_shift_p_runs_what_applies_where_it_was_opened(cx: &mut TestAppContext) {
+        init_places(cx);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            window.focus(&shell.focus_handle, cx)
+        });
+        cx.run_until_parked();
+        let is_open = |cx: &mut gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, _| {
+                shell.overlay_kind() == Some(OverlayKind::CommandPalette)
+            })
+        };
+
+        // The Agents view's actions, and not the Workspaces view's.
+        cx.simulate_keystrokes("cmd-shift-p");
+        assert!(is_open(cx));
+        assert!(cx.debug_bounds("command-agentz: toggle diff").is_some());
+        assert!(cx.debug_bounds("command-workspaces: split right").is_none());
+        // A list's own keys aren't commands.
+        assert!(cx.debug_bounds("command-menu: confirm").is_none());
+
+        // Filtered as typed, it runs the chosen one where it was opened.
+        cx.simulate_input("toggle diff");
+        assert!(cx.debug_bounds("command-agentz: toggle sidebar").is_none());
+        cx.simulate_keystrokes("enter");
+        assert!(!is_open(cx));
+        assert!(shell.read_with(cx, |shell, _| shell.show_diff));
+        shell.update_in(cx, |shell, window, _| {
+            assert!(shell.focus_handle.is_focused(window));
+        });
+
+        shell.update_in(cx, |shell, window, cx| {
+            shell.set_view(MainView::Workspaces, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-p");
+        assert!(cx.debug_bounds("command-workspaces: split right").is_some());
+        assert!(cx.debug_bounds("command-agentz: toggle diff").is_none());
+        // Its key closes it, and Go To's opens Go To in its place.
+        cx.simulate_keystrokes("cmd-shift-p");
+        assert!(!is_open(cx));
+        cx.simulate_keystrokes("cmd-shift-p cmd-p");
+        assert_eq!(
+            shell.read_with(cx, |shell, _| shell.overlay_kind()),
+            Some(OverlayKind::GoTo)
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_p_goes_to_a_tab_or_a_thread(cx: &mut TestAppContext) {
+        init_places(cx);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            window.focus(&shell.focus_handle, cx)
+        });
+        cx.run_until_parked();
+
+        // In Agents, its threads come first.
+        cx.simulate_keystrokes("cmd-p");
+        let thread = cx
+            .debug_bounds("go-to-Fix the login")
+            .expect("the thread is listed");
+        let workspace = cx
+            .debug_bounds("go-to-demo")
+            .expect("the workspace is listed");
+        assert!(thread.top() < workspace.top());
+
+        // A tab, by its name.
+        cx.simulate_input("tab 2");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(shell.overlay.is_none());
+            assert!(shell.view == MainView::Workspaces);
+            let pane = shell.spaces_view.read(cx).focused_pane(cx);
+            assert_eq!(pane.map(|pane| pane.pane.0), Some(7));
+        });
+
+        // In Workspaces, the workspaces come first; a thread opens in Agents.
+        cx.simulate_keystrokes("cmd-p");
+        let thread = cx
+            .debug_bounds("go-to-Fix the login")
+            .expect("the thread is listed");
+        let workspace = cx
+            .debug_bounds("go-to-demo")
+            .expect("the workspace is listed");
+        assert!(workspace.top() < thread.top());
+        cx.simulate_input("login");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.view == MainView::Agents);
+            assert_eq!(shell.active_thread.map(|thread| thread.thread.0), Some(5));
+        });
     }
 
     #[gpui::test]

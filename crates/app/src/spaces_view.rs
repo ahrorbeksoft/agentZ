@@ -34,6 +34,7 @@ use crate::OpenSettings;
 use crate::agent_icons::agent_icon;
 use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
 use crate::confirm_dialog::ConfirmRequest;
+use crate::go_to_picker::{Place, PlaceEntry, PlaceIcon};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
@@ -95,6 +96,18 @@ actions!(
         ActivatePaneUp,
         /// Focuses the pane below.
         ActivatePaneDown,
+        /// Renames the tab on screen.
+        RenameTab,
+        /// Closes the tab on screen.
+        CloseTab,
+        /// Renames the workspace on screen.
+        RenameWorkspace,
+        /// Closes the workspace on screen.
+        CloseWorkspace,
+        /// Makes a worktree of the repository the workspace on screen is in.
+        NewWorktree,
+        /// Opens another checkout of the repository the workspace on screen is in.
+        OpenWorktree,
     ]
 );
 
@@ -451,7 +464,7 @@ impl SpacesView {
         ))
     }
 
-    fn focused_pane(&self, cx: &App) -> Option<PaneKey> {
+    pub(crate) fn focused_pane(&self, cx: &App) -> Option<PaneKey> {
         let (_, _, tab) = self.visible_tab(cx)?;
         Some(PaneKey {
             machine: tab.machine,
@@ -653,7 +666,12 @@ impl SpacesView {
         cx.notify();
     }
 
-    fn activate_space(&mut self, key: SpaceKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn activate_space(
+        &mut self,
+        key: SpaceKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(space) = self.space(key, cx) else {
             return;
         };
@@ -670,7 +688,12 @@ impl SpacesView {
         );
     }
 
-    fn activate_tab(&mut self, key: TabKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn activate_tab(
+        &mut self,
+        key: TabKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(layout) = self.layouts.get(&key) {
             let pane = PaneKey {
                 machine: key.machine,
@@ -1270,6 +1293,152 @@ impl SpacesView {
         }
     }
 
+    fn rename_visible_tab(&mut self, _: &RenameTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, space, tab)) = self.visible_tab(cx) else {
+            return;
+        };
+        if let Some(index) = space.tabs.iter().position(|other| other.id == tab.tab) {
+            let name = tab_label(&space.tabs[index], index).into();
+            self.start_renaming(RenameTarget::Tab(tab), name, window, cx);
+        }
+    }
+
+    fn close_visible_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, _, tab)) = self.visible_tab(cx) {
+            self.close_tab(tab, window, cx);
+        }
+    }
+
+    fn rename_active_space(
+        &mut self,
+        _: &RenameWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.active_space else {
+            return;
+        };
+        // Named as its row is, in a worktree group or not.
+        let entry = self
+            .listed_spaces(cx)
+            .into_iter()
+            .find(|entry| entry.machine == key.machine && entry.space.id == key.space);
+        if let Some(entry) = entry {
+            let name = row_label(&entry).into();
+            self.start_renaming(RenameTarget::Space(key), name, window, cx);
+        }
+    }
+
+    fn close_active_space(
+        &mut self,
+        _: &CloseWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(key) = self.active_space {
+            self.close_space(key, window, cx);
+        }
+    }
+
+    fn worktree_of_active_space(&self, mode: WorktreeModalMode, cx: &mut Context<Self>) {
+        let Some(key) = self.active_space else {
+            return;
+        };
+        if let Some((folder, name)) = self.space(key, cx).as_ref().and_then(worktree_source) {
+            cx.emit(SpacesViewEvent::Worktree {
+                machine: key.machine,
+                folder,
+                name,
+                mode,
+            });
+        }
+    }
+
+    /// Every workspace, with its worktrees under their group's parent and none folded, as the
+    /// sidebar lists them.
+    fn listed_spaces(&self, cx: &App) -> Vec<SpaceEntry> {
+        space_entries(
+            self.all_spaces(cx),
+            |machine, space| self.group_membership(machine, space, cx),
+            &HashSet::default(),
+            None,
+        )
+    }
+
+    /// The workspaces, their tabs and their panes, for Go To.
+    pub(crate) fn places(&self, cx: &App) -> Vec<PlaceEntry> {
+        let machines = self.machines.read(cx);
+        let has_remotes = machines.has_remotes();
+        let mut spaces = Vec::new();
+        let mut tabs = Vec::new();
+        let mut panes = Vec::new();
+        for entry in self.listed_spaces(cx) {
+            let (machine, space) = (entry.machine, &entry.space);
+            let name = row_label(&entry);
+            let mut detail = space
+                .git
+                .as_ref()
+                .and_then(|git| git.branch.clone())
+                .or_else(|| {
+                    space
+                        .current
+                        .as_ref()
+                        .map(|current| current.display_path.clone())
+                })
+                .unwrap_or_else(|| space.folder.to_string_lossy().into_owned());
+            if has_remotes {
+                detail = format!("{} · {detail}", machines.label(machine, cx));
+            }
+            let project = machines.projects(machine, cx).and_then(|store| {
+                project_at(store.read(cx).projects(), space.current_folder())
+                    .map(|project| project.id)
+            });
+            spaces.push(PlaceEntry {
+                place: Place::Space(SpaceKey {
+                    machine,
+                    space: space.id,
+                }),
+                icon: match project {
+                    Some(project) => PlaceIcon::Project(ProjectKey { machine, project }),
+                    None => PlaceIcon::Icon(Icon::new(IconName::Folder)),
+                },
+                label: name.clone().into(),
+                detail: detail.into(),
+                section: "Workspaces".into(),
+            });
+            for (index, tab) in space.tabs.iter().enumerate() {
+                let tab_name = tab_label(tab, index);
+                tabs.push(PlaceEntry {
+                    place: Place::Tab(TabKey {
+                        machine,
+                        tab: tab.id,
+                    }),
+                    icon: PlaceIcon::Icon(Icon::new(IconName::Tab)),
+                    label: tab_name.clone().into(),
+                    detail: name.clone().into(),
+                    section: "Tabs".into(),
+                });
+                for pane in &tab.panes {
+                    let key = PaneKey {
+                        machine,
+                        pane: pane.id,
+                    };
+                    let (icon, title, _) = self.pane_title(key, pane, cx);
+                    panes.push(PlaceEntry {
+                        place: Place::Pane(key),
+                        icon: PlaceIcon::Icon(icon),
+                        label: title,
+                        detail: format!("{name} › {tab_name}").into(),
+                        section: "Panes".into(),
+                    });
+                }
+            }
+        }
+        spaces.extend(tabs);
+        spaces.extend(panes);
+        spaces
+    }
+
     fn activate_pane_in(&mut self, nav: NavDirection, window: &mut Window, cx: &mut Context<Self>) {
         let Some((_, _, tab)) = self.visible_tab(cx) else {
             return;
@@ -1451,11 +1620,7 @@ impl SpacesView {
         };
         let colors = cx.theme().colors().clone();
         let is_active = self.active_space == Some(key);
-        let label: SharedString = entry
-            .child
-            .and_then(|_| child_label(space))
-            .unwrap_or_else(|| space.label())
-            .into();
+        let label: SharedString = row_label(entry).into();
         // A folded group's parent stands for the whole group (herdr).
         let collapsed_group = entry
             .group
@@ -1537,21 +1702,7 @@ impl SpacesView {
         let checkout_root = project
             .as_ref()
             .and_then(|project| checkout_root(project, space.current_folder()));
-        // herdr offers worktrees in any workspace inside a git repository.
-        let worktree_source = git.as_ref().map(|git| {
-            let folder = space.current_folder().to_path_buf();
-            let name: SharedString = git
-                .repository
-                .clone()
-                .or_else(|| {
-                    folder
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_default()
-                .into();
-            (folder, name)
-        });
+        let worktree_source = worktree_source(space);
         let details = ThreadDetails {
             title: label.clone(),
             project: project.map(|project| (project, project_info)),
@@ -3513,9 +3664,34 @@ impl Render for SpacesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main_background = cx.theme().colors().editor_background;
         let main = self.render_main(cx);
+        let is_sidebar_hidden = crate::app_settings::is_sidebar_hidden(cx);
+        // Only what applies is handled, so the command palette lists only that.
+        let has_tab = self.visible_tab(cx).is_some();
+        let active_space = self.active_space.and_then(|key| self.space(key, cx));
+        let has_space = active_space.is_some();
+        let is_in_git = active_space.as_ref().and_then(worktree_source).is_some();
         h_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
+            .when(has_tab, |view| {
+                view.on_action(cx.listener(Self::rename_visible_tab))
+                    .on_action(cx.listener(Self::close_visible_tab))
+            })
+            .when(has_space, |view| {
+                view.on_action(cx.listener(Self::close_active_space))
+            })
+            // The workspace is renamed in its row.
+            .when(has_space && !is_sidebar_hidden, |view| {
+                view.on_action(cx.listener(Self::rename_active_space))
+            })
+            .when(is_in_git, |view| {
+                view.on_action(cx.listener(|this, _: &NewWorktree, _, cx| {
+                    this.worktree_of_active_space(WorktreeModalMode::New, cx)
+                }))
+                .on_action(cx.listener(|this, _: &OpenWorktree, _, cx| {
+                    this.worktree_of_active_space(WorktreeModalMode::Open, cx)
+                }))
+            })
             .on_action(cx.listener(Self::new_workspace))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -3556,7 +3732,7 @@ impl Render for SpacesView {
                     );
                 }
             }))
-            .when(!crate::app_settings::is_sidebar_hidden(cx), |view| {
+            .when(!is_sidebar_hidden, |view| {
                 view.child(self.render_sidebar(window, cx))
             })
             .child(
@@ -3701,7 +3877,6 @@ fn still_running(programs: &[String], place: &str) -> String {
     format!("{names} {verb} still running in {place}, and closing {place} ends {object}.")
 }
 
-/// A tab's name, or its number, as herdr numbers unnamed tabs.
 /// A worktree group: the machine, and its repository's main checkout.
 type GroupKey = (MachineId, PathBuf);
 
@@ -3804,6 +3979,32 @@ fn space_entries(
         }
     }
     entries
+}
+
+/// What a workspace's row is called: a worktree under its group's parent by its branch.
+fn row_label(entry: &SpaceEntry) -> String {
+    entry
+        .child
+        .and_then(|_| child_label(&entry.space))
+        .unwrap_or_else(|| entry.space.label())
+}
+
+/// The folder and name of the repository a workspace is in, which herdr offers worktrees of
+/// in any workspace inside a git repository.
+fn worktree_source(space: &Space) -> Option<(PathBuf, SharedString)> {
+    let git = space.git.as_ref()?;
+    let folder = space.current_folder().to_path_buf();
+    let name: SharedString = git
+        .repository
+        .clone()
+        .or_else(|| {
+            folder
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+        .into();
+    Some((folder, name))
 }
 
 /// A worktree's row is named after its branch, without agentZ's `agentz/` prefix (herdr

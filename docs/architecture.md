@@ -115,6 +115,18 @@ Each entry: what it does, where it lives, and where it comes from.
   Each key is the one that runs from where the sheet was opened (`binding_in`: GPUI's
   `bindings_for_input` with the focused element's context stack), so a key taken there by
   another binding isn't listed. Escape closes it and gives focus back.
+- **Command palette** (`command_palette.rs`, Zed's): Cmd-Shift-P lists the actions that apply
+  where it was opened (`Window::available_actions`, so only what's handled there: the
+  Workspaces view registers Rename Tab, Close Workspace, New Worktree… only when they apply,
+  and the shell the Agents view's switcher, Changes and Terminal only there), named as Zed
+  names them ("workspaces: split right") with their keys. A list's and a text field's own
+  keys (`menu`, `text_input`) are left out. The chosen one runs where the palette was opened.
+- **Go To** (`go_to_picker.rs`; `SpacesView::places`, `go_to_picker::thread_places`): Cmd-P
+  lists the workspaces, tabs and panes, and the Agents view's threads, the view on screen's
+  first, filtered by name or where they are (a pane's workspace and tab). Choosing one shows
+  it in its view and focuses it. The palette, Go To and the shortcut sheet are the shell's
+  overlays (`Shell::overlay`): each one's key closes it, one replaces another, and focus goes
+  back to what had it.
 - **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
   `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
   favicons or monograms, git branches. The switcher is Zed's recent-projects popover.

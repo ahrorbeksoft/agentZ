@@ -3,10 +3,12 @@ mod agent_icons;
 mod agent_login;
 mod agent_view;
 mod app_settings;
+mod command_palette;
 mod confirm_dialog;
 mod controls;
 mod diff_panel;
 mod elicitation_card;
+mod go_to_picker;
 mod login_item;
 mod machine_icon_picker;
 mod machine_modal;
@@ -67,6 +69,10 @@ actions!(
         ToggleTerminalDrawer,
         /// Lists the shortcuts for what's focused, and the app's.
         ShowShortcuts,
+        /// Opens the command palette, to run what applies to what's focused.
+        ToggleCommandPalette,
+        /// Goes to a workspace, a tab, a pane or a thread.
+        GoTo,
     ]
 );
 
@@ -151,6 +157,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleTerminalDrawer, context),
         // herdr's help is prefix-?; Cmd-? is macOS's Help menu search.
         KeyBinding::new("secondary-/", ShowShortcuts, context),
+        // Zed's keys: its command palette, and its file finder for places.
+        KeyBinding::new("secondary-shift-p", ToggleCommandPalette, context),
+        KeyBinding::new("secondary-p", GoTo, context),
     ]);
 }
 
@@ -212,6 +221,8 @@ fn main() {
             machine_modal::init(cx);
             confirm_dialog::init(cx);
             shortcut_sheet::init(cx);
+            command_palette::init(cx);
+            go_to_picker::init(cx);
             agent_view::init(cx);
             agent_login::init(cx);
             elicitation_card::init(cx);
