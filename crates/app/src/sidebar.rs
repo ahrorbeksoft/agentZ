@@ -1869,20 +1869,50 @@ pub(crate) struct ThreadDetails {
     pub(crate) contents: Option<SharedString>,
 }
 
+/// A details card's row: an icon, then a label in the details' color.
+pub(crate) fn details_row(icon: AnyElement, label: Label, cx: &App) -> AnyElement {
+    let detail_color = Color::Custom(cx.theme().colors().text.opacity(0.75));
+    h_flex()
+        .min_w_0()
+        .gap_2()
+        .child(div().flex_none().child(icon))
+        .child(
+            div()
+                .min_w_0()
+                .child(label.size(LabelSize::Small).color(detail_color)),
+        )
+        .into_any_element()
+}
+
+/// The card a details popover shows: a title over its rows.
+pub(crate) fn details_card(title: SharedString, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+    v_flex()
+        .elevation_2(cx)
+        .font(theme::theme_settings(cx).ui_font(cx).clone())
+        .text_ui(cx)
+        .py_1()
+        .px_2()
+        .child(
+            v_flex()
+                .min_w(px(220.))
+                .max_w(px(320.))
+                .gap_2()
+                .px_1()
+                .py_2()
+                .child(
+                    Label::new(title)
+                        .size(LabelSize::Small)
+                        .weight(FontWeight::MEDIUM)
+                        .truncate(),
+                )
+                .child(v_flex().gap_1p5().pl_0p5().children(rows)),
+        )
+        .into_any_element()
+}
+
 impl ThreadDetails {
     fn render(self, cx: &App) -> AnyElement {
-        let detail_color = Color::Custom(cx.theme().colors().text.opacity(0.75));
-        let detail_row = |icon: AnyElement, label: Label| {
-            h_flex()
-                .min_w_0()
-                .gap_2()
-                .child(div().flex_none().child(icon))
-                .child(
-                    div()
-                        .min_w_0()
-                        .child(label.size(LabelSize::Small).color(detail_color)),
-                )
-        };
+        let detail_row = |icon: AnyElement, label: Label| details_row(icon, label, cx);
         let small_icon = |name: IconName| {
             Icon::new(name)
                 .size(IconSize::XSmall)
@@ -1938,28 +1968,7 @@ impl ThreadDetails {
                 Label::new(contents.clone()).truncate(),
             ));
         }
-        v_flex()
-            .elevation_2(cx)
-            .font(theme::theme_settings(cx).ui_font(cx).clone())
-            .text_ui(cx)
-            .py_1()
-            .px_2()
-            .child(
-                v_flex()
-                    .min_w(px(220.))
-                    .max_w(px(320.))
-                    .gap_2()
-                    .px_1()
-                    .py_2()
-                    .child(
-                        Label::new(self.title)
-                            .size(LabelSize::Small)
-                            .weight(FontWeight::MEDIUM)
-                            .truncate(),
-                    )
-                    .child(v_flex().gap_1p5().pl_0p5().children(rows)),
-            )
-            .into_any_element()
+        details_card(self.title, rows, cx)
     }
 }
 
@@ -2073,6 +2082,11 @@ fn describe_folder(kind: WorkspaceKind, folder: &Path) -> SharedString {
 
 /// Placed beside the row's right edge, top-aligned, as t3code places its row tooltip.
 pub(crate) fn render_details_popover(details: ThreadDetails, cx: &App) -> AnyElement {
+    render_card_popover(details.render(cx))
+}
+
+/// A card beside the row it belongs to, kept inside the window.
+pub(crate) fn render_card_popover(card: AnyElement) -> AnyElement {
     div()
         .absolute()
         .top_0()
@@ -2081,7 +2095,7 @@ pub(crate) fn render_details_popover(details: ThreadDetails, cx: &App) -> AnyEle
             deferred(
                 anchored()
                     .snap_to_window_with_margin(px(8.))
-                    .child(div().ml_1().child(details.render(cx))),
+                    .child(div().ml_1().child(card)),
             )
             .with_priority(1),
         )

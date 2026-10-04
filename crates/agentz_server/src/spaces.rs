@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use agentz_protocol::layout::{Direction, Node, PaneId, TileLayout};
 use agentz_protocol::spaces::{
-    Pane, PaneAgent, PaneContent, PaneLocation, Space, SpaceFolder, SpaceGit, SpaceId,
-    SpacesSnapshot, Tab, TabId,
+    Pane, PaneAgent, PaneContent, PaneLocation, Space, SpaceChanges, SpaceCommit, SpaceFolder,
+    SpaceGit, SpaceId, SpacesSnapshot, Tab, TabId,
 };
 use anyhow::{Context as _, Result, anyhow};
 use projects::{ProjectId, Saver, ThreadId};
@@ -490,6 +490,38 @@ pub(crate) async fn space_git(folder: &Path) -> Option<SpaceGit> {
     // Found through the shared `.git`, so a linked worktree is named after the repository
     // rather than itself, and grouped under it.
     let main_checkout = crate::workspaces::main_checkout(folder).await.ok();
+    let upstream = crate::git::git(
+        folder,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+        &[],
+    )
+    .await
+    .ok()
+    .map(|upstream| upstream.trim().to_string())
+    .filter(|upstream| !upstream.is_empty());
+    let changed_files = crate::git::git(folder, &["status", "--porcelain"], &[])
+        .await
+        .map(|status| status.lines().count() as u32)
+        .unwrap_or_default();
+    let (added, removed) = crate::git::git(folder, &["diff", "HEAD", "--numstat"], &[])
+        .await
+        .map(|numstat| sum_numstat(&numstat))
+        .unwrap_or_default();
+    let last_commit = crate::git::git(folder, &["log", "-1", "--format=%ct%x00%s"], &[])
+        .await
+        .ok()
+        .and_then(|log| {
+            let (time, subject) = log.trim_end().split_once('\0')?;
+            Some(SpaceCommit {
+                subject: subject.to_string(),
+                time: time.parse().ok()?,
+            })
+        });
     Some(SpaceGit {
         branch,
         ahead,
@@ -499,6 +531,25 @@ pub(crate) async fn space_git(folder: &Path) -> Option<SpaceGit> {
             .and_then(|root| Some(root.file_name()?.to_string_lossy().into_owned())),
         checkout,
         main_checkout,
+        upstream,
+        changes: SpaceChanges {
+            files: changed_files,
+            added,
+            removed,
+        },
+        last_commit,
+    })
+}
+
+/// Lines added and removed in `git diff --numstat`; binary files count none.
+fn sum_numstat(numstat: &str) -> (u32, u32) {
+    numstat.lines().fold((0, 0), |(added, removed), line| {
+        let mut columns = line.split('\t');
+        let count = |column: Option<&str>| column.and_then(|count| count.parse::<u32>().ok());
+        (
+            added + count(columns.next()).unwrap_or_default(),
+            removed + count(columns.next()).unwrap_or_default(),
+        )
     })
 }
 
@@ -523,6 +574,14 @@ fn parse_ahead_behind(output: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numstat_sums_lines_and_skips_binary_files() {
+        assert_eq!(
+            super::sum_numstat("3\t1\ta.rs\n-\t-\tlogo.png\n10\t0\tb.rs\n"),
+            (13, 1)
+        );
+    }
+
     use super::*;
     use agentz_protocol::spaces::PaneTerminal;
 
@@ -641,6 +700,7 @@ mod tests {
                     repository: Some("w".into()),
                     checkout: Some("/w".into()),
                     main_checkout: Some("/w".into()),
+                    ..SpaceGit::default()
                 }),
             );
             store.set_pane_agent(
@@ -767,6 +827,7 @@ mod tests {
                 repository: name.clone(),
                 checkout: Some(root.clone()),
                 main_checkout: Some(root.clone()),
+                ..SpaceGit::default()
             })
         );
         // Inside it, and in a worktree of it, the repository keeps its name.
@@ -805,6 +866,14 @@ mod tests {
         )
         .await
         .expect("worktree");
+        // What isn't committed, and the last commit.
+        std::fs::write(directory.path().join("new.txt"), "a\nb\n").expect("write");
+        let git = space_git(directory.path()).await.expect("a repository");
+        assert_eq!(git.changes.files, 1);
+        assert_eq!(
+            git.last_commit.map(|commit| commit.subject),
+            Some("first".to_string())
+        );
         let git = space_git(&worktree).await.expect("a repository");
         // A linked worktree, grouped under the main checkout.
         assert!(git.is_linked_worktree());

@@ -230,6 +230,30 @@ pub struct SpaceGit {
     /// The repository's main checkout. A linked worktree's differs from its `checkout`.
     #[serde(default)]
     pub main_checkout: Option<PathBuf>,
+    /// The branch's upstream, such as `origin/main`.
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// What isn't committed yet.
+    #[serde(default)]
+    pub changes: SpaceChanges,
+    /// The checkout's last commit.
+    #[serde(default)]
+    pub last_commit: Option<SpaceCommit>,
+}
+
+/// A checkout's uncommitted changes: files changed or new, and lines added and removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceChanges {
+    pub files: u32,
+    pub added: u32,
+    pub removed: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceCommit {
+    pub subject: String,
+    /// Seconds since the Unix epoch.
+    pub time: u64,
 }
 
 impl SpaceGit {

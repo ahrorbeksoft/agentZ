@@ -27,7 +27,7 @@ Notes for whoever continues:
 | 7 | 5 | Row menu: New Tab, Copy Path, Reveal in Finder, New Thread Here | done (Delete Worktree Checkout… comes with item 9) |
 | 8 | 2 | Worktree groups (herdr), collapse toggle | done |
 | 9 | 15 | Delete Worktree Checkout…; fuller New Worktree dialog | done |
-| 10 | 6 | Hover details: git at a glance | not started |
+| 10 | 6 | Hover details: git at a glance | done |
 | 11 | 3E | "Needs you" strip on top of the sidebar | not started |
 | 12 | 17 | Badge on the Agents / Workspaces switch | not started |
 | 13 | 13 | New workspace picker: Recent first, Open marks | not started |

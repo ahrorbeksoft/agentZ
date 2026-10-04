@@ -5,13 +5,15 @@
 //! workspace is its checkout.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::layout::{
     Direction, NavDirection, Node, PaneId, Rect, TileLayout, find_in_direction,
 };
 use agentz_protocol::spaces::{
-    Pane, PaneContent, PaneTerminal, Space, SpaceFolder, SpaceId, SpaceRequest, Tab, TabId,
+    Pane, PaneContent, PaneTerminal, Space, SpaceFolder, SpaceGit, SpaceId, SpaceRequest, Tab,
+    TabId,
 };
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
@@ -39,9 +41,9 @@ use crate::project_store::ThreadStatus;
 use crate::project_switcher::compact_path;
 use crate::settings_page::remove_workspace;
 use crate::sidebar::{
-    DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover, render_folder_icon,
-    render_footer_item, render_status_dot, render_status_pill, repository_branch,
-    thread_agent_icon,
+    DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, details_card, details_row, format_relative_time,
+    render_card_popover, render_details_popover, render_folder_icon, render_footer_item,
+    render_status_dot, render_status_pill, repository_branch, thread_agent_icon,
 };
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -1426,8 +1428,11 @@ impl SpacesView {
             agent: None,
             contents: contents.clone().map(Into::into),
         };
-        let details_popover =
-            (self.details_space == Some(key)).then(|| render_details_popover(details, cx));
+        // In git, the checkout at a glance; elsewhere, the general details.
+        let details_popover = (self.details_space == Some(key)).then(|| match &git {
+            Some(git) => render_card_popover(self.render_git_glance(entry, git, &label, &path, cx)),
+            None => render_details_popover(details, cx),
+        });
         let id = format!("workspace-{}-{}", machine.slug(), space.id.0);
 
         let faint_text = colors.text_muted.opacity(0.4);
@@ -1983,6 +1988,142 @@ impl SpacesView {
             self.collapsed_groups.insert(group);
         }
         cx.notify();
+    }
+
+    /// A workspace's checkout at a glance: the branch and its upstream, what isn't committed,
+    /// the last commit, where it is, and its worktrees.
+    fn render_git_glance(
+        &self,
+        entry: &SpaceEntry,
+        git: &SpaceGit,
+        title: &SharedString,
+        path: &SharedString,
+        cx: &App,
+    ) -> AnyElement {
+        let small_icon = |name: IconName| {
+            Icon::new(name)
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
+        };
+        let detail = |text: String| Label::new(text).size(LabelSize::Small);
+        let mut rows = Vec::new();
+        let branch = git.branch.clone().unwrap_or_else(|| "detached".to_string());
+        rows.push(
+            h_flex()
+                .min_w_0()
+                .gap_2()
+                .child(small_icon(IconName::GitBranch))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(detail(branch).truncate())
+                        .children(git.upstream.clone().map(|upstream| {
+                            detail(format!("→ {upstream}"))
+                                .color(Color::Muted)
+                                .truncate()
+                        }))
+                        .when(git.ahead > 0, |line| {
+                            line.child(detail(format!("↑{}", git.ahead)).color(Color::Created))
+                        })
+                        .when(git.behind > 0, |line| {
+                            line.child(detail(format!("↓{}", git.behind)).color(Color::Deleted))
+                        }),
+                )
+                .into_any_element(),
+        );
+        let changes = git.changes;
+        rows.push(if changes.files == 0 {
+            details_row(
+                small_icon(IconName::Diff),
+                Label::new("Nothing uncommitted"),
+                cx,
+            )
+        } else {
+            h_flex()
+                .gap_2()
+                .child(small_icon(IconName::Diff))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(detail(format!(
+                            "{} {} changed",
+                            changes.files,
+                            if changes.files == 1 { "file" } else { "files" }
+                        )))
+                        .when(changes.added > 0, |line| {
+                            line.child(detail(format!("+{}", changes.added)).color(Color::Created))
+                        })
+                        .when(changes.removed > 0, |line| {
+                            line.child(
+                                detail(format!("−{}", changes.removed)).color(Color::Deleted),
+                            )
+                        }),
+                )
+                .into_any_element()
+        });
+        if let Some(commit) = &git.last_commit {
+            let time = UNIX_EPOCH + Duration::from_secs(commit.time);
+            rows.push(details_row(
+                small_icon(IconName::GitCommit),
+                Label::new(format!(
+                    "“{}” · {}",
+                    commit.subject,
+                    format_relative_time(time, SystemTime::now())
+                ))
+                .truncate(),
+                cx,
+            ));
+        }
+        rows.push(details_row(
+            small_icon(IconName::Folder),
+            Label::new(path.clone()).truncate_middle(),
+            cx,
+        ));
+        // A parent lists its worktrees; a worktree says whose it is.
+        let worktrees = self.group_worktree_names(entry, cx);
+        if !worktrees.is_empty() {
+            rows.push(details_row(
+                small_icon(IconName::GitWorktree),
+                Label::new(format!(
+                    "{} {}: {}",
+                    worktrees.len(),
+                    if worktrees.len() == 1 {
+                        "worktree"
+                    } else {
+                        "worktrees"
+                    },
+                    worktrees.join(", ")
+                ))
+                .truncate(),
+                cx,
+            ));
+        } else if let Some(repository) = git.repository.as_ref().filter(|_| entry.child.is_some()) {
+            rows.push(details_row(
+                small_icon(IconName::GitWorktree),
+                Label::new(format!("Worktree of {repository}")).truncate(),
+                cx,
+            ));
+        }
+        details_card(title.clone(), rows, cx)
+    }
+
+    /// The names of a group parent's worktrees, folded or not.
+    fn group_worktree_names(&self, entry: &SpaceEntry, cx: &App) -> Vec<String> {
+        let Some(group) = &entry.group else {
+            return Vec::new();
+        };
+        self.all_spaces(cx)
+            .into_iter()
+            .filter(|(machine, space)| {
+                self.group_membership(*machine, space, cx)
+                    .is_some_and(|(main, role)| {
+                        role == GroupRole::Child && (*machine, main) == *group
+                    })
+            })
+            .map(|(_, space)| child_label(&space).unwrap_or_else(|| space.label()))
+            .collect()
     }
 
     /// Shows a workspace's details after a moment, like the thread cards do.

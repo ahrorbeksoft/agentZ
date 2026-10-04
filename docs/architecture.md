@@ -485,8 +485,10 @@ since a thread's workspace is its checkout.
   project the folder is in (a folder icon outside every project) and the folder's name, then
   the branch (or the path outside git), its agents by their icons (up to three, then +N), the
   terminal count, and the machine's icon once there are remote machines, laid out as the
-  sidebar's shell rows, with the thread cards'
-  details popover on hover (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
+  sidebar's shell rows, with, on hover, the
+  checkout at a glance in git (branch → upstream with ↑↓, uncommitted files and lines, the last
+  commit, the path, its worktrees; `SpaceGit::{upstream, changes, last_commit}`) or the thread
+  cards' details popover outside it (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
   An ACP thread's pane has one header: the thread's title, agent and toolbar buttons
   (`AgentView::render_toolbar_buttons`) beside the pane's own, so its toolbar is hidden there.
