@@ -1522,7 +1522,7 @@ impl SpacesView {
         let this = cx.entity().downgrade();
         let folder = space.current_folder().to_path_buf();
         // New Thread Here starts in the checkout the workspace is in.
-        let thread_target = project_key.zip(checkout_root.clone());
+        let thread_target = project_key.zip(checkout_root);
         right_click_menu(ElementId::Name(format!("{id}-menu").into()))
             .trigger(move |is_menu_open, _, _| {
                 div()
