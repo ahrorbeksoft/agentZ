@@ -19,9 +19,9 @@ use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, Point, PromptLevel,
-    ScrollHandle, Subscription, Task, Window, actions, relative,
+    Action, AnyElement, App, Bounds, BoxShadow, ClickEvent, ClipboardItem, Context, DragMoveEvent,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, Point,
+    PromptLevel, ScrollHandle, Subscription, Task, Window, actions, anchored, deferred, relative,
 };
 use projects::ThreadId;
 use text_input::{TextInput, TextInputEvent};
@@ -304,6 +304,29 @@ impl Render for DragPreview {
     }
 }
 
+/// A workspace row being dragged. The view draws the row lifted itself (`SpaceDrag`), so
+/// nothing is drawn for it at the pointer.
+#[derive(Clone, Copy, PartialEq)]
+struct DraggedSpace(SpaceKey);
+
+impl Render for DraggedSpace {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// The workspace row being dragged: where in it the pointer holds it, and its width once
+/// known.
+#[derive(Clone, Copy)]
+struct SpaceDrag {
+    space: SpaceKey,
+    grab: Point<Pixels>,
+    width: Option<Pixels>,
+}
+
+/// How strongly a dragged workspace's own row still shows.
+const DRAGGED_ROW_OPACITY: f32 = 0.5;
+
 #[derive(Clone, Copy, PartialEq)]
 struct DraggedTab {
     space: SpaceKey,
@@ -380,6 +403,7 @@ pub struct SpacesView {
     pending_focus: Option<PaneKey>,
     split_override: Option<SplitOverride>,
     pane_drop: Option<PaneDrop>,
+    space_drag: Option<SpaceDrag>,
     renaming: Option<RenameTarget>,
     /// The name the rename started from, so ending it unchanged keeps an automatic name.
     rename_original: SharedString,
@@ -440,6 +464,7 @@ impl SpacesView {
             pending_focus: None,
             split_override: None,
             pane_drop: None,
+            space_drag: None,
             renaming: None,
             rename_original: SharedString::default(),
             rename_input,
@@ -1604,8 +1629,24 @@ impl SpacesView {
         };
         let rows: Vec<AnyElement> = entries
             .iter()
-            .map(|entry| self.render_space_row(entry, cx))
+            .map(|entry| self.render_space_row(entry, false, cx))
             .collect();
+        // The dragged row, lifted out of the list and held where it was grabbed.
+        let lifted_row = self.space_drag.and_then(|drag| {
+            let width = drag.width?;
+            let entry = entries.iter().find(|entry| {
+                entry.machine == drag.space.machine && entry.space.id == drag.space.space
+            })?;
+            Some(
+                deferred(
+                    anchored()
+                        .position(window.mouse_position() - drag.grab)
+                        .snap_to_window()
+                        .child(div().w(width).child(self.render_space_row(entry, true, cx))),
+                )
+                .with_priority(1),
+            )
+        });
 
         v_flex()
             .w(SIDEBAR_WIDTH)
@@ -1642,6 +1683,7 @@ impl SpacesView {
                     )
                     .vertical_scrollbar_for(&self.sidebar_scroll, window, cx),
             )
+            .children(lifted_row)
             .child(self.render_agents(has_remotes, window, cx))
             .child(render_footer_item(
                 "workspaces-open-settings",
@@ -1728,7 +1770,13 @@ impl SpacesView {
     }
 
     /// herdr's space row: the rolled-up state and name, then the branch and ahead/behind.
-    fn render_space_row(&self, entry: &SpaceEntry, cx: &mut Context<Self>) -> AnyElement {
+    /// `lifted` is the copy that follows the pointer while the row is dragged (t3code's).
+    fn render_space_row(
+        &self,
+        entry: &SpaceEntry,
+        lifted: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (machine, index, space) = (entry.machine, entry.index, &entry.space);
         let key = SpaceKey {
             machine,
@@ -1736,6 +1784,7 @@ impl SpacesView {
         };
         let colors = cx.theme().colors().clone();
         let is_active = self.active_space == Some(key);
+        let is_dragged = self.space_drag.is_some_and(|drag| drag.space == key);
         let label: SharedString = row_label(entry).into();
         // A folded group's parent stands for the whole group (herdr).
         let collapsed_group = entry
@@ -1767,7 +1816,7 @@ impl SpacesView {
                     .filter_map(|pane| self.pane_status(machine, pane, cx)),
             ),
         };
-        let is_renaming = self.renaming == Some(RenameTarget::Space(key));
+        let is_renaming = !lifted && self.renaming == Some(RenameTarget::Space(key));
         let machine_icon = self.machines.read(cx).machine_icon(machine, cx);
         let machine_label = self.machines.read(cx).label(machine, cx);
         let git = space.git.clone();
@@ -1876,14 +1925,17 @@ impl SpacesView {
                     )
                     .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text(if is_collapsed {
-                        "Show Worktrees"
-                    } else {
-                        "Hide Worktrees"
-                    }))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.toggle_group(group.clone(), cx)),
-                    ),
+                    .when(!lifted, |button| {
+                        button
+                            .tooltip(Tooltip::text(if is_collapsed {
+                                "Show Worktrees"
+                            } else {
+                                "Hide Worktrees"
+                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_group(group.clone(), cx)
+                            }))
+                    }),
                 )
             });
         let faint_label = |text: String| {
@@ -1945,21 +1997,23 @@ impl SpacesView {
                         .id(ElementId::Name(format!("{id}-contents").into()))
                         .flex_none()
                         .gap_1p5()
-                        .tooltip(Tooltip::text(contents))
                         // The tooltip says it already, so the details give way to it.
-                        .debug_selector({
-                            let id = format!("{id}-contents");
-                            move || id
+                        .when(!lifted, |this| {
+                            this.tooltip(Tooltip::text(contents))
+                                .debug_selector({
+                                    let id = format!("{id}-contents");
+                                    move || id
+                                })
+                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                    this.hovered_contents = hovered.then_some(key);
+                                    if *hovered {
+                                        this.hide_details(cx);
+                                    } else if this.hovered_space == Some(key) {
+                                        // Back on the row rather than off it.
+                                        this.space_hovered(key, true, cx);
+                                    }
+                                }))
                         })
-                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            this.hovered_contents = hovered.then_some(key);
-                            if *hovered {
-                                this.hide_details(cx);
-                            } else if this.hovered_space == Some(key) {
-                                // Back on the row rather than off it.
-                                this.space_hovered(key, true, cx);
-                            }
-                        }))
                         // The agents by their own icons, a few at most; shells by count.
                         .children(agent_icons.iter().take(MAX_ROW_AGENT_ICONS).cloned().map(
                             |icon| icon.size(IconSize::XSmall).color(Color::Custom(faint_text)),
@@ -1987,6 +2041,27 @@ impl SpacesView {
                 )
             });
 
+        if lifted {
+            // Opaque: the selected row's color over the sidebar's own.
+            return div()
+                .debug_selector(|| "lifted-row".into())
+                .rounded_md()
+                .bg(colors.panel_background)
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(10.), gpui::black().opacity(0.55))
+                        .blur_radius(px(24.)),
+                ])
+                .child(
+                    v_flex()
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded_md()
+                        .bg(colors.ghost_element_selected)
+                        .child(main_line)
+                        .child(detail_line),
+                )
+                .into_any_element();
+        }
         let row =
             v_flex()
                 .id(ElementId::Name(id.clone().into()))
@@ -2004,6 +2079,7 @@ impl SpacesView {
                 .cursor_pointer()
                 .when(is_active, |row| row.bg(colors.ghost_element_selected))
                 .hover(|row| row.bg(colors.ghost_element_hover))
+                .when(is_dragged, |row| row.opacity(DRAGGED_ROW_OPACITY))
                 .child(main_line)
                 .child(detail_line)
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -2021,34 +2097,54 @@ impl SpacesView {
                         this.activate_space(key, window, cx);
                     }
                 }))
-                .on_drag(
-                    DraggedLabel {
-                        item: key,
-                        label: label.clone(),
+                .on_drag(DraggedSpace(key), {
+                    let this = cx.entity().downgrade();
+                    move |dragged, grab, _, cx| {
+                        this.update(cx, |this, cx| {
+                            this.space_drag = Some(SpaceDrag {
+                                space: dragged.0,
+                                grab,
+                                width: None,
+                            });
+                            cx.notify();
+                        })
+                        .ok();
+                        cx.new(|_| *dragged)
+                    }
+                })
+                // The lifted copy is as wide as the row.
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<DraggedSpace>, _, cx| {
+                        let width = event.bounds.size.width;
+                        if event.drag(cx).0 == key
+                            && let Some(drag) = this.space_drag.as_mut()
+                            && drag.space == key
+                            && drag.width != Some(width)
+                        {
+                            drag.width = Some(width);
+                            cx.notify();
+                        }
                     },
-                    |dragged, click_offset, window, cx| dragged.preview(click_offset, window, cx),
-                )
-                .drag_over::<DraggedLabel<SpaceKey>>(move |style, dragged, _, cx| {
-                    if dragged.item.machine == machine {
+                ))
+                .drag_over::<DraggedSpace>(move |style, dragged, _, cx| {
+                    if dragged.0.machine == machine && dragged.0 != key {
                         style.bg(cx.theme().colors().drop_target_background)
                     } else {
                         style
                     }
                 })
-                .on_drop(
-                    cx.listener(move |this, dragged: &DraggedLabel<SpaceKey>, _, cx| {
-                        if dragged.item.machine == machine && dragged.item != key {
-                            this.send(
-                                machine,
-                                SpaceRequest::MoveSpace {
-                                    space: dragged.item.space,
-                                    index,
-                                },
-                                cx,
-                            );
-                        }
-                    }),
-                );
+                .on_drop(cx.listener(move |this, dragged: &DraggedSpace, _, cx| {
+                    if dragged.0.machine == machine && dragged.0 != key {
+                        this.send(
+                            machine,
+                            SpaceRequest::MoveSpace {
+                                space: dragged.0.space,
+                                index,
+                            },
+                            cx,
+                        );
+                    }
+                }));
 
         // herdr's tree lines from the parent to each worktree: ├ for one with more below,
         // └ for the last.
@@ -3854,6 +3950,10 @@ impl SpacesView {
 
 impl Render for SpacesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The window redraws when a drag ends, wherever it was dropped.
+        if !cx.has_active_drag() {
+            self.space_drag = None;
+        }
         let main_background = cx.theme().colors().editor_background;
         let main = self.render_main(cx);
         let is_sidebar_hidden = crate::app_settings::is_sidebar_hidden(cx);
@@ -4516,6 +4616,79 @@ mod tests {
                 move_pane,
                 Request::Spaces(SpaceRequest::SwapPanes(PaneId(4), PaneId(5)))
             ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_dragged_workspace_row_lifts_and_takes_the_place_of_the_row_it_is_dropped_on(
+        cx: &mut TestAppContext,
+    ) {
+        let mut state = spaces();
+        state.spaces.push(Space {
+            id: SpaceId(7),
+            name: Some("second".to_string()),
+            folder: PathBuf::from("/tmp/second"),
+            project_id: None,
+            tabs: vec![Tab {
+                id: TabId(8),
+                name: None,
+                root: Node::Pane(PaneId(9)),
+                panes: vec![pane(9, None)],
+            }],
+            git: None,
+            current: None,
+        });
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+        let none = gpui::Modifiers::none();
+        let first = cx
+            .debug_bounds("workspace-local-1")
+            .expect("the first row is drawn");
+        let second = cx
+            .debug_bounds("workspace-local-7")
+            .expect("the second row is drawn");
+        assert!(cx.debug_bounds("lifted-row").is_none());
+
+        // The drag starts once the pointer has moved a little, where it holds the row.
+        let grab = gpui::point(px(30.), px(10.));
+        cx.simulate_mouse_down(first.origin + grab, MouseButton::Left, none);
+        cx.simulate_mouse_move(first.origin + grab, MouseButton::Left, none);
+        let grab = grab + gpui::point(px(0.), px(8.));
+        cx.simulate_mouse_move(first.origin + grab, MouseButton::Left, none);
+        cx.simulate_mouse_move(second.center(), MouseButton::Left, none);
+        // A copy of the row, held where it was grabbed.
+        let lifted = cx.debug_bounds("lifted-row").expect("the row lifts");
+        let offset = lifted.origin - (second.center() - grab);
+        assert!(
+            f32::from(offset.x).abs() <= 1. && f32::from(offset.y).abs() <= 1.,
+            "the copy is {offset:?} off"
+        );
+        assert_eq!(lifted.size, first.size);
+
+        cx.simulate_mouse_up(second.center(), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("lifted-row").is_none());
+        let sent: Vec<Request> = client.read_with(cx, |client, _| {
+            client
+                .sent_for_test()
+                .into_iter()
+                .filter(|request| matches!(request, Request::Spaces(_)))
+                .collect()
+        });
+        assert_eq!(
+            sent,
+            [Request::Spaces(SpaceRequest::MoveSpace {
+                space: SpaceId(1),
+                index: 1,
+            })]
         );
     }
 

@@ -531,6 +531,10 @@ since a thread's workspace is its checkout.
   commit, the path, its worktrees; `SpaceGit::{upstream, changes, last_commit}`) or the thread
   cards' details popover outside it (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
   or an ACP thread; resize, zoom, close. Which tab shows, focus and zoom are client-only.
+  A dragged workspace row lifts, as t3code's sidebar rows do: an opaque copy with a shadow is
+  held where it was grabbed (`SpaceDrag`, drawn by the view rather than GPUI's drag view), its
+  own place dims, and the row under it is shaded; dropping it there takes that row's place
+  (`SpaceRequest::MoveSpace`).
   Dragging a pane's header over another pane of its tab works as Zed's pane drop targets
   (`pane_drop_edge`): near an edge (a fifth of the pane's shorter side), that half lights up
   and dropping splits the pane there with the dragged one (`SpaceRequest::MovePane`,
