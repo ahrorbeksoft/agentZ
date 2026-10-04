@@ -847,9 +847,28 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if !self.detached {
-            self.kill();
+        if self.detached {
+            return;
         }
+        self.kill();
+        // A stopped loop gives back its PTY, and dropping the PTY waits for the process to end:
+        // that mustn't hold up the server.
+        let event_loop = self.event_loop.take();
+        let paused = self.paused.take();
+        if event_loop.is_none() && paused.is_none() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("terminal-end".into())
+            .spawn(move || {
+                if let Some(event_loop) = event_loop
+                    && event_loop.join().is_err()
+                {
+                    log::error!("a terminal's event loop panicked");
+                }
+                drop(paused);
+            })
+            .log_err();
     }
 }
 
@@ -1066,6 +1085,60 @@ enum PtyKind {
     Started(tty::Pty),
     #[cfg(unix)]
     Adopted(AdoptedPty),
+}
+
+impl Drop for TerminalPty {
+    fn drop(&mut self) {
+        // `tty::Pty` hangs up and waits for its process before it closes the PTY, and nothing
+        // reads the PTY by then. What the process writes as it ends fills it, and on macOS
+        // `login` and the shell then can't finish exiting, so the wait never ends. Reading it
+        // meanwhile lets them end.
+        #[cfg(unix)]
+        if let PtyKind::Started(pty) = &self.kind {
+            let pid = pty.child().id();
+            match self.file.file.try_clone() {
+                Ok(file) => {
+                    std::thread::Builder::new()
+                        .name("terminal-drain".into())
+                        .spawn(move || drain_pty(&file, pid))
+                        .log_err();
+                }
+                Err(error) => log::error!("failed to read a closed terminal: {error}"),
+            }
+        }
+    }
+}
+
+/// Reads and drops what's written to a PTY until `pid`, the process it started, is gone.
+#[cfg(unix)]
+fn drain_pty(file: &File, pid: u32) {
+    let mut buffer = [0u8; 8192];
+    let mut poll_fd = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(file),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    while process_exists(pid) {
+        // SAFETY: `poll_fd` is one entry with an open descriptor.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 50) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+        if ready <= 0 {
+            continue;
+        }
+        match (&*file).read(&mut buffer) {
+            // Every process has let go of the PTY.
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// The PTY's controlling side as the event loop reads and writes it. For a started terminal,
@@ -1797,5 +1870,58 @@ mod tests {
         );
         let killed = exit_from_status(std::process::ExitStatus::from_raw(9));
         assert_eq!(killed.signal.as_deref(), Some("SIGKILL"));
+    }
+
+    /// Once its terminal stops reading, a program that keeps writing fills the PTY. Closing the
+    /// terminal mustn't wait for the program, and the program must still end.
+    #[test]
+    fn closing_a_terminal_that_is_still_written_to_neither_waits_nor_leaves_it_running() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let ready = directory.path().join("ready");
+        let script = format!(
+            "trap '' HUP TERM; touch '{}'; while :; do echo {}; done",
+            ready.display(),
+            "x".repeat(200)
+        );
+        let terminal = Terminal::start(
+            TerminalSpawn {
+                program: Some(("/bin/sh".into(), vec!["-c".into(), script])),
+                cwd: std::env::temp_dir(),
+                env: HashMap::default(),
+            },
+            TerminalSize::default(),
+            None,
+            Arc::new(|_| {}),
+        )
+        .expect("starting sh");
+        let wait_until = |done: &dyn Fn() -> bool, what: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_until(&|| ready.exists(), "the script didn't start");
+        // The loop has stopped and given back the PTY by the time the terminal is dropped.
+        terminal.sender.send(Msg::Shutdown).ok();
+        wait_until(
+            &|| {
+                terminal
+                    .event_loop
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            },
+            "the event loop didn't stop",
+        );
+        let child = terminal.child_pid.expect("the terminal's process");
+
+        let closing = std::time::Instant::now();
+        drop(terminal);
+        assert!(
+            closing.elapsed() < Duration::from_millis(250),
+            "closing waited {:?} for the program",
+            closing.elapsed()
+        );
+        wait_until(&|| !process_exists(child), "the program never ended");
     }
 }

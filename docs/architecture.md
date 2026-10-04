@@ -392,7 +392,9 @@ Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
 - **Server** (`terminals.rs`, `server/terminal_requests.rs`): a PTY with `alacritty_terminal`, as
   Zed's `alacritty.rs` without GPUI. 5,000 lines of scrollback, kept while nobody watches.
   Screens stream as lines of styled runs, only changed lines, at most every 16 ms, only to
-  subscribed clients. Closing a terminal ends its whole session (herdr's pane shutdown).
+  subscribed clients. Closing a terminal ends its whole session (herdr's pane shutdown), off
+  the server's request loop, and keeps reading the PTY until its process is gone: a program
+  writing as it ends would otherwise fill the PTY and never end.
 - **App** (`terminal_entity.rs`, `terminal_view.rs`, `terminal_element.rs`, `terminal_mouse.rs`):
   Zed's element, key mappings (`agentz_protocol::terminal_keys`), IME, mouse, selection. Font
   size with Cmd-+, Cmd-- and Cmd-0.
