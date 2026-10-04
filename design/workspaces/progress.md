@@ -25,7 +25,7 @@ Notes for whoever continues:
 | 5 | 1 | Rows: full-color icons, agent icons, `~` paths, machine only with remotes | done |
 | 6 | 3A | Agents list: herdr's two-line rows | done |
 | 7 | 5 | Row menu: New Tab, Copy Path, Reveal in Finder, New Thread Here | done (Delete Worktree Checkout… comes with item 9) |
-| 8 | 2 | Worktree groups (herdr), collapse toggle | not started |
+| 8 | 2 | Worktree groups (herdr), collapse toggle | done |
 | 9 | 15 | Delete Worktree Checkout…; fuller New Worktree dialog | not started |
 | 10 | 6 | Hover details: git at a glance | not started |
 | 11 | 3E | "Needs you" strip on top of the sidebar | not started |

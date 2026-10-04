@@ -482,19 +482,24 @@ pub(crate) async fn space_git(folder: &Path) -> Option<SpaceGit> {
     .ok()
     .and_then(|counts| parse_ahead_behind(&counts))
     .unwrap_or_default();
+    let checkout = crate::git::git(folder, &["rev-parse", "--show-toplevel"], &[])
+        .await
+        .ok()
+        .map(|top| PathBuf::from(top.trim()))
+        .filter(|top| !top.as_os_str().is_empty());
+    // Found through the shared `.git`, so a linked worktree is named after the repository
+    // rather than itself, and grouped under it.
+    let main_checkout = crate::workspaces::main_checkout(folder).await.ok();
     Some(SpaceGit {
         branch,
         ahead,
         behind,
-        repository: repository_name(folder).await,
+        repository: main_checkout
+            .as_ref()
+            .and_then(|root| Some(root.file_name()?.to_string_lossy().into_owned())),
+        checkout,
+        main_checkout,
     })
-}
-
-/// The folder of the repository's main checkout, found through its shared `.git`, so a linked
-/// worktree is named after the repository rather than itself.
-async fn repository_name(folder: &Path) -> Option<String> {
-    let root = crate::workspaces::main_checkout(folder).await.ok()?;
-    Some(root.file_name()?.to_string_lossy().into_owned())
 }
 
 /// The folder most tabs are in. When tabs are split evenly, the earliest tab's wins.
@@ -634,6 +639,8 @@ mod tests {
                     ahead: 1,
                     behind: 0,
                     repository: Some("w".into()),
+                    checkout: Some("/w".into()),
+                    main_checkout: Some("/w".into()),
                 }),
             );
             store.set_pane_agent(
@@ -747,8 +754,8 @@ mod tests {
         crate::git::git(directory.path(), &["init", "-q", "-b", "trunk"], &[])
             .await
             .expect("init");
-        let name = std::fs::canonicalize(directory.path())
-            .expect("canonical path")
+        let root = std::fs::canonicalize(directory.path()).expect("canonical path");
+        let name = root
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
         assert_eq!(
@@ -758,6 +765,8 @@ mod tests {
                 ahead: 0,
                 behind: 0,
                 repository: name.clone(),
+                checkout: Some(root.clone()),
+                main_checkout: Some(root.clone()),
             })
         );
         // Inside it, and in a worktree of it, the repository keeps its name.
@@ -797,6 +806,9 @@ mod tests {
         .await
         .expect("worktree");
         let git = space_git(&worktree).await.expect("a repository");
+        // A linked worktree, grouped under the main checkout.
+        assert!(git.is_linked_worktree());
+        assert_eq!(git.main_checkout.as_ref(), Some(&root));
         assert_eq!(
             (git.branch.as_deref(), git.repository),
             (Some("feature"), name)

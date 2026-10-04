@@ -34,7 +34,7 @@ use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
-use crate::project_info::{ProjectInfoStore, render_project_icon};
+use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ThreadStatus;
 use crate::sidebar::{
     DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, render_details_popover, render_folder_icon,
@@ -52,6 +52,10 @@ const RENAME_KEY_CONTEXT: &str = "WorkspacesRename";
 const SEARCH_KEY_CONTEXT: &str = "WorkspacesSearch";
 /// The grab area of a split's border. The line drawn in its middle is a pixel wide.
 const DIVIDER_SIZE: Pixels = px(5.);
+/// How far a worktree's row sits in from its parent's.
+const CHILD_ROW_INDENT: Pixels = px(20.);
+/// Where the tree line from a parent to its worktrees runs.
+const CONNECTOR_LEFT: Pixels = px(14.);
 /// An agent row's second line starts past the first's state slot.
 const AGENT_ROW_INDENT: Pixels = px(14.);
 /// How many agents a workspace row shows by icon before counting the rest.
@@ -296,6 +300,8 @@ pub struct SpacesView {
     details_space: Option<SpaceKey>,
     details_delay: Option<(SpaceKey, Task<()>)>,
     hovered_space: Option<SpaceKey>,
+    /// Worktree groups folded to their parent (client-only, as in herdr).
+    collapsed_groups: HashSet<GroupKey>,
     /// The row whose counts are under the mouse, which show a tooltip instead of the details.
     hovered_contents: Option<SpaceKey>,
     is_visible: bool,
@@ -347,6 +353,7 @@ impl SpacesView {
             details_space: None,
             details_delay: None,
             hovered_space: None,
+            collapsed_groups: HashSet::default(),
             hovered_contents: None,
             is_visible: false,
             _subscriptions: subscriptions,
@@ -874,35 +881,76 @@ impl SpacesView {
         );
     }
 
+    /// Closes a workspace. A group's only parent takes its worktrees' workspaces with it, as
+    /// in herdr; their checkouts and branches stay.
     fn close_space(&mut self, key: SpaceKey, window: &mut Window, cx: &mut Context<Self>) {
         let Some(space) = self.space(key, cx) else {
             return;
         };
-        let has_terminals = space
-            .tabs
-            .iter()
-            .flat_map(|tab| &tab.panes)
+        let worktrees = self.group_children_closing_with(key, &space, cx);
+        let has_terminals = std::iter::once(&space)
+            .chain(&worktrees)
+            .flat_map(|space| space.tabs.iter().flat_map(|tab| &tab.panes))
             .any(|pane| matches!(pane.content, PaneContent::Terminal(_)));
+        let mut closing = vec![key.space];
+        closing.extend(worktrees.iter().map(|space| space.id));
+        let close = move |this: &mut Self, cx: &mut Context<Self>| {
+            for space in &closing {
+                this.send(key.machine, SpaceRequest::CloseSpace(*space), cx);
+            }
+        };
         if !has_terminals {
-            self.send(key.machine, SpaceRequest::CloseSpace(key.space), cx);
+            close(self, cx);
             return;
         }
+        let (title, detail) = match worktrees.len() {
+            0 => (
+                format!("Close “{}”?", space.label()),
+                "Its terminals end. Its threads stay in Agents.",
+            ),
+            count => (
+                format!(
+                    "Close “{}” and its {count} {}?",
+                    space.label(),
+                    if count == 1 { "worktree" } else { "worktrees" }
+                ),
+                "Their terminals end. Checkouts, branches and threads stay.",
+            ),
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Close “{}”?", space.label()),
-            Some("Its terminals end. Its threads stay in Agents."),
+            &title,
+            Some(detail),
             &["Close", "Cancel"],
             cx,
         );
         cx.spawn(async move |this, cx| {
             if answer.await == Ok(0) {
-                this.update(cx, |this, cx| {
-                    this.send(key.machine, SpaceRequest::CloseSpace(key.space), cx)
-                })
-                .ok();
+                this.update(cx, |this, cx| close(this, cx)).ok();
             }
         })
         .detach();
+    }
+
+    /// The worktrees' workspaces that close with a group's parent: all of them, unless
+    /// another workspace on the main checkout stays to hold them.
+    fn group_children_closing_with(&self, key: SpaceKey, space: &Space, cx: &App) -> Vec<Space> {
+        let Some((main, GroupRole::Parent)) = self.group_membership(key.machine, space, cx) else {
+            return Vec::new();
+        };
+        let members: Vec<(Space, GroupRole)> = self
+            .all_spaces(cx)
+            .into_iter()
+            .filter(|(machine, other)| *machine == key.machine && other.id != space.id)
+            .filter_map(|(machine, other)| {
+                let (other_main, role) = self.group_membership(machine, &other, cx)?;
+                (other_main == main).then_some((other, role))
+            })
+            .collect();
+        if members.iter().any(|(_, role)| *role == GroupRole::Parent) {
+            return Vec::new();
+        }
+        members.into_iter().map(|(space, _)| space).collect()
     }
 
     fn start_renaming(
@@ -1123,17 +1171,24 @@ impl SpacesView {
         let has_remotes = self.machines.read(cx).has_remotes();
         let spaces = self.all_spaces(cx);
         let has_spaces = !spaces.is_empty();
-        let mut rows = Vec::new();
-        let mut index_in_machine: HashMap<MachineId, usize> = HashMap::default();
-        for (machine, space) in spaces {
-            let index = index_in_machine.entry(machine).or_default();
-            let row_index = *index;
-            *index += 1;
-            if !matches_space(&space, &query) {
-                continue;
-            }
-            rows.push(self.render_space_row(machine, row_index, &space, cx));
-        }
+        let entries = if query.is_empty() {
+            space_entries(
+                spaces,
+                |machine, space| self.group_membership(machine, space, cx),
+                &self.collapsed_groups,
+                self.active_space,
+            )
+        } else {
+            // Search matches rows wherever they are; groups would hide them.
+            space_entries(spaces, |_, _| None, &HashSet::default(), None)
+                .into_iter()
+                .filter(|entry| matches_space(&entry.space, &query))
+                .collect()
+        };
+        let rows: Vec<AnyElement> = entries
+            .iter()
+            .map(|entry| self.render_space_row(entry, cx))
+            .collect();
 
         v_flex()
             .w(SIDEBAR_WIDTH)
@@ -1244,27 +1299,49 @@ impl SpacesView {
     }
 
     /// herdr's space row: the rolled-up state and name, then the branch and ahead/behind.
-    fn render_space_row(
-        &self,
-        machine: MachineId,
-        index: usize,
-        space: &Space,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_space_row(&self, entry: &SpaceEntry, cx: &mut Context<Self>) -> AnyElement {
+        let (machine, index, space) = (entry.machine, entry.index, &entry.space);
         let key = SpaceKey {
             machine,
             space: space.id,
         };
         let colors = cx.theme().colors().clone();
         let is_active = self.active_space == Some(key);
-        let label: SharedString = space.label().into();
-        let status = rolled_up(
-            space
-                .tabs
-                .iter()
-                .flat_map(|tab| &tab.panes)
-                .filter_map(|pane| self.pane_status(machine, pane, cx)),
-        );
+        let label: SharedString = entry
+            .child
+            .and_then(|_| child_label(space))
+            .unwrap_or_else(|| space.label())
+            .into();
+        // A folded group's parent stands for the whole group (herdr).
+        let collapsed_group = entry
+            .group
+            .clone()
+            .filter(|group| self.collapsed_groups.contains(group));
+        let status = match &collapsed_group {
+            Some(group) => rolled_up(
+                self.all_spaces(cx)
+                    .into_iter()
+                    .filter(|(machine, space)| {
+                        self.group_membership(*machine, space, cx)
+                            .is_some_and(|(main, _)| (*machine, main) == *group)
+                    })
+                    .flat_map(|(machine, space)| {
+                        space
+                            .tabs
+                            .iter()
+                            .flat_map(|tab| &tab.panes)
+                            .filter_map(|pane| self.pane_status(machine, pane, cx))
+                            .collect::<Vec<_>>()
+                    }),
+            ),
+            None => rolled_up(
+                space
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter_map(|pane| self.pane_status(machine, pane, cx)),
+            ),
+        };
         let is_renaming = self.renaming == Some(RenameTarget::Space(key));
         let machine_icon = self.machines.read(cx).machine_icon(machine, cx);
         let machine_label = self.machines.read(cx).label(machine, cx);
@@ -1294,6 +1371,18 @@ impl SpacesView {
                 .cloned()
         });
         let icon = match &project {
+            // A worktree or pasture under its parent shows what kind of checkout it is.
+            _ if entry.child.is_some() => {
+                let is_worktree = git.as_ref().is_some_and(|git| git.is_linked_worktree());
+                Icon::new(workspace_icon(if is_worktree {
+                    projects::WorkspaceKind::Worktree
+                } else {
+                    projects::WorkspaceKind::Pasture
+                }))
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+            }
             Some(project) => render_project_icon(project, project_info.as_ref(), px(16.), cx),
             None => render_folder_icon(),
         };
@@ -1358,6 +1447,30 @@ impl SpacesView {
             })
             .when_some(status.filter(|_| !is_renaming), |line, status| {
                 line.child(div().flex_none().child(render_status_pill(status, cx)))
+            })
+            // A group's parent folds its worktrees away (herdr's ▾/▸).
+            .when_some(entry.group.clone(), |line, group| {
+                let is_collapsed = self.collapsed_groups.contains(&group);
+                line.child(
+                    IconButton::new(
+                        ElementId::Name(format!("{id}-group-toggle").into()),
+                        if is_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        },
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text(if is_collapsed {
+                        "Show Worktrees"
+                    } else {
+                        "Hide Worktrees"
+                    }))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_group(group.clone(), cx)),
+                    ),
+                )
             });
         let faint_label = |text: String| {
             Label::new(text)
@@ -1386,6 +1499,8 @@ impl SpacesView {
             .min_w_0()
             .gap_1()
             .child(match &git {
+                // A worktree's title is its branch already; say where it is.
+                Some(_) if entry.child.is_some() => faint_label(path.to_string()).truncate_middle(),
                 Some(git) => faint_label(repository_branch(
                     Some(&label),
                     git.repository.as_deref(),
@@ -1467,6 +1582,8 @@ impl SpacesView {
                 })
                 .group(group_name)
                 .mx_1()
+                // A worktree sits under its parent.
+                .when(entry.child.is_some(), |row| row.ml(CHILD_ROW_INDENT))
                 .px_2p5()
                 .py_1p5()
                 .rounded_md()
@@ -1519,6 +1636,29 @@ impl SpacesView {
                     }),
                 );
 
+        // herdr's tree lines from the parent to each worktree: ├ for one with more below,
+        // └ for the last.
+        let connector = entry.child.map(|is_last| {
+            let line = colors.border;
+            div()
+                .absolute()
+                .top_0()
+                .left(CONNECTOR_LEFT)
+                .w(px(8.))
+                .map(|this| if is_last { this.h_1_2() } else { this.h_full() })
+                .border_l_1()
+                .border_color(line)
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_1_2()
+                        .w_full()
+                        .border_t_1()
+                        .border_color(line),
+                )
+                .into_any_element()
+        });
         let this = cx.entity().downgrade();
         let folder = space.current_folder().to_path_buf();
         // New Thread Here starts in the checkout the workspace is in.
@@ -1527,6 +1667,7 @@ impl SpacesView {
             .trigger(move |is_menu_open, _, _| {
                 div()
                     .relative()
+                    .when_some(connector, |this, connector| this.child(connector))
                     .child(row)
                     .when(!is_menu_open, |this| this.children(details_popover))
             })
@@ -1663,6 +1804,50 @@ impl SpacesView {
                 })
             })
             .into_any_element()
+    }
+
+    /// Which worktree group a workspace belongs to: a project's pasture under the project, or
+    /// any checkout under its repository's main checkout.
+    fn group_membership(
+        &self,
+        machine: MachineId,
+        space: &Space,
+        cx: &App,
+    ) -> Option<(PathBuf, GroupRole)> {
+        let folder = space.current_folder();
+        let pasture_of = self
+            .machines
+            .read(cx)
+            .projects(machine, cx)
+            .and_then(|store| {
+                store.read(cx).projects().iter().find_map(|project| {
+                    project
+                        .workspaces
+                        .iter()
+                        .any(|workspace| {
+                            workspace.kind == projects::WorkspaceKind::Pasture
+                                && folder.starts_with(&workspace.path)
+                        })
+                        .then(|| project.path.clone())
+                })
+            });
+        if let Some(main) = pasture_of {
+            return Some((main, GroupRole::Child));
+        }
+        let git = space.git.as_ref()?;
+        let role = if git.is_linked_worktree() {
+            GroupRole::Child
+        } else {
+            GroupRole::Parent
+        };
+        Some((git.main_checkout.clone()?, role))
+    }
+
+    fn toggle_group(&mut self, group: GroupKey, cx: &mut Context<Self>) {
+        if !self.collapsed_groups.remove(&group) {
+            self.collapsed_groups.insert(group);
+        }
+        cx.notify();
     }
 
     /// Shows a workspace's details after a moment, like the thread cards do.
@@ -2873,6 +3058,120 @@ fn contents_label(terminals: usize, agents: usize) -> Option<String> {
 }
 
 /// A tab's name, or its number, as herdr numbers unnamed tabs.
+/// A worktree group: the machine, and its repository's main checkout.
+type GroupKey = (MachineId, PathBuf);
+
+/// Where a workspace sits in herdr's worktree groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupRole {
+    /// On the repository's main checkout.
+    Parent,
+    /// In a linked worktree, or a project's pasture.
+    Child,
+}
+
+/// A row of the workspace list.
+#[derive(Clone)]
+struct SpaceEntry {
+    machine: MachineId,
+    space: Space,
+    /// Its place among its machine's workspaces, for reordering.
+    index: usize,
+    /// Under its group's parent, and whether it's the group's last child.
+    child: Option<bool>,
+    /// The group a parent's toggle folds.
+    group: Option<GroupKey>,
+}
+
+/// herdr's `workspace_entries`: a workspace in a linked worktree of a repository sits under
+/// the workspace on that repository's main checkout, however it was opened. A group shows
+/// once it has both; otherwise rows keep their order. A folded group shows only its active
+/// child.
+fn space_entries(
+    spaces: Vec<(MachineId, Space)>,
+    membership: impl Fn(MachineId, &Space) -> Option<(PathBuf, GroupRole)>,
+    collapsed: &HashSet<GroupKey>,
+    active: Option<SpaceKey>,
+) -> Vec<SpaceEntry> {
+    let mut index_in_machine: HashMap<MachineId, usize> = HashMap::default();
+    let members: Vec<(SpaceEntry, Option<(GroupKey, GroupRole)>)> = spaces
+        .into_iter()
+        .map(|(machine, space)| {
+            let index = index_in_machine.entry(machine).or_default();
+            let entry = SpaceEntry {
+                machine,
+                index: *index,
+                child: None,
+                group: None,
+                space,
+            };
+            *index += 1;
+            let member =
+                membership(machine, &entry.space).map(|(main, role)| ((machine, main), role));
+            (entry, member)
+        })
+        .collect();
+    let has = |key: &GroupKey, role: GroupRole| {
+        members
+            .iter()
+            .any(|(_, member)| member.as_ref() == Some(&(key.clone(), role)))
+    };
+    let mut emitted = HashSet::default();
+    let mut entries = Vec::new();
+    for (entry, member) in &members {
+        let Some((key, _)) = member
+            .as_ref()
+            .filter(|(key, _)| has(key, GroupRole::Parent) && has(key, GroupRole::Child))
+        else {
+            entries.push(entry.clone());
+            continue;
+        };
+        if !emitted.insert(key.clone()) {
+            continue;
+        }
+        let in_group = |role: GroupRole| {
+            members
+                .iter()
+                .filter(move |(_, member)| member.as_ref() == Some(&(key.clone(), role)))
+                .map(|(entry, _)| entry)
+        };
+        for parent in in_group(GroupRole::Parent) {
+            entries.push(SpaceEntry {
+                group: Some(key.clone()),
+                ..parent.clone()
+            });
+        }
+        let children: Vec<&SpaceEntry> = in_group(GroupRole::Child)
+            .filter(|child| {
+                !collapsed.contains(key)
+                    || active
+                        == Some(SpaceKey {
+                            machine: child.machine,
+                            space: child.space.id,
+                        })
+            })
+            .collect();
+        let count = children.len();
+        for (position, child) in children.into_iter().enumerate() {
+            entries.push(SpaceEntry {
+                child: Some(position + 1 == count),
+                ..child.clone()
+            });
+        }
+    }
+    entries
+}
+
+/// A worktree's row is named after its branch, without agentZ's `agentz/` prefix (herdr
+/// drops its `worktree/`), unless the user named it.
+fn child_label(space: &Space) -> Option<String> {
+    if space.name.is_some() {
+        return None;
+    }
+    let branch = space.git.as_ref()?.branch.as_deref()?;
+    Some(branch.strip_prefix("agentz/").unwrap_or(branch).to_string())
+}
+
 /// The project's checkout a folder is in: its own folder, or one of its worktrees or pastures.
 fn checkout_root(project: &projects::Project, folder: &Path) -> Option<PathBuf> {
     std::iter::once(&project.path)
@@ -3158,6 +3457,69 @@ mod tests {
         assert_eq!(
             contents_label(3, 1).as_deref(),
             Some("3 terminals · 1 agent")
+        );
+    }
+
+    #[test]
+    fn worktrees_sit_under_their_main_checkout_as_herdr_groups_them() {
+        let space = |id: u64, name: &str| Space {
+            id: SpaceId(id),
+            name: Some(name.to_string()),
+            ..spaces().spaces.remove(0)
+        };
+        // The worktree comes before its parent and another repository sits between them.
+        let spaces: Vec<(MachineId, Space)> = vec![
+            (MachineId::Local, space(1, "feature")),
+            (MachineId::Local, space(2, "other")),
+            (MachineId::Local, space(3, "main")),
+            (MachineId::Local, space(4, "lonely-worktree")),
+        ];
+        let membership = |_: MachineId, space: &Space| match space.id.0 {
+            1 => Some((PathBuf::from("/repo"), GroupRole::Child)),
+            3 => Some((PathBuf::from("/repo"), GroupRole::Parent)),
+            // A worktree whose main checkout has no workspace stays where it is.
+            4 => Some((PathBuf::from("/elsewhere"), GroupRole::Child)),
+            _ => None,
+        };
+        let order = |entries: Vec<SpaceEntry>| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.space.id.0, entry.child, entry.group.is_some()))
+                .collect::<Vec<_>>()
+        };
+        let group = (MachineId::Local, PathBuf::from("/repo"));
+        assert_eq!(
+            order(space_entries(
+                spaces.clone(),
+                membership,
+                &HashSet::default(),
+                None
+            )),
+            [
+                (3, None, true),
+                (1, Some(true), false),
+                (2, None, false),
+                (4, None, false)
+            ]
+        );
+        // Folded, only the active worktree stays under its parent.
+        let collapsed = HashSet::from_iter([group]);
+        assert_eq!(
+            order(space_entries(spaces.clone(), membership, &collapsed, None)),
+            [(3, None, true), (2, None, false), (4, None, false)]
+        );
+        let active = SpaceKey {
+            machine: MachineId::Local,
+            space: SpaceId(1),
+        };
+        assert_eq!(
+            order(space_entries(spaces, membership, &collapsed, Some(active))),
+            [
+                (3, None, true),
+                (1, Some(true), false),
+                (2, None, false),
+                (4, None, false)
+            ]
         );
     }
 

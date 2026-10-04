@@ -224,6 +224,22 @@ pub struct SpaceGit {
     /// The repository's name: its main checkout's folder, also for a worktree of it.
     #[serde(default)]
     pub repository: Option<String>,
+    /// The top of the checkout the folder is in.
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// The repository's main checkout. A linked worktree's differs from its `checkout`.
+    #[serde(default)]
+    pub main_checkout: Option<PathBuf>,
+}
+
+impl SpaceGit {
+    /// A linked worktree of a repository, rather than its main checkout (herdr's
+    /// `is_linked_worktree`).
+    pub fn is_linked_worktree(&self) -> bool {
+        self.checkout.is_some()
+            && self.main_checkout.is_some()
+            && self.checkout != self.main_checkout
+    }
 }
 
 /// Where a request put a pane: [`crate::Response::SpacePane`].

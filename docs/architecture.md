@@ -497,6 +497,13 @@ since a thread's workspace is its checkout.
   Close show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
+- **Worktree groups** (herdr's `workspace_entries`): a workspace in a linked worktree of a
+  repository (`SpaceGit::{checkout, main_checkout}`), or in a project's pasture, sits under the
+  workspace on that repository's main checkout, however it was opened, with tree lines and its
+  branch as its name (without `agentz/`). A group shows once it has both. The parent's ▾/▸
+  folds it to the active worktree (client-only) and then shows the group's most urgent state.
+  Closing a group's only parent closes its worktrees' workspaces too; checkouts and branches
+  stay.
 - **Row menu**: New Tab, Rename, Copy Path, Reveal in Finder (this Mac), New Thread Here (in a
   project: a draft in the checkout the workspace is in, in the Agents view), Close Workspace,
   and in a git repository (a project or not) New Worktree… and Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch
