@@ -1,0 +1,67 @@
+{
+  "topics": {
+    "section": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "open": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "move": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "B": "yeah, can be renamed, can be deleted, but not archive"
+      },
+      "note": "",
+      "also": []
+    },
+    "ask": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": "idk, make it consistent, if all the alerts use macos alert then yes, if not use the common one"
+      },
+      "note": "",
+      "also": []
+    },
+    "search": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "draft": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": "well, also we wanna be able to choose to create a worktree or pastures too or use the current checkout if it is a git project"
+      },
+      "note": "",
+      "also": []
+    },
+    "crumb": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-04T16:02:01.794Z"
+}
