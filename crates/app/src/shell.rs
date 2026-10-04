@@ -38,6 +38,7 @@ use crate::{
     ToggleTerminalDrawer,
 };
 
+pub const KEY_CONTEXT: &str = "Shell";
 const TITLE_BAR_HEIGHT: Pixels = px(40.);
 const MIN_DIFF_PANEL_WIDTH: Pixels = px(280.);
 /// What a dragged Changes panel leaves of the thread.
@@ -1378,7 +1379,7 @@ impl Render for Shell {
         let shows_workspaces = self.view == MainView::Workspaces && settings_page.is_none();
 
         v_flex()
-            .key_context("Shell")
+            .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_project_switcher))
@@ -1597,6 +1598,9 @@ mod tests {
 
 #[cfg(test)]
 mod modal_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use agentz_protocol::spaces::SpacesSnapshot;
     use gpui::{Modifiers, TestAppContext, point};
     use projects::{Project, ProjectId, ProjectsSnapshot};
@@ -1751,7 +1755,6 @@ mod modal_tests {
             crate::machines::init_for_test(vec![client], cx);
             crate::project_info::init(cx);
             crate::sidebar::init(cx);
-            cx.bind_keys([gpui::KeyBinding::new("cmd-b", ToggleSidebar, None)]);
         });
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
         shell.update_in(cx, |shell, window, cx| {
@@ -1763,5 +1766,45 @@ mod modal_tests {
         assert!(hidden(cx));
         cx.simulate_keystrokes("cmd-b");
         assert!(!hidden(cx));
+    }
+
+    #[gpui::test]
+    fn cmd_d_splits_in_workspaces_and_shows_changes_in_agents(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        let dispatched = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let dispatched = dispatched.clone();
+            cx.observe_keystrokes(move |event, _, _| {
+                if let Some(action) = &event.action {
+                    dispatched.borrow_mut().push(action.name());
+                }
+            })
+        });
+
+        shell.update_in(cx, |shell, window, cx| {
+            shell.set_view(MainView::Workspaces, window, cx)
+        });
+        cx.simulate_keystrokes("cmd-d");
+        assert_eq!(dispatched.borrow().last(), Some(&"workspaces::SplitRight"));
+        assert!(!shell.read_with(cx, |shell, _| shell.show_diff));
+
+        shell.update_in(cx, |shell, window, cx| {
+            shell.set_view(MainView::Agents, window, cx)
+        });
+        cx.simulate_keystrokes("cmd-d");
+        assert_eq!(dispatched.borrow().last(), Some(&"agentz::ToggleDiff"));
+        assert!(shell.read_with(cx, |shell, _| shell.show_diff));
     }
 }

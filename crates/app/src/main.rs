@@ -128,21 +128,30 @@ fn init_for_test(cx: &mut App) {
     text_input::init(cx);
     terminal_view::init(cx);
     spaces_view::init(cx);
+    bind_keys(cx);
+}
+
+/// The shell's keys are bound in its context, not globally: GPUI ranks a binding without a
+/// context above any view's own, so a global Cmd-D would take the key from Workspaces' Split
+/// Right.
+fn bind_keys(cx: &mut App) {
+    let context = Some(shell::KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-o", OpenFolder, context),
+        KeyBinding::new("secondary-alt-o", ToggleProjectSwitcher, context),
+        KeyBinding::new("secondary-n", NewThread, context),
+        KeyBinding::new("secondary-,", OpenSettings, context),
+        KeyBinding::new("secondary-d", ToggleDiff, context),
+        // Zed's key for its left dock.
+        KeyBinding::new("secondary-b", ToggleSidebar, context),
+        KeyBinding::new("secondary-j", ToggleTerminalDrawer, context),
+    ]);
 }
 
 fn init_actions(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.bind_keys([
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-o", OpenFolder, None),
-        KeyBinding::new("secondary-alt-o", ToggleProjectSwitcher, None),
-        KeyBinding::new("secondary-n", NewThread, None),
-        KeyBinding::new("secondary-,", OpenSettings, None),
-        KeyBinding::new("secondary-d", ToggleDiff, None),
-        // Zed's key for its left dock.
-        KeyBinding::new("secondary-b", ToggleSidebar, None),
-        KeyBinding::new("secondary-j", ToggleTerminalDrawer, None),
-    ]);
+    bind_keys(cx);
     cx.set_menus([
         Menu::new("agentZ").items([
             MenuItem::action("Settings…", OpenSettings),
