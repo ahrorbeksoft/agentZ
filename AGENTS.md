@@ -68,9 +68,11 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   expected.
 - **GPUI tests** need `--features gpui_platform/runtime_shaders` (see Testing below).
 - **Disk is tight** (a few GB free). `target/debug/incremental` once grew to 14 GB and froze the
-  machine, and stale builds piled up to 42 GB in `target/debug`. Check `df -h ~` before long
-  build sessions. When space runs low, `cargo clean --profile dev` is safe and a full
-  `cargo build` takes about 2 minutes (4 GB).
+  machine, and stale builds piled up to 42 GB in `target/debug`. Clean periodically, not only
+  when space runs out: check `df -h ~` and `du -sh target` at the start of each session and
+  before long build sessions, and run `cargo clean --profile dev` whenever `target` is over
+  10 GB or less than 20 GB is free. It's safe (a running app or server keeps working), and a
+  full `cargo build` takes about 2 minutes (4 GB).
 
 ## Rules from the user
 
