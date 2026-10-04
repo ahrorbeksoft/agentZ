@@ -415,6 +415,15 @@ pub enum Request {
         connection: ConnectionId,
         method_id: acp::AuthMethodId,
     },
+    /// Starts a thread with another agent, in the same workspace, that continues this one: its
+    /// conversation goes with the new thread's first message ([`thread::handoff`]).
+    /// [`Response::ThreadCreated`].
+    ContinueThread {
+        thread_id: ThreadId,
+        agent_id: AgentId,
+    },
+    /// Starts the continued thread without the conversation it would have brought.
+    DropHandoff(ConnectionId),
     /// From the agent's own process, through agentZ's `xdg-open`: it tried to open a page in a
     /// browser while logging in. Clients show it ([`thread::ThreadState::login_page`]); refused
     /// when the connection isn't logging in.

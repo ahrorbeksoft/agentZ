@@ -290,6 +290,9 @@ pub struct ThreadState {
     /// A one-time code the agent printed while logging in, to enter on the page it links to
     /// (a device login).
     pub auth_code: Option<SharedString>,
+    /// The conversation this thread continues, to go with its first message, while it waits
+    /// for one ("Continue with another agent").
+    pub handoff: Option<PendingHandoff>,
     /// The page the agent tried to open in a browser while logging in, on a machine agentZ
     /// reaches over SSH. A browser there isn't one the user sees, so agentZ gives agents its own
     /// `xdg-open`, which hands the page to the clients to open instead.
@@ -460,6 +463,10 @@ impl ThreadView {
         self.state.login_page.as_ref()
     }
 
+    pub fn pending_handoff(&self) -> Option<&PendingHandoff> {
+        self.state.handoff.as_ref()
+    }
+
     /// Whether the agent is waiting on the user to answer a request for input.
     pub fn is_awaiting_input(&self) -> bool {
         self.state
@@ -623,6 +630,168 @@ pub fn gateway_meta(base_url: &str, headers: &[(String, String)]) -> acp::Meta {
     )])
 }
 
+/// Opens the context a continued thread's first message brings: [`handoff`].
+pub const HANDOFF_OPENING: &str = "<agentz-handoff";
+const HANDOFF_CLOSING: &str = "</agentz-handoff>";
+/// How much of the old conversation goes along, in characters: a long thread's gist without
+/// filling much of the new agent's context.
+const HANDOFF_BUDGET: usize = 40_000;
+/// The most kept of any one message.
+const HANDOFF_MESSAGE_LIMIT: usize = 6_000;
+/// The most tool calls named for one of the agent's turns.
+const HANDOFF_TOOL_LIMIT: usize = 20;
+
+/// The conversation a thread continues with another agent, sent with its first message
+/// ("Continue with another agent").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingHandoff {
+    pub text: String,
+    /// How many messages (the user's and the agent's) the conversation had.
+    pub messages: usize,
+}
+
+/// A thread's conversation for another agent to continue: the user's messages, the agent's
+/// replies with the tools it used, and the plan, as t3code's deterministic handoff
+/// summarizes. The first message (the goal) and the latest ones are kept when it's long.
+pub fn handoff(view: &ThreadView, agent_name: &str, title: &str) -> PendingHandoff {
+    enum Part {
+        User(String),
+        Agent { text: String, tools: Vec<String> },
+    }
+    let mut parts: Vec<Part> = Vec::new();
+    for entry in &view.entries {
+        match entry {
+            Entry::UserMessage(text) => {
+                let text = without_handoff(text).trim();
+                if !text.is_empty() {
+                    parts.push(Part::User(text.to_string()));
+                }
+            }
+            Entry::AgentMessage(text) => match parts.last_mut() {
+                Some(Part::Agent { text: reply, .. }) => {
+                    if !reply.is_empty() {
+                        reply.push_str("\n\n");
+                    }
+                    reply.push_str(text.trim());
+                }
+                _ => parts.push(Part::Agent {
+                    text: text.trim().to_string(),
+                    tools: Vec::new(),
+                }),
+            },
+            Entry::ToolCall(tool_call) => {
+                let mut tool = tool_call.title.clone();
+                if tool_call.status == acp::ToolCallStatus::Failed {
+                    tool.push_str(" (failed)");
+                }
+                match parts.last_mut() {
+                    Some(Part::Agent { tools, .. }) => tools.push(tool),
+                    _ => parts.push(Part::Agent {
+                        text: String::new(),
+                        tools: vec![tool],
+                    }),
+                }
+            }
+            Entry::AgentThought(_) | Entry::Plan => {}
+        }
+    }
+    let messages = parts.len();
+    let attribute = |value: &str| value.replace('"', "'");
+    // Tags rather than headings, which the messages' own markdown has too.
+    let sections: Vec<String> = parts
+        .into_iter()
+        .map(|part| match part {
+            Part::User(text) => format!(
+                "<message from=\"user\">\n{}\n</message>",
+                clip(&text, HANDOFF_MESSAGE_LIMIT)
+            ),
+            Part::Agent { text, tools } => {
+                let mut section = format!("<message from=\"{}\">", attribute(agent_name));
+                if !text.is_empty() {
+                    section.push('\n');
+                    section.push_str(&clip(&text, HANDOFF_MESSAGE_LIMIT));
+                }
+                if !tools.is_empty() {
+                    let shown = tools.len().min(HANDOFF_TOOL_LIMIT);
+                    section.push_str("\nTools: ");
+                    section.push_str(&tools[..shown].join(" · "));
+                    if tools.len() > shown {
+                        section.push_str(&format!(" · and {} more", tools.len() - shown));
+                    }
+                }
+                section.push_str("\n</message>");
+                section
+            }
+        })
+        .collect();
+
+    // The first section is the goal; then as many of the latest as fit.
+    let mut kept_latest: Vec<&String> = Vec::new();
+    let mut used = sections.first().map_or(0, String::len);
+    for section in sections.iter().skip(1).rev() {
+        if used + section.len() > HANDOFF_BUDGET {
+            break;
+        }
+        used += section.len();
+        kept_latest.push(section);
+    }
+    kept_latest.reverse();
+    let left_out = sections.len().saturating_sub(1 + kept_latest.len());
+    let mut body: Vec<String> = sections.first().cloned().into_iter().collect();
+    if left_out > 0 {
+        body.push(format!("(… {left_out} messages left out …)"));
+    }
+    body.extend(kept_latest.into_iter().cloned());
+    if !view.state.plan.is_empty() {
+        let plan: Vec<String> = view
+            .state
+            .plan
+            .iter()
+            .map(|item| {
+                let mark = match item.status {
+                    acp::PlanEntryStatus::Completed => "x",
+                    acp::PlanEntryStatus::InProgress => "~",
+                    _ => " ",
+                };
+                format!("- [{mark}] {}", item.content)
+            })
+            .collect();
+        body.push(format!("<plan>\n{}\n</plan>", plan.join("\n")));
+    }
+
+    let text = format!(
+        "{HANDOFF_OPENING} from=\"{agent}\" thread=\"{title}\">\n\
+         The user is continuing, with you, a conversation they had with {agent_name} in this \
+         same folder. This is what happened there, oldest first. Files may have changed since, \
+         so check them before relying on details. The user's message to you follows.\n\n\
+         {body}\n{HANDOFF_CLOSING}",
+        agent = attribute(agent_name),
+        title = attribute(title),
+        body = body.join("\n\n"),
+    );
+    PendingHandoff { text, messages }
+}
+
+/// A user message without the handoff it began with, as an agent may replay it.
+pub fn without_handoff(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with(HANDOFF_OPENING) {
+        return text;
+    }
+    match trimmed.find(HANDOFF_CLOSING) {
+        Some(end) => trimmed[end + HANDOFF_CLOSING.len()..].trim_start(),
+        None => text,
+    }
+}
+
+/// At most `limit` characters, ending in "…" when cut.
+fn clip(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
 /// A one-time code in what an agent says while logging in, as device logins print one ("Enter
 /// this one-time code: ABCD-1234"). Only in text that talks about a code, and only a word shaped
 /// like one: two or three groups of capitals and digits joined by dashes.
@@ -730,6 +899,89 @@ fn meta_terminal_auth(method: &acp::AuthMethod) -> Option<MetaTerminalAuth> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_call(title: &str, status: acp::ToolCallStatus) -> Entry {
+        Entry::ToolCall(ToolCall {
+            id: acp::ToolCallId::new(title.to_string()),
+            title: title.to_string(),
+            kind: acp::ToolKind::Other,
+            status,
+            text: Vec::new(),
+            diffs: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+            terminals: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn handoffs_tell_the_conversation() {
+        let mut view = ThreadView::default();
+        view.entries = vec![
+            Entry::UserMessage("Build the checkout page".into()),
+            Entry::AgentThought("The user wants a page.".into()),
+            tool_call("Read src/cart.tsx", acp::ToolCallStatus::Completed),
+            Entry::AgentMessage("It builds.".into()),
+            tool_call("Run npm test", acp::ToolCallStatus::Failed),
+            Entry::Plan,
+        ];
+        view.state.plan = vec![
+            PlanItem {
+                content: "Cart summary".into(),
+                status: acp::PlanEntryStatus::Completed,
+            },
+            PlanItem {
+                content: "Pay button".into(),
+                status: acp::PlanEntryStatus::Pending,
+            },
+        ];
+        let handoff = handoff(&view, "Claude Agent", "Checkout \"page\"");
+        assert_eq!(handoff.messages, 2);
+        assert!(
+            handoff
+                .text
+                .starts_with("<agentz-handoff from=\"Claude Agent\" thread=\"Checkout 'page'\">")
+        );
+        assert!(handoff.text.contains(
+            "<message from=\"user\">\nBuild the checkout page\n</message>\n\n<message \
+             from=\"Claude Agent\">\nIt builds.\nTools: Read src/cart.tsx · Run npm test \
+             (failed)\n</message>\n\n<plan>\n- [x] Cart summary\n- [ ] Pay button\n</plan>"
+        ));
+        // Thoughts stay with the agent that had them.
+        assert!(!handoff.text.contains("wants a page"));
+
+        // An agent may replay the first message with the handoff it brought.
+        let replayed = format!("{}\n\nWire the pay button", handoff.text);
+        assert_eq!(without_handoff(&replayed), "Wire the pay button");
+        assert_eq!(without_handoff("Hello"), "Hello");
+    }
+
+    #[test]
+    fn long_handoffs_keep_the_goal_and_the_latest() {
+        let mut view = ThreadView::default();
+        view.entries.push(Entry::UserMessage("The goal".into()));
+        for turn in 0..40 {
+            view.entries.push(Entry::UserMessage(format!(
+                "Request {turn} {}",
+                "x".repeat(2_000)
+            )));
+            view.entries.push(Entry::AgentMessage(format!(
+                "Reply {turn} {}",
+                "y".repeat(2_000)
+            )));
+        }
+        let handoff = handoff(&view, "Codex", "Long");
+        assert_eq!(handoff.messages, 81);
+        assert!(
+            handoff
+                .text
+                .contains("<message from=\"user\">\nThe goal\n</message>")
+        );
+        assert!(handoff.text.contains("Reply 39"));
+        assert!(!handoff.text.contains("Request 0 "));
+        assert!(handoff.text.contains("messages left out"));
+        assert!(handoff.text.len() < 45_000);
+    }
 
     #[test]
     fn diff_line_counts() {

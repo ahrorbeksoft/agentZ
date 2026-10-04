@@ -24,8 +24,8 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
     AuthStatus, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry, FileDiff,
-    PermissionOption, PermissionRequest, PlanItem, SessionDefaults, SessionRestore, ThreadState,
-    ThreadView, ToolCall,
+    PendingHandoff, PermissionOption, PermissionRequest, PlanItem, SessionDefaults, SessionRestore,
+    ThreadState, ThreadView, ToolCall,
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -61,6 +61,9 @@ pub enum AgentThreadEvent {
     ConfigOptionChanged(acp::SessionConfigId, acp::SessionConfigOptionValue),
     /// The user changed the session's mode; Zed keeps it as the agent's default.
     ModeChanged(acp::SessionModeId),
+    /// The conversation this thread continued went to the agent with its first message, or
+    /// the user dropped it.
+    HandoffDone,
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
     /// The agent is logged out: agentZ logged it out, or it asked for a login.
@@ -216,6 +219,9 @@ pub struct AgentThread {
     session: Option<Session>,
     pending_title: Option<String>,
     queued_prompts: Vec<String>,
+    /// The conversation this thread continues, taken from [`ThreadState::handoff`] by the first
+    /// message, to go with it once that's sent.
+    handoff_to_send: Option<String>,
     /// Given to the agent with every session it opens.
     mcp_servers: Vec<acp::McpServer>,
     terminal_host: Option<TerminalHost>,
@@ -412,6 +418,7 @@ impl AgentThread {
             session: None,
             pending_title: None,
             queued_prompts: Vec::new(),
+            handoff_to_send: None,
             mcp_servers: Vec::new(),
             terminal_host: None,
             turn_hook: None,
@@ -1258,6 +1265,18 @@ impl AgentThread {
         });
     }
 
+    /// The conversation this thread continues, to go with its first message.
+    pub fn set_handoff(&mut self, handoff: Option<PendingHandoff>) {
+        self.view.state.handoff = handoff;
+    }
+
+    /// Starts without the conversation the thread would have brought.
+    pub fn drop_handoff(&mut self) {
+        if self.view.state.handoff.take().is_some() || self.handoff_to_send.take().is_some() {
+            self.emit(AgentThreadEvent::HandoffDone);
+        }
+    }
+
     /// The agent tried to open a page in a browser while logging in, and agentZ's `xdg-open`
     /// handed it here for the clients to open (see [`ThreadState::login_page`]). Refused unless
     /// it's logging in, through `authenticate` or the connection's login terminal.
@@ -1410,6 +1429,9 @@ impl AgentThread {
             self.emit(AgentThreadEvent::FirstPrompt(text.clone()));
         }
         self.view.entries.push(Entry::UserMessage(text.clone()));
+        if let Some(handoff) = self.view.state.handoff.take() {
+            self.handoff_to_send = Some(handoff.text);
+        }
         self.view.state.turn_error = None;
         match self.view.state.status {
             ConnectionStatus::Ready => self.send_to_agent(text),
@@ -1449,13 +1471,35 @@ impl AgentThread {
 
     fn send_to_agent(&mut self, text: String) {
         self.remember_session();
+        if self.session.is_none() {
+            return;
+        }
+        let mut prompt = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+        if let Some(handoff) = self.handoff_to_send.take() {
+            // Embedded, the agent tells it from the message: replays show only the message.
+            let block = if self
+                .view
+                .state
+                .capabilities
+                .prompt_capabilities
+                .embedded_context
+            {
+                acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents::new(handoff, "agentz://handoff")
+                            .mime_type("text/markdown".to_string()),
+                    ),
+                ))
+            } else {
+                acp::ContentBlock::Text(acp::TextContent::new(handoff))
+            };
+            prompt.insert(0, block);
+            self.emit(AgentThreadEvent::HandoffDone);
+        }
         let Some(session) = &self.session else {
             return;
         };
-        let request = acp::PromptRequest::new(
-            session.session_id.clone(),
-            vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-        );
+        let request = acp::PromptRequest::new(session.session_id.clone(), prompt);
         let connection = session.connection.clone();
         self.set_working(true);
         let Some(hook) = self.turn_hook.clone() else {

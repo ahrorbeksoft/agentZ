@@ -104,7 +104,8 @@ From Zed's guidelines, which this code follows:
   different turns (see its docstring). With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
   `MOCK_BROWSER_OPEN` too, a browser login that runs `xdg-open` and waits on a `127.0.0.1`
-  callback, as Devin's and Codex's do (`tests/browser.rs` drives it as on an SSH machine). With
+  callback, as Devin's and Codex's do (`tests/browser.rs` drives it as on an SSH machine). It
+  names context embedded in a prompt in its echo ("Echo: next [with agentz://handoff]"). With
   `MOCK_SESSIONS_FILE` (a JSON array of ACP session infos, each with an optional `history` to
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the

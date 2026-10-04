@@ -296,6 +296,27 @@ impl ProjectStore {
         )
     }
 
+    /// "Continue with another agent": a thread with `agent_id` in the thread's workspace, whose
+    /// first message brings the thread's conversation.
+    pub fn continue_thread(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: AgentId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ThreadId>> {
+        self.request(
+            Request::ContinueThread {
+                thread_id,
+                agent_id,
+            },
+            |response| match response {
+                Response::ThreadCreated(thread_id) => Some(thread_id),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
     /// A thread that runs a terminal: a login shell, or `command` in one.
     pub fn create_terminal_thread(
         &mut self,

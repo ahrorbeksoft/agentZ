@@ -659,6 +659,8 @@ impl SpacesView {
                         AgentViewEvent::Confirm(request) => {
                             cx.emit(SpacesViewEvent::Confirm(request.clone()))
                         }
+                        // A pane shows its own header, without the thread's project.
+                        AgentViewEvent::NewThreadInProject(_) => {}
                     });
                     (PaneView::Agent(view), vec![subscription])
                 }

@@ -294,6 +294,11 @@ impl AgentThread {
         self.request(Request::RetrySession, cx)
     }
 
+    /// Starts this continued thread without the conversation it would have brought.
+    pub fn drop_handoff(&mut self, cx: &mut Context<Self>) {
+        self.request(Request::DropHandoff, cx)
+    }
+
     pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
         self.request(Request::ClearPlan, cx)
     }

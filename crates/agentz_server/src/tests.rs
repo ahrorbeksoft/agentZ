@@ -356,6 +356,93 @@ async fn prompts_a_thread_and_names_it() {
     assert!(error.is_err());
 }
 
+/// "Continue with another agent": a new thread in the same workspace, pointing back at the old
+/// one, whose first message brings the old conversation as embedded context.
+#[tokio::test(flavor = "multi_thread")]
+async fn continues_threads_with_another_agent() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let old = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(old).await;
+    client
+        .ok(Request::Prompt {
+            connection: old,
+            text: "build the page".into(),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(old);
+            !thread.is_working() && agent_text(thread) == "Echo: build the page"
+        })
+        .await;
+
+    let Response::ThreadCreated(new_id) = client
+        .ok(Request::ContinueThread {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let new = ConnectionId::Thread(new_id);
+    client.subscribe_thread(new).await;
+    let handoff = client
+        .thread(new)
+        .pending_handoff()
+        .cloned()
+        .expect("the conversation waits for the first message");
+    assert_eq!(handoff.messages, 2);
+    assert!(
+        handoff
+            .text
+            .contains("<message from=\"user\">\nbuild the page\n</message>")
+    );
+    assert!(
+        handoff
+            .text
+            .contains("<message from=\"Mock\">\nEcho: build the page")
+    );
+    let saved = server
+        .data_dir
+        .path()
+        .join(format!("handoffs/{}.json", new_id.0));
+    assert!(saved.exists());
+    client
+        .wait_until(|client| {
+            client.projects.as_ref().is_some_and(|projects| {
+                projects
+                    .threads
+                    .iter()
+                    .any(|thread| thread.id == new_id && thread.continued_from == Some(thread_id))
+            })
+        })
+        .await;
+
+    client
+        .ok(Request::Prompt {
+            connection: new,
+            text: "next".into(),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(new);
+            !thread.is_working() && agent_text(thread) == "Echo: next [with agentz://handoff]"
+        })
+        .await;
+    let thread = client.thread(new);
+    assert_eq!(thread.pending_handoff(), None);
+    // Only the user's words are their message.
+    assert!(matches!(thread.entries().first(), Some(Entry::UserMessage(text)) if text == "next"));
+    assert!(!saved.exists());
+}
+
 /// The point of the server: a turn keeps going without a client, and the next client sees
 /// where it got to.
 #[tokio::test(flavor = "multi_thread")]
@@ -771,11 +858,20 @@ async fn terminal_logins_run_on_the_server_and_restart_the_agent() {
     };
     let connection = ConnectionId::Account(account_id);
     client.subscribe_thread(connection).await;
+    let method_id = acp::AuthMethodId::new("mock-terminal-login");
+    // The agent reports its account apart from answering `initialize`, so it can say it's
+    // logged out before its login methods are known.
     client
-        .wait_until(|client| client.thread(connection).logged_in() == Some(false))
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            thread.logged_in() == Some(false)
+                && thread
+                    .auth_methods()
+                    .iter()
+                    .any(|method| *method.id() == method_id)
+        })
         .await;
 
-    let method_id = acp::AuthMethodId::new("mock-terminal-login");
     client
         .ok(Request::TerminalLogin {
             connection,

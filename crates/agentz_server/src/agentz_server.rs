@@ -9,6 +9,7 @@ mod agent_settings;
 pub mod browser;
 mod checkpoints;
 mod connection;
+mod continuations;
 mod detect;
 mod directories;
 mod git;

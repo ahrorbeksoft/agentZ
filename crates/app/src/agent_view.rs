@@ -1,28 +1,32 @@
 //! The conversation with one agent. Layout, spacing and colors follow Zed's agent thread view
 //! (`agent_ui::conversation_view::thread_view`).
 
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::agents::InstallState;
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
+    without_handoff,
 };
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyBinding, ScrollHandle, Subscription, Task, Window,
-    pulsating_between,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, DragMoveEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, PromptLevel, ScrollHandle,
+    Subscription, Task, Window, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use projects::{TaskEnd, ThreadId};
+use projects::{ProjectId, TaskEnd, ThreadId};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
-    Callout, CommonAnimationExt as _, ContextMenu, Disclosure, IconPosition, PopoverMenu, Severity,
-    SpinnerLabel, Switch, ToggleState, Tooltip, prelude::*,
+    ButtonLike, Callout, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
+    IconPosition, PopoverMenu, PopoverMenuHandle, Severity, SpinnerLabel, Switch, ToggleState,
+    Tooltip, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -30,6 +34,7 @@ use crate::agent_icons::agent_icon;
 use crate::agent_login::{AgentLogin, LoginLayout};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
+use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
@@ -41,6 +46,7 @@ use crate::thread_entity::AgentThread;
 use crate::{ToggleDiff, ToggleTerminalDrawer};
 
 const KEY_CONTEXT: &str = "AgentComposer";
+const RENAME_KEY_CONTEXT: &str = "ThreadHeaderRename";
 
 gpui::actions!(
     agent,
@@ -79,6 +85,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", menu::SelectPrevious, Some(KEY_CONTEXT)),
         KeyBinding::new("down", menu::SelectNext, Some(KEY_CONTEXT)),
         KeyBinding::new("tab", AcceptSlashCommand, Some(KEY_CONTEXT)),
+        KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
     ]);
 }
 
@@ -93,6 +101,8 @@ pub enum AgentViewEvent {
     OpenThread(ThreadId),
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
+    /// The header's project was clicked: a new thread in it, as in t3code.
+    NewThreadInProject(ProjectId),
 }
 
 const COMPOSER_PLACEHOLDER: &str = "Message the agent…";
@@ -111,9 +121,9 @@ pub struct AgentView {
     shows_toolbar: bool,
     /// Whether the shell shows this thread's changes beside it.
     is_diff_open: bool,
-    /// How many files the thread has changed, for the diff button's dot.
-    changed_files: usize,
-    /// The turn completion and connection `changed_files` was last asked for.
+    /// What the thread has changed, for the header's counts.
+    changes: ChangeStat,
+    /// The turn completion and connection `changes` were last asked for.
     changed_files_asked_for: Option<(Option<SystemTime>, bool)>,
     _changed_files_load: Task<()>,
     thread: Entity<AgentThread>,
@@ -159,6 +169,17 @@ pub struct AgentView {
     elicitation_cards: Vec<Entity<ElicitationCard>>,
     /// What the composer says while empty: to log in first, while the agent needs a login.
     composer_placeholder: SharedString,
+    /// The header title's menu: Rename, Continue with Another Agent, Archive, Delete.
+    title_menu: PopoverMenuHandle<ContextMenu>,
+    /// The header's title, while it's renamed in place.
+    rename_input: Entity<TextInput>,
+    renaming: bool,
+    _rename_blur: Option<Subscription>,
+    /// The composer's handoff chip shows what goes to the agent.
+    handoff_expanded: bool,
+    /// Why "Continue with another agent" didn't start a thread.
+    continue_error: Option<SharedString>,
+    _continuing: Task<()>,
     _subscriptions: Vec<Subscription>,
     _elapsed_refresh: Task<()>,
 }
@@ -175,9 +196,13 @@ impl AgentView {
         let store = client.read(cx).projects().clone();
         let registry = client.read(cx).registry().clone();
         let composer = cx.new(|cx| TextInput::new(COMPOSER_PLACEHOLDER, cx));
+        let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let login = cx
             .new(|cx| AgentLogin::new(thread.clone(), LoginLayout::Centered, agent_id.clone(), cx));
         let subscriptions = vec![
+            cx.subscribe(&rename_input, |this, _, _: &TextInputEvent, cx| {
+                this.apply_rename(cx)
+            }),
             cx.observe(&thread, |this, thread, cx| {
                 // Only follow new output if the user hasn't scrolled up to read.
                 let follow = this.is_scrolled_to_bottom();
@@ -233,7 +258,7 @@ impl AgentView {
             is_archived: false,
             shows_toolbar: true,
             is_diff_open: false,
-            changed_files: 0,
+            changes: ChangeStat::default(),
             changed_files_asked_for: None,
             _changed_files_load: Task::ready(()),
             client,
@@ -263,6 +288,13 @@ impl AgentView {
             login,
             elicitation_cards: Vec::new(),
             composer_placeholder: COMPOSER_PLACEHOLDER.into(),
+            title_menu: PopoverMenuHandle::default(),
+            rename_input,
+            renaming: false,
+            _rename_blur: None,
+            handoff_expanded: false,
+            continue_error: None,
+            _continuing: Task::ready(()),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
@@ -628,7 +660,7 @@ impl AgentView {
         }
     }
 
-    /// Asks the server how many files the thread has changed, after each turn and on
+    /// Asks the server what the thread has changed, after each turn and on
     /// reconnecting, or now when `force`d.
     fn load_changed_files(&mut self, force: bool, cx: &mut Context<Self>) {
         let completed_at = self
@@ -650,8 +682,12 @@ impl AgentView {
             scope: DiffScope::All,
         });
         self._changed_files_load = cx.spawn(async move |this, cx| {
-            let changed_files = match request.await {
-                Ok(Response::ThreadDiff(diff)) => diff.files.len(),
+            let changes = match request.await {
+                Ok(Response::ThreadDiff(diff)) => ChangeStat {
+                    files: diff.files.len(),
+                    additions: diff.files.iter().map(|file| file.additions as usize).sum(),
+                    deletions: diff.files.iter().map(|file| file.deletions as usize).sum(),
+                },
                 Ok(response) => {
                     log::error!("expected a diff, got {response:?}");
                     return;
@@ -662,8 +698,8 @@ impl AgentView {
                 }
             };
             this.update(cx, |this, cx| {
-                if this.changed_files != changed_files {
-                    this.changed_files = changed_files;
+                if this.changes != changes {
+                    this.changes = changes;
                     cx.notify();
                 }
             })
@@ -766,7 +802,11 @@ impl AgentView {
         let entries = self.thread.read(cx).entries().to_vec();
         for (index, entry) in entries.iter().enumerate() {
             match entry {
-                Entry::UserMessage(text) | Entry::AgentMessage(text) => {
+                // An agent may replay a continued thread's first message with what it brought.
+                Entry::UserMessage(text) => {
+                    self.sync_markdown((index, 0), without_handoff(text), cx);
+                }
+                Entry::AgentMessage(text) => {
                     self.sync_markdown((index, 0), text, cx);
                 }
                 Entry::AgentThought(text) => {
@@ -1104,41 +1144,418 @@ impl AgentView {
             .blend(colors.element_selected.opacity(0.3))
     }
 
+    /// t3code's breadcrumb: the project, where a click starts a new thread, then the title,
+    /// which opens the thread's menu (a double-click renames it in place). The branch and the
+    /// thread's buttons follow.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let agent_name = self.agent_name(cx);
+        let store = self.store.read(cx);
+        let project = store
+            .thread(self.thread_id)
+            .and_then(|thread| store.project(thread.project_id))
+            .cloned();
+        let title = if self.renaming {
+            self.render_rename_input(cx)
+        } else {
+            self.render_title_menu(cx)
+        };
         h_flex()
             .h(TOOLBAR_HEIGHT)
             .flex_none()
             .px_2()
-            .gap_1p5()
+            .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(
-                self.agent_icon(cx)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(self.title.clone())
-                    .size(LabelSize::Small)
-                    .truncate(),
-            )
-            .child(
-                Label::new(agent_name)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(div().flex_1())
+            .children(project.map(|project| self.render_project_crumb(&project, cx)))
+            .child(h_flex().flex_1().min_w_0().child(title))
+            .children(self.render_branch(cx))
             .child(self.render_toolbar_buttons(cx))
     }
 
-    /// The terminal, changes and options buttons, also shown in a workspace pane's header.
+    fn render_project_crumb(
+        &self,
+        project: &projects::Project,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let project_id = project.id;
+        let name = project.name();
+        let new_thread = cx.listener(move |_, _: &ClickEvent, _, cx| {
+            cx.emit(AgentViewEvent::NewThreadInProject(project_id))
+        });
+        let machine = self.store.read(cx).machine();
+        let info_store = ProjectInfoStore::global(cx);
+        let icon = render_project_icon(
+            project,
+            info_store.read(cx).info(machine, project_id),
+            px(14.),
+            cx,
+        );
+        let hover = cx.theme().colors().ghost_element_hover;
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id("thread-header-project")
+                    .debug_selector(|| "thread-header-project".into())
+                    .gap_1p5()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(icon)
+                    .child(
+                        div().max_w(px(160.)).child(
+                            Label::new(name.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                    .tooltip(Tooltip::text(format!("New Thread in {name}")))
+                    .on_click(new_thread),
+            )
+            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+            .into_any_element()
+    }
+
+    /// The title as the trigger of the thread's menu: Rename, Continue with Another Agent,
+    /// Archive and Delete.
+    fn render_title_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.weak_entity();
+        let thread_id = self.thread_id;
+        let store = self.store.clone();
+        let registry = self.registry.clone();
+        let current_agent = self.agent_id.clone();
+        let is_archived = self.is_archived;
+        let title = self.title.clone();
+        let rename = {
+            let view = view.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.start_rename(window, cx))
+                    .log_err();
+            })
+        };
+        let rename_from_menu = rename.clone();
+        PopoverMenu::new("thread-title-menu")
+            .with_handle(self.title_menu.clone())
+            .menu(move |window, cx| {
+                let agents: Vec<(AgentId, SharedString)> = {
+                    let registry = registry.read(cx);
+                    registry
+                        .agents()
+                        .iter()
+                        .filter(|agent| {
+                            Some(agent.id()) != current_agent.as_ref()
+                                && agent.supports_current_platform()
+                                && matches!(
+                                    registry.install_state(agent.id()),
+                                    InstallState::Installed { .. }
+                                )
+                        })
+                        .map(|agent| (agent.id().clone(), agent.name().clone()))
+                        .collect()
+                };
+                let view = view.clone();
+                let store = store.clone();
+                let title = title.clone();
+                let rename = rename_from_menu.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let rename = rename.clone();
+                    let continue_with = {
+                        let view = view.clone();
+                        let agents = agents.clone();
+                        move |mut menu: ContextMenu,
+                              _: &mut Window,
+                              _: &mut Context<ContextMenu>| {
+                            if agents.is_empty() {
+                                return menu.label("No other agents are installed");
+                            }
+                            for (agent_id, name) in &agents {
+                                let view = view.clone();
+                                let agent_id = agent_id.clone();
+                                let render_id = agent_id.clone();
+                                let name = name.clone();
+                                menu = menu.custom_entry(
+                                    move |_, cx| {
+                                        h_flex()
+                                            .gap_1p5()
+                                            .child(
+                                                agent_icon(&render_id, cx)
+                                                    .map(Icon::from_svg_markup)
+                                                    .unwrap_or_else(|| Icon::new(IconName::Sparkle))
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(Label::new(name.clone()))
+                                            .into_any_element()
+                                    },
+                                    move |_, cx| {
+                                        let agent_id = agent_id.clone();
+                                        view.update(cx, |view, cx| {
+                                            view.continue_with(agent_id, cx)
+                                        })
+                                        .log_err();
+                                    },
+                                );
+                            }
+                            menu
+                        }
+                    };
+                    let archive = {
+                        let store = store.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            store.update(cx, |store, cx| {
+                                if is_archived {
+                                    store.unarchive_thread(thread_id, cx)
+                                } else {
+                                    store.archive_thread(thread_id, cx)
+                                }
+                            })
+                        }
+                    };
+                    let delete = {
+                        let store = store.clone();
+                        let title = title.clone();
+                        move |window: &mut Window, cx: &mut App| {
+                            confirm_delete_thread(&store, thread_id, &title, window, cx)
+                        }
+                    };
+                    menu.item(
+                        ContextMenuEntry::new("Rename")
+                            .icon(IconName::Pencil)
+                            .icon_color(Color::Muted)
+                            .handler(move |window, cx| rename(window, cx)),
+                    )
+                    .submenu_with_icon(
+                        "Continue with Another Agent",
+                        IconName::ArrowRight,
+                        continue_with,
+                    )
+                    .separator()
+                    .item(
+                        ContextMenuEntry::new(if is_archived { "Unarchive" } else { "Archive" })
+                            .icon(if is_archived {
+                                IconName::Undo
+                            } else {
+                                IconName::Archive
+                            })
+                            .icon_color(Color::Muted)
+                            .handler(archive),
+                    )
+                    .item(
+                        ContextMenuEntry::new("Delete…")
+                            .icon(IconName::Trash)
+                            .icon_color(Color::Muted)
+                            .handler(delete),
+                    )
+                }))
+            })
+            .trigger(TitleButton::new(self.title.clone(), move |window, cx| {
+                rename(window, cx)
+            }))
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)))
+            .into_any_element()
+    }
+
+    fn render_rename_input(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        div()
+            .flex_1()
+            .min_w_0()
+            .max_w(px(480.))
+            .key_context(RENAME_KEY_CONTEXT)
+            .on_action(
+                cx.listener(|this, _: &menu::Confirm, window, cx| this.end_rename(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &menu::Cancel, window, cx| this.end_rename(window, cx)),
+            )
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(colors.border_focused)
+            .text_ui_sm(cx)
+            .child(self.rename_input.clone())
+            .into_any_element()
+    }
+
+    /// The branch the thread works on, marked as a worktree or pasture's.
+    fn render_branch(&self, cx: &App) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let thread = store.thread(self.thread_id)?;
+        let folder = store.thread_folder(self.thread_id)?;
+        let workspace = store.thread_workspace(self.thread_id).cloned();
+        let machine = store.machine();
+        let info = ProjectInfoStore::global(cx).read(cx);
+        let head = if workspace.is_some() {
+            info.workspace_head(machine, &folder).cloned()
+        } else {
+            info.info(machine, thread.project_id)
+                .and_then(|info| info.git_head.clone())
+        };
+        let branch = head
+            .map(|head| head.branch)
+            .or_else(|| workspace.as_ref()?.branch.clone())?;
+        let icon = workspace.as_ref().map_or(IconName::GitBranch, |workspace| {
+            workspace_icon(workspace.kind)
+        });
+        Some(
+            h_flex()
+                .id("thread-header-branch")
+                .flex_none()
+                .max_w(px(200.))
+                .h(px(22.))
+                .px_1p5()
+                .gap_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                .child(
+                    Label::new(branch)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .tooltip(Tooltip::text(folder.display().to_string()))
+                .into_any_element(),
+        )
+    }
+
+    pub(crate) fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The double-click's first click opened the menu.
+        self.title_menu.hide(cx);
+        // Cleared while the text is set, so that change doesn't count as a rename.
+        self.renaming = false;
+        let title = self.title.clone();
+        self.rename_input.update(cx, |input, cx| {
+            input.set_text(title, cx);
+            input.select_all_text(cx);
+        });
+        self.renaming = true;
+        cx.notify();
+        // A menu takes focus two frames after it opens, and gives it back as it closes: the
+        // field takes it after both.
+        let view = cx.weak_entity();
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| {
+                    view.update(cx, |view, cx| view.focus_rename(window, cx))
+                        .log_err();
+                });
+            });
+        });
+    }
+
+    fn focus_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.renaming {
+            return;
+        }
+        let focus_handle = self.rename_input.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        // Clicking elsewhere ends it, as in the sidebar.
+        self._rename_blur = Some(cx.on_blur(&focus_handle, window, |this, _, cx| {
+            this.renaming = false;
+            this._rename_blur = None;
+            cx.notify();
+        }));
+    }
+
+    /// Renames as you type, as the sidebar does; an empty title goes back to the automatic one.
+    fn apply_rename(&mut self, cx: &mut Context<Self>) {
+        if !self.renaming {
+            return;
+        }
+        let title = self.rename_input.read(cx).text().trim().to_string();
+        let is_unchanged = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_none_or(|thread| thread.title == title);
+        if !is_unchanged {
+            let thread_id = self.thread_id;
+            self.store
+                .update(cx, |store, cx| store.set_custom_title(thread_id, title, cx));
+        }
+    }
+
+    /// Enter or Escape: the title is already saved, and typing goes back to the composer.
+    fn end_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.renaming = false;
+        self._rename_blur = None;
+        window.focus(&self.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Starts a thread with `agent_id` that continues this one, and opens it.
+    fn continue_with(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        self.continue_error = None;
+        let agent_name = self
+            .registry
+            .read(cx)
+            .agent(&agent_id)
+            .map(|agent| agent.name().clone())
+            .unwrap_or_else(|| agent_id.0.clone());
+        let thread_id = self.thread_id;
+        let task = self.store.update(cx, |store, cx| {
+            store.continue_thread(thread_id, agent_id, cx)
+        });
+        self._continuing = cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(thread_id) => cx.emit(AgentViewEvent::OpenThread(thread_id)),
+                Err(error) => {
+                    log::error!("couldn't continue the thread: {error:#}");
+                    this.continue_error =
+                        Some(format!("Couldn't continue with {agent_name}: {error:#}").into());
+                    cx.notify();
+                }
+            })
+            .log_err();
+        });
+    }
+
+    /// The changes, terminal and options buttons, also shown in a workspace pane's header.
     pub(crate) fn render_toolbar_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.clone();
         let view = cx.weak_entity();
         let agent_name = self.agent_name(cx);
+        let changes = self.changes;
+        let changes_tooltip: SharedString = match changes.files {
+            0 => "Show Changes".into(),
+            1 => "Show Changes · 1 file changed".into(),
+            count => format!("Show Changes · {count} files changed").into(),
+        };
         h_flex()
             .gap_1p5()
+            .child(if changes.files > 0 {
+                // What the thread changed, in lines, as t3code's header shows it.
+                ButtonLike::new("toggle-diff")
+                    .style(ButtonStyle::Outlined)
+                    .size(ButtonSize::Compact)
+                    .toggle_state(self.is_diff_open)
+                    .child(
+                        div()
+                            .px_1()
+                            .child(diff_stat(changes.additions, changes.deletions)),
+                    )
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action(changes_tooltip.clone(), &ToggleDiff, cx)
+                    })
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx))
+                    .into_any_element()
+            } else {
+                IconButton::new("toggle-diff", IconName::Diff)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.is_diff_open)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action(changes_tooltip.clone(), &ToggleDiff, cx)
+                    })
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx))
+                    .into_any_element()
+            })
             .child({
                 // With the drawer hidden, a dot says something still runs in its terminals.
                 let running: Vec<String> = if self.is_drawer_open {
@@ -1175,33 +1592,6 @@ impl AgentView {
                     .when(!running.is_empty(), |button| {
                         button.child(indicator_dot(cx))
                     })
-            })
-            .child({
-                // With the changes hidden, a dot says the thread has changed files.
-                let changed_files = if self.is_diff_open {
-                    0
-                } else {
-                    self.changed_files
-                };
-                let tooltip: SharedString = match changed_files {
-                    0 => "Show Changes".into(),
-                    1 => "Show Changes · 1 file changed".into(),
-                    count => format!("Show Changes · {count} files changed").into(),
-                };
-                div()
-                    .relative()
-                    .child(
-                        IconButton::new("toggle-diff", IconName::Diff)
-                            .icon_size(IconSize::Small)
-                            .toggle_state(self.is_diff_open)
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action(tooltip.clone(), &ToggleDiff, cx)
-                            })
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(ToggleDiff), cx)
-                            }),
-                    )
-                    .when(changed_files > 0, |button| button.child(indicator_dot(cx)))
             })
             .child(
                 // Zed's agent options: log in again, log out, or restart the agent.
@@ -2100,6 +2490,11 @@ impl AgentView {
                 .icon(IconName::XCircle)
                 .title("The agent stopped with an error")
                 .description(error.clone())
+        } else if let Some(error) = &self.continue_error {
+            Callout::new()
+                .severity(Severity::Error)
+                .icon(IconName::XCircle)
+                .title(error.clone())
         } else {
             return None;
         };
@@ -2822,6 +3217,239 @@ impl AgentView {
         )
     }
 
+    /// The thread this one continues, with its agent's name and icon, while it's kept.
+    fn continued_from(&self, cx: &App) -> Option<(ThreadId, SharedString, SharedString, Icon)> {
+        let store = self.store.read(cx);
+        let from = store.thread(store.thread(self.thread_id)?.continued_from?)?;
+        let (name, icon) = self.thread_agent(from, cx);
+        Some((from.id, from.title.clone().into(), name, icon))
+    }
+
+    /// The title of the thread this one continues, until its first message is sent.
+    fn continued_title(&self, cx: &App) -> Option<SharedString> {
+        self.thread.read(cx).pending_handoff()?;
+        self.continued_from(cx).map(|(_, title, _, _)| title)
+    }
+
+    /// A thread's agent, by name, and its icon.
+    fn thread_agent(&self, thread: &projects::Thread, cx: &App) -> (SharedString, Icon) {
+        let agent_id = thread.agent_id.clone().map(AgentId::new);
+        let name = agent_id
+            .as_ref()
+            .and_then(|agent_id| self.registry.read(cx).agent(agent_id))
+            .map(|agent| agent.name().clone())
+            .or_else(|| thread.agent_id.clone().map(SharedString::from))
+            .unwrap_or_else(|| "Agent".into());
+        let icon = agent_id
+            .as_ref()
+            .and_then(|agent_id| agent_icon(agent_id, cx))
+            .map(Icon::from_svg_markup)
+            .unwrap_or_else(|| Icon::new(IconName::Sparkle));
+        (name, icon)
+    }
+
+    /// The divider that opens a continued thread: where it came from.
+    fn render_continued_from(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (from_id, title, agent_name, icon) = self.continued_from(cx)?;
+        let line = cx.theme().colors().border;
+        let rule = move || div().flex_1().h_px().bg(line);
+        Some(
+            h_flex()
+                .debug_selector(|| "thread-continued-from".into())
+                .w_full()
+                .px_5()
+                .pt_2()
+                .pb_1()
+                .gap_2()
+                .child(rule())
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .child(
+                            Label::new("Continued from")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(icon.size(IconSize::XSmall).color(Color::Muted))
+                        .child(
+                            Label::new(format!("{agent_name} ·"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            div()
+                                .id("continued-from-thread")
+                                .max_w(px(320.))
+                                .cursor_pointer()
+                                .child(
+                                    Label::new(title)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .underline()
+                                        .truncate(),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(AgentViewEvent::OpenThread(from_id))
+                                })),
+                        ),
+                )
+                .child(rule())
+                .into_any_element(),
+        )
+    }
+
+    /// A card for each thread that continues this one with another agent, after its end.
+    fn render_continuations(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let continuations: Vec<(ThreadId, SharedString, SharedString, Icon)> = {
+            let store = self.store.read(cx);
+            store
+                .continuations(self.thread_id)
+                .map(|thread| {
+                    let (name, icon) = self.thread_agent(thread, cx);
+                    (thread.id, thread.title.clone().into(), name, icon)
+                })
+                .collect()
+        };
+        let colors = cx.theme().colors().clone();
+        continuations
+            .into_iter()
+            .map(|(thread_id, title, agent_name, icon)| {
+                let open = cx.listener(move |_, _: &ClickEvent, _, cx| {
+                    cx.emit(AgentViewEvent::OpenThread(thread_id))
+                });
+                div()
+                    .px_5()
+                    .pt_2()
+                    .pb_1()
+                    .child(
+                        h_flex()
+                            .debug_selector(|| "thread-continued-in".into())
+                            .px_3()
+                            .py_2p5()
+                            .gap_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(colors.border)
+                            .child(icon.size(IconSize::Small).color(Color::Muted))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Label::new(format!("Continued in {agent_name}")))
+                                    .child(
+                                        Label::new(title)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    ),
+                            )
+                            .child(
+                                Button::new(("open-continuation", thread_id.0), "Open")
+                                    .style(ButtonStyle::Outlined)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(open),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// The conversation a continued thread brings with its first message, as an attachment in
+    /// the composer: a click shows exactly what goes to the agent, × starts without it.
+    fn render_handoff_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let handoff = self.thread.read(cx).pending_handoff()?.clone();
+        let (_, title, agent_name, icon) = self.continued_from(cx).unwrap_or_else(|| {
+            (
+                self.thread_id,
+                "Another thread".into(),
+                "Agent".into(),
+                Icon::new(IconName::Sparkle),
+            )
+        });
+        let colors = cx.theme().colors().clone();
+        let messages = match handoff.messages {
+            1 => "1 message".to_string(),
+            count => format!("{count} messages"),
+        };
+        let chip = h_flex()
+            .id("handoff-chip")
+            .debug_selector(|| "handoff-chip".into())
+            .max_w_full()
+            .min_w_0()
+            .gap_1p5()
+            .pl_2()
+            .pr_1()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.element_background)
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.element_hover))
+            .when(self.handoff_expanded, |chip| {
+                chip.bg(colors.element_selected)
+            })
+            .child(
+                Icon::new(IconName::Return)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(icon.size(IconSize::XSmall).color(Color::Muted))
+            .child(
+                div()
+                    .min_w_0()
+                    .child(Label::new(title).size(LabelSize::Small).truncate()),
+            )
+            .child(
+                Label::new(format!("· {agent_name} · {messages}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .single_line(),
+            )
+            .child(
+                IconButton::new("drop-handoff", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Start Without It"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.handoff_expanded = false;
+                        this.thread.update(cx, |thread, cx| thread.drop_handoff(cx));
+                    })),
+            )
+            .tooltip(Tooltip::text("Show What Goes with Your Message"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.handoff_expanded = !this.handoff_expanded;
+                cx.notify();
+            }));
+        let preview = self.handoff_expanded.then(|| {
+            div()
+                .id("handoff-preview")
+                .debug_selector(|| "handoff-preview".into())
+                .max_h(px(200.))
+                .overflow_y_scroll()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_background)
+                .font_buffer(cx)
+                .text_xs()
+                .text_color(colors.text_muted)
+                .child(handoff.text.clone())
+        });
+        Some(
+            v_flex()
+                .w_full()
+                .pt_1()
+                .gap_1()
+                .child(h_flex().w_full().child(chip))
+                .children(preview)
+                .into_any_element(),
+        )
+    }
+
     fn render_message_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
@@ -2889,6 +3517,7 @@ impl AgentView {
                     .gap_2()
                     // A draft can still be typed, but the composer reads as waiting on the login.
                     .when(needs_login, |this| this.opacity(0.55))
+                    .children(self.render_handoff_chip(cx))
                     .child(
                         v_flex()
                             .relative()
@@ -3026,6 +3655,11 @@ impl Render for AgentView {
         for (index, entry) in entries.iter().enumerate() {
             rows.push(self.render_entry(index, entry, index + 1 == entry_count, window, cx));
         }
+        // Where this thread came from, once it has a message, and where it went on.
+        let continued_from = (entry_count > 0)
+            .then(|| self.render_continued_from(cx))
+            .flatten();
+        rows.extend(self.render_continuations(cx));
         let orphans: Vec<(acp::ToolCallId, String)> = self
             .thread
             .read(cx)
@@ -3050,6 +3684,9 @@ impl Render for AgentView {
             rows.push(generating);
         }
         let has_rows = !rows.is_empty();
+        if let Some(continued_from) = continued_from {
+            rows.insert(0, continued_from);
+        }
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
         let needs_login = self.needs_login(cx);
 
@@ -3120,14 +3757,25 @@ impl Render for AgentView {
                                 )
                             })
                             .when(!has_rows && !is_connecting && !needs_login, |this| {
-                                this.child(
-                                    div().w_full().max_w(MAX_CONTENT_WIDTH).px_5().py_8().child(
-                                        Label::new(format!(
+                                let prompt = match self.continued_title(cx) {
+                                    Some(title) => format!(
+                                        "{} continues “{title}”. Tell it what to do next.",
+                                        self.agent_name(cx)
+                                    ),
+                                    None => {
+                                        format!(
                                             "Start a conversation with {}.",
                                             self.agent_name(cx)
-                                        ))
-                                        .color(Color::Muted),
-                                    ),
+                                        )
+                                    }
+                                };
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .max_w(MAX_CONTENT_WIDTH)
+                                        .px_5()
+                                        .py_8()
+                                        .child(Label::new(prompt).color(Color::Muted)),
                                 )
                             })
                             // The login takes the empty thread's middle, or follows its history.
@@ -3223,6 +3871,110 @@ fn humanize_token_count(count: u64) -> String {
             }
         }
     }
+}
+
+/// What a thread changed: files, and lines added and removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChangeStat {
+    files: usize,
+    additions: usize,
+    deletions: usize,
+}
+
+/// The thread's title in its header, the trigger of the thread's menu. A double-click renames
+/// it instead: its second click closes the menu the first opened, then lands here.
+#[derive(IntoElement)]
+struct TitleButton {
+    title: SharedString,
+    is_open: bool,
+    on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
+    on_double_click: Rc<dyn Fn(&mut Window, &mut App)>,
+}
+
+impl TitleButton {
+    fn new(title: SharedString, on_double_click: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        Self {
+            title,
+            is_open: false,
+            on_click: None,
+            on_double_click: Rc::new(on_double_click),
+        }
+    }
+}
+
+impl Clickable for TitleButton {
+    fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_click = Some(Rc::new(handler));
+        self
+    }
+
+    fn cursor_style(self, _: gpui::CursorStyle) -> Self {
+        self
+    }
+}
+
+impl Toggleable for TitleButton {
+    fn toggle_state(mut self, selected: bool) -> Self {
+        self.is_open = selected;
+        self
+    }
+}
+
+impl RenderOnce for TitleButton {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let hover = colors.ghost_element_hover;
+        let on_click = self.on_click;
+        let on_double_click = self.on_double_click;
+        h_flex()
+            .id("thread-header-title")
+            .debug_selector(|| "thread-header-title".into())
+            .min_w_0()
+            .gap_1()
+            .px_1()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .when(self.is_open, |this| this.bg(colors.ghost_element_selected))
+            .hover(move |style| style.bg(hover))
+            .child(Label::new(self.title).size(LabelSize::Small).truncate())
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(move |event, window, cx| {
+                if event.click_count() >= 2 {
+                    on_double_click(window, cx);
+                } else if let Some(on_click) = &on_click {
+                    on_click(event, window, cx);
+                }
+            })
+    }
+}
+
+/// Asks first, as the sidebar does.
+fn confirm_delete_thread(
+    store: &Entity<ProjectStore>,
+    thread_id: ThreadId,
+    title: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let answer = window.prompt(
+        PromptLevel::Warning,
+        &format!("Delete “{title}”?"),
+        Some("The thread and its conversation will be removed. This can't be undone."),
+        &["Delete", "Cancel"],
+        cx,
+    );
+    let store = store.clone();
+    cx.spawn(async move |cx| {
+        if answer.await == Ok(0) {
+            store.update(cx, |store, cx| store.delete_thread(thread_id, cx));
+        }
+    })
+    .detach();
 }
 
 /// The dot in a toolbar button's corner that says something is behind it.

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
+use agentz_protocol::thread::{ConnectionStatus, handoff};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{ConnectionId, Request, Response};
 use anyhow::{Context as _, Result, anyhow};
@@ -13,7 +14,9 @@ use futures::future::BoxFuture;
 use projects::{ProjectId, ThreadId, Workspace, WorkspaceKind};
 
 use super::{ClientId, Server};
+use crate::continuations;
 use crate::workspaces::{self, NewWorkspace};
+use util::ResultExt as _;
 
 /// What a new thread runs.
 pub(super) enum NewThread {
@@ -239,6 +242,59 @@ impl Server {
             }
         }
         Ok(thread_id)
+    }
+
+    /// "Continue with another agent": a thread with `agent_id` in `thread_id`'s workspace,
+    /// whose first message brings `thread_id`'s conversation ([`handoff`]), t3code's context
+    /// handoff. The conversation is the one the running agent replayed, so the thread is open.
+    pub(super) fn continue_thread(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: AgentId,
+    ) -> Result<ThreadId> {
+        let thread = self
+            .projects
+            .thread(thread_id)
+            .context("no such thread")?
+            .clone();
+        anyhow::ensure!(
+            thread.terminal.is_none(),
+            "a terminal thread has no conversation to continue"
+        );
+        let running = self
+            .threads
+            .get(&thread_id)
+            .context("the thread's agent isn't running; open the thread first")?;
+        anyhow::ensure!(
+            *running.status() != ConnectionStatus::Connecting,
+            "the thread is still loading its conversation"
+        );
+        let from_agent = thread
+            .agent_id
+            .clone()
+            .map(|agent_id| self.agent_name(&AgentId::new(agent_id)))
+            .unwrap_or_else(|| running.agent_name().clone());
+        let handoff = handoff(running, &from_agent, &thread.title);
+        anyhow::ensure!(
+            handoff.messages > 0,
+            "the thread has no conversation to continue yet"
+        );
+        let choice = thread
+            .workspace
+            .clone()
+            .map_or(WorkspaceChoice::Checkout, WorkspaceChoice::Existing);
+        let PreparedWorkspace::Ready(folder) = self.prepare_workspace(thread.project_id, choice)?
+        else {
+            return Err(anyhow!("the thread's workspace isn't ready"));
+        };
+        let new_thread =
+            self.create_thread_in(thread.project_id, NewThread::Agent(agent_id), folder)?;
+        self.projects.set_continued_from(new_thread, thread_id);
+        continuations::save(&self.data_dir, new_thread, &handoff).log_err();
+        self.update_thread(ConnectionId::Thread(new_thread), |thread| {
+            thread.set_handoff(Some(handoff))
+        })?;
+        Ok(new_thread)
     }
 
     pub(super) fn project_path(&self, project_id: ProjectId) -> Result<PathBuf> {

@@ -40,6 +40,7 @@ use util::ResultExt as _;
 use crate::agent_settings::AgentSettingsStore;
 use crate::browser;
 use crate::checkpoints::Checkpoints;
+use crate::continuations;
 use crate::machine_kind;
 use crate::repositories::{self, RepositoryChecks};
 use crate::spaces::SpaceStore;
@@ -563,8 +564,22 @@ impl Server {
             }
             Request::DeleteThread(thread_id) => {
                 self.existing_thread(thread_id)?;
-                self.delete_checkpoints(self.projects.thread_and_subthreads(thread_id));
+                let threads = self.projects.thread_and_subthreads(thread_id);
+                for thread_id in &threads {
+                    continuations::remove(&self.data_dir, *thread_id).log_err();
+                }
+                self.delete_checkpoints(threads);
                 self.projects.delete_thread(thread_id);
+                Ok(Response::Ok)
+            }
+            Request::ContinueThread {
+                thread_id,
+                agent_id,
+            } => Ok(Response::ThreadCreated(
+                self.continue_thread(thread_id, agent_id)?,
+            )),
+            Request::DropHandoff(connection) => {
+                self.update_thread(connection, AgentThread::drop_handoff)?;
                 Ok(Response::Ok)
             }
 
@@ -1092,6 +1107,12 @@ impl Server {
             previous_session,
             Some(self.agent_terminal_host(thread_id)),
         );
+        if let Some(handoff) = continuations::load(&self.data_dir, thread_id)
+            .log_err()
+            .flatten()
+        {
+            agent_thread.set_handoff(Some(handoff));
+        }
         agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_turn_hook(self.turn_hook(cwd, thread_id));
         agent_thread.set_defaults(self.agent_settings.get(&agent_id).session_defaults());
@@ -1283,6 +1304,9 @@ impl Server {
                     }
                 }
                 (ConnectionId::Thread(_), AgentThreadEvent::Paused) => paused = true,
+                (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffDone) => {
+                    continuations::remove(&self.data_dir, thread_id).log_err();
+                }
                 (ConnectionId::Account(_), _) => {}
             }
         }

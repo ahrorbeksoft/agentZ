@@ -28,6 +28,9 @@ logins, as real agents offer them:
   with a `baseUrl`, as Claude Agent's does.
 Every login and logout is reported with `_auth/status_update`, as Claude Agent and Codex do.
 
+Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
+thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
+
 A prompt of "form" asks the client to fill in a form (a session elicitation) and replies
 "Form: <action> <content as JSON>".
 
@@ -72,6 +75,8 @@ session_cwd = os.getcwd()
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
 # Set by logout: sessions then need a login, until the process restarts.
 logged_out = False
+# The resources embedded in the prompt being answered.
+prompt_resources = []
 
 
 def config_options():
@@ -146,6 +151,9 @@ def text_chunk(kind, text):
 def finish_prompt(request_id, session_id, prompt_text, chosen=None):
     update(session_id, text_chunk("agent_message_chunk", "Echo: "))
     update(session_id, text_chunk("agent_message_chunk", prompt_text))
+    if prompt_resources:
+        update(session_id, text_chunk("agent_message_chunk",
+                                      f" [with {', '.join(prompt_resources)}]"))
     update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "call-1",
                         "title": "Read README.md", "kind": "read", "status": "completed"})
     if chosen is not None:
@@ -344,6 +352,7 @@ for line in sys.stdin:
                          "agentCapabilities": {
                              "loadSession": HISTORY_PATH is not None or SESSIONS_FILE is not None,
                              "sessionCapabilities": session_capabilities,
+                             "promptCapabilities": {"embeddedContext": True},
                              "auth": {"logout": {}}},
                          "authMethods": auth_methods}})
         send_auth_status()
@@ -390,7 +399,11 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
     elif method == "session/prompt":
         params = message["params"]
-        prompt_text = "".join(block.get("text", "") for block in params["prompt"])
+        prompt_text = "".join(block.get("text", "") for block in params["prompt"]
+                              if block.get("type", "text") == "text")
+        # Context embedded in the prompt (a handoff from another thread), named in the reply.
+        prompt_resources = [block["resource"]["uri"] for block in params["prompt"]
+                            if block.get("type") == "resource"]
         record(text_chunk("user_message_chunk", prompt_text))
         if prompt_text == "permission":
             next_request_id += 1

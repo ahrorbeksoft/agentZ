@@ -676,6 +676,15 @@ impl Shell {
                 AgentViewEvent::Confirm(request) => {
                     this.open_confirm_dialog(request.clone(), window, cx)
                 }
+                AgentViewEvent::NewThreadInProject(project) => this.open_new_thread_modal(
+                    Some(ProjectKey {
+                        machine: key.machine,
+                        project: *project,
+                    }),
+                    None,
+                    window,
+                    cx,
+                ),
             },
         );
         Some(OpenThread {
