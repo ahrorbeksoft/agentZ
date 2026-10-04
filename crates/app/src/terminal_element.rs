@@ -12,8 +12,8 @@ use gpui::{
     App, BorderStyle, Bounds, ContentMask, DispatchPhase, Element, ElementId, Entity, FocusHandle,
     Font, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, InputHandler,
     InteractiveElement, Interactivity, IntoElement, LayoutId, MouseButton, MouseMoveEvent, Pixels,
-    Point, Rgba, ShapedLine, StrikethroughStyle, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, fill, outline, point, px, relative, size,
+    Point, Rgba, ShapedLine, StrikethroughStyle, TextRun, UTF16Selection, UnderlineStyle, Window,
+    fill, outline, point, px, relative, size,
 };
 use theme::{ActiveTheme as _, Theme};
 use ui::utils::ensure_minimum_contrast;
@@ -800,10 +800,6 @@ pub struct TerminalMetrics {
 
 impl TerminalMetrics {
     pub fn new(window: &mut Window, cx: &App) -> Self {
-        Self::with_font_size(font_size(cx), window, cx)
-    }
-
-    pub fn with_font_size(font_size: Pixels, window: &mut Window, cx: &App) -> Self {
         let settings = theme::theme_settings(cx);
         let buffer_font = settings.buffer_font(cx);
         let font = Font {
@@ -813,6 +809,7 @@ impl TerminalMetrics {
             weight: buffer_font.weight,
             style: FontStyle::Normal,
         };
+        let font_size = font_size(cx);
         let line_height = px((f32::from(font_size) * LINE_HEIGHT).round());
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&font);
@@ -1520,125 +1517,6 @@ impl Element for TerminalElement {
 }
 
 impl IntoElement for TerminalElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-/// The top of a terminal's screen drawn small, as a dragged pane carries it. It only paints:
-/// no cursor, selection or input.
-pub struct TerminalThumbnail {
-    terminal: Entity<Terminal>,
-    font_size: Pixels,
-}
-
-impl TerminalThumbnail {
-    pub fn new(terminal: Entity<Terminal>, font_size: Pixels) -> Self {
-        Self {
-            terminal,
-            font_size,
-        }
-    }
-}
-
-pub struct ThumbnailLayout {
-    dimensions: TerminalBounds,
-    rects: Vec<LayoutRect>,
-    batched_text_runs: Vec<BatchedTextRun>,
-    block_element_rects: Vec<BlockElementLayoutRect>,
-    background_color: Hsla,
-}
-
-impl Element for TerminalThumbnail {
-    type RequestLayoutState = ();
-    type PrepaintState = ThumbnailLayout;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = relative(1.).into();
-        (window.request_layout(style, None, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        let metrics = TerminalMetrics::with_font_size(self.font_size, window, cx);
-        let theme = cx.theme().clone();
-        let dimensions = TerminalBounds {
-            cell_width: metrics.cell_width,
-            line_height: metrics.line_height,
-            bounds,
-        };
-        let grid_style = GridStyle {
-            font: metrics.font,
-            minimum_contrast: MINIMUM_CONTRAST,
-        };
-        let (rects, batched_text_runs, block_element_rects) = match self.terminal.read(cx).frame() {
-            Some(frame) => {
-                let rows = 0..frame.screen_lines.min(dimensions.num_lines() as u16);
-                layout_grid(frame, rows, &grid_style, &theme)
-            }
-            None => Default::default(),
-        };
-        ThumbnailLayout {
-            dimensions,
-            rects,
-            batched_text_runs,
-            block_element_rects,
-            background_color: theme.colors().terminal_background,
-        }
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        layout: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            window.paint_quad(fill(bounds, layout.background_color));
-            let origin = bounds.origin;
-            for rect in &layout.rects {
-                rect.paint(origin, &layout.dimensions, window);
-            }
-            for batch in &layout.batched_text_runs {
-                batch.paint(origin, &layout.dimensions, self.font_size, window, cx);
-            }
-            for block_element_rect in &layout.block_element_rects {
-                block_element_rect.paint(origin, &layout.dimensions, window);
-            }
-        });
-    }
-}
-
-impl IntoElement for TerminalThumbnail {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
