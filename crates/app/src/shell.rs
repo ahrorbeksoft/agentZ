@@ -168,6 +168,9 @@ impl Shell {
                             this.thread_target = Some(*pane);
                         }
                     },
+                    SpacesViewEvent::NewThread { project, folder } => {
+                        this.start_draft(*project, Some(folder.clone()), None, window, cx)
+                    }
                     SpacesViewEvent::Worktree {
                         machine,
                         folder,

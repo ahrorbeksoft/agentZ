@@ -4,7 +4,7 @@
 //! window's, as herdr keeps them per client. In code they're spaces, since a thread's
 //! workspace is its checkout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::layout::{
@@ -17,9 +17,9 @@ use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    Action, AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Subscription, Task,
-    Window, actions, relative,
+    Action, AnyElement, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, PromptLevel, ScrollHandle,
+    Subscription, Task, Window, actions, relative,
 };
 use projects::ThreadId;
 use text_input::{TextInput, TextInputEvent};
@@ -154,6 +154,11 @@ pub enum SpacesViewEvent {
     /// Show the thread in Agents.
     OpenThread(ThreadKey),
     /// New Thread, to be shown in the pane once it's made.
+    /// New Thread Here: a draft in the project, in this checkout, shown in the Agents view.
+    NewThread {
+        project: ProjectKey,
+        folder: PathBuf,
+    },
     NewThreadInPane {
         pane: PaneKey,
         project: Option<ProjectKey>,
@@ -1292,6 +1297,13 @@ impl SpacesView {
             Some(project) => render_project_icon(project, project_info.as_ref(), px(16.), cx),
             None => render_folder_icon(),
         };
+        let project_key = project.as_ref().map(|project| ProjectKey {
+            machine,
+            project: project.id,
+        });
+        let checkout_root = project
+            .as_ref()
+            .and_then(|project| checkout_root(project, space.current_folder()));
         // herdr offers worktrees in any workspace inside a git repository.
         let worktree_source = git.as_ref().map(|git| {
             let folder = space.current_folder().to_path_buf();
@@ -1508,6 +1520,9 @@ impl SpacesView {
                 );
 
         let this = cx.entity().downgrade();
+        let folder = space.current_folder().to_path_buf();
+        // New Thread Here starts in the checkout the workspace is in.
+        let thread_target = project_key.zip(checkout_root.clone());
         right_click_menu(ElementId::Name(format!("{id}-menu").into()))
             .trigger(move |is_menu_open, _, _| {
                 div()
@@ -1519,7 +1534,28 @@ impl SpacesView {
                 let this = this.clone();
                 let label = label.clone();
                 let worktree_source = worktree_source.clone();
+                let folder = folder.clone();
+                let thread_target = thread_target.clone();
                 ContextMenu::build(window, cx, move |menu, _, _| {
+                    let new_tab = {
+                        let this = this.clone();
+                        move |window: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.new_tab_in(key, window, cx))
+                                .ok();
+                        }
+                    };
+                    let copy_path = {
+                        let folder = folder.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                folder.to_string_lossy().into_owned(),
+                            ));
+                        }
+                    };
+                    let reveal = {
+                        let folder = folder.clone();
+                        move |_: &mut Window, cx: &mut App| cx.reveal_path(&folder)
+                    };
                     let rename = {
                         let this = this.clone();
                         let label = label.clone();
@@ -1558,21 +1594,54 @@ impl SpacesView {
                             }
                         };
                     menu.item(
+                        ContextMenuEntry::new("New Tab")
+                            .icon(IconName::Plus)
+                            .icon_color(Color::Muted)
+                            .action(Box::new(NewTab))
+                            .handler(new_tab),
+                    )
+                    .item(
                         ContextMenuEntry::new("Rename")
                             .icon(IconName::Pencil)
                             .icon_color(Color::Muted)
                             .handler(rename),
                     )
                     .item(
-                        ContextMenuEntry::new("Close")
-                            .icon(IconName::Close)
+                        ContextMenuEntry::new("Copy Path")
+                            .icon(IconName::Copy)
                             .icon_color(Color::Muted)
-                            .handler(close),
+                            .handler(copy_path),
                     )
+                    // Finder can only show this Mac's folders.
+                    .when(machine == MachineId::Local, |menu| {
+                        menu.item(
+                            ContextMenuEntry::new("Reveal in Finder")
+                                .icon(IconName::FolderOpen)
+                                .icon_color(Color::Muted)
+                                .handler(reveal),
+                        )
+                    })
+                    .when_some(thread_target.clone(), |menu, (project, checkout)| {
+                        let this = this.clone();
+                        menu.item(
+                            ContextMenuEntry::new("New Thread Here")
+                                .icon(IconName::Chat)
+                                .icon_color(Color::Muted)
+                                .handler(move |_, cx| {
+                                    this.update(cx, |_, cx| {
+                                        cx.emit(SpacesViewEvent::NewThread {
+                                            project,
+                                            folder: checkout.clone(),
+                                        })
+                                    })
+                                    .ok();
+                                }),
+                        )
+                    })
                     .when_some(worktree_source, |menu, source| {
                         menu.separator()
                             .item(
-                                ContextMenuEntry::new("New Worktree")
+                                ContextMenuEntry::new("New Worktree…")
                                     .icon(IconName::GitWorktree)
                                     .icon_color(Color::Muted)
                                     .handler(worktree(WorktreeModalMode::New, source.clone())),
@@ -1584,6 +1653,13 @@ impl SpacesView {
                                     .handler(worktree(WorktreeModalMode::Open, source)),
                             )
                     })
+                    .separator()
+                    .item(
+                        ContextMenuEntry::new("Close Workspace")
+                            .icon(IconName::Close)
+                            .icon_color(Color::Muted)
+                            .handler(close),
+                    )
                 })
             })
             .into_any_element()
@@ -2797,6 +2873,15 @@ fn contents_label(terminals: usize, agents: usize) -> Option<String> {
 }
 
 /// A tab's name, or its number, as herdr numbers unnamed tabs.
+/// The project's checkout a folder is in: its own folder, or one of its worktrees or pastures.
+fn checkout_root(project: &projects::Project, folder: &Path) -> Option<PathBuf> {
+    std::iter::once(&project.path)
+        .chain(project.workspaces.iter().map(|workspace| &workspace.path))
+        .filter(|root| folder.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+}
+
 /// A terminal pane's icon: its agent CLI's, as the ACP Registry draws that agent, or a terminal.
 fn pane_agent_icon(pane: &Pane, cx: &App) -> Icon {
     pane.agent

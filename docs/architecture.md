@@ -497,8 +497,9 @@ since a thread's workspace is its checkout.
   Close show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
-- **Row menu**: Rename, Close, and in a git repository (a project or not) New Worktree and
-  Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch
+- **Row menu**: New Tab, Rename, Copy Path, Reveal in Finder (this Mac), New Thread Here (in a
+  project: a draft in the checkout the workspace is in, in the Agents view), Close Workspace,
+  and in a git repository (a project or not) New Worktree… and Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch
   (herdr's generated `agentz/<adjective>-<noun>-<hex>` by default) and makes a worktree or a
   pasture of the repository's main checkout from what the workspace has checked out
   (`Request::CreateWorkspace`, no thread in it; a project's is recorded as its workspace). Open
