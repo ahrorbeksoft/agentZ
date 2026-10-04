@@ -1912,7 +1912,7 @@ fn matches_query(thread: &Thread, query: &str) -> bool {
 }
 
 /// A short "time ago" label: `now`, `5m`, `3h`, `2d`, `1w`.
-fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
+pub(crate) fn format_relative_time(time: SystemTime, now: SystemTime) -> String {
     let seconds = now.duration_since(time).unwrap_or_default().as_secs();
     const MINUTE: u64 = 60;
     const HOUR: u64 = 60 * MINUTE;

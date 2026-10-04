@@ -28,6 +28,10 @@ A prompt of "form" asks the client to fill in a form (a session elicitation) and
 "Form: <action> <content as JSON>".
 
 It supports `session/close`, and with MOCK_CLOSED_FILE set, notes each closed session there.
+
+With MOCK_SESSIONS_FILE set, it lists the sessions in that file (`session/list`, two to a
+page): a JSON array of ACP session infos, each with an optional "history" of session updates
+that `session/load` replays for it. Listing needs a login, as sessions do.
 """
 import json
 import os
@@ -38,6 +42,9 @@ import time
 LOGIN_FILE = os.environ.get("MOCK_LOGIN_FILE")
 # Where `session/close` notes the sessions it closed, a line each.
 CLOSED_FILE = os.environ.get("MOCK_CLOSED_FILE")
+# The sessions `session/list` reports.
+SESSIONS_FILE = os.environ.get("MOCK_SESSIONS_FILE")
+SESSIONS_PER_PAGE = 2
 
 if sys.argv[-1] == "--login":
     print("Press Enter to log in to the mock agent.", flush=True)
@@ -83,11 +90,32 @@ def send(message):
     sys.stdout.flush()
 
 
-def load_history():
+def listed_sessions():
+    if not SESSIONS_FILE:
+        return []
+    with open(SESSIONS_FILE) as file:
+        return json.load(file)
+
+
+def load_history(session_id=None):
+    for session in listed_sessions():
+        if session["sessionId"] == session_id:
+            return session.get("history", [])
     if HISTORY_PATH and os.path.exists(HISTORY_PATH):
         with open(HISTORY_PATH) as file:
             return json.load(file)
     return []
+
+
+def list_sessions(params):
+    sessions = [{key: value for key, value in session.items() if key != "history"}
+                for session in listed_sessions()
+                if params.get("cwd") in (None, session["cwd"])]
+    start = int(params.get("cursor") or 0)
+    result = {"sessions": sessions[start:start + SESSIONS_PER_PAGE]}
+    if start + SESSIONS_PER_PAGE < len(sessions):
+        result["nextCursor"] = str(start + SESSIONS_PER_PAGE)
+    return result
 
 
 def record(payload):
@@ -262,11 +290,15 @@ for line in sys.stdin:
         if ((capabilities.get("auth") or {}).get("_meta") or {}).get("gateway"):
             auth_methods.append({"id": "mock-gateway", "name": "Use a gateway",
                                  "_meta": {"gateway": {"protocol": "anthropic"}}})
+        session_capabilities = {"close": {}}
+        if SESSIONS_FILE:
+            session_capabilities["list"] = {}
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
-                         "agentCapabilities": {"loadSession": HISTORY_PATH is not None,
-                                               "sessionCapabilities": {"close": {}},
-                                               "auth": {"logout": {}}},
+                         "agentCapabilities": {
+                             "loadSession": HISTORY_PATH is not None or SESSIONS_FILE is not None,
+                             "sessionCapabilities": session_capabilities,
+                             "auth": {"logout": {}}},
                          "authMethods": auth_methods}})
         send_auth_status()
     elif method == "authenticate":
@@ -277,7 +309,7 @@ for line in sys.stdin:
             os.remove(LOGIN_FILE)
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
         send_auth_status()
-    elif method in ("session/new", "session/load") and not logged_in():
+    elif method in ("session/new", "session/load", "session/list") and not logged_in():
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32000, "message": "\n\nYour code: MOCK-1234\n\nClick Log In."}})
     elif method == "session/new":
@@ -295,10 +327,12 @@ for line in sys.stdin:
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)
         session_id = message["params"]["sessionId"]
-        for payload in load_history():
+        for payload in load_history(session_id):
             send({"jsonrpc": "2.0", "method": "session/update",
                   "params": {"sessionId": session_id, "update": payload}})
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
+    elif method == "session/list":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": list_sessions(message["params"])})
     elif method == "session/close":
         if CLOSED_FILE:
             with open(CLOSED_FILE, "a") as file:

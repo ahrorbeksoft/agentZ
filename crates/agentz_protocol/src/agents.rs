@@ -1,12 +1,14 @@
-//! Agents: the registry's listing, what's installed, how to start one, and each agent's
-//! settings.
+//! Agents: the registry's listing, what's installed, how to start one, each agent's settings,
+//! and the sessions it keeps.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use agent_client_protocol::schema::v1 as acp;
 use collections::HashMap;
 use gpui_shared_string::SharedString;
+use projects::{ProjectId, ThreadId};
 use serde::{Deserialize, Serialize};
 
 use crate::thread::SessionDefaults;
@@ -159,6 +161,44 @@ pub struct AgentSettings {
     /// The login method last used from agentZ, to say how the agent is logged in. ACP has no way
     /// to ask the agent.
     pub login_method: Option<String>,
+}
+
+/// [`crate::Request::ListAgentSessions`]'s answer: the conversations an agent keeps on the
+/// server's machine, from ACP's `session/list`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AgentSessions {
+    /// As the agent orders them.
+    Listed(Vec<AgentSession>),
+    /// The agent doesn't support `session/list`.
+    Unsupported,
+    /// The agent wants a login first.
+    LoggedOut,
+    /// From a newer version.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
+}
+
+/// One of an agent's sessions, and where it would go as a thread.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentSession {
+    pub session_id: String,
+    /// The folder it ran in, as the agent reports it.
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// When the agent last worked on it.
+    #[serde(default)]
+    pub updated_at: Option<SystemTime>,
+    /// The project whose folder, or one of whose worktrees or pastures, `cwd` is. Only these
+    /// sessions can be imported, since a thread belongs to a project.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// The project's worktree or pasture `cwd` is, or `None` for the project's own folder.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+    /// The thread that has it already.
+    #[serde(default)]
+    pub thread_id: Option<ThreadId>,
 }
 
 impl AgentSettings {

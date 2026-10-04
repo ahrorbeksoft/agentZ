@@ -2,6 +2,7 @@
 
 #[cfg(unix)]
 mod hand_off;
+mod session_requests;
 mod space_requests;
 mod terminal_requests;
 mod tools;
@@ -373,6 +374,11 @@ impl Server {
                 id,
                 request: Request::RestoreCheckpoint { thread_id, scope },
             } => self.restore_checkpoint(client, id, thread_id, scope),
+            Input::Request {
+                client,
+                id,
+                request: Request::ListAgentSessions(agent_id),
+            } => self.list_agent_sessions(client, id, agent_id),
             Input::Respond { client, id, result } => {
                 self.send(client, ServerMessage::Response { id, result })
             }
@@ -736,6 +742,12 @@ impl Server {
                 }
                 Ok(Response::Ok)
             }
+            Request::ImportAgentSessions {
+                agent_id,
+                sessions,
+                archived,
+            } => self.import_agent_sessions(agent_id, sessions, archived),
+            Request::ListAgentSessions(_) => Err(anyhow!("listing sessions is handled separately")),
 
             Request::Shutdown => {
                 self.stopping = true;

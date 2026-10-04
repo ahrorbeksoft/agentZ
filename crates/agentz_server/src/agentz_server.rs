@@ -141,6 +141,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             agentz_protocol::CAPABILITY_SPACES.to_string(),
             agentz_protocol::CAPABILITY_MACHINE_ICON.to_string(),
             agentz_protocol::CAPABILITY_DRAWER_TERMINALS.to_string(),
+            agentz_protocol::CAPABILITY_IMPORT_SESSIONS.to_string(),
         ]
         .into_iter()
         .chain(can_hand_off.then(|| agentz_protocol::CAPABILITY_HAND_OFF.to_string()))

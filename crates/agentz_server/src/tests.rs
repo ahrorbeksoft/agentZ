@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::agents::AgentId;
+use agentz_protocol::agents::{AgentId, AgentSessions};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::layout::{Direction, Node};
 use agentz_protocol::spaces::{
@@ -526,6 +526,137 @@ async fn accounts_log_in_and_close_with_their_client() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(closed);
+}
+
+/// An agent's sessions list with the project each would go to, import as threads in that
+/// project (once), and load their conversation when opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn lists_and_imports_an_agents_sessions() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let project_dir = tempfile::tempdir().expect("temp dir");
+    // Agents report folders as they were given, which may not be canonical (`/var` on macOS
+    // is `/private/var`).
+    let project_path = project_dir.path().to_path_buf();
+    let elsewhere = data_dir.path().to_path_buf();
+    let sessions_file = data_dir.path().join("sessions.json");
+    let sessions = json!([
+        {"sessionId": "fix-login", "cwd": project_path, "title": "Fix the login",
+         "updatedAt": "2026-05-01T10:00:00Z",
+         "history": [{"sessionUpdate": "agent_message_chunk",
+                      "content": {"type": "text", "text": "Fixed it earlier."}}]},
+        {"sessionId": "untitled", "cwd": project_path},
+        {"sessionId": "other-folder", "cwd": elsewhere, "title": "Somewhere else"},
+    ]);
+    std::fs::write(&sessions_file, sessions.to_string()).expect("writing sessions");
+    command.env.insert(
+        "MOCK_SESSIONS_FILE".into(),
+        sessions_file.to_string_lossy().into_owned(),
+    );
+    let Some(server) = TestServer::start_with_agent(data_dir, project_dir, command) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let Response::ProjectAdded(project_id) = client
+        .ok(Request::AddProject {
+            path: project_path.clone(),
+        })
+        .await
+    else {
+        panic!("expected a project");
+    };
+    assert!(
+        client
+            .welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == agentz_protocol::CAPABILITY_IMPORT_SESSIONS)
+    );
+
+    let list = async |client: &mut TestClient| match client
+        .ok(Request::ListAgentSessions(AgentId::new("mock")))
+        .await
+    {
+        Response::AgentSessions(AgentSessions::Listed(sessions)) => sessions,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let sessions = list(&mut client).await;
+    let summary: Vec<_> = sessions
+        .iter()
+        .map(|session| {
+            (
+                session.session_id.as_str(),
+                session.title.as_deref(),
+                session.project_id,
+                session.thread_id,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("fix-login", Some("Fix the login"), Some(project_id), None),
+            ("untitled", None, Some(project_id), None),
+            ("other-folder", Some("Somewhere else"), None, None),
+        ]
+    );
+    let updated_at = sessions[0].updated_at.expect("a time");
+    assert_eq!(
+        updated_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs(),
+        1_777_629_600
+    );
+
+    let Response::ThreadsImported(imported) = client
+        .ok(Request::ImportAgentSessions {
+            agent_id: AgentId::new("mock"),
+            sessions: sessions.clone(),
+            archived: false,
+        })
+        .await
+    else {
+        panic!("expected imported threads");
+    };
+    assert_eq!(imported.len(), 2, "the session outside a project stays out");
+    let projects = client.projects.clone().expect("projects");
+    let titles: Vec<_> = imported
+        .iter()
+        .map(|id| {
+            let thread = projects
+                .threads
+                .iter()
+                .find(|thread| thread.id == *id)
+                .expect("an imported thread");
+            (thread.title.as_str(), thread.last_activity_at)
+        })
+        .collect();
+    assert_eq!(titles[0], ("Fix the login", Some(updated_at)));
+    assert_eq!(titles[1].0, "Imported thread");
+
+    let listed_again = list(&mut client).await;
+    assert_eq!(listed_again[0].thread_id, Some(imported[0]));
+    let Response::ThreadsImported(again) = client
+        .ok(Request::ImportAgentSessions {
+            agent_id: AgentId::new("mock"),
+            sessions,
+            archived: false,
+        })
+        .await
+    else {
+        panic!("expected imported threads");
+    };
+    assert!(again.is_empty(), "sessions are imported once");
+
+    let connection = ConnectionId::Thread(imported[0]);
+    client.subscribe_thread(connection).await;
+    client
+        .wait_until(|client| agent_text(client.thread(connection)) == "Fixed it earlier.")
+        .await;
 }
 
 /// Codex's device-code login asks the client to open a URL (an elicitation) while

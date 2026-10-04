@@ -2,21 +2,24 @@
 //! Appearance, Agents, Machines, then one entry per project) and the chosen section's rows on
 //! the right.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use crate::agent_icons::agent_icon;
-use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey};
+use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey, ThreadKey};
 use crate::project_store::ProjectStore;
-use agentz_protocol::agents::{AgentId, AgentListing, InstallState};
+use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
+use agentz_protocol::agents::{AgentId, AgentListing, AgentSession, AgentSessions, InstallState};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, ScrollHandle, Subscription, UniformListScrollHandle, Window,
-    actions, uniform_list,
+    PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Task, UniformListScrollHandle,
+    Window, actions, uniform_list,
 };
-use projects::{Project, ProjectIcon, ProjectId, ThreadOrder, Workspace};
+use projects::{Project, ProjectIcon, ProjectId, ThreadId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
@@ -48,11 +51,15 @@ use crate::project_info::{
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
-use crate::sidebar::{SIDEBAR_WIDTH, render_footer_item};
+use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
 use crate::thread_entity::AgentThread;
 
 const KEY_CONTEXT: &str = "SettingsPage";
 const CONTENT_WIDTH: Pixels = px(720.);
+/// An agent can keep hundreds of sessions in a project, so the Threads tab shows them a page at
+/// a time, as the sidebar shows archived threads.
+const SESSIONS_INITIAL_COUNT: usize = 10;
+const SESSIONS_PAGE_COUNT: usize = 25;
 
 actions!(
     settings,
@@ -72,6 +79,8 @@ pub enum SettingsPageEvent {
     EditMachine(Option<MachineProfile>),
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
+    /// Leave settings for the thread, as an agent's Threads tab opens one.
+    OpenThread(ThreadKey),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -111,7 +120,7 @@ pub struct SettingsPage {
     agents_machine: MachineId,
     agent_search: Entity<TextInput>,
     /// Machines whose server is being updated, so a second click doesn't restart it midway.
-    updating: std::collections::HashSet<MachineId>,
+    updating: HashSet<MachineId>,
     /// Whether this Mac's server has a launch agent, so it starts at login.
     starts_at_login: bool,
     agents_page: AgentsPage,
@@ -1641,6 +1650,7 @@ impl SettingsPage {
             AgentTab::Account => self.render_account_tab(cx),
             AgentTab::Defaults => self.render_agent_defaults(window, cx),
             AgentTab::Environment => self.render_agent_env(cx),
+            AgentTab::Threads => self.render_agent_threads(window, cx),
         };
         vec![
             v_flex()
@@ -1791,7 +1801,7 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    /// Account, Defaults and Environment, underlined when chosen.
+    /// Account, Defaults, Environment and Threads, underlined when chosen.
     fn render_agent_tabs(&self, current: AgentTab, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         h_flex()
@@ -1803,6 +1813,7 @@ impl SettingsPage {
                     (AgentTab::Account, "Account"),
                     (AgentTab::Defaults, "Defaults"),
                     (AgentTab::Environment, "Environment"),
+                    (AgentTab::Threads, "Threads"),
                 ]
                 .into_iter()
                 .map(|(tab, label)| {
@@ -1830,11 +1841,8 @@ impl SettingsPage {
                             this.cursor_pointer()
                                 .hover(|style| style.text_color(colors.text))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(panel) = this.account_mut() {
-                                        panel.tab = tab;
-                                    }
+                                    this.select_agent_tab(tab, cx);
                                     this.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
-                                    cx.notify();
                                 }))
                         })
                         .child(label)
@@ -1924,6 +1932,11 @@ impl SettingsPage {
             changing_account: false,
             was_authenticating: false,
             env_rows,
+            sessions: None,
+            sessions_project: None,
+            sessions_shown: SESSIONS_INITIAL_COUNT,
+            importing: HashSet::new(),
+            import_error: None,
             _subscriptions: [subscription],
         };
         self.show_agents_page(AgentsPage::Agent(panel), window, cx);
@@ -2440,9 +2453,521 @@ impl SettingsPage {
         let tab = account.tab;
         let name = account.connection.read(cx).agent_name().clone();
         self.open_agent(&id, &name, window, cx);
-        if let Some(account) = self.account_mut() {
-            account.tab = tab;
+        self.select_agent_tab(tab, cx);
+    }
+
+    /// Shows one of the agent page's tabs. Threads lists the agent's sessions the first time,
+    /// and again after the agent couldn't list them.
+    fn select_agent_tab(&mut self, tab: AgentTab, cx: &mut Context<Self>) {
+        let Some(panel) = self.account_mut() else {
+            return;
+        };
+        panel.tab = tab;
+        let needs_listing = match &panel.sessions {
+            None | Some(SessionList::Failed(_)) => true,
+            Some(SessionList::Listed(sessions)) => !matches!(sessions, AgentSessions::Listed(_)),
+            Some(SessionList::Listing { .. }) => false,
+        };
+        if tab == AgentTab::Threads && needs_listing {
+            self.list_agent_sessions(cx);
         }
+        cx.notify();
+    }
+
+    fn list_agent_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.account() else {
+            return;
+        };
+        let agent_id = panel.agent_id.clone();
+        let client = panel.connection.read(cx).client().clone();
+        // While disconnected, the request fails and says so.
+        let is_outdated = client.read(cx).connection().is_some()
+            && !client.read(cx).has_capability(CAPABILITY_IMPORT_SESSIONS);
+        if is_outdated {
+            if let Some(panel) = self.account_mut() {
+                panel.sessions = Some(SessionList::Failed(
+                    "This machine's agentz-server can't list threads. Update it to import them."
+                        .into(),
+                ));
+            }
+            cx.notify();
+            return;
+        }
+        let listing = client
+            .read(cx)
+            .projects()
+            .read(cx)
+            .list_agent_sessions(agent_id.clone(), cx);
+        let task = cx.spawn(async move |this, cx| {
+            let listing = listing.await;
+            this.update(cx, |this, cx| {
+                let Some(panel) = this
+                    .account_mut()
+                    .filter(|panel| panel.agent_id == agent_id)
+                else {
+                    return;
+                };
+                panel.sessions = Some(match listing {
+                    Ok(sessions) => SessionList::Listed(sessions),
+                    Err(error) => SessionList::Failed(format!("{error:#}").into()),
+                });
+                panel.sessions_shown = SESSIONS_INITIAL_COUNT;
+                cx.notify();
+            })
+            .log_err();
+        });
+        if let Some(panel) = self.account_mut() {
+            panel.sessions = Some(SessionList::Listing { _task: task });
+            panel.import_error = None;
+        }
+        cx.notify();
+    }
+
+    /// Adds an archived thread for each of the sessions.
+    fn import_agent_sessions(&mut self, sessions: Vec<AgentSession>, cx: &mut Context<Self>) {
+        let Some(panel) = self.account_mut() else {
+            return;
+        };
+        let agent_id = panel.agent_id.clone();
+        let session_ids: Vec<String> = sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect();
+        panel.importing.extend(session_ids.iter().cloned());
+        panel.import_error = None;
+        let import = panel
+            .connection
+            .read(cx)
+            .client()
+            .read(cx)
+            .projects()
+            .read(cx)
+            .import_agent_sessions(agent_id.clone(), sessions, cx);
+        cx.spawn(async move |this, cx| {
+            let imported = import.await;
+            this.update(cx, |this, cx| {
+                let Some(panel) = this
+                    .account_mut()
+                    .filter(|panel| panel.agent_id == agent_id)
+                else {
+                    return;
+                };
+                for session_id in &session_ids {
+                    panel.importing.remove(session_id);
+                }
+                if let Err(error) = imported {
+                    panel.import_error = Some(format!("Couldn't import: {error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The agent's sessions on the Threads tab: those in the chosen project, newest first,
+    /// each with Import, or Open once agentZ has it.
+    fn render_agent_threads(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel) = self.account() else {
+            return div().into_any_element();
+        };
+        let status_colors = cx.theme().status().clone();
+        let connection = panel.connection.read(cx);
+        let agent_name = connection.agent_name().clone();
+        let client = connection.client().clone();
+        let machine = self.machines.read(cx).label(self.agents_machine, cx);
+        let message = |text: String| {
+            div()
+                .px_4()
+                .py_3()
+                .child(Label::new(text).color(Color::Muted))
+                .into_any_element()
+        };
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut toolbar = None;
+        let mut notes: Vec<(SharedString, Color)> = Vec::new();
+        match &panel.sessions {
+            None | Some(SessionList::Listing { .. }) => rows.push(render_status_row(
+                spinner(Color::Muted),
+                format!("Listing {agent_name}'s threads…").into(),
+                None,
+                Vec::new(),
+            )),
+            Some(SessionList::Failed(error)) => rows.push(render_status_row(
+                status_dot(status_colors.error).into_any_element(),
+                format!("Couldn't list {agent_name}'s threads").into(),
+                Some((error.clone(), Color::Error)),
+                vec![
+                    ActionButton::new("sessions-retry", "Try Again")
+                        .on_click(cx.listener(|this, _, _, cx| this.list_agent_sessions(cx)))
+                        .into_any_element(),
+                ],
+            )),
+            Some(SessionList::Listed(AgentSessions::LoggedOut)) => rows.push(message(format!(
+                "Log in to {agent_name} to see its threads here."
+            ))),
+            Some(SessionList::Listed(AgentSessions::Unsupported | AgentSessions::Unknown(_))) => {
+                rows.push(message(format!(
+                    "{agent_name} doesn't list its threads, so they can't be imported."
+                )))
+            }
+            Some(SessionList::Listed(AgentSessions::Listed(sessions))) => {
+                let store = client.read(cx).projects().read(cx);
+                let projects = store.projects().to_vec();
+                let threads: HashMap<&str, ThreadId> = sessions
+                    .iter()
+                    .filter_map(|session| {
+                        let thread =
+                            store.thread_for_session(&panel.agent_id.0, &session.session_id)?;
+                        Some((session.session_id.as_str(), thread))
+                    })
+                    .collect();
+                let thread_of =
+                    |session: &AgentSession| threads.get(session.session_id.as_str()).copied();
+                let project = panel
+                    .sessions_project
+                    .and_then(|id| projects.iter().find(|project| project.id == id))
+                    .or_else(|| {
+                        projects.iter().find(|project| {
+                            sessions
+                                .iter()
+                                .any(|session| session.project_id == Some(project.id))
+                        })
+                    })
+                    .or(projects.first());
+                let outside_projects = sessions
+                    .iter()
+                    .filter(|session| {
+                        session
+                            .project_id
+                            .is_none_or(|id| projects.iter().all(|project| project.id != id))
+                    })
+                    .count();
+                match project {
+                    None => rows.push(message(format!(
+                        "Add a project on {machine} to import threads into it."
+                    ))),
+                    Some(project) => {
+                        let mut in_project: Vec<&AgentSession> = sessions
+                            .iter()
+                            .filter(|session| session.project_id == Some(project.id))
+                            .collect();
+                        in_project.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+                        let to_import: Vec<AgentSession> = in_project
+                            .iter()
+                            .filter(|session| {
+                                thread_of(session).is_none()
+                                    && !panel.importing.contains(&session.session_id)
+                            })
+                            .map(|session| (*session).clone())
+                            .collect();
+                        let in_agentz = in_project
+                            .iter()
+                            .filter(|session| thread_of(session).is_some())
+                            .count();
+                        toolbar = Some(self.render_sessions_toolbar(
+                            project,
+                            in_project.len(),
+                            in_agentz,
+                            to_import,
+                            window,
+                            cx,
+                        ));
+                        if in_project.is_empty() {
+                            rows.push(message(format!(
+                                "No threads with {agent_name} in {}.",
+                                project.name()
+                            )));
+                        }
+                        let now = SystemTime::now();
+                        for session in in_project.iter().take(panel.sessions_shown) {
+                            rows.push(self.render_session_row(
+                                session,
+                                project,
+                                thread_of(session),
+                                panel.importing.contains(&session.session_id),
+                                now,
+                                cx,
+                            ));
+                        }
+                        let hidden = in_project.len().saturating_sub(panel.sessions_shown);
+                        if hidden > 0 {
+                            rows.push(render_show_more_sessions(hidden, cx));
+                        }
+                    }
+                }
+                if outside_projects > 0 {
+                    notes.push((
+                        match outside_projects {
+                            1 => {
+                                format!("1 more is in a folder that isn't a project on {machine}.")
+                            }
+                            count => format!(
+                                "{count} more are in folders that aren't projects on \
+                                     {machine}."
+                            ),
+                        }
+                        .into(),
+                        Color::Muted,
+                    ));
+                }
+            }
+        }
+        if let Some(error) = &panel.import_error {
+            notes.push((error.clone(), Color::Error));
+        }
+
+        v_flex()
+            .gap_3()
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(Label::new(format!(
+                        "Threads {agent_name} keeps on {machine}"
+                    )))
+                    .child(
+                        Label::new(
+                            "Started in agentZ or anywhere else. Imported threads go to \
+                             Archived, and open where they left off.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            )
+            .children(toolbar)
+            .child(render_rows(rows, cx))
+            .children(
+                notes
+                    .into_iter()
+                    .map(|(note, color)| Label::new(note).size(LabelSize::Small).color(color)),
+            )
+            .into_any_element()
+    }
+
+    /// The project picker, how many of the project's threads agentZ has, and Import All.
+    fn render_sessions_toolbar(
+        &self,
+        project: &Project,
+        count: usize,
+        in_agentz: usize,
+        to_import: Vec<AgentSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let projects: Vec<(ProjectId, SharedString)> = self
+            .machines
+            .read(cx)
+            .projects(self.agents_machine, cx)
+            .map(|store| {
+                store
+                    .read(cx)
+                    .projects()
+                    .iter()
+                    .map(|project| (project.id, project.name()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let current = project.id;
+        let page = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for (id, name) in projects {
+                let page = page.clone();
+                menu = menu.toggleable_entry(
+                    name,
+                    id == current,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        page.update(cx, |page, cx| {
+                            if let Some(panel) = page.account_mut() {
+                                panel.sessions_project = Some(id);
+                                panel.sessions_shown = SESSIONS_INITIAL_COUNT;
+                            }
+                            cx.notify();
+                        })
+                        .log_err();
+                    },
+                );
+            }
+            menu
+        });
+        let summary = match (count, in_agentz) {
+            (1, 0) => "1 thread".to_string(),
+            (count, 0) => format!("{count} threads"),
+            (count, in_agentz) => format!("{count} threads, {in_agentz} in agentZ"),
+        };
+        let import_count = to_import.len();
+        let is_importing = self
+            .account()
+            .is_some_and(|panel| !panel.importing.is_empty());
+        h_flex()
+            .gap_3()
+            .child(DropdownMenu::new("sessions-project", project.name(), menu))
+            .child(
+                Label::new(summary)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                IconButton::new("sessions-refresh", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .on_click(cx.listener(|this, _, _, cx| this.list_agent_sessions(cx))),
+            )
+            .when(import_count > 1, |toolbar| {
+                toolbar.child(
+                    ActionButton::new("sessions-import-all", format!("Import All {import_count}"))
+                        .disabled(is_importing)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.import_agent_sessions(to_import.clone(), cx)
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// A session's title, where it ran and when, and Import, or Open once agentZ has it.
+    fn render_session_row(
+        &self,
+        session: &AgentSession,
+        project: &Project,
+        thread: Option<ThreadId>,
+        is_importing: bool,
+        now: SystemTime,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title: SharedString = session
+            .title
+            .clone()
+            .unwrap_or_else(|| session.session_id.clone())
+            .into();
+        let checkout = session.workspace.as_ref().map(|path| {
+            let workspace = project
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.path == *path);
+            let name = workspace
+                .and_then(|workspace| workspace.branch.clone())
+                .or_else(|| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| path.display().to_string());
+            let kind = workspace.map_or("Worktree", |workspace| workspace.kind.label());
+            format!("{name} · {kind}")
+        });
+        let age = session
+            .updated_at
+            .map(|time| match format_relative_time(time, now).as_str() {
+                "now" => "now".to_string(),
+                age => format!("{age} ago"),
+            });
+        let details = checkout
+            .into_iter()
+            .chain(age)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let session_id = session.session_id.clone();
+        let action_selector = match thread {
+            Some(_) => format!("session-in-agentz-{session_id}"),
+            None if is_importing => format!("session-importing-{session_id}"),
+            None => format!("session-import-{session_id}"),
+        };
+        let action = match thread {
+            Some(thread) => {
+                let machine = self.agents_machine;
+                let open_selector = format!("session-open-{session_id}");
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Check)
+                            .size(IconSize::XSmall)
+                            .color(Color::Success),
+                    )
+                    .child(
+                        Label::new("In agentZ")
+                            .size(LabelSize::Small)
+                            .color(Color::Success),
+                    )
+                    .child(
+                        div().debug_selector(move || open_selector).child(
+                            ActionButton::new(
+                                SharedString::from(format!("session-open-{session_id}")),
+                                "Open",
+                            )
+                            .style(ActionStyle::Ghost)
+                            .on_click(cx.listener(
+                                move |_, _, _, cx| {
+                                    cx.emit(SettingsPageEvent::OpenThread(ThreadKey {
+                                        machine,
+                                        thread,
+                                    }))
+                                },
+                            )),
+                        ),
+                    )
+                    .into_any_element()
+            }
+            None if is_importing => Label::new("Importing…")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+            None => {
+                let session = session.clone();
+                ActionButton::new(
+                    SharedString::from(format!("session-import-{session_id}")),
+                    "Import",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.import_agent_sessions(vec![session.clone()], cx)
+                }))
+                .into_any_element()
+            }
+        };
+        let selector = format!("agent-session-{session_id}");
+        h_flex()
+            .debug_selector(move || selector)
+            .px_4()
+            .py_2()
+            .gap_3()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(Label::new(title).truncate())
+                    .when(!details.is_empty(), |column| {
+                        column.child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_1()
+                                .when(session.workspace.is_some(), |line| {
+                                    line.child(
+                                        Icon::new(IconName::GitBranch)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                })
+                                .child(
+                                    Label::new(details)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || action_selector)
+                    .child(action),
+            )
+            .into_any_element()
     }
 
     /// Asks first, as t3code does: logging out affects every thread with the agent.
@@ -3142,6 +3667,14 @@ enum AgentTab {
     Account,
     Defaults,
     Environment,
+    Threads,
+}
+
+/// What the Threads tab knows of the agent's sessions.
+enum SessionList {
+    Listing { _task: Task<()> },
+    Listed(AgentSessions),
+    Failed(SharedString),
 }
 
 /// Where an agent's account stands, for the badge beside its name and its account card.
@@ -3182,6 +3715,14 @@ struct AccountPanel {
     /// Whether the connection was logging in when last seen, to notice when it's done.
     was_authenticating: bool,
     env_rows: Vec<EnvRow>,
+    /// Listed when the Threads tab first opens; `None` before.
+    sessions: Option<SessionList>,
+    /// The project whose sessions the Threads tab shows, once the user picks one.
+    sessions_project: Option<ProjectId>,
+    sessions_shown: usize,
+    /// Sessions whose import hasn't been answered yet.
+    importing: HashSet<String>,
+    import_error: Option<SharedString>,
     _subscriptions: [Subscription; 1],
 }
 
@@ -3447,8 +3988,6 @@ fn render_section_with_actions(
     actions: AnyElement,
     cx: &App,
 ) -> AnyElement {
-    let colors = cx.theme().colors().clone();
-    let count = rows.len();
     v_flex()
         .gap_2()
         .child(
@@ -3457,20 +3996,55 @@ fn render_section_with_actions(
                 .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
                 .child(actions),
         )
+        .child(render_rows(rows, cx))
+        .into_any_element()
+}
+
+/// A section's bordered group of rows, divided by lines.
+fn render_rows(rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors().clone();
+    let count = rows.len();
+    v_flex()
+        .rounded_lg()
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.panel_background)
+        .children(rows.into_iter().enumerate().map(|(index, row)| {
+            div()
+                .when(index + 1 < count, |row| {
+                    row.border_b_1().border_color(colors.border_variant)
+                })
+                .child(row)
+        }))
+        .into_any_element()
+}
+
+/// The Threads tab's last row while sessions are hidden, as the sidebar's archived threads
+/// show more.
+fn render_show_more_sessions(hidden: usize, cx: &mut Context<SettingsPage>) -> AnyElement {
+    h_flex()
+        .id("sessions-show-more")
+        .debug_selector(|| "sessions-show-more".to_string())
+        .px_4()
+        .py_2()
+        .gap_2()
+        .cursor_pointer()
+        .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
         .child(
-            v_flex()
-                .rounded_lg()
-                .border_1()
-                .border_color(colors.border)
-                .bg(colors.panel_background)
-                .children(rows.into_iter().enumerate().map(|(index, row)| {
-                    div()
-                        .when(index + 1 < count, |row| {
-                            row.border_b_1().border_color(colors.border_variant)
-                        })
-                        .child(row)
-                })),
+            Icon::new(IconName::Plus)
+                .size(IconSize::Small)
+                .color(Color::Muted),
         )
+        .child(
+            Label::new(format!("Show {} more", hidden.min(SESSIONS_PAGE_COUNT)))
+                .color(Color::Muted),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            if let Some(panel) = this.account_mut() {
+                panel.sessions_shown += SESSIONS_PAGE_COUNT;
+            }
+            cx.notify();
+        }))
         .into_any_element()
 }
 
@@ -3595,9 +4169,12 @@ impl Render for SettingsPage {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use agentz_protocol::agents::{RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::spaces::SpacesSnapshot;
     use gpui::TestAppContext;
+    use projects::ImportedSession;
 
     use super::*;
     use crate::server_client::ServerClient;
@@ -3783,6 +4360,177 @@ mod tests {
         // Scrolling re-renders the page every frame, so building all 200 cards made it lag.
         assert!(cx.debug_bounds("registry-card-agent-100").is_some());
         assert!(cx.debug_bounds("registry-card-agent-299").is_none());
+    }
+
+    fn agent_session(id: &str, project_id: Option<ProjectId>, hours_ago: u64) -> AgentSession {
+        AgentSession {
+            session_id: id.to_string(),
+            cwd: "/tmp/somewhere".into(),
+            title: Some(format!("Session {id}")),
+            updated_at: Some(SystemTime::now() - Duration::from_secs(hours_ago * 3600)),
+            project_id,
+            workspace: None,
+            thread_id: None,
+        }
+    }
+
+    #[gpui::test]
+    fn the_threads_tab_shows_a_projects_sessions_to_import_or_open(cx: &mut TestAppContext) {
+        let empty_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = tempfile::tempdir().expect("temp dir");
+        let mut store = projects::ProjectStore::load(None);
+        let empty = store.add_project(empty_dir.path().to_path_buf());
+        let project = store.add_project(project_dir.path().to_path_buf());
+        let thread = store
+            .add_imported_thread(ImportedSession {
+                project_id: project,
+                workspace: None,
+                agent_id: "mock".into(),
+                session_id: "s-03".into(),
+                title: "Session s-03".into(),
+                updated_at: None,
+                archived: true,
+            })
+            .expect("a thread");
+        let snapshot = store.snapshot();
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client
+                .read(cx)
+                .registry()
+                .clone()
+                .update(cx, |registry, cx| {
+                    registry.set_snapshot(
+                        RegistrySnapshot {
+                            agents: vec![listing(
+                                "mock",
+                                "Mock",
+                                InstallState::Installed {
+                                    version: "2.0.0".into(),
+                                    update_available: false,
+                                },
+                            )],
+                            is_fetching: false,
+                            fetch_error: None,
+                        },
+                        cx,
+                    )
+                });
+            client
+                .read(cx)
+                .projects()
+                .clone()
+                .update(cx, |store, cx| store.set_snapshot(snapshot, cx));
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let opened = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.subscribe(&page, move |_, event: &SettingsPageEvent, _| {
+                if let SettingsPageEvent::OpenThread(thread) = event {
+                    opened.borrow_mut().push(*thread);
+                }
+            })
+            .detach();
+        });
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("agent-row-mock")
+            .expect("the agent is listed");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        let tab = cx
+            .debug_bounds("agent-tab-threads")
+            .expect("the page has a Threads tab");
+        cx.simulate_click(tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        // Opening the tab lists the sessions, which fails without a server.
+        let sessions = |page: &Entity<SettingsPage>, cx: &mut gpui::VisualTestContext| {
+            page.read_with(cx, |page, _| match page.account()?.sessions.as_ref()? {
+                SessionList::Listing { .. } => Some("listing"),
+                SessionList::Listed(_) => Some("listed"),
+                SessionList::Failed(_) => Some("failed"),
+            })
+        };
+        assert_eq!(sessions(&page, cx), Some("failed"));
+
+        // Listed oldest first, and one in a folder that isn't a project.
+        let mut listed: Vec<AgentSession> = (0..14)
+            .rev()
+            .map(|number| agent_session(&format!("s-{number:02}"), Some(project), number))
+            .collect();
+        listed.push(agent_session("elsewhere", None, 0));
+        page.update(cx, |page, cx| {
+            if let Some(panel) = page.account_mut() {
+                panel.sessions = Some(SessionList::Listed(AgentSessions::Listed(listed)));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // The first project with sessions shows, newest first, ten at a time.
+        let newest = cx
+            .debug_bounds("agent-session-s-00")
+            .expect("the newest session shows");
+        let next = cx
+            .debug_bounds("agent-session-s-01")
+            .expect("the next one shows");
+        assert!(newest.top() < next.top());
+        assert!(cx.debug_bounds("agent-session-s-09").is_some());
+        assert!(cx.debug_bounds("agent-session-s-10").is_none());
+        assert!(cx.debug_bounds("agent-session-elsewhere").is_none());
+        let more = cx
+            .debug_bounds("sessions-show-more")
+            .expect("the rest are a click away");
+        cx.simulate_click(more.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agent-session-s-13").is_some());
+        assert!(cx.debug_bounds("sessions-show-more").is_none());
+
+        // A session agentZ has opens its thread; the others import.
+        assert!(cx.debug_bounds("session-import-s-00").is_some());
+        let open = cx
+            .debug_bounds("session-open-s-03")
+            .expect("the imported session opens");
+        cx.simulate_click(open.center(), gpui::Modifiers::none());
+        assert_eq!(
+            *opened.borrow(),
+            [ThreadKey {
+                machine: MachineId::Local,
+                thread,
+            }]
+        );
+        let import = cx
+            .debug_bounds("session-import-s-00")
+            .expect("the session imports");
+        cx.simulate_click(import.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let import_error = page.read_with(cx, |page, _| {
+            page.account().and_then(|panel| panel.import_error.clone())
+        });
+        assert!(
+            import_error.is_some_and(|error| error.contains("not connected")),
+            "a failed import says why"
+        );
+        assert!(cx.debug_bounds("session-import-s-00").is_some());
+
+        // Another project shows its own sessions.
+        page.update(cx, |page, cx| {
+            if let Some(panel) = page.account_mut() {
+                panel.sessions_project = Some(empty);
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agent-session-s-00").is_none());
     }
 
     #[test]

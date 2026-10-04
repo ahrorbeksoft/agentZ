@@ -2404,6 +2404,72 @@ fn is_auth_required(error: &agent_client_protocol::Error) -> bool {
     error.code == acp::ErrorCode::AuthRequired
 }
 
+/// Pages of `session/list` read at most, in case an agent keeps handing out new cursors.
+const MAX_SESSION_LIST_PAGES: usize = 100;
+
+/// How long listing an agent's sessions may take, starting the agent included.
+const LIST_SESSIONS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What an agent says about the sessions it keeps, from ACP's `session/list`.
+#[derive(Debug)]
+pub enum SessionListing {
+    Listed(Vec<acp::SessionInfo>),
+    /// The agent doesn't advertise `sessionCapabilities.list`.
+    Unsupported,
+    /// The agent wants a login first.
+    LoggedOut,
+}
+
+/// The agent's sessions, every page of them, as Zed's thread import collects them. The agent
+/// starts only for this, in a scratch directory, and stops afterwards.
+pub async fn list_sessions(command: CommandFuture) -> Result<SessionListing> {
+    tokio::time::timeout(LIST_SESSIONS_TIMEOUT, async {
+        let command = command.await?;
+        // Nothing listens: the agent has no session to report on, and a request it sends is
+        // turned down.
+        let (messages, _) = mpsc::unbounded();
+        let sender = MessageSender {
+            sender: messages,
+            generation: 0,
+        };
+        // Stops the agent when dropped.
+        let mut agent_tasks = JoinSet::new();
+        let connected = connect(
+            command,
+            std::env::temp_dir(),
+            sender,
+            None,
+            &mut agent_tasks,
+        )
+        .await?;
+        if connected.capabilities.session_capabilities.list.is_none() {
+            return Ok(SessionListing::Unsupported);
+        }
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_SESSION_LIST_PAGES {
+            let response = connected
+                .connection
+                .send_request(acp::ListSessionsRequest::new().cursor(cursor.clone()))
+                .block_task()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if is_auth_required(&error) => return Ok(SessionListing::LoggedOut),
+                Err(error) => return Err(anyhow!(error_message(&error))),
+            };
+            sessions.extend(response.sessions);
+            match response.next_cursor {
+                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(SessionListing::Listed(sessions))
+    })
+    .await
+    .map_err(|_| anyhow!("the agent didn't list its sessions in time"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3041,6 +3107,75 @@ mod tests {
             second.thread.entries()[1],
             Entry::AgentMessage("Echo: hello".into())
         );
+    }
+
+    /// Every page of an agent's sessions is listed, and a thread opened with a listed session
+    /// loads that session's conversation. Agents that can't list, or want a login, say so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lists_an_agents_sessions() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let unsupported = list_sessions(ready(command.clone()))
+            .await
+            .expect("listing");
+        assert!(matches!(unsupported, SessionListing::Unsupported));
+
+        let sessions_dir = tempfile::tempdir().expect("temp dir");
+        let sessions_file = sessions_dir.path().join("sessions.json");
+        let sessions: Vec<Value> = (1..=5)
+            .map(|number| {
+                serde_json::json!({
+                    "sessionId": format!("listed-{number}"),
+                    "cwd": format!("/projects/{}", number % 2),
+                    "title": format!("Session {number}"),
+                    "history": [{"sessionUpdate": "agent_message_chunk",
+                                 "content": {"type": "text", "text": format!("Earlier {number}")}}],
+                })
+            })
+            .collect();
+        std::fs::write(&sessions_file, serde_json::to_vec(&sessions).expect("json"))
+            .expect("writing sessions");
+        command.env.insert(
+            "MOCK_SESSIONS_FILE".into(),
+            sessions_file.to_string_lossy().into_owned(),
+        );
+        let SessionListing::Listed(listed) = list_sessions(ready(command.clone()))
+            .await
+            .expect("listing")
+        else {
+            panic!("the mock agent lists its sessions");
+        };
+        let ids: Vec<&str> = listed
+            .iter()
+            .map(|session| &*session.session_id.0)
+            .collect();
+        assert_eq!(
+            ids,
+            ["listed-1", "listed-2", "listed-3", "listed-4", "listed-5"]
+        );
+        assert_eq!(listed[1].cwd, PathBuf::from("/projects/0"));
+        assert_eq!(listed[1].title.as_deref(), Some("Session 2"));
+
+        let mut thread = start(command.clone(), Some(acp::SessionId::new("listed-3")));
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(
+            thread.thread.entries(),
+            [Entry::AgentMessage("Earlier 3".into())]
+        );
+
+        command.env.insert(
+            "MOCK_LOGIN_FILE".into(),
+            sessions_dir
+                .path()
+                .join("logged-in")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let logged_out = list_sessions(ready(command)).await.expect("listing");
+        assert!(matches!(logged_out, SessionListing::LoggedOut));
     }
 
     /// Pauses the thread, hands its agent to a new thread as another server would, and

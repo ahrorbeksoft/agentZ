@@ -123,7 +123,8 @@ Each entry: what it does, where it lives, and where it comes from.
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
   installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
   a login status badge, the version and registry links, Update when there is one, and a "⋯"
-  menu with Uninstall. Below it are Account, Defaults (for new threads) and Environment tabs.
+  menu with Uninstall. Below it are Account, Defaults (for new threads), Environment and Threads
+  tabs (Threads is described under Agent threads).
   Account is a card: the login methods while logged out, or the account the agent reported
   with Change Account and Log Out (both described under Agent threads). Add Agent opens the ACP Registry
   page, which has search, an All / Installed / Not Installed filter, and a card for each agent.
@@ -184,6 +185,17 @@ Each entry: what it does, where it lives, and where it comes from.
   stops (Reload Agent, the thread going away) or its session is dropped (logged out), waiting
   at most 3 seconds. A reload opens the new session only after the old one closed. A thread
   handed off to a new server leaves its session open.
+- **Importing threads** (`agent_thread::list_sessions`, `server/session_requests.rs`, the agent
+  page's Threads tab in `settings_page.rs`; t3code's "Native sessions", Zed's thread import):
+  opening the tab starts the agent in a scratch folder and reads every page of ACP's
+  `session/list` (`Request::ListAgentSessions`). The server matches each session's folder,
+  made canonical, to a project's folder or one of its worktrees and pastures. The tab shows one
+  project's sessions at a time, newest first, with Import and Import All
+  (`Request::ImportAgentSessions`). Imported sessions become archived threads, as in Zed, so
+  a bulk import doesn't flood the thread list. A session that already has a thread (by agent
+  and session id) shows "In agentZ" with Open. Sessions outside every project are only
+  counted, since a thread belongs to a project. Opening an imported thread loads its session,
+  which replays the conversation.
 - **Requests for input** (`elicitation_card.rs`, Zed's checks for ACP's `elicitation/create`): a
   card in the thread for a form (text, numbers, a choice, checkboxes) with Decline and Submit,
   or a page to open, named by its host, with a warning for non-ASCII hosts. An opened page

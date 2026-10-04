@@ -476,6 +476,9 @@ impl Shell {
                         SettingsPageEvent::Confirm(request) => {
                             this.open_confirm_dialog(request.clone(), window, cx)
                         }
+                        SettingsPageEvent::OpenThread(thread) => {
+                            this.open_thread(*thread, window, cx)
+                        }
                     });
                 self.settings_page = Some((page.clone(), subscription));
                 page

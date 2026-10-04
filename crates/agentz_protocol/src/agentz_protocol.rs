@@ -33,7 +33,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::agents::{AgentIcon, AgentId, AgentSettings, IconId, RegistrySnapshot};
+use crate::agents::{
+    AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, IconId, RegistrySnapshot,
+};
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
 use crate::terminal::{
@@ -71,6 +73,9 @@ pub const CAPABILITY_DRAWER_TERMINALS: &str = "drawer_terminals";
 /// [`ServerWelcome::capabilities`]: the server can hand its terminals to the binary installed
 /// now and exit ([`Request::HandOff`]), so updating it keeps them running.
 pub const CAPABILITY_HAND_OFF: &str = "hand_off";
+/// [`ServerWelcome::capabilities`]: the server lists agents' sessions and imports them as
+/// threads ([`Request::ListAgentSessions`], [`Request::ImportAgentSessions`]).
+pub const CAPABILITY_IMPORT_SESSIONS: &str = "import_sessions";
 
 /// Larger frames are refused, so a bad length can't make the reader allocate without bound.
 /// Long threads with big tool outputs are the largest messages.
@@ -435,6 +440,20 @@ pub enum Request {
         agent_id: AgentId,
         change: AgentSettingsChange,
     },
+    /// The conversations the agent keeps on this machine, to import as threads, as Zed's
+    /// thread import lists them: [`Response::AgentSessions`]. The agent starts only for this.
+    ListAgentSessions(AgentId),
+    /// Adds a thread for each of the agent's sessions from [`Request::ListAgentSessions`], in
+    /// the project its folder belongs to. The agent loads the session when its thread opens.
+    /// Sessions that have a thread already, or no project, are left out:
+    /// [`Response::ThreadsImported`].
+    ImportAgentSessions {
+        agent_id: AgentId,
+        sessions: Vec<AgentSession>,
+        /// Straight into Archived.
+        #[serde(default)]
+        archived: bool,
+    },
 
     /// Ends the server, its agents and terminals.
     Shutdown,
@@ -587,6 +606,8 @@ pub enum Response {
     Directories(DirectoryListing),
     SpacePane(PaneLocation),
     AgentIcons(Vec<AgentIcon>),
+    AgentSessions(AgentSessions),
+    ThreadsImported(Vec<ThreadId>),
     /// The titles of the threads whose turns are running.
     TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.

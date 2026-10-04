@@ -195,6 +195,21 @@ pub struct Thread {
     pub terminal: Option<TerminalCommand>,
 }
 
+/// An agent's session to add as a thread: [`ProjectStore::add_imported_thread`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedSession {
+    pub project_id: ProjectId,
+    /// The project's worktree or pasture the session ran in, or `None` for its own folder.
+    pub workspace: Option<PathBuf>,
+    pub agent_id: String,
+    pub session_id: String,
+    pub title: String,
+    /// When the agent last worked on it, which orders it among the other threads.
+    pub updated_at: Option<SystemTime>,
+    /// Imported straight into Archived.
+    pub archived: bool,
+}
+
 impl Thread {
     /// The thread that delegated this one, for a subthread.
     pub fn parent(&self) -> Option<ThreadId> {
@@ -691,6 +706,49 @@ impl ProjectStore {
         }
         self.changed();
         Some(id)
+    }
+
+    /// Adds a thread for a conversation the agent already keeps (from ACP's `session/list`).
+    /// The agent loads it when the thread opens.
+    pub fn add_imported_thread(&mut self, session: ImportedSession) -> Option<ThreadId> {
+        let id = self.add_thread(session.project_id, session.title, Some(session.agent_id))?;
+        let archived_at = session.archived.then(SystemTime::now);
+        let thread = self.threads.iter_mut().find(|thread| thread.id == id)?;
+        thread.session_id = Some(session.session_id);
+        thread.workspace = session.workspace;
+        if let Some(updated_at) = session.updated_at {
+            thread.last_activity_at = Some(updated_at);
+            thread.created_at = Some(updated_at);
+        }
+        thread.archived_at = archived_at;
+        self.changed();
+        Some(id)
+    }
+
+    /// The thread that has the agent's session.
+    pub fn thread_for_session(&self, agent_id: &str, session_id: &str) -> Option<ThreadId> {
+        self.threads
+            .iter()
+            .find(|thread| {
+                thread.agent_id.as_deref() == Some(agent_id)
+                    && thread.session_id.as_deref() == Some(session_id)
+            })
+            .map(|thread| thread.id)
+    }
+
+    /// The project whose folder `folder` is, or one of whose worktrees or pastures, with that
+    /// workspace. Both are compared as given, so pass canonical paths.
+    pub fn folder_owner(&self, folder: &Path) -> Option<(ProjectId, Option<PathBuf>)> {
+        self.projects.iter().find_map(|project| {
+            if project.path == folder {
+                return Some((project.id, None));
+            }
+            project
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.path == folder)
+                .map(|workspace| (project.id, Some(workspace.path.clone())))
+        })
     }
 
     /// The thread's subthreads, newest first.
@@ -1568,5 +1626,82 @@ mod tests {
         store.remove_workspace(project, &pasture);
         assert!(store.thread_workspace(lead).is_none());
         assert_eq!(store.thread_folder(lead), Some(pasture), "keeps its folder");
+    }
+
+    #[test]
+    fn imported_sessions_become_threads_in_their_folder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let project_path = store.project(project).expect("project").path.clone();
+        let worktree = dir.path().join("worktrees/demo/agentz-1");
+        store.add_workspace(
+            project,
+            Workspace {
+                kind: WorkspaceKind::Worktree,
+                path: worktree.clone(),
+                branch: Some("agentz/1".into()),
+                base: None,
+                created_at: SystemTime::now(),
+            },
+        );
+        assert_eq!(store.folder_owner(&project_path), Some((project, None)));
+        assert_eq!(
+            store.folder_owner(&worktree),
+            Some((project, Some(worktree.clone())))
+        );
+        assert_eq!(store.folder_owner(&dir.path().join("elsewhere")), None);
+
+        let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let recent = store.add_thread(project, "Recent", None).expect("thread");
+        let imported = store
+            .add_imported_thread(ImportedSession {
+                project_id: project,
+                workspace: Some(worktree.clone()),
+                agent_id: "codex".into(),
+                session_id: "session-a".into(),
+                title: "Fix the login".into(),
+                updated_at: Some(earlier),
+                archived: false,
+            })
+            .expect("imported");
+        let thread = store.thread(imported).expect("thread");
+        assert_eq!(thread.session_id.as_deref(), Some("session-a"));
+        assert_eq!(thread.title, "Fix the login");
+        assert_eq!(thread.last_activity_at, Some(earlier));
+        assert_eq!(store.thread_folder(imported), Some(worktree));
+        store.set_thread_order(ThreadOrder::LastActivity);
+        let listed: Vec<_> = store.threads_for(project).map(|thread| thread.id).collect();
+        assert_eq!(
+            listed,
+            vec![recent, imported],
+            "ordered by when it was active"
+        );
+
+        assert_eq!(
+            store.thread_for_session("codex", "session-a"),
+            Some(imported)
+        );
+        assert_eq!(store.thread_for_session("claude", "session-a"), None);
+
+        let archived = store
+            .add_imported_thread(ImportedSession {
+                project_id: project,
+                workspace: None,
+                agent_id: "codex".into(),
+                session_id: "session-b".into(),
+                title: "Old work".into(),
+                updated_at: None,
+                archived: true,
+            })
+            .expect("imported");
+        assert_eq!(
+            store
+                .archived_threads()
+                .iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>(),
+            vec![archived]
+        );
     }
 }

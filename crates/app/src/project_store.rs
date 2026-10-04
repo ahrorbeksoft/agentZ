@@ -6,7 +6,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use agentz_protocol::agents::AgentId;
+use agentz_protocol::agents::{AgentId, AgentSession, AgentSessions};
 use agentz_protocol::terminal::TerminalCommand;
 use agentz_protocol::workspace::{
     ProjectGit, RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval,
@@ -312,6 +312,41 @@ impl ProjectStore {
             },
             |response| match response {
                 Response::ThreadCreated(thread_id) => Some(thread_id),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// The conversations the agent keeps on this machine, each with the project it would be
+    /// imported into. The server starts the agent only to ask.
+    pub fn list_agent_sessions(&self, agent_id: AgentId, cx: &App) -> Task<Result<AgentSessions>> {
+        self.request(
+            Request::ListAgentSessions(agent_id),
+            |response| match response {
+                Response::AgentSessions(sessions) => Some(sessions),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// Adds an archived thread for each session that has none yet. Resolves once they're in
+    /// this copy.
+    pub fn import_agent_sessions(
+        &self,
+        agent_id: AgentId,
+        sessions: Vec<AgentSession>,
+        cx: &App,
+    ) -> Task<Result<Vec<ThreadId>>> {
+        self.request(
+            Request::ImportAgentSessions {
+                agent_id,
+                sessions,
+                archived: true,
+            },
+            |response| match response {
+                Response::ThreadsImported(threads) => Some(threads),
                 _ => None,
             },
             cx,
