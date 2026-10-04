@@ -73,6 +73,7 @@ impl TestServer {
                 shell_environment_ready: futures::future::ready(()).boxed().shared(),
                 custom_agents,
                 agent_control: None,
+                hands_pages_to_clients: false,
                 terminal_shell: Some("/bin/sh".into()),
                 listener: None,
                 handed_over: None,

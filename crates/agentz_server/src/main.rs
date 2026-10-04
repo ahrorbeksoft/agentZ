@@ -76,6 +76,18 @@ enum Command {
         #[arg(long)]
         thread: Option<u64>,
     },
+    /// Stands in for `program` (`xdg-open`, …) for agents on a machine reached over SSH: while
+    /// the agent logs in, the page goes to agentZ's clients, to open where the user is.
+    /// Otherwise it runs the real program, the next one on `PATH` outside `skip`.
+    #[command(hide = true)]
+    OpenUrl {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        skip: std::path::PathBuf,
+        #[arg(last = true)]
+        arguments: Vec<String>,
+    },
 }
 
 fn main() {
@@ -98,6 +110,11 @@ fn main() {
             arguments,
             thread,
         } => block_on(call(tool, arguments, thread)),
+        Command::OpenUrl {
+            program,
+            skip,
+            arguments,
+        } => open_url(&program, &skip, arguments),
     };
     if let Err(error) = result {
         log::error!("{error:#}");
@@ -197,6 +214,7 @@ async fn serve(socket: &Path, handoff: Option<Handoff>) -> Result<()> {
                 executable: std::env::current_exe().context("finding this executable")?,
                 socket: socket.to_path_buf(),
             }),
+            hands_pages_to_clients: agentz_server::browser::hands_pages_to_clients(),
             terminal_shell: None,
             listener: Some(listener.as_raw_fd()),
             handed_over,
@@ -445,6 +463,43 @@ async fn call(tool: String, arguments: Option<String>, thread: Option<u64>) -> R
         }
         response => bail!("unexpected response: {response:?}"),
     }
+}
+
+fn open_url(program: &str, skip: &Path, arguments: Vec<String>) -> Result<()> {
+    if let Some(url) = agentz_server::browser::page_to_hand_over(&arguments) {
+        let connection = std::env::var(agentz_server::browser::CONNECTION_ENV_VAR)
+            .ok()
+            .and_then(|text| agentz_server::browser::connection_from_string(&text));
+        if let Some(connection) = connection {
+            let url = url.to_string();
+            let handed_over = block_on(async move {
+                let response = connect_for_tools(ClientKind::Cli)
+                    .await?
+                    .request(Request::OpenLoginPage { connection, url })
+                    .await?;
+                match response {
+                    Response::Ok => Ok(()),
+                    response => bail!("unexpected response: {response:?}"),
+                }
+            });
+            match handed_over {
+                Ok(()) => return Ok(()),
+                // Not logging in: the page is the real program's to open.
+                Err(error) => log::debug!("not handing the page to agentZ: {error:#}"),
+            }
+        }
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let Some(real) = agentz_server::browser::real_program(program, skip, &path) else {
+        eprintln!("{program}: no program to open {}", arguments.join(" "));
+        // xdg-open's code for a missing tool.
+        std::process::exit(3);
+    };
+    let error = std::process::Command::new(&real)
+        .arg0(program)
+        .args(&arguments)
+        .exec();
+    Err(error).with_context(|| format!("running {}", real.display()))
 }
 
 fn print_json(value: &serde_json::Value) -> Result<()> {

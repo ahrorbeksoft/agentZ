@@ -63,7 +63,10 @@ pub enum AgentThreadEvent {
     ModeChanged(acp::SessionModeId),
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
+    /// The agent is logged out: agentZ logged it out, or it asked for a login.
     LoggedOut,
+    /// The account the agent says it's logged in to (`_auth/status_update`).
+    AccountReported(AuthStatus),
     /// The connection paused after [`AgentThread::pause`], with everything the agent sent
     /// before handled: the thread can be handed off.
     Paused,
@@ -582,6 +585,7 @@ impl AgentThread {
                 self.view.state.authenticating = None;
                 self.view.state.auth_links.clear();
                 self.view.state.auth_code = None;
+                self.view.state.login_page = None;
                 // Whatever the login asked for is moot once it's over.
                 self.cancel_elicitations(|elicitation| {
                     matches!(
@@ -629,6 +633,7 @@ impl AgentThread {
             }
             MessageKind::AuthStatus(status) => {
                 self.view.state.logged_in = Some(status.is_logged_in());
+                self.emit(AgentThreadEvent::AccountReported(status.clone()));
                 self.view.state.auth_status = Some(status);
             }
             MessageKind::LoggedOut(result) => match result {
@@ -674,7 +679,7 @@ impl AgentThread {
                     // prompt.
                     Err(error) if is_auth_required(&error) => {
                         self.view.state.status = ConnectionStatus::AuthRequired;
-                        self.view.state.logged_in = Some(false);
+                        self.found_logged_out();
                         self.view.state.auth_description = auth_description(&error);
                     }
                     Err(error) => {
@@ -716,6 +721,7 @@ impl AgentThread {
         self.view.state.authenticating = None;
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
+        self.view.state.login_page = None;
         self.view.state.turn_error = None;
         self.view.state.status = ConnectionStatus::Connecting;
         self.set_working(false);
@@ -1202,12 +1208,21 @@ impl AgentThread {
             }
             Err(error) if is_auth_required(&error) => {
                 self.view.state.status = ConnectionStatus::AuthRequired;
-                self.view.state.logged_in = Some(false);
+                self.found_logged_out();
                 self.view.state.auth_description = auth_description(&error);
                 self.set_working(false);
             }
             Err(error) => self.fail(format!("starting a session: {}", error_message(&error))),
         }
+    }
+
+    /// The agent asked for a login, so whatever logged it in, agentZ or something else, no
+    /// longer does.
+    fn found_logged_out(&mut self) {
+        if self.view.state.logged_in != Some(false) {
+            self.emit(AgentThreadEvent::LoggedOut);
+        }
+        self.view.state.logged_in = Some(false);
     }
 
     /// Logs in with one of the agent's own methods, then opens the session. `meta` carries
@@ -1233,6 +1248,7 @@ impl AgentThread {
         self.view.state.auth_error = None;
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
+        self.view.state.login_page = None;
         self.view.state.authenticating = Some(method_id);
         self.spawn(async move {
             MessageKind::Authenticated {
@@ -1240,6 +1256,26 @@ impl AgentThread {
                 result: request.await.map(|_| ()),
             }
         });
+    }
+
+    /// The agent tried to open a page in a browser while logging in, and agentZ's `xdg-open`
+    /// handed it here for the clients to open (see [`ThreadState::login_page`]). Refused unless
+    /// it's logging in, through `authenticate` or the connection's login terminal.
+    pub fn open_login_page(
+        &mut self,
+        url: SharedString,
+        in_terminal_login: bool,
+    ) -> std::result::Result<(), String> {
+        if self.view.state.authenticating.is_none() && !in_terminal_login {
+            return Err(format!("{} isn't logging in", self.view.state.agent_name));
+        }
+        self.view.state.login_page = Some(url);
+        Ok(())
+    }
+
+    /// A terminal login starts over, so the page its last run asked for is moot.
+    pub fn terminal_login_started(&mut self) {
+        self.view.state.login_page = None;
     }
 
     /// A terminal login method exited successfully. The agent is restarted to pick up its new
@@ -1565,6 +1601,7 @@ impl AgentThread {
         self.view.state.authenticating = None;
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
+        self.view.state.login_page = None;
         self.cancel_elicitations(|_| true);
         self.set_working(false);
     }

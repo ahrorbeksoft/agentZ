@@ -16,9 +16,13 @@ With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail 
 "authentication required" and a pairing code, as Factory Droid does); "mock-login" creates
 it, and so does the terminal login "mock-terminal-login", offered to clients that support
 terminal logins: it runs this script with `--login`, which waits for Enter, then creates the
-file and exits. The other logins, as real agents offer them:
+file and exits (with MOCK_BROWSER_OPEN set, it first opens a page with `xdg-open`). The other
+logins, as real agents offer them:
 - "mock-browser-login" (to clients that take URL elicitations) asks the client to open a
   URL, as Codex's device-code login does, and logs in once the client accepts.
+- "mock-browser-open-login" (with MOCK_BROWSER_OPEN set) opens a page with `xdg-open` that
+  sends the browser back to a callback on 127.0.0.1, as Devin's and Codex's browser logins do,
+  and logs in once a request with a `code` arrives there. It fails if `xdg-open` does.
 - "mock-api-key" takes `_meta["api-key"]["apiKey"]`, as Codex's does.
 - "mock-gateway" (to clients that set `auth._meta.gateway`) takes `_meta["gateway"]`
   with a `baseUrl`, as Claude Agent's does.
@@ -47,6 +51,9 @@ SESSIONS_FILE = os.environ.get("MOCK_SESSIONS_FILE")
 SESSIONS_PER_PAGE = 2
 
 if sys.argv[-1] == "--login":
+    if os.environ.get("MOCK_BROWSER_OPEN"):
+        # As `claude /login` does, before it offers a link to open by hand.
+        subprocess.run(["xdg-open", "https://example.com/terminal-login"])
     print("Press Enter to log in to the mock agent.", flush=True)
     sys.stdin.readline()
     open(LOGIN_FILE, "w").close()
@@ -182,6 +189,41 @@ def send_auth_status():
     send({"jsonrpc": "2.0", "method": "_auth/status_update", "params": {"authStatus": status}})
 
 
+def browser_open_login():
+    """Opens the login page, as Devin and Codex do, and waits for the browser to come back to
+    the callback it names. Returns why it failed, if it did."""
+    import http.server
+    import urllib.parse
+    codes = []
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            codes.append(query.get("code", [""])[0])
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Logged in to the mock agent.")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Callback)
+    callback = urllib.parse.quote(f"http://127.0.0.1:{server.server_port}/callback", safe="")
+    url = f"https://example.com/login?redirect_uri={callback}&state=mock"
+    try:
+        # Its output mustn't reach stdout, which is the client's.
+        opened = subprocess.run(["xdg-open", url], stdout=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        opened = False
+    if not opened:
+        server.server_close()
+        return "Could not open browser for authentication"
+    server.timeout = 120
+    server.handle_request()
+    server.server_close()
+    return None if codes and codes[0] else "The login didn't finish"
+
+
 def authenticate(request_id, params):
     method_id = params.get("methodId")
     meta = params.get("_meta") or {}
@@ -196,6 +238,8 @@ def authenticate(request_id, params):
                   "params": {"elicitationId": "login-1"}})
         else:
             error = f"Login {answer.get('action')}"
+    elif method_id == "mock-browser-open-login":
+        error = browser_open_login()
     elif method_id == "mock-api-key":
         if not (meta.get("api-key") or {}).get("apiKey"):
             error = "No API key given"
@@ -285,6 +329,8 @@ for line in sys.stdin:
                                  "type": "terminal", "args": ["--login"]})
         if "url" in (capabilities.get("elicitation") or {}):
             auth_methods.append({"id": "mock-browser-login", "name": "Log in with a browser"})
+        if os.environ.get("MOCK_BROWSER_OPEN"):
+            auth_methods.append({"id": "mock-browser-open-login", "name": "Log in with your browser"})
         auth_methods.append({"id": "mock-api-key", "name": "Use an API key",
                              "_meta": {"api-key": {"provider": "mock"}}})
         if ((capabilities.get("auth") or {}).get("_meta") or {}).get("gateway"):

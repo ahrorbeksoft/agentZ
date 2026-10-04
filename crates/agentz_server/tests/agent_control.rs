@@ -106,6 +106,7 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
                 executable: PathBuf::from(BRIDGE),
                 socket: socket.clone(),
             }),
+            hands_pages_to_clients: false,
             terminal_shell: Some("/bin/sh".into()),
             listener: None,
             handed_over: None,

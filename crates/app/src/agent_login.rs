@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use agentz_client::ssh::{HeldForward, LocalForward, Ssh};
+
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::terminal::TerminalKey;
@@ -26,6 +28,7 @@ use crate::controls::{
     ActionButton, ActionSize, ActionStyle, code_boxes, copy_to_clipboard, field_label, icon_tile,
     link_host, spinner, text_field,
 };
+use crate::server_client::Transport;
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
@@ -77,6 +80,13 @@ pub struct AgentLogin {
     description: Option<(SharedString, Entity<Markdown>)>,
     copied: Option<Copied>,
     _copied_reset: Task<()>,
+    /// The page from another machine ([`ThreadView::login_page`]) last opened here, so the
+    /// panel stops asking to open it.
+    opened_page: Option<SharedString>,
+    /// Ports forwarded from the agent's machine for the login's page, until it's over.
+    forwards: Vec<HeldForward>,
+    forward_error: Option<SharedString>,
+    _forwarding: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -94,6 +104,8 @@ struct LoginWait {
     code: Option<String>,
     /// The agent's own request to open the page, which opening it answers.
     elicitation: Option<Elicitation>,
+    /// The agent opened it on its machine, and it hasn't been opened here yet.
+    must_open: bool,
 }
 
 impl AgentLogin {
@@ -111,6 +123,18 @@ impl AgentLogin {
                 // A login started elsewhere (another window) takes over from typing one in.
                 if thread.read(cx).is_authenticating() && this.entering.is_some() {
                     this.stop_entering(cx);
+                }
+                // The login's page and its forwarded ports are done with once it's over.
+                let thread = thread.read(cx);
+                if thread.login_page().is_none() {
+                    this.opened_page = None;
+                }
+                if !thread.is_authenticating()
+                    && thread.login_page().is_none()
+                    && this.running_terminal_login(cx).is_none()
+                {
+                    this.forwards.clear();
+                    this.forward_error = None;
                 }
                 cx.notify();
             }),
@@ -134,6 +158,10 @@ impl AgentLogin {
             description: None,
             copied: None,
             _copied_reset: Task::ready(()),
+            opened_page: None,
+            forwards: Vec::new(),
+            forward_error: None,
+            _forwarding: Task::ready(()),
             _subscriptions: subscriptions,
         };
         this.sync_description(cx);
@@ -330,12 +358,60 @@ impl AgentLogin {
         cx.notify();
     }
 
-    /// Opens the login's page here. Opening the page the agent asked for answers it.
+    /// Opens the login's page here. Opening the page the agent asked for answers it. A page from
+    /// an agent on another machine sends the browser back to `localhost` there, so those ports
+    /// are forwarded from it first, over its SSH connection.
     fn open(&mut self, wait: &LoginWait, cx: &mut Context<Self>) {
-        let Some(url) = &wait.url else {
+        let Some(url) = wait.url.clone() else {
             return;
         };
-        cx.open_url(url);
+        let thread = self.thread.read(cx);
+        if thread.login_page() == Some(&url) {
+            self.opened_page = Some(url.clone());
+        }
+        let forwards = match thread.client().read(cx).transport() {
+            Transport::Ssh(target) => Some(target.clone()).zip(Some(loopback_forwards(&url))),
+            Transport::Local => None,
+        }
+        .filter(|(_, forwards)| !forwards.is_empty());
+        match forwards {
+            None => cx.open_url(&url),
+            Some((target, forwards)) => {
+                self.forward_error = None;
+                let runtime = reqwest_client::runtime().handle().clone();
+                let forwarding = runtime.spawn({
+                    let runtime = runtime.clone();
+                    async move {
+                        let ssh = Ssh::new(&target)?;
+                        let mut held = Vec::new();
+                        for forward in forwards {
+                            held.push(ssh.hold_forward(forward, runtime.clone()).await?);
+                        }
+                        anyhow::Ok(held)
+                    }
+                });
+                self._forwarding = cx.spawn(async move |this, cx| {
+                    let held = forwarding
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|held| held);
+                    this.update(cx, |this, cx| {
+                        match held {
+                            Ok(held) => {
+                                this.forwards.extend(held);
+                                cx.open_url(&url);
+                            }
+                            Err(error) => {
+                                log::error!("couldn't forward the login page's port: {error:#}");
+                                this.forward_error = Some(format!("{error:#}").into());
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                });
+            }
+        }
         if let Some(elicitation) = wait
             .elicitation
             .as_ref()
@@ -350,6 +426,8 @@ impl AgentLogin {
                 )
             });
         }
+        // The page from another machine is opened now.
+        cx.notify();
     }
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
@@ -445,8 +523,13 @@ impl AgentLogin {
             .into_any_element()
     }
 
-    fn render_terminal(&self, terminal: Entity<TerminalView>, cx: &App) -> AnyElement {
+    fn render_terminal(
+        &self,
+        terminal: Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let agent_name = self.thread.read(cx).agent_name().clone();
+        let page = self.render_terminal_page(cx);
         v_flex()
             .w_full()
             .gap_2()
@@ -460,6 +543,7 @@ impl AgentLogin {
                     .overflow_hidden()
                     .child(terminal),
             )
+            .children(page)
             .child(
                 Label::new(format!(
                     "Finish in the terminal. {agent_name} starts again logged in once it's done."
@@ -471,6 +555,69 @@ impl AgentLogin {
     }
 
     /// The API key, or the gateway's address and headers, as the method asks.
+    /// The page the command in the login terminal opened on the agent's machine (see
+    /// [`ThreadView::login_page`]), to open here: the same buttons as a login in progress.
+    fn render_terminal_page(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let agent_name = thread.agent_name().clone();
+        thread.login_page()?;
+        let wait = self.login_wait(cx);
+        let url = wait.url.clone()?;
+        let host = link_host(&url);
+        let must_open = wait.must_open;
+        let wait = std::rc::Rc::new(wait);
+        let copy_link = ActionButton::new(
+            "login-terminal-copy-link",
+            if self.copied == Some(Copied::Link) {
+                "Copied"
+            } else {
+                "Copy Link"
+            },
+        )
+        .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
+        .on_click(cx.listener(move |this, _, _, cx| this.copy(Copied::Link, &url, cx)));
+        let open_label = match (&host, must_open) {
+            (_, false) => "Open Again".to_string(),
+            (Some(host), true) => format!("Open {host}"),
+            (None, true) => "Open Page".to_string(),
+        };
+        let open = ActionButton::new("login-terminal-open", open_label)
+            .style(if must_open {
+                ActionStyle::Primary
+            } else {
+                ActionStyle::Outline
+            })
+            .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
+            .on_click(cx.listener(move |this, _, _, cx| this.open(&wait, cx)));
+        let message = match &host {
+            Some(host) => format!("{agent_name} needs you to log in at {host}."),
+            None => format!("{agent_name} needs you to log in in your browser."),
+        };
+        Some(
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(message)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(copy_link)
+                        .child(open),
+                )
+                .children(
+                    self.forward_error
+                        .clone()
+                        .map(|error| Label::new(error).size(LabelSize::Small).color(Color::Error)),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_entry_fields(
         &self,
         method: &acp::AuthMethod,
@@ -631,16 +778,24 @@ impl AgentLogin {
             .as_ref()
             .and_then(|elicitation| elicitation.url())
             .map(|url| SharedString::from(url.to_string()))
+            .or_else(|| thread.login_page().cloned())
             .or_else(|| thread.auth_links().first().cloned());
         let code = elicitation
             .as_ref()
             .and_then(|elicitation| login_code(&elicitation.request.message))
             .or_else(|| thread.auth_code().map(|code| code.to_string()))
             .or_else(|| thread.auth_description().and_then(|text| login_code(text)));
+        let must_open = match &elicitation {
+            Some(elicitation) => !elicitation.opened,
+            None => thread.login_page().is_some_and(|page| {
+                url.as_ref() == Some(page) && self.opened_page.as_ref() != Some(page)
+            }),
+        };
         LoginWait {
             url,
             code,
             elicitation,
+            must_open,
         }
     }
 
@@ -740,10 +895,7 @@ impl AgentLogin {
         }
 
         // A page the agent asked to open that hasn't been yet waits on the user to open it.
-        let must_open = wait
-            .elicitation
-            .as_ref()
-            .is_some_and(|elicitation| !elicitation.opened);
+        let must_open = wait.must_open;
         let (title, message): (SharedString, SharedString) = if must_open {
             (
                 "Continue in your browser".into(),
@@ -807,6 +959,11 @@ impl AgentLogin {
                         .color(Color::Muted),
                 ),
             )
+            .children(self.forward_error.clone().map(|error| {
+                div()
+                    .max_w(px(380.))
+                    .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            }))
             .when(copy_link.is_some() || open.is_some(), |panel| {
                 panel.child(h_flex().mt_1().gap_2().children(copy_link).children(open))
             })
@@ -1007,6 +1164,38 @@ impl AgentLogin {
     }
 }
 
+/// The ports to forward from the agent's machine for a login page: the page's own, when it's on
+/// `localhost`, and those of the `localhost` addresses it sends the browser back to (OAuth's
+/// `redirect_uri`, and whatever else it names in its query).
+fn loopback_forwards(page: &str) -> Vec<LocalForward> {
+    let Ok(page) = url::Url::parse(page) else {
+        return Vec::new();
+    };
+    let named = page
+        .query_pairs()
+        .filter_map(|(_, value)| url::Url::parse(&value).ok());
+    let mut forwards = Vec::new();
+    for url in std::iter::once(page.clone()).chain(named) {
+        if !matches!(url.scheme(), "http" | "https") {
+            continue;
+        }
+        let host = match url.host() {
+            Some(url::Host::Domain("localhost")) => "localhost".to_string(),
+            Some(url::Host::Ipv4(address)) if address.is_loopback() => address.to_string(),
+            Some(url::Host::Ipv6(address)) if address.is_loopback() => address.to_string(),
+            _ => continue,
+        };
+        let Some(port) = url.port() else {
+            continue;
+        };
+        let forward = LocalForward { host, port };
+        if !forwards.contains(&forward) {
+            forwards.push(forward);
+        }
+    }
+    forwards
+}
+
 /// While a login runs, the page the agent asks to open for it (a device or browser login):
 /// the login panel shows it, not a card of its own.
 pub(crate) fn login_elicitation(thread: &ThreadView) -> Option<&Elicitation> {
@@ -1050,5 +1239,55 @@ impl Render for AgentLogin {
             LoginLayout::Centered => self.render_centered(window, cx),
         };
         div().w_full().text_ui(cx).child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn forwards(page: &str) -> Vec<(String, u16)> {
+        loopback_forwards(page)
+            .into_iter()
+            .map(|forward| (forward.host, forward.port))
+            .collect()
+    }
+
+    #[test]
+    fn forwards_the_ports_login_pages_come_back_to() {
+        // Devin's, Codex's and Claude Code's pages, which send the browser back to the agent.
+        assert_eq!(
+            forwards(
+                "https://app.devin.ai/auth/cli/continue?redirect_uri=http%3A%2F%2F127.0.0.1%3A43607\
+                 %2Fcallback&state=49bcf2a7"
+            ),
+            [("127.0.0.1".to_string(), 43607)]
+        );
+        assert_eq!(
+            forwards(
+                "https://auth.openai.com/oauth/authorize?response_type=code&redirect_uri=\
+                 http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid"
+            ),
+            [("localhost".to_string(), 1455)]
+        );
+        // A page served by the agent itself.
+        assert_eq!(
+            forwards("http://localhost:8085/start"),
+            [("localhost".to_string(), 8085)]
+        );
+        assert_eq!(
+            forwards("https://example.com/login?redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A9000%2F"),
+            [("::1".to_string(), 9000)]
+        );
+        // Device logins and manual codes come back to nothing local.
+        assert_eq!(forwards("https://auth.openai.com/codex/device"), []);
+        assert_eq!(
+            forwards(
+                "https://claude.ai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2F\
+                 console.anthropic.com%2Foauth%2Fcode%2Fcallback"
+            ),
+            []
+        );
+        assert_eq!(forwards("http://localhost/no-port"), []);
     }
 }

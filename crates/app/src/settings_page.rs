@@ -2290,6 +2290,8 @@ impl SettingsPage {
 
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut shows_login = false;
+        // Agents that report no account show the method as the card's title.
+        let mut title_shows_method = false;
         match state {
             AccountState::Connecting => rows.push(render_status_row(
                 spinner(Color::Muted),
@@ -2341,6 +2343,10 @@ impl SettingsPage {
                     .as_ref()
                     .and_then(|status| status.account.as_ref())
                     .and_then(|account| account.email.clone());
+                title_shows_method = email.is_none()
+                    && auth_status
+                        .as_ref()
+                        .is_none_or(|status| status.label.is_none());
                 let title: SharedString = match &email {
                     Some(email) => email.clone().into(),
                     None => logged_in_title(auth_status.as_ref(), login_method.as_deref()),
@@ -2425,13 +2431,14 @@ impl SettingsPage {
                     .when(shows_login, |card| card.child(account.login.clone())),
             )
             .when(state == AccountState::LoggedIn, |tab| {
-                tab.child(
-                    Label::new(format!(
-                        "Every thread with {agent_name} on {machine} uses this login."
-                    ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
+                tab.child(render_login_source(
+                    &agent_name,
+                    &machine,
+                    login_method.as_deref(),
+                    title_shows_method,
+                    can_log_out,
+                    cx,
+                ))
             })
             .children(cards)
             .into_any_element()
@@ -3732,8 +3739,8 @@ struct EnvRow {
     _subscriptions: [Subscription; 2],
 }
 
-/// What a login method logs in with, from its name: "Log in with Google" gives "Google", "API
-/// Key" stays, and a bare "Log In" gives nothing.
+/// What a login method logs in with, from its name: "Log in with Google" gives "Google", "Use an
+/// API key" "an API key", "API Key" stays, and a bare "Log In" gives nothing.
 fn login_method_subject(method: &str) -> Option<String> {
     let trimmed = method.trim();
     let lower = trimmed.to_lowercase();
@@ -3742,6 +3749,7 @@ fn login_method_subject(method: &str) -> Option<String> {
         "login with ",
         "sign in with ",
         "signin with ",
+        "use ",
     ] {
         if lower.starts_with(prefix) {
             return Some(trimmed[prefix.len()..].trim().to_string())
@@ -3771,6 +3779,76 @@ fn logged_in_title(status: Option<&AuthStatus>, login_method: Option<&str>) -> S
         Some(subject) => format!("Logged in with {subject}").into(),
         None => "Logged in".into(),
     }
+}
+
+/// Under the account card: that agentZ logged the agent in, with which method, or that it was
+/// logged in outside agentZ (as by its own CLI), which a callout explains since logging out here
+/// logs that login out too. Either way, every thread with the agent on the machine shares it.
+fn render_login_source(
+    agent_name: &SharedString,
+    machine: &SharedString,
+    login_method: Option<&str>,
+    title_shows_method: bool,
+    can_log_out: bool,
+    cx: &App,
+) -> AnyElement {
+    let Some(method) = login_method else {
+        let colors = cx.theme().colors();
+        let heading = "Logged in outside agentZ.";
+        let text = format!(
+            "{heading} {agent_name} found the login it already had on {machine} (from its CLI or \
+             its own settings). Every thread with it uses this login{}",
+            if can_log_out {
+                ", and logging out here logs out the CLI too."
+            } else {
+                "."
+            }
+        );
+        let heading_style = gpui::HighlightStyle {
+            color: Some(colors.text),
+            font_weight: Some(gpui::FontWeight::MEDIUM),
+            ..Default::default()
+        };
+        return h_flex()
+            .debug_selector(|| "login-source-outside".into())
+            .items_start()
+            .gap_2p5()
+            .px_3()
+            .py_2p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border_variant)
+            .child(
+                div().pt(px(1.)).child(
+                    Icon::new(IconName::Info)
+                        .size(IconSize::Small)
+                        .color(Color::Accent),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_ui_sm(cx)
+                    .text_color(colors.text_muted)
+                    .child(
+                        gpui::StyledText::new(text)
+                            .with_highlights([(0..heading.len(), heading_style)]),
+                    ),
+            )
+            .into_any_element();
+    };
+    let subject = login_method_subject(method).filter(|_| !title_shows_method);
+    let source = match subject {
+        Some(subject) => format!("Logged in from agentZ with {subject}."),
+        None => "Logged in from agentZ.".to_string(),
+    };
+    Label::new(format!(
+        "{source} Every thread with {agent_name} on {machine} uses this login."
+    ))
+    .size(LabelSize::Small)
+    .color(Color::Muted)
+    .into_any_element()
 }
 
 /// The rest of what the agent said about the account: how it's logged in (when the title
@@ -4545,6 +4623,10 @@ mod tests {
         );
         assert_eq!(login_method_subject("ChatGPT").as_deref(), Some("ChatGPT"));
         assert_eq!(login_method_subject("API Key").as_deref(), Some("API Key"));
+        assert_eq!(
+            login_method_subject("Use an API key").as_deref(),
+            Some("an API key")
+        );
         assert_eq!(login_method_subject("Log In"), None);
         assert_eq!(login_method_subject("Login"), None);
     }

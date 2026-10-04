@@ -11,7 +11,7 @@ use gpui_shared_string::SharedString;
 use projects::{ProjectId, ThreadId};
 use serde::{Deserialize, Serialize};
 
-use crate::thread::SessionDefaults;
+use crate::thread::{AuthStatus, LoginIdentity, SessionDefaults};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -158,9 +158,13 @@ pub struct AgentSettings {
     /// without starting a session.
     pub known_config_options: Vec<acp::SessionConfigOption>,
     pub known_modes: Option<acp::SessionModeState>,
-    /// The login method last used from agentZ, to say how the agent is logged in. ACP has no way
-    /// to ask the agent.
+    /// The method of the login agentZ made, while the agent still has it, to say how it's
+    /// logged in. ACP has no way to ask the agent. `None` while it's logged in means it was
+    /// logged in outside agentZ, as by its own CLI.
     pub login_method: Option<String>,
+    /// The account the agent reported after agentZ logged it in. Another one later means it was
+    /// logged in again outside agentZ.
+    pub login_identity: Option<LoginIdentity>,
 }
 
 /// [`crate::Request::ListAgentSessions`]'s answer: the conversations an agent keeps on the
@@ -202,6 +206,37 @@ pub struct AgentSession {
 }
 
 impl AgentSettings {
+    /// agentZ logged the agent in with `method`.
+    pub fn logged_in(&mut self, method: String) {
+        self.login_method = Some(method);
+        self.login_identity = None;
+    }
+
+    /// The agent is logged out, whoever logged it out.
+    pub fn logged_out(&mut self) {
+        self.login_method = None;
+        self.login_identity = None;
+    }
+
+    /// Follows the account the agent reports. The first one after agentZ logged it in is the
+    /// login agentZ made; a different one means it was logged in again outside agentZ.
+    pub fn account_reported(&mut self, status: &AuthStatus) {
+        if !status.is_logged_in() {
+            self.logged_out();
+            return;
+        }
+        if self.login_method.is_none() {
+            return;
+        }
+        let identity = status.identity();
+        match &self.login_identity {
+            Some(known) if known.differs_from(&identity) => self.logged_out(),
+            // Keep the one that says more.
+            Some(known) if known.key.is_some() => {}
+            _ => self.login_identity = Some(identity),
+        }
+    }
+
     pub fn session_defaults(&self) -> SessionDefaults {
         SessionDefaults {
             mode: self.default_mode.clone(),
@@ -211,5 +246,62 @@ impl AgentSettings {
                 .map(|(id, value)| (acp::SessionConfigId::new(id.clone()), value.clone()))
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::AuthAccount;
+
+    fn account(email: Option<&str>) -> AuthStatus {
+        AuthStatus {
+            kind: "account".into(),
+            label: Some("Claude Max".into()),
+            account: Some(AuthAccount {
+                email: email.map(str::to_string),
+                ..Default::default()
+            }),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn logins_made_outside_agentz() {
+        let mut settings = AgentSettings::default();
+        // Logged in before agentZ ever logged it in.
+        settings.account_reported(&account(Some("a@example.com")));
+        assert_eq!(settings.login_method, None);
+
+        settings.logged_in("Claude Subscription".into());
+        // Claude Agent's CLI check leaves the email out, which doesn't make it another login.
+        settings.account_reported(&account(None));
+        settings.account_reported(&account(Some("a@example.com")));
+        settings.account_reported(&account(None));
+        assert_eq!(
+            settings.login_method.as_deref(),
+            Some("Claude Subscription")
+        );
+
+        // Logged in again as someone else, in a terminal.
+        settings.account_reported(&account(Some("b@example.com")));
+        assert_eq!(settings.login_method, None);
+
+        settings.logged_in("Claude Subscription".into());
+        settings.account_reported(&account(Some("b@example.com")));
+        // An API key from the environment now pays instead.
+        settings.account_reported(&AuthStatus {
+            kind: "api_key".into(),
+            detail: Some("ANTHROPIC_API_KEY".into()),
+            ..Default::default()
+        });
+        assert_eq!(settings.login_method, None);
+
+        settings.logged_in("Claude Subscription".into());
+        settings.account_reported(&AuthStatus {
+            kind: "none".into(),
+            ..Default::default()
+        });
+        assert_eq!(settings.login_method, None);
     }
 }

@@ -102,7 +102,9 @@ From Zed's guidelines, which this code follows:
   JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp` (or
   `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>` and `delete <path>` script
   different turns (see its docstring). With `MOCK_LOGIN_FILE` in its env it needs a login, and
-  offers every kind: plain, terminal, browser (a page to open), API key and gateway. With
+  offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
+  `MOCK_BROWSER_OPEN` too, a browser login that runs `xdg-open` and waits on a `127.0.0.1`
+  callback, as Devin's and Codex's do (`tests/browser.rs` drives it as on an SSH machine). With
   `MOCK_SESSIONS_FILE` (a JSON array of ACP session infos, each with an optional `history` to
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the

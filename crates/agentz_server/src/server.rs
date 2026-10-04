@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, ThreadMessage, ThreadView};
 use agentz_protocol::agents::{
-    AgentId, AgentListing, InstallState, RegistryAgentMetadata, RegistrySnapshot,
+    AgentId, AgentListing, AgentSettings, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
@@ -38,6 +38,7 @@ use tokio::task::JoinSet;
 use util::ResultExt as _;
 
 use crate::agent_settings::AgentSettingsStore;
+use crate::browser;
 use crate::checkpoints::Checkpoints;
 use crate::machine_kind;
 use crate::repositories::{self, RepositoryChecks};
@@ -119,6 +120,8 @@ pub(crate) struct Server {
     data_dir: PathBuf,
     custom_agents: BTreeMap<AgentId, CustomAgent>,
     agent_control: Option<AgentControl>,
+    /// Where agentZ's `xdg-open` and the like are, when agents' login pages go to the clients.
+    browser_programs: Option<PathBuf>,
     terminal_shell: Option<String>,
     /// The socket clients connect to, for handing off.
     #[cfg(unix)]
@@ -196,6 +199,16 @@ impl Server {
             detected: None,
             chosen: machine_kind::load_choice(&data_dir.join("machine.json")),
         };
+        let browser_programs = config
+            .agent_control
+            .as_ref()
+            .filter(|_| config.hands_pages_to_clients)
+            .and_then(|control| {
+                let directory = data_dir.join("browser");
+                browser::install(&directory, &control.executable)
+                    .log_err()
+                    .map(|()| directory)
+            });
         let mut server = Self {
             runtime,
             inputs,
@@ -203,6 +216,7 @@ impl Server {
             data_dir,
             custom_agents: config.custom_agents,
             agent_control: config.agent_control,
+            browser_programs,
             terminal_shell: config.terminal_shell,
             #[cfg(unix)]
             listener: config.listener,
@@ -640,6 +654,22 @@ impl Server {
                 self.start_terminal_login(connection, method_id)?;
                 Ok(Response::Ok)
             }
+            Request::OpenLoginPage { connection, url } => {
+                let in_terminal_login = self.terminal_login_runs(connection);
+                // Only a connection that's running: this mustn't start a thread's agent.
+                let runs = match connection {
+                    ConnectionId::Thread(thread_id) => self.threads.contains_key(&thread_id),
+                    ConnectionId::Account(account_id) => self.accounts.contains_key(&account_id),
+                };
+                if !runs {
+                    return Err(anyhow!("the agent isn't running"));
+                }
+                self.update_thread(connection, |thread| {
+                    thread.open_login_page(url.into(), in_terminal_login)
+                })?
+                .map_err(|error| anyhow!(error))?;
+                Ok(Response::Ok)
+            }
             Request::Reauthenticate(connection) => {
                 self.update_thread(connection, |thread| thread.reauthenticate())?;
                 Ok(Response::Ok)
@@ -663,14 +693,16 @@ impl Server {
 
             Request::OpenAccount(agent_id) => {
                 self.client(client)?;
+                let account_id = self.next_account_id;
+                self.next_account_id += 1;
                 let command = self.agent_command(&agent_id, false);
+                let command =
+                    self.with_browser_programs(command, ConnectionId::Account(account_id));
                 let (thread, inbox) = AgentThread::start_for_account(
                     self.runtime.clone(),
                     self.agent_name(&agent_id),
                     command,
                 );
-                let account_id = self.next_account_id;
-                self.next_account_id += 1;
                 self.accounts.insert(
                     account_id,
                     Account {
@@ -1051,6 +1083,7 @@ impl Server {
             }
             .boxed();
         }
+        let command = self.with_browser_programs(command, ConnectionId::Thread(thread_id));
         let (mut agent_thread, inbox) = AgentThread::start(
             self.runtime.clone(),
             self.agent_name(&agent_id),
@@ -1138,6 +1171,38 @@ impl Server {
         .boxed()
     }
 
+    /// Puts agentZ's `xdg-open` and the like first for the agent of `connection`, when agents'
+    /// login pages go to the clients.
+    fn with_browser_programs(
+        &self,
+        command: CommandFuture,
+        connection: ConnectionId,
+    ) -> CommandFuture {
+        let (Some(directory), Some(control)) = (&self.browser_programs, &self.agent_control) else {
+            return command;
+        };
+        let directory = directory.clone();
+        let socket = control.socket.clone();
+        async move {
+            let mut command = command.await?;
+            // Read once the command is ready, which waits for the login shell's environment.
+            let path = command
+                .env
+                .get("PATH")
+                .cloned()
+                .or_else(|| std::env::var("PATH").ok());
+            command
+                .env
+                .extend(browser::agent_env(&directory, connection, path.as_deref()));
+            command.env.insert(
+                "AGENTZ_SOCKET".to_string(),
+                socket.to_string_lossy().into_owned(),
+            );
+            Ok(command)
+        }
+        .boxed()
+    }
+
     /// Applies what the thread reports to the projects and agent settings.
     fn thread_changed(&mut self, connection: ConnectionId) {
         self.changed_connections.insert(connection);
@@ -1198,17 +1263,23 @@ impl Server {
                             .update(agent_id, |settings| settings.default_mode = Some(mode));
                     }
                 }
+                // What agentZ logged in, until the agent is logged out or in again elsewhere.
                 (_, AgentThreadEvent::LoggedIn(method)) => {
                     if let Some(agent_id) = &agent_id {
-                        self.agent_settings.update(agent_id, |settings| {
-                            settings.login_method = Some(method.to_string())
-                        });
+                        self.agent_settings
+                            .update(agent_id, |settings| settings.logged_in(method.to_string()));
                     }
                 }
                 (_, AgentThreadEvent::LoggedOut) => {
                     if let Some(agent_id) = &agent_id {
                         self.agent_settings
-                            .update(agent_id, |settings| settings.login_method = None);
+                            .update(agent_id, AgentSettings::logged_out);
+                    }
+                }
+                (_, AgentThreadEvent::AccountReported(status)) => {
+                    if let Some(agent_id) = &agent_id {
+                        self.agent_settings
+                            .update(agent_id, |settings| settings.account_reported(&status));
                     }
                 }
                 (ConnectionId::Thread(_), AgentThreadEvent::Paused) => paused = true,

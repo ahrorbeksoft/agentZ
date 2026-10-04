@@ -487,6 +487,150 @@ impl Ssh {
     }
 }
 
+/// A port on this machine forwarded to the same port on the machine, as `ssh -L` does. A login
+/// page on the machine sends the browser back to `localhost` there, where the agent waits.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LocalForward {
+    /// `localhost`, `127.0.0.1` or `::1`, as the page names it: on both ends, so the browser
+    /// finds the port where it looks and reaches the agent where it listens.
+    pub host: String,
+    pub port: u16,
+}
+
+impl LocalForward {
+    /// `-L`'s argument.
+    fn specification(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{host}:{port}:{host}:{port}", port = self.port)
+    }
+}
+
+/// How long a forward stays once nobody holds it: the browser may still be loading the page the
+/// agent sends it to once the login is done.
+const FORWARD_LINGER: Duration = Duration::from_secs(30);
+
+/// The forwards held through [`Ssh::hold_forward`], by machine: how many hold each, and which
+/// release last let go of it, so only the latest one's cancel runs.
+static HELD_FORWARDS: std::sync::LazyLock<
+    parking_lot::Mutex<collections::HashMap<(String, LocalForward), (usize, u64)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A forward someone needs. Dropping it cancels the forward a while after the last holder
+/// does.
+pub struct HeldForward {
+    ssh: Ssh,
+    forward: LocalForward,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for HeldForward {
+    fn drop(&mut self) {
+        let key = (self.ssh.target.clone(), self.forward.clone());
+        let release = {
+            let mut held = HELD_FORWARDS.lock();
+            let Some((holders, release)) = held.get_mut(&key) else {
+                return;
+            };
+            *holders = holders.saturating_sub(1);
+            if *holders > 0 {
+                return;
+            }
+            *release += 1;
+            *release
+        };
+        let ssh = self.ssh.clone();
+        let forward = self.forward.clone();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(FORWARD_LINGER).await;
+            let still_released = {
+                let mut held = HELD_FORWARDS.lock();
+                let unchanged = held.get(&key) == Some(&(0, release));
+                if unchanged {
+                    held.remove(&key);
+                }
+                unchanged
+            };
+            if still_released && let Err(error) = ssh.cancel_forward(&forward).await {
+                log::warn!(
+                    "couldn't stop forwarding port {} from {}: {error:#}",
+                    forward.port,
+                    ssh.target
+                );
+            }
+        });
+    }
+}
+
+impl Ssh {
+    /// Forwards the port until the returned holder and every other one for it are dropped.
+    /// Call it on `runtime`.
+    pub async fn hold_forward(
+        &self,
+        forward: LocalForward,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<HeldForward> {
+        let key = (self.target.clone(), forward.clone());
+        HELD_FORWARDS.lock().entry(key.clone()).or_default().0 += 1;
+        let held = HeldForward {
+            ssh: self.clone(),
+            forward: forward.clone(),
+            runtime,
+        };
+        // Asked again even when held: the connection may have started over since.
+        self.forward(&forward).await?;
+        Ok(held)
+    }
+
+    /// Adds the forward to the shared connection (`ssh -O forward`), which keeps it until it's
+    /// cancelled or the connection ends. Asking for one it has already succeeds.
+    pub async fn forward(&self, forward: &LocalForward) -> Result<()> {
+        match self.control("forward", forward).await {
+            Ok(()) => Ok(()),
+            // The master couldn't listen on it here.
+            Err(error) if format!("{error}").contains("Port forwarding failed") => {
+                bail!("port {} is in use on this Mac", forward.port)
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("forwarding port {} from {}", forward.port, self.target)),
+        }
+    }
+
+    pub async fn cancel_forward(&self, forward: &LocalForward) -> Result<()> {
+        self.control("cancel", forward).await
+    }
+
+    /// Asks the shared connection's master to forward a port, or stop.
+    async fn control(&self, operation: &str, forward: &LocalForward) -> Result<()> {
+        let control_path = self
+            .control_path
+            .as_ref()
+            .context("there's no shared SSH connection to forward it through")?;
+        let output = tokio::process::Command::new(&self.program)
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .args(["-O", operation, "-L", &forward.specification()])
+            .arg(&self.target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(COMMAND_TIMEOUT, output)
+            .await
+            .map_err(|_| anyhow!("ssh {} didn't answer in time", self.target))?
+            .with_context(|| format!("running {}", self.program.display()))?;
+        if !output.status.success() {
+            bail!("{}", failure_message(&output.status, &output.stderr));
+        }
+        Ok(())
+    }
+}
+
 /// A session with a machine's server.
 pub struct Connected {
     pub connection: Connection,

@@ -6,6 +6,7 @@
 //! its channel; after each batch it sends subscribers what changed.
 
 mod agent_settings;
+pub mod browser;
 mod checkpoints;
 mod connection;
 mod detect;
@@ -50,6 +51,8 @@ pub struct ServerConfig {
     pub custom_agents: BTreeMap<AgentId, CustomAgent>,
     /// How agents reach the agent-control tools. `None` leaves them out.
     pub agent_control: Option<AgentControl>,
+    /// Agents' login pages go to the clients ([`browser`]), which needs `agent_control`.
+    pub hands_pages_to_clients: bool,
     /// The shell terminals run, and run commands with (`-c`). `None` is the user's login
     /// shell, which tests avoid since it reads the user's own setup.
     pub terminal_shell: Option<String>,

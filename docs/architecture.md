@@ -63,7 +63,7 @@ agentZ's own crates. Everything else in `crates/` is copied from Zed at the same
 | Crate | What it is |
 |---|---|
 | `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
-| `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`). |
+| `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
 | `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook. `test_support/mock_agent.py` is the scripted test agent. |
@@ -170,13 +170,35 @@ Each entry: what it does, where it lives, and where it comes from.
   and "Open <host>", then waits. Cancel restarts the agent (`Request::CancelAuthentication`),
   as t3code does, since browser logins only return when the user finishes. The login's own
   page request shows in the login panel, not as a card.
+- **Browser logins on SSH machines** (`agentz_server::browser`, `agentz-server open-url`,
+  `Request::OpenLoginPage`, `ThreadState::login_page`, `agentz_client::ssh::HeldForward`,
+  `agent_login::loopback_forwards`; VS Code Remote's `BROWSER` helper and port forwarding): a
+  browser there isn't one the user sees, and the page sends it back to `localhost` there, where
+  the agent waits. A server on Linux, or one SSH started, writes its own `xdg-open`,
+  `x-www-browser`, `www-browser`, `sensible-browser` (and `open` on a Mac) into `browser/` in
+  its data directory, and puts them first on agents' and login terminals' `PATH`, with
+  `BROWSER` and `AGENTZ_CONNECTION`. While the connection logs in (`authenticate`, or its login
+  terminal), they hand the page to the server, which the clients show as "Continue in your
+  browser" with Copy Link and "Open <host>" (the user's choice over opening it by itself), or a
+  row under the login terminal. Otherwise they run the real program. Open forwards the ports of
+  the `localhost` addresses the page names (`redirect_uri`) through the machine's shared SSH
+  connection (`ssh -O forward`), then opens it; the forward is cancelled 30 seconds after the
+  login ends, so a fixed port (Codex's 1455) isn't left taken on the Mac.
 - **The login panel** (`agent_login.rs`, agentZ's own design, since Zed only has a callout):
   `LoginLayout::Rows` on the agent's page, a row for each method; `LoginLayout::Centered` in the
   middle of a thread that needs a login, a full-width button for each method. While logged out,
   the thread's composer is dimmed, says "Log in to <agent> to send a message", and doesn't send.
 - **The account** (`agentz_protocol::thread::AuthStatus`): Claude Agent and Codex report their
   login, unasked, with `_auth/status_update` (the account's email, plan and how it's logged
-  in). The Account card shows it, or "Logged in" with the method last used from agentZ.
+  in). The Account card shows it, or "Logged in" with the method agentZ logged in with.
+- **Where the login came from** (`AgentSettings::{login_method, login_identity}`,
+  `settings_page::render_login_source`; the user chose the note under the card from three
+  designs): agents often find a login their own CLI made, which they share. The server records
+  each login agentZ makes, per agent and machine, with the first account reported after it
+  (`AuthStatus::identity`). It forgets it when the agent is logged out (by agentZ, or asking for
+  a login) or reports another account. While logged in with nothing recorded, the note under
+  the Account card is a callout: "Logged in outside agentZ", found on that machine, and that
+  logging out here logs out the CLI too. Otherwise it says "Logged in from agentZ with <method>".
 - **Logging out** (`confirm_dialog.rs`, t3code's dialogs): Log Out on the agent's page or in a
   thread's "…" menu first asks in a dialog in the shell's modal layer, since it stops every
   thread that shares the login. Uninstall asks in the same dialog.

@@ -415,6 +415,13 @@ pub enum Request {
         connection: ConnectionId,
         method_id: acp::AuthMethodId,
     },
+    /// From the agent's own process, through agentZ's `xdg-open`: it tried to open a page in a
+    /// browser while logging in. Clients show it ([`thread::ThreadState::login_page`]); refused
+    /// when the connection isn't logging in.
+    OpenLoginPage {
+        connection: ConnectionId,
+        url: String,
+    },
     Reauthenticate(ConnectionId),
     Logout(ConnectionId),
     RetrySession(ConnectionId),

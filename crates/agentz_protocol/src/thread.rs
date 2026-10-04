@@ -205,6 +205,41 @@ impl AuthStatus {
     pub fn is_logged_in(&self) -> bool {
         !self.kind.is_empty() && self.kind != "none"
     }
+
+    /// Which login this is, compared as Claude Agent compares them: by the account's email,
+    /// by where an API key comes from, or by the kind alone.
+    pub fn identity(&self) -> LoginIdentity {
+        let key = match self.kind.as_str() {
+            "account" => self
+                .account
+                .as_ref()
+                .and_then(|account| account.email.clone()),
+            "api_key" => self.detail.clone(),
+            _ => None,
+        };
+        LoginIdentity {
+            kind: self.kind.clone(),
+            key: key.filter(|key| !key.trim().is_empty()),
+        }
+    }
+}
+
+/// What tells one login from another: see [`AuthStatus::identity`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginIdentity {
+    pub kind: String,
+    /// The email or key source, when the agent says which.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl LoginIdentity {
+    /// Whether `other` is a different login. One the agent reported without its email (Claude
+    /// Agent's CLI check leaves it out at times) can't be told from one with it.
+    pub fn differs_from(&self, other: &LoginIdentity) -> bool {
+        self.kind != other.kind
+            || matches!((&self.key, &other.key), (Some(key), Some(other)) if key != other)
+    }
 }
 
 /// How the thread's ACP session was set up when the agent started.
@@ -255,6 +290,10 @@ pub struct ThreadState {
     /// A one-time code the agent printed while logging in, to enter on the page it links to
     /// (a device login).
     pub auth_code: Option<SharedString>,
+    /// The page the agent tried to open in a browser while logging in, on a machine agentZ
+    /// reaches over SSH. A browser there isn't one the user sees, so agentZ gives agents its own
+    /// `xdg-open`, which hands the page to the clients to open instead.
+    pub login_page: Option<SharedString>,
     /// The account the agent reported, if it reports one.
     pub auth_status: Option<AuthStatus>,
     /// Requests for input from the agent, oldest first.
@@ -415,6 +454,10 @@ impl ThreadView {
 
     pub fn auth_code(&self) -> Option<&SharedString> {
         self.state.auth_code.as_ref()
+    }
+
+    pub fn login_page(&self) -> Option<&SharedString> {
+        self.state.login_page.as_ref()
     }
 
     /// Whether the agent is waiting on the user to answer a request for input.

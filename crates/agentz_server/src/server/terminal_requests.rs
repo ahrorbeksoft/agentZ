@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::TerminalRequest;
+use agent_thread::{AgentThread, TerminalRequest};
 use agentz_protocol::terminal::{TerminalExit, TerminalKey};
 use agentz_protocol::{ConnectionId, Event, Request, Response, ServerMessage};
 use alacritty_terminal::event::Event as AlacEvent;
@@ -18,6 +18,7 @@ use util::shell::Shell;
 use util::shell_builder::ShellBuilder;
 
 use super::{ClientId, Input, Server, send_to};
+use crate::browser;
 use crate::detect::{self, Agent, AgentState, AgentTracker, DetectionInput, ProcessObservation};
 use crate::terminal_programs;
 use crate::terminals::{Terminal, TerminalSize, TerminalSpawn, frame_changes};
@@ -838,17 +839,34 @@ impl Server {
         let command = thread
             .terminal_auth_command(&method_id)
             .context("the agent has no such terminal login")?;
+        let mut env: HashMap<String, String> = command.env.into_iter().collect();
+        let path = env
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok());
+        if let Some(directory) = &self.browser_programs {
+            env.extend(browser::agent_env(directory, connection, path.as_deref()));
+        }
         let spawn = TerminalSpawn {
             program: Some((command.path.to_string_lossy().into_owned(), command.args)),
             cwd: thread.state.cwd.clone(),
-            env: command.env.into_iter().collect(),
+            env,
         };
+        self.update_thread(connection, AgentThread::terminal_login_started)?;
         self.terminals.logins.insert(connection, method_id);
         self.start_terminal(
             TerminalKey::Login(connection),
             spawn,
             TerminalSize::default(),
         )
+    }
+
+    /// Whether the connection's login terminal still runs its login.
+    pub(super) fn terminal_login_runs(&self, connection: ConnectionId) -> bool {
+        self.terminals
+            .running
+            .get(&TerminalKey::Login(connection))
+            .is_some_and(|running| running.terminal.exit().is_none())
     }
 
     /// A login terminal exited successfully: it closes, and its agent restarts logged in.
