@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dragging Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="dragging" data-title="Dragging">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Dragging <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>What you see while dragging in the Workspaces view. Three things drag: a <b>pane</b> by its header (onto another pane of its tab: near an edge it splits there, in the middle the two swap), a <b>tab</b> along the tab bar, and a <b>workspace row</b> up and down the sidebar. Today all three carry the same small floating label with the dragged thing's name, and the spot it would land on is shaded. Since your screenshot, the label stays just past the pointer instead of trailing behind it; it still looks the same. The demo: storefront's <i>agents</i> tab, moving <b>npm run dev</b> to the right of Claude Code; the white arrow is the pointer. Each topic changes one thing; the others show as today, except that the later Panes and Tabs topics show that section's small preview.</p>`;
+</script>
+<script src="topics-drag.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
