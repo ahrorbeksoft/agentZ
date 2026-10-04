@@ -878,6 +878,7 @@ impl Server {
             | Request::UnsubscribeTerminal(_)
             | Request::TerminalInput { .. }
             | Request::TerminalSelectionText(_)
+            | Request::FindInTerminal { .. }
             | Request::RestartTerminal(_)
             | Request::CloseTerminal(_)) => self.terminal_request(client, request),
             Request::CreateThread { .. }

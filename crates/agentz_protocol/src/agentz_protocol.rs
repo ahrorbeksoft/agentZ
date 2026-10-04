@@ -39,7 +39,9 @@ use crate::agents::{
 };
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
-use crate::terminal::{TerminalCommand, TerminalFrame, TerminalInput, TerminalKey};
+use crate::terminal::{
+    TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalMatches,
+};
 use crate::thread::{ThreadUpdate, ThreadView};
 use crate::workspace::{ProjectGit, RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval};
 
@@ -307,6 +309,12 @@ pub enum Request {
     },
     /// The selected text: [`Response::Message`], empty without a selection.
     TerminalSelectionText(TerminalKey),
+    /// Where `query` appears, as plain text, in the screen and the history:
+    /// [`Response::TerminalMatches`]. Lowercase queries ignore case, as alacritty's do.
+    FindInTerminal {
+        terminal: TerminalKey,
+        query: String,
+    },
     /// Starts the terminal's command again, after it exited or to replace it.
     RestartTerminal(TerminalKey),
     /// Ends the terminal's process and forgets it.
@@ -638,6 +646,7 @@ pub enum Response {
     RepositoryCheckouts(RepositoryCheckouts),
     DrawerTerminals(Vec<u32>),
     TerminalFrame(TerminalFrame),
+    TerminalMatches(TerminalMatches),
     Directories(DirectoryListing),
     SpacePane(PaneLocation),
     AgentIcons(Vec<AgentIcon>),

@@ -3057,6 +3057,47 @@ async fn terminal_threads_stream_their_screens_to_watchers() {
         Response::Message("selected-word".into())
     );
 
+    // Finding sees the command and its output. A capital letter makes case count.
+    let find = |query: &str| Request::FindInTerminal {
+        terminal: key.clone(),
+        query: query.to_string(),
+    };
+    let found = match client.ok(find("Selected-")).await {
+        Response::TerminalMatches(found) => found,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(found.total, 0);
+    let found = match client.ok(find("selected-")).await {
+        Response::TerminalMatches(found) => found,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(found.total, 2);
+    let output = found.matches[1];
+    assert_eq!(
+        (output.start, output.end),
+        (
+            TerminalPoint {
+                line: row as i32,
+                column: 0
+            },
+            TerminalPoint {
+                line: row as i32,
+                column: 8
+            }
+        )
+    );
+    // Showing a match selects it.
+    client
+        .ok(Request::TerminalInput {
+            terminal: key.clone(),
+            input: TerminalInput::ShowMatch(output),
+        })
+        .await;
+    assert_eq!(
+        client.ok(Request::TerminalSelectionText(key.clone())).await,
+        Response::Message("selected-".into())
+    );
+
     // Clearing keeps only the prompt's line.
     client
         .ok(Request::TerminalInput {

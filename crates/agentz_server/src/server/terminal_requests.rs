@@ -126,6 +126,9 @@ impl Server {
             Request::TerminalSelectionText(key) => Ok(Response::Message(
                 self.terminal(&key)?.selection_text().unwrap_or_default(),
             )),
+            Request::FindInTerminal { terminal, query } => Ok(Response::TerminalMatches(
+                self.terminal(&terminal)?.find(&query),
+            )),
             Request::RestartTerminal(key) => {
                 let spawn = match self.terminal_spawn(&key) {
                     Ok(spawn) => spawn,

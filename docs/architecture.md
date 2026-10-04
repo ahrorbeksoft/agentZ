@@ -409,6 +409,14 @@ Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
 - **App** (`terminal_entity.rs`, `terminal_view.rs`, `terminal_element.rs`, `terminal_mouse.rs`):
   Zed's element, key mappings (`agentz_protocol::terminal_keys`), IME, mouse, selection. Font
   size with Cmd-+, Cmd-- and Cmd-0.
+- **Find** (Zed's terminal search): Cmd-F opens a find bar above a scrolling terminal, seeded
+  with the selection. The server searches the screen and history as plain text (smart case:
+  lowercase ignores case), returning the 1,024 matches nearest the prompt and the total
+  (`Request::FindInTerminal`); the element highlights them in `search_match_background`, and
+  the one shown is the selection (`TerminalInput::ShowMatch`, which scrolls to it). The count
+  reads "n/total"; Enter and Shift-Enter step through, wrapping; Escape closes. It searches
+  again as the output moves, one search at a time, and keeps the selected match. The bar sits
+  outside the terminal's key context so its keys don't reach the shell.
 - **Where they appear**: terminal threads (`terminal_thread_view.rs`, a login shell from New
   Thread); the thread's terminal drawer (`terminal_drawer.rs`, t3code's: Cmd-J, groups of up to
   four split terminals, a dot on its button while something runs with the drawer hidden); ACP

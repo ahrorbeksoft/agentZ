@@ -4,7 +4,7 @@
 //! [`TerminalFrame`]s.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::path::PathBuf;
@@ -16,8 +16,8 @@ use util::ResultExt as _;
 
 use agentz_protocol::terminal::{
     TerminalColor, TerminalCursor, TerminalCursorShape, TerminalExit, TerminalFrame, TerminalInput,
-    TerminalLine, TerminalModes, TerminalPoint, TerminalRun, TerminalScroll, TerminalSelection,
-    TerminalSelectionKind, TerminalStyle,
+    TerminalLine, TerminalMatches, TerminalModes, TerminalPoint, TerminalRange, TerminalRun,
+    TerminalScroll, TerminalSelection, TerminalSelectionKind, TerminalStyle,
 };
 use alacritty_terminal::Grid;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, Notify as _, WindowSize};
@@ -25,10 +25,13 @@ use alacritty_terminal::event_loop::{
     EventLoop, EventLoopSender, Msg, Notifier, State as EventLoopState,
 };
 use alacritty_terminal::grid::{Dimensions, Scroll as AlacScroll};
-use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+use alacritty_terminal::index::{
+    Column, Direction as AlacDirection, Line, Point as AlacPoint, Side,
+};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, SEMANTIC_ESCAPE_CHARS, Term, TermMode};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite};
 use alacritty_terminal::vte::ansi::{
@@ -558,6 +561,27 @@ impl Terminal {
                 term.selection = Some(selection);
                 true
             }
+            TerminalInput::ShowMatch(range) => {
+                let mut term = self.term.lock();
+                // A match from before the output moved on may be past the history's end.
+                let point = |point: TerminalPoint| {
+                    AlacPoint::new(
+                        Line(
+                            point
+                                .line
+                                .clamp(term.topmost_line().0, term.bottommost_line().0),
+                        ),
+                        Column((point.column as usize).min(term.last_column().0)),
+                    )
+                };
+                let start = point(range.start);
+                let end = point(range.end);
+                let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+                selection.update(end, Side::Right);
+                term.selection = Some(selection);
+                term.scroll_to_point(start);
+                true
+            }
             TerminalInput::Clear => {
                 clear(&mut self.term.lock());
                 true
@@ -626,6 +650,39 @@ impl Terminal {
 
     pub(crate) fn selection_text(&self) -> Option<String> {
         self.term.lock().selection_to_string()
+    }
+
+    /// Where `query` appears as plain text, history included, as Zed's terminal searches.
+    pub(crate) fn find(&self, query: &str) -> TerminalMatches {
+        if query.is_empty() {
+            return TerminalMatches::default();
+        }
+        let mut regex = match RegexSearch::new(&regex::escape(query)) {
+            Ok(regex) => regex,
+            Err(error) => {
+                log::warn!("couldn't search the terminal: {error}");
+                return TerminalMatches::default();
+            }
+        };
+        let term = self.term.lock();
+        let start = AlacPoint::new(term.topmost_line(), Column(0));
+        let end = AlacPoint::new(term.bottommost_line(), term.last_column());
+        let mut matches = VecDeque::new();
+        let mut total = 0;
+        for found in RegexIter::new(start, end, AlacDirection::Right, &term, &mut regex) {
+            total += 1;
+            if matches.len() == TerminalMatches::LIMIT {
+                matches.pop_front();
+            }
+            matches.push_back(TerminalRange {
+                start: point_from_alacritty(*found.start()),
+                end: point_from_alacritty(*found.end()),
+            });
+        }
+        TerminalMatches {
+            matches: matches.into(),
+            total,
+        }
     }
 
     /// All the text, history included, with wrapped lines joined and trailing blank lines

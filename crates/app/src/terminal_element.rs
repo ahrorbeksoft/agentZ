@@ -5,7 +5,8 @@
 //! because there's no editor to borrow them from.
 
 use agentz_protocol::terminal::{
-    TerminalColor, TerminalCursorShape, TerminalFrame, TerminalModes, TerminalRun, TerminalStyle,
+    TerminalColor, TerminalCursorShape, TerminalFrame, TerminalModes, TerminalRange, TerminalRun,
+    TerminalStyle,
 };
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, DispatchPhase, Element, ElementId, Entity, FocusHandle,
@@ -86,6 +87,8 @@ pub struct LayoutState {
     batched_text_runs: Vec<BatchedTextRun>,
     block_element_rects: Vec<BlockElementLayoutRect>,
     rects: Vec<LayoutRect>,
+    match_rects: Vec<Bounds<Pixels>>,
+    match_color: Hsla,
     selection_rects: Vec<Bounds<Pixels>>,
     selection_color: Hsla,
     cursor: Option<CursorLayout>,
@@ -917,29 +920,71 @@ fn selection_rects(
     let Some(selection) = frame.selection else {
         return Vec::new();
     };
+    let range = TerminalRange {
+        start: selection.start,
+        end: selection.end,
+    };
+    let mut rects = Vec::new();
+    range_rects(
+        range,
+        selection.is_block,
+        frame,
+        first_row,
+        rows,
+        dimensions,
+        &mut rects,
+    );
+    rects
+}
+
+/// The search's matches on screen, as Zed's terminal highlights them.
+fn match_rects(
+    matches: &[TerminalRange],
+    frame: &TerminalFrame,
+    first_row: u16,
+    rows: u16,
+    dimensions: &TerminalBounds,
+) -> Vec<Bounds<Pixels>> {
+    let mut rects = Vec::new();
+    for range in matches {
+        range_rects(
+            *range, false, frame, first_row, rows, dimensions, &mut rects,
+        );
+    }
+    rects
+}
+
+/// The cells of `range` shown on screen, one rectangle per line, relative to the grid's
+/// origin.
+fn range_rects(
+    range: TerminalRange,
+    is_block: bool,
+    frame: &TerminalFrame,
+    first_row: u16,
+    rows: u16,
+    dimensions: &TerminalBounds,
+    rects: &mut Vec<Bounds<Pixels>>,
+) {
     let offset = frame.display_offset as i32 - first_row as i32;
-    let start_line = selection.start.line.saturating_add(offset);
-    let end_line = selection.end.line.saturating_add(offset);
+    let start_line = range.start.line.saturating_add(offset);
+    let end_line = range.end.line.saturating_add(offset);
     let last_line = rows as i32 - 1;
     if end_line < 0 || start_line > last_line {
-        return Vec::new();
+        return;
     }
     let columns = frame.columns as usize;
-    (start_line.max(0)..=end_line.min(last_line))
-        .filter_map(|line| {
-            let (start, end) = if selection.is_block {
-                (
-                    selection.start.column as usize,
-                    selection.end.column as usize + 1,
-                )
+    rects.extend(
+        (start_line.max(0)..=end_line.min(last_line)).filter_map(|line| {
+            let (start, end) = if is_block {
+                (range.start.column as usize, range.end.column as usize + 1)
             } else {
                 let start = if line == start_line {
-                    selection.start.column as usize
+                    range.start.column as usize
                 } else {
                     0
                 };
                 let end = if line == end_line {
-                    selection.end.column as usize + 1
+                    range.end.column as usize + 1
                 } else {
                     columns
                 };
@@ -957,8 +1002,8 @@ fn selection_rects(
                     ),
                 )
             })
-        })
-        .collect()
+        }),
+    );
 }
 
 /// The GPUI element that paints the terminal.
@@ -1217,6 +1262,7 @@ impl Element for TerminalElement {
                 };
                 let background_color = theme.colors().terminal_background;
                 let player_color = theme.players().local();
+                let match_color = theme.colors().search_match_background;
 
                 let Some(frame) = frame else {
                     self.view.update(cx, |view, _| {
@@ -1230,6 +1276,8 @@ impl Element for TerminalElement {
                         batched_text_runs: Vec::new(),
                         block_element_rects: Vec::new(),
                         rects: Vec::new(),
+                        match_rects: Vec::new(),
+                        match_color,
                         selection_rects: Vec::new(),
                         selection_color: player_color.selection,
                         cursor: None,
@@ -1283,6 +1331,13 @@ impl Element for TerminalElement {
                     layout_grid(&frame, rows, &grid_style, &theme)
                 };
 
+                let match_rects = match_rects(
+                    self.view.read(cx).find_matches(),
+                    &frame,
+                    first_row,
+                    row_count,
+                    &dimensions,
+                );
                 let selection_rects = selection_rects(&frame, first_row, row_count, &dimensions);
 
                 let cursor_cell = frame.cursor.and_then(|cursor| {
@@ -1343,6 +1398,8 @@ impl Element for TerminalElement {
                     batched_text_runs,
                     block_element_rects,
                     rects,
+                    match_rects,
+                    match_color,
                     selection_rects,
                     selection_color: player_color.selection,
                     cursor,
@@ -1393,6 +1450,9 @@ impl Element for TerminalElement {
 
                     for rect in &layout.rects {
                         rect.paint(origin, &layout.dimensions, window);
+                    }
+                    for search_match in &layout.match_rects {
+                        window.paint_quad(fill(*search_match + origin, layout.match_color));
                     }
                     for selection in &layout.selection_rects {
                         window.paint_quad(fill(*selection + origin, layout.selection_color));
@@ -1721,5 +1781,36 @@ mod tests {
         assert_eq!(rects[0].origin.x, px(30.));
         assert_eq!(rects[1].size.width, px(100.));
         assert_eq!(rects[2].size.width, px(20.));
+    }
+
+    #[test]
+    fn matches_in_the_history_show_once_scrolled_to() {
+        let mut frame = frame(vec![TerminalLine::default(); 4]);
+        let dimensions = TerminalBounds {
+            cell_width: px(10.),
+            line_height: px(20.),
+            bounds: Bounds::new(point(px(0.), px(0.)), size(px(100.), px(80.))),
+        };
+        let range = |line, start, end| TerminalRange {
+            start: TerminalPoint {
+                line,
+                column: start,
+            },
+            end: TerminalPoint { line, column: end },
+        };
+        let matches = [range(-3, 2, 4), range(1, 0, 1), range(5, 0, 1)];
+        // At the prompt, only the match on the screen shows.
+        let rects = match_rects(&matches, &frame, 0, 4, &dimensions);
+        assert_eq!(
+            rects,
+            [Bounds::new(point(px(0.), px(20.)), size(px(20.), px(20.)))]
+        );
+        // Three lines back, the history's match is on the top row and the other moved down.
+        frame.display_offset = 3;
+        let rects = match_rects(&matches, &frame, 0, 4, &dimensions);
+        assert_eq!(
+            rects,
+            [Bounds::new(point(px(20.), px(0.)), size(px(30.), px(20.)))]
+        );
     }
 }

@@ -204,6 +204,27 @@ pub struct TerminalSelection {
     pub is_block: bool,
 }
 
+/// Cells from `start` to `end`, inclusive, across lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalRange {
+    pub start: TerminalPoint,
+    pub end: TerminalPoint,
+}
+
+/// A search's matches, from the top of the history down: [`crate::Response::TerminalMatches`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalMatches {
+    /// The last [`TerminalMatches::LIMIT`] of them, nearest the prompt, as herdr returns a
+    /// window of its matches.
+    pub matches: Vec<TerminalRange>,
+    /// How many there are, those left out included.
+    pub total: usize,
+}
+
+impl TerminalMatches {
+    pub const LIMIT: usize = 1024;
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalSelectionKind {
     #[default]
@@ -272,6 +293,8 @@ pub enum TerminalInput {
     /// Starts or extends a selection; `None` clears it.
     Select(Option<TerminalSelectionUpdate>),
     SelectAll,
+    /// Selects a search match and scrolls to it, as Zed's terminal activates a match.
+    ShowMatch(TerminalRange),
     /// Clears the history and the screen but for the cursor's line, which moves to the top.
     Clear,
     /// Whether the terminal has keyboard focus, for programs that asked to know.

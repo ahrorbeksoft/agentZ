@@ -3,17 +3,22 @@
 //! here because the app's copy of a terminal may be shown in more than one place.
 
 use agentz_protocol::terminal::{
-    TerminalInput, TerminalModes, TerminalScroll, TerminalSelectionKind, TerminalSelectionUpdate,
+    TerminalInput, TerminalMatches, TerminalModes, TerminalRange, TerminalScroll,
+    TerminalSelectionKind, TerminalSelectionUpdate,
 };
 use agentz_protocol::terminal_keys::{self, Keystroke as TerminalKeystroke};
+use anyhow::Result;
 use gpui::{
     Action, App, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
-    Subscription, TouchPhase, Window, actions, px,
+    Subscription, Task, TouchPhase, Window, actions, px,
 };
-use ui::prelude::*;
+use text_input::{TextInput, TextInputEvent};
+use ui::{Tooltip, prelude::*};
+use util::ResultExt as _;
 
 use crate::app_settings::AppSettingsStore;
+use crate::controls::text_field;
 use crate::terminal_element::{self, GridLayout, TerminalElement, TerminalMode};
 use crate::terminal_entity::Terminal;
 use crate::terminal_mouse::{
@@ -22,6 +27,8 @@ use crate::terminal_mouse::{
 };
 
 const KEY_CONTEXT: &str = "Terminal";
+/// The find bar's, outside the terminal's so the keys typed there don't reach the shell.
+const FIND_KEY_CONTEXT: &str = "TerminalFind";
 
 /// How far the pointer moves before a press becomes a selection, as gpui's `div` drags.
 const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
@@ -55,6 +62,14 @@ actions!(
         DecreaseFontSize,
         /// Puts every terminal's text back to its default size.
         ResetFontSize,
+        /// Finds text in the terminal and its history.
+        Find,
+        /// Shows the next match, toward the prompt.
+        SelectNextMatch,
+        /// Shows the previous match, back in the history.
+        SelectPreviousMatch,
+        /// Closes the find bar.
+        DismissFind,
     ]
 );
 
@@ -114,7 +129,44 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-+", IncreaseFontSize, context),
         KeyBinding::new("cmd--", DecreaseFontSize, context),
         KeyBinding::new("cmd-0", ResetFontSize, context),
+        // Zed's buffer search keys.
+        KeyBinding::new("cmd-f", Find, context),
+        KeyBinding::new("cmd-f", Find, Some(FIND_KEY_CONTEXT)),
+        KeyBinding::new("enter", SelectNextMatch, Some(FIND_KEY_CONTEXT)),
+        KeyBinding::new("shift-enter", SelectPreviousMatch, Some(FIND_KEY_CONTEXT)),
+        KeyBinding::new("escape", DismissFind, Some(FIND_KEY_CONTEXT)),
     ]);
+}
+
+/// Zed's terminal search bar: a query, its matches' count and buttons to step through them.
+struct FindBar {
+    input: Entity<TextInput>,
+    /// The matches the server returned, from the top of the history down.
+    matches: Vec<TerminalRange>,
+    /// How many there are, those the server left out included.
+    total: usize,
+    /// The match shown, into `matches`.
+    active: Option<usize>,
+    search: Option<Task<()>>,
+    /// The terminal changed while the search ran, so its matches may have moved.
+    stale: bool,
+    /// The selection on its way to become the query.
+    seed: Option<Task<()>>,
+    _subscription: Subscription,
+}
+
+impl FindBar {
+    /// Zed's count: the match shown and how many there are, or 0/0.
+    fn count(&self) -> String {
+        match self.active {
+            Some(index) => format!(
+                "{}/{}",
+                self.total - self.matches.len() + index + 1,
+                self.total
+            ),
+            None => "0/0".to_string(),
+        }
+    }
 }
 
 pub struct TerminalView {
@@ -133,6 +185,7 @@ pub struct TerminalView {
     /// Whether the view had focus when it last rendered: focus changes are noticed there, so
     /// views can be made without a window, as a thread's tool calls make them.
     was_focused: bool,
+    find_bar: Option<FindBar>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -148,7 +201,10 @@ impl TerminalView {
         let view = cx.entity_id();
         let weak_terminal = terminal.downgrade();
         let subscriptions = vec![
-            cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.observe(&terminal, |this, _, cx| {
+                this.find_again(cx);
+                cx.notify();
+            }),
             cx.on_release(move |_, cx| {
                 weak_terminal
                     .update(cx, |terminal, _| terminal.remove_view(view))
@@ -166,8 +222,259 @@ impl TerminalView {
             mouse_down_position: None,
             last_mouse: None,
             was_focused: false,
+            find_bar: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The find bar's matches, for the element to highlight.
+    pub(crate) fn find_matches(&self) -> &[TerminalRange] {
+        self.find_bar
+            .as_ref()
+            .map_or(&[], |find_bar| find_bar.matches.as_slice())
+    }
+
+    /// Opens the find bar, or focuses it, with the selection as the query as Zed seeds it.
+    fn deploy_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != TerminalMode::Scrollable {
+            cx.propagate();
+            return;
+        }
+        let selection = self.terminal.read(cx).selection_text(cx);
+        let find_bar = self.find_bar.get_or_insert_with(|| {
+            let input = cx.new(|cx| TextInput::new("Search…", cx));
+            let subscription = cx.subscribe(&input, |this, _, _: &TextInputEvent, cx| {
+                this.find(true, cx)
+            });
+            FindBar {
+                input,
+                matches: Vec::new(),
+                total: 0,
+                active: None,
+                search: None,
+                stale: false,
+                seed: None,
+                _subscription: subscription,
+            }
+        });
+        find_bar.seed = selection.map(|selection| {
+            cx.spawn(async move |this, cx| {
+                let Some(text) = selection.await.log_err() else {
+                    return;
+                };
+                if text.is_empty() || text.contains('\n') {
+                    return;
+                }
+                this.update(cx, |this, cx| {
+                    if let Some(find_bar) = &this.find_bar {
+                        find_bar.input.update(cx, |input, cx| {
+                            input.set_text(text, cx);
+                            input.select_all_text(cx);
+                        });
+                    }
+                })
+                .log_err();
+            })
+        });
+        self.focus_find(&Find, window, cx);
+    }
+
+    /// Focuses the query with its text selected, to type over.
+    fn focus_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(find_bar) = &self.find_bar else {
+            return;
+        };
+        let input = find_bar.input.clone();
+        input.update(cx, |input, cx| input.select_all_text(cx));
+        window.focus(&input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn dismiss_find(&mut self, _: &DismissFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_bar = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Searches for the query; `show` then shows the match Zed would.
+    fn find(&mut self, show: bool, cx: &mut Context<Self>) {
+        let Some(find_bar) = &mut self.find_bar else {
+            return;
+        };
+        find_bar.stale = false;
+        let query = find_bar.input.read(cx).text().to_string();
+        if query.is_empty() {
+            find_bar.search = None;
+            find_bar.matches.clear();
+            find_bar.total = 0;
+            find_bar.active = None;
+            cx.notify();
+            return;
+        }
+        let search = self.terminal.read(cx).find(query, cx);
+        find_bar.search = Some(cx.spawn(async move |this, cx| {
+            let matches = search.await;
+            this.update(cx, |this, cx| this.found(matches, show, cx))
+                .log_err();
+        }));
+    }
+
+    /// Searches again after the output moved on, as Zed does on each of a terminal's
+    /// wakeups, one search at a time.
+    fn find_again(&mut self, cx: &mut Context<Self>) {
+        let Some(find_bar) = &mut self.find_bar else {
+            return;
+        };
+        if find_bar.input.read(cx).text().is_empty() {
+            return;
+        }
+        if find_bar.search.is_some() {
+            find_bar.stale = true;
+        } else {
+            self.find(false, cx);
+        }
+    }
+
+    fn found(&mut self, matches: Result<TerminalMatches>, show: bool, cx: &mut Context<Self>) {
+        let Some(find_bar) = &mut self.find_bar else {
+            return;
+        };
+        find_bar.search = None;
+        let stale = std::mem::take(&mut find_bar.stale);
+        if let Some(matches) = matches.log_err() {
+            find_bar.matches = matches.matches;
+            find_bar.total = matches.total;
+            // The match shown is selected, and its selection moves with the output.
+            let selection = self
+                .terminal
+                .read(cx)
+                .frame()
+                .and_then(|frame| frame.selection);
+            find_bar.active = active_match(&find_bar.matches, selection.map(|s| s.end));
+            if show && let Some(index) = find_bar.active {
+                let range = find_bar.matches[index];
+                self.terminal
+                    .update(cx, |terminal, cx| terminal.show_match(range, cx));
+            }
+            cx.notify();
+        }
+        if stale {
+            self.find(false, cx);
+        }
+    }
+
+    fn select_next_match(&mut self, _: &SelectNextMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(true, cx);
+    }
+
+    fn select_previous_match(
+        &mut self,
+        _: &SelectPreviousMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_match(false, cx);
+    }
+
+    /// Shows the next or previous match, wrapping around as Zed's search does.
+    fn step_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(find_bar) = &mut self.find_bar else {
+            return;
+        };
+        let count = find_bar.matches.len();
+        if count == 0 {
+            return;
+        }
+        let index = match find_bar.active {
+            Some(index) if forward => (index + 1) % count,
+            Some(index) => (index + count - 1) % count,
+            None => count - 1,
+        };
+        find_bar.active = Some(index);
+        let range = find_bar.matches[index];
+        self.terminal
+            .update(cx, |terminal, cx| terminal.show_match(range, cx));
+        cx.notify();
+    }
+
+    fn render_find_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let find_bar = self.find_bar.as_ref()?;
+        let has_match = find_bar.active.is_some();
+        let has_query = !find_bar.input.read(cx).text().is_empty();
+        let found_nothing = has_query && find_bar.search.is_none() && find_bar.matches.is_empty();
+        let input_focus = find_bar.input.focus_handle(cx);
+        let step_button =
+            |id: &'static str, icon: IconName, title: &'static str, action: Box<dyn Action>| {
+                let input_focus = input_focus.clone();
+                IconButton::new(id, icon)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_match)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action_in(title, action.as_ref(), &input_focus, cx)
+                    })
+            };
+        Some(
+            h_flex()
+                .debug_selector(|| "terminal-find".into())
+                .key_context(FIND_KEY_CONTEXT)
+                .on_action(cx.listener(Self::focus_find))
+                .on_action(cx.listener(Self::select_next_match))
+                .on_action(cx.listener(Self::select_previous_match))
+                .on_action(cx.listener(Self::dismiss_find))
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(text_field(&find_bar.input, found_nothing, window, cx).flex_1())
+                .child(
+                    step_button(
+                        "terminal-find-previous",
+                        IconName::ChevronLeft,
+                        "Select Previous Match",
+                        SelectPreviousMatch.boxed_clone(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.step_match(false, cx))),
+                )
+                .child(
+                    step_button(
+                        "terminal-find-next",
+                        IconName::ChevronRight,
+                        "Select Next Match",
+                        SelectNextMatch.boxed_clone(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.step_match(true, cx))),
+                )
+                .child(
+                    div().min_w(rems_from_px(40_f32)).child(
+                        Label::new(find_bar.count())
+                            .size(LabelSize::Small)
+                            .color(if has_match {
+                                Color::Default
+                            } else {
+                                Color::Disabled
+                            }),
+                    ),
+                )
+                .child(
+                    IconButton::new("terminal-find-close", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action_in(
+                                "Close Search Bar",
+                                &DismissFind,
+                                &input_focus,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dismiss_find(&DismissFind, window, cx)
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     pub fn terminal(&self) -> &Entity<Terminal> {
@@ -547,6 +854,22 @@ impl TerminalView {
     }
 }
 
+/// The match to show, as Zed's terminal picks it: the first at or after the selection's head,
+/// else the last, nearest the prompt.
+fn active_match(
+    matches: &[TerminalRange],
+    selection_head: Option<agentz_protocol::terminal::TerminalPoint>,
+) -> Option<usize> {
+    let last = matches.len().checked_sub(1)?;
+    Some(match selection_head {
+        Some(head) => matches
+            .iter()
+            .position(|range| range.end >= head)
+            .unwrap_or(last),
+        None => last,
+    })
+}
+
 /// A GPUI keystroke in the terms of the protocol's key mappings.
 fn terminal_keystroke(keystroke: &gpui::Keystroke) -> TerminalKeystroke {
     let modifiers = keystroke.modifiers;
@@ -582,13 +905,18 @@ impl Render for TerminalView {
             (None, None) => Some("Starting…".into()),
             (Some(_), None) => None,
         };
-        div()
+        let scrollable = self.mode == TerminalMode::Scrollable;
+        let find_bar = self.render_find_bar(window, cx);
+        let screen = div()
             .id("terminal-view")
             .w_full()
-            .when(self.mode == TerminalMode::Scrollable, |this| this.h_full())
+            .when(scrollable, |this| this.flex_1().min_h_0())
             .relative()
             .track_focus(&self.focus_handle)
             .key_context(KEY_CONTEXT)
+            .when(scrollable, |this| {
+                this.on_action(cx.listener(Self::deploy_find))
+            })
             .on_action(cx.listener(Self::send_text))
             .on_action(cx.listener(Self::send_keystroke))
             .on_action(cx.listener(Self::copy))
@@ -620,7 +948,13 @@ impl Render for TerminalView {
                             .color(Color::Muted),
                     ),
                 )
-            })
+            });
+        // The find bar sits beside the terminal rather than in it, outside its key context.
+        v_flex()
+            .w_full()
+            .when(scrollable, |this| this.h_full())
+            .children(find_bar)
+            .child(screen)
     }
 }
 
@@ -642,7 +976,8 @@ fn change_font_size(step: Option<f32>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
-    use agentz_protocol::terminal::TerminalKey;
+    use agentz_protocol::terminal::{TerminalFrame, TerminalKey, TerminalPoint, TerminalSelection};
+    use agentz_protocol::{Request, Response};
     use gpui::{TestAppContext, VisualTestContext};
     use projects::ThreadId;
 
@@ -681,5 +1016,140 @@ mod tests {
         assert_eq!(size(cx), terminal_element::MIN_FONT_SIZE);
         cx.simulate_keystrokes("cmd-0");
         assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE);
+    }
+
+    #[gpui::test]
+    fn cmd_f_finds_in_the_terminal_and_enter_steps_through_the_matches(cx: &mut TestAppContext) {
+        let range = |line, column| TerminalRange {
+            start: TerminalPoint { line, column },
+            end: TerminalPoint {
+                line,
+                column: column + 2,
+            },
+        };
+        // The server found five, and sent the three nearest the prompt.
+        let matches = vec![range(-2, 0), range(0, 4), range(2, 1)];
+        let frame = TerminalFrame {
+            full: true,
+            columns: 20,
+            screen_lines: 4,
+            ..TerminalFrame::default()
+        };
+        let (client, terminal) = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let answer_matches = matches.clone();
+            client.update(cx, |client, _| {
+                client.answer_for_test(move |request| match request {
+                    Request::SubscribeTerminal(_) => Some(Response::TerminalFrame(frame.clone())),
+                    Request::FindInTerminal { query, .. } => {
+                        Some(Response::TerminalMatches(match query.as_str() {
+                            "x" => TerminalMatches {
+                                matches: answer_matches.clone(),
+                                total: 5,
+                            },
+                            _ => TerminalMatches::default(),
+                        }))
+                    }
+                    Request::TerminalSelectionText(_) => Some(Response::Message("x".into())),
+                    _ => None,
+                })
+            });
+            let terminal = Terminal::shared(&client, TerminalKey::Drawer(ThreadId(1)), cx);
+            (client, terminal)
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(terminal.clone(), TerminalMode::Scrollable, cx)
+        });
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle(cx), cx)
+        });
+        cx.run_until_parked();
+        let count = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.find_bar.as_ref().map(FindBar::count))
+        };
+        let shown = |cx: &mut VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter_map(|request| match request {
+                        Request::TerminalInput {
+                            input: TerminalInput::ShowMatch(range),
+                            ..
+                        } => Some(range),
+                        Request::TerminalInput {
+                            input: TerminalInput::Bytes(bytes),
+                            ..
+                        } => panic!("the shell got {bytes:?}"),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("terminal-find").is_some());
+        assert_eq!(count(cx), Some("0/0".into()));
+
+        // Typing searches, and shows the match nearest the prompt, as the fifth of five.
+        cx.simulate_input("x");
+        cx.run_until_parked();
+        assert_eq!(count(cx), Some("5/5".into()));
+        assert_eq!(shown(cx), [matches[2]]);
+        view.read_with(cx, |view, _| assert_eq!(view.find_matches(), matches));
+
+        // Enter goes on to the next, wrapping to the top; Shift-Enter comes back.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(count(cx), Some("3/5".into()));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(count(cx), Some("5/5".into()));
+        assert_eq!(shown(cx), [matches[2], matches[0], matches[2]]);
+
+        // Nothing found reads 0/0.
+        cx.simulate_input("y");
+        cx.run_until_parked();
+        assert_eq!(count(cx), Some("0/0".into()));
+
+        // Escape closes the bar and gives the terminal its keys back.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(count(cx), None);
+        assert!(cx.debug_bounds("terminal-find").is_none());
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.focus_handle(cx).is_focused(window));
+            assert!(view.find_matches().is_empty());
+        });
+
+        // With a selection, Cmd-F searches for it.
+        terminal.update(cx, |terminal, cx| {
+            terminal.apply_frame(
+                TerminalFrame {
+                    full: true,
+                    columns: 20,
+                    screen_lines: 4,
+                    selection: Some(TerminalSelection {
+                        start: matches[1].start,
+                        end: matches[1].end,
+                        is_block: false,
+                    }),
+                    ..TerminalFrame::default()
+                },
+                cx,
+            )
+        });
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let find_bar = view.find_bar.as_ref().expect("the find bar is open");
+            assert_eq!(find_bar.input.read(cx).text(), "x");
+        });
+        // The selected match is the one shown.
+        assert_eq!(count(cx), Some("4/5".into()));
     }
 }

@@ -114,6 +114,9 @@ pub struct ServerClient {
     peers_sent: Option<Peers>,
     #[cfg(test)]
     sent_for_test: std::cell::RefCell<Vec<Request>>,
+    /// Answers requests as the server would, for a test client.
+    #[cfg(test)]
+    answer_for_test: Option<Box<dyn Fn(&Request) -> Option<Response>>>,
     _maintain_connection: Task<()>,
 }
 
@@ -152,6 +155,8 @@ impl ServerClient {
                 peers_sent: None,
                 #[cfg(test)]
                 sent_for_test: Default::default(),
+                #[cfg(test)]
+                answer_for_test: None,
                 _maintain_connection: cx.spawn(async move |this, cx| {
                     maintain_connection(this, connect_transport, cx).await
                 }),
@@ -278,6 +283,14 @@ impl ServerClient {
     /// Sends a request now; the future waits for the answer. It fails at once while
     /// disconnected.
     pub fn request(&self, request: Request) -> BoxFuture<'static, Result<Response>> {
+        #[cfg(test)]
+        if let Some(response) = self
+            .answer_for_test
+            .as_ref()
+            .and_then(|answer| answer(&request))
+        {
+            return futures::future::ready(Ok(response)).boxed();
+        }
         match &self.connection {
             Some(connection) => connection.request(request).boxed(),
             None => {
@@ -496,6 +509,12 @@ impl ServerClient {
     #[cfg(test)]
     pub fn sent_for_test(&self) -> Vec<Request> {
         self.sent_for_test.borrow().clone()
+    }
+
+    /// Answers the requests `answer` knows, as the server would; the rest fail as unconnected.
+    #[cfg(test)]
+    pub fn answer_for_test(&mut self, answer: impl Fn(&Request) -> Option<Response> + 'static) {
+        self.answer_for_test = Some(Box::new(answer));
     }
 
     /// Reads as connected, though a test client has no connection.

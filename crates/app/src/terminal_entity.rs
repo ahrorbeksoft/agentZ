@@ -2,10 +2,11 @@
 //! the changes that follow. Its actions are requests, as the thread copy's are.
 
 use agentz_protocol::terminal::{
-    TerminalFrame, TerminalInput, TerminalKey, TerminalModes, TerminalScroll,
-    TerminalSelectionUpdate,
+    TerminalFrame, TerminalInput, TerminalKey, TerminalMatches, TerminalModes, TerminalRange,
+    TerminalScroll, TerminalSelectionUpdate,
 };
 use agentz_protocol::{Request, Response};
+use anyhow::{Result, anyhow};
 use collections::HashMap;
 use gpui::{App, AppContext as _, ClipboardItem, Context, Entity, EntityId, SharedString, Task};
 
@@ -267,6 +268,41 @@ impl Terminal {
             Err(error) => log::error!("failed to copy from the terminal: {error:#}"),
         })
         .detach();
+    }
+
+    /// Where `query` appears in the screen and history, which only the server has.
+    pub fn find(&self, query: String, cx: &App) -> Task<Result<TerminalMatches>> {
+        let response = self.client.read(cx).request(Request::FindInTerminal {
+            terminal: self.key.clone(),
+            query,
+        });
+        cx.background_spawn(async move {
+            match response.await? {
+                Response::TerminalMatches(matches) => Ok(matches),
+                response => Err(anyhow!("expected matches, got {response:?}")),
+            }
+        })
+    }
+
+    pub fn show_match(&mut self, range: TerminalRange, cx: &mut Context<Self>) {
+        self.input(TerminalInput::ShowMatch(range), cx);
+    }
+
+    /// The selected text, when there's a selection.
+    pub fn selection_text(&self, cx: &App) -> Option<Task<Result<String>>> {
+        if !self.has_selection() {
+            return None;
+        }
+        let response = self
+            .client
+            .read(cx)
+            .request(Request::TerminalSelectionText(self.key.clone()));
+        Some(cx.background_spawn(async move {
+            match response.await? {
+                Response::Message(text) => Ok(text),
+                response => Err(anyhow!("expected the selection, got {response:?}")),
+            }
+        }))
     }
 
     /// Runs the terminal's program again, in place of the one that ran.
