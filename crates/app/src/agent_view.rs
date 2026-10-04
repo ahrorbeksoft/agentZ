@@ -1288,6 +1288,8 @@ impl AgentView {
         let registry = self.registry.clone();
         let current_agent = self.agent_id.clone();
         let is_archived = self.is_archived;
+        // A draft has no conversation to continue, and its agent picker changes the agent.
+        let is_draft = self.is_draft(cx);
         let title = self.title.clone();
         let rename = {
             let view = view.clone();
@@ -1381,20 +1383,26 @@ impl AgentView {
                             confirm_delete_thread(&store, thread_id, &title, window, cx)
                         }
                     };
-                    menu.item(
+                    let mut menu = menu.item(
                         ContextMenuEntry::new("Rename")
                             .icon(IconName::Pencil)
                             .icon_color(Color::Muted)
                             .handler(move |window, cx| rename(window, cx)),
-                    )
-                    .submenu_with_icon(
-                        "Continue with Another Agent",
-                        IconName::ArrowRight,
-                        continue_with,
-                    )
-                    .separator()
-                    .item(
-                        ContextMenuEntry::new(if is_archived { "Unarchive" } else { "Archive" })
+                    );
+                    if !is_draft {
+                        menu = menu.submenu_with_icon(
+                            "Continue with Another Agent",
+                            IconName::ArrowRight,
+                            continue_with,
+                        );
+                    }
+                    menu.separator()
+                        .item(
+                            ContextMenuEntry::new(if is_archived {
+                                "Unarchive"
+                            } else {
+                                "Archive"
+                            })
                             .icon(if is_archived {
                                 IconName::Undo
                             } else {
@@ -1402,13 +1410,13 @@ impl AgentView {
                             })
                             .icon_color(Color::Muted)
                             .handler(archive),
-                    )
-                    .item(
-                        ContextMenuEntry::new("Delete…")
-                            .icon(IconName::Trash)
-                            .icon_color(Color::Muted)
-                            .handler(delete),
-                    )
+                        )
+                        .item(
+                            ContextMenuEntry::new("Delete…")
+                                .icon(IconName::Trash)
+                                .icon_color(Color::Muted)
+                                .handler(delete),
+                        )
                 }))
             })
             .trigger(TitleButton::new(self.title.clone(), move |window, cx| {
@@ -3555,6 +3563,24 @@ impl AgentView {
         let is_editor_empty = self.composer.read(cx).text().trim().is_empty();
         let has_failed = matches!(thread.status(), ConnectionStatus::Failed(_));
         let needs_login = thread.status() == &ConnectionStatus::AuthRequired;
+        // The agent's options come with its session, which opens only once the agent has
+        // started, so until then their place says they're coming.
+        let settings_loading = (thread.status() == &ConnectionStatus::Connecting).then(|| {
+            h_flex()
+                .debug_selector(|| "session-settings-loading".into())
+                .px_1()
+                .gap_1()
+                .child(
+                    SpinnerLabel::dots()
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Loading options…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+        });
 
         let send_button = if is_generating && is_editor_empty {
             IconButton::new("stop-generation", IconName::Stop)
@@ -3665,6 +3691,7 @@ impl AgentView {
                                     .flex_wrap()
                                     .gap_1()
                                     .children(self.render_context_usage(cx))
+                                    .children(settings_loading)
                                     .children(self.render_session_settings(cx))
                                     .child(send_button),
                             ),
@@ -4912,6 +4939,21 @@ mod tests {
     fn an_archived_thread_shows_its_conversation(cx: &mut TestAppContext) {
         let (_, cx) = open(2, true, cx);
         assert!(cx.debug_bounds("new-thread").is_none());
+    }
+
+    #[gpui::test]
+    fn options_show_as_loading_while_the_agent_starts(cx: &mut TestAppContext) {
+        let (view, cx) = open(1, false, cx);
+        let set_status = |status: ConnectionStatus, cx: &mut VisualTestContext| {
+            let thread = view.read_with(cx, |view, _| view.thread.clone());
+            thread.update(cx, |thread, cx| thread.set_status_for_test(status, cx));
+            cx.run_until_parked();
+        };
+        set_status(ConnectionStatus::Connecting, cx);
+        assert!(cx.debug_bounds("new-thread").is_some());
+        assert!(cx.debug_bounds("session-settings-loading").is_some());
+        set_status(ConnectionStatus::Ready, cx);
+        assert!(cx.debug_bounds("session-settings-loading").is_none());
     }
 
     #[gpui::test]

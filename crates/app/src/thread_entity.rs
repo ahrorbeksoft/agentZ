@@ -196,6 +196,12 @@ impl AgentThread {
         self.fail("The agent's connection closed.".to_string(), cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&mut self, status: ConnectionStatus, cx: &mut Context<Self>) {
+        self.view.state.status = status;
+        cx.notify();
+    }
+
     fn fail(&mut self, error: String, cx: &mut Context<Self>) {
         self.queued_updates = None;
         self.view.state.status = ConnectionStatus::Failed(error.into());

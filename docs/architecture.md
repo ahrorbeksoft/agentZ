@@ -150,10 +150,12 @@ Each entry: what it does, where it lives, and where it comes from.
 
 - **Thread view** (`agent_view.rs`, Zed's `agent_ui` thread view): messages, tool calls, diffs,
   plan, permissions, composer with config selectors, context usage, queued messages, slash
-  commands, the "…" menu with Zed's Reauthenticate, Log Out and Reload Agent.
+  commands, the "…" menu with Zed's Reauthenticate, Log Out and Reload Agent. The config
+  selectors come with the agent's session, so while the agent starts "Loading options…" with a
+  spinner stands in for them.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
-  thread's menu (Rename, Continue with Another Agent ▸, Archive, Delete…), and a double-click
+  thread's menu (Rename, Continue with Another Agent ▸ except on a draft, Archive, Delete…), and a double-click
   renames it in place, as you type, as the sidebar does (`TitleButton`: the second click closes
   the menu the first opened; the field takes focus after the menu's delayed focus). Then the
   branch with its worktree or pasture icon, the changes as +added −removed (the Diff icon when

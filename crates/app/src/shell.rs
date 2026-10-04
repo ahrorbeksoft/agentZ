@@ -1588,6 +1588,82 @@ mod modal_tests {
     }
 
     #[gpui::test]
+    fn new_thread_reuses_the_open_draft_until_something_is_typed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| client.set_online_for_test(cx));
+            let projects = client.read(cx).projects().clone();
+            let draft: projects::Thread = serde_json::from_value(serde_json::json!({
+                "id": 5,
+                "project_id": 1,
+                "title": "New thread",
+                "agent_id": "mock",
+                "is_draft": true,
+            }))
+            .expect("a thread");
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![Project {
+                            id: ProjectId(1),
+                            path: "/tmp/demo".into(),
+                            custom_name: None,
+                            icon: None,
+                            workspaces: Vec::new(),
+                            repository: None,
+                        }],
+                        threads: vec![draft],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        let draft = ThreadKey {
+            machine: MachineId::Local,
+            thread: projects::ThreadId(5),
+        };
+        shell.update_in(cx, |shell, window, cx| shell.open_thread(draft, window, cx));
+        cx.run_until_parked();
+
+        // No agent is installed, so a new draft would send the user to Settings › Agents.
+        shell.update_in(cx, |shell, window, cx| {
+            shell.new_thread(&NewThread, window, cx)
+        });
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_thread, Some(draft));
+            assert!(shell.settings_page.is_none());
+        });
+
+        shell.update_in(cx, |shell, _, cx| {
+            let Some(OpenThread {
+                view: ThreadView::Agent(view),
+                ..
+            }) = shell.open_threads.get(&draft)
+            else {
+                panic!("the draft is open");
+            };
+            view.update(cx, |view, cx| view.set_composer_text("Fix it".into(), cx));
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            shell.new_thread(&NewThread, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.settings_page.is_some()));
+    }
+
+    #[gpui::test]
     fn cmd_b_hides_and_shows_the_sidebar(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init_for_test(cx);
