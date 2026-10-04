@@ -47,7 +47,33 @@
       "comments": {},
       "note": "",
       "also": []
+    },
+    "pane-live": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "pane-motion": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "row": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "B": "a little less dimmed i guess"
+      },
+      "note": "",
+      "also": []
     }
   },
-  "updated": "2026-10-04T20:42:03.406Z"
+  "updated": "2026-10-04T21:11:03.358Z"
 }
