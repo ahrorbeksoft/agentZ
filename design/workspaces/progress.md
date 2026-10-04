@@ -28,7 +28,7 @@ Notes for whoever continues:
 | 8 | 2 | Worktree groups (herdr), collapse toggle | done |
 | 9 | 15 | Delete Worktree Checkout…; fuller New Worktree dialog | done |
 | 10 | 6 | Hover details: git at a glance | done |
-| 11 | 3E | "Needs you" strip on top of the sidebar | not started |
+| 11 | 3E | "Needs you" strip on top of the sidebar | done |
 | 12 | 17 | Badge on the Agents / Workspaces switch | not started |
 | 13 | 13 | New workspace picker: Recent first, Open marks | not started |
 | 14 | 11 | Split menu: Shell, agent CLIs on the machine, New Thread | not started |

@@ -499,6 +499,8 @@ since a thread's workspace is its checkout.
   Close show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
+- **Needs you**: while an agent in a pane waits for an approval or an answer, a tinted strip
+  above the workspaces lists each, with Go to focus its pane.
 - **Worktree groups** (herdr's `workspace_entries`): a workspace in a linked worktree of a
   repository (`SpaceGit::{checkout, main_checkout}`), or in a project's pasture, sits under the
   workspace on that repository's main checkout, however it was opened, with tree lines and its
