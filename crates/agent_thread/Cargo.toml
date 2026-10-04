@@ -24,7 +24,7 @@ log.workspace = true
 registry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "time"] }
 url.workspace = true
 
 [dev-dependencies]

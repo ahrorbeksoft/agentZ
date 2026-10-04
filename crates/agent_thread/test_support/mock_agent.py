@@ -26,6 +26,8 @@ Every login and logout is reported with `_auth/status_update`, as Claude Agent a
 
 A prompt of "form" asks the client to fill in a form (a session elicitation) and replies
 "Form: <action> <content as JSON>".
+
+It supports `session/close`, and with MOCK_CLOSED_FILE set, notes each closed session there.
 """
 import json
 import os
@@ -34,6 +36,8 @@ import sys
 import time
 
 LOGIN_FILE = os.environ.get("MOCK_LOGIN_FILE")
+# Where `session/close` notes the sessions it closed, a line each.
+CLOSED_FILE = os.environ.get("MOCK_CLOSED_FILE")
 
 if sys.argv[-1] == "--login":
     print("Press Enter to log in to the mock agent.", flush=True)
@@ -261,6 +265,7 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
                          "agentCapabilities": {"loadSession": HISTORY_PATH is not None,
+                                               "sessionCapabilities": {"close": {}},
                                                "auth": {"logout": {}}},
                          "authMethods": auth_methods}})
         send_auth_status()
@@ -294,6 +299,11 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "session/update",
                   "params": {"sessionId": session_id, "update": payload}})
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
+    elif method == "session/close":
+        if CLOSED_FILE:
+            with open(CLOSED_FILE, "a") as file:
+                file.write(message["params"]["sessionId"] + "\n")
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
     elif method == "session/set_config_option":
         params = message["params"]
         settings[params["configId"]] = params["value"]

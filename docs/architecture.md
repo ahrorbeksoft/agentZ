@@ -179,6 +179,11 @@ Each entry: what it does, where it lives, and where it comes from.
 - **Logging out** (`confirm_dialog.rs`, t3code's dialogs): Log Out on the agent's page or in a
   thread's "…" menu first asks in a dialog in the shell's modal layer, since it stops every
   thread that shares the login. Uninstall asks in the same dialog.
+- **Closing sessions** (`AgentThread::{stop_agent, close_session}`, as Zed closes a thread's
+  session): an agent that advertises `sessionCapabilities.close` gets `session/close` before it
+  stops (Reload Agent, the thread going away) or its session is dropped (logged out), waiting
+  at most 3 seconds. A reload opens the new session only after the old one closed. A thread
+  handed off to a new server leaves its session open.
 - **Requests for input** (`elicitation_card.rs`, Zed's checks for ACP's `elicitation/create`): a
   card in the thread for a form (text, numbers, a choice, checkboxes) with Decline and Submit,
   or a page to open, named by its host, with a warning for non-ASCII hosts. An opened page

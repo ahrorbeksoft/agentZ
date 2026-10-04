@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
@@ -41,6 +41,9 @@ use tokio::task::JoinSet;
 use crate::wire::{ANSWER_MARKER_SESSION, PAUSE_MARKER_SESSION, Parked, Wire, marker_line};
 
 const STDERR_LINES_KEPT: usize = 20;
+
+/// How long an agent may take to close its session before it's stopped anyway.
+const CLOSE_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How Claude Agent and Codex report their login, unasked: an ACP extension notification.
 const AUTH_STATUS_NOTIFICATION: &str = "_auth/status_update";
@@ -312,6 +315,20 @@ impl std::ops::Deref for AgentThread {
 
     fn deref(&self) -> &Self::Target {
         &self.view
+    }
+}
+
+impl Drop for AgentThread {
+    /// A thread that goes away closes its session before its agent stops. Otherwise the agent
+    /// stops with the thread's fields.
+    fn drop(&mut self) {
+        if !self.can_close_session() {
+            return;
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        runtime.spawn(self.stop_agent());
     }
 }
 
@@ -623,7 +640,7 @@ impl AgentThread {
                         self.view.state.status = ConnectionStatus::AuthRequired;
                     } else {
                         self.view.state.account_notice = Some("Logged out.".into());
-                        self.session = None;
+                        self.drop_session();
                     }
                 }
                 Err(error) => {
@@ -685,15 +702,9 @@ impl AgentThread {
         let Some(command) = self.view.state.command.clone() else {
             return;
         };
-        // Aborting the tasks stops the agent process along with its connection.
-        self.tasks.abort_all();
-        self.wire = None;
-        self.process = None;
-        self.adopted_process = None;
-        self.pausing = None;
+        // The new agent waits for the old one to close the session it will load.
+        let stopping = self.stop_agent();
         self.generation += 1;
-        self.connection = None;
-        self.session = None;
         self.view.entries.clear();
         self.view.state.prompts_from_agents.clear();
         self.view.state.plan.clear();
@@ -708,7 +719,93 @@ impl AgentThread {
         self.view.state.turn_error = None;
         self.view.state.status = ConnectionStatus::Connecting;
         self.set_working(false);
-        self.connect_agent(futures::future::ready(Ok(command)).boxed());
+        self.connect_agent(
+            async move {
+                stopping.await;
+                Ok(command)
+            }
+            .boxed(),
+        );
+    }
+
+    /// Takes the agent out of the thread. The future it returns closes the agent's session
+    /// first when it can (see [`Self::close_session`]), then stops the agent.
+    fn stop_agent(&mut self) -> BoxFuture<'static, ()> {
+        let closing = self.close_session();
+        // Dropping these stops the agent process along with its connection.
+        let running = (
+            std::mem::take(&mut self.tasks),
+            self.wire.take(),
+            self.adopted_process.take(),
+        );
+        self.process = None;
+        self.pausing = None;
+        self.connection = None;
+        self.session = None;
+        async move {
+            if let Some(closing) = closing {
+                closing.await;
+            }
+            drop(running);
+        }
+        .boxed()
+    }
+
+    /// Forgets the open session, closing it while the agent keeps running.
+    fn drop_session(&mut self) {
+        if let Some(closing) = self.close_session() {
+            self.spawn_task(closing);
+        }
+        self.session = None;
+    }
+
+    /// Whether the open session can be closed: the agent supports it and still runs here (it
+    /// didn't exit or go to another server), and the connection isn't paused, which would hold
+    /// the request back.
+    fn can_close_session(&self) -> bool {
+        let Some(process) = self
+            .process
+            .as_ref()
+            .or(self.adopted_process.as_ref().map(|guard| &guard.0))
+        else {
+            return false;
+        };
+        self.session.is_some()
+            && self
+                .view
+                .state
+                .capabilities
+                .session_capabilities
+                .close
+                .is_some()
+            && process.armed.load(Ordering::SeqCst)
+            && !self.is_paused()
+    }
+
+    /// Asks the agent to close the open session, so it stops its work on it and frees it, as
+    /// Zed does when a thread goes away. Resolves once the agent answers, or gives up.
+    fn close_session(&self) -> Option<BoxFuture<'static, ()>> {
+        if !self.can_close_session() {
+            return None;
+        }
+        let session = self.session.as_ref()?;
+        let reply = session
+            .connection
+            .send_request(acp::CloseSessionRequest::new(session.session_id.clone()))
+            .block_task();
+        Some(
+            async move {
+                match tokio::time::timeout(CLOSE_SESSION_TIMEOUT, reply).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => log::warn!(
+                        "the agent couldn't close its session: {}",
+                        error_message(&error)
+                    ),
+                    Err(_) => log::warn!("the agent didn't close its session in time"),
+                }
+            }
+            .boxed(),
+        )
     }
 
     /// Gives up on the login in flight. Agents' browser logins only return once the user
@@ -1001,7 +1098,7 @@ impl AgentThread {
         if self.opens_session || self.connection.is_none() {
             return;
         }
-        self.session = None;
+        self.drop_session();
         self.view.state.account_notice = None;
         self.open_session();
     }
@@ -2856,6 +2953,42 @@ mod tests {
         );
     }
 
+    /// A thread closes its session before its agent stops: when reloading, before the new agent
+    /// opens one, and when the thread goes away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closes_its_session_before_the_agent_stops() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let closed_dir = tempfile::tempdir().expect("temp dir");
+        let closed_file = closed_dir.path().join("closed");
+        command.env.insert(
+            "MOCK_CLOSED_FILE".into(),
+            closed_file.to_string_lossy().into_owned(),
+        );
+        let closed = || std::fs::read_to_string(&closed_file).unwrap_or_default();
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(closed(), "");
+
+        thread.update(AgentThread::reload);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(closed(), "session-1\n");
+
+        drop(thread);
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            while closed() != "session-1\nsession-1\n" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "closed: {:?}", closed());
+    }
+
     /// A second thread given the first one's session id gets the conversation replayed.
     #[tokio::test(flavor = "multi_thread")]
     async fn reloads_previous_session() {
@@ -2954,9 +3087,15 @@ mod tests {
     /// A turn streaming when its agent is handed off goes on and ends on the new connection.
     #[tokio::test(flavor = "multi_thread")]
     async fn hands_off_a_turn_in_progress() {
-        let Some(command) = mock_agent(&[]) else {
+        let Some(mut command) = mock_agent(&[]) else {
             return;
         };
+        let closed_dir = tempfile::tempdir().expect("temp dir");
+        let closed_file = closed_dir.path().join("closed");
+        command.env.insert(
+            "MOCK_CLOSED_FILE".into(),
+            closed_file.to_string_lossy().into_owned(),
+        );
         let mut thread = start(command, None);
         thread
             .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
@@ -2986,6 +3125,11 @@ mod tests {
         thread.update(|thread| thread.send("hello".into()));
         thread.wait_until(|thread| !thread.is_working()).await;
         assert!(agent_text(&thread.thread).ends_with("Echo: hello"));
+        // The thread that handed the agent off left its session open.
+        assert_eq!(
+            std::fs::read_to_string(&closed_file).unwrap_or_default(),
+            ""
+        );
     }
 
     /// A permission request the agent waits on is asked again on the new connection, which
