@@ -501,6 +501,9 @@ since a thread's workspace is its checkout.
   Close show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
+- **New Workspace** (`new_space_picker.rs`, Zed's recent projects): the workspaces used here
+  most recently first, then each machine's home and projects' checkouts. A folder with a
+  workspace open is marked Open, and Enter goes there; Cmd-Enter opens another.
 - **Needs you**: while an agent in a pane waits for an approval or an answer, a tinted strip
   above the workspaces lists each, with Go to focus its pane.
 - **Worktree groups** (herdr's `workspace_entries`): a workspace in a linked worktree of a

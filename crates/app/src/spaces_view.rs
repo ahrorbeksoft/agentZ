@@ -307,6 +307,8 @@ pub struct SpacesView {
     hovered_space: Option<SpaceKey>,
     /// Worktree groups folded to their parent (client-only, as in herdr).
     collapsed_groups: HashSet<GroupKey>,
+    /// Workspaces by when they were last used here, most recent first, for New Workspace.
+    recent_spaces: Vec<SpaceKey>,
     /// The row whose counts are under the mouse, which show a tooltip instead of the details.
     hovered_contents: Option<SpaceKey>,
     is_visible: bool,
@@ -359,6 +361,7 @@ impl SpacesView {
             details_delay: None,
             hovered_space: None,
             collapsed_groups: HashSet::default(),
+            recent_spaces: Vec::new(),
             hovered_contents: None,
             is_visible: false,
             _subscriptions: subscriptions,
@@ -594,6 +597,8 @@ impl SpacesView {
             tab,
         };
         self.active_space = Some(space_key);
+        self.recent_spaces.retain(|recent| *recent != space_key);
+        self.recent_spaces.insert(0, space_key);
         self.active_tabs.insert(space_key, tab);
         if let Some(layout) = self.layouts.get_mut(&tab_key)
             && layout.focused() != key.pane
@@ -773,7 +778,18 @@ impl SpacesView {
         }
     }
 
+    /// Goes to the folder's open workspace, or opens one there.
     fn create_space(&mut self, choice: SpaceChoice, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(space) = choice.existing {
+            let key = SpaceKey {
+                machine: choice.machine,
+                space,
+            };
+            if self.space(key, cx).is_some() {
+                self.activate_space(key, window, cx);
+                return;
+            }
+        }
         self.request(
             choice.machine,
             SpaceRequest::CreateSpace {
@@ -1241,6 +1257,15 @@ impl SpacesView {
     }
 
     fn render_sidebar_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Read now: the picker can open while this view is being updated (its shortcut). The
+        // workspace on screen counts as the most recent.
+        let mut recent = self.recent_spaces.clone();
+        if let Some(active) = self.active_space
+            && recent.first() != Some(&active)
+        {
+            recent.retain(|space| *space != active);
+            recent.insert(0, active);
+        }
         let has_query = !self.search.read(cx).text().trim().is_empty();
         let this = cx.entity().downgrade();
         h_flex()
@@ -1281,8 +1306,10 @@ impl SpacesView {
                     .with_handle(self.new_space_handle.clone())
                     .menu(move |window, cx| {
                         let this = this.clone();
+                        let recent = recent.clone();
                         Some(cx.new(|cx| {
                             NewSpacePicker::new(
+                                recent,
                                 move |choice, window, cx| {
                                     this.update(cx, |this, cx| {
                                         this.create_space(choice, window, cx)

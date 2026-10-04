@@ -30,7 +30,7 @@ Notes for whoever continues:
 | 10 | 6 | Hover details: git at a glance | done |
 | 11 | 3E | "Needs you" strip on top of the sidebar | done |
 | 12 | 17 | Badge on the Agents / Workspaces switch | done |
-| 13 | 13 | New workspace picker: Recent first, Open marks | not started |
+| 13 | 13 | New workspace picker: Recent first, Open marks | done |
 | 14 | 11 | Split menu: Shell, agent CLIs on the machine, New Thread | not started |
 | 15 | 10 | Drag a pane: edges split, middle swaps | not started |
 | 16 | 18 | Find in terminal (Cmd-F) | not started |

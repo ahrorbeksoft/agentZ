@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use agentz_protocol::CAPABILITY_SPACES;
+use agentz_protocol::spaces::{Space, SpaceId};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Window,
@@ -20,14 +21,18 @@ use ui::{
 use crate::machines::{MachineId, Machines};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_switcher::{compact_path, fuzzy_match};
+use crate::spaces_view::SpaceKey;
 
 const KEY_CONTEXT: &str = "NewSpacePicker";
+/// How many recently used workspaces the picker lists first.
+const MAX_RECENT: usize = 5;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", menu::SelectPrevious, Some(KEY_CONTEXT)),
         KeyBinding::new("down", menu::SelectNext, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-enter", menu::SecondaryConfirm, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(KEY_CONTEXT)),
     ]);
 }
@@ -38,6 +43,9 @@ pub struct SpaceChoice {
     pub machine: MachineId,
     pub folder: PathBuf,
     pub project_id: Option<ProjectId>,
+    /// The workspace already open there, which choosing it goes to instead of opening
+    /// another (Cmd-Enter opens another).
+    pub existing: Option<SpaceId>,
 }
 
 #[derive(Clone)]
@@ -59,6 +67,8 @@ struct Entry {
 
 pub struct NewSpacePicker {
     machines: Entity<Machines>,
+    /// Open workspaces by when they were last used, most recent first.
+    recent: Vec<(MachineId, SpaceId)>,
     on_choose: Rc<dyn Fn(SpaceChoice, &mut Window, &mut App)>,
     search: Entity<TextInput>,
     entries: Vec<Entry>,
@@ -77,6 +87,7 @@ impl Focusable for NewSpacePicker {
 
 impl NewSpacePicker {
     pub fn new(
+        recent: Vec<SpaceKey>,
         on_choose: impl Fn(SpaceChoice, &mut Window, &mut App) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -93,6 +104,10 @@ impl NewSpacePicker {
         window.focus(&search.focus_handle(cx), cx);
         let mut this = Self {
             machines,
+            recent: recent
+                .into_iter()
+                .map(|key| (key.machine, key.space))
+                .collect(),
             on_choose: Rc::new(on_choose),
             search,
             entries: Vec::new(),
@@ -109,6 +124,72 @@ impl NewSpacePicker {
         let machines = self.machines.read(cx);
         let has_remotes = machines.has_remotes();
         let mut entries = Vec::new();
+        // The open workspaces, where choosing a folder goes instead of opening another.
+        let open: Vec<(MachineId, Space)> = machines
+            .clients()
+            .iter()
+            .flat_map(|client| {
+                let client = client.read(cx);
+                client
+                    .spaces()
+                    .spaces
+                    .iter()
+                    .map(|space| (client.machine(), space.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let open_at = |machine: MachineId, folder: &std::path::Path| {
+            open.iter()
+                .find(|(space_machine, space)| {
+                    *space_machine == machine
+                        && (space.current_folder() == folder
+                            || (folder == std::path::Path::new("~")
+                                && space
+                                    .current
+                                    .as_ref()
+                                    .is_some_and(|current| current.display_path == "~")))
+                })
+                .map(|(_, space)| space.id)
+        };
+        // Recently used workspaces first.
+        for (machine, space_id) in self.recent.iter().take(MAX_RECENT) {
+            let Some((_, space)) = open
+                .iter()
+                .find(|(space_machine, space)| space_machine == machine && space.id == *space_id)
+            else {
+                continue;
+            };
+            let detail: SharedString = space
+                .current
+                .as_ref()
+                .map(|current| current.display_path.clone())
+                .unwrap_or_else(|| space.folder.display().to_string())
+                .into();
+            let mut entry = Entry {
+                choice: SpaceChoice {
+                    machine: *machine,
+                    folder: space.current_folder().to_path_buf(),
+                    project_id: space.project_id,
+                    existing: Some(space.id),
+                },
+                // A project's workspace shows the project's icon.
+                kind: if space.project_id.is_some() {
+                    EntryKind::Checkout
+                } else {
+                    EntryKind::Home
+                },
+                label: space.label().into(),
+                detail,
+                section: "Recent".into(),
+                positions: Vec::new(),
+            };
+            if let Some(positions) = fuzzy_match(&query, &entry.label)
+                .or_else(|| entry.detail.to_lowercase().contains(&query).then(Vec::new))
+            {
+                entry.positions = positions;
+                entries.push(entry);
+            }
+        }
         for client in machines.clients() {
             let client = client.read(cx);
             if !client.has_capability(CAPABILITY_SPACES) {
@@ -125,6 +206,7 @@ impl NewSpacePicker {
                     machine,
                     folder: "~".into(),
                     project_id: None,
+                    existing: open_at(machine, std::path::Path::new("~")),
                 },
                 kind: EntryKind::Home,
                 label: "Home Folder".into(),
@@ -144,6 +226,7 @@ impl NewSpacePicker {
                         machine,
                         folder: project.path.clone(),
                         project_id: Some(project.id),
+                        existing: open_at(machine, &project.path),
                     },
                     kind: EntryKind::Checkout,
                     label: project.name(),
@@ -164,6 +247,7 @@ impl NewSpacePicker {
                             machine,
                             folder: workspace.path.clone(),
                             project_id: Some(project.id),
+                            existing: open_at(machine, &workspace.path),
                         },
                         kind: EntryKind::Workspace(workspace.kind),
                         label: format!("{} › {name}", project.name()).into(),
@@ -239,6 +323,22 @@ impl NewSpacePicker {
         }
     }
 
+    /// Opens another workspace even where one is open.
+    fn secondary_confirm(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.entries.get(self.selected_index) {
+            let choice = SpaceChoice {
+                existing: None,
+                ..entry.choice.clone()
+            };
+            self.choose(choice, window, cx);
+        }
+    }
+
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
     }
@@ -283,6 +383,7 @@ impl NewSpacePicker {
                 .color(Color::Muted)
                 .into_any_element(),
         };
+        let is_open = entry.choice.existing.is_some();
         let choice = entry.choice.clone();
         ListItem::new(("new-space-entry", index))
             .inset(true)
@@ -302,6 +403,13 @@ impl NewSpacePicker {
                             .truncate(),
                     ),
             )
+            .when(is_open, |item| {
+                item.end_slot(
+                    Label::new("Open")
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+            })
             .on_click(
                 cx.listener(move |this, _, window, cx| this.choose(choice.clone(), window, cx)),
             )
@@ -336,6 +444,7 @@ impl Render for NewSpacePicker {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_confirm))
             .on_action(cx.listener(Self::cancel))
             .child(
                 h_flex()
@@ -371,6 +480,24 @@ impl Render for NewSpacePicker {
                             }),
                     )
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+            )
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(border_variant)
+                    .child(
+                        Label::new("↩ Open")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("⌘↩ Open Another")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
             )
     }
 }
