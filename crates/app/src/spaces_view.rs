@@ -937,8 +937,73 @@ impl SpacesView {
         .detach();
     }
 
-    fn close_pane(&mut self, pane: PaneKey, cx: &mut Context<Self>) {
-        self.send(pane.machine, SpaceRequest::ClosePane(pane.pane), cx);
+    fn close_pane(&mut self, key: PaneKey, window: &mut Window, cx: &mut Context<Self>) {
+        let running = self
+            .find_pane(key, cx)
+            .and_then(|(_, _, pane)| running_program(&pane));
+        let close = move |this: &mut Self, cx: &mut Context<Self>| {
+            this.send(key.machine, SpaceRequest::ClosePane(key.pane), cx)
+        };
+        match running {
+            None => close(self, cx),
+            Some(program) => self.confirm_close(
+                format!("Close “{program}”?"),
+                "It's still running, and closing the pane ends it.".to_string(),
+                close,
+                window,
+                cx,
+            ),
+        }
+    }
+
+    fn close_tab(&mut self, key: TabKey, window: &mut Window, cx: &mut Context<Self>) {
+        let running = self
+            .machines
+            .read(cx)
+            .client(key.machine, cx)
+            .and_then(|client| {
+                let (_, tab) = client.read(cx).spaces().tab(key.tab)?;
+                Some(running_programs(&tab.panes))
+            })
+            .unwrap_or_default();
+        let close = move |this: &mut Self, cx: &mut Context<Self>| {
+            this.send(key.machine, SpaceRequest::CloseTab(key.tab), cx)
+        };
+        if running.is_empty() {
+            close(self, cx);
+            return;
+        }
+        self.confirm_close(
+            "Close this tab?".to_string(),
+            still_running(&running, "it"),
+            close,
+            window,
+            cx,
+        );
+    }
+
+    /// Asks before ending what still runs, as terminals such as Ghostty do.
+    fn confirm_close(
+        &mut self,
+        title: String,
+        detail: String,
+        close: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&detail),
+            &["Close", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| close(this, cx)).ok();
+            }
+        })
+        .detach();
     }
 
     fn toggle_zoom_of(&mut self, pane: PaneKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -986,10 +1051,11 @@ impl SpacesView {
             return;
         };
         let worktrees = self.group_children_closing_with(key, &space, cx);
-        let has_terminals = std::iter::once(&space)
+        let panes: Vec<Pane> = std::iter::once(&space)
             .chain(&worktrees)
-            .flat_map(|space| space.tabs.iter().flat_map(|tab| &tab.panes))
-            .any(|pane| matches!(pane.content, PaneContent::Terminal(_)));
+            .flat_map(|space| space.tabs.iter().flat_map(|tab| tab.panes.iter().cloned()))
+            .collect();
+        let running = running_programs(&panes);
         let mut closing = vec![key.space];
         closing.extend(worktrees.iter().map(|space| space.id));
         let close = move |this: &mut Self, cx: &mut Context<Self>| {
@@ -997,14 +1063,17 @@ impl SpacesView {
                 this.send(key.machine, SpaceRequest::CloseSpace(*space), cx);
             }
         };
-        if !has_terminals {
+        if running.is_empty() {
             close(self, cx);
             return;
         }
         let (title, detail) = match worktrees.len() {
             0 => (
                 format!("Close “{}”?", space.label()),
-                "Its terminals end. Its threads stay in Agents.",
+                format!(
+                    "{} Its threads stay in Agents.",
+                    still_running(&running, "it")
+                ),
             ),
             count => (
                 format!(
@@ -1012,22 +1081,13 @@ impl SpacesView {
                     space.label(),
                     if count == 1 { "worktree" } else { "worktrees" }
                 ),
-                "Their terminals end. Checkouts, branches and threads stay.",
+                format!(
+                    "{} Checkouts, branches and threads stay.",
+                    still_running(&running, "them")
+                ),
             ),
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &title,
-            Some(detail),
-            &["Close", "Cancel"],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if answer.await == Ok(0) {
-                this.update(cx, |this, cx| close(this, cx)).ok();
-            }
-        })
-        .detach();
+        self.confirm_close(title, detail, close, window, cx);
     }
 
     /// The worktrees' workspaces that close with a group's parent: all of them, unless
@@ -1224,9 +1284,9 @@ impl SpacesView {
         }
     }
 
-    fn close_focused_pane(&mut self, _: &ClosePane, _: &mut Window, cx: &mut Context<Self>) {
+    fn close_focused_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pane) = self.focused_pane(cx) {
-            self.close_pane(pane, cx);
+            self.close_pane(pane, window, cx);
         }
     }
 
@@ -2793,9 +2853,9 @@ impl SpacesView {
                 .icon_size(IconSize::XSmall)
                 .visible_on_hover("")
                 .tooltip(Tooltip::text("Close Tab"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.send(machine, SpaceRequest::CloseTab(tab_key.tab), cx)
-                })),
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.close_tab(tab_key, window, cx)),
+                ),
             )
             .child(if is_renaming {
                 div()
@@ -2891,11 +2951,9 @@ impl SpacesView {
                     };
                     let close = {
                         let this = this.clone();
-                        move |_: &mut Window, cx: &mut App| {
-                            this.update(cx, |this, cx| {
-                                this.send(machine, SpaceRequest::CloseTab(tab_key.tab), cx)
-                            })
-                            .ok();
+                        move |window: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.close_tab(tab_key, window, cx))
+                                .ok();
                         }
                     };
                     menu.entry("Rename", None, rename)
@@ -3202,7 +3260,9 @@ impl SpacesView {
                         IconButton::new(key.element_id("pane-close"), IconName::Close)
                             .icon_size(IconSize::Small)
                             .tooltip(|_, cx| Tooltip::for_action("Close Pane", &ClosePane, cx))
-                            .on_click(cx.listener(move |this, _, _, cx| this.close_pane(key, cx))),
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_pane(key, window, cx)
+                            })),
                     ),
             )
             .on_drag(
@@ -3395,7 +3455,7 @@ impl SpacesView {
                 .entry(
                     "Close Pane",
                     Some(Box::new(ClosePane)),
-                    on(|this, key, _, cx| this.close_pane(key, cx)),
+                    on(|this, key, window, cx| this.close_pane(key, window, cx)),
                 )
             })
         }
@@ -3565,6 +3625,49 @@ fn contents_label(terminals: usize, agents: usize) -> Option<String> {
             plural(agents, "agent")
         )),
     }
+}
+
+/// What a terminal pane runs in front of its shell, named as its header names it: a server,
+/// say, or an agent CLI, even one waiting at its prompt. An idle shell has nothing to lose,
+/// and a thread's pane leaves the thread in Agents.
+fn running_program(pane: &Pane) -> Option<String> {
+    let PaneContent::Terminal(terminal) = &pane.content else {
+        return None;
+    };
+    let program = pane.program.as_ref()?;
+    Some(
+        pane.agent
+            .as_ref()
+            .map(|agent| agent.name.clone())
+            .or_else(|| terminal.command.clone())
+            .unwrap_or_else(|| program.clone()),
+    )
+}
+
+/// Each program running in the panes, once.
+fn running_programs(panes: &[Pane]) -> Vec<String> {
+    let mut programs: Vec<String> = Vec::new();
+    for program in panes.iter().filter_map(running_program) {
+        if !programs.contains(&program) {
+            programs.push(program);
+        }
+    }
+    programs
+}
+
+/// "Claude Code and npm are still running in it, and closing it ends them."
+fn still_running(programs: &[String], place: &str) -> String {
+    let names = match programs {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    let (verb, object) = if programs.len() == 1 {
+        ("is", "it")
+    } else {
+        ("are", "them")
+    };
+    format!("{names} {verb} still running in {place}, and closing {place} ends {object}.")
 }
 
 /// A tab's name, or its number, as herdr numbers unnamed tabs.
@@ -3870,6 +3973,115 @@ mod tests {
         cx.run_until_parked();
         let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
         assert_eq!(focused.map(|pane| pane.pane), Some(PaneId(3)));
+    }
+
+    #[gpui::test]
+    fn closing_asks_first_only_while_something_runs(cx: &mut TestAppContext) {
+        // An idle shell, a server, and Claude Code.
+        let mut state = spaces();
+        let panes = &mut state.spaces[0].tabs[0].panes;
+        panes[0].content = new_shell();
+        panes[1].content = new_shell();
+        panes[1].program = Some("npm".to_string());
+        panes[2].program = Some("claude".to_string());
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+        let sent = |cx: &mut gpui::VisualTestContext| -> Vec<Request> {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter(|request| matches!(request, Request::Spaces(_)))
+                    .collect()
+            })
+        };
+        let pane = |id: u64| PaneKey {
+            machine: MachineId::Local,
+            pane: PaneId(id),
+        };
+        let close_pane = |id: u64| Request::Spaces(SpaceRequest::ClosePane(PaneId(id)));
+
+        view.update_in(cx, |view, window, cx| view.close_pane(pane(3), window, cx));
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(sent(cx), [close_pane(3)]);
+
+        // Cmd-W on Claude Code asks first, even while it only waits at its prompt.
+        view.update_in(cx, |view, window, cx| view.focus_pane(pane(5), window, cx));
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Close “Claude Code”?".to_string(),
+                "It's still running, and closing the pane ends it.".to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(sent(cx), [close_pane(3)]);
+        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_prompt_answer("Close");
+        cx.run_until_parked();
+        assert_eq!(sent(cx), [close_pane(3), close_pane(5)]);
+
+        let tab = TabKey {
+            machine: MachineId::Local,
+            tab: TabId(2),
+        };
+        view.update_in(cx, |view, window, cx| view.close_tab(tab, window, cx));
+        assert_eq!(
+            cx.pending_prompt().map(|(_, detail)| detail),
+            Some(
+                "npm and Claude Code are still running in it, and closing it ends them."
+                    .to_string()
+            )
+        );
+        cx.simulate_prompt_answer("Close");
+        cx.run_until_parked();
+        assert_eq!(
+            sent(cx).last(),
+            Some(&Request::Spaces(SpaceRequest::CloseTab(TabId(2))))
+        );
+
+        let space = SpaceKey {
+            machine: MachineId::Local,
+            space: SpaceId(1),
+        };
+        view.update_in(cx, |view, window, cx| view.close_space(space, window, cx));
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Close “demo”?".to_string(),
+                "npm and Claude Code are still running in it, and closing it ends them. \
+                 Its threads stay in Agents."
+                    .to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(sent(cx).len(), 3);
+    }
+
+    #[test]
+    fn still_running_lists_every_program() {
+        let programs =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        assert_eq!(
+            still_running(&programs(&["npm"]), "it"),
+            "npm is still running in it, and closing it ends it."
+        );
+        assert_eq!(
+            still_running(&programs(&["npm", "Codex", "Claude Code"]), "them"),
+            "npm, Codex and Claude Code are still running in them, and closing them ends them."
+        );
     }
 
     #[test]

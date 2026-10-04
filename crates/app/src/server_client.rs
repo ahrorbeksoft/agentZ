@@ -112,6 +112,8 @@ pub struct ServerClient {
     retry_now: Option<oneshot::Sender<()>>,
     /// What the server was last told of the other machines, this connection.
     peers_sent: Option<Peers>,
+    #[cfg(test)]
+    sent_for_test: std::cell::RefCell<Vec<Request>>,
     _maintain_connection: Task<()>,
 }
 
@@ -148,6 +150,8 @@ impl ServerClient {
                 upload_progress: None,
                 retry_now: None,
                 peers_sent: None,
+                #[cfg(test)]
+                sent_for_test: Default::default(),
                 _maintain_connection: cx.spawn(async move |this, cx| {
                     maintain_connection(this, connect_transport, cx).await
                 }),
@@ -285,6 +289,8 @@ impl ServerClient {
 
     /// Sends a request whose answer only matters if it's an error.
     pub fn send(&self, request: Request, cx: &App) {
+        #[cfg(test)]
+        self.sent_for_test.borrow_mut().push(request.clone());
         let description = request_name(&request);
         let response = self.request(request);
         cx.background_spawn(async move {
@@ -484,6 +490,12 @@ impl ServerClient {
             client.spaces = spaces;
         });
         client
+    }
+
+    /// What `send` was given, oldest first.
+    #[cfg(test)]
+    pub fn sent_for_test(&self) -> Vec<Request> {
+        self.sent_for_test.borrow().clone()
     }
 
     /// Reads as connected, though a test client has no connection.

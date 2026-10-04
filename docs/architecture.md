@@ -530,6 +530,9 @@ since a thread's workspace is its checkout.
   list`, then a project's pastures). Either opens as a new workspace with a shell.
 - **Tabs**: a tab the user hasn't named takes the title of its focused pane (what runs there),
   in muted text; a rename left unchanged keeps it automatic.
+- **Closing** a pane, tab or workspace asks first while a terminal there runs something in
+  front of its shell (`Pane::program`: a server, an agent CLI even at its prompt), naming it,
+  as Ghostty does; idle shells and thread panes close at once (`SpacesView::confirm_close`).
 - **Keys** (Mac-style, in the `Workspaces` context, all with Cmd so terminals never get them):
   Cmd-T, Cmd-}/Cmd-{, Cmd-1…9 (a tab by position), Cmd-D/Cmd-Shift-D, Cmd-W, Cmd-Shift-Enter,
   Cmd-Option-arrows, Cmd-Shift-N.
