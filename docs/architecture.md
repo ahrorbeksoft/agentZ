@@ -91,7 +91,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
 | `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
-| `settings.json` | app | Theme, saved machines, sidebar and terminal preferences |
+| `settings.json` | app | Theme, saved machines, sidebar and terminal preferences, saved layouts |
 | `viewed.json` | app | Completions this client has displayed |
 
 ## Features
@@ -124,9 +124,9 @@ Each entry: what it does, where it lives, and where it comes from.
 - **Go To** (`go_to_picker.rs`; `SpacesView::places`, `go_to_picker::thread_places`): Cmd-P
   lists the workspaces, tabs and panes, and the Agents view's threads, the view on screen's
   first, filtered by name or where they are (a pane's workspace and tab). Choosing one shows
-  it in its view and focuses it. The palette, Go To and the shortcut sheet are the shell's
-  overlays (`Shell::overlay`): each one's key closes it, one replaces another, and focus goes
-  back to what had it.
+  it in its view and focuses it. The palette, Go To, the shortcut sheet and Save Layout are the
+  shell's overlays (`Shell::overlay`): each one's key closes it, one replaces another, and
+  focus goes back to what had it.
 - **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
   `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
   favicons or monograms, git branches. The switcher is Zed's recent-projects popover.
@@ -583,6 +583,16 @@ since a thread's workspace is its checkout.
 - **Tabs**: a tab the user hasn't named is "Tab 1", "Tab 2"… by its position, in muted text,
   so moving it renumbers it (`tab_label`); a name the user gives stays wherever it moves, and a
   rename left unchanged keeps it automatic.
+- **Layouts** (`save_layout_modal.rs`, iTerm2's arrangements): a tab's menu has Save Layout…
+  (also `workspaces: save layout` in the palette), which names the tab's splits and lists its
+  panes, each pane with a command ticked to run it again: the command it was opened with, or
+  the command line of what runs in front of its shell (`Pane::command_line`, the foreground
+  process's arguments, quoted for the shell). An unticked pane or a thread pane opens a plain
+  shell. Layouts are the app's (`AppSettings::saved_layouts`, as `LayoutNode` trees), so one
+  opens in any workspace on any machine; saving under a taken name replaces it. Once there
+  are some, the tab bar's **+** is a menu of New Tab and the layouts, each deletable from its
+  row. Opening one sends `SpaceRequest::CreateTabFromLayout`: the server makes the tab with
+  its splits in the workspace's folder, running each command in a shell there.
 - **Closing** a pane, tab or workspace asks first while a terminal there runs something in
   front of its shell (`Pane::program`: a server, an agent CLI even at its prompt), naming it,
   as Ghostty does; idle shells and thread panes close at once (`SpacesView::confirm_close`).

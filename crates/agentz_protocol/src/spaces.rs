@@ -150,6 +150,9 @@ pub struct Pane {
     /// The program in a terminal pane's foreground, unless that's the shell. Not saved.
     #[serde(default)]
     pub program: Option<String>,
+    /// That program's command line, to run it again, as a saved layout does. Not saved.
+    #[serde(default)]
+    pub command_line: Option<String>,
 }
 
 impl Pane {
@@ -160,6 +163,7 @@ impl Pane {
             agent: None,
             folder: None,
             program: None,
+            command_line: None,
         }
     }
 
@@ -168,6 +172,44 @@ impl Pane {
         self.agent = None;
         self.folder = None;
         self.program = None;
+        self.command_line = None;
+    }
+}
+
+/// A saved layout's tab: its splits, and the command each pane runs, `None` for a shell.
+/// Clients keep layouts, so one opens in any workspace on any machine.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LayoutNode {
+    Pane {
+        command: Option<String>,
+    },
+    Split {
+        direction: Direction,
+        ratio: f32,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    /// A tab's splits, each pane running what `command` gives it.
+    pub fn of(root: &Node, command: &impl Fn(PaneId) -> Option<String>) -> Self {
+        match root {
+            Node::Pane(pane) => Self::Pane {
+                command: command(*pane),
+            },
+            Node::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => Self::Split {
+                direction: *direction,
+                ratio: *ratio,
+                first: Box::new(Self::of(first, command)),
+                second: Box::new(Self::of(second, command)),
+            },
+        }
     }
 }
 
@@ -299,6 +341,12 @@ pub enum SpaceRequest {
     CreateTab {
         space: SpaceId,
         content: PaneContent,
+    },
+    /// A tab after the space's others, split as `layout` is, its panes in the space's folder:
+    /// [`crate::Response::SpacePane`] with the top-left pane.
+    CreateTabFromLayout {
+        space: SpaceId,
+        layout: LayoutNode,
     },
     RenameTab {
         tab: TabId,

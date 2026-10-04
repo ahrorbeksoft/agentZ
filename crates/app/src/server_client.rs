@@ -979,6 +979,7 @@ mod tests {
                         }),
                         folder: None,
                         program: None,
+                        command_line: None,
                     }],
                 }],
                 git: None,

@@ -19,6 +19,7 @@ mod project_info;
 mod project_store;
 mod project_switcher;
 mod registry_store;
+mod save_layout_modal;
 mod server_client;
 mod settings_page;
 mod shell;
@@ -223,6 +224,7 @@ fn main() {
             shortcut_sheet::init(cx);
             command_palette::init(cx);
             go_to_picker::init(cx);
+            save_layout_modal::init(cx);
             agent_view::init(cx);
             agent_login::init(cx);
             elicitation_card::init(cx);

@@ -20,6 +20,7 @@ use util::shell_builder::ShellBuilder;
 
 use super::{ClientId, Input, Server, send_to};
 use crate::browser;
+use crate::detect::process::ForegroundProcess;
 use crate::detect::{self, Agent, AgentState, AgentTracker, DetectionInput, ProcessObservation};
 use crate::terminal_programs;
 use crate::terminals::{Terminal, TerminalSize, TerminalSpawn, frame_changes};
@@ -526,7 +527,7 @@ impl Server {
         let mut published = Vec::new();
         // Terminal threads' and drawer terminals' whose foreground changed, and the program
         // now there unless it's the shell.
-        let mut foregrounds: Vec<(TerminalKey, Option<String>)> = Vec::new();
+        let mut foregrounds: Vec<(TerminalKey, Option<ForegroundProcess>)> = Vec::new();
         // Terminal threads whose foreground moved to another folder.
         let mut folders = Vec::new();
         // Workspace panes whose foreground moved to another folder.
@@ -629,7 +630,10 @@ impl Server {
             let tick = tracker.next_tick();
             next_tick = Some(next_tick.map_or(tick, |next| next.min(tick)));
         }
-        for (key, program) in foregrounds {
+        for (key, leader) in foregrounds {
+            let program = leader
+                .as_ref()
+                .map(|leader| leader.argv0.clone().unwrap_or_else(|| leader.name.clone()));
             match key {
                 TerminalKey::Thread(thread_id) => {
                     // A thread started with a command runs it until it exits, whatever its
@@ -647,7 +651,11 @@ impl Server {
                 TerminalKey::DrawerTerminal { thread_id, number } => {
                     self.projects.set_drawer_command(thread_id, number, program)
                 }
-                TerminalKey::Pane(pane) => self.spaces.set_pane_program(pane, program),
+                TerminalKey::Pane(pane) => self.spaces.set_pane_program(
+                    pane,
+                    program,
+                    leader.as_ref().and_then(command_line),
+                ),
                 TerminalKey::Agent { .. } | TerminalKey::Login(_) => {}
             }
         }
@@ -1068,7 +1076,27 @@ fn truncate_start(text: String, limit: Option<usize>) -> (String, bool) {
 mod tests {
     use std::path::Path;
 
-    use super::{home_relative, truncate_start};
+    use super::{ForegroundProcess, command_line, home_relative, truncate_start};
+
+    #[test]
+    fn a_command_line_runs_what_the_arguments_say() {
+        let line = |argv: &[&str]| {
+            command_line(&ForegroundProcess::new(
+                "node".into(),
+                argv.iter().map(|word| word.to_string()).collect(),
+            ))
+        };
+        assert_eq!(
+            line(&["python3", "-m", "http.server", "a b", "it's"]).as_deref(),
+            Some("python3 -m http.server 'a b' \"it's\"")
+        );
+        // Node's `process.title` overwrites the arguments' memory.
+        assert_eq!(
+            line(&["npm run dev", "", ""]).as_deref(),
+            Some("npm run dev")
+        );
+        assert_eq!(line(&[]), None);
+    }
 
     #[test]
     fn paths_under_home_start_with_a_tilde() {
@@ -1119,9 +1147,24 @@ pub(super) fn home_relative(path: &Path) -> String {
 }
 
 /// The program leading a terminal's foreground, unless that's the shell itself.
-fn foreground_program(group: Option<u32>) -> Option<String> {
+fn foreground_program(group: Option<u32>) -> Option<ForegroundProcess> {
     group
         .and_then(detect::process::group_leader)
         .filter(|leader| !detect::is_shell(leader))
-        .map(|leader| leader.argv0.unwrap_or(leader.name))
+}
+
+/// A program's command line, to run it again: its arguments, quoted for the shell, after
+/// the first as it is. That one may be a title the program gave itself, as npm's Node sets
+/// `process.title` to "npm run dev", which clears the arguments after it.
+fn command_line(leader: &ForegroundProcess) -> Option<String> {
+    let mut words = leader.argv.iter().flatten().filter(|word| !word.is_empty());
+    let mut line = words.next()?.clone();
+    for word in words {
+        line.push(' ');
+        match util::shell::ShellKind::Posix.try_quote(word) {
+            Some(quoted) => line.push_str(&quoted),
+            None => line.push_str(word),
+        }
+    }
+    Some(line)
 }

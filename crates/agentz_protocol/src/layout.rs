@@ -667,7 +667,7 @@ fn split_node(target: PaneId, direction: Direction, new_id: PaneId, ratio: f32) 
     }
 }
 
-fn valid_split_ratio(ratio: f32) -> f32 {
+pub fn valid_split_ratio(ratio: f32) -> f32 {
     if ratio.is_finite() {
         ratio.clamp(0.1, 0.9)
     } else {

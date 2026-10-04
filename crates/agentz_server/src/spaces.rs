@@ -3,10 +3,12 @@
 
 use std::path::{Path, PathBuf};
 
-use agentz_protocol::layout::{Direction, NavDirection, Node, PaneId, TileLayout};
+use agentz_protocol::layout::{
+    Direction, NavDirection, Node, PaneId, TileLayout, valid_split_ratio,
+};
 use agentz_protocol::spaces::{
-    Pane, PaneAgent, PaneContent, PaneLocation, Space, SpaceChanges, SpaceCommit, SpaceFolder,
-    SpaceGit, SpaceId, SpacesSnapshot, Tab, TabId,
+    LayoutNode, Pane, PaneAgent, PaneContent, PaneLocation, Space, SpaceChanges, SpaceCommit,
+    SpaceFolder, SpaceGit, SpaceId, SpacesSnapshot, Tab, TabId,
 };
 use anyhow::{Context as _, Result, anyhow};
 use projects::{ProjectId, Saver, ThreadId};
@@ -178,6 +180,60 @@ impl SpaceStore {
         self.space_mut(space)?.tabs.push(tab);
         self.changed();
         Ok(location)
+    }
+
+    /// A tab after the space's others, split as `layout` is, each pane holding what `content`
+    /// makes of its command. Returns where its top-left pane is, and all its panes.
+    pub(crate) fn create_tab_from_layout(
+        &mut self,
+        space: SpaceId,
+        layout: &LayoutNode,
+        content: impl Fn(Option<String>) -> PaneContent,
+    ) -> Result<(PaneLocation, Vec<PaneId>)> {
+        self.space_index(space)?;
+        let tab = TabId(self.allocate_id());
+        let mut panes = Vec::new();
+        let root = self.layout_node(layout, &content, &mut panes);
+        let location = PaneLocation {
+            space,
+            tab,
+            pane: root.first_pane(),
+        };
+        let pane_ids = panes.iter().map(|pane| pane.id).collect();
+        self.space_mut(space)?.tabs.push(Tab {
+            id: tab,
+            name: None,
+            root,
+            panes,
+        });
+        self.changed();
+        Ok((location, pane_ids))
+    }
+
+    fn layout_node(
+        &mut self,
+        layout: &LayoutNode,
+        content: &impl Fn(Option<String>) -> PaneContent,
+        panes: &mut Vec<Pane>,
+    ) -> Node {
+        match layout {
+            LayoutNode::Pane { command } => {
+                let pane = PaneId(self.allocate_id());
+                panes.push(Pane::new(pane, content(command.clone())));
+                Node::Pane(pane)
+            }
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => Node::Split {
+                direction: *direction,
+                ratio: valid_split_ratio(*ratio),
+                first: Box::new(self.layout_node(first, content, panes)),
+                second: Box::new(self.layout_node(second, content, panes)),
+            },
+        }
     }
 
     pub(crate) fn rename_tab(&mut self, id: TabId, name: Option<String>) -> Result<()> {
@@ -370,13 +426,19 @@ impl SpaceStore {
     }
 
     /// Runtime state: not saved, but sent to clients.
-    pub(crate) fn set_pane_program(&mut self, id: PaneId, program: Option<String>) {
+    pub(crate) fn set_pane_program(
+        &mut self,
+        id: PaneId,
+        program: Option<String>,
+        command_line: Option<String>,
+    ) {
         let Ok((space, tab, pane)) = self.pane_index(id) else {
             return;
         };
         let pane = &mut self.spaces[space].tabs[tab].panes[pane];
-        if pane.program != program {
+        if pane.program != program || pane.command_line != command_line {
             pane.program = program;
+            pane.command_line = command_line;
             self.revision += 1;
         }
     }

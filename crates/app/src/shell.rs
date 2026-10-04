@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey};
 use crate::project_store::ThreadStatus;
 use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::layout::Node;
 use agentz_protocol::workspace::WorkspaceChoice;
 use anyhow::Result;
 use collections::HashMap;
@@ -29,6 +30,7 @@ use crate::machine_modal::MachineModal;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
+use crate::save_layout_modal::{LayoutPane, SaveLayoutModal};
 use crate::server_client::MachineStatus;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::shortcut_sheet::ShortcutSheet;
@@ -122,6 +124,7 @@ enum OverlayKind {
     ShortcutSheet,
     CommandPalette,
     GoTo,
+    SaveLayout,
 }
 
 struct Overlay {
@@ -196,6 +199,9 @@ impl Shell {
                     ),
                     SpacesViewEvent::Confirm(request) => {
                         this.open_confirm_dialog(request.clone(), window, cx)
+                    }
+                    SpacesViewEvent::SaveLayout { root, panes, name } => {
+                        this.open_save_layout(root.clone(), panes.clone(), name.clone(), window, cx)
                     }
                     SpacesViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
                 },
@@ -1050,6 +1056,23 @@ impl Shell {
         self.open_overlay(OverlayKind::GoTo, picker, previous_focus, window, cx);
     }
 
+    fn open_save_layout(
+        &mut self,
+        root: Node,
+        panes: Vec<LayoutPane>,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.make_room_for(OverlayKind::SaveLayout, window, cx) {
+            return;
+        }
+        let modal = cx.new(|cx| SaveLayoutModal::new(root, panes, name, window, cx));
+        // From the tab's menu, what has focus is the menu, which is gone once it closes; the
+        // tab's pane gets it back instead.
+        self.open_overlay(OverlayKind::SaveLayout, modal, None, window, cx);
+    }
+
     /// Shows the place in its view and focuses it.
     fn go_to(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
         if let Place::Thread(thread) = place {
@@ -1553,7 +1576,9 @@ impl Render for Shell {
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
-        let is_dialog = self.machine_modal.is_some() || self.confirm_dialog.is_some();
+        let is_dialog = self.machine_modal.is_some()
+            || self.confirm_dialog.is_some()
+            || self.overlay_kind() == Some(OverlayKind::SaveLayout);
         // Beside the thread, or filling its area when full screen.
         let diff_panel = self.diff_panel.clone();
         let is_diff_full_screen = self.diff_full_screen && diff_panel.is_some();
@@ -2016,6 +2041,46 @@ mod modal_tests {
             shell.read_with(cx, |shell, _| shell.overlay_kind()),
             Some(OverlayKind::GoTo)
         );
+    }
+
+    #[gpui::test]
+    fn save_layout_names_the_tab_then_gives_focus_back_to_it(cx: &mut TestAppContext) {
+        init_places(cx);
+        cx.update(crate::save_layout_modal::init);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.set_view(MainView::Workspaces, window, cx)
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_input("save layout");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            shell.read_with(cx, |shell, _| shell.overlay_kind()),
+            Some(OverlayKind::SaveLayout)
+        );
+        cx.simulate_input("dev");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        shell.update_in(cx, |shell, window, cx| {
+            assert!(shell.overlay.is_none());
+            let names: Vec<String> = AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .saved_layouts
+                .iter()
+                .map(|layout| layout.name.clone())
+                .collect();
+            assert_eq!(names, ["dev"]);
+            assert!(
+                shell
+                    .spaces_view
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
     }
 
     #[gpui::test]

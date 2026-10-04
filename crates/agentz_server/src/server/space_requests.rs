@@ -30,6 +30,7 @@ impl Server {
         let moves_tabs = matches!(
             request,
             SpaceRequest::CreateTab { .. }
+                | SpaceRequest::CreateTabFromLayout { .. }
                 | SpaceRequest::CloseTab(_)
                 | SpaceRequest::MoveTab { .. }
                 | SpaceRequest::ClosePane(_)
@@ -88,6 +89,21 @@ impl Server {
                 let content = self.checked_content(content, &folder)?;
                 let location = self.spaces.create_tab(space, content)?;
                 self.start_pane(location.pane);
+                Ok(Response::SpacePane(location))
+            }
+            SpaceRequest::CreateTabFromLayout { space, layout } => {
+                let folder = self.space_folder(space)?;
+                let (location, panes) =
+                    self.spaces
+                        .create_tab_from_layout(space, &layout, |command| {
+                            PaneContent::Terminal(PaneTerminal {
+                                folder: folder.clone(),
+                                command: command.filter(|command| !command.trim().is_empty()),
+                            })
+                        })?;
+                for pane in panes {
+                    self.start_pane(pane);
+                }
                 Ok(Response::SpacePane(location))
             }
             SpaceRequest::RenameTab { tab, name } => {

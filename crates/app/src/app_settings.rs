@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agentz_protocol::spaces::LayoutNode;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task, WindowAppearance};
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,14 @@ pub struct AppSettings {
     pub terminal_font_size: Option<f32>,
     /// The sidebar was hidden with Cmd-B, in Agents and Workspaces alike.
     pub is_sidebar_hidden: bool,
+    /// Tabs saved with Save Layout…, which open in any workspace on any machine.
+    pub saved_layouts: Vec<SavedLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedLayout {
+    pub name: String,
+    pub layout: LayoutNode,
 }
 
 impl Default for AppSettings {
@@ -90,6 +99,7 @@ impl Default for AppSettings {
             last_combined_grouping: ProjectGroupingMode::default(),
             terminal_font_size: None,
             is_sidebar_hidden: false,
+            saved_layouts: Vec::new(),
         }
     }
 }
@@ -110,6 +120,18 @@ impl AppSettings {
             enabled: true,
         });
         id
+    }
+
+    /// Saves a layout, in place of one with the same name.
+    pub fn save_layout(&mut self, layout: SavedLayout) {
+        match self
+            .saved_layouts
+            .iter_mut()
+            .find(|saved| saved.name == layout.name)
+        {
+            Some(saved) => *saved = layout,
+            None => self.saved_layouts.push(layout),
+        }
     }
 }
 

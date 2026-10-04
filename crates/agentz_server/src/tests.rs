@@ -10,7 +10,8 @@ use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::layout::{Direction, Node};
 use agentz_protocol::spaces::{
-    PaneAgentState, PaneContent, PaneLocation, PaneTerminal, SpaceRequest, SpacesSnapshot,
+    LayoutNode, PaneAgentState, PaneContent, PaneLocation, PaneTerminal, SpaceRequest,
+    SpacesSnapshot,
 };
 use agentz_protocol::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalPoint,
@@ -3591,6 +3592,92 @@ async fn spaces_are_saved_restored_and_streamed() {
         .wait_until(|client| !client.terminals.contains_key(&key))
         .await;
     assert!(client.space_snapshot().spaces.is_empty());
+}
+
+/// A saved layout opens as a tab of its splits in the workspace's folder, running its
+/// commands; what runs in a pane is read back as a command line to save.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layout_opens_as_a_tab_running_its_commands() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = std::fs::canonicalize(server.project_dir.path()).expect("canonical path");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let first = client
+        .space_pane(SpaceRequest::CreateSpace {
+            folder: folder.clone(),
+            project_id: None,
+            content: shell_in(&folder),
+        })
+        .await;
+    let pane = |command: Option<&str>| {
+        Box::new(LayoutNode::Pane {
+            command: command.map(str::to_string),
+        })
+    };
+    let layout = LayoutNode::Split {
+        direction: Direction::Horizontal,
+        ratio: 0.7,
+        first: pane(Some("echo from-$PWD; sleep 30")),
+        second: Box::new(LayoutNode::Split {
+            direction: Direction::Vertical,
+            ratio: 0.5,
+            first: pane(None),
+            second: pane(Some(" ")),
+        }),
+    };
+    let location = client
+        .space_pane(SpaceRequest::CreateTabFromLayout {
+            space: first.space,
+            layout,
+        })
+        .await;
+    assert_eq!(location.space, first.space);
+    client
+        .wait_until(|client| client.space_snapshot().tab(location.tab).is_some())
+        .await;
+    let spaces = client.space_snapshot();
+    let (_, tab) = spaces.tab(location.tab).expect("the tab");
+    assert_eq!(tab.root.first_pane(), location.pane);
+    assert!(matches!(
+        tab.root,
+        Node::Split { direction: Direction::Horizontal, ratio, .. } if (ratio - 0.7).abs() < 1e-6
+    ));
+    let commands: Vec<Option<String>> = tab
+        .panes
+        .iter()
+        .map(|pane| match &pane.content {
+            PaneContent::Terminal(terminal) => {
+                assert_eq!(terminal.folder, folder);
+                terminal.command.clone()
+            }
+            content => panic!("unexpected content: {content:?}"),
+        })
+        .collect();
+    assert_eq!(
+        commands,
+        [Some("echo from-$PWD; sleep 30".to_string()), None, None]
+    );
+    let key = TerminalKey::Pane(location.pane);
+    client.subscribe_terminal(key.clone()).await;
+    client
+        .wait_for_screen(&key, &format!("from-{}", folder.display()))
+        .await;
+
+    let shell = tab.panes[1].id;
+    let shell_key = TerminalKey::Pane(shell);
+    client.subscribe_terminal(shell_key.clone()).await;
+    client.type_into(&shell_key, "cat - 'a b'\n").await;
+    client
+        .wait_until(|client| {
+            client
+                .space_snapshot()
+                .pane(shell)
+                .is_some_and(|(_, _, pane)| pane.command_line.as_deref() == Some("cat - 'a b'"))
+        })
+        .await;
 }
 
 /// A workspace is named after the folder most of its tabs are in, and describes that folder.

@@ -12,8 +12,8 @@ use agentz_protocol::layout::{
     Direction, NavDirection, Node, PaneId, Rect, TileLayout, find_in_direction,
 };
 use agentz_protocol::spaces::{
-    Pane, PaneContent, PaneTerminal, Space, SpaceFolder, SpaceGit, SpaceId, SpaceRequest, Tab,
-    TabId,
+    LayoutNode, Pane, PaneContent, PaneTerminal, Space, SpaceFolder, SpaceGit, SpaceId,
+    SpaceRequest, Tab, TabId,
 };
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
@@ -33,6 +33,7 @@ use ui::{
 use crate::OpenSettings;
 use crate::agent_icons::agent_icon;
 use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
+use crate::app_settings::AppSettingsStore;
 use crate::confirm_dialog::ConfirmRequest;
 use crate::go_to_picker::{Place, PlaceEntry, PlaceIcon};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
@@ -40,6 +41,7 @@ use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ThreadStatus;
 use crate::project_switcher::compact_path;
+use crate::save_layout_modal::LayoutPane;
 use crate::settings_page::remove_workspace;
 use crate::sidebar::{
     DETAILS_DELAY, SIDEBAR_WIDTH, ThreadDetails, details_card, details_row, format_relative_time,
@@ -100,6 +102,8 @@ actions!(
         RenameTab,
         /// Closes the tab on screen.
         CloseTab,
+        /// Saves the tab on screen as a layout, to open as a tab in any workspace.
+        SaveLayout,
         /// Renames the workspace on screen.
         RenameWorkspace,
         /// Closes the workspace on screen.
@@ -194,6 +198,12 @@ pub enum SpacesViewEvent {
     },
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
+    /// Save Layout… for a tab: its tree, its panes, and its name if it was given one.
+    SaveLayout {
+        root: Node,
+        panes: Vec<LayoutPane>,
+        name: Option<String>,
+    },
     /// Manage Agents, from a new thread's agent picker.
     OpenAgentSettings,
 }
@@ -379,6 +389,8 @@ impl SpacesView {
             }),
             cx.subscribe(&search, |_, _, _: &TextInputEvent, cx| cx.notify()),
             cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
+            // The tab bar's + lists the saved layouts.
+            cx.observe(&AppSettingsStore::global(cx), |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 this.mark_visible_seen(window, cx)
             }),
@@ -1307,6 +1319,81 @@ impl SpacesView {
         if let Some((_, _, tab)) = self.visible_tab(cx) {
             self.close_tab(tab, window, cx);
         }
+    }
+
+    fn save_visible_tab_layout(&mut self, _: &SaveLayout, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, _, tab)) = self.visible_tab(cx) {
+            self.save_layout_of(tab, cx);
+        }
+    }
+
+    /// Asks for a name and which panes run their command again, then keeps the tab's layout.
+    fn save_layout_of(&mut self, key: TabKey, cx: &mut Context<Self>) {
+        let Some(client) = self.machines.read(cx).client(key.machine, cx) else {
+            return;
+        };
+        let Some(tab) = client
+            .read(cx)
+            .spaces()
+            .tab(key.tab)
+            .map(|(_, tab)| tab.clone())
+        else {
+            return;
+        };
+        let panes = TileLayout::from_saved(tab.root.clone(), tab.root.first_pane())
+            .pane_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let pane = tab.pane(id)?;
+                let (icon, title, _) = self.pane_title(
+                    PaneKey {
+                        machine: key.machine,
+                        pane: id,
+                    },
+                    pane,
+                    cx,
+                );
+                Some(LayoutPane {
+                    id,
+                    icon,
+                    title,
+                    command: pane_command(pane),
+                })
+            })
+            .collect();
+        cx.emit(SpacesViewEvent::SaveLayout {
+            root: tab.root,
+            panes,
+            name: tab.name,
+        });
+    }
+
+    /// A tab split as the layout is, in the workspace's folder, running its commands.
+    fn open_layout(
+        &mut self,
+        space: SpaceKey,
+        layout: LayoutNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(
+            space.machine,
+            SpaceRequest::CreateTabFromLayout {
+                space: space.space,
+                layout,
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn delete_layout(name: &str, cx: &mut App) {
+        AppSettingsStore::global(cx).update(cx, |store, cx| {
+            store.update(
+                |settings| settings.saved_layouts.retain(|layout| layout.name != name),
+                cx,
+            )
+        });
     }
 
     fn rename_active_space(
@@ -2915,13 +3002,81 @@ impl SpacesView {
             .enumerate()
             .map(|(index, tab)| self.render_tab(space_key, index, tab, selected, count, cx))
             .collect();
+        let new_tab =
+            IconButton::new("new-workspace-tab", IconName::Plus).icon_size(IconSize::Small);
+        let has_layouts = !AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .saved_layouts
+            .is_empty();
+        if !has_layouts {
+            return TabBar::new("workspace-tabs").children(tabs).end_child(
+                new_tab
+                    .tooltip(|_, cx| Tooltip::for_action("New Tab", &NewTab, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.new_tab_in(space_key, window, cx)
+                    })),
+            );
+        }
+        let this = cx.entity().downgrade();
         TabBar::new("workspace-tabs").children(tabs).end_child(
-            IconButton::new("new-workspace-tab", IconName::Plus)
-                .icon_size(IconSize::Small)
-                .tooltip(|_, cx| Tooltip::for_action("New Tab", &NewTab, cx))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.new_tab_in(space_key, window, cx)),
-                ),
+            div().debug_selector(|| "new-tab-menu".into()).child(
+                PopoverMenu::new("new-workspace-tab-menu")
+                    .trigger_with_tooltip(new_tab, Tooltip::text("New Tab or Layout"))
+                    .anchor(gpui::Anchor::TopRight)
+                    .menu(move |window, cx| {
+                        let this = this.clone();
+                        // Rebuilt after a layout is deleted, so it leaves the menu at once.
+                        Some(ContextMenu::build_persistent(
+                            window,
+                            cx,
+                            move |menu, _, cx| {
+                                let new_tab = {
+                                    let this = this.clone();
+                                    move |window: &mut Window, cx: &mut App| {
+                                        this.update(cx, |this, cx| {
+                                            this.new_tab_in(space_key, window, cx)
+                                        })
+                                        .ok();
+                                    }
+                                };
+                                let mut menu = menu
+                                    .keep_open_on_confirm(false)
+                                    .end_slot_action(Box::new(menu::SecondaryConfirm))
+                                    .entry("New Tab", Some(Box::new(NewTab)), new_tab)
+                                    .separator();
+                                let layouts = AppSettingsStore::global(cx)
+                                    .read(cx)
+                                    .settings()
+                                    .saved_layouts
+                                    .clone();
+                                for saved in layouts {
+                                    let open = {
+                                        let this = this.clone();
+                                        let layout = saved.layout.clone();
+                                        move |window: &mut Window, cx: &mut App| {
+                                            let layout = layout.clone();
+                                            this.update(cx, |this, cx| {
+                                                this.open_layout(space_key, layout, window, cx)
+                                            })
+                                            .ok();
+                                        }
+                                    };
+                                    let name = saved.name.clone();
+                                    menu = menu.entry_with_end_slot_on_hover(
+                                        saved.name,
+                                        None,
+                                        open,
+                                        IconName::Trash,
+                                        "Delete Layout".into(),
+                                        move |_, cx| Self::delete_layout(&name, cx),
+                                    );
+                                }
+                                menu
+                            },
+                        ))
+                    }),
+            ),
         )
     }
 
@@ -3067,6 +3222,13 @@ impl SpacesView {
                                 .ok();
                         }
                     };
+                    let save_layout = {
+                        let this = this.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.save_layout_of(tab_key, cx))
+                                .ok();
+                        }
+                    };
                     let close = {
                         let this = this.clone();
                         move |window: &mut Window, cx: &mut App| {
@@ -3076,6 +3238,7 @@ impl SpacesView {
                     };
                     menu.entry("Rename", None, rename)
                         .entry("New Tab", Some(Box::new(NewTab)), new_tab)
+                        .entry("Save Layout…", None, save_layout)
                         .separator()
                         .entry("Close Tab", None, close)
                 })
@@ -3676,6 +3839,7 @@ impl Render for SpacesView {
             .when(has_tab, |view| {
                 view.on_action(cx.listener(Self::rename_visible_tab))
                     .on_action(cx.listener(Self::close_visible_tab))
+                    .on_action(cx.listener(Self::save_visible_tab_layout))
             })
             .when(has_space, |view| {
                 view.on_action(cx.listener(Self::close_active_space))
@@ -3849,6 +4013,18 @@ fn running_program(pane: &Pane) -> Option<String> {
             .or_else(|| terminal.command.clone())
             .unwrap_or_else(|| program.clone()),
     )
+}
+
+/// What a pane runs, for a saved layout to run again: the command it was opened with, or what
+/// was started in its shell.
+fn pane_command(pane: &Pane) -> Option<String> {
+    let PaneContent::Terminal(terminal) = &pane.content else {
+        return None;
+    };
+    terminal
+        .command
+        .clone()
+        .or_else(|| pane.command_line.clone())
 }
 
 /// Each program running in the panes, once.
@@ -4369,6 +4545,107 @@ mod tests {
                 })]
             );
         }
+    }
+
+    #[gpui::test]
+    fn a_tab_saves_as_a_layout_that_the_plus_menu_opens(cx: &mut TestAppContext) {
+        // The middle pane's shell runs npm; the bottom one was opened with claude.
+        let mut state = spaces();
+        let panes = &mut state.spaces[0].tabs[0].panes;
+        panes[1].content = new_shell();
+        panes[1].program = Some("npm".to_string());
+        panes[1].command_line = Some("npm run dev".to_string());
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
+            let requests = requests.clone();
+            client.update(cx, |client, _| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    None
+                })
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.set_visible(true, window, cx);
+            view.focus_active(window, cx);
+        });
+        cx.run_until_parked();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|_, cx| {
+            let saved = saved.clone();
+            cx.subscribe(&view, move |_, event: &SpacesViewEvent, _| {
+                if let SpacesViewEvent::SaveLayout { root, panes, name } = event {
+                    let panes: Vec<(PaneId, Option<String>)> = panes
+                        .iter()
+                        .map(|pane| (pane.id, pane.command.clone()))
+                        .collect();
+                    *saved.borrow_mut() = Some((root.clone(), panes, name.clone()));
+                }
+            })
+            .detach();
+        });
+
+        cx.dispatch_action(SaveLayout);
+        cx.run_until_parked();
+        let (root, panes, name) = saved.borrow_mut().take().expect("Save Layout asks");
+        assert_eq!(root, spaces().spaces[0].tabs[0].root);
+        assert_eq!(
+            panes,
+            [
+                (PaneId(3), None),
+                (PaneId(4), Some("npm run dev".to_string())),
+                (PaneId(5), Some("claude".to_string())),
+            ]
+        );
+        assert_eq!(name, None);
+
+        let layout = LayoutNode::of(&root, &|pane| {
+            (pane == PaneId(5)).then(|| "claude".to_string())
+        });
+        cx.update(|_, cx| {
+            AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(
+                    |settings| {
+                        settings.save_layout(crate::app_settings::SavedLayout {
+                            name: "dev".to_string(),
+                            layout: layout.clone(),
+                        })
+                    },
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let plus = cx
+            .debug_bounds("new-tab-menu")
+            .expect("with a saved layout, + is a menu");
+        cx.simulate_click(plus.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        for _ in 0..2 {
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        }
+        // New Tab, then the layout.
+        cx.dispatch_action(menu::SelectLast);
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        let spaces_requests: Vec<Request> = requests
+            .borrow_mut()
+            .drain(..)
+            .filter(|request| matches!(request, Request::Spaces(_)))
+            .collect();
+        assert_eq!(
+            spaces_requests,
+            [Request::Spaces(SpaceRequest::CreateTabFromLayout {
+                space: SpaceId(1),
+                layout,
+            })]
+        );
     }
 
     #[gpui::test]
