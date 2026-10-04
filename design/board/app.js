@@ -107,7 +107,7 @@ function renderTopic(topic) {
   const issues = topic.issues?.length ? `<ul>${topic.issues.map((issue) => `<li>${issue}</li>`).join('')}</ul>` : '';
   return `<div class="crumb">${esc(topic.section)} · ${index + 1} of ${TOPICS.length}</div>
     <h2>${esc(topic.title)}</h2>
-    <div class="kind">${isMulti ? '<b>Pick any</b> — these are separate features; want as many as you like.' : '<b>Pick one</b>, then <b>+ Also</b> on any others to take parts of (say which in their comment).'} Keys: <b>1–5</b> pick, <b>← →</b> topics.</div>
+    <div class="kind">${isMulti ? '<b>Pick any</b> — these are separate features; want as many as you like.' : '<b>Pick one</b>, then <b>+ Also</b> on any others to take parts of (say which in their comment).'} Keys: <b>1–${Math.min(9, topic.options.length)}</b> pick, <b>← →</b> topics.</div>
     <div class="today ${topic.nowImg ? '' : 'noimg'}"><div><h4>Today</h4><p>${topic.now}</p>${issues}</div>${topic.nowImg ? `<img src="${topic.nowImg}" alt="The current ${esc(topic.title)}" data-cap="Today: ${esc(topic.title)}">` : ''}</div>
     <div class="grid ${topic.size || 'wide'}">${options}</div>
     <div class="after">
@@ -277,7 +277,7 @@ document.addEventListener('keydown', (event) => {
     else if (TOPICS[index + step]) location.hash = TOPICS[index + step].id;
     else if (step > 0) location.hash = 'summary';
   }
-  if (index >= 0 && /^[1-5]$/.test(event.key)) {
+  if (index >= 0 && /^[1-9]$/.test(event.key)) {
     const option = TOPICS[index].options[Number(event.key) - 1];
     if (option) setPick(TOPICS[index], option.key);
   }

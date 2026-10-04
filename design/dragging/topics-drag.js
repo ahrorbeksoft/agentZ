@@ -30,8 +30,8 @@ const tabPanes = ({ claude = {}, shell = {}, dev = {} } = {}) => split('h', 0.56
 const W = 760, H = 420;
 const PX = 385, PY = 170;
 const RIGHT_HALF = 'left:213px;top:36px;width:212px;height:384px';
-const paneScene = ({ panes = {}, drop = floating(`${RIGHT_HALF};${shade};z-index:12`, ''), carried = '', tabs = tabBar([['agents', 'working'], ['server'], ['Tab 3']]) } = {}) =>
-  frame(main(tabs, tabPanes(panes), drop + carried + pointer(PX, PY)), { w: W, h: H });
+const paneScene = ({ panes = {}, layout, drop = floating(`${RIGHT_HALF};${shade};z-index:12`, ''), carried = '', tabs = tabBar([['agents', 'working'], ['server'], ['Tab 3']]) } = {}) =>
+  frame(main(tabs, layout ?? tabPanes(panes), drop + carried + pointer(PX, PY)), { w: W, h: H });
 
 // The small preview: the pane's header and the top of its screen, drawn small.
 const miniPane = (name, x, y, { w = 240, h = 150, style = '' } = {}) => {
@@ -40,6 +40,12 @@ const miniPane = (name, x, y, { w = 240, h = 150, style = '' } = {}) => {
     `<div class="row g15" style="height:24px;padding:0 8px;background:var(--ed);border-bottom:1px solid var(--bv);font-size:11px;flex:none">${p.lead}<span>${p.title}</span><span class="mu trunc">storefront</span></div>${term(p.body, 'font-size:8.5px;line-height:12px;padding:4px 6px')}`);
 };
 const PREVIEW = miniPane('dev', PX + 10, PY + 10);
+// The whole pane, header and all of its screen: npm run dev is 334×192, grabbed by its header
+// 60 pixels in.
+const DEV_W = 334, DEV_H = 192, GRAB_X = 60, GRAB_Y = 14;
+const wholePane = (style = '') => `<div style="width:${DEV_W}px;height:${DEV_H}px;display:flex;border:1px solid var(--b);${style}">${tabPane('dev')}</div>`;
+const atGrab = (style, html) => floating(`left:${PX - GRAB_X}px;top:${PY - GRAB_Y}px;box-shadow:0 14px 34px rgba(0,0,0,.6);${style}`, html);
+const WHOLE_SEE_THROUGH = atGrab('opacity:.6', wholePane());
 
 // 1. What follows the pointer ------------------------------------------------------------
 TOPICS.push({
@@ -81,10 +87,54 @@ TOPICS.push({
         drop: floating(`${RIGHT_HALF};${shade};z-index:12;display:grid;place-items:center`, '<span class="sm" style="background:var(--panel);border:1px solid var(--b);border-radius:5px;padding:3px 8px">npm run dev → right of Claude Code</span>'),
       }),
     },
+    {
+      key: 'F', name: 'The whole pane, slightly dimmed', from: 'new',
+      desc: 'A picture of the whole pane, its header and all of its screen, slightly dimmed. How big it is and where it sits are the next topic\'s variants: at full size held where you grabbed it (shown here), at half size, or drawn in the spot it will land.',
+      good: 'Nothing about the pane is left out.', cost: 'At full size it covers a lot; see the next topic.',
+      mock: () => paneScene({ carried: WHOLE_SEE_THROUGH }),
+    },
   ],
 });
 
-// 2. The pane left behind ----------------------------------------------------------------
+// 2. The whole pane, dimmed --------------------------------------------------------------
+TOPICS.push({
+  id: 'pane-whole', section: 'Panes', title: 'The whole pane, slightly dimmed', size: 'wide', rec: 'D',
+  now: 'Nothing like it today. If you pick F in the first topic, these are the ways it could look. npm run dev, grabbed by its header, is over Claude Code\'s right edge, so dropping puts it on the right of Claude Code. D and E show the drop themselves, in place of the shading of "Where the pane will land".',
+  options: [
+    {
+      key: 'A', name: 'Full size, see-through', from: 'GPUI\'s default drag (the element moves, held where you grabbed it)',
+      desc: 'The whole pane at its own size, at 60%, held where you grabbed its header, so the target\'s shading shows through it.',
+      good: 'Exactly what you picked up, where your hand is.', cost: 'Big panes cover most of the tab; its text mixes with the text under it.',
+      mock: () => paneScene({ carried: WHOLE_SEE_THROUGH }),
+    },
+    {
+      key: 'B', name: 'Full size, darkened', from: 'new',
+      desc: 'As A, but solid and a little darker, with a shadow: nothing shows through it.',
+      good: 'Reads cleanly; no text over text.', cost: 'Hides whatever is under it, often part of the target.',
+      mock: () => paneScene({ carried: atGrab('', wholePane('filter:brightness(.72)')) }),
+    },
+    {
+      key: 'C', name: 'Half size', from: 'new',
+      desc: 'The whole pane shrunk to half its size (all of it, keeping its shape), at 85%, just past the pointer.',
+      good: 'All of the pane, at a size that leaves the target in view.', cost: 'Text in a big pane gets too small to read; the shape matters more than the words.',
+      mock: () => paneScene({ carried: floating(`left:${PX + 10}px;top:${PY + 10}px;width:${DEV_W / 2}px;height:${DEV_H / 2}px;overflow:hidden;opacity:.85;border-radius:4px;box-shadow:0 12px 30px rgba(0,0,0,.55)`, `<div style="transform:scale(.5);transform-origin:0 0">${wholePane()}</div>`) }),
+    },
+    {
+      key: 'D', name: 'Drawn where it will land', from: 'new (macOS shows a window\'s tiled size before you let go)',
+      desc: 'Nothing follows the pointer. The spot it would take shows the pane in it, dimmed, at the size it will get: the half it splits off, or all of the pane for a swap. Pairs with the tab chip at the pointer (A in the first topic) if you want something in your hand too.',
+      good: 'Shows exactly where and how big it will be, with no copy in the way.', cost: 'The screen is cut to the new size until you drop it and it redraws.',
+      mock: () => paneScene({ drop: floating(`${RIGHT_HALF};z-index:12;display:flex;background:var(--ed);box-shadow:inset 0 0 0 1px var(--b)`, `<div style="flex:1;display:flex;min-width:0;opacity:.6">${tabPane('dev')}</div>`) }),
+    },
+    {
+      key: 'E', name: 'The layout you\'ll get', from: 'new',
+      desc: 'The tab shows the result while you hover: Claude Code narrows, npm run dev sits on its right, dimmed with a dashed outline, and its old place closes up so Shell fills the column. Moving on to another spot redraws it; letting go keeps it.',
+      good: 'What you see is what you get, all of it.', cost: 'Every pane moves each time you cross into a new spot, which is busy for a long drag.',
+      mock: () => paneScene({ drop: '', layout: split('h', 0.56, split('h', 0.5, tabPane('claude'), tabPane('dev', { style: 'opacity:.6;border:1.5px dashed var(--ac)' })), tabPane('shell')) }),
+    },
+  ],
+});
+
+// 3. The pane left behind ----------------------------------------------------------------
 TOPICS.push({
   id: 'pane-source', section: 'Panes', title: 'The pane you\'re moving, while you drag', size: 'wide', rec: 'B',
   now: 'It stays exactly as it was, focused (clicking its header to start the drag focuses it). Shown here with the small preview (B above).',
@@ -118,7 +168,7 @@ TOPICS.push({
   ],
 });
 
-// 3. Where it will land ------------------------------------------------------------------
+// 4. Where it will land ------------------------------------------------------------------
 const verbBadge = (icon, text) => `<span class="row g1" style="height:22px;padding:0 8px;border-radius:4px;border:1px solid rgba(116,173,232,.4);background:rgba(116,173,232,.12);color:var(--ac);font-size:12px;font-weight:500">${ic(icon, 'xs')}${text}</span>`;
 TOPICS.push({
   id: 'pane-drop', section: 'Panes', title: 'Where the pane will land', size: 'wide', rec: 'C',
@@ -150,7 +200,7 @@ TOPICS.push({
   ],
 });
 
-// 4–5. Tabs -----------------------------------------------------------------------------
+// 5–7. Tabs -----------------------------------------------------------------------------
 // Tabs: agents 0–83, server 83–154, Tab 3 154–218. server (docker compose up beside a shell)
 // is dragged onto agents.
 const TABS = { agents: ['agents', 'working'], server: ['server'], three: ['Tab 3'] };
@@ -169,6 +219,48 @@ const miniBox = (lead, title, lines) => `<div class="col" style="flex:1;min-widt
 const TAB_PREVIEW = floating(`left:${TX + 10}px;top:${TY + 10}px;width:230px;height:150px;border:1px solid var(--b);border-radius:6px;overflow:hidden;box-shadow:0 12px 30px rgba(0,0,0,.55);display:flex;flex-direction:column;background:var(--ed)`,
   `<div class="row g15" style="height:24px;padding:0 8px;border-bottom:1px solid var(--bv);font-size:11px;flex:none"><span>server</span><span class="mu">2 panes</span></div>
   <div class="row" style="flex:1;min-height:0;align-items:stretch">${miniBox(ic('terminal', 'xs'), 'docker compose up', DOCKER)}<div style="width:1px;background:var(--b)"></div>${miniBox(ic('terminal', 'xs'), 'Shell', SCREENS.shell)}</div>`);
+
+// The tab sliding along the bar, on a 6-second loop: nine tabs, more than the 523-pixel bar
+// holds; server, grabbed 50 pixels in, slides left past agents (which moves over to make room)
+// and back.
+const SLIDE = [['agents', 'working', 84], ['server', null, 72], ['Tab 3', null, 64], ['tests', null, 64], ['docs', null, 60], ['deploy', null, 72], ['logs', null, 60], ['review', null, 70], ['Tab 9', null, 64]];
+const BAR_W = 523, SLIDE_GRAB = 50;
+const SLIDE_MOTION = `<style>
+@keyframes dz-drag { 0%, 8% { transform: translateX(0) } 40%, 60% { transform: translateX(-78px) } 92%, 100% { transform: translateX(0) } }
+@keyframes dz-room { 0%, 24% { transform: translateX(0) } 30%, 76% { transform: translateX(72px) } 82%, 100% { transform: translateX(0) } }
+@keyframes dz-hop { 0%, 24% { transform: translateX(0) } 26%, 76% { transform: translateX(72px) } 78%, 100% { transform: translateX(0) } }
+@keyframes dz-jump { 0%, 24% { transform: translateX(0) } 26%, 76% { transform: translateX(-84px) } 78%, 100% { transform: translateX(0) } }
+@keyframes dz-scroll { 0%, 12% { transform: translateX(0) } 70%, 90% { transform: translateX(-87px) } 100% { transform: translateX(0) } }
+@keyframes dz-fade { 0%, 12% { opacity: 0 } 30%, 90% { opacity: 1 } 100% { opacity: 0 } }
+</style>`;
+const loop = (name) => `animation:${name} 6s ease-in-out infinite`;
+const slideTab = ([name, state, w], x, { on = false, style = '' } = {}) => `<div class="tab ${on ? 'on' : ''}" style="position:absolute;top:0;left:${x}px;width:${w}px;height:${on ? 36 : 35}px;margin:0;${style}">${dot(state)}${name}</div>`;
+const slideBar = (inner) => `<div class="tabbar"><div style="position:relative;flex:1;align-self:flex-start;height:36px;overflow:hidden">${inner}</div><div class="end">${ibtn('plus')}</div></div>`;
+const PLAIN = 'background:var(--panel);border-left:1px solid var(--b);z-index:2';
+const RAISED = 'background:var(--sel);color:var(--t);border:1px solid #5a606c;height:36px;box-shadow:0 4px 14px rgba(0,0,0,.6);z-index:2';
+// The bar with server carried by `motion`, and agents making room by `room`.
+const slidingTabs = (look, { motion = 'dz-drag', room = 'dz-room' } = {}) => {
+  let x = 0;
+  return slideBar(SLIDE.map((tab) => {
+    const left = x;
+    x += tab[2];
+    if (tab[0] === 'server') return slideTab(tab, left, { style: `${look};${loop(motion)}` });
+    return slideTab(tab, left, { on: tab[0] === 'agents', style: tab[0] === 'agents' ? loop(room) : '' });
+  }).join(''));
+};
+// Held at the bar's right end: the other tabs scroll left under it, and the left end fades
+// once tabs are out of sight there.
+const scrollingTabs = () => {
+  let x = 0;
+  const others = SLIDE.filter(([name]) => name !== 'server').map((tab) => {
+    const left = x;
+    x += tab[2];
+    return slideTab(tab, left, { on: tab[0] === 'agents' });
+  }).join('');
+  return slideBar(`<div style="position:absolute;left:0;top:0;right:${SLIDE[1][2]}px;height:36px;overflow:hidden"><div style="position:absolute;inset:0;${loop('dz-scroll')}">${others}</div><div style="position:absolute;left:0;top:0;width:56px;height:35px;background:linear-gradient(90deg,var(--panel) 20%,transparent);z-index:3;${loop('dz-fade')}"></div></div>${slideTab(SLIDE[1], BAR_W - SLIDE[1][2], { style: RAISED })}`);
+};
+const slideScene = (bar, { pointerX = SLIDE[0][2] + SLIDE_GRAB, motion = loop('dz-drag') } = {}) =>
+  frame(SLIDE_MOTION + main(bar, tabPanes()) + `<div style="position:absolute;left:0;top:0;z-index:40;${motion}">${pointer(pointerX, TY)}</div>`, { w: 560, h: 240 });
 TOPICS.push({
   id: 'tab-preview', section: 'Tabs', title: 'What follows the pointer when you drag a tab', size: 'medium', rec: 'C',
   now: 'The same small label as for panes follows the pointer, and the tab it\'s over is shaded; dropping puts the dragged tab in that tab\'s place. Here server (docker compose up beside a shell) is dragged onto agents.',
@@ -202,12 +294,49 @@ TOPICS.push({
       good: 'Puts your eye on the tab bar, where the drop happens.', cost: 'The whole view flickers darker for a short drag.',
       mock: () => frame(main(shadedTabs(), tabPanes({ claude: { style: 'opacity:.4' }, shell: { style: 'opacity:.4' }, dev: { style: 'opacity:.4' } })) + liftedTab() + pointer(TX, TY), { w: 560, h: 240 }),
     },
+    {
+      key: 'F', name: 'The tab slides along the bar', from: 't3code sidebar rows (dnd-kit, held to one axis), turned sideways',
+      desc: 'The tab itself, as in B, but it only moves sideways and stays in the bar, and the other tabs move aside as it passes them, so the order changes while you drag. The bar scrolls when you hold it near an end. The next topic has variants of how it looks; this one moves.',
+      good: 'Moves like the tab it is; the order you see is the order you get.', cost: 'Tabs move while you drag: the most to build.',
+      mock: () => slideScene(slidingTabs(RAISED)),
+    },
+  ],
+});
+
+TOPICS.push({
+  id: 'tab-slide', section: 'Tabs', title: 'The tab slides along the bar', size: 'medium', rec: 'B',
+  now: 'Nothing like it today. If you pick F in the first Tabs topic, these are the ways it could look. Each one moves: server slides left past agents, which moves over to take its place, then back. In all of them the tab stays in the bar however far up or down the pointer goes, letting go leaves it where it is, and there are more tabs than fit.',
+  options: [
+    {
+      key: 'A', name: 'Slides, as it is', from: 't3code sidebar rows (dnd-kit, held to one axis), turned sideways',
+      desc: 'The tab keeps its usual look and moves with the pointer. When its edge passes the middle of the next tab, that tab slides over into the old place.',
+      good: 'Plain; the motion alone says what\'s happening.', cost: 'A tab that isn\'t open looks like any other while it moves.',
+      mock: () => slideScene(slidingTabs(PLAIN)),
+    },
+    {
+      key: 'B', name: 'Slides, raised', from: 'Zed dragged tab (a copy held where you grabbed it), kept in the bar',
+      desc: 'As A, and the tab is raised while you hold it: a lighter background, full-strength text and a shadow, so it stands apart from the tabs it passes.',
+      good: 'Always clear which tab is in your hand.', cost: 'A shadow in a 36-pixel bar can look heavy.',
+      mock: () => slideScene(slidingTabs(RAISED)),
+    },
+    {
+      key: 'C', name: 'Jumps from place to place', from: 'new',
+      desc: 'Nothing floats. The tab stays lined up with the others, and when the pointer passes the middle of the next tab, the two swap at once.',
+      good: 'Simplest to build; the bar is always neat.', cost: 'Moves in jumps, and between them the tab lags behind the pointer.',
+      mock: () => slideScene(slidingTabs(PLAIN, { motion: 'dz-jump', room: 'dz-hop' })),
+    },
+    {
+      key: 'D', name: 'At the ends, the bar scrolls', from: 't3code sidebar (dnd-kit scrolls its list while you drag near an end)',
+      desc: 'Add to any of the above: held near an end of the bar, the tab stays put and the bar scrolls under it, faster the closer to the edge, and the tabs it passes go behind it. The end with tabs out of sight fades out.',
+      good: 'Reaches tabs you can\'t see without letting go.', cost: 'Easy to overshoot when it scrolls fast.',
+      mock: () => slideScene(scrollingTabs(), { pointerX: BAR_W - SLIDE[1][2] + SLIDE_GRAB, motion: '' }),
+    },
   ],
 });
 
 TOPICS.push({
   id: 'tab-drop', section: 'Tabs', title: 'Where the tab will land', size: 'medium', rec: 'C',
-  now: 'The tab under the pointer is shaded gray, and the dragged tab takes its place. The tab you\'re moving stays as it is. Shown here with the small preview of the tab.',
+  now: 'The tab under the pointer is shaded gray, and the dragged tab takes its place. The tab you\'re moving stays as it is. Shown here with the small preview of the tab. If the tab slides along the bar (F in the first Tabs topic), the order changes as you drag and that settles this topic: it\'s C.',
   options: [
     {
       key: 'A', name: 'Shaded tab (today)', from: 'Zed tab drop',
@@ -235,7 +364,7 @@ TOPICS.push({
   ],
 });
 
-// 6. Workspace rows ----------------------------------------------------------------------
+// 8. Workspace rows ----------------------------------------------------------------------
 // Rows are about 54 pixels apart from y 40: storefront, brave-otter, api, Release notes, ~.
 // api is dragged onto storefront.
 const space = (id) => SPACES.find((s) => s.id === id);
