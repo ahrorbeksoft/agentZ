@@ -54,4 +54,4 @@ Notes for whoever continues:
 | 17 | 19E | Shortcut sheet (Cmd-/), by focus | done (df4e01b) |
 | 18 | 16 | Command palette (Cmd-K) | done (the user split it in two, Zed's keys: Cmd-Shift-P for actions, Cmd-P to go to workspaces, tabs, panes and threads, in both views) |
 | 19 | 14 | Save a tab as a layout | done (the user chose to keep layouts in the app, so one opens in any workspace on any machine) |
-| 20 | 19D | Notes pane (needs a multi-line editor) | not started |
+| 20 | 19D | Notes pane (needs a multi-line editor) | cancelled by the user |
