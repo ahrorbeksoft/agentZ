@@ -264,14 +264,43 @@ struct DraggedLabel<T> {
     label: SharedString,
 }
 
-impl<T: 'static> Render for DraggedLabel<T> {
+impl<T> DraggedLabel<T> {
+    fn preview(
+        &self,
+        click_offset: Point<Pixels>,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Entity<DragPreview> {
+        cx.new(|_| DragPreview {
+            label: self.label.clone(),
+            click_offset,
+        })
+    }
+}
+
+/// A dragged label, drawn just past the pointer as Zed's project panel draws a dragged file.
+/// GPUI draws it where the dragged element was, moved as the pointer moves, so without the
+/// offset a pane's header dragged by its far end leaves the label far behind.
+struct DragPreview {
+    label: SharedString,
+    /// Where in the dragged element the drag started.
+    click_offset: Point<Pixels>,
+}
+
+impl Render for DragPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .elevation_2(cx)
-            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+            .pl(self.click_offset.x + px(12.))
+            .pt(self.click_offset.y + px(12.))
+            .child(
+                div()
+                    .debug_selector(|| "drag-preview".into())
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .elevation_2(cx)
+                    .child(Label::new(self.label.clone()).size(LabelSize::Small)),
+            )
     }
 }
 
@@ -1997,7 +2026,7 @@ impl SpacesView {
                         item: key,
                         label: label.clone(),
                     },
-                    |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                    |dragged, click_offset, window, cx| dragged.preview(click_offset, window, cx),
                 )
                 .drag_over::<DraggedLabel<SpaceKey>>(move |style, dragged, _, cx| {
                     if dragged.item.machine == machine {
@@ -3169,7 +3198,7 @@ impl SpacesView {
                     item: dragged_tab,
                     label: label.clone(),
                 },
-                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                |dragged, click_offset, window, cx| dragged.preview(click_offset, window, cx),
             )
             .drag_over::<DraggedLabel<DraggedTab>>(move |style, dragged, _, cx| {
                 if dragged.item.space == space_key {
@@ -3537,7 +3566,7 @@ impl SpacesView {
                     },
                     label: title,
                 },
-                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                |dragged, click_offset, window, cx| dragged.preview(click_offset, window, cx),
             );
         let menu = self.pane_menu(key, pane, is_zoomed, cx);
         let header = right_click_menu(key.element_id("pane-menu"))
@@ -4444,6 +4473,11 @@ mod tests {
         start_drag(cx);
         let edge = gpui::point(left.left() + px(5.), left.center().y);
         cx.simulate_mouse_move(edge, MouseButton::Left, none);
+        // The label follows just past the pointer, wherever on the header the drag started.
+        let preview = cx
+            .debug_bounds("drag-preview")
+            .expect("the dragged pane's label shows");
+        assert_eq!(preview.origin, edge + gpui::point(px(12.), px(12.)));
         let overlay = cx
             .debug_bounds("pane-drop-3")
             .expect("the left half lights up");
