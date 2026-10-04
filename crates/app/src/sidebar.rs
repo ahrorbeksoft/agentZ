@@ -2374,7 +2374,7 @@ pub(crate) fn thread_agent_icon(thread: &Thread, cx: &App) -> Icon {
 
 /// Purple, apart from the other statuses' colors. Every bundled theme's fourth player color is
 /// one, and `Color::Player` skips the first (the local user's).
-const AWAITING_INPUT_COLOR: Color = Color::Player(2);
+pub(crate) const AWAITING_INPUT_COLOR: Color = Color::Player(2);
 
 /// t3code's status pill: a dot and a label in the status color.
 pub(crate) fn render_status_pill(status: ThreadStatus, cx: &App) -> impl IntoElement {

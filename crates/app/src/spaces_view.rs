@@ -2335,6 +2335,22 @@ impl SpacesView {
             )
     }
 
+    /// The agents in panes waiting on the user, and the most urgent of their states.
+    pub fn waiting(&self, cx: &App) -> (usize, Option<ThreadStatus>) {
+        let statuses: Vec<ThreadStatus> = self
+            .agent_entries(cx)
+            .into_iter()
+            .filter_map(|entry| entry.status)
+            .filter(|status| {
+                matches!(
+                    status,
+                    ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput
+                )
+            })
+            .collect();
+        (statuses.len(), rolled_up(statuses.into_iter()))
+    }
+
     /// The agents waiting on the user (an approval or an answer), in a tinted strip above the
     /// workspaces, each with Go. Nothing shows while none waits.
     fn render_needs_you(&self, has_remotes: bool, cx: &mut Context<Self>) -> Option<AnyElement> {

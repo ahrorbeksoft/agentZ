@@ -28,7 +28,7 @@ use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
 use crate::server_client::MachineStatus;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
-use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
+use crate::sidebar::{AWAITING_INPUT_COLOR, SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
@@ -311,6 +311,33 @@ impl Shell {
             should_move_window: false,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The Agents view's threads waiting on the user, and the most urgent of their states.
+    fn waiting_threads(&self, cx: &App) -> (usize, Option<ThreadStatus>) {
+        let machines = self.machines.read(cx);
+        let statuses: Vec<ThreadStatus> = machines
+            .active_threads(cx)
+            .into_iter()
+            .filter_map(|(machine, thread)| {
+                machines
+                    .projects(machine, cx)?
+                    .read(cx)
+                    .thread_status(thread.id)
+            })
+            .filter(|status| {
+                matches!(
+                    status,
+                    ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput
+                )
+            })
+            .collect();
+        let most_urgent = if statuses.contains(&ThreadStatus::PendingApproval) {
+            Some(ThreadStatus::PendingApproval)
+        } else {
+            statuses.first().copied()
+        };
+        (statuses.len(), most_urgent)
     }
 
     /// The app's copy of a thread on any machine.
@@ -1083,6 +1110,27 @@ impl Shell {
             })
         };
         let shows_switcher = self.view == MainView::Agents;
+        // The other view's agents waiting on the user, counted beside its side of the switch.
+        let badge = match self.view {
+            MainView::Agents => {
+                let (count, status) = self.spaces_view.read(cx).waiting(cx);
+                status.map(|status| (false, count, status))
+            }
+            MainView::Workspaces => {
+                let (count, status) = self.waiting_threads(cx);
+                status.map(|status| (true, count, status))
+            }
+        };
+        let (badge_before, badge_after) = match badge {
+            Some((true, count, status)) => (Some(render_waiting_badge(count, status, cx)), None),
+            Some((false, count, status)) => (None, Some(render_waiting_badge(count, status, cx))),
+            None => (None, None),
+        };
+        let view_tabs = h_flex()
+            .gap_1p5()
+            .children(badge_before)
+            .child(view_tabs)
+            .children(badge_after);
 
         h_flex()
             .id("title-bar")
@@ -1286,6 +1334,30 @@ impl Focusable for Shell {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+/// A count in the most urgent waiting state's color, for the view switch.
+fn render_waiting_badge(count: usize, status: ThreadStatus, cx: &App) -> Div {
+    let color = match status {
+        ThreadStatus::PendingApproval => cx.theme().status().warning,
+        _ => AWAITING_INPUT_COLOR.color(cx),
+    };
+    div()
+        .min_w(px(16.))
+        .h(px(16.))
+        .px_1()
+        .rounded_full()
+        .bg(color)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Label::new(count.to_string())
+                .size(LabelSize::XSmall)
+                .line_height_style(LineHeightStyle::UiLabel)
+                .weight(gpui::FontWeight::BOLD)
+                .color(Color::Custom(cx.theme().colors().editor_background)),
+        )
 }
 
 impl Render for Shell {

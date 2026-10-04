@@ -29,7 +29,7 @@ Notes for whoever continues:
 | 9 | 15 | Delete Worktree Checkout…; fuller New Worktree dialog | done |
 | 10 | 6 | Hover details: git at a glance | done |
 | 11 | 3E | "Needs you" strip on top of the sidebar | done |
-| 12 | 17 | Badge on the Agents / Workspaces switch | not started |
+| 12 | 17 | Badge on the Agents / Workspaces switch | done |
 | 13 | 13 | New workspace picker: Recent first, Open marks | not started |
 | 14 | 11 | Split menu: Shell, agent CLIs on the machine, New Thread | not started |
 | 15 | 10 | Drag a pane: edges split, middle swaps | not started |

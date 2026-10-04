@@ -101,7 +101,9 @@ Each entry: what it does, where it lives, and where it comes from.
 ### Window, sidebar and settings
 
 - **Window** (`shell.rs`): title bar with the sidebar toggle (Cmd-B), project switcher,
-  connection status, and Agents | Workspaces tabs; the sidebar; the open thread or settings; the
+  connection status, and Agents | Workspaces tabs, the view not shown counting its agents
+  waiting for an approval or an answer beside its side, in the most urgent one's color; the
+  sidebar; the open thread or settings; the
   diff panel; modals, which close on a press outside them. The connection status
   (`Shell::render_connection_status`, the user's choice of designs) is each machine that can't
   be reached or runs an older server, by its own icon with a dot: accent for an update,
