@@ -20,6 +20,7 @@ mod registry_store;
 mod server_client;
 mod settings_page;
 mod shell;
+mod shortcut_sheet;
 mod sidebar;
 mod spaces_view;
 mod terminal_drawer;
@@ -64,6 +65,8 @@ actions!(
         ToggleSidebar,
         /// Opens or closes the terminal under the open thread.
         ToggleTerminalDrawer,
+        /// Lists the shortcuts for what's focused, and the app's.
+        ShowShortcuts,
     ]
 );
 
@@ -146,6 +149,8 @@ fn bind_keys(cx: &mut App) {
         // Zed's key for its left dock.
         KeyBinding::new("secondary-b", ToggleSidebar, context),
         KeyBinding::new("secondary-j", ToggleTerminalDrawer, context),
+        // herdr's help is prefix-?; Cmd-? is macOS's Help menu search.
+        KeyBinding::new("secondary-/", ShowShortcuts, context),
     ]);
 }
 
@@ -206,6 +211,7 @@ fn main() {
             worktree_modal::init(cx);
             machine_modal::init(cx);
             confirm_dialog::init(cx);
+            shortcut_sheet::init(cx);
             agent_view::init(cx);
             agent_login::init(cx);
             elicitation_card::init(cx);

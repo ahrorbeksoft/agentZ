@@ -49,7 +49,7 @@ use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
 use crate::{ToggleDiff, ToggleTerminalDrawer};
 
-const KEY_CONTEXT: &str = "AgentComposer";
+pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
 const RENAME_KEY_CONTEXT: &str = "ThreadHeaderRename";
 
 gpui::actions!(

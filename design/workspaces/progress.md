@@ -48,8 +48,8 @@ Notes for whoever continues:
 | 14 | 11 | Split menu: Shell, New Thread | done (a15a4bd, 07b7f86; agent CLIs dropped after) |
 | — | — | Threads started in panes (above; designs in `design/pane-threads/`) | done |
 | 15 | 10 | Drag a pane: edges split, middle swaps | done (6da7f7a) |
-| 16 | 18 | Find in terminal (Cmd-F) | done |
-| 17 | 19E | Shortcut sheet (Cmd-/), by focus | not started |
+| 16 | 18 | Find in terminal (Cmd-F) | done (defd471) |
+| 17 | 19E | Shortcut sheet (Cmd-/), by focus | done |
 | 18 | 16 | Command palette (Cmd-K) | not started |
 | 19 | 14 | Save a tab as a layout | not started |
 | 20 | 19D | Notes pane (needs a multi-line editor) | not started |

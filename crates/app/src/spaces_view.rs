@@ -52,9 +52,9 @@ use crate::thread_entity::AgentThread;
 use crate::worktree_modal::WorktreeModalMode;
 use agentz_protocol::workspace::WorkspaceRemoval;
 
-const KEY_CONTEXT: &str = "Workspaces";
+pub(crate) const KEY_CONTEXT: &str = "Workspaces";
 const RENAME_KEY_CONTEXT: &str = "WorkspacesRename";
-const SEARCH_KEY_CONTEXT: &str = "WorkspacesSearch";
+pub(crate) const SEARCH_KEY_CONTEXT: &str = "WorkspacesSearch";
 /// The grab area of a split's border. The line drawn in its middle is a pixel wide.
 const DIVIDER_SIZE: Pixels = px(5.);
 /// How far a worktree's row sits in from its parent's.

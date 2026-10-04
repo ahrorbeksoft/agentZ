@@ -26,9 +26,9 @@ use crate::terminal_mouse::{
     mouse_moved_report, scroll_report,
 };
 
-const KEY_CONTEXT: &str = "Terminal";
+pub(crate) const KEY_CONTEXT: &str = "Terminal";
 /// The find bar's, outside the terminal's so the keys typed there don't reach the shell.
-const FIND_KEY_CONTEXT: &str = "TerminalFind";
+pub(crate) const FIND_KEY_CONTEXT: &str = "TerminalFind";
 
 /// How far the pointer moves before a press becomes a selection, as gpui's `div` drags.
 const SELECTION_DRAG_THRESHOLD: f64 = 2.0;

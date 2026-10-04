@@ -109,6 +109,12 @@ Each entry: what it does, where it lives, and where it comes from.
   be reached or runs an older server, by its own icon with a dot: accent for an update,
   warning for attention, dim while it reconnects. Its tooltip says which and why, and a click
   opens Settings › Machines.
+- **Shortcuts** (`shortcut_sheet.rs`, herdr's keybind help): Cmd-/ shows the shortcuts of
+  what's focused first (a terminal, its find bar, a thread's message editor, a sidebar's
+  search), then the Workspaces view's and the app's, filtered by command or key as you type.
+  Each key is the one that runs from where the sheet was opened (`binding_in`: GPUI's
+  `bindings_for_input` with the focused element's context stack), so a key taken there by
+  another binding isn't listed. Escape closes it and gives focus back.
 - **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
   `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
   favicons or monograms, git branches. The switcher is Zed's recent-projects popover.

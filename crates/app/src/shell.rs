@@ -29,14 +29,15 @@ use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::ProjectSwitcher;
 use crate::server_client::MachineStatus;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
+use crate::shortcut_sheet::ShortcutSheet;
 use crate::sidebar::{AWAITING_INPUT_COLOR, SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
-    NewThread, OpenFolder, OpenSettings, ToggleDiff, ToggleProjectSwitcher, ToggleSidebar,
-    ToggleTerminalDrawer,
+    NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleDiff, ToggleProjectSwitcher,
+    ToggleSidebar, ToggleTerminalDrawer,
 };
 
 pub const KEY_CONTEXT: &str = "Shell";
@@ -113,6 +114,13 @@ impl ThreadView {
     }
 }
 
+struct OpenShortcutSheet {
+    sheet: Entity<ShortcutSheet>,
+    /// What had focus, which gets it back, as Zed's modal layer gives it back.
+    previous_focus: Option<FocusHandle>,
+    _subscription: Subscription,
+}
+
 pub struct Shell {
     focus_handle: FocusHandle,
     machines: Entity<Machines>,
@@ -127,6 +135,7 @@ pub struct Shell {
     worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
     machine_modal: Option<(Entity<MachineModal>, Subscription)>,
     confirm_dialog: Option<(Entity<ConfirmDialog>, Subscription)>,
+    shortcut_sheet: Option<OpenShortcutSheet>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
@@ -289,6 +298,7 @@ impl Shell {
             worktree_modal: None,
             machine_modal: None,
             confirm_dialog: None,
+            shortcut_sheet: None,
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
@@ -888,15 +898,53 @@ impl Shell {
         let had_worktree_modal = self.worktree_modal.take().is_some();
         let had_machine_modal = self.machine_modal.take().is_some();
         let had_confirm_dialog = self.confirm_dialog.take().is_some();
-        if had_new_thread_modal
+        let shortcut_sheet = self.shortcut_sheet.take();
+        if let Some(focus) = shortcut_sheet
+            .as_ref()
+            .and_then(|sheet| sheet.previous_focus.clone())
+        {
+            window.focus(&focus, cx);
+            cx.notify();
+        } else if had_new_thread_modal
             || had_add_project_modal
             || had_worktree_modal
             || had_machine_modal
             || had_confirm_dialog
+            || shortcut_sheet.is_some()
         {
             self.focus_main(window, cx);
             cx.notify();
         }
+    }
+
+    /// Opens the shortcut sheet for what's focused, or closes it.
+    fn toggle_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shortcut_sheet.is_some() {
+            self.dismiss_modal(window, cx);
+            return;
+        }
+        // Another modal shows first, so the sheet would take its focus unseen.
+        if self.new_thread_modal.is_some()
+            || self.add_project_modal.is_some()
+            || self.worktree_modal.is_some()
+            || self.machine_modal.is_some()
+            || self.confirm_dialog.is_some()
+        {
+            return;
+        }
+        let context_stack = window.context_stack();
+        let previous_focus = window.focused(cx);
+        let sheet = cx.new(|cx| ShortcutSheet::new(context_stack, window, cx));
+        let subscription =
+            cx.subscribe_in(&sheet, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            });
+        self.shortcut_sheet = Some(OpenShortcutSheet {
+            sheet,
+            previous_focus,
+            _subscription: subscription,
+        });
+        cx.notify();
     }
 
     /// Focus goes back to what the main area shows.
@@ -1408,6 +1456,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::toggle_diff))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_terminal_drawer))
+            .on_action(cx.listener(Self::toggle_shortcuts))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDiffEdge>, _, cx| {
                     let available = event.bounds.size.width - SIDEBAR_WIDTH - MIN_THREAD_WIDTH;
@@ -1514,6 +1563,11 @@ impl Render for Shell {
                         self.confirm_dialog
                             .as_ref()
                             .map(|(dialog, _)| AnyView::from(dialog.clone()))
+                    })
+                    .or_else(|| {
+                        self.shortcut_sheet
+                            .as_ref()
+                            .map(|open| AnyView::from(open.sheet.clone()))
                     }),
                 |shell, modal| {
                     shell.child(
@@ -1684,6 +1738,50 @@ mod modal_tests {
         cx.simulate_click(point(px(20.), px(500.)), Modifiers::none());
         cx.run_until_parked();
         assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
+    }
+
+    #[gpui::test]
+    fn cmd_slash_shows_the_shortcuts_and_gives_focus_back(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            crate::shortcut_sheet::init(cx);
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            window.focus(&shell.focus_handle, cx)
+        });
+        cx.run_until_parked();
+        let is_open = |cx: &mut gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, _| shell.shortcut_sheet.is_some())
+        };
+
+        cx.simulate_keystrokes("cmd-/");
+        assert!(is_open(cx));
+        assert!(cx.debug_bounds("shortcut-group-General").is_some());
+        // The sheet has the keys while it's open.
+        shell.update_in(cx, |shell, window, _| {
+            assert!(!shell.focus_handle.is_focused(window));
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(!is_open(cx));
+        shell.update_in(cx, |shell, window, _| {
+            assert!(shell.focus_handle.is_focused(window));
+        });
+
+        // Cmd-/ closes it too.
+        cx.simulate_keystrokes("cmd-/");
+        assert!(is_open(cx));
+        cx.simulate_keystrokes("cmd-/");
+        assert!(!is_open(cx));
     }
 
     #[gpui::test]
