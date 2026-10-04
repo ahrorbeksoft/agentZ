@@ -2357,9 +2357,55 @@ fn client_connection(
 /// Keeps the agent's last stderr lines for errors, and logs them.
 fn stderr_reporter(sender: MessageSender) -> Arc<dyn Fn(String) + Send + Sync> {
     Arc::new(move |line: String| {
+        let line = without_terminal_escapes(&line);
         log::warn!("agent stderr: {line}");
         sender.send(MessageKind::Stderr(line)).ok();
     })
+}
+
+/// Agents color their stderr for a terminal even through a pipe (OpenCode's errors start with
+/// a red bold "Error:"), and the codes would show as text in an error.
+fn without_terminal_escapes(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\x1b' {
+            plain.push(character);
+            continue;
+        }
+        match characters.next() {
+            // A control sequence, such as a color: parameters up to a final byte.
+            Some('[') => {
+                for character in characters.by_ref() {
+                    if ('\x40'..='\x7e').contains(&character) {
+                        break;
+                    }
+                }
+            }
+            // An operating system command, such as a hyperlink: up to BEL or ESC \.
+            Some(']') => {
+                while let Some(character) = characters.next() {
+                    if character == '\x07' {
+                        break;
+                    }
+                    if character == '\x1b' && characters.peek() == Some(&'\\') {
+                        characters.next();
+                        break;
+                    }
+                }
+            }
+            // Character set selections and the like: intermediates, then a final byte.
+            Some(character) if ('\x20'..='\x2f').contains(&character) => {
+                for character in characters.by_ref() {
+                    if !('\x20'..='\x2f').contains(&character) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    plain
 }
 
 /// The answer to a prompt, as the SDK would have parsed it.
@@ -2626,6 +2672,21 @@ mod tests {
             new_text: "x\ny\n".into(),
         };
         assert_eq!(created.line_counts(), (2, 0));
+    }
+
+    #[test]
+    fn stderr_loses_terminal_escapes() {
+        assert_eq!(
+            without_terminal_escapes("\x1b[91m\x1b[1mError: \x1b[0mUnexpected error"),
+            "Error: Unexpected error"
+        );
+        assert_eq!(
+            without_terminal_escapes(
+                "Open \x1b]8;;https://example.com/login\x1b\\the page\x1b]8;;\x07 \x1b(Bnow"
+            ),
+            "Open the page now"
+        );
+        assert_eq!(without_terminal_escapes("plain ✓"), "plain ✓");
     }
 
     /// A thread under test, with its inbox pumped by [`Self::wait_until`].
