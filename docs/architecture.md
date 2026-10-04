@@ -541,7 +541,8 @@ since a thread's workspace is its checkout.
   or the program in front of its shell) and where it is, within the workspace as
   "storefront/src" (`Pane::{program, folder}`, which the server looks up with agent detection
   and doesn't save). The title fits before the folder. The header's buttons are Split Right
-  and Split Down (the terminal drawer's icons, each a menu of Shell and New Thread…), Zoom and
+  and Split Down (Zed's split icon, shading the half the new pane takes, and it turned down;
+  each a menu of Shell and New Thread…), Zoom and
   Close; an unfocused pane's show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.

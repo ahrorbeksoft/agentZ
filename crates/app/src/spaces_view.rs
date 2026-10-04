@@ -3384,19 +3384,19 @@ impl SpacesView {
             .filter(|open| open.content == pane.content)
             .map(|open| open.view.clone());
         // A button for each way to split, each a menu of what the new pane holds: a shell or
-        // a thread.
+        // a thread. Their icons shade the half the new pane takes.
         let split_menu = |direction: Direction, cx: &mut Context<Self>| {
             let this = cx.entity().downgrade();
             let (id, icon, title, action): (_, _, _, Box<dyn Action>) = match direction {
                 Direction::Horizontal => (
                     "pane-split-right",
-                    IconName::SquareSplitHorizontal,
+                    IconName::Split,
                     "Split Right",
                     Box::new(SplitRight),
                 ),
                 Direction::Vertical => (
                     "pane-split-down",
-                    IconName::SquareSplitVertical,
+                    IconName::SplitDown,
                     "Split Down",
                     Box::new(SplitDown),
                 ),
