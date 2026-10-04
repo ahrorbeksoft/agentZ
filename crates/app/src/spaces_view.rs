@@ -3100,30 +3100,39 @@ impl SpacesView {
             .get(&key)
             .filter(|open| open.content == pane.content)
             .map(|open| open.view.clone());
-        let split_menu = {
+        // A button for each way to split, each a menu of what the new pane holds: a shell or
+        // a thread.
+        let split_menu = |direction: Direction, cx: &mut Context<Self>| {
             let this = cx.entity().downgrade();
-            PopoverMenu::new(key.element_id("pane-split"))
-                .trigger_with_tooltip(
-                    IconButton::new(key.element_id("pane-split-button"), IconName::Split)
-                        .icon_size(IconSize::Small),
-                    Tooltip::text("Split Pane"),
-                )
-                .anchor(gpui::Anchor::TopRight)
-                .menu(move |window, cx| {
-                    let this = this.clone();
-                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                        // Each way to split: a shell or a thread.
-                        let choices = move |direction: Direction| {
-                            let this = this.clone();
-                            move |menu: ContextMenu,
-                                  _: &mut Window,
-                                  _: &mut Context<ContextMenu>| {
-                                let action: Box<dyn Action> = match direction {
-                                    Direction::Horizontal => Box::new(SplitRight),
-                                    Direction::Vertical => Box::new(SplitDown),
-                                };
-                                let shell = this.clone();
-                                let thread = this.clone();
+            let (id, icon, title, action): (_, _, _, Box<dyn Action>) = match direction {
+                Direction::Horizontal => (
+                    "pane-split-right",
+                    IconName::SquareSplitHorizontal,
+                    "Split Right",
+                    Box::new(SplitRight),
+                ),
+                Direction::Vertical => (
+                    "pane-split-down",
+                    IconName::SquareSplitVertical,
+                    "Split Down",
+                    Box::new(SplitDown),
+                ),
+            };
+            div()
+                .debug_selector(|| format!("{id}-{}", key.pane.0))
+                .child(
+                    PopoverMenu::new(key.element_id(id))
+                        .trigger_with_tooltip(
+                            IconButton::new(key.element_id(&format!("{id}-button")), icon)
+                                .icon_size(IconSize::Small),
+                            Tooltip::text(title),
+                        )
+                        .anchor(gpui::Anchor::TopRight)
+                        .menu(move |window, cx| {
+                            let shell = this.clone();
+                            let thread = this.clone();
+                            let action = action.boxed_clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
                                 menu.entry("Shell", Some(action), move |window, cx| {
                                     shell
                                         .update(cx, |this, cx| {
@@ -3142,13 +3151,12 @@ impl SpacesView {
                                             .ok();
                                     },
                                 )
-                            }
-                        };
-                        menu.submenu("Split Right", choices(Direction::Horizontal))
-                            .submenu("Split Down", choices(Direction::Vertical))
-                    }))
-                })
+                            }))
+                        }),
+                )
         };
+        let split_right = split_menu(Direction::Horizontal, cx);
+        let split_down = split_menu(Direction::Vertical, cx);
         let thread_buttons = match &view {
             Some(PaneView::Agent(view)) => Some(view.update(cx, |view, cx| {
                 view.render_toolbar_buttons(cx).into_any_element()
@@ -3209,7 +3217,8 @@ impl SpacesView {
                     .when(!is_focused, |buttons| {
                         buttons.visible_on_hover(header_group.clone())
                     })
-                    .child(split_menu)
+                    .child(split_right)
+                    .child(split_down)
                     .when(shows_focus || is_zoomed, |buttons| {
                         buttons.child(
                             IconButton::new(key.element_id("pane-zoom"), IconName::Maximize)
@@ -4125,6 +4134,68 @@ mod tests {
                 Request::Spaces(SpaceRequest::SwapPanes(PaneId(4), PaneId(5)))
             ]
         );
+    }
+
+    #[gpui::test]
+    fn each_split_button_splits_its_own_way(cx: &mut TestAppContext) {
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client =
+                ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(), cx);
+            let requests = requests.clone();
+            client.update(cx, |client, _| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    None
+                })
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+        let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
+        assert_eq!(focused.map(|pane| pane.pane), Some(PaneId(3)));
+        // A focused pane's buttons show without the pointer over it.
+        view.update_in(cx, |view, window, cx| view.focus_active(window, cx));
+        cx.run_until_parked();
+        let spaces_requests = || {
+            requests
+                .borrow_mut()
+                .drain(..)
+                .filter(|request| matches!(request, Request::Spaces(_)))
+                .collect::<Vec<_>>()
+        };
+
+        for (button, direction) in [
+            ("pane-split-right-3", Direction::Horizontal),
+            ("pane-split-down-3", Direction::Vertical),
+        ] {
+            let bounds = cx
+                .debug_bounds(button)
+                .expect("the focused pane has the button");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            // A popover menu takes focus two frames after it opens.
+            for _ in 0..2 {
+                cx.update(|window, cx| window.simulate_next_frame(cx));
+                cx.run_until_parked();
+            }
+            // The menu's first entry is Shell.
+            cx.dispatch_action(menu::SelectFirst);
+            cx.dispatch_action(menu::Confirm);
+            cx.run_until_parked();
+            assert_eq!(
+                spaces_requests(),
+                [Request::Spaces(SpaceRequest::SplitPane {
+                    pane: PaneId(3),
+                    direction,
+                    content: new_shell(),
+                })]
+            );
+        }
     }
 
     #[gpui::test]

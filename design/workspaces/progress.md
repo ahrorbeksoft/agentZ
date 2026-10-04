@@ -16,9 +16,11 @@ Notes for whoever continues:
 - §15 is A plus C's dialog, without C's "Open with".
 - §19E: the sheet shows the shortcuts for what's focused (terminal, thread, sidebar) too.
 - §11: after it was built, the user dropped the agent CLIs: Split Right and Split Down offer a
-  shell or a new thread, and nothing scans the machine for agent CLIs.
+  shell or a new thread, and nothing scans the machine for agent CLIs. Later the user asked for
+  two header buttons in place of the one Split menu: Split Right and Split Down, each a menu of
+  Shell and New Thread….
 - Threads started in a pane (the user's decisions after §11):
-  - Every thread started in a pane (New Thread…, Split › New Thread…) is a Workspaces thread,
+  - Every thread started in a pane (New Thread…, a split button's New Thread…) is a Workspaces thread,
     even in a project's folder. It works in the shell's current folder, else the workspace's.
   - The Agents sidebar lists them in a "Workspaces" section just above Archived, styled like
     it. Under All projects it lists all of them; under a project, those whose folder is in it.

@@ -528,8 +528,9 @@ since a thread's workspace is its checkout.
   A terminal pane's header names what runs there (its agent, the command it was opened with,
   or the program in front of its shell) and where it is, within the workspace as
   "storefront/src" (`Pane::{program, folder}`, which the server looks up with agent detection
-  and doesn't save). The title fits before the folder, and an unfocused pane's Split, Zoom and
-  Close show on hover.
+  and doesn't save). The title fits before the folder. The header's buttons are Split Right
+  and Split Down (the terminal drawer's icons, each a menu of Shell and New Thread…), Zoom and
+  Close; an unfocused pane's show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
 - **New Workspace** (`new_space_picker.rs`, Zed's recent projects): the workspaces used here
@@ -557,7 +558,7 @@ since a thread's workspace is its checkout.
   project's is recorded as its workspace). Open
   Worktree… lists the repository's other checkouts (`Request::RepositoryCheckouts`: `git worktree
   list`, then a project's pastures). Either opens as a new workspace with a shell.
-- **Threads in panes**: a pane's New Thread… and Split › New Thread… start a draft of a
+- **Threads in panes**: a pane's New Thread… and a split button's New Thread… start a draft of a
   Workspaces thread (`ProjectId::WORKSPACES`, `Request::CreateWorkspacesThread`), working where
   the pane is (its shell's current folder, else the workspace's), in no project. Under its
   composer the folder is a chip (`AgentView::render_folder_picker`); in git it's a menu of
