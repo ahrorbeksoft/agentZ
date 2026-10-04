@@ -18,7 +18,7 @@ Notes for whoever continues:
 
 | Order | § | Item | Status |
 |---|---|---|---|
-| 1 | 8 | Pane header: title first, folder as detail, buttons on hover | not started |
+| 1 | 8 | Pane header: title first, folder as detail, buttons on hover | done |
 | 2 | 9 | Focus: accent outline | not started |
 | 3 | 7 | Unnamed tabs named by what runs, Cmd-1…9 in tooltips | not started |
 | 4 | 12 | Empty state: minimal | not started |

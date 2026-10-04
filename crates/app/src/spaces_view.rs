@@ -11,7 +11,7 @@ use agentz_protocol::layout::{
     Direction, NavDirection, Node, PaneId, Rect, TileLayout, find_in_direction,
 };
 use agentz_protocol::spaces::{
-    Pane, PaneContent, PaneTerminal, Space, SpaceId, SpaceRequest, Tab, TabId,
+    Pane, PaneContent, PaneTerminal, Space, SpaceFolder, SpaceId, SpaceRequest, Tab, TabId,
 };
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
@@ -1773,7 +1773,7 @@ impl SpacesView {
         }
     }
 
-    /// A pane's icon, title, and a detail such as its terminal's window title.
+    /// A pane's icon, title, and a detail: where a terminal is, or a thread's agent.
     fn pane_title(
         &self,
         key: PaneKey,
@@ -1782,27 +1782,20 @@ impl SpacesView {
     ) -> (Icon, SharedString, Option<SharedString>) {
         match &pane.content {
             PaneContent::Terminal(terminal) => {
-                let window_title = self
-                    .panes
-                    .get(&key)
-                    .and_then(|open| match &open.view {
-                        PaneView::Terminal(view) => {
-                            view.read(cx).terminal().read(cx).frame()?.title.clone()
-                        }
-                        PaneView::Agent(_) => None,
-                    })
-                    .filter(|title| !title.is_empty());
+                // What runs there: its agent, the command it was opened with, or what's in
+                // front of the shell.
                 let title = pane
                     .agent
                     .as_ref()
                     .map(|agent| agent.name.clone())
                     .or_else(|| terminal.command.clone())
+                    .or_else(|| pane.program.clone())
                     .unwrap_or_else(|| "Shell".to_string());
-                (
-                    Icon::new(IconName::Terminal),
-                    title.into(),
-                    window_title.map(Into::into),
-                )
+                let folder = pane.folder.as_ref().and_then(|folder| {
+                    let (space, _, _) = self.find_pane(key, cx)?;
+                    Some(pane_folder_label(&space, folder).into())
+                });
+                (Icon::new(IconName::Terminal), title.into(), folder)
             }
             PaneContent::Thread(thread_id) => {
                 let machines = self.machines.read(cx);
@@ -2232,8 +2225,11 @@ impl SpacesView {
             })),
             _ => None,
         };
+        let header_group =
+            SharedString::from(format!("pane-header-{}-{}", key.machine.slug(), key.pane.0));
         let header = h_flex()
             .id(key.element_id("pane-header"))
+            .group(header_group.clone())
             .h(TOOLBAR_HEIGHT)
             .flex_none()
             .px_2()
@@ -2250,49 +2246,63 @@ impl SpacesView {
             } else {
                 Color::Muted
             }))
+            // The title fits first; the detail gives way.
             .child(
-                Label::new(title.clone())
-                    .size(LabelSize::Small)
-                    .color(if is_focused {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    })
-                    .truncate(),
+                div().flex_none().max_w(relative(0.6)).child(
+                    Label::new(title.clone())
+                        .size(LabelSize::Small)
+                        .color(if is_focused {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        })
+                        .truncate(),
+                ),
             )
             .children(detail.map(|detail| {
-                Label::new(detail)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .truncate()
+                div().min_w_0().child(
+                    Label::new(detail)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
             }))
             .children(status.map(|status| render_status_dot(status, cx)))
             .child(div().flex_1())
             .children(thread_buttons)
-            .child(split_menu)
-            .when(shows_focus || is_zoomed, |header| {
-                header.child(
-                    IconButton::new(key.element_id("pane-zoom"), IconName::Maximize)
-                        .icon_size(IconSize::Small)
-                        .toggle_state(is_zoomed)
-                        .selected_icon(IconName::Minimize)
-                        .tooltip(move |_, cx| {
-                            Tooltip::for_action(
-                                if is_zoomed { "Zoom Out" } else { "Zoom In" },
-                                &ToggleZoom,
-                                cx,
-                            )
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.toggle_zoom_of(key, window, cx)
-                        })),
-                )
-            })
             .child(
-                IconButton::new(key.element_id("pane-close"), IconName::Close)
-                    .icon_size(IconSize::Small)
-                    .tooltip(|_, cx| Tooltip::for_action("Close Pane", &ClosePane, cx))
-                    .on_click(cx.listener(move |this, _, _, cx| this.close_pane(key, cx))),
+                // An unfocused pane's own buttons wait for the pointer.
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .when(!is_focused, |buttons| {
+                        buttons.visible_on_hover(header_group.clone())
+                    })
+                    .child(split_menu)
+                    .when(shows_focus || is_zoomed, |buttons| {
+                        buttons.child(
+                            IconButton::new(key.element_id("pane-zoom"), IconName::Maximize)
+                                .icon_size(IconSize::Small)
+                                .toggle_state(is_zoomed)
+                                .selected_icon(IconName::Minimize)
+                                .tooltip(move |_, cx| {
+                                    Tooltip::for_action(
+                                        if is_zoomed { "Zoom Out" } else { "Zoom In" },
+                                        &ToggleZoom,
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.toggle_zoom_of(key, window, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        IconButton::new(key.element_id("pane-close"), IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(|_, cx| Tooltip::for_action("Close Pane", &ClosePane, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| this.close_pane(key, cx))),
+                    ),
             )
             .on_drag(
                 DraggedLabel {
@@ -2656,6 +2666,24 @@ fn contents_label(terminals: usize, agents: usize) -> Option<String> {
 }
 
 /// A tab's name, or its number, as herdr numbers unnamed tabs.
+/// Where a pane is: within its workspace's folder as "storefront/src", elsewhere as its
+/// path.
+fn pane_folder_label(space: &Space, folder: &SpaceFolder) -> String {
+    let root = space.current_folder();
+    let is_home = space
+        .current
+        .as_ref()
+        .is_some_and(|current| current.display_path == "~");
+    if !is_home && let (Ok(rest), Some(name)) = (folder.path.strip_prefix(root), root.file_name()) {
+        let name = name.to_string_lossy();
+        if rest.as_os_str().is_empty() {
+            return name.into_owned();
+        }
+        return format!("{name}/{}", rest.display());
+    }
+    folder.display_path.clone()
+}
+
 fn tab_label(tab: &Tab, index: usize) -> String {
     tab.name.clone().unwrap_or_else(|| (index + 1).to_string())
 }
@@ -2685,7 +2713,7 @@ fn new_shell() -> PaneContent {
 
 #[cfg(test)]
 mod tests {
-    use agentz_protocol::spaces::{PaneAgent, PaneAgentState, SpaceFolder, SpacesSnapshot};
+    use agentz_protocol::spaces::{PaneAgent, PaneAgentState, SpacesSnapshot};
     use gpui::TestAppContext;
 
     use super::*;
@@ -2693,9 +2721,8 @@ mod tests {
 
     fn pane(id: u64, agent: Option<PaneAgent>) -> Pane {
         Pane {
-            id: PaneId(id),
-            content: PaneContent::Unknown(serde_json::Value::Null),
             agent,
+            ..Pane::new(PaneId(id), PaneContent::Unknown(serde_json::Value::Null))
         }
     }
 
@@ -2905,6 +2932,30 @@ mod tests {
             contents_label(3, 1).as_deref(),
             Some("3 terminals · 1 agent")
         );
+    }
+
+    #[test]
+    fn panes_say_where_they_are_within_their_workspace() {
+        let folder = |path: &str, display_path: &str| SpaceFolder {
+            path: PathBuf::from(path),
+            display_path: display_path.to_string(),
+        };
+        let mut space = spaces().spaces.remove(0);
+        space.current = Some(folder("/Users/me/w/storefront", "~/w/storefront"));
+        let label = |path, display| pane_folder_label(&space, &folder(path, display));
+        assert_eq!(
+            label("/Users/me/w/storefront", "~/w/storefront"),
+            "storefront"
+        );
+        assert_eq!(
+            label("/Users/me/w/storefront/src/app", "~/w/storefront/src/app"),
+            "storefront/src/app"
+        );
+        assert_eq!(label("/Users/me/w/api", "~/w/api"), "~/w/api");
+        // Everything is inside home, so a home workspace shows paths.
+        space.current = Some(folder("/Users/me", "~"));
+        let label = |path, display| pane_folder_label(&space, &folder(path, display));
+        assert_eq!(label("/Users/me/docs", "~/docs"), "~/docs");
     }
 
     #[test]

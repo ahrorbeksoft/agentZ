@@ -57,7 +57,7 @@ impl SpaceStore {
             }
             space.tabs.retain_mut(|tab| {
                 for pane in &mut tab.panes {
-                    pane.agent = None;
+                    pane.clear_runtime();
                 }
                 // A tree and pane list that disagree came from a bad write; keep what's
                 // consistent.
@@ -223,11 +223,7 @@ impl SpaceStore {
             "the pane isn't in its tab"
         );
         tab.root = layout.into_root();
-        tab.panes.push(Pane {
-            id: pane,
-            content,
-            agent: None,
-        });
+        tab.panes.push(Pane::new(pane, content));
         let location = PaneLocation {
             space: space_id,
             tab: tab.id,
@@ -289,7 +285,7 @@ impl SpaceStore {
     ) -> Result<PaneContent> {
         let (space, tab, pane) = self.pane_index(id)?;
         let pane = &mut self.spaces[space].tabs[tab].panes[pane];
-        pane.agent = None;
+        pane.clear_runtime();
         let previous = std::mem::replace(&mut pane.content, content);
         self.changed();
         Ok(previous)
@@ -343,6 +339,30 @@ impl SpaceStore {
         }
     }
 
+    /// Runtime state: not saved, but sent to clients.
+    pub(crate) fn set_pane_folder(&mut self, id: PaneId, folder: Option<SpaceFolder>) {
+        let Ok((space, tab, pane)) = self.pane_index(id) else {
+            return;
+        };
+        let pane = &mut self.spaces[space].tabs[tab].panes[pane];
+        if pane.folder != folder {
+            pane.folder = folder;
+            self.revision += 1;
+        }
+    }
+
+    /// Runtime state: not saved, but sent to clients.
+    pub(crate) fn set_pane_program(&mut self, id: PaneId, program: Option<String>) {
+        let Ok((space, tab, pane)) = self.pane_index(id) else {
+            return;
+        };
+        let pane = &mut self.spaces[space].tabs[tab].panes[pane];
+        if pane.program != program {
+            pane.program = program;
+            self.revision += 1;
+        }
+    }
+
     fn new_tab(&mut self, content: PaneContent) -> (Tab, PaneId) {
         let tab = TabId(self.allocate_id());
         let pane = PaneId(self.allocate_id());
@@ -351,11 +371,7 @@ impl SpaceStore {
                 id: tab,
                 name: None,
                 root: Node::Pane(pane),
-                panes: vec![Pane {
-                    id: pane,
-                    content,
-                    agent: None,
-                }],
+                panes: vec![Pane::new(pane, content)],
             },
             pane,
         )
@@ -432,7 +448,7 @@ impl SpaceStore {
             space.git = None;
             space.current = None;
             for pane in space.tabs.iter_mut().flat_map(|tab| &mut tab.panes) {
-                pane.agent = None;
+                pane.clear_runtime();
             }
         }
         saver.save(SavedSpaces {

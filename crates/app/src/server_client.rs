@@ -945,6 +945,8 @@ mod tests {
                             name: "Codex".to_string(),
                             state,
                         }),
+                        folder: None,
+                        program: None,
                     }],
                 }],
                 git: None,

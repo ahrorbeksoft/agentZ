@@ -144,6 +144,31 @@ pub struct Pane {
     /// The agent CLI detected in a terminal pane, and its state. Not saved.
     #[serde(default)]
     pub agent: Option<PaneAgent>,
+    /// Where a terminal pane's foreground works now. Not saved.
+    #[serde(default)]
+    pub folder: Option<SpaceFolder>,
+    /// The program in a terminal pane's foreground, unless that's the shell. Not saved.
+    #[serde(default)]
+    pub program: Option<String>,
+}
+
+impl Pane {
+    pub fn new(id: PaneId, content: PaneContent) -> Self {
+        Self {
+            id,
+            content,
+            agent: None,
+            folder: None,
+            program: None,
+        }
+    }
+
+    /// Forgets what's looked up while it runs, which isn't saved.
+    pub fn clear_runtime(&mut self) {
+        self.agent = None;
+        self.folder = None;
+        self.program = None;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

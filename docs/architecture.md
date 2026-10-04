@@ -486,6 +486,11 @@ since a thread's workspace is its checkout.
   or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
   An ACP thread's pane has one header: the thread's title, agent and toolbar buttons
   (`AgentView::render_toolbar_buttons`) beside the pane's own, so its toolbar is hidden there.
+  A terminal pane's header names what runs there (its agent, the command it was opened with,
+  or the program in front of its shell) and where it is, within the workspace as
+  "storefront/src" (`Pane::{program, folder}`, which the server looks up with agent detection
+  and doesn't save). The title fits before the folder, and an unfocused pane's Split, Zoom and
+  Close show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
 - **Row menu**: Rename, Close, and in a git repository (a project or not) New Worktree and

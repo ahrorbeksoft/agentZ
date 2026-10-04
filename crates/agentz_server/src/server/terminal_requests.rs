@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, TerminalRequest};
+use agentz_protocol::spaces::SpaceFolder;
 use agentz_protocol::terminal::{TerminalExit, TerminalKey};
 use agentz_protocol::{ConnectionId, Event, Request, Response, ServerMessage};
 use alacritty_terminal::event::Event as AlacEvent;
@@ -559,7 +560,7 @@ impl Server {
                 if let Some(state) = tracker.exited() {
                     published.push((key.clone(), None, state));
                 }
-                if let TerminalKey::Thread(_) = key
+                if let TerminalKey::Thread(_) | TerminalKey::Pane(_) = key
                     && running.foreground_group.take().is_some()
                 {
                     foregrounds.push((key.clone(), None));
@@ -568,7 +569,7 @@ impl Server {
             }
             let mut update = None;
             let process_group_id = running.terminal.foreground_process_group_id();
-            if let TerminalKey::Thread(_) = key
+            if let TerminalKey::Thread(_) | TerminalKey::Pane(_) = key
                 && process_group_id != running.foreground_group
             {
                 running.foreground_group = process_group_id;
@@ -587,8 +588,8 @@ impl Server {
                 && let Some(folder) = process_group_id.and_then(detect::process::process_cwd)
                 && running.folder.as_ref() != Some(&folder)
             {
-                running.folder = Some(folder);
-                moved_panes.push(*pane);
+                running.folder = Some(folder.clone());
+                moved_panes.push((*pane, folder));
             }
             if tracker.should_probe(now, process_group_id) {
                 let leader = process_group_id.and_then(detect::process::group_leader);
@@ -646,7 +647,8 @@ impl Server {
                 TerminalKey::DrawerTerminal { thread_id, number } => {
                     self.projects.set_drawer_command(thread_id, number, program)
                 }
-                TerminalKey::Agent { .. } | TerminalKey::Pane(_) | TerminalKey::Login(_) => {}
+                TerminalKey::Pane(pane) => self.spaces.set_pane_program(pane, program),
+                TerminalKey::Agent { .. } | TerminalKey::Login(_) => {}
             }
         }
         for (thread_id, folder) in folders {
@@ -662,7 +664,14 @@ impl Server {
                     .rename_thread(thread_id, folder_title(&folder));
             }
         }
-        for pane in moved_panes {
+        for (pane, folder) in moved_panes {
+            self.spaces.set_pane_folder(
+                pane,
+                Some(SpaceFolder {
+                    display_path: home_relative(&folder),
+                    path: folder,
+                }),
+            );
             self.refresh_space_of_pane(pane);
         }
         for (key, agent, state) in published {
