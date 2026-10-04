@@ -5,7 +5,7 @@
 //! workspace is its checkout.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::layout::{
@@ -327,11 +327,115 @@ struct SpaceDrag {
 /// How strongly a dragged workspace's own row still shows.
 const DRAGGED_ROW_OPACITY: f32 = 0.5;
 
+/// A tab being dragged along its bar. The view draws it (`TabDrag`), so nothing is drawn for it
+/// at the pointer.
 #[derive(Clone, Copy, PartialEq)]
 struct DraggedTab {
     space: SpaceKey,
     tab: TabId,
 }
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// A tab sliding along its bar while dragged: the order the bar shows meanwhile, with the
+/// dragged tab where it would land, and the tabs moving over to make room for it.
+struct TabDrag {
+    space: SpaceKey,
+    tab: TabId,
+    order: Vec<TabId>,
+    /// Each tab's width when the drag started.
+    widths: HashMap<TabId, Pixels>,
+    /// Where across the tab the pointer holds it.
+    grab: Pixels,
+    pointer: Pixels,
+    /// The tabs sliding over: how far from their new place they started, and when.
+    slides: HashMap<TabId, (Pixels, Instant)>,
+    is_scrolling: bool,
+    _scroll: Task<()>,
+}
+
+impl TabDrag {
+    fn width(&self, tab: TabId) -> Pixels {
+        self.widths.get(&tab).copied().unwrap_or_default()
+    }
+
+    /// The dragged tab's left edge: held where it was grabbed, within the bar.
+    fn left(&self, bar: Bounds<Pixels>) -> Pixels {
+        let right_most = (bar.right() - self.width(self.tab)).max(bar.left());
+        (self.pointer - self.grab).clamp(bar.left(), right_most)
+    }
+
+    /// Moves the dragged tab, its left edge `left` from the bar's first tab, past each tab
+    /// whose middle its edge has crossed, and slides that tab into the place it left.
+    fn reorder(&mut self, left: Pixels) {
+        let width = self.width(self.tab);
+        let Some(mut index) = self.order.iter().position(|tab| *tab == self.tab) else {
+            return;
+        };
+        loop {
+            let start = self.order[..index]
+                .iter()
+                .fold(px(0.), |start, tab| start + self.width(*tab));
+            if let Some(&next) = self.order.get(index + 1)
+                && left + width > start + width + self.width(next) / 2.
+            {
+                self.order.swap(index, index + 1);
+                self.slide(next, width);
+                index += 1;
+                continue;
+            }
+            if index > 0 {
+                let previous = self.order[index - 1];
+                if left < start - self.width(previous) / 2. {
+                    self.order.swap(index - 1, index);
+                    self.slide(previous, -width);
+                    index -= 1;
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    /// Starts `tab` sliding to its new place, `by` from it; one already sliding starts from
+    /// where it is.
+    fn slide(&mut self, tab: TabId, by: Pixels) {
+        let now = Instant::now();
+        let from = self
+            .slides
+            .get(&tab)
+            .map_or(px(0.), |(from, started)| slide_offset(*from, *started, now));
+        self.slides.insert(tab, (from + by, now));
+    }
+}
+
+/// How long a tab takes to slide over for a dragged one.
+const TAB_SLIDE_DURATION: Duration = Duration::from_millis(150);
+/// How near an end of the bar a dragged tab scrolls it, and how far each step.
+const TAB_SCROLL_EDGE: Pixels = px(24.);
+const TAB_SCROLL_STEP: Pixels = px(6.);
+const TAB_SCROLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How far a sliding tab is from its place at `now`, easing out.
+fn slide_offset(from: Pixels, started: Instant, now: Instant) -> Pixels {
+    let progress =
+        now.saturating_duration_since(started).as_secs_f32() / TAB_SLIDE_DURATION.as_secs_f32();
+    from * (1. - progress.min(1.)).powi(3)
+}
+
+/// The order a dropped tab left the bar in, shown until the server moves the tab.
+struct DroppedTabOrder {
+    space: SpaceKey,
+    order: Vec<TabId>,
+    _expire: Task<()>,
+}
+
+/// How long a dropped tab's order shows while the server doesn't move it.
+const DROPPED_TAB_ORDER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq)]
 struct DraggedPane {
@@ -404,6 +508,10 @@ pub struct SpacesView {
     split_override: Option<SplitOverride>,
     pane_drop: Option<PaneDrop>,
     space_drag: Option<SpaceDrag>,
+    /// The visible tab bar's tabs, which a dragged tab is measured against and scrolls.
+    tab_scroll: ScrollHandle,
+    tab_drag: Option<TabDrag>,
+    dropped_tab_order: Option<DroppedTabOrder>,
     renaming: Option<RenameTarget>,
     /// The name the rename started from, so ending it unchanged keeps an automatic name.
     rename_original: SharedString,
@@ -465,6 +573,9 @@ impl SpacesView {
             split_override: None,
             pane_drop: None,
             space_drag: None,
+            tab_scroll: ScrollHandle::new(),
+            tab_drag: None,
+            dropped_tab_order: None,
             renaming: None,
             rename_original: SharedString::default(),
             rename_input,
@@ -603,6 +714,21 @@ impl SpacesView {
         if !cx.has_active_drag() {
             self.split_override = None;
             self.pane_drop = None;
+        }
+        // A dropped tab's order gives way once the server has moved the tab.
+        if let Some(dropped) = &self.dropped_tab_order {
+            let order = spaces
+                .iter()
+                .find(|(machine, space)| {
+                    SpaceKey {
+                        machine: *machine,
+                        space: space.id,
+                    } == dropped.space
+                })
+                .map(|(_, space)| space.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>());
+            if order.is_none_or(|order| order == dropped.order) {
+                self.dropped_tab_order = None;
+            }
         }
 
         // Threads shown in panes follow renames and archiving.
@@ -3054,7 +3180,7 @@ impl SpacesView {
         }
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some((space_key, space, tab_key)) = self.visible_tab(cx) else {
             return self.render_empty_state(cx).into_any_element();
         };
@@ -3081,7 +3207,7 @@ impl SpacesView {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_tab_bar(space_key, &space, tab_key.tab, cx))
+            .child(self.render_tab_bar(space_key, &space, tab_key.tab, window, cx))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
@@ -3108,25 +3234,250 @@ impl SpacesView {
             )
     }
 
+    /// The tabs in the order the bar shows them: while one is dragged, or after it's dropped
+    /// until the server has moved it, in that order.
+    fn shown_tabs<'a>(&self, space_key: SpaceKey, space: &'a Space) -> Vec<&'a Tab> {
+        let order = match (&self.tab_drag, &self.dropped_tab_order) {
+            (Some(drag), _) if drag.space == space_key => &drag.order,
+            (_, Some(dropped)) if dropped.space == space_key => &dropped.order,
+            _ => return space.tabs.iter().collect(),
+        };
+        let mut tabs: Vec<&Tab> = order
+            .iter()
+            .filter_map(|id| space.tabs.iter().find(|tab| tab.id == *id))
+            .collect();
+        tabs.extend(space.tabs.iter().filter(|tab| !order.contains(&tab.id)));
+        tabs
+    }
+
+    fn start_tab_drag(
+        &mut self,
+        dragged: DraggedTab,
+        grab: Pixels,
+        pointer: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(space) = self.space(dragged.space, cx) else {
+            return;
+        };
+        let order: Vec<TabId> = self
+            .shown_tabs(dragged.space, &space)
+            .iter()
+            .map(|tab| tab.id)
+            .collect();
+        // The bar last drew the tabs in this order.
+        let widths = order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                Some((*tab, self.tab_scroll.bounds_for_item(index)?.size.width))
+            })
+            .collect();
+        self.dropped_tab_order = None;
+        self.tab_drag = Some(TabDrag {
+            space: dragged.space,
+            tab: dragged.tab,
+            order,
+            widths,
+            grab,
+            pointer,
+            slides: HashMap::default(),
+            is_scrolling: false,
+            _scroll: Task::ready(()),
+        });
+        cx.notify();
+    }
+
+    /// The dragged tab follows the pointer along the bar, and the others make room for it.
+    fn drag_tab(&mut self, pointer: Pixels, cx: &mut Context<Self>) {
+        let bar = self.tab_scroll.bounds();
+        let first_tab = bar.left() + self.tab_scroll.offset().x;
+        let Some(drag) = self.tab_drag.as_mut() else {
+            return;
+        };
+        drag.pointer = pointer;
+        let left = drag.left(bar);
+        drag.reorder(left - first_tab);
+        if !drag.is_scrolling && self.tab_scroll_direction().is_some() {
+            self.scroll_tabs_while_held(cx);
+        }
+        cx.notify();
+    }
+
+    /// Which way the bar scrolls for the dragged tab: toward the end it's held near, while
+    /// there's more to see there (1 toward the start).
+    fn tab_scroll_direction(&self) -> Option<f32> {
+        let drag = self.tab_drag.as_ref()?;
+        let bar = self.tab_scroll.bounds();
+        let offset = self.tab_scroll.offset().x;
+        let left = drag.pointer - drag.grab;
+        if left < bar.left() + TAB_SCROLL_EDGE && offset < px(0.) {
+            Some(1.)
+        } else if left + drag.width(drag.tab) > bar.right() - TAB_SCROLL_EDGE
+            && offset > -self.tab_scroll.max_offset().x
+        {
+            Some(-1.)
+        } else {
+            None
+        }
+    }
+
+    fn scroll_tabs_while_held(&mut self, cx: &mut Context<Self>) {
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TAB_SCROLL_INTERVAL).await;
+                let scrolled = this
+                    .update(cx, |this, cx| this.scroll_tabs_step(cx))
+                    .unwrap_or(false);
+                if !scrolled {
+                    break;
+                }
+            }
+        });
+        if let Some(drag) = self.tab_drag.as_mut() {
+            drag.is_scrolling = true;
+            drag._scroll = task;
+        }
+    }
+
+    fn scroll_tabs_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let direction = self.tab_scroll_direction();
+        let Some(drag) = self.tab_drag.as_mut() else {
+            return false;
+        };
+        let Some(direction) = direction else {
+            drag.is_scrolling = false;
+            return false;
+        };
+        let pointer = drag.pointer;
+        let offset = self.tab_scroll.offset();
+        let max = self.tab_scroll.max_offset().x;
+        self.tab_scroll.set_offset(gpui::point(
+            (offset.x + TAB_SCROLL_STEP * direction).clamp(-max, px(0.)),
+            offset.y,
+        ));
+        // The tabs pass under the held one.
+        self.drag_tab(pointer, cx);
+        true
+    }
+
+    /// Letting go leaves the tab where it is.
+    fn drop_tab(&mut self, dragged: DraggedTab, cx: &mut Context<Self>) {
+        let Some(drag) = self
+            .tab_drag
+            .take()
+            .filter(|drag| drag.space == dragged.space && drag.tab == dragged.tab)
+        else {
+            return;
+        };
+        cx.notify();
+        let Some(index) = drag.order.iter().position(|tab| *tab == drag.tab) else {
+            return;
+        };
+        let Some(space) = self.space(drag.space, cx) else {
+            return;
+        };
+        if space.tabs.get(index).map(|tab| tab.id) == Some(drag.tab) {
+            return;
+        }
+        self.send(
+            drag.space.machine,
+            SpaceRequest::MoveTab {
+                tab: drag.tab,
+                index,
+            },
+            cx,
+        );
+        let expire = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(DROPPED_TAB_ORDER_TIMEOUT)
+                .await;
+            this.update(cx, |this, cx| {
+                this.dropped_tab_order = None;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.dropped_tab_order = Some(DroppedTabOrder {
+            space: drag.space,
+            order: drag.order,
+            _expire: expire,
+        });
+    }
+
     fn render_tab_bar(
         &self,
         space_key: SpaceKey,
         space: &Space,
         active_tab: TabId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = space
-            .tabs
+        let shown = self.shown_tabs(space_key, space);
+        let selected = shown
             .iter()
             .position(|tab| tab.id == active_tab)
             .unwrap_or_default();
-        let count = space.tabs.len();
-        let tabs: Vec<AnyElement> = space
-            .tabs
+        let count = shown.len();
+        let drag = self
+            .tab_drag
+            .as_ref()
+            .filter(|drag| drag.space == space_key);
+        let now = Instant::now();
+        let mut is_sliding = false;
+        let tabs: Vec<AnyElement> = shown
             .iter()
             .enumerate()
-            .map(|(index, tab)| self.render_tab(space_key, index, tab, selected, count, cx))
+            .map(|(index, tab)| {
+                let element = self.render_tab(space_key, index, tab, selected, count, cx);
+                match drag {
+                    // Its place in the bar, kept while it's held above.
+                    Some(drag) if drag.tab == tab.id => div()
+                        .debug_selector(|| "dragged-tab-place".into())
+                        .invisible()
+                        .child(element)
+                        .into_any_element(),
+                    Some(drag) => {
+                        let offset = drag
+                            .slides
+                            .get(&tab.id)
+                            .map_or(px(0.), |(from, started)| slide_offset(*from, *started, now));
+                        is_sliding |= offset != px(0.);
+                        div()
+                            .relative()
+                            .left(offset)
+                            .child(element)
+                            .into_any_element()
+                    }
+                    None => element,
+                }
+            })
             .collect();
+        if is_sliding {
+            window.request_animation_frame();
+        }
+        // Raised above the bar, in it however far up or down the pointer goes.
+        let raised_tab = drag.and_then(|drag| {
+            let index = shown.iter().position(|tab| tab.id == drag.tab)?;
+            let bar = self.tab_scroll.bounds();
+            Some(
+                deferred(
+                    anchored()
+                        .position(gpui::point(drag.left(bar), bar.top()))
+                        .child(self.render_raised_tab(
+                            space_key,
+                            index,
+                            shown[index],
+                            drag.width(drag.tab),
+                            cx,
+                        )),
+                )
+                .with_priority(1),
+            )
+        });
+        let bar = TabBar::new("workspace-tabs")
+            .track_scroll(&self.tab_scroll)
+            .children(tabs);
         let new_tab =
             IconButton::new("new-workspace-tab", IconName::Plus).icon_size(IconSize::Small);
         let has_layouts = !AppSettingsStore::global(cx)
@@ -3134,74 +3485,136 @@ impl SpacesView {
             .settings()
             .saved_layouts
             .is_empty();
-        if !has_layouts {
-            return TabBar::new("workspace-tabs").children(tabs).end_child(
+        let bar = if has_layouts {
+            bar.end_child(self.render_new_tab_menu(space_key, new_tab, cx))
+        } else {
+            bar.end_child(
                 new_tab
                     .tooltip(|_, cx| Tooltip::for_action("New Tab", &NewTab, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.new_tab_in(space_key, window, cx)
                     })),
-            );
-        }
+            )
+        };
+        div()
+            .flex_none()
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                    if event.drag(cx).space == space_key {
+                        this.drag_tab(event.event.position.x, cx);
+                    }
+                }),
+            )
+            .child(bar)
+            .children(raised_tab)
+    }
+
+    /// A dragged tab, raised: a lighter background, full-strength text and a shadow.
+    fn render_raised_tab(
+        &self,
+        space_key: SpaceKey,
+        index: usize,
+        tab: &Tab,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let status = rolled_up(
+            tab.panes
+                .iter()
+                .filter_map(|pane| self.pane_status(space_key.machine, pane, cx)),
+        );
+        div()
+            .debug_selector(|| "raised-tab".into())
+            .w(width)
+            .h(TabItem::container_height(cx))
+            .bg(colors.tab_bar_background)
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(4.), gpui::black().opacity(0.6)).blur_radius(px(14.)),
+            ])
+            .child(
+                h_flex()
+                    .size_full()
+                    .px(DynamicSpacing::Base04.px(cx))
+                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.ghost_element_selected)
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .size(px(12.))
+                            .justify_center()
+                            .children(status.map(|status| render_status_dot(status, cx))),
+                    )
+                    .child(Label::new(tab_label(tab, index)).size(LabelSize::Small)),
+            )
+    }
+
+    /// The tab bar's +, once there are saved layouts: a menu of New Tab and each layout.
+    fn render_new_tab_menu(
+        &self,
+        space_key: SpaceKey,
+        new_tab: IconButton,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let this = cx.entity().downgrade();
-        TabBar::new("workspace-tabs").children(tabs).end_child(
-            div().debug_selector(|| "new-tab-menu".into()).child(
-                PopoverMenu::new("new-workspace-tab-menu")
-                    .trigger_with_tooltip(new_tab, Tooltip::text("New Tab or Layout"))
-                    .anchor(gpui::Anchor::TopRight)
-                    .menu(move |window, cx| {
-                        let this = this.clone();
-                        // Rebuilt after a layout is deleted, so it leaves the menu at once.
-                        Some(ContextMenu::build_persistent(
-                            window,
-                            cx,
-                            move |menu, _, cx| {
-                                let new_tab = {
+        div().debug_selector(|| "new-tab-menu".into()).child(
+            PopoverMenu::new("new-workspace-tab-menu")
+                .trigger_with_tooltip(new_tab, Tooltip::text("New Tab or Layout"))
+                .anchor(gpui::Anchor::TopRight)
+                .menu(move |window, cx| {
+                    let this = this.clone();
+                    // Rebuilt after a layout is deleted, so it leaves the menu at once.
+                    Some(ContextMenu::build_persistent(
+                        window,
+                        cx,
+                        move |menu, _, cx| {
+                            let new_tab = {
+                                let this = this.clone();
+                                move |window: &mut Window, cx: &mut App| {
+                                    this.update(cx, |this, cx| {
+                                        this.new_tab_in(space_key, window, cx)
+                                    })
+                                    .ok();
+                                }
+                            };
+                            let mut menu = menu
+                                .keep_open_on_confirm(false)
+                                .end_slot_action(Box::new(menu::SecondaryConfirm))
+                                .entry("New Tab", Some(Box::new(NewTab)), new_tab)
+                                .separator();
+                            let layouts = AppSettingsStore::global(cx)
+                                .read(cx)
+                                .settings()
+                                .saved_layouts
+                                .clone();
+                            for saved in layouts {
+                                let open = {
                                     let this = this.clone();
+                                    let layout = saved.layout.clone();
                                     move |window: &mut Window, cx: &mut App| {
+                                        let layout = layout.clone();
                                         this.update(cx, |this, cx| {
-                                            this.new_tab_in(space_key, window, cx)
+                                            this.open_layout(space_key, layout, window, cx)
                                         })
                                         .ok();
                                     }
                                 };
-                                let mut menu = menu
-                                    .keep_open_on_confirm(false)
-                                    .end_slot_action(Box::new(menu::SecondaryConfirm))
-                                    .entry("New Tab", Some(Box::new(NewTab)), new_tab)
-                                    .separator();
-                                let layouts = AppSettingsStore::global(cx)
-                                    .read(cx)
-                                    .settings()
-                                    .saved_layouts
-                                    .clone();
-                                for saved in layouts {
-                                    let open = {
-                                        let this = this.clone();
-                                        let layout = saved.layout.clone();
-                                        move |window: &mut Window, cx: &mut App| {
-                                            let layout = layout.clone();
-                                            this.update(cx, |this, cx| {
-                                                this.open_layout(space_key, layout, window, cx)
-                                            })
-                                            .ok();
-                                        }
-                                    };
-                                    let name = saved.name.clone();
-                                    menu = menu.entry_with_end_slot_on_hover(
-                                        saved.name,
-                                        None,
-                                        open,
-                                        IconName::Trash,
-                                        "Delete Layout".into(),
-                                        move |_, cx| Self::delete_layout(&name, cx),
-                                    );
-                                }
-                                menu
-                            },
-                        ))
-                    }),
-            ),
+                                let name = saved.name.clone();
+                                menu = menu.entry_with_end_slot_on_hover(
+                                    saved.name,
+                                    None,
+                                    open,
+                                    IconName::Trash,
+                                    "Delete Layout".into(),
+                                    move |_, cx| Self::delete_layout(&name, cx),
+                                );
+                            }
+                            menu
+                        },
+                    ))
+                }),
         )
     }
 
@@ -3289,34 +3702,17 @@ impl SpacesView {
                     this.activate_tab(tab_key, window, cx);
                 }
             }))
-            .on_drag(
-                DraggedLabel {
-                    item: dragged_tab,
-                    label: label.clone(),
-                },
-                |dragged, click_offset, window, cx| dragged.preview(click_offset, window, cx),
-            )
-            .drag_over::<DraggedLabel<DraggedTab>>(move |style, dragged, _, cx| {
-                if dragged.item.space == space_key {
-                    style.bg(cx.theme().colors().drop_target_background)
-                } else {
-                    style
+            .on_drag(dragged_tab, {
+                let this = cx.entity().downgrade();
+                move |dragged, grab, window, cx| {
+                    let pointer = window.mouse_position().x;
+                    this.update(cx, |this, cx| {
+                        this.start_tab_drag(*dragged, grab.x, pointer, cx)
+                    })
+                    .ok();
+                    cx.new(|_| *dragged)
                 }
-            })
-            .on_drop(
-                cx.listener(move |this, dragged: &DraggedLabel<DraggedTab>, _, cx| {
-                    if dragged.item.space == space_key && dragged.item.tab != tab_key.tab {
-                        this.send(
-                            machine,
-                            SpaceRequest::MoveTab {
-                                tab: dragged.item.tab,
-                                index,
-                            },
-                            cx,
-                        );
-                    }
-                }),
-            );
+            });
 
         let this = cx.entity().downgrade();
         right_click_menu(ElementId::Name(format!("{id}-menu").into()))
@@ -3953,9 +4349,10 @@ impl Render for SpacesView {
         // The window redraws when a drag ends, wherever it was dropped.
         if !cx.has_active_drag() {
             self.space_drag = None;
+            self.tab_drag = None;
         }
         let main_background = cx.theme().colors().editor_background;
-        let main = self.render_main(cx);
+        let main = self.render_main(window, cx);
         let is_sidebar_hidden = crate::app_settings::is_sidebar_hidden(cx);
         // Only what applies is handled, so the command palette lists only that.
         let has_tab = self.visible_tab(cx).is_some();
@@ -4025,6 +4422,21 @@ impl Render for SpacesView {
                     );
                 }
             }))
+            // A dragged tab stays in its bar, so it's dropped wherever the pointer is, even
+            // past the window's edge, where it's held to scroll the bar.
+            .on_drop(cx.listener(|this, dragged: &DraggedTab, _, cx| this.drop_tab(*dragged, cx)))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if let Some(drag) = &this.tab_drag {
+                        let dragged = DraggedTab {
+                            space: drag.space,
+                            tab: drag.tab,
+                        };
+                        this.drop_tab(dragged, cx);
+                    }
+                }),
+            )
             .when(!is_sidebar_hidden, |view| {
                 view.child(self.render_sidebar(window, cx))
             })
@@ -4689,6 +5101,165 @@ mod tests {
                 space: SpaceId(1),
                 index: 1,
             })]
+        );
+    }
+
+    #[gpui::test]
+    fn a_dragged_tab_slides_along_its_bar_and_stays_where_it_is_let_go(cx: &mut TestAppContext) {
+        let mut state = spaces();
+        let tabs = &mut state.spaces[0].tabs;
+        tabs[0].name = Some("agents".to_string());
+        for (tab, pane_id, name) in [(10, 12, "server"), (11, 13, "logs")] {
+            tabs.push(Tab {
+                id: TabId(tab),
+                name: Some(name.to_string()),
+                root: Node::Pane(PaneId(pane_id)),
+                panes: vec![pane(pane_id, None)],
+            });
+        }
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+        let none = gpui::Modifiers::none();
+        let server = cx
+            .debug_bounds("TAB-workspace-tab-local-10")
+            .expect("server's tab is drawn");
+        let logs = cx
+            .debug_bounds("TAB-workspace-tab-local-11")
+            .expect("logs' tab is drawn");
+
+        // logs, grabbed past its middle, goes left until its edge passes server's middle,
+        // the pointer far below the bar.
+        cx.simulate_mouse_down(logs.center(), MouseButton::Left, none);
+        let start = logs.center() - gpui::point(px(4.), px(0.));
+        cx.simulate_mouse_move(start, MouseButton::Left, none);
+        let grab = start.x - logs.left();
+        let left = server.left() + server.size.width / 2. - px(2.);
+        let pointer = gpui::point(left + grab, logs.bottom() + px(200.));
+        cx.simulate_mouse_move(pointer, MouseButton::Left, none);
+        cx.simulate_mouse_move(pointer, MouseButton::Left, none);
+        let raised = cx.debug_bounds("raised-tab").expect("the tab is raised");
+        assert_eq!(raised.top(), logs.top());
+        assert!(f32::from(raised.left() - left).abs() <= 1.);
+        assert_eq!(raised.size.width, logs.size.width);
+        // Its place is where server was.
+        let place = cx
+            .debug_bounds("dragged-tab-place")
+            .expect("its place is kept");
+        assert_eq!(place.left(), server.left());
+
+        cx.simulate_mouse_up(pointer, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("raised-tab").is_none());
+        let sent: Vec<Request> = client.read_with(cx, |client, _| {
+            client
+                .sent_for_test()
+                .into_iter()
+                .filter(|request| matches!(request, Request::Spaces(_)))
+                .collect()
+        });
+        assert_eq!(
+            sent,
+            [Request::Spaces(SpaceRequest::MoveTab {
+                tab: TabId(11),
+                index: 1,
+            })]
+        );
+        // It stays there while the server moves it.
+        let logs = cx
+            .debug_bounds("TAB-workspace-tab-local-11")
+            .expect("logs' tab is drawn");
+        assert_eq!(logs.left(), server.left());
+    }
+
+    #[gpui::test]
+    fn a_tab_held_at_the_end_of_a_full_bar_scrolls_it(cx: &mut TestAppContext) {
+        let mut state = spaces();
+        let tabs = &mut state.spaces[0].tabs;
+        tabs[0].name = Some("agents".to_string());
+        for id in 10..60 {
+            tabs.push(Tab {
+                id: TabId(id),
+                name: Some(format!("tab {id}")),
+                root: Node::Pane(PaneId(id + 100)),
+                panes: vec![pane(id + 100, None)],
+            });
+        }
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+        let none = gpui::Modifiers::none();
+        let first = cx
+            .debug_bounds("TAB-workspace-tab-local-2")
+            .expect("the first tab is drawn");
+        let (bar, visible) = view.read_with(cx, |view, _| {
+            let bar = view.tab_scroll.bounds();
+            let visible = (0..view.tab_scroll.children_count())
+                .filter(|index| {
+                    view.tab_scroll
+                        .bounds_for_item(*index)
+                        .is_some_and(|tab| tab.right() <= bar.right())
+                })
+                .count();
+            (bar, visible)
+        });
+        assert!(
+            visible < 51,
+            "the tabs overflow the bar, which shows {visible}"
+        );
+
+        cx.simulate_mouse_down(first.center(), MouseButton::Left, none);
+        let start = first.center() + gpui::point(px(4.), px(0.));
+        cx.simulate_mouse_move(start, MouseButton::Left, none);
+        let held = gpui::point(bar.right() + px(40.), first.center().y);
+        cx.simulate_mouse_move(held, MouseButton::Left, none);
+        let place_before = cx
+            .debug_bounds("dragged-tab-place")
+            .expect("its place is kept");
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.tab_scroll.offset().x) < px(0.));
+        // The raised tab stays at the end while the tabs pass under it.
+        let raised = cx.debug_bounds("raised-tab").expect("the tab is raised");
+        assert!(f32::from(raised.right() - bar.right()).abs() <= 1.);
+        // Its place follows it, out past the tabs shown at first.
+        let place_after = cx
+            .debug_bounds("dragged-tab-place")
+            .expect("its place is kept");
+        assert!(place_before.right() <= bar.right());
+        assert!(place_after.left() < bar.right() && place_after.right() > raised.left());
+
+        // Let go past the window's edge, it stays there.
+        cx.simulate_mouse_up(held, MouseButton::Left, none);
+        cx.run_until_parked();
+        let sent: Vec<Request> = client.read_with(cx, |client, _| {
+            client
+                .sent_for_test()
+                .into_iter()
+                .filter(|request| matches!(request, Request::Spaces(_)))
+                .collect()
+        });
+        let [Request::Spaces(SpaceRequest::MoveTab { tab, index })] = sent.as_slice() else {
+            panic!("one tab moves: {sent:?}");
+        };
+        assert_eq!(*tab, TabId(2));
+        assert!(
+            *index >= visible,
+            "moved to {index} of the {visible} shown at first"
         );
     }
 

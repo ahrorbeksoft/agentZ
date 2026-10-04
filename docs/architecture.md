@@ -535,6 +535,12 @@ since a thread's workspace is its checkout.
   held where it was grabbed (`SpaceDrag`, drawn by the view rather than GPUI's drag view), its
   own place dims, and the row under it is shaded; dropping it there takes that row's place
   (`SpaceRequest::MoveSpace`).
+  A dragged tab slides along its bar, raised (a lighter background, full-strength text, a
+  shadow) and held in the bar however far the pointer strays (`TabDrag`): once its edge passes
+  the middle of the next tab, that tab slides over into its place, so the order changes while
+  dragging, and letting go anywhere, even past the window's edge, leaves it there
+  (`SpaceRequest::MoveTab`; the bar keeps that order until the server's arrives). Held near an
+  end of a bar with more tabs than fit, it scrolls the bar.
   Dragging a pane's header over another pane of its tab works as Zed's pane drop targets
   (`pane_drop_edge`): near an edge (a fifth of the pane's shorter side), that half lights up
   and dropping splits the pane there with the dragged one (`SpaceRequest::MovePane`,
