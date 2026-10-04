@@ -34,6 +34,7 @@ impl Server {
                 | SpaceRequest::MoveTab { .. }
                 | SpaceRequest::ClosePane(_)
                 | SpaceRequest::SwapPanes(..)
+                | SpaceRequest::MovePane { .. }
                 | SpaceRequest::SetPaneContent { .. }
         );
         let response = self.handle_space_request(request)?;
@@ -120,6 +121,10 @@ impl Server {
             }
             SpaceRequest::SwapPanes(first, second) => {
                 self.spaces.swap_panes(first, second)?;
+                Ok(Response::Ok)
+            }
+            SpaceRequest::MovePane { pane, target, edge } => {
+                self.spaces.move_pane(pane, target, edge)?;
                 Ok(Response::Ok)
             }
             SpaceRequest::SetSplitRatio { tab, path, ratio } => {

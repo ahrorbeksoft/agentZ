@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use projects::{ProjectId, ThreadId};
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{Direction, Node, PaneId};
+use crate::layout::{Direction, NavDirection, Node, PaneId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SpaceId(pub u64);
@@ -321,6 +321,13 @@ pub enum SpaceRequest {
     ClosePane(PaneId),
     /// Swaps two panes of one tab.
     SwapPanes(PaneId, PaneId),
+    /// Moves `pane` beside `target`, another pane of its tab, splitting `target` in half on
+    /// `edge`'s side.
+    MovePane {
+        pane: PaneId,
+        target: PaneId,
+        edge: NavDirection,
+    },
     /// Sets the first child's share of the split at `path` (see
     /// [`crate::layout::SplitBorder::path`]).
     SetSplitRatio {

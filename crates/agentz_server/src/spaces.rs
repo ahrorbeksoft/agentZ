@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentz_protocol::layout::{Direction, Node, PaneId, TileLayout};
+use agentz_protocol::layout::{Direction, NavDirection, Node, PaneId, TileLayout};
 use agentz_protocol::spaces::{
     Pane, PaneAgent, PaneContent, PaneLocation, Space, SpaceChanges, SpaceCommit, SpaceFolder,
     SpaceGit, SpaceId, SpacesSnapshot, Tab, TabId,
@@ -256,6 +256,24 @@ impl SpaceStore {
         let mut layout = TileLayout::from_saved(tab.root.clone(), first);
         anyhow::ensure!(
             layout.swap_panes(first, second),
+            "those panes aren't two panes of one tab"
+        );
+        tab.root = layout.into_root();
+        self.changed();
+        Ok(())
+    }
+
+    pub(crate) fn move_pane(
+        &mut self,
+        pane: PaneId,
+        target: PaneId,
+        edge: NavDirection,
+    ) -> Result<()> {
+        let (space, tab, _) = self.pane_index(pane)?;
+        let tab = &mut self.spaces[space].tabs[tab];
+        let mut layout = TileLayout::from_saved(tab.root.clone(), pane);
+        anyhow::ensure!(
+            layout.move_pane(pane, target, edge),
             "those panes aren't two panes of one tab"
         );
         tab.root = layout.into_root();
@@ -622,6 +640,29 @@ mod tests {
             pane_ids(&store, first.tab),
             vec![third.pane, second.pane, first.pane]
         );
+
+        store
+            .move_pane(third.pane, first.pane, NavDirection::Down)
+            .expect("move");
+        assert_eq!(
+            pane_ids(&store, first.tab),
+            vec![second.pane, first.pane, third.pane]
+        );
+        store
+            .move_pane(second.pane, third.pane, NavDirection::Up)
+            .expect("move");
+        assert_eq!(
+            pane_ids(&store, first.tab),
+            vec![first.pane, second.pane, third.pane]
+        );
+        let other = store.create_space("/o".into(), None, shell("/o"));
+        assert!(
+            store
+                .move_pane(first.pane, other.pane, NavDirection::Left)
+                .is_err()
+        );
+        store.close_space(other.space).expect("close");
+        store.swap_panes(first.pane, third.pane).expect("swap back");
 
         store.set_split_ratio(first.tab, &[], 0.3).expect("ratio");
         let snapshot = store.snapshot();

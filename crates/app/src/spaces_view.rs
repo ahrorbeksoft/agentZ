@@ -19,9 +19,9 @@ use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    Action, AnyElement, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, PromptLevel, ScrollHandle,
-    Subscription, Task, Window, actions, relative,
+    Action, AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId,
+    Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, Point, PromptLevel,
+    ScrollHandle, Subscription, Task, Window, actions, relative,
 };
 use projects::ThreadId;
 use text_input::{TextInput, TextInputEvent};
@@ -264,6 +264,40 @@ struct DraggedPane {
     pane: PaneId,
 }
 
+/// The pane a dragged pane is over, and the edge it's near: `None` is the middle, which swaps
+/// the two.
+#[derive(Clone, Copy, PartialEq)]
+struct PaneDrop {
+    pane: PaneKey,
+    edge: Option<NavDirection>,
+}
+
+/// How far into a pane its edges reach, as a share of its shorter side (Zed's
+/// `drop_target_size`).
+const PANE_DROP_EDGE_SIZE: f32 = 0.2;
+
+/// The edge of `bounds` nearest `position` when it's within reach of one, as Zed's
+/// `Pane::handle_drag_move` finds it.
+fn pane_drop_edge(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<NavDirection> {
+    let size = bounds.size.width.min(bounds.size.height) * PANE_DROP_EDGE_SIZE;
+    let x = position.x - bounds.left();
+    let y = position.y - bounds.top();
+    let width = bounds.size.width;
+    let height = bounds.size.height;
+    if x >= size && x <= width - size && y >= size && y <= height - size {
+        return None;
+    }
+    [
+        (NavDirection::Up, y),
+        (NavDirection::Right, width - x),
+        (NavDirection::Down, height - y),
+        (NavDirection::Left, x),
+    ]
+    .into_iter()
+    .min_by_key(|(_, distance)| *distance)
+    .map(|(edge, _)| edge)
+}
+
 /// A row of the sidebar's agents list.
 struct AgentEntry {
     pane: PaneKey,
@@ -293,6 +327,7 @@ pub struct SpacesView {
     /// A pane the server is making, focused once it arrives.
     pending_focus: Option<PaneKey>,
     split_override: Option<SplitOverride>,
+    pane_drop: Option<PaneDrop>,
     renaming: Option<RenameTarget>,
     /// The name the rename started from, so ending it unchanged keeps an automatic name.
     rename_original: SharedString,
@@ -350,6 +385,7 @@ impl SpacesView {
             replaced_composer_texts: HashMap::default(),
             pending_focus: None,
             split_override: None,
+            pane_drop: None,
             renaming: None,
             rename_original: SharedString::default(),
             rename_input,
@@ -487,6 +523,7 @@ impl SpacesView {
         }
         if !cx.has_active_drag() {
             self.split_override = None;
+            self.pane_drop = None;
         }
 
         // Threads shown in panes follow renames and archiving.
@@ -3122,6 +3159,7 @@ impl SpacesView {
             SharedString::from(format!("pane-header-{}-{}", key.machine.slug(), key.pane.0));
         let header = h_flex()
             .id(key.element_id("pane-header"))
+            .debug_selector(|| format!("pane-header-{}", key.pane.0))
             .group(header_group.clone())
             .h(TOOLBAR_HEIGHT)
             .flex_none()
@@ -3239,6 +3277,7 @@ impl SpacesView {
         v_flex()
             .id(key.element_id("pane"))
             .debug_selector(|| format!("pane-{}", key.pane.0))
+            .relative()
             .size_full()
             .when(shows_focus, |pane| {
                 pane.border_1().border_color(if is_focused {
@@ -3251,26 +3290,86 @@ impl SpacesView {
             .capture_any_mouse_down(
                 cx.listener(move |this, _, window, cx| this.focus_pane(key, window, cx)),
             )
-            .drag_over::<DraggedLabel<DraggedPane>>(move |style, dragged, _, cx| {
-                if dragged.item.tab == tab_key && dragged.item.pane != key.pane {
-                    style.border_color(cx.theme().colors().border_focused)
-                } else {
-                    style
-                }
-            })
-            .on_drop(
-                cx.listener(move |this, dragged: &DraggedLabel<DraggedPane>, _, cx| {
-                    if dragged.item.tab == tab_key && dragged.item.pane != key.pane {
-                        this.send(
-                            key.machine,
-                            SpaceRequest::SwapPanes(dragged.item.pane, key.pane),
-                            cx,
-                        );
+            // Every pane hears every move, so each one only answers while the pointer is
+            // over it, and lets go when it leaves.
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedLabel<DraggedPane>>, _, cx| {
+                    let dragged = event.drag(cx).item;
+                    let pane_drop = if event.bounds.contains(&event.event.position) {
+                        (dragged.tab == tab_key && dragged.pane != key.pane).then(|| PaneDrop {
+                            pane: key,
+                            edge: pane_drop_edge(event.bounds, event.event.position),
+                        })
+                    } else if this
+                        .pane_drop
+                        .is_some_and(|pane_drop| pane_drop.pane == key)
+                    {
+                        None
+                    } else {
+                        return;
+                    };
+                    if this.pane_drop != pane_drop {
+                        this.pane_drop = pane_drop;
+                        cx.notify();
                     }
-                }),
-            )
+                },
+            ))
             .child(header)
             .child(div().flex_1().min_h_0().child(content))
+            .children(
+                self.pane_drop
+                    .filter(|pane_drop| pane_drop.pane == key && cx.has_active_drag())
+                    .map(|pane_drop| {
+                        // Where the pane would go, as Zed shows it: the half it would split
+                        // off, or all of this pane for a swap. It takes the drop, as Zed's
+                        // does, so the content under it can't keep it from the pane.
+                        let half = relative(0.5);
+                        div()
+                            .debug_selector(|| format!("pane-drop-{}", key.pane.0))
+                            .absolute()
+                            .bg(colors.drop_target_background)
+                            .on_drop(cx.listener(
+                                move |this, dragged: &DraggedLabel<DraggedPane>, _, cx| {
+                                    let edge = this
+                                        .pane_drop
+                                        .take()
+                                        .filter(|pane_drop| pane_drop.pane == key)
+                                        .and_then(|pane_drop| pane_drop.edge);
+                                    cx.notify();
+                                    if dragged.item.tab != tab_key || dragged.item.pane == key.pane
+                                    {
+                                        return;
+                                    }
+                                    let request = match edge {
+                                        Some(edge) => SpaceRequest::MovePane {
+                                            pane: dragged.item.pane,
+                                            target: key.pane,
+                                            edge,
+                                        },
+                                        None => {
+                                            SpaceRequest::SwapPanes(dragged.item.pane, key.pane)
+                                        }
+                                    };
+                                    this.send(key.machine, request, cx);
+                                },
+                            ))
+                            .map(|overlay| match pane_drop.edge {
+                                None => overlay.inset_0(),
+                                Some(NavDirection::Up) => {
+                                    overlay.top_0().left_0().right_0().h(half)
+                                }
+                                Some(NavDirection::Down) => {
+                                    overlay.bottom_0().left_0().right_0().h(half)
+                                }
+                                Some(NavDirection::Left) => {
+                                    overlay.top_0().bottom_0().left_0().w(half)
+                                }
+                                Some(NavDirection::Right) => {
+                                    overlay.top_0().bottom_0().right_0().w(half)
+                                }
+                            })
+                    }),
+            )
             .into_any_element()
     }
 
@@ -3927,6 +4026,105 @@ mod tests {
         cx.run_until_parked();
         let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
         assert_eq!(focused.map(|pane| pane.pane), Some(PaneId(3)));
+    }
+
+    #[test]
+    fn a_pane_drop_is_on_the_nearest_edge_within_reach_or_in_the_middle() {
+        let bounds = Bounds::new(gpui::point(px(10.), px(10.)), gpui::size(px(100.), px(50.)));
+        let at = |x: f32, y: f32| pane_drop_edge(bounds, gpui::point(px(x), px(y)));
+        // The edges reach a fifth of the shorter side, 10px.
+        assert_eq!(at(15., 35.), Some(NavDirection::Left));
+        assert_eq!(at(105., 30.), Some(NavDirection::Right));
+        assert_eq!(at(60., 12.), Some(NavDirection::Up));
+        assert_eq!(at(60., 55.), Some(NavDirection::Down));
+        assert_eq!(at(21., 35.), None);
+        assert_eq!(at(60., 35.), None);
+        // In a corner, the nearer edge wins.
+        assert_eq!(at(12., 15.), Some(NavDirection::Left));
+        assert_eq!(at(15., 12.), Some(NavDirection::Up));
+    }
+
+    #[gpui::test]
+    fn dropping_a_pane_on_an_edge_splits_and_in_the_middle_swaps(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client =
+                ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(), cx);
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+        let sent = |cx: &mut gpui::VisualTestContext| -> Vec<Request> {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter(|request| matches!(request, Request::Spaces(_)))
+                    .collect()
+            })
+        };
+        let none = gpui::Modifiers::none();
+        let header = cx
+            .debug_bounds("pane-header-4")
+            .expect("the top pane has a header");
+        let left = cx.debug_bounds("pane-3").expect("the left pane is drawn");
+        let bottom = cx.debug_bounds("pane-5").expect("the bottom pane is drawn");
+        let start_drag = |cx: &mut gpui::VisualTestContext| {
+            cx.simulate_mouse_down(header.center(), MouseButton::Left, none);
+            cx.simulate_mouse_move(
+                header.center() + gpui::point(px(20.), px(0.)),
+                MouseButton::Left,
+                none,
+            );
+        };
+
+        // Near the left pane's left edge, its left half lights up, and dropping puts the
+        // top pane there.
+        start_drag(cx);
+        let edge = gpui::point(left.left() + px(5.), left.center().y);
+        cx.simulate_mouse_move(edge, MouseButton::Left, none);
+        let overlay = cx
+            .debug_bounds("pane-drop-3")
+            .expect("the left half lights up");
+        assert!(f32::from(overlay.left() - left.left()).abs() <= 1.);
+        assert!(f32::from(overlay.top() - left.top()).abs() <= 1.);
+        assert_close(overlay.size.width / left.size.width, 0.5);
+        assert_close(overlay.size.height / left.size.height, 1.);
+        assert!(cx.debug_bounds("pane-drop-4").is_none());
+        cx.simulate_mouse_up(edge, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("pane-drop-3").is_none());
+        let move_pane = Request::Spaces(SpaceRequest::MovePane {
+            pane: PaneId(4),
+            target: PaneId(3),
+            edge: NavDirection::Left,
+        });
+        assert_eq!(sent(cx), std::slice::from_ref(&move_pane));
+
+        // Over the dragged pane itself, nothing lights up.
+        start_drag(cx);
+        cx.simulate_mouse_move(header.center(), MouseButton::Left, none);
+        assert!(cx.debug_bounds("pane-drop-4").is_none());
+
+        // In the middle of the bottom pane, all of it lights up, and dropping swaps.
+        cx.simulate_mouse_move(bottom.center(), MouseButton::Left, none);
+        let overlay = cx
+            .debug_bounds("pane-drop-5")
+            .expect("the whole pane lights up");
+        assert_close(overlay.size.width / bottom.size.width, 1.);
+        assert_close(overlay.size.height / bottom.size.height, 1.);
+        cx.simulate_mouse_up(bottom.center(), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(
+            sent(cx),
+            [
+                move_pane,
+                Request::Spaces(SpaceRequest::SwapPanes(PaneId(4), PaneId(5)))
+            ]
+        );
     }
 
     #[gpui::test]

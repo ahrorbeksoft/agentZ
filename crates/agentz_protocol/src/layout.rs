@@ -311,6 +311,44 @@ impl TileLayout {
         true
     }
 
+    /// Takes `moved` out of its split and puts it beside `target`, on `edge`'s side of it,
+    /// splitting `target` in half. Focus and its history stay. True only when both exist and
+    /// differ.
+    pub fn move_pane(&mut self, moved: PaneId, target: PaneId, edge: NavDirection) -> bool {
+        if moved == target {
+            return false;
+        }
+        let ids = self.pane_ids();
+        if !ids.contains(&moved) || !ids.contains(&target) {
+            return false;
+        }
+        let Some(mut root) = remove_pane(self.root.clone(), moved) else {
+            return false;
+        };
+        let Some(node) = find_pane_mut(&mut root, target) else {
+            return false;
+        };
+        let (direction, moved_first) = match edge {
+            NavDirection::Left => (Direction::Horizontal, true),
+            NavDirection::Right => (Direction::Horizontal, false),
+            NavDirection::Up => (Direction::Vertical, true),
+            NavDirection::Down => (Direction::Vertical, false),
+        };
+        let (first, second) = if moved_first {
+            (moved, target)
+        } else {
+            (target, moved)
+        };
+        *node = Node::Split {
+            direction,
+            ratio: 0.5,
+            first: Box::new(Node::Pane(first)),
+            second: Box::new(Node::Pane(second)),
+        };
+        self.root = root;
+        true
+    }
+
     /// Sets the ratio of the split at `path`.
     pub fn set_ratio_at(&mut self, path: &[bool], ratio: f32) -> bool {
         set_ratio_at(&mut self.root, path, ratio.clamp(0.1, 0.9))
@@ -922,6 +960,48 @@ mod tests {
         assert_eq!(pane_rects(&layout), before_rects);
         assert_eq!(split_snapshot(&layout), before_splits);
         assert_eq!(layout.focused(), before_focus);
+    }
+
+    #[test]
+    fn move_pane_splits_the_target_on_the_edge_side() {
+        // 1 | (2 / (3 | 4)): moving 4 above 1 leaves 3 where 3 | 4 was.
+        let mut layout = sample_layout();
+        assert!(layout.move_pane(pane(4), pane(1), NavDirection::Up));
+        assert_eq!(layout.pane_ids(), [pane(4), pane(1), pane(2), pane(3)]);
+        assert_eq!(
+            split_snapshot(&layout),
+            [
+                (Direction::Horizontal, 0.3),
+                (Direction::Vertical, 0.5),
+                (Direction::Vertical, 0.6)
+            ]
+        );
+        assert_eq!(pane_rect(&layout, pane(4)), Rect::new(0, 0, 30, 20));
+        assert_eq!(pane_rect(&layout, pane(1)), Rect::new(0, 20, 30, 20));
+        assert_eq!(pane_rect(&layout, pane(3)), Rect::new(30, 24, 70, 16));
+        assert_eq!(layout.focused(), pane(2));
+
+        // The right and bottom edges put it second.
+        assert!(layout.move_pane(pane(4), pane(3), NavDirection::Right));
+        assert_eq!(layout.pane_ids(), [pane(1), pane(2), pane(3), pane(4)]);
+        assert_eq!(pane_rect(&layout, pane(4)), Rect::new(65, 24, 35, 16));
+        assert!(layout.move_pane(pane(1), pane(2), NavDirection::Down));
+        assert_eq!(layout.pane_ids(), [pane(2), pane(1), pane(3), pane(4)]);
+        assert_eq!(pane_rect(&layout, pane(1)), Rect::new(0, 12, 100, 12));
+    }
+
+    #[test]
+    fn move_pane_is_noop_for_same_or_missing_pane() {
+        let mut layout = sample_layout();
+        let before_rects = pane_rects(&layout);
+        let before_splits = split_snapshot(&layout);
+
+        assert!(!layout.move_pane(pane(2), pane(2), NavDirection::Left));
+        assert!(!layout.move_pane(pane(2), pane(99), NavDirection::Left));
+        assert!(!layout.move_pane(pane(99), pane(2), NavDirection::Left));
+
+        assert_eq!(pane_rects(&layout), before_rects);
+        assert_eq!(split_snapshot(&layout), before_splits);
     }
 
     #[test]

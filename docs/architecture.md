@@ -504,7 +504,11 @@ since a thread's workspace is its checkout.
   checkout at a glance in git (branch → upstream with ↑↓, uncommitted files and lines, the last
   commit, the path, its worktrees; `SpaceGit::{upstream, changes, last_commit}`) or the thread
   cards' details popover outside it (`sidebar::ThreadDetails`, no pane list); tab bar; panes holding a shell, an agent CLI,
-  or an ACP thread; resize, zoom, swap, close. Which tab shows, focus and zoom are client-only.
+  or an ACP thread; resize, zoom, close. Which tab shows, focus and zoom are client-only.
+  Dragging a pane's header over another pane of its tab works as Zed's pane drop targets
+  (`pane_drop_edge`): near an edge (a fifth of the pane's shorter side), that half lights up
+  and dropping splits the pane there with the dragged one (`SpaceRequest::MovePane`,
+  `TileLayout::move_pane`); in the middle, all of it lights up and dropping swaps the two.
   An ACP thread's pane has one header: the thread's title, agent and toolbar buttons
   (`AgentView::render_toolbar_buttons`) beside the pane's own, so its toolbar is hidden there.
   A terminal pane's header names what runs there (its agent, the command it was opened with,
