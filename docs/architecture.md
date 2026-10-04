@@ -568,8 +568,9 @@ since a thread's workspace is its checkout.
   machine picker. Closing the pane keeps the thread, and the pane menu's Show Thread lists it.
   The server's tools treat its folder as a project's path (`orchestrator_capabilities` has no
   project).
-- **Tabs**: a tab the user hasn't named takes the title of its focused pane (what runs there),
-  in muted text; a rename left unchanged keeps it automatic.
+- **Tabs**: a tab the user hasn't named is "Tab 1", "Tab 2"… by its position, in muted text,
+  so moving it renumbers it (`tab_label`); a name the user gives stays wherever it moves, and a
+  rename left unchanged keeps it automatic.
 - **Closing** a pane, tab or workspace asks first while a terminal there runs something in
   front of its shell (`Pane::program`: a server, an agent CLI even at its prompt), naming it,
   as Ghostty does; idle shells and thread panes close at once (`SpacesView::confirm_close`).

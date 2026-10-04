@@ -36,7 +36,7 @@ Notes for whoever continues:
 |---|---|---|---|
 | 1 | 8 | Pane header: title first, folder as detail, buttons on hover | done |
 | 2 | 9 | Focus: accent outline | done |
-| 3 | 7 | Unnamed tabs named by what runs, Cmd-1…9 in tooltips | done |
+| 3 | 7 | Unnamed tabs named by what runs, Cmd-1…9 in tooltips | done (later the user asked for "Tab 1", "Tab 2"… by position instead) |
 | 4 | 12 | Empty state: minimal | done |
 | 5 | 1 | Rows: full-color icons, agent icons, `~` paths, machine only with remotes | done |
 | 6 | 3A | Agents list: herdr's two-line rows | done |

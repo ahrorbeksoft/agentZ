@@ -1238,30 +1238,6 @@ impl SpacesView {
         self.activate_tab(tab, window, cx);
     }
 
-    /// What an unnamed tab is called: what runs in its focused pane.
-    fn automatic_tab_label(&self, machine: MachineId, tab: &Tab, cx: &App) -> SharedString {
-        let tab_key = TabKey {
-            machine,
-            tab: tab.id,
-        };
-        let focused = self
-            .layouts
-            .get(&tab_key)
-            .map_or(tab.root.first_pane(), TileLayout::focused);
-        let Some(pane) = tab.pane(focused) else {
-            return SharedString::default();
-        };
-        let (_, title, _) = self.pane_title(
-            PaneKey {
-                machine,
-                pane: pane.id,
-            },
-            pane,
-            cx,
-        );
-        title
-    }
-
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_tab(true, window, cx);
     }
@@ -2812,11 +2788,7 @@ impl SpacesView {
             machine,
             tab: tab.id,
         };
-        // A name the user gave wins; otherwise the tab says what runs in it.
-        let label: SharedString = match &tab.name {
-            Some(name) => name.clone().into(),
-            None => self.automatic_tab_label(machine, tab, cx),
-        };
+        let label: SharedString = tab_label(tab, index).into();
         let is_automatic = tab.name.is_none();
         let status = rolled_up(
             tab.panes
@@ -2877,11 +2849,8 @@ impl SpacesView {
                     let name = this
                         .space(space_key, cx)
                         .and_then(|space| {
-                            let tab = space.tabs.iter().find(|tab| tab.id == tab_key.tab)?;
-                            Some(match &tab.name {
-                                Some(name) => name.clone().into(),
-                                None => this.automatic_tab_label(machine, tab, cx),
-                            })
+                            let index = space.tabs.iter().position(|tab| tab.id == tab_key.tab)?;
+                            Some(tab_label(&space.tabs[index], index).into())
                         })
                         .unwrap_or_default();
                     this.start_renaming(RenameTarget::Tab(tab_key), name, window, cx);
@@ -3884,8 +3853,11 @@ fn pane_folder_label(space: &Space, folder: &SpaceFolder) -> String {
     folder.display_path.clone()
 }
 
+/// A name the user gave, or else the tab's position, so moving it renumbers it.
 fn tab_label(tab: &Tab, index: usize) -> String {
-    tab.name.clone().unwrap_or_else(|| (index + 1).to_string())
+    tab.name
+        .clone()
+        .unwrap_or_else(|| format!("Tab {}", index + 1))
 }
 
 fn matches_space(space: &Space, query: &str) -> bool {
@@ -4534,7 +4506,7 @@ mod tests {
             root: Node::Pane(PaneId(1)),
             panes: Vec::new(),
         };
-        assert_eq!(tab_label(&tab, 1), "2");
+        assert_eq!(tab_label(&tab, 1), "Tab 2");
         let named = Tab {
             name: Some("server".to_string()),
             ..tab
