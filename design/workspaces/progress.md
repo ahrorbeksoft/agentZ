@@ -19,7 +19,7 @@ Notes for whoever continues:
 | Order | § | Item | Status |
 |---|---|---|---|
 | 1 | 8 | Pane header: title first, folder as detail, buttons on hover | done |
-| 2 | 9 | Focus: accent outline | not started |
+| 2 | 9 | Focus: accent outline | done |
 | 3 | 7 | Unnamed tabs named by what runs, Cmd-1…9 in tooltips | not started |
 | 4 | 12 | Empty state: minimal | not started |
 | 5 | 1 | Rows: full-color icons, agent icons, `~` paths, machine only with remotes | not started |

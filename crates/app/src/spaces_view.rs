@@ -2347,7 +2347,7 @@ impl SpacesView {
             .size_full()
             .when(shows_focus, |pane| {
                 pane.border_1().border_color(if is_focused {
-                    colors.pane_focused_border
+                    colors.text_accent
                 } else {
                     gpui::transparent_black()
                 })
