@@ -275,8 +275,14 @@ impl AgentThread {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_supports_steering_for_test(&mut self, cx: &mut Context<Self>) {
-        self.view.state.supports_steering = true;
+    pub(crate) fn set_queued_messages_for_test(
+        &mut self,
+        messages: Vec<agentz_protocol::thread::QueuedMessage>,
+        steering: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.state.queued_messages = messages;
+        self.view.state.steering_queued = steering;
         cx.notify();
     }
 
@@ -417,13 +423,46 @@ impl AgentThread {
         self.request(|connection| Request::Prompt { connection, prompt }, cx)
     }
 
-    /// Sends the message into the agent's running turn ([`Request::Steer`]).
-    pub fn steer(&mut self, prompt: Vec<agentz_protocol::PromptPart>, cx: &mut Context<Self>) {
-        self.request(|connection| Request::Steer { connection, prompt }, cx)
-    }
-
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         self.request(Request::Cancel, cx)
+    }
+
+    /// Adds the message to the queue the server keeps for the thread
+    /// ([`ThreadState::queued_messages`]).
+    pub fn queue_message(
+        &mut self,
+        prompt: Vec<agentz_protocol::PromptPart>,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(
+            |connection| Request::QueueMessage { connection, prompt },
+            cx,
+        )
+    }
+
+    pub fn remove_queued_message(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.request(
+            |connection| Request::RemoveQueuedMessage { connection, id },
+            cx,
+        )
+    }
+
+    pub fn steer_queued_message(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.request(
+            |connection| Request::SteerQueuedMessage { connection, id },
+            cx,
+        )
+    }
+
+    pub fn send_queued_message_now(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.request(
+            |connection| Request::SendQueuedMessageNow { connection, id },
+            cx,
+        )
+    }
+
+    pub fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        self.request(Request::ClearQueue, cx)
     }
 
     pub fn respond_to_permission(

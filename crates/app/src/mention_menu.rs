@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::{FileListing, PromptPart};
 use gpui::{AnyElement, App, SharedString};
 use projects::ThreadId;
@@ -20,11 +21,8 @@ pub(crate) enum Mention {
     /// A file or folder on the thread's machine.
     Path(PathBuf),
     Thread(ThreadId),
-    Image {
-        mime_type: String,
-        /// Base64.
-        data: String,
-    },
+    /// An image kept by the thread's server.
+    Image(AttachmentId),
 }
 
 impl Mention {
@@ -32,10 +30,7 @@ impl Mention {
         match self {
             Mention::Path(path) => PromptPart::Path(path.clone()),
             Mention::Thread(thread_id) => PromptPart::Thread(*thread_id),
-            Mention::Image { mime_type, data } => PromptPart::Image {
-                mime_type: mime_type.clone(),
-                data: data.clone(),
-            },
+            Mention::Image(id) => PromptPart::Image(id.clone()),
         }
     }
 }

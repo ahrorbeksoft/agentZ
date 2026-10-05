@@ -3,6 +3,7 @@ mod agent_icons;
 mod agent_login;
 mod agent_view;
 mod app_settings;
+mod attachment_image;
 mod command_palette;
 mod confirm_dialog;
 mod controls;

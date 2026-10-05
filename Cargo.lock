@@ -172,6 +172,7 @@ dependencies = [
  "agent-client-protocol",
  "agentz_protocol",
  "anyhow",
+ "base64",
  "futures",
  "gpui_shared_string",
  "libc",
@@ -217,6 +218,7 @@ dependencies = [
  "projects",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -230,6 +232,7 @@ dependencies = [
  "agentz_protocol",
  "alacritty_terminal",
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "collections",
@@ -239,6 +242,7 @@ dependencies = [
  "gpui_shared_string",
  "http_client",
  "ignore",
+ "image",
  "libc",
  "log",
  "nix",

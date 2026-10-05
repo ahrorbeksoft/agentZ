@@ -288,6 +288,10 @@ impl Server {
     pub(super) fn send_follow_ups(&mut self) {
         let waiting: Vec<ThreadId> = self.follow_ups.keys().copied().collect();
         for thread_id in waiting {
+            // The user's message, still being read, goes first.
+            if self.has_waiting_prompt(thread_id) && self.threads.contains_key(&thread_id) {
+                continue;
+            }
             let Some(thread) = self.threads.get_mut(&thread_id) else {
                 self.follow_ups.remove(&thread_id);
                 continue;
@@ -1622,7 +1626,8 @@ impl Server {
         let Some(thread) = self.threads.get(&thread_id) else {
             return "idle";
         };
-        let has_follow_ups = self.follow_ups.contains_key(&thread_id);
+        let has_follow_ups =
+            self.follow_ups.contains_key(&thread_id) || self.has_queued_messages(thread_id);
         match thread.status() {
             ConnectionStatus::Failed(_) => "failed",
             ConnectionStatus::AuthRequired => "needs_login",

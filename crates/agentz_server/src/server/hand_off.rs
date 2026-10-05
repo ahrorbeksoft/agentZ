@@ -276,6 +276,12 @@ impl Server {
             if let Some(cwd) = self.projects.thread_folder(thread_id) {
                 thread.set_turn_hook(self.turn_hook(cwd, thread_id));
             }
+            thread.set_attachments(agent_thread::Attachments::for_thread(
+                &self.data_dir,
+                thread_id,
+            ));
+            let (queued_messages, steering) = self.queues.state(thread_id);
+            thread.set_queued_messages(queued_messages, steering);
             if let Some(token) = handed.token {
                 self.tool_sessions.insert(token, thread_id);
             }

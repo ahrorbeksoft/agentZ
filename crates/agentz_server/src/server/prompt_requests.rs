@@ -5,8 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agent_thread::MessagePart;
+use agent_thread::{Attachments, MessagePart};
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::thread::{ConnectionStatus, mentioned_thread};
 use agentz_protocol::{ConnectionId, FileEntry, FileListing, PromptPart, Response};
 use anyhow::{Context as _, Result, anyhow};
@@ -24,14 +25,15 @@ const MENTIONED_FILE_LIMIT: u64 = 1024 * 1024;
 pub(super) struct PendingPrompt {
     connection: ConnectionId,
     prompt: Vec<PromptPart>,
-    /// Sent into the turn the agent is working on ([`agentz_protocol::Request::Steer`]).
+    /// Sent into the turn the agent is working on, as a steered queued message is
+    /// ([`agentz_protocol::Request::SteerQueuedMessage`]).
     steer: bool,
     deadline: Instant,
 }
 
 impl Server {
-    /// Sends a message to a thread's agent ([`agentz_protocol::Request::Prompt`]), or into the turn it's working
-    /// on ([`agentz_protocol::Request::Steer`]).
+    /// Sends a message to a thread's agent ([`agentz_protocol::Request::Prompt`]), or into the
+    /// turn it's working on.
     pub(super) fn prompt(
         &mut self,
         connection: ConnectionId,
@@ -107,11 +109,14 @@ impl Server {
         Ok(())
     }
 
-    /// Whether a message to the thread waits for the threads it mentions.
+    /// Whether a message to the thread waits for the threads it mentions, or for its files and
+    /// images to be read.
     pub(super) fn has_waiting_prompt(&self, thread_id: ThreadId) -> bool {
+        let connection = ConnectionId::Thread(thread_id);
         self.pending_prompts
             .iter()
-            .any(|pending| pending.connection == ConnectionId::Thread(thread_id))
+            .any(|pending| pending.connection == connection)
+            || self.reading_prompts.contains(&connection)
     }
 
     /// Sends the waiting messages whose mentioned threads have loaded, or that waited long
@@ -139,36 +144,56 @@ impl Server {
         }
     }
 
-    /// Takes the mentioned threads' conversations now, reads the mentioned files off the
-    /// server's task, then sends.
+    /// Takes the mentioned threads' conversations now, reads the mentioned files and the
+    /// images off the server's task, then sends.
     fn send_prompt(&mut self, connection: ConnectionId, prompt: Vec<PromptPart>, steer: bool) {
-        let parts: Vec<Result<MessagePart, PathBuf>> = prompt
+        let attachments = match connection {
+            ConnectionId::Thread(thread_id) => {
+                Some(Attachments::for_thread(&self.data_dir, thread_id))
+            }
+            ConnectionId::Account(_) => None,
+        };
+        let parts: Vec<UnreadPart> = prompt
             .into_iter()
             .map(|part| match part {
-                PromptPart::Text(text) => Ok(MessagePart::Text(text)),
-                PromptPart::Thread(thread_id) => Ok(self.mentioned_thread(thread_id)),
-                PromptPart::Image { mime_type, data } => Ok(MessagePart::Image { mime_type, data }),
-                PromptPart::Path(path) => Err(path),
+                PromptPart::Text(text) => UnreadPart::Read(MessagePart::Text(text)),
+                PromptPart::Thread(thread_id) => UnreadPart::Read(self.mentioned_thread(thread_id)),
+                PromptPart::Image(id) => UnreadPart::Image(id),
+                PromptPart::Path(path) => UnreadPart::Path(path),
             })
             .collect();
+        self.reading_prompts.push(connection);
         self.spawn_then(
             async move {
                 let mut resolved = Vec::with_capacity(parts.len());
                 for part in parts {
-                    resolved.push(match part {
-                        Ok(part) => part,
-                        Err(path) => mentioned_path(path).await,
-                    });
+                    match part {
+                        UnreadPart::Read(part) => resolved.push(part),
+                        UnreadPart::Path(path) => resolved.push(mentioned_path(path).await),
+                        UnreadPart::Image(id) => {
+                            match attached_image(attachments.clone(), id).await {
+                                Ok(part) => resolved.push(part),
+                                Err(error) => log::error!("failed to send an image: {error:#}"),
+                            }
+                        }
+                    }
                 }
                 resolved
             },
             move |server, parts| {
+                if let Some(index) = server
+                    .reading_prompts
+                    .iter()
+                    .position(|reading| *reading == connection)
+                {
+                    server.reading_prompts.remove(index);
+                }
                 server
                     .update_thread(connection, |thread| {
                         if steer {
                             thread.steer_message(parts)
                         } else {
-                            thread.send_message(parts)
+                            thread.send_after_turn(parts)
                         }
                     })
                     .log_err();
@@ -215,6 +240,24 @@ impl Server {
             move |server, listing| server.respond(client, id, listing.map(Response::Files)),
         );
     }
+}
+
+/// A part of a message, before what it names is read.
+enum UnreadPart {
+    Read(MessagePart),
+    Path(PathBuf),
+    Image(AttachmentId),
+}
+
+/// An image kept for the thread, with its bytes.
+async fn attached_image(attachments: Option<Attachments>, id: AttachmentId) -> Result<MessagePart> {
+    let attachments = attachments.context("only threads take images")?;
+    let read = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || attachments.read_base64(&id))
+    };
+    let data = read.await.context("reading the image")??;
+    Ok(MessagePart::Image { id, data })
 }
 
 /// A mentioned path: a folder, or a file with its contents when they're text and not too big.

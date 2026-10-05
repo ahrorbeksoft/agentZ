@@ -7,7 +7,10 @@
 //! [`ThreadMessage`]s, which the thread's owner passes to [`AgentThread::handle`]. What the
 //! owner should hear about queues up as [`AgentThreadEvent`]s.
 
+mod attachments;
 mod wire;
+
+pub use attachments::Attachments;
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -21,11 +24,12 @@ use std::time::{Duration, SystemTime};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
+use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
     AuthStatus, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry, FileDiff,
-    PendingHandoff, PermissionOption, PermissionRequest, PlanItem, SessionDefaults, SessionRestore,
-    ThreadState, ThreadView, ToolCall, TurnTime,
+    PendingHandoff, PermissionOption, PermissionRequest, PlanItem, QueuedMessage, SessionDefaults,
+    SessionRestore, ThreadState, ThreadView, ToolCall, TurnTime,
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -240,6 +244,8 @@ pub struct AgentThread {
     handoff_to_send: Option<PendingHandoff>,
     /// Given to the agent with every session it opens.
     mcp_servers: Vec<acp::McpServer>,
+    /// Where images the agent shows or replays are kept, for messages to link to.
+    attachments: Option<Attachments>,
     terminal_host: Option<TerminalHost>,
     turn_hook: Option<TurnHook>,
     /// Set by [`Self::cancel`] for the turn in flight, in case its prompt hasn't gone out yet.
@@ -445,6 +451,7 @@ impl AgentThread {
             entries_changed_from: Some(0),
             handoff_to_send: None,
             mcp_servers: Vec::new(),
+            attachments: None,
             terminal_host: None,
             turn_hook: None,
             turn_cancelled: None,
@@ -474,6 +481,30 @@ impl AgentThread {
     /// Work to do around each turn. Set it right after starting.
     pub fn set_turn_hook(&mut self, hook: TurnHook) {
         self.turn_hook = Some(hook);
+    }
+
+    /// Where to keep the images the agent shows, and the ones its history replays. Without it
+    /// they show as a plain `@Image`. Set it right after starting.
+    pub fn set_attachments(&mut self, attachments: Attachments) {
+        self.attachments = Some(attachments);
+    }
+
+    /// The thread's queue, which its owner keeps, for clients to see.
+    pub fn set_queued_messages(&mut self, messages: Vec<QueuedMessage>, steering: bool) {
+        self.view.state.queued_messages = messages;
+        self.view.state.steering_queued = steering;
+    }
+
+    /// Keeps an image the agent sent, for a message to link to.
+    fn keep_image(&self, mime_type: &str, data: &str) -> Option<AttachmentId> {
+        let attachments = self.attachments.as_ref()?;
+        match attachments.add_base64(mime_type, data) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                log::error!("failed to keep an image from the agent: {error:#}");
+                None
+            }
+        }
     }
 
     /// The events since the last call, oldest first.
@@ -1589,7 +1620,7 @@ impl AgentThread {
     }
 
     /// Sends a message once no turn is running.
-    fn send_after_turn(&mut self, parts: Vec<MessagePart>) {
+    pub fn send_after_turn(&mut self, parts: Vec<MessagePart>) {
         if self.is_working() {
             self.after_turn.push_back(parts);
         } else {
@@ -1994,7 +2025,7 @@ impl AgentThread {
         new_entry: impl FnOnce(String) -> Entry,
         existing_text: impl FnOnce(&mut Entry) -> Option<&mut String>,
     ) {
-        let Some(text) = content_markdown(content) else {
+        let Some(text) = self.content_markdown(content) else {
             return;
         };
         if let Some(existing) = self.view.entries.last_mut().and_then(existing_text) {
@@ -2020,8 +2051,9 @@ impl AgentThread {
                 .collect(),
             raw_input: tool_call.raw_input.as_ref().and_then(raw_input_text),
             terminals: Vec::new(),
+            images: Vec::new(),
         };
-        set_tool_call_content(&mut entry, tool_call.content);
+        self.tool_content(tool_call.content).apply_to(&mut entry);
         if let Some(existing) = self.tool_call_mut(&entry.id) {
             *existing = entry;
         } else {
@@ -2031,6 +2063,8 @@ impl AgentThread {
 
     fn apply_tool_call_update(&mut self, update: acp::ToolCallUpdate) {
         let fields = update.fields;
+        // Read before the tool call is borrowed to change, as it keeps the images.
+        let content = fields.content.map(|content| self.tool_content(content));
         let Some(existing) = self.tool_call_mut(&update.tool_call_id) else {
             let mut entry = ToolCall {
                 id: update.tool_call_id,
@@ -2047,8 +2081,11 @@ impl AgentThread {
                     .collect(),
                 raw_input: fields.raw_input.as_ref().and_then(raw_input_text),
                 terminals: Vec::new(),
+                images: Vec::new(),
             };
-            set_tool_call_content(&mut entry, fields.content.unwrap_or_default());
+            if let Some(content) = content {
+                content.apply_to(&mut entry);
+            }
             self.push_entry(Entry::ToolCall(entry));
             return;
         };
@@ -2067,11 +2104,68 @@ impl AgentThread {
                 .map(|location| location.path)
                 .collect();
         }
-        if let Some(content) = fields.content {
-            set_tool_call_content(existing, content);
+        if let Some(content) = content {
+            content.apply_to(existing);
         }
         if let Some(raw_input) = fields.raw_input.as_ref() {
             existing.raw_input = raw_input_text(raw_input);
+        }
+    }
+
+    /// What a tool call shows of its content: text, diffs, terminals, and images, which are
+    /// kept for the thread.
+    fn tool_content(&self, content: Vec<acp::ToolCallContent>) -> ToolContent {
+        let mut tool_content = ToolContent::default();
+        for item in content {
+            match item {
+                acp::ToolCallContent::Content(content) => match content.content {
+                    acp::ContentBlock::Text(text) => tool_content.text.push(text.text),
+                    acp::ContentBlock::Image(image) => {
+                        if let Some(id) = self.keep_image(&image.mime_type, &image.data) {
+                            tool_content.images.push(id);
+                        }
+                    }
+                    _ => {}
+                },
+                acp::ToolCallContent::Diff(diff) => tool_content.diffs.push(FileDiff {
+                    path: diff.path,
+                    old_text: diff.old_text,
+                    new_text: diff.new_text,
+                }),
+                acp::ToolCallContent::Terminal(terminal) => tool_content
+                    .terminals
+                    .push(terminal.terminal_id.0.to_string()),
+                _ => {}
+            }
+        }
+        tool_content
+    }
+
+    /// A replayed or streamed chunk of a message as its entry shows it, mentions as links. The
+    /// handoff a continued thread began with stays hidden.
+    fn content_markdown(&self, content: acp::ContentBlock) -> Option<String> {
+        match content {
+            acp::ContentBlock::Text(text) => Some(text.text),
+            acp::ContentBlock::ResourceLink(link) => {
+                Some(format!("[@{}]({})", link.name, link.uri))
+            }
+            acp::ContentBlock::Resource(resource) => {
+                let uri = match resource.resource {
+                    acp::EmbeddedResourceResource::TextResourceContents(contents) => contents.uri,
+                    acp::EmbeddedResourceResource::BlobResourceContents(contents) => contents.uri,
+                    _ => return None,
+                };
+                if uri == "agentz://handoff" {
+                    return None;
+                }
+                let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
+                Some(format!("[@{name}]({uri})"))
+            }
+            acp::ContentBlock::Image(image) => Some(
+                self.keep_image(&image.mime_type, &image.data)
+                    .map_or_else(|| "`@Image`".to_string(), |id| id.markdown_link()),
+            ),
+            _ => None,
         }
     }
 
@@ -2137,9 +2231,9 @@ pub enum MessagePart {
         title: String,
         text: String,
     },
-    /// An image's MIME type and its bytes in base64.
+    /// An image kept for the thread, with its bytes in base64.
     Image {
-        mime_type: String,
+        id: AttachmentId,
         data: String,
     },
 }
@@ -2175,8 +2269,8 @@ impl MessagePart {
             MessagePart::Thread { text, .. } => {
                 acp::ContentBlock::Text(acp::TextContent::new(text))
             }
-            MessagePart::Image { mime_type, data } if images => {
-                acp::ContentBlock::Image(acp::ImageContent::new(data, mime_type))
+            MessagePart::Image { id, data } if images => {
+                acp::ContentBlock::Image(acp::ImageContent::new(data, id.mime_type()))
             }
             MessagePart::Image { .. } => return None,
         })
@@ -2209,7 +2303,7 @@ fn message_markdown(parts: &[MessagePart]) -> String {
                 format!("[@{}]({})", path_name(path), file_uri(path))
             }
             MessagePart::Thread { uri, title, .. } => format!("[@{title}]({uri})"),
-            MessagePart::Image { .. } => "`@Image`".to_string(),
+            MessagePart::Image { id, .. } => id.markdown_link(),
         })
         .collect()
 }
@@ -2229,29 +2323,6 @@ fn message_title(parts: &[MessagePart]) -> String {
         .collect()
 }
 
-/// A replayed chunk of a message as the user's entry shows it, mentions as links. The handoff
-/// a continued thread began with stays hidden.
-fn content_markdown(content: acp::ContentBlock) -> Option<String> {
-    match content {
-        acp::ContentBlock::Text(text) => Some(text.text),
-        acp::ContentBlock::ResourceLink(link) => Some(format!("[@{}]({})", link.name, link.uri)),
-        acp::ContentBlock::Resource(resource) => {
-            let uri = match resource.resource {
-                acp::EmbeddedResourceResource::TextResourceContents(contents) => contents.uri,
-                acp::EmbeddedResourceResource::BlobResourceContents(contents) => contents.uri,
-                _ => return None,
-            };
-            if uri == "agentz://handoff" {
-                return None;
-            }
-            let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
-            Some(format!("[@{name}]({uri})"))
-        }
-        acp::ContentBlock::Image(_) => Some("`@Image`".to_string()),
-        _ => None,
-    }
-}
-
 fn file_uri(path: &Path) -> String {
     format!("file://{}", path.display())
 }
@@ -2262,27 +2333,22 @@ fn path_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn set_tool_call_content(tool_call: &mut ToolCall, content: Vec<acp::ToolCallContent>) {
-    tool_call.text.clear();
-    tool_call.diffs.clear();
-    tool_call.terminals.clear();
-    for item in content {
-        match item {
-            acp::ToolCallContent::Content(content) => {
-                if let acp::ContentBlock::Text(text) = content.content {
-                    tool_call.text.push(text.text);
-                }
-            }
-            acp::ToolCallContent::Diff(diff) => tool_call.diffs.push(FileDiff {
-                path: diff.path,
-                old_text: diff.old_text,
-                new_text: diff.new_text,
-            }),
-            acp::ToolCallContent::Terminal(terminal) => {
-                tool_call.terminals.push(terminal.terminal_id.0.to_string())
-            }
-            _ => {}
-        }
+/// A tool call's content, read by [`AgentThread::tool_content`].
+#[derive(Default)]
+struct ToolContent {
+    text: Vec<String>,
+    diffs: Vec<FileDiff>,
+    terminals: Vec<String>,
+    images: Vec<AttachmentId>,
+}
+
+impl ToolContent {
+    /// Replaces the tool call's content, as ACP's updates do.
+    fn apply_to(self, tool_call: &mut ToolCall) {
+        tool_call.text = self.text;
+        tool_call.diffs = self.diffs;
+        tool_call.terminals = self.terminals;
+        tool_call.images = self.images;
     }
 }
 

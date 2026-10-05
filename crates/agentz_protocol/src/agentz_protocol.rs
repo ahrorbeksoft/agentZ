@@ -13,6 +13,7 @@
 //!   rule).
 
 pub mod agents;
+pub mod attachments;
 pub mod diff;
 pub mod layout;
 pub mod spaces;
@@ -38,6 +39,7 @@ use crate::agents::{
     AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, CustomAgentChange, IconId,
     RegistrySnapshot,
 };
+use crate::attachments::{AttachmentData, AttachmentId};
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
 use crate::terminal::{
@@ -408,14 +410,54 @@ pub enum Request {
         connection: ConnectionId,
         prompt: Vec<PromptPart>,
     },
-    /// Sends a message into the turn the agent is working on, for agents that take one
-    /// ([`thread::ThreadState::supports_steering`]). One the agent doesn't take goes once the
-    /// turn ends.
-    Steer {
+    Cancel(ConnectionId),
+    /// Adds a message to the thread's queue ([`thread::ThreadState::queued_messages`]), which
+    /// the server keeps and sends one at a time whenever the agent is free, as Zed's queue does.
+    QueueMessage {
         connection: ConnectionId,
         prompt: Vec<PromptPart>,
     },
-    Cancel(ConnectionId),
+    /// Takes a message out of the queue, unsent: to delete it, or to edit it.
+    RemoveQueuedMessage {
+        connection: ConnectionId,
+        id: u64,
+    },
+    /// Zed's Steer: an agent that takes messages into its turn gets this one at once; for any
+    /// other, it goes first and the turn ends once the agent's current step is done
+    /// ([`thread::ThreadState::steering_queued`]). Steering the steering message again stops it.
+    SteerQueuedMessage {
+        connection: ConnectionId,
+        id: u64,
+    },
+    /// Puts the message first and sends it as soon as possible, stopping the agent's turn.
+    SendQueuedMessageNow {
+        connection: ConnectionId,
+        id: u64,
+    },
+    ClearQueue(ConnectionId),
+    /// Keeps an image for the thread's messages: [`Response::Attachment`] with its id.
+    AddAttachment {
+        thread_id: ThreadId,
+        mime_type: String,
+        /// Its bytes, in base64.
+        data: String,
+    },
+    /// An image the thread's messages link to, or a thumbnail of it that fits a hover
+    /// preview: [`Response::AttachmentData`].
+    Attachment {
+        thread_id: ThreadId,
+        id: AttachmentId,
+        thumbnail: bool,
+    },
+    /// Keeps a file from the client's machine on the server's, for a thread whose agent can't
+    /// reach the client's files (one on another machine): [`Response::UploadedFile`] with
+    /// where it's kept.
+    UploadFile {
+        thread_id: ThreadId,
+        name: String,
+        /// Its bytes, in base64.
+        data: String,
+    },
     /// The files and folders of the folder a thread works in, for its composer's @-mentions:
     /// [`Response::Files`].
     ListFiles(ThreadId),
@@ -617,11 +659,8 @@ pub enum PromptPart {
     Path(PathBuf),
     /// Another thread on the thread's machine, which goes along as its conversation.
     Thread(ThreadId),
-    /// A pasted image: its MIME type, and its bytes in base64.
-    Image {
-        mime_type: String,
-        data: String,
-    },
+    /// A pasted image, kept for the thread ([`Request::AddAttachment`]).
+    Image(AttachmentId),
 }
 
 impl PromptPart {
@@ -722,6 +761,10 @@ pub enum Response {
     AgentSessions(AgentSessions),
     ThreadsImported(Vec<ThreadId>),
     CustomAgentSaved(AgentId),
+    Attachment(AttachmentId),
+    AttachmentData(AttachmentData),
+    /// Where the server keeps a file sent with [`Request::UploadFile`].
+    UploadedFile(PathBuf),
     /// The titles of the threads whose turns are running.
     TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.

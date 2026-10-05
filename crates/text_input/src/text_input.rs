@@ -7,13 +7,12 @@
 //! over and Backspace removes whole (Zed's mention creases).
 
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, Hsla, Image, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    GlobalElementId, Hsla, ImageSource, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, SharedString, Style,
     Subscription, TextAlign, TextRun, TransformationMatrix, UTF16Selection, UnderlineStyle, Window,
     WrappedLine, actions, anchored, deferred, div, fill, img, point, prelude::*, px, quad,
@@ -102,6 +101,8 @@ pub enum TextInputEvent {
     },
     /// A right-click in an input of several lines, where its owner can show a menu.
     ContextMenu(Point<Pixels>),
+    /// A click on a chip that selected nothing.
+    ChipClicked(ChipId),
 }
 
 pub type ChipId = u64;
@@ -110,7 +111,7 @@ pub type ChipId = u64;
 #[derive(Clone)]
 pub enum ChipPreview {
     Text(SharedString),
-    Image(Arc<Image>),
+    Image(ImageSource),
 }
 
 /// A piece of the text drawn as one outlined box with an icon.
@@ -158,6 +159,8 @@ pub struct TextInput {
     menu_open: bool,
     handles_paste: bool,
     hovered_chip: Option<(ChipId, Bounds<Pixels>)>,
+    /// The chip a click went down on, a click on it once the mouse goes up there.
+    pressed_chip: Option<ChipId>,
 }
 
 /// What a drag selects by, set by the click that started it (Zed's editor's `SelectMode`).
@@ -300,6 +303,7 @@ impl TextInput {
             menu_open: false,
             handles_paste: false,
             hovered_chip: None,
+            pressed_chip: None,
         }
     }
 
@@ -488,6 +492,33 @@ impl TextInput {
         cx.emit(TextInputEvent::Changed);
         self.pause_blinking(cx);
         id
+    }
+
+    /// Takes a chip out of the text, with the space after it.
+    pub fn remove_chip(&mut self, id: ChipId, cx: &mut Context<Self>) {
+        let Some(mut range) = self
+            .chips
+            .iter()
+            .find(|chip| chip.id == id)
+            .map(|chip| chip.range.clone())
+        else {
+            return;
+        };
+        if self.content[range.end..].starts_with(' ') {
+            range.end += 1;
+        }
+        let cursor = self.cursor_offset();
+        self.marked_range = None;
+        let removed = self.replace_range(range, "");
+        let cursor = if cursor >= removed.end {
+            cursor - removed.len()
+        } else {
+            cursor.min(removed.start)
+        };
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        cx.emit(TextInputEvent::Changed);
+        cx.notify();
     }
 
     /// Replaces `range` with `new_text`, taking whole any chip it touches, and moves the chips
@@ -771,13 +802,15 @@ impl TextInput {
             return;
         }
         self.is_selecting = true;
+        self.pressed_chip = None;
         match event.click_count {
             0 | 1 => {
                 self.select_mode = SelectMode::Character;
                 if event.modifiers.shift {
                     self.select_to(offset, cx);
                 } else {
-                    self.move_to(offset, cx)
+                    self.move_to(offset, cx);
+                    self.pressed_chip = self.chip_at_position(event.position).map(|(id, _)| id);
                 }
             }
             2 => {
@@ -806,8 +839,14 @@ impl TextInput {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_selecting = false;
+        if let Some(pressed) = self.pressed_chip.take()
+            && !self.has_selection()
+            && self.chip_at_position(event.position).map(|(id, _)| id) == Some(pressed)
+        {
+            cx.emit(TextInputEvent::ChipClicked(pressed));
+        }
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1965,6 +2004,72 @@ mod tests {
         );
         let hovered = input.read_with(cx, |input, _| input.hovered_chip);
         assert!(hovered.is_none());
+    }
+
+    #[gpui::test]
+    fn clicking_a_chip_says_so(cx: &mut TestAppContext) {
+        let (input, cx) = input(true, cx);
+        cx.simulate_input("see ");
+        let chip = input.update(cx, |input, cx| {
+            input.insert_chip(
+                None,
+                "Image",
+                "icons/image.svg".into(),
+                ChipPreview::Text("".into()),
+                "@Image".into(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let clicked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let clicked = clicked.clone();
+            cx.subscribe(&input, move |_, event: &TextInputEvent, _| {
+                if let TextInputEvent::ChipClicked(id) = event {
+                    clicked.borrow_mut().push(*id);
+                }
+            })
+            .detach();
+        });
+        let (_, bounds) = input
+            .read_with(cx, |input, _| {
+                input
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.chip_bounds.first().copied())
+            })
+            .expect("the chip's bounds");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        assert_eq!(*clicked.borrow(), vec![chip]);
+        // A click on the text isn't one on the chip.
+        cx.simulate_click(
+            bounds.origin - point(px(8.), px(0.)) + point(px(0.), bounds.size.height / 2.),
+            gpui::Modifiers::none(),
+        );
+        assert_eq!(*clicked.borrow(), vec![chip]);
+    }
+
+    #[gpui::test]
+    fn a_removed_chip_takes_its_space(cx: &mut TestAppContext) {
+        let (input, cx) = input(true, cx);
+        cx.simulate_input("see ");
+        let chip = input.update(cx, |input, cx| {
+            input.insert_chip(
+                None,
+                "Image",
+                "icons/image.svg".into(),
+                ChipPreview::Text("".into()),
+                "@Image".into(),
+                cx,
+            )
+        });
+        cx.simulate_input("and that");
+        input.update(cx, |input, cx| input.remove_chip(chip, cx));
+        input.read_with(cx, |input, _| {
+            assert_eq!(input.text().as_ref(), "see and that");
+            assert!(input.chips().is_empty());
+            assert_eq!(input.cursor_offset(), "see and that".len());
+        });
     }
 
     #[gpui::test]

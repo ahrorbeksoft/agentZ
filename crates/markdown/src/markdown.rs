@@ -1511,9 +1511,7 @@ impl MarkdownElement {
         self
     }
 
-    /// Registers a test-only callback invoked with the laid-out text each
-    /// time this element runs layout.
-    #[cfg(test)]
+    /// What a click on a link does, instead of opening it.
     pub fn on_url_click(
         mut self,
         handler: impl Fn(SharedString, &mut Window, &mut App) + 'static,

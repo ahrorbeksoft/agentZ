@@ -1,9 +1,11 @@
 //! The state the server owns, and how requests and background results change it.
 
+mod attachment_requests;
 mod custom_agents;
 #[cfg(unix)]
 mod hand_off;
 mod prompt_requests;
+mod queue_requests;
 mod session_requests;
 mod space_requests;
 mod terminal_requests;
@@ -18,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{AgentThread, AgentThreadEvent, ThreadMessage, ThreadView};
+use agent_thread::{AgentThread, AgentThreadEvent, Attachments, ThreadMessage, ThreadView};
 use agentz_protocol::agents::{
     AgentId, AgentListing, AgentSettings, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
@@ -148,6 +150,10 @@ pub(crate) struct Server {
     pending_tool_calls: Vec<PendingToolCall>,
     /// Messages waiting for the threads they mention to load.
     pending_prompts: Vec<prompt_requests::PendingPrompt>,
+    /// The connections of messages whose files and images are being read, one for each.
+    reading_prompts: Vec<ConnectionId>,
+    /// The messages the user queued for each thread.
+    queues: queue_requests::Queues,
     tool_results: ToolResults,
     /// Tool calls for other machines, relayed through app clients.
     relays: tools::Relays,
@@ -220,6 +226,8 @@ impl Server {
         );
         registry.refresh_if_stale();
         let spaces = SpaceStore::load(Some(data_dir.join("spaces.json")));
+        let mut queues = queue_requests::Queues::load(data_dir.join("queues.json"));
+        queues.retain(|thread_id| projects.thread(thread_id).is_some());
         let machine_icon = MachineIcon {
             detected: None,
             chosen: machine_kind::load_choice(&data_dir.join("machine.json")),
@@ -255,6 +263,8 @@ impl Server {
             moving_threads: HashMap::default(),
             pending_tool_calls: Vec::new(),
             pending_prompts: Vec::new(),
+            reading_prompts: Vec::new(),
+            queues,
             tool_results: ToolResults::default(),
             relays: tools::Relays::default(),
             projects_revision_sent: projects.revision(),
@@ -316,6 +326,12 @@ impl Server {
                 continuations::remove(&server.data_dir, thread_id).log_err();
             }
         }
+        // Those of threads removed along with their project.
+        let orphaned = Attachments::threads_with_attachments(&server.data_dir)
+            .into_iter()
+            .filter(|thread_id| server.projects.thread(*thread_id).is_none())
+            .collect();
+        server.delete_attachments(orphaned);
         server.sweep_drafts();
         server.spawn_then(machine_kind::detect(), |server, detected| {
             server.machine_icon.detected = detected;
@@ -449,6 +465,14 @@ impl Server {
                 id,
                 request: Request::SaveCustomAgent(change),
             } => self.save_custom_agent(client, id, change),
+            Input::Request {
+                client,
+                id,
+                request:
+                    request @ (Request::AddAttachment { .. }
+                    | Request::Attachment { .. }
+                    | Request::UploadFile { .. }),
+            } => self.attachment_request(client, id, request),
             Input::Respond { client, id, result } => {
                 self.send(client, ServerMessage::Response { id, result })
             }
@@ -588,7 +612,11 @@ impl Server {
                     .iter()
                     .filter(|thread| thread.project_id == project_id)
                     .map(|thread| thread.id)
-                    .collect();
+                    .collect::<Vec<_>>();
+                for thread_id in &threads {
+                    self.queues.remove(*thread_id);
+                }
+                self.delete_attachments(threads.clone());
                 self.delete_checkpoints(threads);
                 self.projects.remove_project(project_id);
                 Ok(Response::Ok)
@@ -670,11 +698,18 @@ impl Server {
             }
 
             Request::Prompt { connection, prompt } => self.prompt(connection, prompt, false),
-            Request::Steer { connection, prompt } => self.prompt(connection, prompt, true),
             Request::Cancel(connection) => {
                 self.update_thread(connection, |thread| thread.cancel())?;
                 Ok(Response::Ok)
             }
+            request @ (Request::QueueMessage { .. }
+            | Request::RemoveQueuedMessage { .. }
+            | Request::SteerQueuedMessage { .. }
+            | Request::SendQueuedMessageNow { .. }
+            | Request::ClearQueue(_)) => self.queue_request(request),
+            Request::AddAttachment { .. }
+            | Request::Attachment { .. }
+            | Request::UploadFile { .. } => Err(anyhow!("attachments are handled separately")),
             Request::RespondToPermission {
                 connection,
                 tool_call_id,
@@ -1032,6 +1067,21 @@ impl Server {
         );
     }
 
+    fn delete_attachments(&self, threads: Vec<ThreadId>) {
+        if threads.is_empty() {
+            return;
+        }
+        let attachments: Vec<Attachments> = threads
+            .into_iter()
+            .map(|thread_id| Attachments::for_thread(&self.data_dir, thread_id))
+            .collect();
+        self.runtime.spawn_blocking(move || {
+            for attachments in attachments {
+                attachments.remove_all().log_err();
+            }
+        });
+    }
+
     fn delete_checkpoints(&self, threads: Vec<ThreadId>) {
         let checkpoints: Vec<Checkpoints> = threads
             .into_iter()
@@ -1218,6 +1268,9 @@ impl Server {
         }
         agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_turn_hook(self.turn_hook(cwd, thread_id));
+        agent_thread.set_attachments(Attachments::for_thread(&self.data_dir, thread_id));
+        let (queued_messages, steering) = self.queues.state(thread_id);
+        agent_thread.set_queued_messages(queued_messages, steering);
         agent_thread.set_defaults(self.agent_settings.get(&agent_id).session_defaults());
         let connection = ConnectionId::Thread(thread_id);
         self.forward(inbox, move |message| Input::Thread(connection, message));
@@ -1282,14 +1335,17 @@ impl Server {
             .unwrap_or_else(|| agent_id.0.clone())
     }
 
-    /// Removes the thread, its subthreads, and what they kept: their checkpoints and any
-    /// conversation waiting to go with a first message. Their agents stop with the next changes.
+    /// Removes the thread, its subthreads, and what they kept: their checkpoints, attachments,
+    /// queued messages, and any conversation waiting to go with a first message. Their agents
+    /// stop with the next changes.
     fn delete_thread(&mut self, thread_id: ThreadId) {
         let threads = self.projects.thread_and_subthreads(thread_id);
         for thread_id in &threads {
             self.draft_due.remove(thread_id);
             continuations::remove(&self.data_dir, *thread_id).log_err();
+            self.queues.remove(*thread_id);
         }
+        self.delete_attachments(threads.clone());
         self.delete_checkpoints(threads);
         self.projects.delete_thread(thread_id);
     }
@@ -1616,6 +1672,8 @@ impl Server {
         let answers = self.answer_waiting_tool_calls();
         self.send_waiting_prompts();
         self.announce_finished_tasks();
+        // The user's messages before agents'.
+        self.send_queued_messages();
         self.send_follow_ups();
         // After the waiting tool calls, which may have started an agent to read its thread.
         self.stop_idle_agents();

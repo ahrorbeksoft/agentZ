@@ -11,11 +11,12 @@ use std::time::{Duration, SystemTime};
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::agents::InstallState;
+use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
-    without_handoff,
+    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, QueuedMessage, SessionRestore,
+    ToolCall, without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
@@ -23,8 +24,9 @@ use collections::{HashMap, HashSet};
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FollowMode, Hsla, KeyBinding, ListAlignment, ListState, Pixels, Point,
-    PromptLevel, Subscription, Task, Window, anchored, deferred, list, pulsating_between,
+    FocusHandle, Focusable, FollowMode, Hsla, ImageSource, KeyBinding, ListAlignment, ListState,
+    ObjectFit, Pixels, Point, PromptLevel, Subscription, Task, Window, anchored, deferred, img,
+    list, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, WorkspaceKind};
@@ -43,9 +45,12 @@ use crate::mention_menu::{
 
 use crate::agent_icons::agent_icon;
 use crate::agent_login::{AgentLogin, LoginLayout};
+use crate::attachment_image::{
+    AttachmentImage, ImagePreviewTooltip, ImageViewer, render_hover_preview,
+};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
-use crate::machines::{Machines, ProjectKey, ThreadKey};
+use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
@@ -119,6 +124,7 @@ pub fn init(cx: &mut App) {
         // Zed's key for copying what's selected in a message.
         KeyBinding::new("secondary-c", markdown::Copy, Some("Markdown")),
     ]);
+    crate::attachment_image::init(cx);
 }
 
 /// Identifies one rendered piece of markdown: an entry, and which part of it.
@@ -162,10 +168,17 @@ const UNSENT_TEXT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// The most subthreads the Agents control lists before it scrolls.
 const MAX_AGENT_ROWS_SHOWN: usize = 6;
 
-/// A message typed while the agent works: its text for the queue, and what it sends.
-struct QueuedMessage {
-    text: String,
-    prompt: Vec<PromptPart>,
+/// An image link in a message under the mouse, whose thumbnail shows above it.
+struct HoveredImage {
+    key: MarkdownKey,
+    id: AttachmentId,
+    /// Where the mouse first came onto the link, so the preview stays put on it.
+    position: Point<Pixels>,
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// The image formats agents take, by a file's extension.
@@ -226,12 +239,19 @@ pub struct AgentView {
     synced_show_thinking: bool,
     toggled_thoughts: HashSet<usize>,
     plan_expanded: bool,
-    /// Messages typed while the agent works; sent one at a time as each turn ends, like Zed.
-    queued_messages: Vec<QueuedMessage>,
-    /// The first queued message steers: the agent's turn ends once its current step is done.
-    steer_armed: bool,
     /// What each of the composer's chips mentions.
     mentions: HashMap<ChipId, Mention>,
+    /// Files of this Mac being sent to another machine's thread, by their chips, which mention
+    /// them once they're there.
+    uploads: HashMap<ChipId, Task<()>>,
+    /// The message was sent while files were still on their way, so it goes once they're there.
+    send_after_uploads: bool,
+    /// Why a pasted or dropped file couldn't be attached.
+    attachment_error: Option<SharedString>,
+    hovered_image: Option<HoveredImage>,
+    /// The image to show in the viewer, which opens at the next render, where the window is.
+    pending_image_viewer: Option<ImageSource>,
+    image_viewer: Option<(Entity<ImageViewer>, Subscription)>,
     /// The `@query` the composer's cursor is at, while its menu is open.
     mention_query: Option<MentionQuery>,
     mention_kind: MentionKind,
@@ -322,10 +342,8 @@ impl AgentView {
             }),
             cx.observe(&thread, |this, thread, cx| {
                 this.sync_entries(cx);
-                this.steer_if_due(cx);
                 sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
                 this.sync_composer_placeholder(cx);
-                this.send_next_queued_message(cx);
                 cx.notify();
             }),
             // The agent's display name and icon come from the registry, which may load later.
@@ -375,6 +393,12 @@ impl AgentView {
                 TextInputEvent::ContextMenu(position) => {
                     this.pending_composer_menu = Some(*position);
                     cx.notify();
+                }
+                TextInputEvent::ChipClicked(chip) => {
+                    if let Some(Mention::Image(id)) = this.mentions.get(chip) {
+                        let image = this.attachment_image(id.clone(), cx);
+                        this.view_image(image.original(), cx);
+                    }
                 }
             },
         ));
@@ -426,9 +450,13 @@ impl AgentView {
                 .show_thinking,
             toggled_thoughts: HashSet::default(),
             plan_expanded: false,
-            queued_messages: Vec::new(),
-            steer_armed: false,
             mentions: HashMap::default(),
+            uploads: HashMap::default(),
+            send_after_uploads: false,
+            attachment_error: None,
+            hovered_image: None,
+            pending_image_viewer: None,
+            image_viewer: None,
             mention_query: None,
             mention_kind: MentionKind::Any,
             mention_matches: Vec::new(),
@@ -1096,12 +1124,6 @@ impl AgentView {
         }
     }
 
-    fn markdown(&self, key: MarkdownKey, style: MarkdownStyle) -> Option<MarkdownElement> {
-        self.markdowns
-            .get(&key)
-            .map(|markdown| MarkdownElement::new(markdown.clone(), style))
-    }
-
     /// Agent commands matching a `/name` being typed at the start of the message.
     fn matching_commands(&self, cx: &App) -> Vec<acp::AvailableCommand> {
         let text = self.composer.read(cx).text();
@@ -1220,7 +1242,16 @@ impl AgentView {
             self.accept_mention(self.mention_index, cx);
             return;
         }
+        self.send_message(cx);
+    }
+
+    fn send_message(&mut self, cx: &mut Context<Self>) {
         if self.is_archived || !self.client.read(cx).is_online() || self.needs_login(cx) {
+            return;
+        }
+        // As Zed waits for its mentions to load: the message goes once its files are there.
+        if !self.uploads.is_empty() {
+            self.send_after_uploads = true;
             return;
         }
         let commands = self.matching_commands(cx);
@@ -1255,38 +1286,22 @@ impl AgentView {
                 return;
             }
         }
-        let message = QueuedMessage {
-            text,
-            prompt: self.composer_prompt(cx),
-        };
+        let prompt = self.composer_prompt(cx);
         self.composer
             .update(cx, |composer, cx| composer.set_text("", cx));
         self.mentions.clear();
-        if self.thread.read(cx).is_working() || !self.queued_messages.is_empty() {
-            self.queued_messages.push(message);
+        self.attachment_error = None;
+        // Messages typed while the agent works wait in the queue the server keeps, which
+        // sends them one at a time as each turn ends, like Zed's.
+        let thread = self.thread.read(cx);
+        if thread.is_working() || !thread.state.queued_messages.is_empty() {
+            self.thread
+                .update(cx, |thread, cx| thread.queue_message(prompt, cx));
             cx.notify();
             return;
         }
         self.list_state.scroll_to_end();
-        self.thread
-            .update(cx, |thread, cx| thread.send(message.prompt, cx));
-    }
-
-    fn send_next_queued_message(&mut self, cx: &mut Context<Self>) {
-        let thread = self.thread.read(cx);
-        if self.is_archived
-            || self.queued_messages.is_empty()
-            || thread.is_working()
-            || thread.status() != &ConnectionStatus::Ready
-        {
-            return;
-        }
-        let message = self.queued_messages.remove(0);
-        self.steer_armed = false;
-        self.list_state.scroll_to_end();
-        // Deferred: this runs while the thread is notifying observers.
-        let thread = self.thread.clone();
-        cx.defer(move |cx| thread.update(cx, |thread, cx| thread.send(message.prompt, cx)));
+        self.thread.update(cx, |thread, cx| thread.send(prompt, cx));
     }
 
     fn stop(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
@@ -1341,29 +1356,37 @@ impl AgentView {
         }
     }
 
-    /// A pasted or dropped file: an image becomes an Image chip, anything else a mention of
-    /// it. Another machine's thread can't see this Mac's files, so it gets the path as text.
+    /// A pasted or dropped file (one copied in Finder too): an image becomes an Image chip,
+    /// anything else a mention of it. Another machine's thread can't see this Mac's files, so a
+    /// file goes to that machine first. A folder can't, so it goes as its path.
     fn mention_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if let Some(format) = image_format(&path)
             && self.thread.read(cx).supports_images()
         {
             match std::fs::read(&path) {
                 Ok(bytes) => self.insert_image(format, bytes, cx),
-                Err(error) => log::error!("failed to read {}: {error}", path.display()),
+                Err(error) => {
+                    self.attachment_failed(format!("Couldn't read {}: {error}", path.display()), cx)
+                }
             }
-            return;
-        }
-        if self.client.read(cx).machine() != crate::machines::MachineId::Local {
-            let text = format!("{} ", path.display());
-            self.composer
-                .update(cx, |composer, cx| composer.insert(&text, cx));
             return;
         }
         let label = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        let icon = if path.is_dir() {
+        let is_dir = path.is_dir();
+        if self.client.read(cx).machine() != MachineId::Local {
+            if is_dir {
+                let text = format!("{} ", path.display());
+                self.composer
+                    .update(cx, |composer, cx| composer.insert(&text, cx));
+            } else {
+                self.upload_file(path, label, cx);
+            }
+            return;
+        }
+        let icon = if is_dir {
             IconName::Folder
         } else {
             IconName::File
@@ -1372,22 +1395,151 @@ impl AgentView {
         self.insert_mention(None, &label, icon, preview, Mention::Path(path), cx);
     }
 
+    /// A pasted or dropped image, which the thread's server keeps for its messages. Its chip
+    /// shows this Mac's copy at once, and mentions the server's once it's there.
     fn insert_image(&mut self, format: gpui::ImageFormat, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        use base64::Engine as _;
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mime_type = format.mime_type();
+        if !agentz_protocol::attachments::is_image_type(mime_type) {
+            self.attachment_failed(format!("{mime_type} images can't be attached."), cx);
+            return;
+        }
+        if bytes.len() > MAX_ATTACHMENT_SIZE {
+            self.attachment_failed(
+                format!("The image is larger than {} MB.", MAX_ATTACHMENT_SIZE >> 20),
+                cx,
+            );
+            return;
+        }
         let image = Arc::new(gpui::Image::from_bytes(format, bytes));
-        let mention = Mention::Image {
-            mime_type: format.mime_type().to_string(),
-            data,
-        };
-        self.insert_mention(
-            None,
-            "Image",
-            IconName::Image,
-            ChipPreview::Image(image),
-            mention,
-            cx,
-        );
+        let preview = ChipPreview::Image(ImageSource::Image(image.clone()));
+        let chip = self.insert_pending_chip("Image", IconName::Image, preview, cx);
+        let client = self.client.clone();
+        let thread_id = self.thread_id;
+        let upload = cx.spawn(async move |this, cx| {
+            let result = async {
+                let data = cx
+                    .background_spawn(async move { encode_base64(&image.bytes) })
+                    .await;
+                // Not `send`, which would write the whole request into its log line.
+                let response = client
+                    .read_with(cx, |client, _| {
+                        client.request(Request::AddAttachment {
+                            thread_id,
+                            mime_type: mime_type.to_string(),
+                            data,
+                        })
+                    })
+                    .await?;
+                match response {
+                    Response::Attachment(id) => Ok(Mention::Image(id)),
+                    response => Err(anyhow::anyhow!("unexpected response: {response:?}")),
+                }
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.upload_finished(chip, result, "Couldn't attach the image", cx)
+            })
+            .log_err();
+        });
+        self.uploads.insert(chip, upload);
+    }
+
+    /// Sends a file of this Mac to the thread's machine, and mentions where it's kept there.
+    fn upload_file(&mut self, path: PathBuf, label: String, cx: &mut Context<Self>) {
+        let preview = ChipPreview::Text(compact_path(&path).into());
+        let chip = self.insert_pending_chip(&label, IconName::File, preview, cx);
+        let client = self.client.clone();
+        let thread_id = self.thread_id;
+        let upload = cx.spawn(async move |this, cx| {
+            let result = async {
+                let data = cx
+                    .background_spawn({
+                        let path = path.clone();
+                        async move {
+                            let bytes = std::fs::read(&path)?;
+                            anyhow::ensure!(
+                                bytes.len() <= MAX_ATTACHMENT_SIZE,
+                                "it's larger than {} MB",
+                                MAX_ATTACHMENT_SIZE >> 20
+                            );
+                            Ok(encode_base64(&bytes))
+                        }
+                    })
+                    .await?;
+                let response = client
+                    .read_with(cx, |client, _| {
+                        client.request(Request::UploadFile {
+                            thread_id,
+                            name: label,
+                            data,
+                        })
+                    })
+                    .await?;
+                match response {
+                    Response::UploadedFile(path) => Ok(Mention::Path(path)),
+                    response => Err(anyhow::anyhow!("unexpected response: {response:?}")),
+                }
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                let message = format!("Couldn't send {} to the thread's machine", path.display());
+                this.upload_finished(chip, result, &message, cx)
+            })
+            .log_err();
+        });
+        self.uploads.insert(chip, upload);
+    }
+
+    /// A chip whose mention follows once what it mentions is uploaded.
+    fn insert_pending_chip(
+        &mut self,
+        label: &str,
+        icon: IconName,
+        preview: ChipPreview,
+        cx: &mut Context<Self>,
+    ) -> ChipId {
+        let copy_text: SharedString = format!("@{label}").into();
+        let chip = self.composer.update(cx, |composer, cx| {
+            composer.insert_chip(None, label, icon.path().into(), preview, copy_text, cx)
+        });
+        self.mention_kind = MentionKind::Any;
+        cx.notify();
+        chip
+    }
+
+    fn upload_finished(
+        &mut self,
+        chip: ChipId,
+        result: anyhow::Result<Mention>,
+        failure: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // Its chip was deleted meanwhile.
+        if self.uploads.remove(&chip).is_none() {
+            return;
+        }
+        match result {
+            Ok(mention) => {
+                self.mentions.insert(chip, mention);
+                if self.send_after_uploads && self.uploads.is_empty() {
+                    self.send_after_uploads = false;
+                    self.send_message(cx);
+                }
+            }
+            Err(error) => {
+                self.send_after_uploads = false;
+                self.composer
+                    .update(cx, |composer, cx| composer.remove_chip(chip, cx));
+                self.attachment_failed(format!("{failure}: {error:#}"), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn attachment_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        log::error!("{error}");
+        self.attachment_error = Some(error.into());
+        cx.notify();
     }
 
     /// Puts a mention's chip in place of `range` (or the selection).
@@ -1419,6 +1571,7 @@ impl AgentView {
             .map(|chip| chip.id)
             .collect();
         self.mentions.retain(|chip, _| chips.contains(chip));
+        self.uploads.retain(|chip, _| chips.contains(chip));
     }
 
     /// The composer's message: its text, and what its chips mention, in order.
@@ -2519,7 +2672,7 @@ impl AgentView {
                             .rounded_xl()
                             .bg(user_message_background(cx))
                             .text_ui(cx)
-                            .children(self.markdown((index, 0), style)),
+                            .children(self.markdown((index, 0), style, cx)),
                     )
                     .child(
                         h_flex()
@@ -2564,7 +2717,7 @@ impl AgentView {
                             .when(is_last && !show_controls, |this| this.pb_4())
                             .w_full()
                             .text_ui(cx)
-                            .children(self.markdown((index, 0), style)),
+                            .children(self.markdown((index, 0), style, cx)),
                     )
                     .when(show_controls, |this| {
                         this.child(self.render_thread_controls(index, cx))
@@ -2804,7 +2957,7 @@ impl AgentView {
                 .py_1()
                 .border_l_1()
                 .border_color(Self::tool_card_border_color(cx))
-                .children(self.markdown((index, 0), style))
+                .children(self.markdown((index, 0), style, cx))
         });
 
         v_flex()
@@ -2836,6 +2989,7 @@ impl AgentView {
         let has_content = !tool_call.text.is_empty()
             || !tool_call.diffs.is_empty()
             || !tool_call.terminals.is_empty()
+            || !tool_call.images.is_empty()
             || tool_call.raw_input.is_some();
         let is_openable = has_content && !needs_confirmation;
         let is_open = needs_confirmation || self.toggled_tool_calls.contains(&tool_call.id);
@@ -2923,8 +3077,12 @@ impl AgentView {
                 matches!(tool_call.kind, acp::ToolKind::Edit) || !tool_call.diffs.is_empty();
             if !is_execute && !is_edit && tool_call.raw_input.is_some() {
                 output.extend(
-                    self.markdown((index, RAW_INPUT_PART), tool_output_style(true, window, cx))
-                        .map(|markdown| div().text_xs().child(markdown).into_any_element()),
+                    self.markdown(
+                        (index, RAW_INPUT_PART),
+                        tool_output_style(true, window, cx),
+                        cx,
+                    )
+                    .map(|markdown| div().text_xs().child(markdown).into_any_element()),
                 );
             }
             for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
@@ -2945,9 +3103,12 @@ impl AgentView {
             }
             for part in 0..tool_call.text.len() {
                 let style = tool_output_style(is_execute, window, cx);
-                if let Some(markdown) = self.markdown((index, part + 1), style) {
+                if let Some(markdown) = self.markdown((index, part + 1), style, cx) {
                     output.push(div().text_xs().child(markdown).into_any_element());
                 }
+            }
+            for (image_index, id) in tool_call.images.iter().enumerate() {
+                output.push(self.render_tool_image(index, image_index, id.clone(), cx));
             }
         }
         let details = (!output.is_empty()).then(|| {
@@ -3107,6 +3268,7 @@ impl AgentView {
             locations: Vec::new(),
             raw_input: None,
             terminals: Vec::new(),
+            images: Vec::new(),
         };
         Some(
             v_flex()
@@ -3279,6 +3441,11 @@ impl AgentView {
                 .icon(IconName::XCircle)
                 .title("Couldn't start the thread that way")
                 .description(error.clone())
+        } else if let Some(error) = &self.attachment_error {
+            Callout::new()
+                .severity(Severity::Error)
+                .icon(IconName::XCircle)
+                .title(error.clone())
         } else {
             return None;
         };
@@ -3403,11 +3570,14 @@ impl AgentView {
     }
 
     fn render_queue_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.queued_messages.is_empty() {
+        let thread = self.thread.read(cx);
+        let messages = thread.state.queued_messages.clone();
+        let is_steering = thread.state.steering_queued;
+        if messages.is_empty() {
             return None;
         }
         let colors = cx.theme().colors();
-        let count = self.queued_messages.len();
+        let count = messages.len();
         let expanded = self.queue_expanded;
         let title = if count == 1 {
             "1 Queued Message".to_string()
@@ -3438,14 +3608,25 @@ impl AgentView {
                 Button::new("clear-queue", "Clear All")
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.queued_messages.clear();
-                        cx.notify();
+                        this.thread.update(cx, |thread, cx| thread.clear_queue(cx));
                     })),
             );
 
         let mut rows = Vec::new();
-        for (index, message) in self.queued_messages.iter().enumerate() {
+        for (index, message) in messages.iter().enumerate() {
             let is_next = index == 0;
+            let id = message.id;
+            let text = self.prompt_text(&message.prompt, cx);
+            let images: Vec<AnyElement> = message
+                .prompt
+                .iter()
+                .filter_map(|part| match part {
+                    PromptPart::Image(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .enumerate()
+                .map(|(image_index, id)| self.render_queued_image((index, image_index), id, cx))
+                .collect();
             rows.push(
                 h_flex()
                     .group("queue-entry")
@@ -3471,11 +3652,18 @@ impl AgentView {
                             })),
                     )
                     .child(
-                        div()
+                        h_flex()
                             .flex_1()
                             .min_w_0()
-                            .text_xs()
-                            .child(message.text.lines().next().unwrap_or_default().to_string()),
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .child(text.lines().next().unwrap_or_default().to_string()),
+                            )
+                            .children(images),
                     )
                     .child(
                         h_flex()
@@ -3488,13 +3676,9 @@ impl AgentView {
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Remove Message from Queue"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if index < this.queued_messages.len() {
-                                            this.queued_messages.remove(index);
-                                            if index == 0 {
-                                                this.steer_armed = false;
-                                            }
-                                        }
-                                        cx.notify();
+                                        this.thread.update(cx, |thread, cx| {
+                                            thread.remove_queued_message(id, cx)
+                                        });
                                     })),
                             )
                             .child(
@@ -3502,30 +3686,23 @@ impl AgentView {
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Edit"))
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        if index < this.queued_messages.len() {
-                                            let message = this.queued_messages.remove(index);
-                                            if index == 0 {
-                                                this.steer_armed = false;
-                                            }
-                                            this.composer.update(cx, |composer, cx| {
-                                                composer.set_text(message.text, cx)
-                                            });
-                                            window.focus(&this.composer.focus_handle(cx), cx);
-                                        }
-                                        cx.notify();
+                                        this.edit_queued_message(id, window, cx);
                                     })),
                             )
                             .child(
                                 Button::new(("steer-queued", index), "Steer")
                                     .label_size(LabelSize::Small)
                                     .style(ButtonStyle::Outlined)
-                                    .toggle_state(is_next && self.steer_armed)
+                                    .toggle_state(is_next && is_steering)
                                     .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
                                     .tooltip(Tooltip::text(
                                         "Send once the agent finishes the step it's on",
                                     ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.steer_queued_message(index, cx);
+                                        this.list_state.scroll_to_end();
+                                        this.thread.update(cx, |thread, cx| {
+                                            thread.steer_queued_message(id, cx)
+                                        });
                                     })),
                             )
                             .child(
@@ -3533,7 +3710,10 @@ impl AgentView {
                                     .label_size(LabelSize::Small)
                                     .when(is_next, |this| this.style(ButtonStyle::Outlined))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.send_queued_message_now(index, cx);
+                                        this.list_state.scroll_to_end();
+                                        this.thread.update(cx, |thread, cx| {
+                                            thread.send_queued_message_now(id, cx)
+                                        });
                                     })),
                             ),
                     ),
@@ -3555,86 +3735,305 @@ impl AgentView {
         )
     }
 
-    /// Moves a queued message to the front and sends it as soon as possible, stopping the
-    /// current turn if the agent is working.
-    /// Zed's Steer: puts the message first, to go once the agent's current step is done.
-    /// Steering the steering message again stops it.
-    /// An agent that takes messages into its turn gets the message at once.
-    fn steer_queued_message(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.queued_messages.len() {
-            return;
-        }
-        let thread = self.thread.read(cx);
-        if thread.state.supports_steering
-            && thread.is_working()
-            && thread.status() == &ConnectionStatus::Ready
-        {
-            let message = self.queued_messages.remove(index);
-            if index == 0 {
-                self.steer_armed = false;
-            }
-            self.list_state.scroll_to_end();
-            self.thread
-                .update(cx, |thread, cx| thread.steer(message.prompt, cx));
-            cx.notify();
-            return;
-        }
-        if index == 0 && self.steer_armed {
-            self.steer_armed = false;
-        } else {
-            let message = self.queued_messages.remove(index);
-            self.queued_messages.insert(0, message);
-            self.steer_armed = true;
-        }
-        self.steer_if_due(cx);
-        cx.notify();
+    /// An image in a queued message: a small thumbnail, larger on hover, whole on click.
+    fn render_queued_image(
+        &self,
+        element_index: (usize, usize),
+        id: AttachmentId,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let image = self.attachment_image(id, cx);
+        let thumbnail = image.thumbnail();
+        let (message_index, image_index) = element_index;
+        let name = format!("queued-image-{message_index}-{image_index}");
+        div()
+            .id(SharedString::from(name.clone()))
+            .debug_selector(move || name)
+            .flex_none()
+            .size(px(18.))
+            .rounded_sm()
+            .overflow_hidden()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .cursor_pointer()
+            .child(
+                img(thumbnail.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Cover),
+            )
+            .tooltip(move |_, cx| {
+                let thumbnail = thumbnail.clone();
+                cx.new(|_| ImagePreviewTooltip(thumbnail)).into()
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.view_image(image.original(), cx);
+            }))
+            .into_any_element()
     }
 
-    /// For an agent that can't take a message into its turn, a steering message ends the turn
-    /// at the next step: once no tool call is running (one waiting for approval is between
-    /// steps). The queue then sends it, as at any turn's end.
-    fn steer_if_due(&mut self, cx: &mut Context<Self>) {
-        if !self.steer_armed {
-            return;
-        }
-        if self.queued_messages.is_empty() {
-            self.steer_armed = false;
-            return;
-        }
-        let thread = self.thread.read(cx);
-        if !thread.is_working() {
-            return;
-        }
-        let entries = thread.entries();
-        let turn_start = entries
+    /// An image a tool gave back, as Zed shows one in a tool call's output; whole on click.
+    fn render_tool_image(
+        &self,
+        entry_index: usize,
+        image_index: usize,
+        id: AttachmentId,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let image = self.attachment_image(id, cx);
+        let name = format!("tool-image-{entry_index}-{image_index}");
+        div()
+            .id(SharedString::from(name.clone()))
+            .debug_selector(move || name)
+            .cursor_pointer()
+            .child(
+                img(image.thumbnail())
+                    .max_w_96()
+                    .max_h_96()
+                    .object_fit(ObjectFit::ScaleDown),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.view_image(image.original(), cx);
+            }))
+            .into_any_element()
+    }
+
+    /// Puts a queued message back in the composer, its mentions as chips again, and takes it
+    /// out of the queue.
+    fn edit_queued_message(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message) = self
+            .thread
+            .read(cx)
+            .state
+            .queued_messages
             .iter()
-            .rposition(|entry| matches!(entry, Entry::UserMessage(_)))
-            .unwrap_or(0);
-        let is_running = entries[turn_start..].iter().any(|entry| {
-            matches!(entry, Entry::ToolCall(tool_call)
-                if tool_call.status == acp::ToolCallStatus::InProgress)
-        });
-        if is_running && thread.state.permission_requests.is_empty() {
+            .find(|message| message.id == id)
+            .cloned()
+        else {
             return;
-        }
-        self.steer_armed = false;
-        // Deferred: this can run while the thread notifies its observers.
-        let thread = self.thread.clone();
-        cx.defer(move |cx| thread.update(cx, |thread, cx| thread.cancel(cx)));
+        };
+        self.thread
+            .update(cx, |thread, cx| thread.remove_queued_message(id, cx));
+        self.restore_prompt(&message, cx);
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
     }
 
-    fn send_queued_message_now(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.queued_messages.len() {
-            return;
+    fn restore_prompt(&mut self, message: &QueuedMessage, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_text("", cx));
+        self.mentions.clear();
+        self.uploads.clear();
+        let mut after_chip = false;
+        for part in &message.prompt {
+            if let PromptPart::Text(text) = part {
+                // A chip brings the space after it, which the text after it starts with.
+                let text = if after_chip {
+                    text.strip_prefix(' ').unwrap_or(text)
+                } else {
+                    text
+                };
+                self.composer
+                    .update(cx, |composer, cx| composer.insert(text, cx));
+                after_chip = false;
+                continue;
+            }
+            let (label, icon, preview, mention) = match part {
+                PromptPart::Path(path) => {
+                    let label = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let is_dir =
+                        self.client.read(cx).machine() == MachineId::Local && path.is_dir();
+                    let icon = if is_dir {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    };
+                    let preview = ChipPreview::Text(compact_path(path).into());
+                    (label, icon, preview, Mention::Path(path.clone()))
+                }
+                PromptPart::Thread(thread_id) => {
+                    let title: SharedString = self.thread_title(*thread_id, cx).into();
+                    (
+                        title.to_string(),
+                        IconName::Thread,
+                        ChipPreview::Text(title),
+                        Mention::Thread(*thread_id),
+                    )
+                }
+                PromptPart::Image(id) => {
+                    let image = self.attachment_image(id.clone(), cx);
+                    (
+                        "Image".to_string(),
+                        IconName::Image,
+                        ChipPreview::Image(image.thumbnail()),
+                        Mention::Image(id.clone()),
+                    )
+                }
+                PromptPart::Text(_) => continue,
+            };
+            self.insert_mention(None, &label, icon, preview, mention, cx);
+            after_chip = true;
         }
-        let message = self.queued_messages.remove(index);
-        self.queued_messages.insert(0, message);
-        if self.thread.read(cx).is_working() {
-            self.thread.update(cx, |thread, cx| thread.cancel(cx));
-        } else {
-            self.send_next_queued_message(cx);
+    }
+
+    /// A message's text as the queue shows it, its mentions as copying their chips gives.
+    fn prompt_text(&self, prompt: &[PromptPart], cx: &App) -> String {
+        prompt
+            .iter()
+            .map(|part| match part {
+                PromptPart::Text(text) => text.clone(),
+                PromptPart::Path(path) => format!(
+                    "@{}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ),
+                PromptPart::Thread(thread_id) => format!("@{}", self.thread_title(*thread_id, cx)),
+                PromptPart::Image(_) => "@Image".to_string(),
+            })
+            .collect()
+    }
+
+    fn thread_title(&self, thread_id: ThreadId, cx: &App) -> String {
+        self.store
+            .read(cx)
+            .thread(thread_id)
+            .map_or_else(|| "Thread".to_string(), |thread| thread.title.clone())
+    }
+
+    /// An image kept for this thread, on its machine.
+    fn attachment_image(&self, id: AttachmentId, cx: &App) -> AttachmentImage {
+        AttachmentImage {
+            machine: self.client.read(cx).machine(),
+            thread_id: self.thread_id,
+            id,
         }
+    }
+
+    /// Opens the image viewer at the next render, which has the window to focus it in.
+    fn view_image(&mut self, source: ImageSource, cx: &mut Context<Self>) {
+        self.hovered_image = None;
+        self.pending_image_viewer = Some(source);
         cx.notify();
+    }
+
+    fn open_image_viewer(
+        &mut self,
+        source: ImageSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewer = cx.new(|cx| ImageViewer::new(source, window, cx));
+        let subscription =
+            cx.subscribe_in(&viewer, window, |this, _, _: &DismissEvent, window, cx| {
+                this.image_viewer = None;
+                window.focus(&this.focus_handle(cx), cx);
+                cx.notify();
+            });
+        self.image_viewer = Some((viewer, subscription));
+    }
+
+    fn render_image_viewer(&self) -> Option<AnyElement> {
+        let (viewer, _) = self.image_viewer.as_ref()?;
+        Some(
+            deferred(
+                anchored()
+                    .position(gpui::point(px(0.), px(0.)))
+                    .child(viewer.clone()),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
+    }
+
+    /// The thumbnail of the image link under the mouse, above where the mouse came onto it.
+    fn render_image_hover(&self, cx: &App) -> Option<AnyElement> {
+        let hovered = self.hovered_image.as_ref()?;
+        let image = self.attachment_image(hovered.id.clone(), cx);
+        Some(
+            deferred(
+                anchored()
+                    .position(hovered.position - gpui::point(px(0.), px(8.)))
+                    .anchor(Anchor::BottomLeft)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .debug_selector(|| "image-hover-preview".into())
+                            .child(render_hover_preview(image.thumbnail(), cx)),
+                    ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// A message's markdown: its image links show their thumbnail on hover and open the
+    /// viewer on click.
+    fn markdown(
+        &self,
+        key: MarkdownKey,
+        style: MarkdownStyle,
+        cx: &Context<Self>,
+    ) -> Option<MarkdownElement> {
+        let markdown = self.markdowns.get(&key)?;
+        let hovered = cx.weak_entity();
+        let clicked = cx.weak_entity();
+        Some(
+            MarkdownElement::new(markdown.clone(), style)
+                .on_url_hover(move |url, window, cx| {
+                    let id = url.as_deref().and_then(AttachmentId::from_uri);
+                    let position = window.mouse_position();
+                    hovered
+                        .update(cx, |this, cx| this.hover_image_link(key, id, position, cx))
+                        .ok();
+                })
+                .on_url_click(move |url, _, cx| match AttachmentId::from_uri(&url) {
+                    Some(id) => {
+                        clicked
+                            .update(cx, |this, cx| {
+                                let image = this.attachment_image(id, cx);
+                                this.view_image(image.original(), cx);
+                            })
+                            .ok();
+                    }
+                    None => cx.open_url(&url),
+                }),
+        )
+    }
+
+    /// Follows the image link the mouse is on in one of the messages. Every message hears
+    /// every move, so only the one the mouse is in, or was last in, changes it.
+    fn hover_image_link(
+        &mut self,
+        key: MarkdownKey,
+        id: Option<AttachmentId>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        match id {
+            Some(id) => {
+                let is_same = self
+                    .hovered_image
+                    .as_ref()
+                    .is_some_and(|hovered| hovered.key == key && hovered.id == id);
+                if !is_same {
+                    self.hovered_image = Some(HoveredImage { key, id, position });
+                    cx.notify();
+                }
+            }
+            None => {
+                if self
+                    .hovered_image
+                    .as_ref()
+                    .is_some_and(|hovered| hovered.key == key)
+                {
+                    self.hovered_image = None;
+                    cx.notify();
+                }
+            }
+        }
     }
 
     /// The bar above the message editor: agents, plan, edited files and queued messages.
@@ -3995,19 +4394,6 @@ impl AgentView {
             && self.typed_text(cx).is_none()
             && self.replacing.is_none()
             && self.thread.read(cx).pending_handoff().is_none()
-    }
-
-    /// Whether messages typed while the agent works wait here for its turn to end.
-    pub(crate) fn has_queued_messages(&self) -> bool {
-        !self.queued_messages.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn queue_message_for_test(&mut self, text: &str) {
-        self.queued_messages.push(QueuedMessage {
-            text: text.into(),
-            prompt: PromptPart::text(text),
-        });
     }
 
     /// A new thread nothing has been sent in yet (t3code's draft thread).
@@ -5369,6 +5755,9 @@ impl Render for AgentView {
         if let Some(position) = self.pending_composer_menu.take() {
             self.deploy_composer_menu(position, window, cx);
         }
+        if let Some(source) = self.pending_image_viewer.take() {
+            self.open_image_viewer(source, window, cx);
+        }
         self.sync_mention_query(cx);
         let menu_open = self.mention_query.is_some() || !self.matching_commands(cx).is_empty();
         self.composer
@@ -5390,7 +5779,7 @@ impl Render for AgentView {
             .thread(self.thread_id)
             .is_some_and(|thread| thread.session_id.is_none());
         let is_new_thread = !has_rows
-            && self.queued_messages.is_empty()
+            && self.thread.read(cx).state.queued_messages.is_empty()
             && (!is_connecting || is_never_opened)
             && !needs_login
             && !is_subthread
@@ -5433,6 +5822,12 @@ impl Render for AgentView {
                             .id("agent-conversation")
                             .flex_1()
                             .min_h_0()
+                            // A link scrolled from under the mouse no longer shows its image.
+                            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                                if this.hovered_image.take().is_some() {
+                                    cx.notify();
+                                }
+                            }))
                             .when(!has_rows, |this| this.pt_2().pb_4())
                             .items_center()
                             .when(has_rows, |this| {
@@ -5525,6 +5920,8 @@ impl Render for AgentView {
                     })
             })
             .children(self.render_drawer(cx))
+            .children(self.render_image_hover(cx))
+            .children(self.render_image_viewer())
     }
 }
 
@@ -6104,7 +6501,6 @@ mod tests {
     use projects::{Project, ProjectsSnapshot};
 
     use super::*;
-    use crate::machines::MachineId;
 
     #[test]
     fn durations_read_like_t3codes() {
@@ -6428,6 +6824,7 @@ mod tests {
             locations: Vec::new(),
             raw_input: None,
             terminals: Vec::new(),
+            images: Vec::new(),
         })
     }
 
@@ -6487,6 +6884,7 @@ mod tests {
             locations: Vec::new(),
             raw_input: None,
             terminals: Vec::new(),
+            images: Vec::new(),
         });
         thread.update(cx, |thread, cx| {
             thread.set_entries_for_test(vec![Entry::UserMessage("Edit it".into()), edit], cx)
@@ -6560,6 +6958,7 @@ mod tests {
             locations: Vec::new(),
             raw_input: None,
             terminals: Vec::new(),
+            images: Vec::new(),
         })
     }
 
@@ -6750,82 +7149,210 @@ mod tests {
         assert!(cx.debug_bounds("thinking-content-1").is_some());
     }
 
-    /// Zed's Steer: the turn ends once the tool call running is done, not before.
-    #[gpui::test]
-    fn steering_waits_for_the_running_tool_call(cx: &mut TestAppContext) {
-        let (view, cx) = open(2, false, cx);
-        let thread = view.read_with(cx, |view, _| view.thread.clone());
-        let client = view.read_with(cx, |view, _| view.client.clone());
-        let user = Entry::UserMessage("Run the tests".into());
-        thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(
-                vec![user.clone(), tool_call(acp::ToolCallStatus::InProgress)],
-                cx,
-            );
-            thread.set_working_for_test(true, cx);
-        });
-        let cancels = |cx: &mut VisualTestContext| {
-            client.read_with(cx, |client, _| {
-                client
-                    .sent_for_test()
-                    .into_iter()
-                    .filter(|request| matches!(request, Request::Cancel(_)))
-                    .count()
-            })
-        };
-        view.update(cx, |view, cx| {
-            view.queued_messages.push(QueuedMessage {
-                text: "Use the receipt's rounding".into(),
-                prompt: PromptPart::text("Use the receipt's rounding"),
-            });
-            view.steer_queued_message(0, cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(cancels(cx), 0);
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
-        thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(vec![user, tool_call(acp::ToolCallStatus::Completed)], cx)
-        });
-        cx.run_until_parked();
-        assert_eq!(cancels(cx), 1);
+    fn image_id() -> AttachmentId {
+        AttachmentId::parse(&format!("{}.png", "ab".repeat(32))).expect("an id")
     }
 
-    /// An agent that takes messages into its turn gets a steered message at once, and its turn
-    /// goes on.
+    /// Answers for the images the view fetches, and for one it keeps.
+    fn serve_images(client: &Entity<ServerClient>, cx: &mut VisualTestContext) {
+        client.update(cx, |client, _| {
+            client.answer_for_test(|request| match request {
+                Request::Attachment { .. } => Some(Response::AttachmentData(
+                    agentz_protocol::attachments::AttachmentData {
+                        mime_type: "image/png".into(),
+                        data: TINY_PNG.into(),
+                    },
+                )),
+                Request::AddAttachment { .. } => Some(Response::Attachment(image_id())),
+                _ => None,
+            })
+        });
+    }
+
+    fn sent(client: &Entity<ServerClient>, cx: &mut VisualTestContext) -> Vec<Request> {
+        client.read_with(cx, |client, _| client.sent_for_test())
+    }
+
+    /// A message typed while the agent works goes to the queue the server keeps.
     #[gpui::test]
-    fn steering_sends_the_message_into_the_turn(cx: &mut TestAppContext) {
+    fn messages_typed_while_the_agent_works_queue_on_the_server(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         let client = view.read_with(cx, |view, _| view.client.clone());
         thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(
-                vec![
-                    Entry::UserMessage("Run the tests".into()),
-                    tool_call(acp::ToolCallStatus::InProgress),
-                ],
-                cx,
-            );
+            thread.set_entries_for_test(vec![Entry::UserMessage("Run the tests".into())], cx);
             thread.set_working_for_test(true, cx);
-            thread.set_status_for_test(ConnectionStatus::Ready, cx);
-            thread.set_supports_steering_for_test(cx);
         });
-        view.update(cx, |view, cx| {
-            view.queued_messages.push(QueuedMessage {
-                text: "Use the receipt's rounding".into(),
-                prompt: PromptPart::text("Use the receipt's rounding"),
-            });
-            view.steer_queued_message(0, cx);
-        });
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("Then the docs");
+        cx.simulate_keystrokes("enter");
         cx.run_until_parked();
-        let sent = client.read_with(cx, |client, _| client.sent_for_test());
+        let sent = sent(&client, cx);
         assert!(sent.iter().any(|request| matches!(request,
-            Request::Steer { prompt, .. } if *prompt == PromptPart::text("Use the receipt's rounding"))));
+            Request::QueueMessage { prompt, .. } if *prompt == PromptPart::text("Then the docs"))));
         assert!(
             !sent
                 .iter()
-                .any(|request| matches!(request, Request::Cancel(_)))
+                .any(|request| matches!(request, Request::Prompt { .. }))
         );
-        assert!(view.read_with(cx, |view, _| view.queued_messages.is_empty()));
+    }
+
+    /// The queue shows what the server keeps. Editing a message takes it out of the queue and
+    /// brings it back to the composer as it was, its mentions as chips.
+    #[gpui::test]
+    fn editing_a_queued_message_brings_back_its_chips(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        let prompt = vec![
+            PromptPart::Text("Compare ".into()),
+            PromptPart::Image(image_id()),
+            PromptPart::Text(" with ".into()),
+            PromptPart::Path("/tmp/demo/README.md".into()),
+            PromptPart::Text(" ".into()),
+        ];
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Run the tests".into())], cx);
+            thread.set_working_for_test(true, cx);
+            thread.set_queued_messages_for_test(
+                vec![QueuedMessage {
+                    id: 7,
+                    prompt: prompt.clone(),
+                }],
+                false,
+                cx,
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.queue_expanded = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("queued-image-0-0").is_some());
+
+        view.update_in(cx, |view, window, cx| {
+            view.edit_queued_message(7, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            sent(&client, cx)
+                .iter()
+                .any(|request| matches!(request, Request::RemoveQueuedMessage { id: 7, .. }))
+        );
+        let (text, restored) = view.read_with(cx, |view, cx| {
+            (
+                view.composer.read(cx).plain_text(),
+                view.composer_prompt(cx),
+            )
+        });
+        assert_eq!(text, "Compare @Image with @README.md ");
+        assert_eq!(restored, prompt);
+    }
+
+    /// A pasted image goes to the server first; a message sent meanwhile goes once it's there,
+    /// naming the server's copy.
+    #[gpui::test]
+    fn a_message_waits_for_its_images(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        let png = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(TINY_PNG)
+                .expect("a PNG")
+        };
+        view.update(cx, |view, cx| {
+            view.insert_image(gpui::ImageFormat::Png, png, cx);
+            view.send_message(cx);
+        });
+        assert!(
+            !sent(&client, cx)
+                .iter()
+                .any(|request| matches!(request, Request::Prompt { .. }))
+        );
+        cx.run_until_parked();
+        assert!(sent(&client, cx).iter().any(|request| matches!(request,
+            Request::Prompt { prompt, .. }
+                if *prompt == [PromptPart::Image(image_id()), PromptPart::Text(" ".into())])));
+    }
+
+    /// A tool's image shows in its output, and a click shows it whole until Escape.
+    #[gpui::test]
+    fn an_image_opens_whole_in_the_viewer(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        let Entry::ToolCall(mut screenshot) = tool_call(acp::ToolCallStatus::Completed) else {
+            panic!("a tool call");
+        };
+        screenshot.text.clear();
+        screenshot.images = vec![image_id()];
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Take a screenshot".into()),
+                    Entry::ToolCall(screenshot),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let image = cx.debug_bounds("tool-image-1-0").expect("the tool's image");
+        cx.simulate_click(image.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("image-viewer").is_some());
+        assert!(cx.debug_bounds("image-viewer-image").is_some());
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("image-viewer").is_none());
+    }
+
+    /// An image link in a message shows the image's thumbnail while the mouse is on it.
+    #[gpui::test]
+    fn hovering_an_image_link_shows_its_thumbnail(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Describe it".into()),
+                    Entry::AgentMessage(format!("{} is a red dot.", image_id().markdown_link())),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("conversation-row-2")
+            .expect("the agent's message");
+        // The message is centered at most as wide as the content, its first line at its top.
+        let left = row.left() + (row.size.width - row.size.width.min(MAX_CONTENT_WIDTH)) / 2.;
+        let on_link = gpui::point(left + px(30.), row.top() + px(14.));
+        cx.simulate_mouse_move(on_link, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("image-hover-preview").is_some());
+
+        let past_text = gpui::point(
+            left + MAX_CONTENT_WIDTH.min(row.size.width) - px(30.),
+            on_link.y,
+        );
+        cx.simulate_mouse_move(past_text, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("image-hover-preview").is_none());
     }
 
     #[gpui::test]

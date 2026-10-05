@@ -881,15 +881,11 @@ impl Shell {
             self.open_threads.insert(thread_id, open_thread);
         }
         // Leaving a thread closes its view, saving what's typed: the server runs its agent
-        // without one, and stops it once no window has had the thread open for a while. A
-        // draft, a new thread before its first message, is removed then, unless something is
-        // typed. Messages queued in a view wait in it for the agent's turn to end.
+        // without one, sends its queued messages, and stops it once no window has had the
+        // thread open for a while. A draft, a new thread before its first message, is removed
+        // then, unless something is typed.
         self.open_threads.retain(|key, open_thread| {
-            *key == thread_id
-                || match &open_thread.view {
-                    ThreadView::Agent(view) => view.read(cx).has_queued_messages(),
-                    ThreadView::Terminal(_) => true,
-                }
+            *key == thread_id || matches!(open_thread.view, ThreadView::Terminal(_))
         });
         self.active_thread = Some(thread_id);
         self.active_project = self.project_of(thread_id, cx);
@@ -2776,10 +2772,10 @@ mod modal_tests {
         assert_eq!(active_thread(&shell, cx), Some(8));
     }
 
-    /// Leaving a thread closes its view, so the server can stop its agent once it's idle,
-    /// unless messages wait in the view for the agent's turn to end.
+    /// Leaving a thread closes its view, so the server can stop its agent once it's idle. Its
+    /// queued messages wait on the server.
     #[gpui::test]
-    fn leaving_a_thread_closes_its_view_unless_messages_are_queued(cx: &mut TestAppContext) {
+    fn leaving_a_thread_closes_its_view(cx: &mut TestAppContext) {
         let (store, _) = init_for_drafts(cx);
         cx.update(install_mock_agent);
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
@@ -2802,21 +2798,6 @@ mod modal_tests {
             shell.open_thread(local_thread(7), window, cx)
         });
         assert_eq!(open_threads(&shell, cx), [7]);
-
-        shell.update(cx, |shell, cx| {
-            let Some(OpenThread {
-                view: ThreadView::Agent(view),
-                ..
-            }) = shell.open_threads.get(&local_thread(7))
-            else {
-                panic!("the thread is open");
-            };
-            view.update(cx, |view, _| view.queue_message_for_test("Then the docs"));
-        });
-        shell.update_in(cx, |shell, window, cx| {
-            shell.open_thread(local_thread(5), window, cx)
-        });
-        assert_eq!(open_threads(&shell, cx), [5, 7]);
     }
 
     #[gpui::test]

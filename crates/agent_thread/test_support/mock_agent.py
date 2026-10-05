@@ -32,7 +32,7 @@ Every login and logout is reported with `_auth/status_update`, as Claude Agent a
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
 So are resource links (their URIs) and images (their MIME types). With MOCK_IMAGES set, it
-takes images.
+takes images. A prompt of "image" shows an image in a tool call's output and in its reply.
 
 A prompt of "form" asks the client to fill in a form (a session elicitation) and replies
 "Form: <action> <content as JSON>".
@@ -86,6 +86,8 @@ if os.environ.get("MOCK_CHILD_PID_FILE"):
 HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
 
 LONG_BUILD_OUTPUT = "".join(f"   Compiling page {n}/60\n" for n in range(1, 61))
+# A 1×1 PNG, for the "image" prompt.
+TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
 next_request_id = 1000
 pending = {}
@@ -507,6 +509,14 @@ for line in sys.stdin:
                 update(params["sessionId"], text_chunk("agent_thought_chunk", word))
                 time.sleep(0.5)
             update(params["sessionId"], text_chunk("agent_message_chunk", "It sums first, then rounds once."))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "image":
+            session_id = params["sessionId"]
+            image = {"type": "image", "mimeType": "image/png", "data": TINY_PNG}
+            update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "screenshot-1",
+                                "title": "Take a screenshot", "kind": "other", "status": "completed",
+                                "content": [{"type": "content", "content": image}]})
+            update(session_id, {"sessionUpdate": "agent_message_chunk", "content": image})
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "demo":
             session_id = params["sessionId"]

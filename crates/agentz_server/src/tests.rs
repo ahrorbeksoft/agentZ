@@ -4248,3 +4248,321 @@ async fn a_drawer_holds_several_terminals() {
         vec![1, 3]
     );
 }
+
+impl TestClient {
+    /// Starts a "permission" turn, which waits for its answer.
+    async fn start_waiting_turn(&mut self, thread_id: ThreadId) {
+        let connection = ConnectionId::Thread(thread_id);
+        self.ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("permission"),
+        })
+        .await;
+        self.wait_until(|client| {
+            !client
+                .thread(connection)
+                .state
+                .permission_requests
+                .is_empty()
+        })
+        .await;
+    }
+
+    async fn queue(&mut self, thread_id: ThreadId, text: &str) {
+        self.ok(Request::QueueMessage {
+            connection: ConnectionId::Thread(thread_id),
+            prompt: PromptPart::text(text),
+        })
+        .await;
+    }
+
+    fn queued_texts(&self, thread_id: ThreadId) -> Vec<String> {
+        self.thread(ConnectionId::Thread(thread_id))
+            .state
+            .queued_messages
+            .iter()
+            .map(|message| {
+                message
+                    .prompt
+                    .iter()
+                    .map(|part| match part {
+                        PromptPart::Text(text) => text.as_str(),
+                        _ => "",
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    async fn answer_permission(&mut self, thread_id: ThreadId) {
+        let connection = ConnectionId::Thread(thread_id);
+        let request = self
+            .thread(connection)
+            .state
+            .permission_requests
+            .first()
+            .expect("a permission request")
+            .clone();
+        self.ok(Request::RespondToPermission {
+            connection,
+            tool_call_id: request.tool_call_id,
+            option_id: acp::PermissionOptionId::new("allow"),
+        })
+        .await;
+    }
+}
+
+/// Zed's queue, kept by the server: what's queued while the agent works waits there for the
+/// app to come back, and for the server to come back, and goes once the turn ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_messages_outlive_the_app_and_the_server() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread_id).await;
+    client.start_waiting_turn(thread_id).await;
+    client.queue(thread_id, "first").await;
+    client.queue(thread_id, "second").await;
+    client
+        .wait_until(|client| client.queued_texts(thread_id) == ["first", "second"])
+        .await;
+    drop(client);
+
+    // The app comes back to the same queue.
+    let mut client = server.connect().await;
+    client
+        .subscribe_thread(ConnectionId::Thread(thread_id))
+        .await;
+    assert_eq!(client.queued_texts(thread_id), ["first", "second"]);
+    let first = client
+        .thread(ConnectionId::Thread(thread_id))
+        .state
+        .queued_messages[0]
+        .id;
+    client
+        .ok(Request::RemoveQueuedMessage {
+            connection: ConnectionId::Thread(thread_id),
+            id: first,
+        })
+        .await;
+    client
+        .wait_until(|client| client.queued_texts(thread_id) == ["second"])
+        .await;
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+
+    // So does a new server, which sends it once the thread's agent is back.
+    let Some(server) = TestServer::start_with(server.data_dir, server.project_dir) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client
+        .subscribe_thread(ConnectionId::Thread(thread_id))
+        .await;
+    client
+        .wait_until(|client| {
+            client.queued_texts(thread_id).is_empty()
+                && agent_text(client.thread(ConnectionId::Thread(thread_id)))
+                    .contains("Echo: second")
+        })
+        .await;
+}
+
+/// Steering, for an agent that can't take a message into its turn: the message goes first and
+/// the turn ends at the next step, here at once, as its only step waits for an answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn steering_a_queued_message_ends_the_turn_for_it() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.wait_until_ready(thread_id).await;
+    client.start_waiting_turn(thread_id).await;
+    client.queue(thread_id, "later").await;
+    client.queue(thread_id, "now").await;
+    client
+        .wait_until(|client| client.queued_texts(thread_id).len() == 2)
+        .await;
+    let now = client.thread(connection).state.queued_messages[1].id;
+    client
+        .ok(Request::SteerQueuedMessage {
+            connection,
+            id: now,
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client.user_messages(thread_id) == ["permission", "now", "later"]
+                && !client.thread(connection).is_working()
+        })
+        .await;
+    assert!(client.queued_texts(thread_id).is_empty());
+    assert!(!client.thread(connection).state.steering_queued);
+}
+
+/// An agent that takes messages into its turn gets a steered message at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn steering_sends_a_queued_message_into_the_turn() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    command.env.insert("MOCK_STEERING".into(), "1".into());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.wait_until_ready(thread_id).await;
+    client.start_waiting_turn(thread_id).await;
+    client.queue(thread_id, "also this").await;
+    client
+        .wait_until(|client| client.queued_texts(thread_id).len() == 1)
+        .await;
+    let id = client.thread(connection).state.queued_messages[0].id;
+    client
+        .ok(Request::SteerQueuedMessage { connection, id })
+        .await;
+    client
+        .wait_until(|client| client.queued_texts(thread_id).is_empty())
+        .await;
+    client.answer_permission(thread_id).await;
+    client
+        .wait_until(|client| {
+            !client.thread(connection).is_working()
+                && agent_text(client.thread(connection)).ends_with("(steered: also this)")
+        })
+        .await;
+}
+
+/// Images are kept by the thread's server and named by their hash: the user's go to the agent
+/// from there, the agent's are kept as it shows them, and clients fetch both, or thumbnails.
+#[tokio::test(flavor = "multi_thread")]
+async fn images_are_kept_for_the_thread() {
+    use agentz_protocol::attachments::AttachmentId;
+    use base64::Engine as _;
+
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    command.env.insert("MOCK_IMAGES".into(), "1".into());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.wait_until_ready(thread_id).await;
+
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(1200, 600, image::Rgba([10, 120, 200, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("a PNG");
+    let base64 = &base64::engine::general_purpose::STANDARD;
+    let Response::Attachment(id) = client
+        .ok(Request::AddAttachment {
+            thread_id,
+            mime_type: "image/png".into(),
+            data: base64.encode(&png),
+        })
+        .await
+    else {
+        panic!("expected the image's id");
+    };
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: vec![
+                PromptPart::Text("see ".into()),
+                PromptPart::Image(id.clone()),
+            ],
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            !client.thread(connection).is_working()
+                && agent_text(client.thread(connection)).contains("[with image/png]")
+        })
+        .await;
+    assert_eq!(
+        client.user_messages(thread_id),
+        [format!("see [@Image]({})", id.uri())]
+    );
+    let Response::AttachmentData(thumbnail) = client
+        .ok(Request::Attachment {
+            thread_id,
+            id: id.clone(),
+            thumbnail: true,
+        })
+        .await
+    else {
+        panic!("expected a thumbnail");
+    };
+    let thumbnail =
+        image::load_from_memory(&base64.decode(thumbnail.data).expect("base64")).expect("an image");
+    assert_eq!((thumbnail.width(), thumbnail.height()), (640, 320));
+
+    // The agent's images, in its reply and its tool call.
+    client.prompt_and_wait(thread_id, "image").await;
+    let view = client.thread(connection);
+    let tool_images = view
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::ToolCall(tool_call) if tool_call.title == "Take a screenshot" => {
+                Some(tool_call.images.clone())
+            }
+            _ => None,
+        })
+        .expect("the tool call");
+    let [shown] = tool_images.as_slice() else {
+        panic!("expected one image, got {tool_images:?}");
+    };
+    assert!(agent_text(view).contains(&shown.markdown_link()));
+    let Response::AttachmentData(original) = client
+        .ok(Request::Attachment {
+            thread_id,
+            id: shown.clone(),
+            thumbnail: false,
+        })
+        .await
+    else {
+        panic!("expected the image");
+    };
+    assert_eq!(original.mime_type, "image/png");
+
+    // Only well-formed ids name an image, and deleting the thread forgets its images.
+    let attachments = server
+        .data_dir
+        .path()
+        .join("attachments")
+        .join(thread_id.0.to_string());
+    assert!(attachments.is_dir());
+    assert!(serde_json::from_value::<AttachmentId>(json!("../state.json")).is_err());
+    client.ok(Request::DeleteThread(thread_id)).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while attachments.exists() {
+        assert!(Instant::now() < deadline, "the images are still kept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

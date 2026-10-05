@@ -77,7 +77,7 @@ agentZ's own crates. Everything else in `crates/` is copied from Zed at the same
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
 | `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
-| `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook. `test_support/mock_agent.py` is the scripted test agent. |
+| `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
 | `paths` | Data locations (`AGENTZ_DATA_DIR` overrides). |
@@ -95,6 +95,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 |---|---|---|
 | `state.json` | server | Projects, threads, workspaces |
 | `spaces.json` | server | Workspaces view: spaces, tabs, pane trees |
+| `queues.json` | server | Each thread's queued messages, and whether the first one steers |
+| `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
 | `agents/settings.json` | server | Per-agent env, defaults and known options |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
 | `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests) |
@@ -240,16 +242,23 @@ Each entry: what it does, where it lives, and where it comes from.
   outlined box with the kind's icon and the name in the code font, which the cursor steps over
   and Backspace removes whole; hovering shows its path. Zed's + button (Add Context) types @
   narrowed to Files & Directories or Threads, or picks images. Pasting an image, or pasting or
-  dropping an image file, makes an Image chip whose hover shows the picture, for agents that
-  take images (ACP's prompt capabilities); other copied files become mentions, except on
-  another machine's thread, which gets the path as text. Paste as Plain Text pastes only text.
+  dropping an image file (one copied in Finder too), makes an Image chip, for agents that take
+  images (ACP's prompt capabilities): the image goes to the thread's server at once
+  (`Request::AddAttachment`, up to 32 MB), and a message waits for its chips' uploads
+  (`AgentView::send_after_uploads`); one that fails drops its chip and says why above the
+  composer. Other copied files become mentions. On another machine's thread a file is sent to
+  that machine first (`Request::UploadFile`, kept in the thread's `attachments/…/files/`) and
+  the mention names the copy there; a folder can't be, so it goes as its path. Paste as Plain
+  Text pastes only text.
 - **Sending mentions** (`PromptPart`, `agent_thread::MessagePart`): a message goes as its parts
   in order. The server reads a mentioned file (up to 1 MB of text) and takes a mentioned
   thread's conversation (`thread::mentioned_thread`, the handoff's summary), starting its agent
   and waiting up to 30 seconds for it to load. As Zed sends them, a file is embedded for agents
   that take embedded context and a link otherwise, a folder is a link, a thread is embedded or
-  plain text, and an image goes only to agents that take images. The user's message shows each
-  mention as Zed writes one, `[@name](uri)`, also when an agent replays it.
+  plain text, and an image (`PromptPart::Image`, by its attachment id, read from the thread's
+  store) goes only to agents that take images. The user's message shows each mention as Zed
+  writes one, `[@name](uri)`, also when an agent replays it; an image is
+  `[@Image](agentz://attachment/<id>)`, and images an agent shows or replays are kept too.
 - **Timeline** (`agent_view.rs`; t3code's `MessagesTimeline`, picked in `design/thread/`): a
   tool call is one compact row: its kind's icon, then "Ran"/"Running" and the command in the
   code font, "Edited" and the path (or "Edited N files") with +added −removed, or the agent's
@@ -278,16 +287,34 @@ Each entry: what it does, where it lives, and where it comes from.
   12s"; under a finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
   (`ThreadState::sent_times` by entry, `finished_turns` by each turn's end entry), so they
   survive reopening the thread; messages and turns an agent replays from history have none.
-- **Steer** (`agent_view.rs`, `AgentThread::steer_message`, picked in `design/thread/`): a
-  queued message has Steer beside Send Now. An agent that advertises `_meta.steering` in
-  `initialize` (Claude Agent, Codex; `ThreadState::supports_steering`) takes it into the running
-  turn: `Request::Steer` sends the `_session/steering` extension request, and the message shows
-  in the thread once the agent answers `injected`. One it doesn't take (`promptRequired` when the
-  turn just ended, or an error) goes as the next prompt once the turn ends. Other agents (Factory
-  Droid, OpenCode) take one prompt at a time, so Steer moves the message to the front and waits
-  for the step the agent is on: once no tool call since the last message is running (or it
-  asks for permission), agentZ cancels the turn and the queue sends the message. Editing or
-  removing the front message disarms it.
+- **Queued messages** (`server/queue_requests.rs`, `agent_view.rs`; Zed's message queue): a
+  message sent while the agent works, or while others wait, joins the thread's queue on its
+  server (`Request::QueueMessage`), which saves it in `queues.json` and sends one each time a
+  turn ends, so the queue outlives the app and the server. Clients show it from
+  `ThreadState::queued_messages`, with Edit, Steer, Send Now (`SendQueuedMessageNow`, which
+  moves it to the front and cancels the turn) and ×, and Clear All. Its images show as
+  thumbnails. Edit takes the message off the queue and back into the composer with its chips
+  (files, folders, threads, images) as they were (`AgentView::restore_prompt`).
+- **Steer** (`server/queue_requests.rs`, `AgentThread::steer_message`, picked in
+  `design/thread/`): a queued message has Steer beside Send Now (`SteerQueuedMessage`). An agent
+  that advertises `_meta.steering` in `initialize` (Claude Agent, Codex;
+  `ThreadState::supports_steering`) takes it into the running turn: the server sends the
+  `_session/steering` extension request, and the message shows in the thread once the agent
+  answers `injected`. One it doesn't take (`promptRequired` when the turn just ended, or an
+  error) goes as the next prompt once the turn ends. Other agents (Factory Droid, OpenCode)
+  take one prompt at a time, so Steer moves the message to the front and waits for the step
+  the agent is on (`ThreadState::steering_queued`): once no tool call since the last message is
+  running (or it asks for permission), the server cancels the turn and the queue sends the
+  message. Editing or removing the front message disarms it.
+- **Images** (`attachment_image.rs`, `server/attachment_requests.rs`; t3code's attachments and
+  `ExpandedImageDialog`): every image in a thread is kept by its server, so every client sees
+  it. Clients fetch one by id (`Request::Attachment`), as a 640-pixel PNG thumbnail (made once
+  and kept) or the original, through GPUI's asset cache (`AttachmentImage`); one that failed
+  while its machine was offline is fetched again once it's back. Hovering an image shows its
+  thumbnail (`ImagePreviewTooltip`, and `HoveredImage` for an `@Image` link in a message), and
+  a click opens the original in a viewer over the window (`ImageViewer`: a dark backdrop, the
+  image fit to the window; Esc, × or a click beside the image closes it). This covers composer chips, queued messages,
+  the user's and the agent's messages, and images in tool output, which show inline.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
   thread's menu (Pin or Unpin where it can be pinned, Rename, Continue with Another Agent ▸
@@ -329,8 +356,8 @@ Each entry: what it does, where it lives, and where it comes from.
   half a second after typing pauses, and as the view closes) and comes back when it's opened,
   as t3code keeps composer drafts; a discard from elsewhere empties the composer
   (`AgentView::follow_discarded_unsent_text`). The shell closes the view of any thread it moves
-  away from, unless messages are queued in it (other views keep threads open), so the server
-  can stop idle agents; it deletes a draft with nothing typed once no
+  away from (other views keep threads open; its queue stays on the server), so the server can
+  stop idle agents; it deletes a draft with nothing typed once no
   client has had it open for 3 seconds (60 after it's made, or found at start, for a far
   client to open it). Quitting counts as leaving; Settings and Workspaces don't. A draft with
   text stays, as a draft row in the sidebar. The first message makes it a thread

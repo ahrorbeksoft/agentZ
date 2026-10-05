@@ -7,7 +7,9 @@ use agent_client_protocol::schema::v1 as acp;
 use gpui_shared_string::SharedString;
 use serde::{Deserialize, Serialize};
 
+use crate::PromptPart;
 use crate::agents::AgentCommand;
+use crate::attachments::AttachmentId;
 use projects::ThreadCreator;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -81,6 +83,17 @@ pub struct ToolCall {
     /// [`crate::terminal::TerminalKey::Agent`].
     #[serde(default)]
     pub terminals: Vec<String>,
+    /// Images the tool gave back, kept for the thread.
+    #[serde(default)]
+    pub images: Vec<AttachmentId>,
+}
+
+/// A message waiting in a thread's queue for the agent to be free.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    /// The thread's own id for it, to remove, steer or send it by.
+    pub id: u64,
+    pub prompt: Vec<PromptPart>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -361,6 +374,14 @@ pub struct ThreadState {
     /// the message). Messages replayed from history have none.
     #[serde(default)]
     pub sent_times: Vec<(usize, SystemTime)>,
+    /// Messages waiting for the agent to be free, first to go first. The server keeps them
+    /// across restarts of the app and of itself.
+    #[serde(default)]
+    pub queued_messages: Vec<QueuedMessage>,
+    /// The first queued message steers: the turn ends once the agent's current step is done,
+    /// and it goes then.
+    #[serde(default)]
+    pub steering_queued: bool,
 }
 
 /// A thread's state and entries, with the read API both the server's thread and the clients'
@@ -1066,6 +1087,7 @@ mod tests {
             locations: Vec::new(),
             raw_input: None,
             terminals: Vec::new(),
+            images: Vec::new(),
         })
     }
 
