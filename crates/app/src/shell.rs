@@ -1650,7 +1650,11 @@ impl Render for Shell {
                                         if is_diff_full_screen {
                                             this.flex_1().min_w_0()
                                         } else {
-                                            this.w(self.diff_width).flex_none()
+                                            // Narrower when the window can't fit it beside
+                                            // the conversation.
+                                            this.w(self.diff_width)
+                                                .min_w(MIN_DIFF_PANEL_WIDTH)
+                                                .flex_shrink(1.)
                                         }
                                     })
                                     .h_full()

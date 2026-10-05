@@ -2267,6 +2267,40 @@ async fn turns_are_checkpointed_for_diffs() {
         "1"
     );
 
+    // One earlier turn, and the turns there are to pick from.
+    let first = client.thread_diff(thread, DiffScope::Turn(1)).await;
+    assert_eq!(
+        diff_files(&first),
+        vec![("src/a.txt", FileChange::Added, 1, 0)]
+    );
+    let numbers: Vec<u32> = first
+        .finished_turns
+        .iter()
+        .map(|turn| turn.number)
+        .collect();
+    assert_eq!(numbers, [1, 2]);
+
+    // t3code's working tree: everything uncommitted, untracked files too, as it is now.
+    std::fs::write(repository.join("notes.txt"), "todo\n").expect("a file");
+    let working_tree = client.thread_diff(thread, DiffScope::WorkingTree).await;
+    assert_eq!(
+        diff_files(&working_tree),
+        vec![
+            ("README.md", FileChange::Modified, 1, 1),
+            ("notes.txt", FileChange::Added, 1, 0),
+            ("src/a.txt", FileChange::Added, 1, 0),
+        ]
+    );
+    assert!(matches!(
+        working_tree.restore,
+        RestoreAvailability::Unavailable(_)
+    ));
+    std::fs::remove_file(repository.join("notes.txt")).expect("removed");
+
+    // t3code's branch changes: on main there's no base to compare with.
+    let branch = client.thread_diff(thread, DiffScope::Branch).await;
+    assert_eq!((branch.base_ref.clone(), branch.files.len()), (None, 0));
+
     // Agents read diffs too.
     let files = client
         .tool(

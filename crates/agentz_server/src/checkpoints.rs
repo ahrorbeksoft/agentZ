@@ -15,13 +15,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use agent_thread::TurnPoint;
-use agentz_protocol::diff::{DiffScope, DiffStatus};
+use agentz_protocol::diff::{DiffScope, DiffStatus, FinishedTurn};
 use anyhow::{Context as _, Result};
 use projects::ThreadId;
 
 use crate::git::{git, git_limited, is_repository};
 
 pub(crate) const REF_ROOT: &str = "refs/agentz/checkpoints";
+/// Git's empty tree, what an unborn branch's working tree is compared with.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// t3code's limit. Larger patches are cut short.
 const MAX_PATCH_BYTES: usize = 10_000_000;
 /// Git renames objects and refs into place without flushing them by default, so a crash can
@@ -53,6 +55,8 @@ pub(crate) struct RawDiff {
     pub turns: u32,
     pub patch: String,
     pub truncated: bool,
+    pub finished_turns: Vec<FinishedTurn>,
+    pub base_ref: Option<String>,
 }
 
 impl Checkpoints {
@@ -113,17 +117,36 @@ impl Checkpoints {
     }
 
     async fn capture(&self, turn: u32) -> Result<()> {
+        let Some(tree) = self.snapshot_tree().await? else {
+            return Ok(());
+        };
+        let turn_ref = self.turn_ref(turn);
+        let message = format!("agentZ checkpoint {turn_ref}");
+        let mut commit_tree = Vec::from(DURABLE_WRITE);
+        commit_tree.extend(["commit-tree", tree.as_str(), "-m", &message]);
+        let commit = git(&self.cwd, &commit_tree, &AUTHOR).await?;
+        let commit = commit.trim();
+        anyhow::ensure!(!commit.is_empty(), "git commit-tree printed no commit");
+        let mut update_ref = Vec::from(DURABLE_WRITE);
+        update_ref.extend(["update-ref", &turn_ref, commit]);
+        git(&self.cwd, &update_ref, &[]).await?;
+        Ok(())
+    }
+
+    /// The folder as it is now, untracked files included, as a tree written with a private
+    /// index. `None` for a sparse checkout, whose index can't be rebuilt safely.
+    async fn snapshot_tree(&self) -> Result<Option<String>> {
         let cwd = &self.cwd;
         let sparse = git(cwd, &["config", "--bool", "core.sparseCheckout"], &[])
             .await
             .unwrap_or_default();
         if sparse.trim() == "true" {
-            return Ok(());
+            return Ok(None);
         }
         let common_dir = git(cwd, &["rev-parse", "--git-common-dir"], &[]).await?;
         let common_dir = cwd.join(common_dir.trim());
         let index = common_dir.join(format!("agentz-checkpoint-index-{}", uuid::Uuid::new_v4()));
-        let result = self.capture_with_index(turn, &index).await;
+        let result = self.write_tree_with_index(&index).await;
         // A killed git can leave the private index's lock behind.
         for path in [index.clone(), index.with_extension("lock")] {
             match tokio::fs::remove_file(&path).await {
@@ -132,10 +155,10 @@ impl Checkpoints {
                 Err(error) => log::error!("failed to remove {}: {error}", path.display()),
             }
         }
-        result
+        result.map(Some)
     }
 
-    async fn capture_with_index(&self, turn: u32, index: &Path) -> Result<()> {
+    async fn write_tree_with_index(&self, index: &Path) -> Result<String> {
         let cwd = &self.cwd;
         let index_value = index.to_string_lossy().into_owned();
         let mut env = vec![("GIT_INDEX_FILE", index_value.as_str())];
@@ -164,67 +187,183 @@ impl Checkpoints {
         write_tree.extend(DURABLE_WRITE);
         write_tree.push("write-tree");
         let tree = git(cwd, &write_tree, &env).await?;
-        let tree = tree.trim();
+        let tree = tree.trim().to_string();
         anyhow::ensure!(!tree.is_empty(), "git write-tree printed no tree");
-        let turn_ref = self.turn_ref(turn);
-        let message = format!("agentZ checkpoint {turn_ref}");
-        let mut commit_tree = Vec::from(DURABLE_WRITE);
-        commit_tree.extend(["commit-tree", tree, "-m", &message]);
-        let commit = git(cwd, &commit_tree, &env).await?;
-        let commit = commit.trim();
-        anyhow::ensure!(!commit.is_empty(), "git commit-tree printed no commit");
-        let mut update_ref = Vec::from(DURABLE_WRITE);
-        update_ref.extend(["update-ref", &turn_ref, commit]);
-        git(cwd, &update_ref, &[]).await?;
-        Ok(())
+        Ok(tree)
     }
 
-    /// The patch for the scope, between the checkpoints that bound it.
+    /// The patch for the scope: between the checkpoints that bound the turns, or for the
+    /// folder as it is (t3code's working tree and branch changes).
     pub(crate) async fn diff(&self, scope: DiffScope) -> Result<RawDiff> {
-        let empty = |status, turns| RawDiff {
-            status,
-            turns,
+        let mut diff = RawDiff {
+            status: DiffStatus::Ready,
+            turns: 0,
             patch: String::new(),
             truncated: false,
+            finished_turns: Vec::new(),
+            base_ref: None,
         };
         if !is_repository(&self.cwd).await {
-            return Ok(empty(DiffStatus::NotRepository, 0));
+            diff.status = DiffStatus::NotRepository;
+            return Ok(diff);
         }
-        let turns = match self.latest().await? {
-            None | Some(0) => return Ok(empty(DiffStatus::NoTurns, 0)),
-            Some(latest) => latest,
+        diff.finished_turns = self.finished_turns().await?;
+        diff.turns = diff.finished_turns.last().map_or(0, |turn| turn.number);
+        let range = match scope {
+            DiffScope::LatestTurn | DiffScope::All | DiffScope::Turn(_) => {
+                let turns = diff.turns;
+                let to = match scope {
+                    DiffScope::Turn(turn) if turn >= 1 && turn <= turns => turn,
+                    _ => turns,
+                };
+                if to == 0 {
+                    diff.status = DiffStatus::NoTurns;
+                    return Ok(diff);
+                }
+                let from = match scope {
+                    DiffScope::All => 0,
+                    _ => to - 1,
+                };
+                Some((
+                    format!("{}^{{commit}}", self.turn_ref(from)),
+                    format!("{}^{{commit}}", self.turn_ref(to)),
+                ))
+            }
+            DiffScope::WorkingTree => {
+                let head = git(
+                    &self.cwd,
+                    &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+                    &[],
+                )
+                .await
+                .map(|head| head.trim().to_string())
+                .unwrap_or(EMPTY_TREE.to_string());
+                match self.snapshot_tree().await? {
+                    Some(tree) => Some((head, tree)),
+                    // A sparse checkout's tracked changes only.
+                    None => Some((head, String::new())),
+                }
+            }
+            DiffScope::Branch => {
+                diff.base_ref = self.base_branch().await;
+                diff.base_ref
+                    .as_ref()
+                    .map(|base| (format!("{base}...HEAD"), String::new()))
+            }
         };
-        let from = match scope {
-            DiffScope::LatestTurn => turns - 1,
-            DiffScope::All => 0,
+        let Some((from, to)) = range else {
+            return Ok(diff);
         };
-        let from = format!("{}^{{commit}}", self.turn_ref(from));
-        let to = format!("{}^{{commit}}", self.turn_ref(turns));
-        let (patch, truncated) = git_limited(
+        let mut args = vec![
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--patch",
+            "--find-renames",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            from.as_str(),
+        ];
+        if !to.is_empty() {
+            args.push(to.as_str());
+        }
+        let (patch, truncated) = git_limited(&self.cwd, &args, MAX_PATCH_BYTES).await?;
+        diff.patch = patch;
+        diff.truncated = truncated;
+        Ok(diff)
+    }
+
+    /// The turns with a checkpoint after them, oldest first, with when each was taken.
+    async fn finished_turns(&self) -> Result<Vec<FinishedTurn>> {
+        let output = git(
             &self.cwd,
             &[
-                "-c",
-                "core.quotePath=false",
-                "diff",
-                "--patch",
-                "--find-renames",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                &from,
-                &to,
+                "for-each-ref",
+                "--format=%(refname) %(committerdate:unix)",
+                &format!("{}/", self.prefix),
             ],
-            MAX_PATCH_BYTES,
+            &[],
         )
         .await?;
-        Ok(RawDiff {
-            status: DiffStatus::Ready,
-            turns,
-            patch,
-            truncated,
-        })
+        let mut turns: Vec<FinishedTurn> = output
+            .lines()
+            .filter_map(|line| {
+                let (name, time) = line.split_once(' ')?;
+                let number = name.rsplit('/').next()?.parse::<u32>().ok()?;
+                let finished_at = time
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+                (number > 0).then_some(FinishedTurn {
+                    number,
+                    finished_at,
+                })
+            })
+            .collect();
+        turns.sort_by_key(|turn| turn.number);
+        Ok(turns)
+    }
+
+    /// t3code's base branch: the branch's `gh-merge-base`, else the remote's default branch,
+    /// else `main` or `master`, the remote's copy first. `None` on the base branch itself.
+    async fn base_branch(&self) -> Option<String> {
+        let cwd = &self.cwd;
+        let branch = git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"], &[])
+            .await
+            .ok()?;
+        let branch = branch.trim();
+        let configured = git(
+            cwd,
+            &["config", "--get", &format!("branch.{branch}.gh-merge-base")],
+            &[],
+        )
+        .await
+        .unwrap_or_default();
+        let default_branch = git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"], &[])
+            .await
+            .ok()
+            .and_then(|head| {
+                head.trim()
+                    .strip_prefix("refs/remotes/origin/")
+                    .map(str::to_string)
+            });
+        let candidates = [
+            Some(configured.trim().to_string()).filter(|name| !name.is_empty()),
+            default_branch,
+            Some("main".to_string()),
+            Some("master".to_string()),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            let name = candidate
+                .strip_prefix("origin/")
+                .unwrap_or(&candidate)
+                .to_string();
+            if name.is_empty() || name == branch {
+                continue;
+            }
+            for reference in [
+                format!("refs/remotes/origin/{name}"),
+                format!("refs/heads/{name}"),
+            ] {
+                if git(cwd, &["show-ref", "--verify", "--quiet", &reference], &[])
+                    .await
+                    .is_ok()
+                {
+                    return Some(
+                        reference
+                            .strip_prefix("refs/remotes/")
+                            .or_else(|| reference.strip_prefix("refs/heads/"))
+                            .unwrap_or(&reference)
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// Puts the folder back as it was at the scope's first checkpoint, and drops the later ones,
@@ -236,7 +375,11 @@ impl Checkpoints {
         };
         let target = match scope {
             DiffScope::LatestTurn => turns - 1,
+            DiffScope::Turn(turn) if turn == turns => turns - 1,
             DiffScope::All => 0,
+            DiffScope::Turn(_) | DiffScope::WorkingTree | DiffScope::Branch => {
+                anyhow::bail!("only the latest turn or all of them can be reverted")
+            }
         };
         let commit = git(
             &self.cwd,
@@ -406,6 +549,24 @@ mod tests {
             .into_iter()
             .map(|file| (file.path, file.additions, file.deletions))
             .collect()
+    }
+
+    /// t3code's branch changes: a feature branch's commits since it left main.
+    #[tokio::test]
+    async fn branch_changes_are_against_the_base_branch() {
+        if git(Path::new("/"), &["--version"], &[]).await.is_err() {
+            return;
+        }
+        let repository = repository().await;
+        let cwd = repository.path();
+        run(cwd, &["checkout", "-q", "-b", "feature"]).await;
+        std::fs::write(cwd.join("feature.txt"), "new\n").expect("a file");
+        run(cwd, &["add", "."]).await;
+        run(cwd, &["commit", "-q", "-m", "feature"]).await;
+        let checkpoints = Checkpoints::new(cwd.to_path_buf(), "machine-1", ThreadId(9));
+        let diff = checkpoints.diff(DiffScope::Branch).await.expect("a diff");
+        assert_eq!(diff.base_ref.as_deref(), Some("main"));
+        assert_eq!(files(&diff.patch), vec![("feature.txt".to_string(), 1, 0)]);
     }
 
     #[tokio::test]

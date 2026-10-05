@@ -18,8 +18,7 @@ use gpui::{
 };
 use projects::ThreadId;
 use ui::{
-    Checkbox, Disclosure, ToggleButtonGroup, ToggleButtonGroupSize, ToggleButtonSimple,
-    ToggleState, Tooltip, prelude::*,
+    Checkbox, ContextMenu, Disclosure, IconPosition, PopoverMenu, ToggleState, Tooltip, prelude::*,
 };
 
 use crate::ToggleDiff;
@@ -27,6 +26,8 @@ use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::server_client::ServerClient;
 
 pub const DIFF_PANEL_WIDTH: Pixels = px(520.);
+/// t3code's 5 seconds before a working tree or branch diff is asked for again.
+const LIVE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What the panel asks of the shell showing it.
 pub enum DiffPanelEvent {
@@ -59,6 +60,8 @@ pub struct DiffPanel {
     thread_id: ThreadId,
     scope: DiffScope,
     diff: Option<Rc<ThreadDiff>>,
+    /// The finished turns last heard of, for the scope menu while a scope loads.
+    finished_turns: Vec<agentz_protocol::diff::FinishedTurn>,
     error: Option<SharedString>,
     loading: bool,
     /// When the thread last finished a turn, to reload after the next one.
@@ -71,6 +74,8 @@ pub struct DiffPanel {
     list_state: ListState,
     is_full_screen: bool,
     _load: Task<()>,
+    /// Asks again every few seconds while a scope shows the folder as it is.
+    _live_refresh: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -106,6 +111,7 @@ impl DiffPanel {
             thread_id,
             scope: DiffScope::LatestTurn,
             diff: None,
+            finished_turns: Vec::new(),
             error: None,
             loading: false,
             completed_at,
@@ -115,6 +121,7 @@ impl DiffPanel {
             list_state: ListState::new(0, ListAlignment::Top, px(400.)),
             is_full_screen: false,
             _load: Task::ready(()),
+            _live_refresh: None,
             _subscriptions: subscriptions,
         };
         this.reload(cx);
@@ -171,10 +178,127 @@ impl DiffPanel {
         if self.scope == scope {
             return;
         }
+        // The turns to pick from stay while the new scope loads.
+        let finished_turns = self
+            .diff
+            .as_ref()
+            .map(|diff| diff.finished_turns.clone())
+            .unwrap_or_default();
         self.scope = scope;
         self.diff = None;
+        self.finished_turns = finished_turns;
         self.update_rows(true);
         self.reload(cx);
+        self.sync_live_refresh(cx);
+    }
+
+    /// t3code asks again for the working tree and branch changes once they're 5 seconds old;
+    /// here they're asked for every 5 seconds while shown.
+    fn sync_live_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.scope.is_turns() {
+            self._live_refresh = None;
+            return;
+        }
+        if self._live_refresh.is_some() {
+            return;
+        }
+        self._live_refresh = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(LIVE_REFRESH_INTERVAL).await;
+                let refreshed = this.update(cx, |this, cx| {
+                    if !this.loading {
+                        this.reload(cx);
+                    }
+                });
+                if refreshed.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// t3code's names for the scopes.
+    fn scope_label(&self) -> SharedString {
+        match self.scope {
+            DiffScope::WorkingTree => "Working tree".into(),
+            DiffScope::Branch => "Branch changes".into(),
+            DiffScope::LatestTurn | DiffScope::All => "Latest turn".into(),
+            DiffScope::Turn(turn) => format!("Turn {turn}").into(),
+        }
+    }
+
+    /// t3code's scope menu: the folder's working tree and branch changes, the latest turn, and
+    /// any finished turn.
+    fn render_scope_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        let scope = self.scope;
+        let finished_turns = self
+            .diff
+            .as_ref()
+            .map(|diff| diff.finished_turns.clone())
+            .unwrap_or_else(|| self.finished_turns.clone());
+        PopoverMenu::new("diff-scope-menu")
+            .trigger(
+                Button::new("diff-scope", self.scope_label())
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Filled)
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
+            .anchor(gpui::Anchor::TopLeft)
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                let finished_turns = finished_turns.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let entry = |menu: ContextMenu, label: &'static str, target: DiffScope| {
+                        let panel = panel.clone();
+                        let selected = scope == target
+                            || (target == DiffScope::LatestTurn && scope == DiffScope::All);
+                        menu.toggleable_entry(
+                            label,
+                            selected,
+                            IconPosition::End,
+                            None,
+                            move |_, cx| {
+                                panel.update(cx, |this, cx| this.set_scope(target, cx)).ok();
+                            },
+                        )
+                    };
+                    let menu = entry(menu, "Working tree", DiffScope::WorkingTree);
+                    let menu = entry(menu, "Branch changes", DiffScope::Branch);
+                    let menu = entry(menu, "Latest turn", DiffScope::LatestTurn);
+                    let panel = panel.clone();
+                    let finished_turns = finished_turns.clone();
+                    menu.submenu("Turn", move |mut menu, _, _| {
+                        // The latest first, as t3code lists them.
+                        for turn in finished_turns.iter().rev() {
+                            let panel = panel.clone();
+                            let number = turn.number;
+                            let time = turn
+                                .finished_at
+                                .map(|time| {
+                                    chrono::DateTime::<chrono::Local>::from(time)
+                                        .format("%H:%M")
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
+                            menu = menu.toggleable_entry(
+                                format!("Turn {number}  {time}"),
+                                scope == DiffScope::Turn(number),
+                                IconPosition::End,
+                                None,
+                                move |_, cx| {
+                                    panel
+                                        .update(cx, |this, cx| {
+                                            this.set_scope(DiffScope::Turn(number), cx)
+                                        })
+                                        .ok();
+                                },
+                            );
+                        }
+                        menu
+                    })
+                }))
+            })
     }
 
     fn set_diff(&mut self, diff: ThreadDiff) {
@@ -271,7 +395,10 @@ impl DiffPanel {
     fn confirm_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scope = self.scope;
         let (message, detail) = match scope {
-            DiffScope::LatestTurn => (
+            DiffScope::LatestTurn
+            | DiffScope::Turn(_)
+            | DiffScope::WorkingTree
+            | DiffScope::Branch => (
                 "Revert the latest turn?",
                 "Its changes to files are undone, and it no longer counts. The conversation \
                  stays as it is.",
@@ -337,8 +464,6 @@ impl DiffPanel {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let latest = cx.entity().downgrade();
-        let all = latest.clone();
         let files = self.diff.as_ref().map(|diff| diff.files.as_slice());
         let all_collapsed = files.is_some_and(|files| {
             !files.is_empty() && files.iter().all(|file| self.collapsed.contains(&file.path))
@@ -350,28 +475,7 @@ impl DiffPanel {
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(
-                ToggleButtonGroup::single_row(
-                    "diff-scope",
-                    [
-                        ToggleButtonSimple::new("Latest Turn", move |_, _, cx| {
-                            latest
-                                .update(cx, |this, cx| this.set_scope(DiffScope::LatestTurn, cx))
-                                .ok();
-                        }),
-                        ToggleButtonSimple::new("All Changes", move |_, _, cx| {
-                            all.update(cx, |this, cx| this.set_scope(DiffScope::All, cx))
-                                .ok();
-                        }),
-                    ],
-                )
-                .size(ToggleButtonGroupSize::Default)
-                .auto_width()
-                .selected_index(match self.scope {
-                    DiffScope::LatestTurn => 0,
-                    DiffScope::All => 1,
-                }),
-            )
+            .child(self.render_scope_menu(cx))
             .child(div().flex_1())
             .when_some(files.filter(|files| !files.is_empty()), |this, files| {
                 let viewed = files
@@ -404,13 +508,10 @@ impl DiffPanel {
             .when_some(
                 self.diff
                     .as_ref()
-                    .filter(|diff| !diff.files.is_empty())
+                    .filter(|diff| !diff.files.is_empty() && self.is_latest_turn(diff))
                     .map(|diff| diff.restore.clone()),
                 |this, restore| {
-                    let label = match self.scope {
-                        DiffScope::LatestTurn => "Revert Latest Turn",
-                        DiffScope::All => "Revert All Changes",
-                    };
+                    let label = "Revert Latest Turn";
                     let (available, tooltip) = match restore {
                         RestoreAvailability::Available => (true, SharedString::from(label)),
                         RestoreAvailability::Unavailable(reason) => (false, reason.into()),
@@ -464,6 +565,15 @@ impl DiffPanel {
             )
     }
 
+    /// Whether the scope shows the latest turn, the one that can be reverted.
+    fn is_latest_turn(&self, diff: &ThreadDiff) -> bool {
+        match self.scope {
+            DiffScope::LatestTurn => true,
+            DiffScope::Turn(turn) => turn == diff.turns,
+            DiffScope::All | DiffScope::WorkingTree | DiffScope::Branch => false,
+        }
+    }
+
     fn render_summary(&self, diff: &ThreadDiff) -> Option<AnyElement> {
         if diff.files.is_empty() {
             return None;
@@ -473,8 +583,14 @@ impl DiffPanel {
         let count = diff.files.len();
         let turns = match self.scope {
             DiffScope::LatestTurn => format!("Turn {}", diff.turns),
+            DiffScope::Turn(turn) => format!("Turn {turn}"),
             DiffScope::All if diff.turns == 1 => "1 turn".to_string(),
             DiffScope::All => format!("{} turns", diff.turns),
+            DiffScope::WorkingTree => "Uncommitted".to_string(),
+            DiffScope::Branch => match &diff.base_ref {
+                Some(base) => format!("Against {base}"),
+                None => String::new(),
+            },
         };
         Some(
             h_flex()
@@ -503,7 +619,8 @@ impl Render for DiffPanel {
         let colors = cx.theme().colors();
         let notice = match (&self.diff, &self.error) {
             (_, Some(error)) => Some(error.clone()),
-            (None, None) => Some(if self.loading { "Loading…" } else { "" }.into()),
+            // Also before the first load is asked for.
+            (None, None) => Some("Loading…".into()),
             (Some(diff), None) => match &diff.status {
                 DiffStatus::NotRepository => Some(
                     "This project isn't a git repository, so agentZ can't track its changes."
@@ -513,7 +630,13 @@ impl Render for DiffPanel {
                 DiffStatus::Unknown(_) => Some("This server sent a diff agentZ can't read.".into()),
                 DiffStatus::Ready if diff.files.is_empty() => Some(match self.scope {
                     DiffScope::LatestTurn => "The latest turn changed no files.".into(),
+                    DiffScope::Turn(turn) => format!("Turn {turn} changed no files.").into(),
                     DiffScope::All => "No changes yet.".into(),
+                    DiffScope::WorkingTree => "No uncommitted changes.".into(),
+                    DiffScope::Branch => match &diff.base_ref {
+                        Some(base) => format!("No changes against {base}.").into(),
+                        None => "This branch has no base branch to compare with.".into(),
+                    },
                 }),
                 DiffStatus::Ready => None,
             },
@@ -846,6 +969,8 @@ diff --git a/b.txt b/b.txt
             files: agentz_protocol::diff::parse_patch(patch),
             truncated: false,
             restore: RestoreAvailability::Available,
+            finished_turns: Vec::new(),
+            base_ref: None,
         };
         let collapsed = HashSet::from_iter(["b.txt".to_string()]);
         let numbers: Vec<(Option<u32>, Option<u32>)> = build_rows(&diff, &collapsed)

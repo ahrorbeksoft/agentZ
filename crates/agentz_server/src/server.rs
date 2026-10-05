@@ -1663,7 +1663,14 @@ async fn thread_diff(
         turns: diff.turns,
         files: agentz_protocol::diff::parse_patch(&diff.patch),
         truncated: diff.truncated,
-        restore,
+        // Only turns can be reverted.
+        restore: if scope.is_turns() {
+            restore
+        } else {
+            RestoreAvailability::Unavailable("Only turns' changes can be reverted.".into())
+        },
+        finished_turns: diff.finished_turns,
+        base_ref: diff.base_ref,
     })
 }
 

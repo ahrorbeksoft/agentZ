@@ -428,8 +428,13 @@ t3code's checkpoints (`apps/server/src/checkpointing/`).
   10 seconds, but not a redraw within a second of a resize or focus change (opening a thread
   does both). An agent CLI's activity is its turns, since its screen also changes while it only
   waits, as a focused prompt blinks.
-- **Diff panel** (`diff_panel.rs`, Cmd-D): latest turn or all, files and hunks, Viewed (a file
-  reopens when it changes). Revert puts files back, only for a thread alone in its worktree or
+- **Diff panel** (`diff_panel.rs`, Cmd-D; t3code's scope menu, as the user picked): Working
+  tree (everything uncommitted, untracked files too, through a private index), Branch changes
+  (`base...HEAD`, the base being the branch's `gh-merge-base`, the remote's default branch, or
+  `main`/`master`, as t3code finds it), Latest turn, and Turn ▸ any finished turn with when it
+  finished. The working tree and branch changes are fetched again every 5 seconds while shown,
+  t3code's 5-second staleness. Files and hunks, Viewed (a file reopens when it changes). The
+  panel narrows when the window can't fit it beside the conversation. Revert puts files back, only for a thread alone in its worktree or
   pasture; ACP can't rewind a conversation, so only files go back.
 - The diff button shows a dot while the panel is hidden and the thread has changed files.
 - Diffs are parsed on the server (`agentz_protocol::diff`), capped at 10 MB of patch.

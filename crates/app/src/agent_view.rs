@@ -1893,7 +1893,9 @@ impl AgentView {
             .border_color(cx.theme().colors().border)
             .children(project.map(|project| self.render_project_crumb(&project, cx)))
             .children(folder.map(render_folder_crumb))
-            .child(h_flex().flex_1().min_w_0().child(title))
+            // From the title's own width, so a narrow header shrinks it and the project's name
+            // together.
+            .child(h_flex().flex_auto().min_w_0().child(title))
             .children(self.render_branch(cx))
             .child(self.render_toolbar_buttons(cx))
     }
@@ -1917,22 +1919,24 @@ impl AgentView {
             cx,
         );
         let hover = cx.theme().colors().ghost_element_hover;
+        // Shrinks with the title when the header is narrow, so neither takes all the room.
         h_flex()
-            .flex_none()
+            .min_w_0()
             .gap_1()
             .child(
                 h_flex()
                     .id("thread-header-project")
                     .debug_selector(|| "thread-header-project".into())
+                    .min_w_0()
                     .gap_1p5()
                     .px_1()
                     .py_0p5()
                     .rounded_sm()
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
-                    .child(icon)
+                    .child(div().flex_none().child(icon))
                     .child(
-                        div().max_w(px(160.)).child(
+                        div().min_w_0().max_w(px(160.)).child(
                             Label::new(name.clone())
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
@@ -1973,6 +1977,9 @@ impl AgentView {
         let rename_from_menu = rename.clone();
         PopoverMenu::new("thread-title-menu")
             .with_handle(self.title_menu.clone())
+            // As wide as the header leaves it, so a long title truncates rather than running
+            // over the branch and buttons.
+            .full_width(true)
             .menu(move |window, cx| {
                 let agents: Vec<(AgentId, SharedString)> = {
                     let registry = registry.read(cx);
@@ -2792,8 +2799,8 @@ impl AgentView {
                         .into_any_element(),
                 );
             }
-            for diff in &tool_call.diffs {
-                output.push(render_diff(diff, cx));
+            for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
+                output.push(render_diff(diff, (index, diff_index), cx));
             }
             for terminal_id in &tool_call.terminals {
                 if let Some(terminal) = self.tool_terminals.get(terminal_id) {
@@ -4327,12 +4334,19 @@ impl AgentView {
                                 window.focus(&this.composer.focus_handle(cx), cx);
                             })),
                     )
+                    // Zed's footer: when it's too narrow, the controls go to their own row as a
+                    // whole, then wrap within it.
                     .child(
                         h_flex()
                             .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .flex_wrap()
                             .justify_between()
                             .child(
                                 h_flex()
+                                    .min_w_0()
+                                    .flex_wrap()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(match style {
@@ -5243,15 +5257,12 @@ fn render_plan_entries(plan: &[PlanItem], _window: &Window, cx: &App) -> AnyElem
         .into_any_element()
 }
 
-fn render_diff(diff: &FileDiff, cx: &App) -> AnyElement {
+/// A tool call's edit. Long lines scroll sideways, as in Zed's editor, rather than being cut
+/// off.
+fn render_diff(diff: &FileDiff, (entry, part): (usize, usize), cx: &App) -> AnyElement {
     let colors = cx.theme().colors();
-    v_flex()
-        .w_full()
-        .border_t_1()
-        .border_color(colors.border.opacity(0.8))
-        .font_buffer(cx)
-        .text_size(rems_from_px(12_f32))
-        .line_height(rems_from_px(18_f32))
+    let lines = v_flex()
+        .min_w_full()
         .children(
             diff.hunk(DIFF_CONTEXT_LINES)
                 .into_iter()
@@ -5266,15 +5277,33 @@ fn render_diff(diff: &FileDiff, cx: &App) -> AnyElement {
                         }
                     };
                     h_flex()
+                        .min_w_full()
                         .px_2()
+                        .whitespace_nowrap()
                         .when_some(background, |this, background| this.bg(background))
                         .when(kind == DiffLineKind::Context, |this| {
                             this.text_color(colors.text_muted)
                         })
-                        .child(div().w(px(14.)).text_color(colors.text_muted).child(marker))
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .flex_none()
+                                .text_color(colors.text_muted)
+                                .child(marker),
+                        )
                         .child(line.to_string())
                 }),
-        )
+        );
+    div()
+        .id(("tool-diff", entry * 1000 + part))
+        .w_full()
+        .overflow_x_scroll()
+        .border_t_1()
+        .border_color(colors.border.opacity(0.8))
+        .font_buffer(cx)
+        .text_size(rems_from_px(12_f32))
+        .line_height(rems_from_px(18_f32))
+        .child(lines)
         .into_any_element()
 }
 
@@ -5628,7 +5657,7 @@ impl RenderOnce for TitleButton {
         let hover = colors.ghost_element_hover;
         let on_click = self.on_click;
         let on_double_click = self.on_double_click;
-        h_flex()
+        let chip = h_flex()
             .id("thread-header-title")
             .debug_selector(|| "thread-header-title".into())
             .min_w_0()
@@ -5651,7 +5680,9 @@ impl RenderOnce for TitleButton {
                 } else if let Some(on_click) = &on_click {
                     on_click(event, window, cx);
                 }
-            })
+            });
+        // The row takes the header's room; the chip fits its title, shrinking with it.
+        h_flex().w_full().min_w_0().child(chip)
     }
 }
 

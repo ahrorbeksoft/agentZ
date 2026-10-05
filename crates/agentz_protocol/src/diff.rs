@@ -12,6 +12,23 @@ pub enum DiffScope {
     /// Everything since the thread's first turn started.
     #[default]
     All,
+    /// One finished turn's, by its number (the first is 1).
+    Turn(u32),
+    /// The folder's uncommitted changes, untracked files included: t3code's "Working tree",
+    /// as the folder is now.
+    WorkingTree,
+    /// The branch's commits since it left its base branch: t3code's "Branch changes".
+    Branch,
+}
+
+impl DiffScope {
+    /// Whether it's of the turns' checkpoints, rather than of the folder as it is.
+    pub fn is_turns(self) -> bool {
+        matches!(
+            self,
+            DiffScope::LatestTurn | DiffScope::All | DiffScope::Turn(_)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -24,6 +41,19 @@ pub struct ThreadDiff {
     pub truncated: bool,
     #[serde(default)]
     pub restore: RestoreAvailability,
+    /// The finished turns, oldest first, for picking one.
+    #[serde(default)]
+    pub finished_turns: Vec<FinishedTurn>,
+    /// What [`DiffScope::Branch`] compared with, such as `origin/main`; `None` when the branch has
+    /// no base to compare with.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FinishedTurn {
+    pub number: u32,
+    pub finished_at: Option<std::time::SystemTime>,
 }
 
 /// Whether [`crate::Request::RestoreCheckpoint`] can put the thread's files back. A checkpoint

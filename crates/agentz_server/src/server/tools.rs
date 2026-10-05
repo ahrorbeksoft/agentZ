@@ -1567,8 +1567,11 @@ impl Server {
                     "threadId": thread_id.0,
                     "status": status,
                     "scope": match scope {
-                        DiffScope::All => "all",
                         DiffScope::LatestTurn => "latest_turn",
+                        DiffScope::All
+                        | DiffScope::Turn(_)
+                        | DiffScope::WorkingTree
+                        | DiffScope::Branch => "all",
                     },
                     "turns": diff.turns,
                     "files": files,
