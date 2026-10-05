@@ -78,6 +78,9 @@ pub enum ServerUpdate {
 pub enum ServerClientEvent {
     /// An agent on this machine wants a tool run on another.
     RelayToolCall(RelayToolCall),
+    /// A terminal pane's agent finished working (`Completed`) or got blocked on a prompt
+    /// (`PendingApproval`).
+    PaneNeedsAttention(PaneId, ThreadStatus),
 }
 
 pub struct ServerClient {
@@ -421,21 +424,37 @@ impl ServerClient {
         if spaces == self.spaces {
             return;
         }
-        let was_working: BTreeSet<PaneId> = panes(&self.spaces)
-            .filter(|pane| pane_agent_state(pane) == Some(PaneAgentState::Working))
-            .map(|pane| pane.id)
+        let previous: BTreeMap<PaneId, Option<PaneAgentState>> = panes(&self.spaces)
+            .map(|pane| (pane.id, pane_agent_state(pane)))
             .collect();
         let mut live = BTreeSet::new();
         for pane in panes(&spaces) {
             live.insert(pane.id);
-            match pane_agent_state(pane) {
-                Some(PaneAgentState::Idle) if was_working.contains(&pane.id) => {
+            // Only a pane seen before can change, so the first spaces after connecting are
+            // no news.
+            let Some(&was) = previous.get(&pane.id) else {
+                continue;
+            };
+            let state = pane_agent_state(pane);
+            match state {
+                Some(PaneAgentState::Idle) if was == Some(PaneAgentState::Working) => {
                     self.unseen_panes.insert(pane.id);
+                    cx.emit(ServerClientEvent::PaneNeedsAttention(
+                        pane.id,
+                        ThreadStatus::Completed,
+                    ));
                 }
                 Some(PaneAgentState::Idle) => {}
                 _ => {
                     self.unseen_panes.remove(&pane.id);
                 }
+            }
+            // herdr's request sound: every time it becomes blocked.
+            if state == Some(PaneAgentState::Blocked) && was != state {
+                cx.emit(ServerClientEvent::PaneNeedsAttention(
+                    pane.id,
+                    ThreadStatus::PendingApproval,
+                ));
             }
         }
         self.unseen_panes.retain(|pane| live.contains(pane));
@@ -503,6 +522,12 @@ impl ServerClient {
             client.spaces = spaces;
         });
         client
+    }
+
+    /// New spaces, as the server would send them.
+    #[cfg(test)]
+    pub fn set_spaces_for_test(&mut self, spaces: SpacesSnapshot, cx: &mut Context<Self>) {
+        self.set_spaces(spaces, cx);
     }
 
     /// What `send` was given, oldest first.
@@ -1017,5 +1042,51 @@ mod tests {
 
         client.update(cx, |client, cx| client.mark_pane_seen(PaneId(3), cx));
         assert_eq!(status(cx), None);
+    }
+
+    #[gpui::test]
+    fn a_pane_agent_asks_for_attention_as_it_finishes_or_gets_blocked(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(None), cx)
+        });
+        let attention = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let attention = attention.clone();
+            cx.subscribe(&client, move |_, event: &ServerClientEvent, _| {
+                if let ServerClientEvent::PaneNeedsAttention(pane, status) = event {
+                    attention.borrow_mut().push((*pane, *status));
+                }
+            })
+            .detach();
+        });
+        let set = |state, cx: &mut TestAppContext| {
+            client.update(cx, |client, cx| client.set_spaces(spaces(Some(state)), cx))
+        };
+
+        set(PaneAgentState::Idle, cx);
+        set(PaneAgentState::Working, cx);
+        set(PaneAgentState::Blocked, cx);
+        set(PaneAgentState::Working, cx);
+        set(PaneAgentState::Idle, cx);
+        // An agent at its prompt from the start finished nothing.
+        set(PaneAgentState::Unknown, cx);
+        set(PaneAgentState::Idle, cx);
+        assert_eq!(
+            *attention.borrow(),
+            vec![
+                (PaneId(3), ThreadStatus::PendingApproval),
+                (PaneId(3), ThreadStatus::Completed),
+            ]
+        );
+
+        // A pane the client hasn't seen before is no news, blocked or not: so are the spaces
+        // that arrive on connecting.
+        attention.borrow_mut().clear();
+        client.update(cx, |client, cx| {
+            client.set_spaces(SpacesSnapshot::default(), cx);
+            client.set_spaces(spaces(Some(PaneAgentState::Blocked)), cx);
+        });
+        assert!(attention.borrow().is_empty());
     }
 }

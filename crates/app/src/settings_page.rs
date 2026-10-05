@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 
 use crate::agent_login::{AgentLogin, LoginLayout};
 use crate::agent_view::TOOLBAR_HEIGHT;
-use crate::app_settings::{AppSettingsStore, MachineProfile, ThemeMode};
+use crate::app_settings::{AppSettingsStore, MachineProfile, PlaySound, ThemeMode};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{
     ActionButton, ActionStyle, account_badge, avatar, icon_tile, spinner, status_badge, status_dot,
@@ -56,6 +56,7 @@ use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
 use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
+use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
 
 const KEY_CONTEXT: &str = "SettingsPage";
@@ -91,6 +92,7 @@ pub enum SettingsPageEvent {
 enum Section {
     General,
     Appearance,
+    Notifications,
     Agents,
     Machines,
     Project(ProjectKey),
@@ -600,6 +602,13 @@ impl SettingsPage {
                 Section::Appearance,
                 cx,
             ),
+            self.render_nav_item(
+                "Notifications",
+                Some(IconName::Bell),
+                None,
+                Section::Notifications,
+                cx,
+            ),
             self.render_nav_item("Agents", Some(IconName::Sparkle), None, Section::Agents, cx),
             self.render_nav_item(
                 "Machines",
@@ -718,6 +727,7 @@ impl SettingsPage {
         let id = match section {
             Section::General => SharedString::from("settings-nav-general"),
             Section::Appearance => "settings-nav-appearance".into(),
+            Section::Notifications => "settings-nav-notifications".into(),
             Section::Agents => "settings-nav-agents".into(),
             Section::Machines => "settings-nav-machines".into(),
             Section::Project(key) => format!(
@@ -922,6 +932,114 @@ impl SettingsPage {
             ));
         }
         rows
+    }
+
+    fn render_notifications(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let settings = self.app_settings.read(cx).settings();
+        let (when_finished, when_input_needed, notify) = (
+            settings.play_sound_when_finished,
+            settings.play_sound_when_input_needed,
+            settings.notify_when_unfocused,
+        );
+        let app_settings = self.app_settings.clone();
+        vec![
+            render_section(
+                "Sounds",
+                vec![
+                    self.render_sound_row(
+                        "Sound when finished",
+                        "When to play a sound as an agent finishes its turn.",
+                        Sound::Finished,
+                        when_finished,
+                        window,
+                        cx,
+                    ),
+                    self.render_sound_row(
+                        "Sound when input is needed",
+                        "When to play a sound as an agent asks for a permission or an answer.",
+                        Sound::NeedsInput,
+                        when_input_needed,
+                        window,
+                        cx,
+                    ),
+                ],
+                cx,
+            ),
+            render_section(
+                "macOS notifications",
+                vec![render_row(
+                    "Notify when agentZ isn't focused",
+                    "Shows a macOS notification when an agent finishes or needs input while \
+                     another app is in front.",
+                    Switch::new("notify-when-unfocused", notify.into())
+                        .on_click(move |state, _, cx| {
+                            let enabled = *state == ToggleState::Selected;
+                            app_settings.update(cx, |store, cx| {
+                                store
+                                    .update(|settings| settings.notify_when_unfocused = enabled, cx)
+                            })
+                        })
+                        .into_any_element(),
+                    cx,
+                )],
+                cx,
+            ),
+        ]
+    }
+
+    /// Zed's "Play sound when agent done" dropdown, for one sound. Picking a value that plays
+    /// it plays it once, as picking an alert sound in macOS's Sound settings does.
+    fn render_sound_row(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        sound: Sound,
+        current: PlaySound,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let app_settings = self.app_settings.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for value in PlaySound::ALL {
+                let app_settings = app_settings.clone();
+                menu = menu.toggleable_entry(
+                    value.label(),
+                    current == value,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        app_settings.update(cx, |store, cx| {
+                            store.update(
+                                |settings| match sound {
+                                    Sound::Finished => settings.play_sound_when_finished = value,
+                                    Sound::NeedsInput => {
+                                        settings.play_sound_when_input_needed = value
+                                    }
+                                },
+                                cx,
+                            )
+                        });
+                        if value != PlaySound::Never {
+                            sound::play(sound, cx);
+                        }
+                    },
+                );
+            }
+            menu
+        });
+        let id = match sound {
+            Sound::Finished => "sound-when-finished",
+            Sound::NeedsInput => "sound-when-input-needed",
+        };
+        render_row(
+            title,
+            description,
+            div()
+                .debug_selector(|| id.to_string())
+                .child(DropdownMenu::new(id, current.label(), menu))
+                .into_any_element(),
+            cx,
+        )
     }
 
     fn confirm_restart_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4621,6 +4739,10 @@ impl Render for SettingsPage {
                 headline("Appearance".into()),
                 self.render_appearance(window, cx),
             ),
+            Section::Notifications => (
+                headline("Notifications".into()),
+                self.render_notifications(window, cx),
+            ),
             Section::Agents => (
                 self.render_agents_header(window, cx),
                 self.render_agents(window, cx),
@@ -4827,6 +4949,59 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("agent-row-claude").is_some());
+    }
+
+    #[gpui::test]
+    fn picking_when_a_sound_plays_plays_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Notifications, window, cx)
+        });
+        cx.run_until_parked();
+        let pick =
+            |dropdown: &'static str, item: &'static str, cx: &mut gpui::VisualTestContext| {
+                let dropdown = cx.debug_bounds(dropdown).expect("the sound has a dropdown");
+                cx.simulate_click(dropdown.center(), gpui::Modifiers::none());
+                let item = cx.debug_bounds(item).expect("the menu lists the value");
+                cx.simulate_click(item.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                let settings =
+                    page.read_with(cx, |page, cx| page.app_settings.read(cx).settings().clone());
+                let played = cx.update(|_, cx| sound::take_played_for_test(cx));
+                (
+                    settings.play_sound_when_finished,
+                    settings.play_sound_when_input_needed,
+                    played,
+                )
+            };
+
+        assert_eq!(
+            pick("sound-when-finished", "MENU_ITEM-Always", cx),
+            (PlaySound::Always, PlaySound::Always, vec![Sound::Finished])
+        );
+        assert_eq!(
+            pick("sound-when-input-needed", "MENU_ITEM-When hidden", cx),
+            (
+                PlaySound::Always,
+                PlaySound::WhenHidden,
+                vec![Sound::NeedsInput]
+            )
+        );
+        assert_eq!(
+            pick("sound-when-finished", "MENU_ITEM-Never", cx),
+            (PlaySound::Never, PlaySound::WhenHidden, Vec::new())
+        );
     }
 
     #[gpui::test]

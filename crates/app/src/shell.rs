@@ -32,7 +32,8 @@ use crate::server_client::MachineStatus;
 use crate::settings_page::{SettingsPage, SettingsPageEvent};
 use crate::shortcut_sheet::ShortcutSheet;
 use crate::sidebar::{AWAITING_INPUT_COLOR, SIDEBAR_WIDTH, Sidebar, SidebarEvent};
-use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
+use crate::sound;
+use crate::spaces_view::{self, PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::welcome::{Section, SectionButton, render_welcome};
@@ -300,6 +301,9 @@ impl Shell {
                     MachinesEvent::NeedsAttention(thread, status) => {
                         this.notify_attention(*thread, *status, window, cx)
                     }
+                    MachinesEvent::PaneNeedsAttention(pane, status) => {
+                        this.notify_pane_attention(*pane, *status, window, cx)
+                    }
                     MachinesEvent::Archiving(thread) => {
                         this.open_draft_after_archiving(*thread, window, cx)
                     }
@@ -324,15 +328,19 @@ impl Shell {
         let shell = cx.entity().downgrade();
         let window_handle = window.window_handle();
         cx.on_system_notification_response(move |response, cx| {
-            let Some(thread_id) = thread_from_notification_tag(&response.tag) else {
-                return;
+            let place = match thread_from_notification_tag(&response.tag) {
+                Some(thread_id) => Place::Thread(thread_id),
+                None => match PaneKey::from_notification_tag(&response.tag) {
+                    Some(pane) => Place::Pane(pane),
+                    None => return,
+                },
             };
             let shell = shell.clone();
             window_handle
                 .update(cx, |_, window, cx| {
                     window.activate_window();
                     shell
-                        .update(cx, |shell, cx| shell.open_thread(thread_id, window, cx))
+                        .update(cx, |shell, cx| shell.go_to(place, window, cx))
                         .ok();
                 })
                 .log_err();
@@ -930,7 +938,8 @@ impl Shell {
         }
     }
 
-    /// A macOS notification for a thread that isn't on screen, as Zed notifies.
+    /// The thread's sound, as the settings say, and a macOS notification while agentZ isn't
+    /// focused, as t3code notifies.
     fn notify_attention(
         &self,
         thread_id: ThreadKey,
@@ -938,7 +947,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_thread_visible(thread_id, window, cx) {
+        sound::play_for_status(status, self.is_thread_visible(thread_id, window, cx), cx);
+        if !should_notify(window, cx) {
             return;
         }
         let machines = self.machines.read(cx);
@@ -970,9 +980,61 @@ impl Shell {
             body: body.into(),
             actions: Vec::new(),
         });
-        if !window.is_window_active() {
-            window.request_attention();
+        window.request_attention();
+    }
+
+    /// A Workspaces pane's agent CLI finished or got blocked: herdr's sound and toast, as a
+    /// thread's.
+    fn notify_pane_attention(
+        &self,
+        key: PaneKey,
+        status: ThreadStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_visible = window.is_window_active()
+            && self.settings_page.is_none()
+            && self.view == MainView::Workspaces
+            && self.spaces_view.read(cx).shows_pane(key, cx);
+        sound::play_for_status(status, is_visible, cx);
+        if !should_notify(window, cx) {
+            return;
         }
+        let machines = self.machines.read(cx);
+        let Some(client) = machines.client(key.machine, cx) else {
+            return;
+        };
+        let client = client.read(cx);
+        let Some((space, tab, pane)) = client.spaces().pane(key.pane) else {
+            return;
+        };
+        let Some(agent) = &pane.agent else {
+            return;
+        };
+        let tab_index = space
+            .tabs
+            .iter()
+            .position(|candidate| candidate.id == tab.id)
+            .unwrap_or_default();
+        let caption = match status {
+            ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput => "Needs attention",
+            ThreadStatus::Working | ThreadStatus::Completed => "Finished",
+        };
+        let mut body = format!(
+            "{} › {} · {caption}",
+            space.label(),
+            spaces_view::tab_label(tab, tab_index)
+        );
+        if key.machine != MachineId::Local {
+            body = format!("{} · {body}", machines.label(key.machine, cx));
+        }
+        cx.show_system_notification(SystemNotification {
+            tag: key.notification_tag(),
+            title: agent.name.clone().into(),
+            body: body.into(),
+            actions: Vec::new(),
+        });
+        window.request_attention();
     }
 
     fn start_thread(
@@ -1992,6 +2054,16 @@ fn reveal_project(machines: &Entity<Machines>, project: ProjectKey, cx: &mut App
     }
 }
 
+/// Whether an agent's news gets a macOS notification: only while another app is in front, so
+/// the sidebar and the sound tell the user otherwise.
+fn should_notify(window: &Window, cx: &App) -> bool {
+    !window.is_window_active()
+        && AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .notify_when_unfocused
+}
+
 fn notification_tag(thread: ThreadKey) -> SharedString {
     format!("thread-{}-{}", thread.machine.slug(), thread.thread.0).into()
 }
@@ -2009,6 +2081,7 @@ fn thread_from_notification_tag(tag: &str) -> Option<ThreadKey> {
 mod tests {
     use super::{notification_tag, thread_from_notification_tag};
     use crate::machines::{MachineId, ThreadKey};
+    use crate::spaces_view::PaneKey;
     use projects::ThreadId;
 
     #[test]
@@ -2022,6 +2095,15 @@ mod tests {
                 thread_from_notification_tag(&notification_tag(thread)),
                 Some(thread)
             );
+            let pane = PaneKey {
+                machine,
+                pane: agentz_protocol::layout::PaneId(7),
+            };
+            assert_eq!(
+                PaneKey::from_notification_tag(&pane.notification_tag()),
+                Some(pane)
+            );
+            assert_eq!(thread_from_notification_tag(&pane.notification_tag()), None);
         }
         assert_eq!(thread_from_notification_tag("thread-7"), None);
     }
@@ -2741,5 +2823,181 @@ mod modal_tests {
         assert!(cx.debug_bounds("welcome-Open Folder…").is_none());
         assert_eq!(*created.borrow(), [ProjectId(1)]);
         assert_eq!(active_thread(&shell, cx), Some(8));
+    }
+
+    #[gpui::test]
+    fn agents_sound_and_notify_as_the_settings_say(cx: &mut TestAppContext) {
+        use agentz_protocol::layout::PaneId;
+        use agentz_protocol::spaces::{
+            Pane, PaneAgent, PaneAgentState, PaneContent, PaneTerminal, Space, SpaceId, Tab, TabId,
+        };
+        use gpui::{SystemNotificationResponse, VisualTestContext};
+        use sound::Sound;
+        use spaces_view::TabKey;
+
+        // Codex alone in the workspace's first tab, Claude in its second.
+        let spaces = |codex: PaneAgentState, claude: PaneAgentState| {
+            let tab = |tab: u64, pane_id: u64, name: &str, state: PaneAgentState| {
+                let mut pane = Pane::new(
+                    PaneId(pane_id),
+                    PaneContent::Terminal(PaneTerminal {
+                        folder: "/tmp/demo".into(),
+                        command: None,
+                    }),
+                );
+                pane.agent = Some(PaneAgent {
+                    registry_agent: None,
+                    name: name.to_string(),
+                    state,
+                });
+                Tab {
+                    id: TabId(tab),
+                    name: None,
+                    root: Node::Pane(PaneId(pane_id)),
+                    panes: vec![pane],
+                }
+            };
+            SpacesSnapshot {
+                spaces: vec![Space {
+                    id: SpaceId(1),
+                    name: None,
+                    folder: "/tmp/demo".into(),
+                    project_id: None,
+                    tabs: vec![tab(2, 3, "Codex", codex), tab(6, 7, "Claude", claude)],
+                    git: None,
+                    current: None,
+                }],
+            }
+        };
+        use PaneAgentState::{Blocked, Idle, Working};
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            cx.set_app_identity("dev.agentz.test", "agentZ");
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                spaces(Working, Working),
+                cx,
+            );
+            let thread: projects::Thread = serde_json::from_value(serde_json::json!({
+                "id": 5,
+                "project_id": 1,
+                "title": "Fix the login",
+                "agent_id": "mock",
+            }))
+            .expect("a thread");
+            client.read(cx).projects().clone().update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![Project {
+                            id: ProjectId(1),
+                            path: "/tmp/demo".into(),
+                            custom_name: None,
+                            icon: None,
+                            workspaces: Vec::new(),
+                            repository: None,
+                        }],
+                        threads: vec![thread],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            client
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            window.activate_window();
+            let tab = TabKey {
+                machine: MachineId::Local,
+                tab: TabId(2),
+            };
+            shell.go_to(Place::Tab(tab), window, cx);
+        });
+        cx.run_until_parked();
+        let set = |codex, claude, cx: &mut VisualTestContext| {
+            client.update(cx, |client, cx| {
+                client.set_spaces_for_test(spaces(codex, claude), cx)
+            });
+            cx.run_until_parked();
+            cx.update(|_, cx| sound::take_played_for_test(cx))
+        };
+        let shown = |cx: &mut VisualTestContext| {
+            cx.shown_system_notifications()
+                .into_iter()
+                .map(|shown| (shown.tag.to_string(), shown.title.to_string(), shown.body))
+                .map(|(tag, title, body)| (tag, title, body.to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        // With agentZ in front, the finished sound plays only for the agent out of sight, the
+        // input sound for both, and nothing is notified.
+        assert_eq!(set(Idle, Working, cx), []);
+        assert_eq!(set(Idle, Idle, cx), [Sound::Finished]);
+        assert_eq!(
+            set(Blocked, Blocked, cx),
+            [Sound::NeedsInput, Sound::NeedsInput]
+        );
+        assert!(shown(cx).is_empty());
+
+        // With another app in front, nothing is in sight, and each gets a notification.
+        cx.deactivate_window();
+        assert_eq!(set(Working, Working, cx), []);
+        assert_eq!(set(Idle, Blocked, cx), [Sound::Finished, Sound::NeedsInput]);
+        let thread = ThreadKey {
+            machine: MachineId::Local,
+            thread: ThreadId(5),
+        };
+        shell.update_in(cx, |shell, window, cx| {
+            shell.notify_attention(thread, ThreadStatus::Completed, window, cx)
+        });
+        assert_eq!(
+            cx.update(|_, cx| sound::take_played_for_test(cx)),
+            [Sound::Finished]
+        );
+        let notification = |tag: &str, title: &str, body: &str| {
+            (tag.to_string(), title.to_string(), body.to_string())
+        };
+        assert_eq!(
+            shown(cx),
+            [
+                notification("pane-local-3", "Codex", "demo › Tab 1 · Finished"),
+                notification("pane-local-7", "Claude", "demo › Tab 2 · Needs attention"),
+                notification("thread-local-5", "Fix the login", "demo · Finished"),
+            ]
+        );
+
+        // Turned off, notifications stop, and sounds don't.
+        cx.update(|_, cx| {
+            AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(|settings| settings.notify_when_unfocused = false, cx)
+            })
+        });
+        assert_eq!(set(Working, Working, cx), []);
+        assert_eq!(set(Idle, Idle, cx), [Sound::Finished, Sound::Finished]);
+        assert_eq!(shown(cx).len(), 3);
+
+        // Clicking a pane's notification shows the pane.
+        shell.update_in(cx, |shell, window, cx| {
+            shell.set_view(MainView::Agents, window, cx)
+        });
+        cx.simulate_system_notification_response(SystemNotificationResponse {
+            tag: "pane-local-7".into(),
+            action_id: None,
+        });
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(shell.view == MainView::Workspaces);
+            assert_eq!(
+                shell.spaces_view.read(cx).focused_pane(cx),
+                Some(PaneKey {
+                    machine: MachineId::Local,
+                    pane: PaneId(7),
+                })
+            );
+        });
     }
 }

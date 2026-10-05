@@ -12,6 +12,9 @@ source there first and keep agentZ's behavior and wording the same.
 | cow (`references/cow`) | MIT | Pastures: copy-on-write project copies, their sync and bring-back |
 
 Code or data ported from herdr keeps its Apache-2.0 notice (`crates/agentz_server/src/detect/`).
+The sounds in `assets/sounds/` are Zed's `agent_done.wav` and t3code's
+`notification-input.mp3` (`agent_needs_input.mp3`, from "Notification Sound 3" by deadrobotmusic
+on freesound.org, CC0).
 
 ## Architecture
 
@@ -181,8 +184,9 @@ Each entry: what it does, where it lives, and where it comes from.
   first asks "Add “~/docs” as a project?". Search finds them, and labels them and archived
   threads in faint text.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
-  combining repositories), Appearance (Zed's theme modes), Agents, Machines, and a page per
-  project (with Checkouts).
+  combining repositories), Appearance (Zed's theme modes), Notifications (sounds and macOS
+  notifications, see Attention states), Agents, Machines, and a page per project (with
+  Checkouts).
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
   installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
   a login status badge, the version and registry links, Update when there is one, and a "⋯"
@@ -440,7 +444,8 @@ Each entry: what it does, where it lives, and where it comes from.
 
 ### Attention states and notifications
 
-herdr's states, t3code's labels and colors, Zed's notifications.
+herdr's states, t3code's labels and colors, Zed's notifications and sound, herdr's two sounds.
+Designed in `design/sounds/`.
 
 - The server sends facts: `working_threads`, `blocked_threads` (a permission waiting, its own
   or a subthread's), `awaiting_input_threads` (a request for input waiting), and each thread's
@@ -449,8 +454,20 @@ herdr's states, t3code's labels and colors, Zed's notifications.
 - Statuses by priority: Pending Approval (warning), Awaiting Input (purple, each theme's fourth
   player color), Working, Completed. Agent control's tools report `waiting_for_input`.
 - "Displayed" is Zed's `agent_status_visible`: window active, settings closed, thread open.
-- Notifications ("Waiting for tool confirmation", "Waiting for your input", "Finished") for
-  threads not displayed. macOS only shows them for an app bundle (`tooling/bundle-mac.sh`).
+- **Sounds** (`sound.rs`, played with `NSSound`): Zed's agent-done sound as a thread finishes,
+  t3code's input sound as it waits for a permission or an answer. Settings › Notifications
+  sets each to Zed's Never, When hidden (not displayed) or Always; finishing defaults to When
+  hidden, input to Always (as herdr always plays its request sound). Picking When hidden or
+  Always plays the sound once, as macOS's Sound settings do.
+- **Notifications** (`Shell::notify_attention`): "Waiting for tool confirmation", "Waiting for
+  your input" or "Finished", only while agentZ isn't the active app (t3code's rule; Settings ›
+  Notifications turns them off). macOS only shows them for an app bundle
+  (`tooling/bundle-mac.sh`).
+- **Agents in Workspaces panes** (`ServerClient::set_spaces`, `Shell::notify_pane_attention`,
+  herdr's pane notifications): an agent CLI going idle after working plays the finished sound,
+  and one becoming blocked the input sound, by the same settings, displayed while its tab is on
+  screen. The notification is titled with the agent ("Codex", "storefront › agents ·
+  Finished", or "Needs attention"), and clicking it shows and focuses the pane.
 
 ### Agent control (MCP and CLI)
 

@@ -18,6 +18,7 @@ use ui::{IconName, SharedString};
 use crate::app_settings::{AppSettingsStore, MachineProfile};
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use crate::server_client::{ServerClient, ServerClientEvent, Transport};
+use crate::spaces_view::PaneKey;
 use agentz_protocol::{
     MachineKind, PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response,
     ToolCaller, ToolResult,
@@ -179,6 +180,8 @@ impl ProjectGroup {
 pub enum MachinesEvent {
     /// A thread finished a turn or started waiting for a permission answer.
     NeedsAttention(ThreadKey, ThreadStatus),
+    /// A Workspaces pane's agent CLI finished working or got blocked.
+    PaneNeedsAttention(PaneKey, ThreadStatus),
     /// The user archived the thread from this app.
     Archiving(ThreadKey),
 }
@@ -440,9 +443,18 @@ impl Machines {
                     this.sync_peers(cx);
                     cx.notify()
                 }),
-                cx.subscribe(&client, |this, client, event, cx| match event {
+                cx.subscribe(&client, move |this, client, event, cx| match event {
                     ServerClientEvent::RelayToolCall(call) => {
                         this.relay_tool_call(client, call.clone(), cx)
+                    }
+                    ServerClientEvent::PaneNeedsAttention(pane, status) => {
+                        cx.emit(MachinesEvent::PaneNeedsAttention(
+                            PaneKey {
+                                machine,
+                                pane: *pane,
+                            },
+                            *status,
+                        ))
                     }
                 }),
                 cx.observe(&registry, |_, _, cx| cx.notify()),

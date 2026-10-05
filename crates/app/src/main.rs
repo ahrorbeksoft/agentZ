@@ -27,6 +27,7 @@ mod shell;
 mod shortcut_sheet;
 mod sidebar;
 mod slide_drag;
+mod sound;
 mod spaces_view;
 mod terminal_drawer;
 mod terminal_element;

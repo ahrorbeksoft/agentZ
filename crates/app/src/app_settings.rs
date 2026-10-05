@@ -28,6 +28,36 @@ pub enum ThemeMode {
     Dark,
 }
 
+/// Zed's `PlaySoundWhenAgentDone`, set for each sound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaySound {
+    Never,
+    /// While the user can't see the agent.
+    WhenHidden,
+    Always,
+}
+
+impl PlaySound {
+    pub const ALL: [Self; 3] = [Self::Never, Self::WhenHidden, Self::Always];
+
+    pub fn should_play(self, is_visible: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::WhenHidden => !is_visible,
+            Self::Always => true,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Never",
+            Self::WhenHidden => "When hidden",
+            Self::Always => "Always",
+        }
+    }
+}
+
 /// A machine reached over SSH (herdr's saved endpoints). No secrets: authentication stays with
 /// OpenSSH.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +113,12 @@ pub struct AppSettings {
     /// Thoughts show open in threads: Zed's `thinking_display` as `always_expanded`, where
     /// otherwise it's `always_collapsed`.
     pub show_thinking: bool,
+    pub play_sound_when_finished: PlaySound,
+    /// When a permission request or a question arrives. Always by default, as herdr plays its
+    /// request sound: it needs an answer either way.
+    pub play_sound_when_input_needed: PlaySound,
+    /// macOS notifications show only while another app is in front, as t3code's do.
+    pub notify_when_unfocused: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -106,6 +142,9 @@ impl Default for AppSettings {
             is_sidebar_hidden: false,
             use_modifier_to_send: false,
             show_thinking: false,
+            play_sound_when_finished: PlaySound::WhenHidden,
+            play_sound_when_input_needed: PlaySound::Always,
+            notify_when_unfocused: true,
             saved_layouts: Vec::new(),
         }
     }

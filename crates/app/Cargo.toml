@@ -51,6 +51,11 @@ ui.workspace = true
 url.workspace = true
 util.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSSound"] }
+objc2-foundation.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

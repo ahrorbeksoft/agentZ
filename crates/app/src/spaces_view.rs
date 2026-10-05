@@ -179,6 +179,19 @@ impl PaneKey {
     fn element_id(self, prefix: &str) -> ElementId {
         ElementId::Name(format!("{prefix}-{}-{}", self.machine.slug(), self.pane.0).into())
     }
+
+    /// The tag of the macOS notification about the pane's agent, which a newer one replaces.
+    pub fn notification_tag(self) -> SharedString {
+        format!("pane-{}-{}", self.machine.slug(), self.pane.0).into()
+    }
+
+    pub fn from_notification_tag(tag: &str) -> Option<Self> {
+        let (machine, pane) = tag.strip_prefix("pane-")?.rsplit_once('-')?;
+        Some(Self {
+            machine: MachineId::from_slug(machine)?,
+            pane: PaneId(pane.parse().ok()?),
+        })
+    }
 }
 
 pub enum SpacesViewEvent {
@@ -894,8 +907,18 @@ impl SpacesView {
         let store = client.read(cx).projects().clone();
         for pane in &tab.panes {
             client.update(cx, |client, cx| client.mark_pane_seen(pane.id, cx));
-            if let PaneContent::Thread(thread_id) = &pane.content {
-                store.update(cx, |store, cx| store.mark_viewed(*thread_id, cx));
+            match &pane.content {
+                PaneContent::Thread(thread_id) => {
+                    store.update(cx, |store, cx| store.mark_viewed(*thread_id, cx))
+                }
+                PaneContent::Terminal(_) if pane.agent.is_some() => {
+                    let key = PaneKey {
+                        machine: tab_key.machine,
+                        pane: pane.id,
+                    };
+                    cx.dismiss_system_notification(&key.notification_tag());
+                }
+                PaneContent::Terminal(_) | PaneContent::Unknown(_) => {}
             }
         }
     }
@@ -908,18 +931,32 @@ impl SpacesView {
 
     /// Whether a pane on screen shows the thread.
     pub fn shows_thread(&self, thread: ThreadKey, cx: &App) -> bool {
+        self.shows_pane_where(
+            thread.machine,
+            |pane| pane.content == PaneContent::Thread(thread.thread),
+            cx,
+        )
+    }
+
+    /// Whether the pane's tab is on screen.
+    pub fn shows_pane(&self, key: PaneKey, cx: &App) -> bool {
+        self.shows_pane_where(key.machine, |pane| pane.id == key.pane, cx)
+    }
+
+    fn shows_pane_where(
+        &self,
+        machine: MachineId,
+        predicate: impl Fn(&Pane) -> bool,
+        cx: &App,
+    ) -> bool {
         self.is_visible
             && self.visible_tab(cx).is_some_and(|(_, space, tab)| {
-                tab.machine == thread.machine
+                tab.machine == machine
                     && space
                         .tabs
                         .iter()
                         .find(|candidate| candidate.id == tab.tab)
-                        .is_some_and(|tab| {
-                            tab.panes
-                                .iter()
-                                .any(|pane| pane.content == PaneContent::Thread(thread.thread))
-                        })
+                        .is_some_and(|tab| tab.panes.iter().any(&predicate))
             })
     }
 
@@ -5267,7 +5304,7 @@ fn pane_folder_label(space: &Space, folder: &SpaceFolder) -> String {
 }
 
 /// A name the user gave, or else the tab's position, so moving it renumbers it.
-fn tab_label(tab: &Tab, index: usize) -> String {
+pub(crate) fn tab_label(tab: &Tab, index: usize) -> String {
     tab.name
         .clone()
         .unwrap_or_else(|| format!("Tab {}", index + 1))
