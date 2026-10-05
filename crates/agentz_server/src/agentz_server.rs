@@ -21,6 +21,7 @@ mod server;
 mod spaces;
 mod terminal_programs;
 mod terminals;
+mod transcripts;
 mod workspaces;
 
 use std::collections::BTreeMap;

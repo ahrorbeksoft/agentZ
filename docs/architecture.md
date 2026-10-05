@@ -98,6 +98,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `state.json` | server | Projects, threads, workspaces |
 | `spaces.json` | server | Workspaces view: spaces, tabs, pane trees |
 | `queues.json` | server | Each thread's queued messages, and whether the first one steers |
+| `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turn times |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
 | `agents/settings.json` | server | Per-agent env, defaults and known options |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
@@ -228,6 +229,13 @@ Each entry: what it does, where it lives, and where it comes from.
   diffs a thread from the first entry that changed (`AgentThread::take_entries_changed_from`)
   and sends streamed text as what was appended (`ThreadUpdate::appended`), not the whole message
   each chunk.
+- **Whole conversations** (`agentz_server/src/transcripts.rs`, `AgentThread::{restore_transcript,
+  transcript}`; t3code keeps its own history and ignores the replay): agents replay only part
+  of a long session when it loads (Factory Droid about the last 100 messages), so the server keeps
+  each thread's conversation in `transcripts/`, saved at most 2 seconds after it changes, when
+  its agent stops, and before the server exits or hands off. A thread starts from it, and while
+  its session loads the replayed messages, tool calls and plan are dropped. Reload Agent keeps
+  the conversation too. Deleting the thread deletes its transcript.
 - **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`):
   Zed's message editor. One line, growing with the text to eight, then scrolling. Shift-Enter
   makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's
@@ -316,7 +324,10 @@ Each entry: what it does, where it lives, and where it comes from.
   thumbnail (`ImagePreviewTooltip`, and `HoveredImage` for an `@Image` link in a message), and
   a click opens the original in a viewer over the window (`ImageViewer`: a dark backdrop, the
   image fit to the window; Esc, × or a click beside the image closes it). This covers composer chips, queued messages,
-  the user's and the agent's messages, and images in tool output, which show inline.
+  the user's and the agent's messages, and images in tool output, which show inline. Every one
+  is sized from the image's own size to fit its box whole (`text_input::FittedImage`): GPUI's
+  `max_w` and `max_h` clamp each side alone, which stretched a tall image's preview and cut off
+  its bottom in the viewer.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
   thread's menu (Pin or Unpin where it can be pinned, Rename, Continue with Another Agent ▸
@@ -356,7 +367,8 @@ Each entry: what it does, where it lives, and where it comes from.
   a draft until its first message, so its agent starts at once, but it isn't in the thread
   list. What's typed in any thread's composer is kept on its machine (`Request::SetUnsentText`,
   half a second after typing pauses, and as the view closes) and comes back when it's opened,
-  as t3code keeps composer drafts; a discard from elsewhere empties the composer
+  with its chips (`Thread::unsent_mentions`: files, folders, threads and uploaded images by
+  their place in the text), as t3code keeps composer drafts; a discard from elsewhere empties the composer
   (`AgentView::follow_discarded_unsent_text`). The shell closes the view of any thread it moves
   away from (other views keep threads open; its queue stays on the server), so the server can
   stop idle agents; it deletes a draft with nothing typed once no

@@ -437,7 +437,7 @@ impl Server {
             if self.projects.thread(thread_id).is_none() {
                 continue;
             }
-            self.threads.remove(&thread_id);
+            self.stop_agent(thread_id);
             self.tool_sessions
                 .retain(|_, session_thread| *session_thread != thread_id);
             self.update_thread(ConnectionId::Thread(thread_id), |thread| {

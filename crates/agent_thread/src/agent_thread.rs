@@ -273,6 +273,15 @@ pub struct AgentThread {
     pausing: Option<Arc<Mutex<PauseSlot>>>,
     /// An adopted agent's session, open once its new connection is.
     pending_session: Option<acp::SessionId>,
+    /// The thread has its whole conversation: from its [`Transcript`], or since a session
+    /// opened. What the agent replays as the session loads again is dropped then, as t3code
+    /// drops it.
+    has_conversation: bool,
+    /// The session is loading, and what the agent replays is dropped.
+    dropping_replay: bool,
+    /// Counts changes to what [`Self::transcript`] gives, so the server saves it only when it
+    /// changed.
+    conversation_revision: u64,
 }
 
 /// The agent's process id, and whether stopping the thread stops it.
@@ -338,6 +347,19 @@ pub struct AgentSnapshot {
     unanswered: Vec<String>,
     stdout_rest: Vec<u8>,
     stderr_rest: Vec<u8>,
+}
+
+/// A thread's conversation as its server keeps it, as t3code keeps each thread's messages, so
+/// the thread opens with all of it: an agent's `session/load` may replay only the end of a long
+/// conversation (Factory Droid replays its last 100 messages), and some can't replay at all.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Transcript {
+    pub entries: Vec<Entry>,
+    pub plan: Vec<PlanItem>,
+    pub finished_turns: Vec<TurnTime>,
+    pub prompts_from_agents: Vec<(usize, projects::ThreadCreator)>,
+    pub sent_times: Vec<(usize, SystemTime)>,
 }
 
 /// A thread's agent, handed to another server: the snapshot and the agent's pipes.
@@ -468,8 +490,43 @@ impl AgentThread {
             adopted_process: None,
             pausing: None,
             pending_session: None,
+            has_conversation: false,
+            dropping_replay: false,
+            conversation_revision: 0,
         };
         (this, inbox)
+    }
+
+    /// Starts with the conversation the server kept ([`Self::transcript`]). Set it right after
+    /// starting: the session opens once the agent has connected.
+    pub fn restore_transcript(&mut self, transcript: Transcript) {
+        if transcript.entries.is_empty() {
+            return;
+        }
+        self.view.entries = transcript.entries;
+        self.view.state.plan = transcript.plan;
+        self.view.state.finished_turns = transcript.finished_turns;
+        self.view.state.prompts_from_agents = transcript.prompts_from_agents;
+        self.view.state.sent_times = transcript.sent_times;
+        self.entry_changed(0);
+        self.has_conversation = true;
+    }
+
+    /// Changes whenever [`Self::transcript`] does, and is `None` while that is.
+    pub fn conversation_revision(&self) -> Option<u64> {
+        self.has_conversation.then_some(self.conversation_revision)
+    }
+
+    /// The conversation for the server to keep, once the thread has all of it: not while its
+    /// session is still replaying it.
+    pub fn transcript(&self) -> Option<Transcript> {
+        self.has_conversation.then(|| Transcript {
+            entries: self.view.entries.clone(),
+            plan: self.view.state.plan.clone(),
+            finished_turns: self.view.state.finished_turns.clone(),
+            prompts_from_agents: self.view.state.prompts_from_agents.clone(),
+            sent_times: self.view.state.sent_times.clone(),
+        })
     }
 
     /// MCP servers for the agent to start with its sessions. Set it right after starting: the
@@ -769,8 +826,8 @@ impl AgentThread {
         }
     }
 
-    /// Zed's "Reload Agent": restarts the agent and reopens the session, whose history the
-    /// agent replays when it can load sessions.
+    /// Zed's "Reload Agent": restarts the agent and reopens the session. The thread keeps its
+    /// conversation, unless it was still replaying in, when it comes again.
     pub fn reload(&mut self) {
         let Some(command) = self.view.state.command.clone() else {
             return;
@@ -778,12 +835,14 @@ impl AgentThread {
         // The new agent waits for the old one to close the session it will load.
         let stopping = self.stop_agent();
         self.generation += 1;
-        self.view.entries.clear();
-        self.view.state.finished_turns.clear();
-        self.entry_changed(0);
-        self.view.state.prompts_from_agents.clear();
-        self.view.state.sent_times.clear();
-        self.view.state.plan.clear();
+        if !self.has_conversation {
+            self.view.entries.clear();
+            self.view.state.finished_turns.clear();
+            self.entry_changed(0);
+            self.view.state.prompts_from_agents.clear();
+            self.view.state.sent_times.clear();
+            self.view.state.plan.clear();
+        }
         self.cancel_permission_requests();
         self.cancel_elicitations(|_| true);
         self.queued_prompts.clear();
@@ -1066,6 +1125,7 @@ impl AgentThread {
         this.adopted_process = Some(ProcessGuard(process));
         let is_working = snapshot.view.is_working();
         this.view = snapshot.view;
+        this.has_conversation = true;
         // Ready once the new connection is.
         this.view.state.status = ConnectionStatus::Connecting;
         this.previous_session = snapshot.previous_session;
@@ -1237,6 +1297,7 @@ impl AgentThread {
         };
         self.view.state.status = ConnectionStatus::Connecting;
         self.view.state.auth_error = None;
+        self.dropping_replay = self.has_conversation && self.previous_session.is_some();
         let opening = open_session(
             connection.clone(),
             self.view.state.capabilities.clone(),
@@ -1257,8 +1318,10 @@ impl AgentThread {
         connection: ConnectionTo<Agent>,
         result: std::result::Result<SessionSetup, agent_client_protocol::Error>,
     ) {
+        self.dropping_replay = false;
         match result {
             Ok(setup) => {
+                self.has_conversation = true;
                 self.view.state.config_options = setup.config_options;
                 self.view.state.modes = setup.modes;
                 self.view.state.session_restore = Some(setup.restore);
@@ -1402,6 +1465,7 @@ impl AgentThread {
 
     pub fn clear_plan(&mut self) {
         self.view.state.plan.clear();
+        self.conversation_revision += 1;
     }
 
     /// Changes one of the agent's session settings at the user's request, which also makes it
@@ -1834,6 +1898,7 @@ impl AgentThread {
                 entries_end: self.view.entries.len(),
                 duration,
             });
+            self.conversation_revision += 1;
         }
         self.view.state.turn_started_at = working.then(SystemTime::now);
         self.emit(AgentThreadEvent::WorkingChanged(working));
@@ -1887,6 +1952,9 @@ impl AgentThread {
     fn handle_incoming(&mut self, incoming: Incoming) {
         match incoming {
             Incoming::Notification(notification) => {
+                if self.dropping_replay && is_conversation_update(&notification.update) {
+                    return;
+                }
                 self.apply_update(notification.update);
                 if let Some(title) = self.pending_title.take() {
                     self.emit(AgentThreadEvent::TitleChanged(title));
@@ -1986,6 +2054,7 @@ impl AgentThread {
                         status: entry.status,
                     })
                     .collect();
+                self.conversation_revision += 1;
                 if !self.view.entries.contains(&Entry::Plan) {
                     self.push_entry(Entry::Plan);
                 }
@@ -2187,6 +2256,7 @@ impl AgentThread {
     }
 
     fn entry_changed(&mut self, index: usize) {
+        self.conversation_revision += 1;
         self.entries_changed_from = Some(
             self.entries_changed_from
                 .map_or(index, |changed_from| changed_from.min(index)),
@@ -2197,6 +2267,20 @@ impl AgentThread {
     pub fn take_entries_changed_from(&mut self) -> Option<usize> {
         self.entries_changed_from.take()
     }
+}
+
+/// Whether the update is part of the conversation, which a loading session replays, rather
+/// than the session's settings or usage.
+fn is_conversation_update(update: &acp::SessionUpdate) -> bool {
+    matches!(
+        update,
+        acp::SessionUpdate::UserMessageChunk(_)
+            | acp::SessionUpdate::AgentMessageChunk(_)
+            | acp::SessionUpdate::AgentThoughtChunk(_)
+            | acp::SessionUpdate::ToolCall(_)
+            | acp::SessionUpdate::ToolCallUpdate(_)
+            | acp::SessionUpdate::Plan(_)
+    )
 }
 
 /// Formats a tool's raw input the way Zed does: plain values as text, anything else as a
@@ -3901,6 +3985,66 @@ mod tests {
             second.thread.entries()[1],
             Entry::AgentMessage("Echo: hello".into())
         );
+    }
+
+    /// A thread started with its transcript shows it, and drops what the agent replays of it as
+    /// the session loads, as when the agent reloads. One that has none yet keeps the replay.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keeps_its_transcript_over_the_replay() {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(command) = mock_agent(&[history_file]) else {
+            return;
+        };
+        let mut first = start(command.clone(), None);
+        assert_eq!(first.thread.conversation_revision(), None);
+        first
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        first.update(|thread| thread.send("hello".into()));
+        first
+            .wait_until(|thread| !thread.is_working() && thread.entries().len() >= 3)
+            .await;
+        let transcript = first.thread.transcript().expect("the whole conversation");
+        assert_eq!(transcript.entries, first.thread.entries());
+        assert_eq!(transcript.finished_turns.len(), 1);
+        assert!(transcript.sent_times.iter().any(|(index, _)| *index == 0));
+
+        // Only the end of a long conversation comes back from some agents: the thread keeps
+        // the start the agent no longer replays.
+        let mut kept = transcript.clone();
+        kept.entries
+            .insert(0, Entry::AgentMessage("From before the replay".into()));
+        let session = Some(acp::SessionId::new("session-1"));
+        let mut second = start(command.clone(), session.clone());
+        second.update(|thread| thread.restore_transcript(kept.clone()));
+        assert_eq!(second.thread.entries(), kept.entries);
+        assert!(second.thread.conversation_revision().is_some());
+        second
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(
+            second.thread.session_restore(),
+            Some(SessionRestore::Loaded)
+        );
+        assert_eq!(second.thread.entries(), kept.entries);
+        assert_eq!(second.thread.transcript(), Some(kept.clone()));
+
+        second.update(AgentThread::reload);
+        second
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(second.thread.entries(), kept.entries);
+
+        let mut replayed = start(command, session);
+        replayed
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(replayed.thread.entries(), transcript.entries);
     }
 
     /// Every page of an agent's sessions is listed, and a thread opened with a listed session

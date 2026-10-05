@@ -12,10 +12,10 @@ use std::time::Duration;
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, Hsla, ImageSource, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, SharedString, Style,
-    Subscription, TextAlign, TextRun, TransformationMatrix, UTF16Selection, UnderlineStyle, Window,
-    WrappedLine, actions, anchored, deferred, div, fill, img, point, prelude::*, px, quad,
+    GlobalElementId, Hsla, ImageSource, Img, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, SharedString, Size,
+    Style, Subscription, TextAlign, TextRun, TransformationMatrix, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, actions, anchored, deferred, div, fill, img, point, prelude::*, px, quad,
     relative, size,
 };
 use theme::ActiveTheme as _;
@@ -60,6 +60,11 @@ pub const MENU_CONTEXT: &str = "menu";
 const CHIP_ICON_ROOM: &str = "\u{a0}\u{a0}\u{a0}";
 const CHIP_END: &str = "\u{a0}";
 const CHIP_LABEL_MAX_CHARS: usize = 40;
+/// The most an image chip's hover preview takes.
+pub const CHIP_IMAGE_PREVIEW_SIZE: Size<Pixels> = Size {
+    width: px(320.),
+    height: px(240.),
+};
 
 pub fn init(cx: &mut App) {
     let multi_line = Some("TextInput && multiline");
@@ -1730,6 +1735,58 @@ impl Element for TextElement {
     }
 }
 
+/// An image at its own size, or smaller to fit in `max`, keeping its shape. A plain `img` takes
+/// the image's size and then limits its width and height each on its own, which crops or
+/// stretches an image larger than both limits.
+#[derive(IntoElement)]
+pub struct FittedImage {
+    source: ImageSource,
+    max: Size<Pixels>,
+    image: Img,
+}
+
+impl FittedImage {
+    pub fn new(source: ImageSource, max: Size<Pixels>) -> Self {
+        Self {
+            image: img(source.clone()),
+            source,
+            max,
+        }
+    }
+
+    /// Styles the image element, as with its loading and fallback elements.
+    pub fn map_image(mut self, map: impl FnOnce(Img) -> Img) -> Self {
+        self.image = map(self.image);
+        self
+    }
+}
+
+impl RenderOnce for FittedImage {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Some(size) = image_size(&self.source, window, cx) else {
+            // Loading or failed: the image element shows its loading or fallback element.
+            return self.image.max_w(self.max.width).max_h(self.max.height);
+        };
+        let scale = (self.max.width / size.width)
+            .min(self.max.height / size.height)
+            .min(1.);
+        self.image.w(size.width * scale).h(size.height * scale)
+    }
+}
+
+/// The size of an image that's loaded, as an `img` of it lays out.
+fn image_size(source: &ImageSource, window: &mut Window, cx: &mut App) -> Option<Size<Pixels>> {
+    let image = match source {
+        ImageSource::Custom(load) => load(window, cx)?.ok()?,
+        ImageSource::Image(image) => image.clone().use_render_image(window, cx)?,
+        ImageSource::Render(image) => image.clone(),
+        ImageSource::Resource(_) => return None,
+    };
+    let pixels = image.size(0);
+    (pixels.width.0 > 0 && pixels.height.0 > 0)
+        .then(|| size(px(pixels.width.0 as f32), px(pixels.height.0 as f32)))
+}
+
 impl TextInput {
     /// What hovering a chip shows, above it.
     fn render_chip_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1746,7 +1803,7 @@ impl TextInput {
                 .into_any_element(),
             ChipPreview::Image(image) => div()
                 .p_1()
-                .child(img(image.clone()).max_w(px(320.)).max_h(px(240.)))
+                .child(FittedImage::new(image.clone(), CHIP_IMAGE_PREVIEW_SIZE))
                 .into_any_element(),
         };
         Some(

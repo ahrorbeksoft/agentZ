@@ -3097,7 +3097,9 @@ fn render_discard_draft_button(
         )
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
-            store.read(cx).set_unsent_text(thread_id.thread, None, cx);
+            store
+                .read(cx)
+                .set_unsent_text(thread_id.thread, None, Vec::new(), cx);
         })
 }
 

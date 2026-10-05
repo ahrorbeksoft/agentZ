@@ -29,7 +29,7 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use projects::{
     ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId, ThreadOrder, ThreadSection,
-    WorkspaceKind,
+    UnsentMention, WorkspaceKind,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -388,10 +388,12 @@ pub enum Request {
         keys: Vec<(ThreadId, String)>,
     },
     DeleteThread(ThreadId),
-    /// What's typed in the thread's composer and not sent ([`projects::Thread::unsent_text`]).
+    /// What's typed in the thread's composer and not sent ([`projects::Thread::unsent_text`]),
+    /// and the mentions in it.
     SetUnsentText {
         thread_id: ThreadId,
         text: Option<String>,
+        mentions: Vec<UnsentMention>,
     },
     /// The thread's changes from its checkpoints: [`Response::ThreadDiff`].
     ThreadDiff {

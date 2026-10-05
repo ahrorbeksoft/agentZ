@@ -154,9 +154,11 @@ impl Server {
                 }
             }
         }
-        // The new server reads the state as it starts.
+        // The new server reads the state as it starts, and the transcripts of the threads whose
+        // agents start again there.
         self.projects.flush_saves();
         self.spaces.flush_saves();
+        self.save_transcripts();
         let (terminals, ptys): (Vec<_>, Vec<_>) =
             self.pause_terminals(&handed_threads).into_iter().unzip();
         let keys: Vec<TerminalKey> = terminals
@@ -284,6 +286,10 @@ impl Server {
             thread.set_queued_messages(queued_messages, steering);
             if let Some(token) = handed.token {
                 self.tool_sessions.insert(token, thread_id);
+            }
+            // The server before saved it as it handed the thread over.
+            if let Some(revision) = thread.conversation_revision() {
+                self.saved_transcripts.insert(thread_id, revision);
             }
             let connection = ConnectionId::Thread(thread_id);
             self.forward(inbox, move |message| {

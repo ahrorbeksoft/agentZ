@@ -48,6 +48,7 @@ use crate::continuations;
 use crate::machine_kind;
 use crate::repositories::{self, RepositoryChecks};
 use crate::spaces::SpaceStore;
+use crate::transcripts;
 use crate::{AgentControl, CustomAgent, ServerConfig};
 use terminal_requests::Terminals;
 use tools::{PendingToolCall, ToolResults};
@@ -187,6 +188,11 @@ pub(crate) struct Server {
     agents_idle_since: HashMap<ThreadId, Instant>,
     /// When the next of them is due to stop.
     agent_sweep_at: Option<Instant>,
+    /// The [`AgentThread::conversation_revision`] each running thread's transcript was last
+    /// saved or loaded at.
+    saved_transcripts: HashMap<ThreadId, u64>,
+    /// Transcripts that changed are saved soon.
+    transcript_save_scheduled: bool,
     stopping: bool,
     /// Pass the stores' and threads' background results on to `inputs`.
     forwarders: JoinSet<()>,
@@ -201,6 +207,8 @@ const OPEN_GRACE: Duration = Duration::from_secs(60);
 /// (t3code's idle timeout). An archived thread's stops after [`LEAVE_GRACE`], which lets a view
 /// be rebuilt.
 const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How soon a changed conversation is saved: what a crash of the server can lose of it.
+const TRANSCRIPT_SAVE_DELAY: Duration = Duration::from_secs(2);
 
 impl Server {
     pub(crate) fn new(
@@ -289,6 +297,8 @@ impl Server {
             agents_idle_since: HashMap::default(),
             agent_sweep_at: None,
             draft_sweep_at: None,
+            saved_transcripts: HashMap::default(),
+            transcript_save_scheduled: false,
             stopping: false,
             forwarders: JoinSet::new(),
         };
@@ -332,6 +342,11 @@ impl Server {
             .filter(|thread_id| server.projects.thread(*thread_id).is_none())
             .collect();
         server.delete_attachments(orphaned);
+        for thread_id in transcripts::list(&server.data_dir) {
+            if server.projects.thread(thread_id).is_none() {
+                transcripts::remove(&server.data_dir, thread_id).log_err();
+            }
+        }
         server.sweep_drafts();
         server.spawn_then(machine_kind::detect(), |server, detected| {
             server.machine_icon.detected = detected;
@@ -388,6 +403,10 @@ impl Server {
             if self.stopping {
                 break;
             }
+        }
+        // A newer server took the threads, and keeps their transcripts now.
+        if !self.handed_off.load(std::sync::atomic::Ordering::Acquire) {
+            self.save_transcripts();
         }
         log::info!("shutting down");
     }
@@ -684,9 +703,13 @@ impl Server {
                 self.delete_thread(thread_id);
                 Ok(Response::Ok)
             }
-            Request::SetUnsentText { thread_id, text } => {
+            Request::SetUnsentText {
+                thread_id,
+                text,
+                mentions,
+            } => {
                 self.existing_thread(thread_id)?;
-                self.projects.set_unsent_text(thread_id, text);
+                self.projects.set_unsent_text(thread_id, text, mentions);
                 // A draft emptied elsewhere goes, like one left empty.
                 self.sweep_drafts();
                 Ok(Response::Ok)
@@ -1271,6 +1294,16 @@ impl Server {
         {
             agent_thread.set_handoff(Some(handoff));
         }
+        if let Some(transcript) = transcripts::load(&self.data_dir, thread_id)
+            .log_err()
+            .flatten()
+        {
+            agent_thread.restore_transcript(transcript);
+        }
+        self.saved_transcripts.remove(&thread_id);
+        if let Some(revision) = agent_thread.conversation_revision() {
+            self.saved_transcripts.insert(thread_id, revision);
+        }
         agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_turn_hook(self.turn_hook(cwd, thread_id));
         agent_thread.set_attachments(Attachments::for_thread(&self.data_dir, thread_id));
@@ -1340,14 +1373,16 @@ impl Server {
             .unwrap_or_else(|| agent_id.0.clone())
     }
 
-    /// Removes the thread, its subthreads, and what they kept: their checkpoints, attachments,
-    /// queued messages, and any conversation waiting to go with a first message. Their agents
-    /// stop with the next changes.
+    /// Removes the thread, its subthreads, and what they kept: their transcripts, checkpoints,
+    /// attachments, queued messages, and any conversation waiting to go with a first message.
+    /// Their agents stop with the next changes.
     fn delete_thread(&mut self, thread_id: ThreadId) {
         let threads = self.projects.thread_and_subthreads(thread_id);
         for thread_id in &threads {
             self.draft_due.remove(thread_id);
             continuations::remove(&self.data_dir, *thread_id).log_err();
+            transcripts::remove(&self.data_dir, *thread_id).log_err();
+            self.saved_transcripts.remove(thread_id);
             self.queues.remove(*thread_id);
         }
         self.delete_attachments(threads.clone());
@@ -1412,6 +1447,69 @@ impl Server {
             .collect()
     }
 
+    /// Stops the thread's agent, keeping its conversation first: starting again, the thread
+    /// opens with it.
+    pub(super) fn stop_agent(&mut self, thread_id: ThreadId) {
+        self.save_transcript(thread_id);
+        self.saved_transcripts.remove(&thread_id);
+        self.threads.remove(&thread_id);
+    }
+
+    /// Saves the conversations that changed, at most every [`TRANSCRIPT_SAVE_DELAY`].
+    fn schedule_transcript_saves(&mut self) {
+        if self.transcript_save_scheduled {
+            return;
+        }
+        let saved = &self.saved_transcripts;
+        let changed = self.threads.iter().any(|(thread_id, thread)| {
+            thread
+                .conversation_revision()
+                .is_some_and(|revision| saved.get(thread_id) != Some(&revision))
+        });
+        if !changed {
+            return;
+        }
+        self.transcript_save_scheduled = true;
+        self.spawn_then(tokio::time::sleep(TRANSCRIPT_SAVE_DELAY), |server, ()| {
+            server.transcript_save_scheduled = false;
+            server.save_transcripts();
+        });
+    }
+
+    pub(super) fn save_transcripts(&mut self) {
+        let threads: Vec<ThreadId> = self.threads.keys().copied().collect();
+        for thread_id in threads {
+            self.save_transcript(thread_id);
+        }
+    }
+
+    /// Keeps the thread's conversation in its transcript, if it changed since.
+    fn save_transcript(&mut self, thread_id: ThreadId) {
+        let Some(thread) = self.threads.get(&thread_id) else {
+            return;
+        };
+        let Some(revision) = thread.conversation_revision() else {
+            return;
+        };
+        // A thread deleted in this batch of inputs is still running until its end.
+        if self.saved_transcripts.get(&thread_id) == Some(&revision)
+            || self.projects.thread(thread_id).is_none()
+        {
+            return;
+        }
+        let Some(transcript) = thread.transcript() else {
+            return;
+        };
+        if !transcript.entries.is_empty()
+            && transcripts::save(&self.data_dir, thread_id, &transcript)
+                .log_err()
+                .is_none()
+        {
+            return;
+        }
+        self.saved_transcripts.insert(thread_id, revision);
+    }
+
     /// Stops the agents of threads that have had nothing to do, sent nothing, and no client
     /// watching them for [`AGENT_IDLE_TIMEOUT`], or for a moment once archived, as t3code
     /// releases idle provider sessions. Opening the thread again starts its agent and loads its
@@ -1457,7 +1555,7 @@ impl Server {
                 );
             }
             self.agents_idle_since.remove(&thread_id);
-            self.threads.remove(&thread_id);
+            self.stop_agent(thread_id);
         }
         if let Some(due) = next_due
             && self.agent_sweep_at.is_none_or(|scheduled| scheduled > due)
@@ -1671,6 +1769,8 @@ impl Server {
         let threads = &self.threads;
         self.tool_sessions
             .retain(|_, thread_id| threads.contains_key(thread_id));
+        self.saved_transcripts
+            .retain(|thread_id, _| threads.contains_key(thread_id));
         self.close_orphaned_panes();
         self.close_orphaned_terminals();
         self.move_threads();
@@ -1683,6 +1783,7 @@ impl Server {
         self.send_follow_ups();
         // After the waiting tool calls, which may have started an agent to read its thread.
         self.stop_idle_agents();
+        self.schedule_transcript_saves();
         for (thread_id, thread) in &self.threads {
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());

@@ -7,6 +7,7 @@
 pub mod order_key;
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
@@ -228,9 +229,31 @@ pub struct Thread {
     #[serde(default)]
     pub is_draft: bool,
     /// What's typed in the thread's composer and not sent yet (t3code's composer draft), kept
-    /// while the user is elsewhere.
+    /// while the user is elsewhere. Its mentions are written as their `@name`.
     #[serde(default)]
     pub unsent_text: Option<String>,
+    /// The mentions in [`Thread::unsent_text`], in order, so they come back as chips.
+    #[serde(default)]
+    pub unsent_mentions: Vec<UnsentMention>,
+}
+
+/// A mention in a thread's [`Thread::unsent_text`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnsentMention {
+    /// Where its `@name` is in the text, in bytes.
+    pub range: Range<usize>,
+    pub target: Mentioned,
+}
+
+/// What a mention names, as the protocol's prompt parts do, which this crate is below.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mentioned {
+    /// A file or folder on the thread's machine.
+    Path(PathBuf),
+    Thread(ThreadId),
+    /// An image kept for the thread, by its attachment id.
+    Image(String),
 }
 
 /// An agent's session to add as a thread: [`ProjectStore::add_imported_thread`].
@@ -771,6 +794,7 @@ impl ProjectStore {
             continued_from: None,
             is_draft: false,
             unsent_text: None,
+            unsent_mentions: Vec::new(),
         });
         self.changed();
         Some(id)
@@ -1200,13 +1224,35 @@ impl ProjectStore {
         }
     }
 
-    /// Keeps what's typed in the thread's composer; blank text is none.
-    pub fn set_unsent_text(&mut self, id: ThreadId, text: Option<String>) {
+    /// Keeps what's typed in the thread's composer, and the mentions in it; blank text is none.
+    /// Mentions out of order or outside the text are dropped.
+    pub fn set_unsent_text(
+        &mut self,
+        id: ThreadId,
+        text: Option<String>,
+        mentions: Vec<UnsentMention>,
+    ) {
         let text = text.filter(|text| !text.trim().is_empty());
+        let mut end = 0;
+        let mentions: Vec<UnsentMention> = mentions
+            .into_iter()
+            .filter(|mention| {
+                let fits = mention.range.start >= end
+                    && !mention.range.is_empty()
+                    && text
+                        .as_deref()
+                        .is_some_and(|text| text.get(mention.range.clone()).is_some());
+                if fits {
+                    end = mention.range.end;
+                }
+                fits
+            })
+            .collect();
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
-            && thread.unsent_text != text
+            && (thread.unsent_text != text || thread.unsent_mentions != mentions)
         {
             thread.unsent_text = text;
+            thread.unsent_mentions = mentions;
             self.changed();
         }
     }
@@ -1926,6 +1972,37 @@ mod tests {
         store.delete_thread(thread);
         assert!(!store.is_thread_awaiting_input(thread));
         assert!(store.snapshot().awaiting_input_threads.is_empty());
+    }
+
+    #[test]
+    fn unsent_text_keeps_only_mentions_in_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let thread = store.add_thread(project, "Thread", None).expect("thread");
+        let mention = |range: Range<usize>| UnsentMention {
+            range,
+            target: Mentioned::Image("image.png".into()),
+        };
+
+        // "see @Image and é", where é takes two bytes.
+        store.set_unsent_text(
+            thread,
+            Some("see @Image and é".into()),
+            vec![
+                mention(4..10),
+                mention(2..6),
+                mention(16..17),
+                mention(15..15),
+            ],
+        );
+        let unsent = store.thread(thread).expect("thread");
+        assert_eq!(unsent.unsent_mentions, vec![mention(4..10)]);
+
+        store.set_unsent_text(thread, Some("  ".into()), vec![mention(0..1)]);
+        let unsent = store.thread(thread).expect("thread");
+        assert_eq!(unsent.unsent_text, None);
+        assert!(unsent.unsent_mentions.is_empty());
     }
 
     #[test]

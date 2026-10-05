@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Context, EventEmitter, Task, WeakEntity};
 use projects::{
     ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder, ThreadSection,
-    WorkspaceKind,
+    UnsentMention, WorkspaceKind,
 };
 use util::ResultExt as _;
 
@@ -592,13 +592,20 @@ impl ProjectStore {
         self.send(Request::DeleteThread(id), cx)
     }
 
-    /// Keeps what's typed in the thread's composer on its machine; `None` discards it. Only
-    /// reads the app, so a closing view can still save.
-    pub fn set_unsent_text(&self, id: ThreadId, text: Option<String>, cx: &App) {
+    /// Keeps what's typed in the thread's composer, and the mentions in it, on its machine;
+    /// `None` discards it. Only reads the app, so a closing view can still save.
+    pub fn set_unsent_text(
+        &self,
+        id: ThreadId,
+        text: Option<String>,
+        mentions: Vec<UnsentMention>,
+        cx: &App,
+    ) {
         self.send(
             Request::SetUnsentText {
                 thread_id: id,
                 text,
+                mentions,
             },
             cx,
         )

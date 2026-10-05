@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::{FileListing, PromptPart};
 use gpui::{AnyElement, App, SharedString};
-use projects::ThreadId;
+use projects::{Mentioned, ThreadId};
 use ui::{ListItem, ListItemSpacing, prelude::*};
 
 use crate::project_switcher::fuzzy_match;
@@ -32,6 +32,23 @@ impl Mention {
             Mention::Thread(thread_id) => PromptPart::Thread(*thread_id),
             Mention::Image(id) => PromptPart::Image(id.clone()),
         }
+    }
+
+    /// How a composer draft keeps it ([`projects::Thread::unsent_mentions`]).
+    pub(crate) fn target(&self) -> Mentioned {
+        match self {
+            Mention::Path(path) => Mentioned::Path(path.clone()),
+            Mention::Thread(thread_id) => Mentioned::Thread(*thread_id),
+            Mention::Image(id) => Mentioned::Image(id.as_str().to_string()),
+        }
+    }
+
+    pub(crate) fn from_target(target: &Mentioned) -> Option<Self> {
+        Some(match target {
+            Mentioned::Path(path) => Mention::Path(path.clone()),
+            Mentioned::Thread(thread_id) => Mention::Thread(*thread_id),
+            Mentioned::Image(id) => Mention::Image(AttachmentId::parse(id)?),
+        })
     }
 }
 

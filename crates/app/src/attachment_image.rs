@@ -10,17 +10,15 @@ use anyhow::{Context as _, anyhow};
 use base64::Engine as _;
 use gpui::{
     App, Asset, DismissEvent, EventEmitter, FocusHandle, Focusable, ImageCacheError, ImageFormat,
-    ImageSource, KeyBinding, MouseButton, ObjectFit, RenderImage, Window, img,
+    ImageSource, KeyBinding, MouseButton, RenderImage, Window, size,
 };
 use projects::ThreadId;
+use text_input::{CHIP_IMAGE_PREVIEW_SIZE, FittedImage};
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 
 use crate::machines::{MachineId, Machines};
 
 const VIEWER_KEY_CONTEXT: &str = "ImageViewer";
-/// The composer's chip previews are this big at most, and the server's thumbnails fit them.
-const PREVIEW_MAX_WIDTH: Pixels = px(320.);
-const PREVIEW_MAX_HEIGHT: Pixels = px(240.);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new(
@@ -153,32 +151,31 @@ pub(crate) fn render_hover_preview(source: ImageSource, cx: &App) -> AnyElement 
         .rounded_md()
         .shadow_md()
         .child(
-            img(source)
-                .max_w(PREVIEW_MAX_WIDTH)
-                .max_h(PREVIEW_MAX_HEIGHT)
-                .object_fit(ObjectFit::ScaleDown)
-                .with_loading(|| {
-                    div()
-                        .p_2()
-                        .child(
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                                .with_rotate_animation(2),
-                        )
-                        .into_any_element()
-                })
-                .with_fallback(|| {
-                    div()
-                        .px_2()
-                        .py_1()
-                        .child(
-                            Label::new("Image unavailable")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .into_any_element()
-                }),
+            FittedImage::new(source, CHIP_IMAGE_PREVIEW_SIZE).map_image(|image| {
+                image
+                    .with_loading(|| {
+                        div()
+                            .p_2()
+                            .child(
+                                Icon::new(IconName::LoadCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted)
+                                    .with_rotate_animation(2),
+                            )
+                            .into_any_element()
+                    })
+                    .with_fallback(|| {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                Label::new("Image unavailable")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element()
+                    })
+            }),
         )
         .into_any_element()
 }
@@ -258,28 +255,28 @@ impl Render for ImageViewer {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        img(self.source.clone())
-                            .debug_selector(|| "image-viewer-image".into())
-                            .max_w(max_width)
-                            .max_h(max_height)
-                            .object_fit(ObjectFit::Contain)
-                            .rounded_lg()
-                            .with_loading(|| {
-                                Icon::new(IconName::LoadCircle)
-                                    .size(IconSize::Medium)
-                                    .color(Color::Muted)
-                                    .with_rotate_animation(2)
-                                    .into_any_element()
-                            })
-                            .with_fallback(|| {
-                                div()
-                                    .p_6()
+                        FittedImage::new(self.source.clone(), size(max_width, max_height))
+                            .map_image(|image| {
+                                image
+                                    .debug_selector(|| "image-viewer-image".into())
                                     .rounded_lg()
-                                    .bg(gpui::black())
-                                    .text_sm()
-                                    .text_color(gpui::white())
-                                    .child("Image unavailable. It may have been deleted.")
-                                    .into_any_element()
+                                    .with_loading(|| {
+                                        Icon::new(IconName::LoadCircle)
+                                            .size(IconSize::Medium)
+                                            .color(Color::Muted)
+                                            .with_rotate_animation(2)
+                                            .into_any_element()
+                                    })
+                                    .with_fallback(|| {
+                                        div()
+                                            .p_6()
+                                            .rounded_lg()
+                                            .bg(gpui::black())
+                                            .text_sm()
+                                            .text_color(gpui::white())
+                                            .child("Image unavailable. It may have been deleted.")
+                                            .into_any_element()
+                                    })
                             }),
                     ),
             )

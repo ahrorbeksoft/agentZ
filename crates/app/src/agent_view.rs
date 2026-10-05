@@ -15,8 +15,8 @@ use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, QueuedMessage, SessionRestore,
-    ToolCall, without_handoff,
+    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
+    without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
@@ -29,8 +29,8 @@ use gpui::{
     list, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use projects::{ProjectId, TaskEnd, Thread, ThreadId, WorkspaceKind};
-use text_input::{ChipId, ChipPreview, TextInput, TextInputEvent};
+use projects::{ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind};
+use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
     IconPosition, PopoverMenu, PopoverMenuHandle, Severity, SpinnerLabel, Switch, ToggleState,
@@ -94,6 +94,11 @@ struct DraggedDrawerEdge;
 
 /// The most lines of a command's terminal a tool call shows.
 const TOOL_TERMINAL_MAX_LINES: usize = 16;
+/// The most an image in a tool call's output takes, as Zed's `max_w_96` and `max_h_96`.
+const TOOL_IMAGE_SIZE: gpui::Size<Pixels> = gpui::Size {
+    width: px(384.),
+    height: px(384.),
+};
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -309,7 +314,7 @@ pub struct AgentView {
     replace_error: Option<SharedString>,
     _replacing: Task<()>,
     /// What the server was last told is typed in the composer (t3code's composer draft).
-    saved_unsent_text: Option<String>,
+    saved_unsent: UnsentDraft,
     /// The server's copy as last seen, to notice when it's discarded elsewhere.
     observed_unsent_text: Option<String>,
     _save_unsent_text: Task<()>,
@@ -491,23 +496,27 @@ impl AgentView {
             replacing: None,
             replace_error: None,
             _replacing: Task::ready(()),
-            saved_unsent_text: None,
+            saved_unsent: UnsentDraft::default(),
             observed_unsent_text: None,
             _save_unsent_text: Task::ready(()),
             _subscriptions: subscriptions,
             _elapsed_refresh: elapsed_refresh,
         };
-        let unsent_text = this
+        let unsent = this
             .store
             .read(cx)
             .thread(thread_id)
-            .and_then(|thread| thread.unsent_text.clone());
-        if let Some(text) = &unsent_text {
-            this.composer
-                .update(cx, |composer, cx| composer.set_text(text.clone(), cx));
+            .map(|thread| UnsentDraft {
+                text: thread.unsent_text.clone(),
+                mentions: thread.unsent_mentions.clone(),
+            })
+            .unwrap_or_default();
+        if let Some(text) = &unsent.text {
+            let prompt = unsent_prompt(text, &unsent.mentions);
+            this.restore_prompt(&prompt, cx);
         }
-        this.saved_unsent_text = unsent_text.clone();
-        this.observed_unsent_text = unsent_text;
+        this.observed_unsent_text = unsent.text.clone();
+        this.saved_unsent = unsent;
         this.sync_entries(cx);
         let thread = this.thread.clone();
         sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
@@ -1521,6 +1530,7 @@ impl AgentView {
         match result {
             Ok(mention) => {
                 self.mentions.insert(chip, mention);
+                self.save_unsent_text(cx);
                 if self.send_after_uploads && self.uploads.is_empty() {
                     self.send_after_uploads = false;
                     self.send_message(cx);
@@ -3785,12 +3795,7 @@ impl AgentView {
             .id(SharedString::from(name.clone()))
             .debug_selector(move || name)
             .cursor_pointer()
-            .child(
-                img(image.thumbnail())
-                    .max_w_96()
-                    .max_h_96()
-                    .object_fit(ObjectFit::ScaleDown),
-            )
+            .child(FittedImage::new(image.thumbnail(), TOOL_IMAGE_SIZE))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.view_image(image.original(), cx);
             }))
@@ -3813,18 +3818,19 @@ impl AgentView {
         };
         self.thread
             .update(cx, |thread, cx| thread.remove_queued_message(id, cx));
-        self.restore_prompt(&message, cx);
+        self.restore_prompt(&message.prompt, cx);
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
-    fn restore_prompt(&mut self, message: &QueuedMessage, cx: &mut Context<Self>) {
+    /// Puts a message in the composer, its mentions as chips.
+    fn restore_prompt(&mut self, prompt: &[PromptPart], cx: &mut Context<Self>) {
         self.composer
             .update(cx, |composer, cx| composer.set_text("", cx));
         self.mentions.clear();
         self.uploads.clear();
         let mut after_chip = false;
-        for part in &message.prompt {
+        for part in prompt {
             if let PromptPart::Text(text) = part {
                 // A chip brings the space after it, which the text after it starts with.
                 let text = if after_chip {
@@ -4391,7 +4397,7 @@ impl AgentView {
     /// another, as t3code does.
     pub(crate) fn is_untouched_draft(&self, cx: &App) -> bool {
         self.is_draft(cx)
-            && self.typed_text(cx).is_none()
+            && self.typed_draft(cx).text.is_none()
             && self.replacing.is_none()
             && self.thread.read(cx).pending_handoff().is_none()
     }
@@ -5505,21 +5511,46 @@ impl AgentView {
             .update(cx, |composer, cx| composer.set_text(text, cx));
     }
 
-    fn typed_text(&self, cx: &App) -> Option<String> {
-        let text = self.composer.read(cx).plain_text();
-        (!text.trim().is_empty()).then_some(text)
+    /// What's typed: the text with each chip as what copying it gives, and what the chips
+    /// mention.
+    fn typed_draft(&self, cx: &App) -> UnsentDraft {
+        let composer = self.composer.read(cx);
+        let content = composer.text();
+        let mut text = String::new();
+        let mut mentions = Vec::new();
+        let mut index = 0;
+        for chip in composer.chips() {
+            text.push_str(&content[index..chip.range.start]);
+            let start = text.len();
+            text.push_str(&chip.copy_text);
+            if let Some(mention) = self.mentions.get(&chip.id) {
+                mentions.push(UnsentMention {
+                    range: start..text.len(),
+                    target: mention.target(),
+                });
+            }
+            index = chip.range.end;
+        }
+        text.push_str(&content[index..]);
+        if text.trim().is_empty() {
+            return UnsentDraft::default();
+        }
+        UnsentDraft {
+            text: Some(text),
+            mentions,
+        }
     }
 
     /// Keeps what's typed on the thread's machine once typing pauses, so it's there after the
     /// user leaves the thread or quits, as t3code keeps composer drafts. Emptied, as sending
     /// does, it's saved at once.
     fn save_unsent_text(&mut self, cx: &mut Context<Self>) {
-        let text = self.typed_text(cx);
-        if text == self.saved_unsent_text {
+        let draft = self.typed_draft(cx);
+        if draft == self.saved_unsent {
             self._save_unsent_text = Task::ready(());
             return;
         }
-        if text.is_none() {
+        if draft.text.is_none() {
             self.save_unsent_text_now(cx);
             return;
         }
@@ -5532,14 +5563,14 @@ impl AgentView {
 
     fn save_unsent_text_now(&mut self, cx: &mut App) {
         self._save_unsent_text = Task::ready(());
-        let text = self.typed_text(cx);
-        if text == self.saved_unsent_text {
+        let draft = self.typed_draft(cx);
+        if draft == self.saved_unsent {
             return;
         }
-        self.saved_unsent_text = text.clone();
+        self.saved_unsent = draft.clone();
         self.store
             .read(cx)
-            .set_unsent_text(self.thread_id, text, cx);
+            .set_unsent_text(self.thread_id, draft.text, draft.mentions, cx);
     }
 
     /// Empties the composer when its text was discarded elsewhere, such as from the sidebar.
@@ -5553,8 +5584,8 @@ impl AgentView {
         }
         // Only a change from what was seen counts: a save of this view's own may not be back.
         self.observed_unsent_text = current.clone();
-        if current.is_none() && self.saved_unsent_text.is_some() {
-            self.saved_unsent_text = None;
+        if current.is_none() && self.saved_unsent.text.is_some() {
+            self.saved_unsent = UnsentDraft::default();
             self._save_unsent_text = Task::ready(());
             self.composer
                 .update(cx, |composer, cx| composer.set_text("", cx));
@@ -5564,8 +5595,41 @@ impl AgentView {
     /// Forgets the composer's text without saving it, for a thread that's going away.
     fn forget_unsent_text(&mut self, cx: &App) {
         self._save_unsent_text = Task::ready(());
-        self.saved_unsent_text = self.typed_text(cx);
+        self.saved_unsent = self.typed_draft(cx);
     }
+}
+
+/// What's typed in a composer, as a thread keeps it ([`projects::Thread::unsent_text`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct UnsentDraft {
+    text: Option<String>,
+    mentions: Vec<UnsentMention>,
+}
+
+/// A composer draft as a message, its mentions in place of their `@name`.
+fn unsent_prompt(text: &str, mentions: &[UnsentMention]) -> Vec<PromptPart> {
+    let mut prompt = Vec::new();
+    let mut index = 0;
+    for mention in mentions {
+        let Some(part) = Mention::from_target(&mention.target).map(|mention| mention.prompt_part())
+        else {
+            continue;
+        };
+        if mention.range.start < index || text.get(mention.range.clone()).is_none() {
+            continue;
+        }
+        if mention.range.start > index {
+            prompt.push(PromptPart::Text(
+                text[index..mention.range.start].to_string(),
+            ));
+        }
+        prompt.push(part);
+        index = mention.range.end;
+    }
+    if index < text.len() {
+        prompt.push(PromptPart::Text(text[index..].to_string()));
+    }
+    prompt
 }
 
 /// How the composer is drawn: along the bottom of a conversation, or as a card in the middle
@@ -6497,6 +6561,7 @@ fn summarize_work(entries: &[Entry]) -> String {
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
+    use agentz_protocol::thread::QueuedMessage;
     use gpui::{TestAppContext, VisualTestContext};
     use projects::{Project, ProjectsSnapshot};
 
@@ -7155,14 +7220,22 @@ mod tests {
         AttachmentId::parse(&format!("{}.png", "ab".repeat(32))).expect("an id")
     }
 
+    /// A 100 by 2000 pixel PNG.
+    const TALL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAGQAAAfQAQAAAAAcZccUAAAAMklEQVR42u3BMQEAAADCoPVPbQ0PoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD4MbWAAAVQlHfcAAAAASUVORK5CYII=";
+
     /// Answers for the images the view fetches, and for one it keeps.
     fn serve_images(client: &Entity<ServerClient>, cx: &mut VisualTestContext) {
+        serve_image(client, TINY_PNG, cx);
+    }
+
+    /// Answers every image the view fetches with this PNG.
+    fn serve_image(client: &Entity<ServerClient>, png: &'static str, cx: &mut VisualTestContext) {
         client.update(cx, |client, _| {
-            client.answer_for_test(|request| match request {
+            client.answer_for_test(move |request| match request {
                 Request::Attachment { .. } => Some(Response::AttachmentData(
                     agentz_protocol::attachments::AttachmentData {
                         mime_type: "image/png".into(),
-                        data: TINY_PNG.into(),
+                        data: png.into(),
                     },
                 )),
                 Request::AddAttachment { .. } => Some(Response::Attachment(image_id())),
@@ -7253,6 +7326,104 @@ mod tests {
         assert_eq!(restored, prompt);
     }
 
+    /// What's typed is kept when the user leaves the thread, and comes back with its images
+    /// and mentions as chips.
+    #[gpui::test]
+    fn a_draft_keeps_its_chips(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        let png = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(TINY_PNG)
+                .expect("a PNG")
+        };
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |composer, cx| composer.insert("Compare ", cx));
+            view.insert_image(gpui::ImageFormat::Png, png, cx);
+            view.composer
+                .update(cx, |composer, cx| composer.insert("with ", cx));
+            view.mention_path("/tmp/demo/README.md".into(), cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(UNSENT_TEXT_SAVE_DELAY * 2);
+        cx.run_until_parked();
+        let saves = |cx: &mut VisualTestContext| -> Vec<(Option<String>, Vec<UnsentMention>)> {
+            sent(&client, cx)
+                .into_iter()
+                .filter_map(|request| match request {
+                    Request::SetUnsentText { text, mentions, .. } => Some((text, mentions)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (text, mentions) = saves(cx).pop().expect("the draft is saved");
+        assert_eq!(text.as_deref(), Some("Compare @Image with @README.md "));
+        assert_eq!(
+            mentions,
+            [
+                UnsentMention {
+                    range: 8..14,
+                    target: projects::Mentioned::Image(image_id().as_str().into()),
+                },
+                UnsentMention {
+                    range: 20..30,
+                    target: projects::Mentioned::Path("/tmp/demo/README.md".into()),
+                },
+            ]
+        );
+
+        // The server keeps it, and the thread opens with it again.
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        store.update(cx, |store, cx| {
+            let mut snapshot = snapshot(None);
+            let typed = snapshot
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == ThreadId(2))
+                .expect("the thread");
+            typed.unsent_text = text;
+            typed.unsent_mentions = mentions;
+            store.set_snapshot(snapshot, cx)
+        });
+        let save_count = saves(cx).len();
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let reopened = cx.update(|_, cx| {
+            cx.new(|cx| {
+                AgentView::new(
+                    ThreadId(2),
+                    thread,
+                    "New thread".into(),
+                    Some(AgentId::new("mock")),
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let (text, prompt) = reopened.read_with(cx, |view, cx| {
+            (
+                view.composer.read(cx).plain_text(),
+                view.composer_prompt(cx),
+            )
+        });
+        assert_eq!(text, "Compare @Image with @README.md ");
+        assert_eq!(
+            prompt,
+            [
+                PromptPart::Text("Compare ".into()),
+                PromptPart::Image(image_id()),
+                PromptPart::Text(" with ".into()),
+                PromptPart::Path("/tmp/demo/README.md".into()),
+                PromptPart::Text(" ".into()),
+            ]
+        );
+        cx.executor().advance_clock(UNSENT_TEXT_SAVE_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(saves(cx).len(), save_count, "nothing new to save");
+    }
+
     /// A pasted image goes to the server first; a message sent meanwhile goes once it's there,
     /// naming the server's copy.
     #[gpui::test]
@@ -7317,6 +7488,49 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(cx.debug_bounds("image-viewer").is_none());
+    }
+
+    /// An image taller than the room for it shrinks to fit, keeping its shape, in a tool's
+    /// output and in the viewer.
+    #[gpui::test]
+    fn a_tall_image_fits_whole(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_image(&client, TALL_PNG, cx);
+        let Entry::ToolCall(mut screenshot) = tool_call(acp::ToolCallStatus::Completed) else {
+            panic!("a tool call");
+        };
+        screenshot.text.clear();
+        screenshot.images = vec![image_id()];
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Take a screenshot".into()),
+                    Entry::ToolCall(screenshot),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let image = cx.debug_bounds("tool-image-1-0").expect("the tool's image");
+        assert_eq!(image.size.height, TOOL_IMAGE_SIZE.height);
+
+        cx.simulate_click(image.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let whole = cx
+            .debug_bounds("image-viewer-image")
+            .expect("the viewer's image");
+        assert!(whole.top() >= px(0.) && whole.bottom() <= viewport.height);
+        assert!(whole.size.height > viewport.height / 2.);
+        let shape = whole.size.width / whole.size.height;
+        assert!((shape - 0.05).abs() < 0.001, "{shape}");
     }
 
     /// An image link in a message shows the image's thumbnail while the mouse is on it.

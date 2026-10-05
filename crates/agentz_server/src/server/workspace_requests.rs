@@ -449,7 +449,7 @@ impl Server {
                     }
                     // Their agents would be left in a deleted folder.
                     for thread_id in server.projects.threads_in_folder(&path) {
-                        server.threads.remove(&thread_id);
+                        server.stop_agent(thread_id);
                     }
                 }
                 server.respond(client, id, removal.map(Response::WorkspaceRemoval));

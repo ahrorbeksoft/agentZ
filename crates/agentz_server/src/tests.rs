@@ -631,12 +631,18 @@ async fn removes_drafts_left_empty() {
         .ok(Request::SetUnsentText {
             thread_id: typed,
             text: Some("fix the header".into()),
+            mentions: Vec::new(),
         })
         .await;
+    let mention = projects::UnsentMention {
+        range: 8..19,
+        target: projects::Mentioned::Path("/tmp/footer.css".into()),
+    };
     client
         .ok(Request::SetUnsentText {
             thread_id,
-            text: Some("and the footer".into()),
+            text: Some("and the @footer.css".into()),
+            mentions: vec![mention.clone()],
         })
         .await;
     for thread_id in drafts.iter().copied() {
@@ -652,10 +658,12 @@ async fn removes_drafts_left_empty() {
     let typed_thread = thread(&client, typed).expect("typed text keeps a draft");
     assert!(typed_thread.is_draft);
     assert_eq!(typed_thread.unsent_text.as_deref(), Some("fix the header"));
+    let typed_in_thread = thread(&client, thread_id).expect("the thread");
     assert_eq!(
-        thread(&client, thread_id).and_then(|thread| thread.unsent_text),
-        Some("and the footer".into())
+        typed_in_thread.unsent_text.as_deref(),
+        Some("and the @footer.css")
     );
+    assert_eq!(typed_in_thread.unsent_mentions, vec![mention]);
     let handoffs = server.data_dir.path().join("handoffs");
     assert!(!handoffs.join(format!("{}.json", continuation.0)).exists());
 
@@ -664,6 +672,7 @@ async fn removes_drafts_left_empty() {
         .ok(Request::SetUnsentText {
             thread_id: typed,
             text: None,
+            mentions: Vec::new(),
         })
         .await;
     client
@@ -4423,6 +4432,79 @@ async fn queued_messages_outlive_the_app_and_the_server() {
                     .contains("Echo: second")
         })
         .await;
+}
+
+/// A thread's conversation outlives the server in its transcript, though the agent replays
+/// only its end, as Factory Droid replays only its last 100 messages, and goes with the
+/// thread.
+#[tokio::test(flavor = "multi_thread")]
+async fn conversations_outlive_the_server() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let history_dir = tempfile::tempdir().expect("temp dir");
+    let history = history_dir.path().join("history.json");
+    command.args.push(history.to_string_lossy().into_owned());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command.clone(),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.wait_until_ready(thread_id).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello there"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == "Echo: hello there"
+        })
+        .await;
+    let entries = client.thread(connection).entries.clone();
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+    let transcript = server
+        .data_dir
+        .path()
+        .join("transcripts")
+        .join(format!("{}.json", thread_id.0));
+    assert!(transcript.exists());
+    let updates: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(&history).expect("the agent's history"))
+            .expect("updates");
+    let end = &updates[updates.len() - 1..];
+    std::fs::write(&history, serde_json::to_vec(end).expect("encodes")).expect("written");
+
+    let Some(server) = TestServer::start_with_agent(server.data_dir, server.project_dir, command)
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.subscribe_thread(connection).await;
+    assert_eq!(client.thread(connection).entries, entries);
+    client
+        .wait_until(|client| client.thread(connection).status() == &ConnectionStatus::Ready)
+        .await;
+    assert_eq!(
+        client.thread(connection).session_restore(),
+        Some(agentz_protocol::thread::SessionRestore::Loaded)
+    );
+    assert_eq!(client.thread(connection).entries, entries);
+
+    client.ok(Request::DeleteThread(thread_id)).await;
+    assert!(!transcript.exists());
 }
 
 /// Steering, for an agent that can't take a message into its turn: the message goes first and
