@@ -197,6 +197,9 @@ Each entry: what it does, where it lives, and where it comes from.
   `use_modifier_to_send`), Cmd-Enter sends and Enter makes a new line. Pasted text keeps its
   line breaks, and Up/Down move between rows, unless a menu is open for the composer
   (`TextInput && menu`). Right-click gives Zed's Cut, Copy, Paste and Paste as Plain Text.
+  Clicks select as in Zed's editor: a double-click selects a word (or a run of punctuation or
+  spaces, or a chip whole), a triple-click its line, a fourth all of it, and dragging on from a
+  double- or triple-click extends by whole words or lines.
 - **Mentions** (`mention_menu.rs`, `agent_view.rs`, `server/prompt_requests.rs`; Zed's mentions
   with t3code's menu, picked in `design/composer/`): @ lists matches at once, under Files and
   Threads: the thread folder's files and folders (`Request::ListFiles`, gitignored ones left

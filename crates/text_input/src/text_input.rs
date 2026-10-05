@@ -135,6 +135,7 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     layout: Option<TextLayout>,
     is_selecting: bool,
+    select_mode: SelectMode,
     /// Whether the blinking cursor is in its visible phase.
     cursor_visible: bool,
     is_blinking: bool,
@@ -157,6 +158,36 @@ pub struct TextInput {
     menu_open: bool,
     handles_paste: bool,
     hovered_chip: Option<(ChipId, Bounds<Pixels>)>,
+}
+
+/// What a drag selects by, set by the click that started it (Zed's editor's `SelectMode`).
+enum SelectMode {
+    Character,
+    /// Whole words, from the double-clicked one.
+    Word(Range<usize>),
+    /// Whole lines, from the triple-clicked one.
+    Line(Range<usize>),
+    All,
+}
+
+/// Zed's `CharKind`, ordered so a word wins over punctuation, and punctuation over whitespace.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CharKind {
+    Whitespace,
+    Punctuation,
+    Word,
+}
+
+impl CharKind {
+    fn of(character: char) -> Self {
+        if character.is_alphanumeric() || character == '_' {
+            Self::Word
+        } else if character.is_whitespace() {
+            Self::Whitespace
+        } else {
+            Self::Punctuation
+        }
+    }
 }
 
 /// The text as last laid out.
@@ -254,6 +285,7 @@ impl TextInput {
             marked_range: None,
             layout: None,
             is_selecting: false,
+            select_mode: SelectMode::Character,
             cursor_visible: true,
             is_blinking: false,
             blink_epoch: 0,
@@ -522,6 +554,64 @@ impl TextInput {
         }
     }
 
+    /// The word, run of punctuation or run of spaces around an offset, which a double-click
+    /// selects (Zed's `surrounding_word`). A chip is a word of its own.
+    fn surrounding_word(&self, offset: usize) -> Range<usize> {
+        if let Some(chip) = self.chip_around(offset) {
+            return chip.range.clone();
+        }
+        let chip_starts_at =
+            |offset: usize| self.chips.iter().any(|chip| chip.range.start == offset);
+        let chip_ends_at = |offset: usize| self.chips.iter().any(|chip| chip.range.end == offset);
+        let before = self.content[..offset]
+            .chars()
+            .next_back()
+            .filter(|_| !chip_ends_at(offset))
+            .map(CharKind::of);
+        let after = self.content[offset..]
+            .chars()
+            .next()
+            .filter(|_| !chip_starts_at(offset))
+            .map(CharKind::of);
+        let kind = before.max(after);
+        let mut start = offset;
+        for character in self.content[..offset].chars().rev() {
+            if chip_ends_at(start) || character == '\n' || Some(CharKind::of(character)) != kind {
+                break;
+            }
+            start -= character.len_utf8();
+        }
+        let mut end = offset;
+        for character in self.content[offset..].chars() {
+            if chip_starts_at(end) || character == '\n' || Some(CharKind::of(character)) != kind {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        start..end
+    }
+
+    fn is_inside_word(&self, offset: usize) -> bool {
+        let before = self.content[..offset].chars().next_back();
+        let after = self.content[offset..].chars().next();
+        self.chip_around(offset).is_some()
+            || before
+                .zip(after)
+                .map(|(before, after)| (CharKind::of(before), CharKind::of(after)))
+                == Some((CharKind::Word, CharKind::Word))
+    }
+
+    /// The line around an offset with its line break, which a triple-click selects.
+    fn line_range(&self, offset: usize) -> Range<usize> {
+        let start = self.content[..offset]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let end = self.content[offset..]
+            .find('\n')
+            .map_or(self.content.len(), |index| offset + index + 1);
+        start..end
+    }
+
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
@@ -681,10 +771,38 @@ impl TextInput {
             return;
         }
         self.is_selecting = true;
-        if event.modifiers.shift {
-            self.select_to(offset, cx);
-        } else {
-            self.move_to(offset, cx)
+        match event.click_count {
+            0 | 1 => {
+                self.select_mode = SelectMode::Character;
+                if event.modifiers.shift {
+                    self.select_to(offset, cx);
+                } else {
+                    self.move_to(offset, cx)
+                }
+            }
+            2 => {
+                // A chip's edges sit between characters, so a click on its half nearer the
+                // text beside it would find that text's word.
+                let range = match self.chip_at_position(event.position) {
+                    Some((id, _)) => self
+                        .chips
+                        .iter()
+                        .find(|chip| chip.id == id)
+                        .map_or_else(|| self.surrounding_word(offset), |chip| chip.range.clone()),
+                    None => self.surrounding_word(offset),
+                };
+                self.select_between(range.start, range.end, cx);
+                self.select_mode = SelectMode::Word(range);
+            }
+            3 => {
+                let range = self.line_range(offset);
+                self.select_between(range.start, range.end, cx);
+                self.select_mode = SelectMode::Line(range);
+            }
+            _ => {
+                self.select_all_text(cx);
+                self.select_mode = SelectMode::All;
+            }
         }
     }
 
@@ -694,15 +812,9 @@ impl TextInput {
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.extend_selection(self.index_for_mouse_position(event.position), cx);
         }
-        let hovered = self.layout.as_ref().and_then(|layout| {
-            layout
-                .chip_bounds
-                .iter()
-                .find(|(_, bounds)| bounds.contains(&event.position))
-                .copied()
-        });
+        let hovered = self.chip_at_position(event.position);
         if hovered.map(|(id, _)| id) != self.hovered_chip.map(|(id, _)| id) {
             self.hovered_chip = hovered;
             cx.notify();
@@ -817,6 +929,7 @@ impl TextInput {
         self.schedule_blink(window, cx);
     }
 
+    /// The content offset closest to a point, which may be inside a chip.
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
         if self.content.is_empty() {
             return 0;
@@ -837,7 +950,71 @@ impl TextInput {
             position.x - bounds.left(),
             position.y - bounds.top() + layout.scroll_top,
         );
-        self.snap(self.content_offset(layout.index_for_position(local)))
+        self.content_offset(layout.index_for_position(local))
+    }
+
+    fn chip_at_position(&self, position: Point<Pixels>) -> Option<(ChipId, Bounds<Pixels>)> {
+        self.layout.as_ref().and_then(|layout| {
+            layout
+                .chip_bounds
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&position))
+                .copied()
+        })
+    }
+
+    /// Drags the selection's head to `offset`, by what the click that started it selected, as
+    /// Zed's editor's `update_selection` does.
+    fn extend_selection(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let (head, original) = match &self.select_mode {
+            SelectMode::Character => {
+                self.select_to(offset, cx);
+                return;
+            }
+            SelectMode::Word(original) => {
+                let head = if self.is_inside_word(offset) || original.contains(&offset) {
+                    let word = self.surrounding_word(offset);
+                    if word.start < original.start {
+                        word.start
+                    } else {
+                        word.end
+                    }
+                } else {
+                    self.snap(offset)
+                };
+                (head, original.clone())
+            }
+            SelectMode::Line(original) => {
+                let line = self.line_range(offset);
+                let head = if line.start < original.start {
+                    line.start
+                } else {
+                    line.end
+                };
+                (head, original.clone())
+            }
+            SelectMode::All => return,
+        };
+        let tail = if head <= original.start {
+            original.end
+        } else {
+            original.start
+        };
+        self.select_between(tail, head, cx);
+    }
+
+    /// Selects from `tail` to `head`, where the cursor ends up.
+    fn select_between(&mut self, tail: usize, head: usize, cx: &mut Context<Self>) {
+        if head < tail {
+            self.selected_range = head..tail;
+            self.selection_reversed = true;
+        } else {
+            self.selected_range = tail..head;
+            self.selection_reversed = false;
+        }
+        self.goal_x = None;
+        self.autoscroll = true;
+        self.pause_blinking(cx);
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -1816,6 +1993,110 @@ mod tests {
         let (plain, chips) =
             input.read_with(cx, |input, _| (input.plain_text(), input.chips().len()));
         assert_eq!((plain.as_str(), chips), ("see  now", 0));
+    }
+
+    /// Where the text at `offset` is drawn, a little to its right.
+    fn position_of(
+        input: &Entity<TextInput>,
+        offset: usize,
+        cx: &mut VisualTestContext,
+    ) -> Point<Pixels> {
+        cx.run_until_parked();
+        input.read_with(cx, |input, _| {
+            let layout = input.layout.as_ref().expect("the input's layout");
+            layout.bounds.origin
+                + layout.position_for_index(offset)
+                + point(px(1.), layout.line_height / 2. - layout.scroll_top)
+        })
+    }
+
+    fn click(position: Point<Pixels>, click_count: usize, cx: &mut VisualTestContext) {
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: gpui::Modifiers::none(),
+            click_count,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: gpui::Modifiers::none(),
+            click_count,
+        });
+    }
+
+    fn selection(input: &Entity<TextInput>, cx: &mut VisualTestContext) -> String {
+        input.read_with(cx, |input, _| {
+            input.content[input.selected_range.clone()].to_string()
+        })
+    }
+
+    #[gpui::test]
+    fn double_click_selects_a_word_and_triple_click_its_line(cx: &mut TestAppContext) {
+        let (input, cx) = input(true, cx);
+        cx.simulate_input("fix total.ts now");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("then test");
+        let total = position_of(&input, 6, cx);
+        click(total, 1, cx);
+        click(total, 2, cx);
+        assert_eq!(selection(&input, cx), "total");
+        click(total, 3, cx);
+        assert_eq!(selection(&input, cx), "fix total.ts now\n");
+        click(total, 4, cx);
+        assert_eq!(selection(&input, cx), "fix total.ts now\nthen test");
+    }
+
+    #[gpui::test]
+    fn dragging_after_a_double_click_selects_whole_words(cx: &mut TestAppContext) {
+        let (input, cx) = input(true, cx);
+        cx.simulate_input("one two three");
+        let two = position_of(&input, 5, cx);
+        let three = position_of(&input, 9, cx);
+        let one = position_of(&input, 1, cx);
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: two,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_move(three, Some(MouseButton::Left), gpui::Modifiers::none());
+        assert_eq!(selection(&input, cx), "two three");
+        cx.simulate_mouse_move(one, Some(MouseButton::Left), gpui::Modifiers::none());
+        assert_eq!(selection(&input, cx), "one two");
+        cx.simulate_mouse_up(one, MouseButton::Left, gpui::Modifiers::none());
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_chip_selects_it_whole(cx: &mut TestAppContext) {
+        let (input, cx) = input(true, cx);
+        cx.simulate_input("see ");
+        input.update(cx, |input, cx| {
+            input.insert_chip(
+                None,
+                "total.ts",
+                "icons/file.svg".into(),
+                ChipPreview::Text("src/total.ts".into()),
+                "@total.ts".into(),
+                cx,
+            );
+        });
+        cx.simulate_input("now");
+        cx.run_until_parked();
+        let (chip_range, chip_bounds) = input.read_with(cx, |input, _| {
+            let layout = input.layout.as_ref().expect("the input's layout");
+            (input.chips[0].range.clone(), layout.chip_bounds[0].1)
+        });
+        for position in [
+            chip_bounds.origin + point(px(1.), chip_bounds.size.height / 2.),
+            chip_bounds.center(),
+        ] {
+            click(position, 2, cx);
+            let selected = input.read_with(cx, |input, _| input.selected_range.clone());
+            assert_eq!(selected, chip_range);
+        }
     }
 
     fn chip(id: ChipId, range: Range<usize>) -> Chip {
