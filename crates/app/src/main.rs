@@ -249,6 +249,10 @@ fn main() {
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(12.), px(12.))),
                     }),
+                    // The shell draws its own title bar and handles its drag and double-click,
+                    // as Zed's does. Left to AppKit too, macOS 27 zooms the window on the
+                    // double-click as well, so it zooms and immediately unzooms.
+                    app_owns_titlebar_drag: true,
                     ..Default::default()
                 },
                 |window, cx| {
