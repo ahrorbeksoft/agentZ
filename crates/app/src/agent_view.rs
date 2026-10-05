@@ -740,7 +740,7 @@ impl AgentView {
                                         .color(Color::Muted),
                                 )
                                 .child(
-                                    Label::new(request.title.clone())
+                                    Label::new(one_line(&request.title))
                                         .size(LabelSize::Small)
                                         .truncate(),
                                 )
@@ -2413,7 +2413,6 @@ impl AgentView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors();
         match entry {
             Entry::UserMessage(_) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
@@ -2465,7 +2464,7 @@ impl AgentView {
                             .px_3()
                             .py_2()
                             .rounded_xl()
-                            .bg(colors.element_background)
+                            .bg(user_message_background(cx))
                             .text_ui(cx)
                             .children(self.markdown((index, 0), style)),
                     )
@@ -2925,7 +2924,14 @@ impl AgentView {
             }
         };
         let (verb, subject) = if matches!(tool_call.kind, acp::ToolKind::Execute) {
-            let command = tool_call.title.trim().trim_matches('`').to_string();
+            // A backslash before a newline continues the command on the next line, so on one
+            // line it's a space.
+            let command = tool_call
+                .title
+                .trim()
+                .trim_matches('`')
+                .replace("\\\r\n", " ")
+                .replace("\\\n", " ");
             (
                 Some(if in_progress { "Running" } else { "Ran" }),
                 Some(command),
@@ -2943,7 +2949,7 @@ impl AgentView {
         } else {
             (None, Some(relative(&tool_call.title)))
         };
-        let subject = subject.unwrap_or_default();
+        let subject = one_line(&subject.unwrap_or_default());
         // One dim gray for the whole row, so rows read apart from the agent's messages; the
         // command keeps the code font.
         h_flex()
@@ -5750,6 +5756,14 @@ fn work_row_color(cx: &App) -> Hsla {
     mix(colors.text_muted, colors.panel_background, 0.25)
 }
 
+/// The soft background of the user's bubble: the thread's background a tenth of the way toward
+/// its text, so it shows in light and dark themes alike. Most themes (One, Ayu, Gruvbox) give
+/// elements the panel's background or one shade off it, so `element_background` would vanish.
+fn user_message_background(cx: &App) -> Hsla {
+    let colors = cx.theme().colors();
+    colors.panel_background.blend(colors.text.opacity(0.1))
+}
+
 /// t3code's `live-tool-shine`: a band of the text color sweeps across a label in the row's
 /// gray, every 2.2 seconds, while the work it names goes on.
 fn shimmering_label(
@@ -5793,6 +5807,13 @@ fn mix(from: Hsla, to: Hsla, amount: f32) -> Hsla {
         b: channel(from.b, to.b),
         a: channel(from.a, to.a),
     })
+}
+
+/// Text for a one-line row: every run of whitespace, newlines included, as one space, as t3code's
+/// `truncate`d rows show a multi-line command. GPUI starts a new line at each newline even in
+/// truncated text.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Whether an entry is the agent's work between messages, which t3code groups: tool calls and
@@ -6303,6 +6324,24 @@ mod tests {
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-call-output-1").is_some());
+
+        // A command over several lines still takes one.
+        let mut multi_line = tool_call(acp::ToolCallStatus::Completed);
+        if let Entry::ToolCall(tool_call) = &mut multi_line {
+            tool_call.id = acp::ToolCallId::new("call-3");
+            tool_call.title = "cd src &&\n  npm test \\\n    --watch".into();
+        }
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![Entry::UserMessage("Run the tests".into()), multi_line],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let multi_line_row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the multi-line command's row");
+        assert_eq!(multi_line_row.size.height, row.size.height);
 
         // An edit's row counts its lines.
         let edit = Entry::ToolCall(ToolCall {

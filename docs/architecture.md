@@ -217,7 +217,9 @@ Each entry: what it does, where it lives, and where it comes from.
 - **Timeline** (`agent_view.rs`; t3code's `MessagesTimeline`, picked in `design/thread/`): a
   tool call is one compact row: its kind's icon, then "Ran"/"Running" and the command in the
   code font, "Edited" and the path (or "Edited N files") with +added −removed, or the agent's
-  title with the thread folder stripped; a spinner while it runs, "Failed" when it fails, a
+  title with the thread folder stripped, always on one line (`one_line`: newlines and runs of
+  spaces become one space, as t3code's truncated rows show a multi-line command, and a
+  command's `\`-newline continuations too); a spinner while it runs, "Failed" when it fails, a
   chevron on hover. Every row starts closed and a click opens its output beside it (input,
   diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. Rows are
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
@@ -230,8 +232,10 @@ Each entry: what it does, where it lives, and where it comes from.
   (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and performed 2 other
   actions"); the running turn's rows show as they come, and a lone call stays a row. The
   user's message is a bubble on the right with its time ("09:07", "yesterday at
-  23:30") and Copy on hover. While a turn runs the footer says "Working for 12s"; under a
-  finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
+  23:30") and Copy on hover. The bubble is the thread's background a tenth of the way toward its
+  text (`user_message_background`), so it shows in every theme: most themes give
+  `element_background` the panel's own color. While a turn runs the footer says "Working for
+  12s"; under a finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
   (`ThreadState::sent_times` by entry, `finished_turns` by each turn's end entry), so they
   survive reopening the thread; messages and turns an agent replays from history have none.
 - **Steer** (`agent_view.rs`, picked in `design/thread/`): a queued message has Steer beside
