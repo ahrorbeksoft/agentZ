@@ -21,8 +21,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FollowMode, Hsla, KeyBinding, ListAlignment, ListOffset, ListState,
-    Pixels, Point, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, list,
+    FocusHandle, Focusable, FollowMode, Hsla, KeyBinding, ListAlignment, ListState, Pixels, Point,
+    PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, list,
     pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -216,7 +216,6 @@ pub struct AgentView {
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
     /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
-    expanded_raw_inputs: HashSet<acp::ToolCallId>,
     /// Keeps a streaming thought scrolled to its newest text while it's height-limited.
     thought_scroll_handles: HashMap<usize, ScrollHandle>,
     toggled_thoughts: HashSet<usize>,
@@ -224,6 +223,8 @@ pub struct AgentView {
     edits_expanded: bool,
     /// Messages typed while the agent works; sent one at a time as each turn ends, like Zed.
     queued_messages: Vec<QueuedMessage>,
+    /// The first queued message steers: the agent's turn ends once its current step is done.
+    steer_armed: bool,
     /// What each of the composer's chips mentions.
     mentions: HashMap<ChipId, Mention>,
     /// The `@query` the composer's cursor is at, while its menu is open.
@@ -316,6 +317,7 @@ impl AgentView {
             }),
             cx.observe(&thread, |this, thread, cx| {
                 this.sync_entries(cx);
+                this.steer_if_due(cx);
                 sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
                 this.sync_composer_placeholder(cx);
                 this.send_next_queued_message(cx);
@@ -399,12 +401,12 @@ impl AgentView {
             synced_revisions: Vec::new(),
             markdowns: HashMap::default(),
             toggled_tool_calls: HashSet::default(),
-            expanded_raw_inputs: HashSet::default(),
             thought_scroll_handles: HashMap::default(),
             toggled_thoughts: HashSet::default(),
             plan_expanded: false,
             edits_expanded: false,
             queued_messages: Vec::new(),
+            steer_armed: false,
             mentions: HashMap::default(),
             mention_query: None,
             mention_kind: MentionKind::Any,
@@ -1238,6 +1240,7 @@ impl AgentView {
             return;
         }
         let message = self.queued_messages.remove(0);
+        self.steer_armed = false;
         self.list_state.scroll_to_end();
         // Deferred: this runs while the thread is notifying observers.
         let thread = self.thread.clone();
@@ -1702,7 +1705,7 @@ impl AgentView {
             v_flex()
                 .w_full()
                 .pb_4()
-                .children(self.render_tail_rows(window, cx))
+                .children(self.render_tail_rows(cx))
                 .when(needs_login, |this| {
                     this.child(
                         v_flex()
@@ -1727,7 +1730,7 @@ impl AgentView {
 
     /// What follows the entries: where the thread went on, permission requests without a tool
     /// call or from subthreads, requests for input, and the working indicator.
-    fn render_tail_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_tail_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let entry_count = self.thread.read(cx).entries().len();
         let mut rows = self.render_continuations(cx);
         let orphans: Vec<(acp::ToolCallId, String)> = self
@@ -1738,7 +1741,7 @@ impl AgentView {
             .collect();
         for (offset, (tool_call_id, title)) in orphans.iter().enumerate() {
             if let Some(element) =
-                self.render_orphan_permission(entry_count + offset, tool_call_id, title, window, cx)
+                self.render_orphan_permission(entry_count + offset, tool_call_id, title, cx)
             {
                 rows.push(element);
             }
@@ -2397,17 +2400,27 @@ impl AgentView {
                         self.store.clone().read(cx).describe_creator(sender)
                     )
                 });
+                let sent_at = self
+                    .thread
+                    .read(cx)
+                    .sent_time(index)
+                    .map(|time| day_aware_time(time, SystemTime::now()));
+                let group = SharedString::from(format!("user-message-{index}"));
+                // t3code's bubble: on the right, soft, at most four fifths wide; its time and
+                // Copy under it on hover.
                 v_flex()
                     .id(("user-message", index))
-                    .pt_2()
-                    .pb_3()
-                    .px_2()
+                    .group(group.clone())
+                    .pt_3()
+                    .pb_1()
+                    .px_5()
                     .w_full()
+                    .items_end()
+                    .gap_1()
                     .when_some(sent_by, |this, sent_by| {
                         this.child(
                             h_flex()
                                 .px_1()
-                                .pb_1()
                                 .gap_1()
                                 .child(
                                     Icon::new(IconName::Sparkle)
@@ -2423,15 +2436,37 @@ impl AgentView {
                     })
                     .child(
                         div()
-                            .py_3()
-                            .px_2()
-                            .rounded_md()
-                            .bg(colors.editor_background)
-                            .border_1()
-                            .border_color(colors.border)
-                            .shadow_md()
-                            .text_xs()
+                            .max_w(relative(0.8))
+                            .px_3()
+                            .py_2()
+                            .rounded_xl()
+                            .bg(colors.element_background)
+                            .text_ui(cx)
                             .children(self.markdown((index, 0), style)),
+                    )
+                    .child(
+                        h_flex()
+                            .h_5()
+                            .gap_2()
+                            .visible_on_hover(group)
+                            .children(sent_at.map(|time| {
+                                Label::new(time).size(LabelSize::XSmall).color(Color::Muted)
+                            }))
+                            .child(
+                                IconButton::new(("copy-user-message", index), IconName::Copy)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Copy Message"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(Entry::UserMessage(text)) =
+                                            this.thread.read(cx).entries().get(index)
+                                        {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                without_handoff(text).to_string(),
+                                            ));
+                                        }
+                                    })),
+                            ),
                     )
                     .into_any_element()
             }
@@ -2468,20 +2503,20 @@ impl AgentView {
 
     /// Zed's controls under a finished reply: copy it, jump to the prompt, jump to the top.
     fn render_thread_controls(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let user_message_index = self.thread.read(cx).entries()[..index]
-            .iter()
-            .rposition(|entry| matches!(entry, Entry::UserMessage(_)));
+        let turn_time = self.thread.read(cx).turn_time(index);
         h_flex()
             .w_full()
-            .py_1p5()
-            .px_4()
-            .gap_1()
-            .justify_end()
-            .opacity(0.4)
-            .hover(|this| this.opacity(1.))
+            .px_5()
+            .pb_3()
+            .gap_2()
+            .children(turn_time.map(|duration| {
+                Label::new(format!("Worked for {}", format_duration(duration)))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+            }))
             .child(
                 IconButton::new(("copy-agent-response", index), IconName::Copy)
-                    .icon_size(IconSize::Small)
+                    .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Copy This Agent Response"))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2490,32 +2525,6 @@ impl AgentView {
                         {
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
                         }
-                    })),
-            )
-            .when_some(user_message_index, |this, user_message_index| {
-                this.child(
-                    IconButton::new(("scroll-to-user-message", index), IconName::ForwardArrowUp)
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Scroll to User Message"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // The list's rows start with the head row.
-                            this.list_state.scroll_to(ListOffset {
-                                item_ix: user_message_index + 1,
-                                offset_in_item: px(0.),
-                            });
-                            cx.notify();
-                        })),
-                )
-            })
-            .child(
-                IconButton::new(("scroll-to-top", index), IconName::ArrowUp)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Scroll to Top"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.list_state.scroll_to(ListOffset::default());
-                        cx.notify();
                     })),
             )
             .into_any_element()
@@ -2638,271 +2647,40 @@ impl AgentView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let editor_background = cx.theme().colors().editor_background;
+        let colors = cx.theme().colors();
         let failed = matches!(tool_call.status, acp::ToolCallStatus::Failed);
+        let in_progress = matches!(
+            tool_call.status,
+            acp::ToolCallStatus::InProgress | acp::ToolCallStatus::Pending
+        );
         let needs_confirmation = self
             .thread
             .read(cx)
             .permission_request(&tool_call.id)
             .is_some();
-        let is_terminal_tool = matches!(tool_call.kind, acp::ToolKind::Execute);
-        let is_edit = matches!(tool_call.kind, acp::ToolKind::Edit) || !tool_call.diffs.is_empty();
-        let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
-        let should_show_raw_input = !is_terminal_tool && !is_edit;
+        let is_execute = matches!(tool_call.kind, acp::ToolKind::Execute);
         let has_content = !tool_call.text.is_empty()
             || !tool_call.diffs.is_empty()
             || !tool_call.terminals.is_empty()
-            || (should_show_raw_input && tool_call.raw_input.is_some());
-        let is_collapsible = has_content && !needs_confirmation;
-        // Like Zed (with its default `expand_edit_card`), edits start open and everything else
-        // starts collapsed; clicking flips that.
-        // A command's live terminal starts open too, as Zed's terminal cards do.
-        let open_by_default = is_edit || !tool_call.terminals.is_empty();
-        let is_open = needs_confirmation
-            || open_by_default != self.toggled_tool_calls.contains(&tool_call.id);
-        let header_group = SharedString::from(format!("tool-call-header-{index}"));
-
-        let label = self.render_tool_call_label(tool_call, use_card_layout, window, cx);
+            || tool_call.raw_input.is_some();
+        let is_openable = has_content && !needs_confirmation;
+        let is_open = needs_confirmation || self.toggled_tool_calls.contains(&tool_call.id);
+        let (added, removed) = tool_call.diffs.iter().map(FileDiff::line_counts).fold(
+            (0, 0),
+            |(added, removed), (more_added, more_removed)| {
+                (added + more_added, removed + more_removed)
+            },
+        );
+        let row_group = SharedString::from(format!("tool-call-row-{index}"));
         let toggle = {
-            let view = cx.entity().downgrade();
             let tool_call_id = tool_call.id.clone();
-            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                view.update(cx, |this, cx| {
-                    if !this.toggled_tool_calls.remove(&tool_call_id) {
-                        this.toggled_tool_calls.insert(tool_call_id.clone());
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
+            cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                if !this.toggled_tool_calls.remove(&tool_call_id) {
+                    this.toggled_tool_calls.insert(tool_call_id.clone());
+                }
+                cx.notify();
+            })
         };
-        let header = h_flex()
-            .group(&header_group)
-            .relative()
-            .w_full()
-            .justify_between()
-            .when(use_card_layout, |this| {
-                this.p_0p5()
-                    .rounded_t(rems_from_px(5_f32))
-                    .bg(Self::tool_card_header_bg(cx))
-            })
-            .child(label)
-            .child(
-                h_flex()
-                    .pr_0p5()
-                    .gap_1()
-                    .when(
-                        matches!(tool_call.status, acp::ToolCallStatus::InProgress)
-                            && use_card_layout,
-                        |this| {
-                            this.child(
-                                Icon::new(IconName::LoadCircle)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted)
-                                    .with_rotate_animation(2),
-                            )
-                        },
-                    )
-                    .when(is_collapsible, |this| {
-                        this.child(
-                            Disclosure::new(("tool-call-disclosure", index), is_open)
-                                .opened_icon(IconName::ChevronUp)
-                                .closed_icon(IconName::ChevronDown)
-                                .visible_on_hover(&header_group)
-                                .on_click(toggle.clone()),
-                        )
-                    })
-                    .when(failed, |this| {
-                        this.child(
-                            Icon::new(IconName::Close)
-                                .color(Color::Error)
-                                .size(IconSize::Small),
-                        )
-                    }),
-            );
-
-        let input_output_header = |label: &'static str| {
-            Label::new(label)
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .buffer_font(cx)
-        };
-
-        let mut output = Vec::new();
-        if is_open {
-            if needs_confirmation {
-                // Zed tucks the raw input behind "View Raw Input" while awaiting permission.
-                if should_show_raw_input && tool_call.raw_input.is_some() {
-                    let is_raw_input_expanded = self.expanded_raw_inputs.contains(&tool_call.id);
-                    let tool_call_id = tool_call.id.clone();
-                    output.push(
-                        v_flex()
-                            .p_2()
-                            .gap_1()
-                            .border_t_1()
-                            .border_color(Self::tool_card_border_color(cx))
-                            .child(
-                                h_flex()
-                                    .id(("raw-input-toggle", index))
-                                    .pl_0p5()
-                                    .gap_1()
-                                    .justify_between()
-                                    .rounded_xs()
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(cx.theme().colors().element_hover))
-                                    .child(input_output_header(if is_raw_input_expanded {
-                                        "Raw Input:"
-                                    } else {
-                                        "View Raw Input"
-                                    }))
-                                    .child(
-                                        Disclosure::new(
-                                            ("raw-input-disclosure", index),
-                                            is_raw_input_expanded,
-                                        )
-                                        .opened_icon(IconName::ChevronUp)
-                                        .closed_icon(IconName::ChevronDown),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if !this.expanded_raw_inputs.remove(&tool_call_id) {
-                                            this.expanded_raw_inputs.insert(tool_call_id.clone());
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(is_raw_input_expanded, |this| {
-                                this.children(self.markdown(
-                                    (index, RAW_INPUT_PART),
-                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                                ))
-                            })
-                            .into_any_element(),
-                    );
-                }
-            } else if should_show_raw_input && tool_call.raw_input.is_some() {
-                output.push(
-                    v_flex()
-                        .mt_1p5()
-                        .w_full()
-                        .ml(rems(0.4))
-                        .px_3p5()
-                        .pb_1()
-                        .gap_1()
-                        .border_l_1()
-                        .border_color(Self::tool_card_border_color(cx))
-                        .child(input_output_header("Raw Input:"))
-                        .children(self.markdown(
-                            (index, RAW_INPUT_PART),
-                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                        ))
-                        .child(input_output_header("Output:"))
-                        .into_any_element(),
-                );
-            }
-            for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
-                output.push(render_diff(diff, (index, diff_index), cx));
-            }
-            for terminal_id in &tool_call.terminals {
-                if let Some(terminal) = self.tool_terminals.get(terminal_id) {
-                    output.push(
-                        div()
-                            .w_full()
-                            .py_1()
-                            .when(use_card_layout, |this| {
-                                this.border_t_1()
-                                    .border_color(Self::tool_card_border_color(cx))
-                            })
-                            .bg(cx.theme().colors().terminal_background)
-                            .child(terminal.clone())
-                            .into_any_element(),
-                    );
-                }
-            }
-            for part in 0..tool_call.text.len() {
-                let style = tool_output_style(is_terminal_tool, window, cx);
-                if let Some(markdown) = self.markdown((index, part + 1), style) {
-                    output.push(
-                        div()
-                            .id(SharedString::from(format!("tool-output-{index}-{part}")))
-                            .when(use_card_layout, |this| {
-                                this.p_2()
-                                    .border_t_1()
-                                    .border_color(Self::tool_card_border_color(cx))
-                            })
-                            // Long command output scrolls inside the card, like Zed's terminal
-                            // card (`h_72`).
-                            .when(is_terminal_tool, |this| this.max_h_72().overflow_y_scroll())
-                            .when(!use_card_layout, |this| {
-                                this.mt_1p5()
-                                    .ml(rems(0.4))
-                                    .px_3p5()
-                                    .border_l_1()
-                                    .border_color(Self::tool_card_border_color(cx))
-                            })
-                            .text_xs()
-                            .child(markdown)
-                            .into_any_element(),
-                    );
-                }
-            }
-            if !use_card_layout && is_collapsible {
-                output.push(
-                    div()
-                        .ml(rems(0.4))
-                        .px_3p5()
-                        .pt_2()
-                        .border_l_1()
-                        .border_color(Self::tool_card_border_color(cx))
-                        .child(
-                            IconButton::new(("tool-call-collapse", index), IconName::ChevronUp)
-                                .full_width()
-                                .style(ButtonStyle::Outlined)
-                                .icon_color(Color::Muted)
-                                .on_click(toggle),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-
-        let permission_buttons = self.render_permission_buttons(index, &tool_call.id, cx);
-
-        v_flex()
-            .map(|this| {
-                if use_card_layout {
-                    this.my_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .when(failed, |this| this.border_dashed())
-                        .border_color(Self::tool_card_border_color(cx))
-                        .bg(editor_background)
-                        .overflow_hidden()
-                } else {
-                    this.my_1()
-                }
-            })
-            .map(|this| {
-                if tool_call.locations.len() == 1 && !use_card_layout {
-                    this.ml_4()
-                } else {
-                    this.ml_5()
-                }
-            })
-            .mr_5()
-            .child(header)
-            .children(output)
-            .children(permission_buttons)
-            .into_any_element()
-    }
-
-    fn render_tool_call_label(
-        &self,
-        tool_call: &ToolCall,
-        use_card_layout: bool,
-        window: &Window,
-        cx: &App,
-    ) -> AnyElement {
-        let colors = cx.theme().colors();
         let icon = Icon::new(match tool_call.kind {
             acp::ToolKind::Read => IconName::ToolSearch,
             acp::ToolKind::Edit => IconName::ToolPencil,
@@ -2917,70 +2695,164 @@ impl AgentView {
         })
         .size(IconSize::Small)
         .color(Color::Muted);
-
-        let fade_bg = if use_card_layout {
-            Self::tool_card_header_bg(cx)
-        } else {
-            colors.panel_background
-        };
-
-        if matches!(tool_call.kind, acp::ToolKind::Execute) {
-            return v_flex()
-                .w_full()
-                .p_1p5()
-                .pt_1()
-                .bg(Self::tool_card_header_bg(cx))
-                .child(
-                    h_flex().h_6().child(
-                        Label::new("Run Command")
-                            .buffer_font(cx)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+        let row = h_flex()
+            .id(("tool-call-row", index))
+            .debug_selector(|| format!("tool-call-row-{index}"))
+            .group(row_group.clone())
+            .min_h(px(24.))
+            .gap_1p5()
+            .px_0p5()
+            .rounded_md()
+            .when(is_openable, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(colors.ghost_element_hover))
+                    .on_click(toggle)
+            })
+            .child(h_flex().w(px(24.)).flex_none().justify_center().child(icon))
+            .child(self.render_tool_call_label(tool_call, in_progress, cx))
+            .when(added + removed > 0, |this| {
+                this.child(div().flex_none().child(diff_stat(added, removed)))
+            })
+            .when(in_progress, |this| {
+                this.child(
+                    Icon::new(IconName::LoadCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+            })
+            .when(failed, |this| {
+                this.child(
+                    Label::new("Failed")
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+            })
+            .when(is_openable, |this| {
+                this.child(
+                    div().flex_none().visible_on_hover(row_group).child(
+                        Icon::new(if is_open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
                     ),
                 )
-                .child(
-                    div()
-                        .font_buffer(cx)
-                        .text_size(rems_from_px(12_f32))
-                        .line_height(rems_from_px(17_f32))
-                        .text_color(colors.text)
-                        .child(tool_call.title.clone()),
-                )
-                .into_any_element();
-        }
+            });
 
-        h_flex()
-            .relative()
-            .w_full()
-            .h(window.line_height() - px(2.))
-            .text_size(rems_from_px(13_f32))
-            .gap_1p5()
-            .when(use_card_layout, |this| this.px_1())
-            .overflow_hidden()
-            .child(div().flex_none().child(icon))
-            .child(
-                div()
-                    .w_full()
-                    .whitespace_nowrap()
-                    .text_color(if use_card_layout {
-                        colors.text
-                    } else {
-                        colors.text_muted
-                    })
-                    .child(tool_call.title.clone()),
+        // What it read, ran or wrote, under the row past its icon, scrolling past 24rem.
+        let mut output = Vec::new();
+        if is_open && has_content {
+            let is_edit =
+                matches!(tool_call.kind, acp::ToolKind::Edit) || !tool_call.diffs.is_empty();
+            if !is_execute && !is_edit && tool_call.raw_input.is_some() {
+                output.extend(
+                    self.markdown((index, RAW_INPUT_PART), tool_output_style(true, window, cx))
+                        .map(|markdown| div().text_xs().child(markdown).into_any_element()),
+                );
+            }
+            for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
+                output.push(render_diff(diff, (index, diff_index), cx));
+            }
+            for terminal_id in &tool_call.terminals {
+                if let Some(terminal) = self.tool_terminals.get(terminal_id) {
+                    output.push(
+                        div()
+                            .w_full()
+                            .py_1()
+                            .rounded_md()
+                            .bg(colors.terminal_background)
+                            .child(terminal.clone())
+                            .into_any_element(),
+                    );
+                }
+            }
+            for part in 0..tool_call.text.len() {
+                let style = tool_output_style(is_execute, window, cx);
+                if let Some(markdown) = self.markdown((index, part + 1), style) {
+                    output.push(div().text_xs().child(markdown).into_any_element());
+                }
+            }
+        }
+        let details = (!output.is_empty()).then(|| {
+            v_flex()
+                .id(("tool-call-output", index))
+                .debug_selector(|| format!("tool-call-output-{index}"))
+                .ml(px(30.))
+                .max_h(rems(24.))
+                .overflow_y_scroll()
+                .py_1()
+                .gap_1()
+                .children(output)
+        });
+
+        v_flex()
+            .mx_5()
+            .child(row)
+            .children(details)
+            .children(self.render_permission_buttons(index, &tool_call.id, cx))
+            .into_any_element()
+    }
+
+    /// What the tool call did, in t3code's words where its kind says what: "Ran" and the
+    /// command in the code font, "Edited" and the file; otherwise the agent's own title. Paths in
+    /// the thread's folder read relative to it.
+    fn render_tool_call_label(
+        &self,
+        tool_call: &ToolCall,
+        in_progress: bool,
+        cx: &App,
+    ) -> AnyElement {
+        let folder = self
+            .store
+            .read(cx)
+            .thread_folder(self.thread_id)
+            .map(|folder| format!("{}/", folder.display()));
+        let relative = |text: &str| -> String {
+            match &folder {
+                Some(folder) => text.replace(folder.as_str(), ""),
+                None => text.to_string(),
+            }
+        };
+        let (verb, subject) = if matches!(tool_call.kind, acp::ToolKind::Execute) {
+            let command = tool_call.title.trim().trim_matches('`').to_string();
+            (
+                Some(if in_progress { "Running" } else { "Ran" }),
+                Some(command),
             )
+        } else if let [diff] = tool_call.diffs.as_slice() {
+            (
+                Some("Edited"),
+                Some(relative(&diff.path.display().to_string())),
+            )
+        } else if tool_call.diffs.len() > 1 {
+            (
+                None,
+                Some(format!("Edited {} files", tool_call.diffs.len())),
+            )
+        } else {
+            (None, Some(relative(&tool_call.title)))
+        };
+        let subject = subject.unwrap_or_default();
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .text_size(rems_from_px(13_f32))
+            .text_color(cx.theme().colors().text_muted)
+            .children(verb.map(|verb| div().flex_none().child(verb)))
             .child(
                 div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .w_12()
-                    .h_full()
-                    .bg(gpui::linear_gradient(
-                        90.,
-                        gpui::linear_color_stop(fade_bg, 1.),
-                        gpui::linear_color_stop(fade_bg.opacity(0.2), 0.),
-                    )),
+                    .min_w_0()
+                    .truncate()
+                    .when(verb.is_some(), |this| {
+                        this.font_buffer(cx)
+                            .text_size(rems_from_px(12_f32))
+                            .text_color(cx.theme().colors().text)
+                    })
+                    .child(subject),
             )
             .into_any_element()
     }
@@ -3041,7 +2913,6 @@ impl AgentView {
         index: usize,
         tool_call_id: &acp::ToolCallId,
         title: &str,
-        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let buttons = self.render_permission_buttons(index, tool_call_id, cx)?;
@@ -3067,10 +2938,12 @@ impl AgentView {
                 .bg(cx.theme().colors().editor_background)
                 .overflow_hidden()
                 .child(
-                    div()
-                        .p_0p5()
-                        .bg(Self::tool_card_header_bg(cx))
-                        .child(self.render_tool_call_label(&tool_call, true, window, cx)),
+                    div().p_0p5().bg(Self::tool_card_header_bg(cx)).child(
+                        h_flex()
+                            .px_1()
+                            .min_h(px(24.))
+                            .child(self.render_tool_call_label(&tool_call, false, cx)),
+                    ),
                 )
                 .child(buttons)
                 .into_any_element(),
@@ -3082,12 +2955,11 @@ impl AgentView {
         let started_at = thread.turn_started_at()?;
         // Any permission request, whether its tool call is shown or not.
         let awaiting_confirmation = !thread.state.permission_requests.is_empty();
-        let elapsed = started_at.elapsed().unwrap_or_default().as_secs();
-        let elapsed_label = if elapsed >= 60 {
-            format!("{}m {:02}s", elapsed / 60, elapsed % 60)
-        } else {
-            format!("{elapsed}s")
-        };
+        // t3code's "Working for 1m 12s".
+        let elapsed_label = format!(
+            "Working for {}",
+            format_elapsed(started_at.elapsed().unwrap_or_default())
+        );
         let status_label = if thread.status() == &ConnectionStatus::Connecting {
             Some(format!("Starting {}…", self.agent_name(cx)))
         } else if awaiting_confirmation {
@@ -3542,6 +3414,9 @@ impl AgentView {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if index < this.queued_messages.len() {
                                             this.queued_messages.remove(index);
+                                            if index == 0 {
+                                                this.steer_armed = false;
+                                            }
                                         }
                                         cx.notify();
                                     })),
@@ -3553,12 +3428,28 @@ impl AgentView {
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if index < this.queued_messages.len() {
                                             let message = this.queued_messages.remove(index);
+                                            if index == 0 {
+                                                this.steer_armed = false;
+                                            }
                                             this.composer.update(cx, |composer, cx| {
                                                 composer.set_text(message.text, cx)
                                             });
                                             window.focus(&this.composer.focus_handle(cx), cx);
                                         }
                                         cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(("steer-queued", index), "Steer")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Outlined)
+                                    .toggle_state(is_next && self.steer_armed)
+                                    .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                    .tooltip(Tooltip::text(
+                                        "Send once the agent finishes the step it's on",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.steer_queued_message(index, cx);
                                     })),
                             )
                             .child(
@@ -3590,6 +3481,56 @@ impl AgentView {
 
     /// Moves a queued message to the front and sends it as soon as possible, stopping the
     /// current turn if the agent is working.
+    /// Zed's Steer: puts the message first, to go once the agent's current step is done.
+    /// Steering the steering message again stops it.
+    fn steer_queued_message(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.queued_messages.len() {
+            return;
+        }
+        if index == 0 && self.steer_armed {
+            self.steer_armed = false;
+        } else {
+            let message = self.queued_messages.remove(index);
+            self.queued_messages.insert(0, message);
+            self.steer_armed = true;
+        }
+        self.steer_if_due(cx);
+        cx.notify();
+    }
+
+    /// Over ACP nothing joins a running turn, so a steering message ends the turn at the next
+    /// step: once no tool call is running (one waiting for approval is between steps). The queue
+    /// then sends it, as at any turn's end.
+    fn steer_if_due(&mut self, cx: &mut Context<Self>) {
+        if !self.steer_armed {
+            return;
+        }
+        if self.queued_messages.is_empty() {
+            self.steer_armed = false;
+            return;
+        }
+        let thread = self.thread.read(cx);
+        if !thread.is_working() {
+            return;
+        }
+        let entries = thread.entries();
+        let turn_start = entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::UserMessage(_)))
+            .unwrap_or(0);
+        let is_running = entries[turn_start..].iter().any(|entry| {
+            matches!(entry, Entry::ToolCall(tool_call)
+                if tool_call.status == acp::ToolCallStatus::InProgress)
+        });
+        if is_running && thread.state.permission_requests.is_empty() {
+            return;
+        }
+        self.steer_armed = false;
+        // Deferred: this can run while the thread notifies its observers.
+        let thread = self.thread.clone();
+        cx.defer(move |cx| thread.update(cx, |thread, cx| thread.cancel(cx)));
+    }
+
     fn send_queued_message_now(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.queued_messages.len() {
             return;
@@ -5330,7 +5271,7 @@ impl Render for AgentView {
             .update(cx, |composer, cx| composer.set_menu_open(menu_open, cx));
         let panel_background = cx.theme().colors().panel_background;
         let entry_count = self.thread.read(cx).entries().len();
-        let has_rows = entry_count > 0 || !self.render_tail_rows(window, cx).is_empty();
+        let has_rows = entry_count > 0 || !self.render_tail_rows(cx).is_empty();
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
         let needs_login = self.needs_login(cx);
 
@@ -5721,6 +5662,68 @@ fn indicator_dot(cx: &App) -> Div {
         .bg(Color::Accent.color(cx))
 }
 
+/// t3code's durations: "45s", "1m 12s", "1h 3m".
+/// A finished turn's length, as t3code words it: milliseconds under a second,
+/// tenths under ten seconds, then whole units ("1h 3m", "2m 5s").
+fn format_duration(duration: Duration) -> String {
+    let milliseconds = duration.as_millis();
+    if milliseconds < 1_000 {
+        return format!("{}ms", milliseconds.max(1));
+    }
+    if milliseconds < 10_000 {
+        let tenths = (milliseconds + 50) / 100;
+        return if tenths >= 100 {
+            "10s".to_string()
+        } else {
+            format!("{}.{}s", tenths / 10, tenths % 10)
+        };
+    }
+    let seconds = (milliseconds + 500) / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let mut parts = Vec::new();
+    if seconds >= 3_600 {
+        parts.push(format!("{}h", seconds / 3_600));
+    }
+    if seconds % 3_600 >= 60 {
+        parts.push(format!("{}m", (seconds % 3_600) / 60));
+    }
+    if !seconds.is_multiple_of(60) {
+        parts.push(format!("{}s", seconds % 60));
+    }
+    parts.join(" ")
+}
+
+/// A message's time as t3code shows it: the time today, "yesterday at" it, or the date
+/// before it.
+fn day_aware_time(time: SystemTime, now: SystemTime) -> String {
+    use chrono::Datelike as _;
+    let time = chrono::DateTime::<chrono::Local>::from(time);
+    let now = chrono::DateTime::<chrono::Local>::from(now);
+    let clock = time.format("%H:%M");
+    let days_ago = (now.date_naive() - time.date_naive()).num_days();
+    if days_ago <= 0 {
+        clock.to_string()
+    } else if days_ago == 1 {
+        format!("yesterday at {clock}")
+    } else if time.year() == now.year() {
+        format!("{} {clock}", time.format("%-m/%-d"))
+    } else {
+        format!("{} {clock}", time.format("%-m/%-d/%Y"))
+    }
+}
+
+/// The running timer counts whole seconds, so it doesn't flicker through tenths.
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format_duration(Duration::from_secs(seconds))
+    }
+}
+
 fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
     h_flex()
         .gap_1()
@@ -5744,6 +5747,51 @@ mod tests {
 
     use super::*;
     use crate::machines::MachineId;
+
+    #[test]
+    fn durations_read_like_t3codes() {
+        let cases = [
+            (Duration::from_millis(0), "1ms"),
+            (Duration::from_millis(420), "420ms"),
+            (Duration::from_millis(8_040), "8.0s"),
+            (Duration::from_millis(9_960), "10s"),
+            (Duration::from_secs(22), "22s"),
+            (Duration::from_secs(60), "1m"),
+            (Duration::from_secs(72), "1m 12s"),
+            (Duration::from_secs(3_780), "1h 3m"),
+        ];
+        for (duration, expected) in cases {
+            assert_eq!(format_duration(duration), expected);
+        }
+        assert_eq!(format_elapsed(Duration::from_millis(8_900)), "8s");
+        assert_eq!(format_elapsed(Duration::from_secs(72)), "1m 12s");
+    }
+
+    #[test]
+    fn message_times_name_the_day_when_not_today() {
+        use chrono::TimeZone as _;
+        let local = |year, month, day, hour, minute| -> SystemTime {
+            chrono::Local
+                .with_ymd_and_hms(year, month, day, hour, minute, 0)
+                .single()
+                .expect("a local time")
+                .into()
+        };
+        let now = local(2026, 10, 5, 15, 0);
+        assert_eq!(day_aware_time(local(2026, 10, 5, 9, 7), now), "09:07");
+        assert_eq!(
+            day_aware_time(local(2026, 10, 4, 23, 30), now),
+            "yesterday at 23:30"
+        );
+        assert_eq!(
+            day_aware_time(local(2026, 8, 13, 12, 34), now),
+            "8/13 12:34"
+        );
+        assert_eq!(
+            day_aware_time(local(2025, 12, 31, 8, 0), now),
+            "12/31/2025 08:00"
+        );
+    }
 
     fn thread(id: u64, session_id: Option<&str>) -> projects::Thread {
         serde_json::from_value(serde_json::json!({
@@ -6009,6 +6057,106 @@ mod tests {
         thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
         cx.run_until_parked();
         assert!(cx.debug_bounds("conversation-row-302").is_some());
+    }
+
+    fn tool_call(status: acp::ToolCallStatus) -> Entry {
+        Entry::ToolCall(ToolCall {
+            id: acp::ToolCallId::new("call-1"),
+            title: "`npm test`".into(),
+            kind: acp::ToolKind::Execute,
+            status,
+            text: vec!["PASS src/cart/total.test.ts".into()],
+            diffs: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+            terminals: Vec::new(),
+        })
+    }
+
+    /// t3code's compact row: closed until clicked, then its output shows under it.
+    #[gpui::test]
+    fn a_tool_call_is_a_row_that_opens_to_its_output(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    tool_call(acp::ToolCallStatus::Completed),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        assert!(cx.debug_bounds("tool-call-output-1").is_none());
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+
+        // An edit's row counts its lines.
+        let edit = Entry::ToolCall(ToolCall {
+            id: acp::ToolCallId::new("call-2"),
+            title: "Edit total.ts".into(),
+            kind: acp::ToolKind::Edit,
+            status: acp::ToolCallStatus::Completed,
+            text: Vec::new(),
+            diffs: vec![FileDiff {
+                path: "/tmp/demo/total.ts".into(),
+                old_text: Some("a\nb\n".into()),
+                new_text: "a\nc\nd\n".into(),
+            }],
+            locations: Vec::new(),
+            raw_input: None,
+            terminals: Vec::new(),
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Edit it".into()), edit], cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-row-1").is_some());
+    }
+
+    /// Zed's Steer: the turn ends once the tool call running is done, not before.
+    #[gpui::test]
+    fn steering_waits_for_the_running_tool_call(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let user = Entry::UserMessage("Run the tests".into());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![user.clone(), tool_call(acp::ToolCallStatus::InProgress)],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+        });
+        let cancels = |cx: &mut VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter(|request| matches!(request, Request::Cancel(_)))
+                    .count()
+            })
+        };
+        view.update(cx, |view, cx| {
+            view.queued_messages.push(QueuedMessage {
+                text: "Use the receipt's rounding".into(),
+                prompt: PromptPart::text("Use the receipt's rounding"),
+            });
+            view.steer_queued_message(0, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(cancels(cx), 0);
+
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![user, tool_call(acp::ToolCallStatus::Completed)], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cancels(cx), 1);
     }
 
     #[gpui::test]

@@ -214,6 +214,22 @@ Each entry: what it does, where it lives, and where it comes from.
   that take embedded context and a link otherwise, a folder is a link, a thread is embedded or
   plain text, and an image goes only to agents that take images. The user's message shows each
   mention as Zed writes one, `[@name](uri)`, also when an agent replays it.
+- **Timeline** (`agent_view.rs`; t3code's `MessagesTimeline`, picked in `design/thread/`): a
+  tool call is one compact row: its kind's icon, then "Ran"/"Running" and the command in the
+  code font, "Edited" and the path (or "Edited N files") with +added −removed, or the agent's
+  title with the thread folder stripped; a spinner while it runs, "Failed" when it fails, a
+  chevron on hover. Every row starts closed and a click opens its output beside it (input,
+  diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. Thinking
+  is Zed's. The user's message is a bubble on the right with its time ("09:07", "yesterday at
+  23:30") and Copy on hover. While a turn runs the footer says "Working for 12s"; under a
+  finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
+  (`ThreadState::sent_times` by entry, `finished_turns` by each turn's end entry), so they
+  survive reopening the thread; messages and turns an agent replays from history have none.
+- **Steer** (`agent_view.rs`, picked in `design/thread/`): a queued message has Steer beside
+  Send Now. ACP takes one prompt at a time, so Steer moves the message to the front and waits
+  for the step the agent is on: once no tool call since the last message is running (or it
+  asks for permission), agentZ cancels the turn and the queue sends the message. Editing or
+  removing the front message disarms it.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
   thread's menu (Rename, Continue with Another Agent ▸ except on a draft, Archive, Delete…), and a double-click

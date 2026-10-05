@@ -1,0 +1,65 @@
+{
+  "topics": {
+    "work": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "B": ""
+      },
+      "note": "",
+      "also": []
+    },
+    "row": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "edits": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "thinking": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "user": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "status": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": "worked for not working for"
+      },
+      "note": "",
+      "also": []
+    },
+    "steer": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-05T04:14:58.018Z"
+}

@@ -1055,6 +1055,13 @@ impl Sidebar {
                 this.group_hover(group_name.clone(), |this| this.invisible())
             })
             .child(status);
+        // The buttons cover the end of the title in the card's own color, fading in from it,
+        // so a long title doesn't show through them.
+        let cover = colors.panel_background.blend(if is_active {
+            selected_background
+        } else {
+            hover_background
+        });
         let hover_buttons = has_hover_buttons.then(|| {
             // Centered on its line, like t3code's Settle button.
             h_flex()
@@ -1063,8 +1070,18 @@ impl Sidebar {
                 .bottom_0()
                 .right_0()
                 .visible_on_hover(group_name.clone())
-                .children(discard_button)
-                .when(is_archivable, |this| this.child(archive_button))
+                .child(div().w_6().h_full().bg(gpui::linear_gradient(
+                    90.,
+                    gpui::linear_color_stop(cover, 1.),
+                    gpui::linear_color_stop(cover.opacity(0.), 0.),
+                )))
+                .child(
+                    h_flex()
+                        .h_full()
+                        .bg(cover)
+                        .children(discard_button)
+                        .when(is_archivable, |this| this.child(archive_button)),
+                )
         });
         // The same pen as the draft rows, so both kinds of unsent work read the same way.
         let unsent_marker = has_unsent_text.then(|| {

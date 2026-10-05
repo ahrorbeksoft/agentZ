@@ -25,7 +25,7 @@ use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
     AuthStatus, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry, FileDiff,
     PendingHandoff, PermissionOption, PermissionRequest, PlanItem, SessionDefaults, SessionRestore,
-    ThreadState, ThreadView, ToolCall,
+    ThreadState, ThreadView, ToolCall, TurnTime,
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -724,8 +724,10 @@ impl AgentThread {
         let stopping = self.stop_agent();
         self.generation += 1;
         self.view.entries.clear();
+        self.view.state.finished_turns.clear();
         self.entry_changed(0);
         self.view.state.prompts_from_agents.clear();
+        self.view.state.sent_times.clear();
         self.view.state.plan.clear();
         self.cancel_permission_requests();
         self.cancel_elicitations(|_| true);
@@ -841,14 +843,16 @@ impl AgentThread {
             (
                 std::mem::take(&mut self.view.entries),
                 std::mem::take(&mut self.view.state.prompts_from_agents),
+                std::mem::take(&mut self.view.state.sent_times),
             )
         });
         self.reload();
         self.queued_prompts = queued_prompts;
-        if let Some((entries, prompts_from_agents)) = conversation {
+        if let Some((entries, prompts_from_agents, sent_times)) = conversation {
             self.view.entries = entries;
             self.entry_changed(0);
             self.view.state.prompts_from_agents = prompts_from_agents;
+            self.view.state.sent_times = sent_times;
         }
     }
 
@@ -1449,6 +1453,10 @@ impl AgentThread {
         {
             self.emit(AgentThreadEvent::FirstPrompt(message_title(&parts)));
         }
+        self.view
+            .state
+            .sent_times
+            .push((self.view.entries.len(), SystemTime::now()));
         self.push_entry(Entry::UserMessage(message_markdown(&parts)));
         if let Some(handoff) = self.view.state.handoff.take() {
             self.handoff_to_send = Some(handoff);
@@ -1655,6 +1663,18 @@ impl AgentThread {
     fn set_working(&mut self, working: bool) {
         if working == self.is_working() {
             return;
+        }
+        if !working
+            && let Some(duration) = self
+                .view
+                .state
+                .turn_started_at
+                .and_then(|started| started.elapsed().ok())
+        {
+            self.view.state.finished_turns.push(TurnTime {
+                entries_end: self.view.entries.len(),
+                duration,
+            });
         }
         self.view.state.turn_started_at = working.then(SystemTime::now);
         self.emit(AgentThreadEvent::WorkingChanged(working));
@@ -3194,11 +3214,12 @@ mod tests {
         thread
             .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
             .await;
-        // The prompt waiting for the login is kept.
+        // The prompt waiting for the login is kept, with when it was sent.
         assert_eq!(
             thread.thread.entries(),
             [Entry::UserMessage("hello".into())]
         );
+        assert!(thread.thread.sent_time(0).is_some());
         thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
         thread
             .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
@@ -3403,6 +3424,10 @@ mod tests {
         assert_eq!(entries[0], Entry::UserMessage("hello".into()));
         assert_eq!(entries[1], Entry::AgentMessage("Echo: hello".into()));
         assert!(matches!(&entries[2], Entry::ToolCall(call) if call.title == "Read README.md"));
+        // The message's time and the turn's length show in the thread.
+        assert!(thread.thread.sent_time(0).is_some());
+        assert_eq!(thread.thread.sent_time(1), None);
+        assert!(thread.thread.turn_time(1).is_some());
         assert_eq!(
             thread.thread.last_stop_reason(),
             Some(&acp::StopReason::EndTurn)

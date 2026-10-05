@@ -250,6 +250,12 @@ impl AgentThread {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_working_for_test(&mut self, working: bool, cx: &mut Context<Self>) {
+        self.view.state.turn_started_at = working.then(std::time::SystemTime::now);
+        cx.notify();
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_status_for_test(&mut self, status: ConnectionStatus, cx: &mut Context<Self>) {
         self.view.state.status = status;
         cx.notify();

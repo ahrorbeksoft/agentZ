@@ -337,6 +337,10 @@ pub struct ThreadState {
     pub cost: Option<acp::Cost>,
     pub available_commands: Vec<acp::AvailableCommand>,
     pub turn_started_at: Option<SystemTime>,
+    /// How long each turn that ended here took, by where its entries ended (t3code's turn
+    /// time under the answer). Turns replayed from history have none.
+    #[serde(default)]
+    pub finished_turns: Vec<TurnTime>,
     pub last_stop_reason: Option<acp::StopReason>,
     pub turn_error: Option<SharedString>,
     /// The outcome of the last log in or out on a connection made only for that.
@@ -350,6 +354,10 @@ pub struct ThreadState {
     /// entry index, in order. A list rather than a map: integer map keys don't survive serde's
     /// buffering of the protocol's untagged fallbacks.
     pub prompts_from_agents: Vec<(usize, ThreadCreator)>,
+    /// When each user message sent here went, by entry index, in order (t3code's time under
+    /// the message). Messages replayed from history have none.
+    #[serde(default)]
+    pub sent_times: Vec<(usize, SystemTime)>,
 }
 
 /// A thread's state and entries, with the read API both the server's thread and the clients'
@@ -358,6 +366,24 @@ pub struct ThreadState {
 pub struct ThreadView {
     pub state: ThreadState,
     pub entries: Vec<Entry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnTime {
+    /// The number of entries when it ended: its entries come before.
+    pub entries_end: usize,
+    pub duration: std::time::Duration,
+}
+
+impl ThreadView {
+    /// How long the turn that `index` belongs to took, if it ended here.
+    pub fn turn_time(&self, index: usize) -> Option<std::time::Duration> {
+        self.state
+            .finished_turns
+            .iter()
+            .find(|turn| turn.entries_end > index)
+            .map(|turn| turn.duration)
+    }
 }
 
 /// What changed in a [`ThreadView`], from [`ThreadView::changes_since`].
@@ -446,6 +472,15 @@ impl ThreadView {
             .iter()
             .find(|(prompt_index, _)| *prompt_index == index)
             .map(|(_, sender)| *sender)
+    }
+
+    /// When the user message at `index` was sent, if it was sent here.
+    pub fn sent_time(&self, index: usize) -> Option<SystemTime> {
+        self.state
+            .sent_times
+            .iter()
+            .find(|(message_index, _)| *message_index == index)
+            .map(|(_, time)| *time)
     }
 
     pub fn status(&self) -> &ConnectionStatus {
