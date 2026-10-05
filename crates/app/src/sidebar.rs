@@ -1,17 +1,26 @@
+use std::cell::Cell;
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::agent_icons::agent_icon;
 use crate::agent_view::TOOLBAR_HEIGHT;
-use crate::machines::{MachineId, Machines, ProjectKey, Scope, ThreadKey, project_at};
-use crate::project_store::{ProjectStore, ThreadStatus};
-use agentz_protocol::agents::AgentId;
-use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, Focusable as _,
-    FontWeight, Hsla, KeyBinding, PromptLevel, ScrollHandle, Stateful, Subscription, Task, Window,
-    anchored, deferred, svg,
+use crate::machines::{
+    MachineId, Machines, ProjectKey, Scope, ThreadKey, by_latest_activity, project_at,
 };
-use projects::{Project, Thread, Workspace, WorkspaceKind};
+use crate::project_store::{ProjectStore, ThreadStatus};
+use crate::slide_drag::{
+    DRAG_SCROLL_STEP, SlideDrag, drag_scroll_direction, render_raised_rows, scroll_while_held,
+};
+use agentz_protocol::agents::AgentId;
+use collections::HashMap;
+use gpui::{
+    AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
+    Focusable as _, FontWeight, Hsla, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Stateful,
+    Subscription, Task, Window, anchored, canvas, deferred, svg,
+};
+use projects::{Project, Thread, ThreadOrder, ThreadSection, Workspace, WorkspaceKind, order_key};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,
@@ -88,6 +97,222 @@ enum PastureAction {
     BringBack,
 }
 
+/// How tall the Pinned and Active labels open while a thread is dragged (t3code's
+/// `SIDEBAR_DRAG_LABEL_HEIGHT`).
+const DRAG_LABEL_HEIGHT: Pixels = px(24.);
+
+/// A thread card or archived row being dragged. The sidebar draws it raised (`ThreadDrag`), so
+/// nothing is drawn under the pointer.
+#[derive(Clone, Copy)]
+struct DraggedThread(ThreadKey);
+
+impl Render for DraggedThread {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Where a dragged thread is from, or would land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragSection {
+    Pinned,
+    Active,
+    Archived,
+}
+
+/// What letting go of a dragged thread does, which its badge says (t3code's drop verb).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropVerb {
+    Pin,
+    Unpin,
+    Archive,
+    Unarchive,
+}
+
+impl DropVerb {
+    /// Nothing when the thread lands where it was.
+    fn between(from: DragSection, to: DragSection) -> Option<Self> {
+        match (from, to) {
+            (DragSection::Pinned, DragSection::Pinned)
+            | (DragSection::Active, DragSection::Active)
+            | (DragSection::Archived, DragSection::Archived) => None,
+            (DragSection::Active | DragSection::Archived, DragSection::Pinned) => Some(Self::Pin),
+            (DragSection::Pinned, DragSection::Active) => Some(Self::Unpin),
+            (DragSection::Archived, DragSection::Active) => Some(Self::Unarchive),
+            (DragSection::Pinned | DragSection::Active, DragSection::Archived) => {
+                Some(Self::Archive)
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pin => "Pin",
+            Self::Unpin => "Unpin",
+            Self::Archive => "Archive",
+            Self::Unarchive => "Unarchive",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Pin => IconName::Pin,
+            Self::Unpin => IconName::Unpin,
+            Self::Archive => IconName::Archive,
+            Self::Unarchive => IconName::Undo,
+        }
+    }
+}
+
+/// What slides along the cards while a thread is dragged: the cards, and the labels that open
+/// above the pinned ones and the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DragItem {
+    PinnedLabel,
+    ActiveLabel,
+    Thread(ThreadKey),
+}
+
+/// A thread card, or an archived thread's row, held while dragged up and down the cards or
+/// onto Archived, as t3code's sidebar does.
+struct ThreadDrag {
+    thread: ThreadKey,
+    from: DragSection,
+    /// An agent CLI's card only moves among the unpinned cards: terminals aren't pinned or
+    /// archived.
+    is_agent_cli: bool,
+    /// When the unpinned cards keep the latest active first, where the thread goes among them,
+    /// as they can't be arranged by hand then.
+    time_index: Option<usize>,
+    /// The pinned cards and the rest in the order shown when the drag started.
+    pinned: Vec<ThreadKey>,
+    active: Vec<ThreadKey>,
+    /// The thread's card or row height, with the space around it.
+    height: Pixels,
+    /// Whether the pointer is on the Archived header or under it.
+    over_archived: bool,
+    /// The cards' top in the list scrolled to its top, where the Pinned label opens.
+    top: Pixels,
+    /// How far the labels opening moved the card's place down. It stays under the pointer, so
+    /// its place is held this far below it, as in t3code.
+    bias: Pixels,
+    left: Pixels,
+    width: Pixels,
+    slide: SlideDrag<DragItem>,
+}
+
+impl ThreadDrag {
+    fn item(&self) -> DragItem {
+        DragItem::Thread(self.thread)
+    }
+
+    fn index(&self, item: DragItem) -> usize {
+        self.slide
+            .order
+            .iter()
+            .position(|candidate| *candidate == item)
+            .unwrap_or_default()
+    }
+
+    /// The Active label's place in the order without the dragged thread.
+    fn active_label_index(&self) -> usize {
+        let label = self.index(DragItem::ActiveLabel);
+        if self.index(self.item()) < label {
+            label - 1
+        } else {
+            label
+        }
+    }
+
+    fn target(&self) -> DragSection {
+        if self.over_archived {
+            DragSection::Archived
+        } else if self.index(self.item()) < self.index(DragItem::ActiveLabel) {
+            DragSection::Pinned
+        } else {
+            DragSection::Active
+        }
+    }
+
+    fn verb(&self) -> Option<DropVerb> {
+        DropVerb::between(self.from, self.target())
+    }
+
+    /// The threads of a section in the order shown.
+    fn shown(&self, section: DragSection) -> Vec<ThreadKey> {
+        let label = self.index(DragItem::ActiveLabel);
+        let items = match section {
+            DragSection::Pinned => &self.slide.order[..label],
+            DragSection::Active => &self.slide.order[label + 1..],
+            DragSection::Archived => &[],
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                DragItem::Thread(key) => Some(*key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where the dragged thread's start crosses from the pinned cards to the rest: halfway
+    /// down the Active label, with the thread just above it.
+    fn boundary(&self) -> Pixels {
+        let item = self.item();
+        let label = self.index(DragItem::ActiveLabel);
+        let before = self.slide.order[..label]
+            .iter()
+            .filter(|candidate| **candidate != item)
+            .fold(px(0.), |length, candidate| {
+                length + self.slide.length(*candidate)
+            });
+        before + self.slide.length(DragItem::ActiveLabel) / 2.
+    }
+
+    /// Moves the thread where the pointer holds it, `offset` being the list's scroll: among
+    /// the pinned cards or the rest, never above the Pinned label, and in the order the rest
+    /// keep when they keep one of their own.
+    fn arrange(&mut self, offset: Pixels) {
+        let item = self.item();
+        // An archived row's place opens among the cards once it leaves Archived.
+        if self.from == DragSection::Archived {
+            let length = if self.over_archived {
+                px(0.)
+            } else {
+                self.height
+            };
+            self.slide.set_length(item, length);
+        }
+        let label = self.slide.length(DragItem::PinnedLabel);
+        let total = self
+            .slide
+            .order
+            .iter()
+            .fold(px(0.), |length, item| length + self.slide.length(*item));
+        let last = (total - self.slide.length(item)).max(label);
+        let boundary = self.boundary();
+        let mut start =
+            (self.slide.held_start() - (self.top + offset) + self.bias).clamp(label, last);
+        if self.is_agent_cli {
+            start = start.max(boundary);
+        }
+        match self.time_index {
+            Some(time_index) if self.is_agent_cli || start > boundary => {
+                self.slide
+                    .move_to(self.active_label_index() + 1 + time_index);
+            }
+            Some(_) => {
+                // Among the pinned cards, it comes in at their end and moves up from there.
+                if self.index(item) > self.index(DragItem::ActiveLabel) {
+                    self.slide.move_to(self.active_label_index());
+                }
+                self.slide.reorder(start.min(boundary));
+            }
+            None => self.slide.reorder(start),
+        }
+    }
+}
+
 /// The thread list, modeled on t3code's sidebar: active threads as cards and archived threads
 /// in a collapsible shelf at the bottom (t3code's "Settled" shelf).
 pub struct Sidebar {
@@ -113,6 +338,10 @@ pub struct Sidebar {
     renaming_thread: Option<ThreadKey>,
     rename_input: Entity<TextInput>,
     _rename_blur: Option<Subscription>,
+    list_scroll: ScrollHandle,
+    thread_drag: Option<ThreadDrag>,
+    /// Where the Archived header is in the window, as last drawn, for dragging onto it.
+    archived_top: Rc<Cell<Option<Pixels>>>,
     _subscriptions: Vec<Subscription>,
     _activity_refresh: Task<()>,
 }
@@ -163,6 +392,9 @@ impl Sidebar {
             renaming_thread: None,
             rename_input,
             _rename_blur: None,
+            list_scroll: ScrollHandle::new(),
+            thread_drag: None,
+            archived_top: Rc::default(),
             _subscriptions: subscriptions,
             _activity_refresh: activity_refresh,
         }
@@ -494,8 +726,8 @@ impl Sidebar {
         .detach();
     }
 
-    /// Rename, Archive or Unarchive, the pasture's actions, Project Settings, and Delete, each
-    /// with its icon. A Workspaces thread's has Rename, Move to Threads and Delete.
+    /// Pin or Unpin, Rename, Archive or Unarchive, the pasture's actions, Project Settings, and
+    /// Delete, each with its icon. A Workspaces thread's has Rename, Move to Threads and Delete.
     fn thread_menu(
         &self,
         machine: MachineId,
@@ -517,6 +749,8 @@ impl Sidebar {
         };
         let title = SharedString::from(thread.title.clone());
         let in_workspaces = thread.in_workspaces();
+        // `None` for the threads that aren't pinned: shells, agent CLIs and Workspaces threads.
+        let is_pinned = thread.can_pin().then(|| thread.is_pinned());
         let checkout = self.thread_checkout(machine, thread, cx);
         let is_pasture = checkout
             .as_ref()
@@ -599,12 +833,32 @@ impl Sidebar {
                             .ok();
                     }
                 };
-                let menu = menu.item(
-                    ContextMenuEntry::new("Rename")
-                        .icon(IconName::Pencil)
-                        .icon_color(Color::Muted)
-                        .handler(rename),
-                );
+                let menu = menu
+                    .when_some(is_pinned, |menu, is_pinned| {
+                        let sidebar = sidebar.clone();
+                        menu.item(
+                            ContextMenuEntry::new(if is_pinned { "Unpin" } else { "Pin" })
+                                .icon(if is_pinned {
+                                    IconName::Unpin
+                                } else {
+                                    IconName::Pin
+                                })
+                                .icon_color(Color::Muted)
+                                .handler(move |_, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.toggle_pinned(thread_id, is_pinned, cx)
+                                        })
+                                        .ok();
+                                }),
+                        )
+                    })
+                    .item(
+                        ContextMenuEntry::new("Rename")
+                            .icon(IconName::Pencil)
+                            .icon_color(Color::Muted)
+                            .handler(rename),
+                    );
                 if in_workspaces {
                     let sidebar = sidebar.clone();
                     return menu
@@ -699,6 +953,15 @@ impl Sidebar {
         }
     }
 
+    /// Pins the thread above the pinned ones, or unpins it.
+    fn toggle_pinned(&mut self, key: ThreadKey, is_pinned: bool, cx: &mut Context<Self>) {
+        if !is_pinned {
+            Machines::pin_thread(&self.machines, key, cx);
+        } else if let Some(store) = self.store(key.machine, cx) {
+            store.update(cx, |store, cx| store.unpin_thread(key.thread, cx));
+        }
+    }
+
     /// Makes a Workspaces thread one of the project its folder is in. Outside every project,
     /// it asks to add the folder as one first.
     fn move_to_agents(&mut self, key: ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -780,7 +1043,8 @@ impl Sidebar {
             return;
         }
         self.hovered_thread = Some(thread_id);
-        if self.details_thread == Some(thread_id) {
+        // Cards pass under the pointer while one is dragged.
+        if self.details_thread == Some(thread_id) || self.thread_drag.is_some() {
             return;
         }
         let delay = cx.spawn(async move |this, cx| {
@@ -799,6 +1063,295 @@ impl Sidebar {
         self.details_delay = None;
         if self.details_thread.take().is_some() {
             cx.notify();
+        }
+    }
+
+    /// The drafts listed above the cards. The open draft's row is the one it had when it was
+    /// opened.
+    fn shown_drafts(&self, cx: &App) -> Vec<(Entity<ProjectStore>, Thread)> {
+        let mut drafts = Vec::new();
+        for (machine, thread) in self.machines.read(cx).typed_drafts(cx) {
+            let key = ThreadKey {
+                machine,
+                thread: thread.id,
+            };
+            let thread = if self.active_thread == Some(key) {
+                match &self.frozen_draft {
+                    Some((frozen_key, frozen)) if *frozen_key == key => frozen.clone(),
+                    _ => continue,
+                }
+            } else {
+                thread
+            };
+            if let Some(store) = self.store(machine, cx) {
+                drafts.push((store, thread));
+            }
+        }
+        drafts
+    }
+
+    /// The thread cards, the pinned ones first.
+    fn shown_cards(&self, cx: &App) -> Vec<(Entity<ProjectStore>, Thread)> {
+        self.machines
+            .read(cx)
+            .active_threads(cx)
+            .into_iter()
+            .filter_map(|(machine, thread)| Some((self.store(machine, cx)?, thread)))
+            .collect()
+    }
+
+    /// Picks up a thread's card, or an archived thread's row held `row_grab` down from its
+    /// top, as the list last drew them.
+    fn start_thread_drag(
+        &mut self,
+        key: ThreadKey,
+        pointer: Pixels,
+        row_grab: Option<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self
+            .store(key.machine, cx)
+            .and_then(|store| store.read(cx).thread(key.thread).cloned())
+        else {
+            return;
+        };
+        let from = if thread.archived_at.is_some() {
+            DragSection::Archived
+        } else if thread.is_pinned() {
+            DragSection::Pinned
+        } else {
+            DragSection::Active
+        };
+        let cards: Vec<(ThreadKey, Thread)> = self
+            .shown_cards(cx)
+            .into_iter()
+            .map(|(store, thread)| {
+                let key = ThreadKey {
+                    machine: store.read(cx).machine(),
+                    thread: thread.id,
+                };
+                (key, thread)
+            })
+            .collect();
+        // The cards follow the drafts and the line under them.
+        let first_card = match self.shown_drafts(cx).len() {
+            0 => 0,
+            drafts => drafts + 1,
+        };
+        let bounds = |index: usize| self.list_scroll.bounds_for_item(index);
+        let Some(first) = bounds(first_card) else {
+            return;
+        };
+        let mut lengths = HashMap::default();
+        let mut pinned = Vec::new();
+        let mut active = Vec::new();
+        for (index, (card_key, card)) in cards.iter().enumerate() {
+            let Some(card_bounds) = bounds(first_card + index) else {
+                return;
+            };
+            lengths.insert(DragItem::Thread(*card_key), card_bounds.size.height);
+            if card.is_pinned() {
+                pinned.push(*card_key);
+            } else {
+                active.push(*card_key);
+            }
+        }
+        let mut order: Vec<DragItem> = std::iter::once(DragItem::PinnedLabel)
+            .chain(pinned.iter().copied().map(DragItem::Thread))
+            .chain(std::iter::once(DragItem::ActiveLabel))
+            .chain(active.iter().copied().map(DragItem::Thread))
+            .collect();
+        let offset = self.list_scroll.offset().y;
+        let (height, grab, bias) = match (from, row_grab) {
+            // Its place among the cards opens once it leaves Archived.
+            (DragSection::Archived, Some(grab)) => {
+                order.push(DragItem::Thread(key));
+                (ARCHIVED_ROW_HEIGHT, grab, px(0.))
+            }
+            (DragSection::Pinned | DragSection::Active, None) => {
+                let Some(card_bounds) = cards
+                    .iter()
+                    .position(|(card_key, _)| *card_key == key)
+                    .and_then(|index| bounds(first_card + index))
+                else {
+                    return;
+                };
+                let labels_above = if from == DragSection::Pinned { 1. } else { 2. };
+                (
+                    card_bounds.size.height,
+                    pointer - (card_bounds.top() + offset),
+                    DRAG_LABEL_HEIGHT * labels_above,
+                )
+            }
+            _ => return,
+        };
+        let time_index = (self.machines.read(cx).thread_order(cx) == ThreadOrder::LastActivity)
+            .then(|| {
+                cards
+                    .iter()
+                    .filter(|(card_key, card)| {
+                        *card_key != key
+                            && !card.is_pinned()
+                            && by_latest_activity((card_key.machine, card), (key.machine, &thread))
+                                == Ordering::Less
+                    })
+                    .count()
+            });
+        let mut slide = SlideDrag::new(DragItem::Thread(key), order, lengths, grab, pointer);
+        // The labels open, and the cards move down to make room for them.
+        slide.set_length(DragItem::PinnedLabel, DRAG_LABEL_HEIGHT);
+        slide.set_length(DragItem::ActiveLabel, DRAG_LABEL_HEIGHT);
+        self.hide_details(cx);
+        self.thread_drag = Some(ThreadDrag {
+            thread: key,
+            from,
+            is_agent_cli: thread.terminal.is_some(),
+            time_index,
+            pinned,
+            active,
+            height,
+            over_archived: false,
+            top: first.top(),
+            bias,
+            left: first.left(),
+            width: first.size.width,
+            slide,
+        });
+        self.drag_thread(pointer, cx);
+    }
+
+    /// The dragged thread follows the pointer among the cards, which make room for it, or onto
+    /// Archived.
+    fn drag_thread(&mut self, pointer: Pixels, cx: &mut Context<Self>) {
+        let list = self.list_scroll.bounds();
+        let offset = self.list_scroll.offset().y;
+        let archived_top = self.archived_top.get();
+        let Some(drag) = self.thread_drag.as_mut() else {
+            return;
+        };
+        drag.slide.pointer = pointer;
+        drag.over_archived = !drag.is_agent_cli
+            && archived_top.is_some_and(|top| top < list.bottom() && pointer >= top);
+        drag.arrange(offset);
+        if !drag.slide.is_scrolling && self.thread_scroll_direction().is_some() {
+            let task = scroll_while_held(Self::scroll_threads_step, cx);
+            if let Some(drag) = self.thread_drag.as_mut() {
+                drag.slide.is_scrolling = true;
+                drag.slide._scroll = task;
+            }
+        }
+        cx.notify();
+    }
+
+    fn thread_scroll_direction(&self) -> Option<f32> {
+        let drag = self.thread_drag.as_ref()?;
+        let list = self.list_scroll.bounds();
+        let top = drag.slide.held_start();
+        drag_scroll_direction(
+            (top, top + drag.height),
+            (list.top(), list.bottom()),
+            self.list_scroll.offset().y,
+            self.list_scroll.max_offset().y,
+        )
+    }
+
+    fn scroll_threads_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let direction = self.thread_scroll_direction();
+        let Some(drag) = self.thread_drag.as_mut() else {
+            return false;
+        };
+        let Some(direction) = direction else {
+            drag.slide.is_scrolling = false;
+            return false;
+        };
+        let pointer = drag.slide.pointer;
+        let offset = self.list_scroll.offset();
+        let max = self.list_scroll.max_offset().y;
+        self.list_scroll.set_offset(gpui::point(
+            offset.x,
+            (offset.y + DRAG_SCROLL_STEP * direction).clamp(-max, px(0.)),
+        ));
+        // The cards pass under the held one.
+        self.drag_thread(pointer, cx);
+        true
+    }
+
+    /// Letting go pins, unpins, archives or unarchives the thread, and leaves it where it was
+    /// let go: one new order key between its neighbors', as t3code's `planSidebarThreadDrop`
+    /// does.
+    fn drop_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.thread_drag.take() else {
+            return;
+        };
+        cx.notify();
+        let key = drag.thread;
+        let Some(store) = self.store(key.machine, cx) else {
+            return;
+        };
+        match drag.target() {
+            DragSection::Archived => {
+                if drag.from != DragSection::Archived {
+                    store.update(cx, |store, cx| store.archive_thread(key.thread, cx));
+                }
+            }
+            DragSection::Pinned => {
+                let order = drag.shown(DragSection::Pinned);
+                if drag.from == DragSection::Pinned && order == drag.pinned {
+                    return;
+                }
+                let keys = self.machines.read(cx).order_keys(ThreadSection::Pinned, cx);
+                let mut assignments = order_key::plan_reorder(&order, &keys, key);
+                if drag.from != DragSection::Pinned {
+                    let own_key = assignments
+                        .iter()
+                        .position(|(assigned, _)| *assigned == key)
+                        .map(|index| assignments.remove(index).1);
+                    store.update(cx, |store, cx| store.pin_thread(key.thread, own_key, cx));
+                }
+                self.write_order_keys(ThreadSection::Pinned, assignments, cx);
+            }
+            DragSection::Active => {
+                match drag.from {
+                    DragSection::Pinned => {
+                        store.update(cx, |store, cx| store.unpin_thread(key.thread, cx))
+                    }
+                    DragSection::Archived => {
+                        store.update(cx, |store, cx| store.unarchive_thread(key.thread, cx))
+                    }
+                    DragSection::Active => {}
+                }
+                // Kept latest active first, the unpinned cards have no order to write.
+                let order = drag.shown(DragSection::Active);
+                if drag.time_index.is_some()
+                    || (drag.from == DragSection::Active && order == drag.active)
+                {
+                    return;
+                }
+                let keys = self.machines.read(cx).order_keys(ThreadSection::Active, cx);
+                let assignments = order_key::plan_reorder(&order, &keys, key);
+                self.write_order_keys(ThreadSection::Active, assignments, cx);
+            }
+        }
+    }
+
+    /// Writes new order keys to each thread's machine.
+    fn write_order_keys(
+        &self,
+        section: ThreadSection,
+        assignments: Vec<(ThreadKey, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut by_machine: HashMap<MachineId, Vec<_>> = HashMap::default();
+        for (key, order_key) in assignments {
+            by_machine
+                .entry(key.machine)
+                .or_default()
+                .push((key.thread, order_key));
+        }
+        for (machine, keys) in by_machine {
+            if let Some(store) = self.store(machine, cx) {
+                store.update(cx, |store, cx| store.reorder_threads(section, keys, cx));
+            }
         }
     }
 
@@ -879,12 +1432,14 @@ impl Sidebar {
     }
 
     /// t3code's thread card: the project and status on top, then the title, then the branch with
-    /// the agent's icon at the bottom right.
+    /// the agent's icon at the bottom right. `raised` is the copy held above the list while the
+    /// card is dragged, which only shows, with what letting go would do.
     fn render_thread_card(
         &self,
         store: &Entity<ProjectStore>,
         thread: Thread,
         project: Option<Project>,
+        raised: Option<Option<DropVerb>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -896,7 +1451,10 @@ impl Sidebar {
             thread: thread.id,
         };
         let is_active = self.active_thread == Some(thread_id);
-        let is_renaming = self.renaming_thread == Some(thread_id);
+        let is_renaming = raised.is_none() && self.renaming_thread == Some(thread_id);
+        // Cards pass under the pointer while one is dragged.
+        let is_dragging = self.thread_drag.is_some();
+        let drop_verb = raised.flatten();
         // The open thread's composer shows its text already.
         let has_unsent_text = thread.unsent_text.is_some() && !is_active;
         let thread_status = store.read(cx).thread_status(thread.id);
@@ -969,8 +1527,9 @@ impl Sidebar {
             .created_by
             .map(|creator| format!("Started by {}", store.read(cx).describe_creator(creator)));
 
-        let status = match thread_status {
-            Some(ThreadStatus::Working) => h_flex()
+        let status = match (drop_verb, thread_status) {
+            (Some(verb), _) => render_drop_badge(verb, cx),
+            (None, Some(ThreadStatus::Working)) => h_flex()
                 .gap_1()
                 .child(
                     Icon::new(IconName::LoadCircle)
@@ -985,8 +1544,8 @@ impl Sidebar {
                         .color(Color::Accent),
                 )
                 .into_any_element(),
-            Some(status) => render_status_pill(status, cx).into_any_element(),
-            None => Label::new(time.unwrap_or_default())
+            (None, Some(status)) => render_status_pill(status, cx).into_any_element(),
+            (None, None) => Label::new(time.unwrap_or_default())
                 .size(LabelSize::Small)
                 .color(Color::Muted)
                 .into_any_element(),
@@ -1047,7 +1606,58 @@ impl Sidebar {
 
         // Terminals aren't archived: a shell or an agent CLI is deleted when done with.
         let is_archivable = thread.terminal.is_none();
-        let has_hover_buttons = !is_renaming && (is_archivable || has_unsent_text);
+        let has_hover_buttons = !is_renaming && !is_dragging && (is_archivable || has_unsent_text);
+        // t3code's pin, before the status: it unpins from the hover buttons, where it moves
+        // over with them. A dragged card shows its badge instead, over another section.
+        let pin = (thread.is_pinned() && drop_verb.is_none()).then(|| {
+            div()
+                .flex_none()
+                .debug_selector(|| format!("pin-mark-{}", thread_id.thread.0))
+                .when(has_hover_buttons, |this| {
+                    this.group_hover(group_name.clone(), |this| this.invisible())
+                })
+                .child(
+                    Icon::new(IconName::Pin)
+                        .size(IconSize::XSmall)
+                        .color(Color::Custom(muted_text.opacity(0.65))),
+                )
+        });
+        let unpin_button = (thread.is_pinned() && has_hover_buttons).then(|| {
+            let button_group =
+                SharedString::from(format!("unpin-button-{}-{}", machine.slug(), thread.id.0));
+            div()
+                .id(thread_element_id("unpin-thread", thread_id))
+                .debug_selector(|| format!("unpin-thread-{}", thread_id.thread.0))
+                .group(button_group.clone())
+                .flex()
+                .items_center()
+                .h_full()
+                .px_1()
+                .cursor_pointer()
+                .tooltip(Tooltip::text("Unpin thread"))
+                .child(
+                    svg()
+                        .path(IconName::Pin.path())
+                        .size(IconSize::XSmall.rems())
+                        .flex_none()
+                        .text_color(muted_text.opacity(0.65))
+                        .group_hover(button_group, |this| this.text_color(bright_text)),
+                )
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    if *hovered {
+                        this.hide_details(cx);
+                    } else if this.hovered_thread == Some(thread_id) {
+                        this.thread_hovered(thread_id, true, cx);
+                    }
+                }))
+                .on_click({
+                    let store = store.clone();
+                    move |_, _, cx| {
+                        cx.stop_propagation();
+                        store.update(cx, |store, cx| store.unpin_thread(thread_id.thread, cx));
+                    }
+                })
+        });
         // The status yields to the Archive and Discard buttons on hover.
         let status_slot = div()
             .flex_none()
@@ -1080,6 +1690,7 @@ impl Sidebar {
                         .h_full()
                         .bg(cover)
                         .children(discard_button)
+                        .children(unpin_button)
                         .when(is_archivable, |this| this.child(archive_button)),
                 )
         });
@@ -1138,6 +1749,7 @@ impl Sidebar {
                                 .map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
                         ),
                 )
+                .children(pin)
                 .child(status_slot)
                 .children(hover_buttons);
             let title_line = h_flex().mt_1().min_w_0().child(title_element);
@@ -1153,116 +1765,134 @@ impl Sidebar {
                 .children(
                     machine_label.map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
                 )
+                .children(pin)
                 .child(status_slot)
                 .children(hover_buttons);
             (None, title_line)
         };
 
-        let card =
-            v_flex()
-                .id(thread_element_id("thread-card", thread_id))
-                .debug_selector(|| format!("thread-card-{}", thread_id.thread.0))
-                .group(group_name)
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
+        let card = v_flex()
+            .id(thread_element_id("thread-card", thread_id))
+            .debug_selector(|| format!("thread-card-{}", thread_id.thread.0))
+            .group(group_name)
+            .when(raised.is_none(), |card| {
+                card.on_hover(cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
                 }))
                 .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-                .relative()
-                .w_full()
-                .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
-                .px_2p5()
-                .py_2()
-                .rounded_md()
-                .when(is_active, |card| card.bg(selected_background))
-                .when(!is_renaming, |card| {
-                    card.cursor_pointer()
-                        .hover(|card| card.bg(hover_background))
-                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
-                })
-                // Readable while its machine is unreachable, but plainly not live.
-                .when(is_offline, |card| card.opacity(0.5))
-                .children(project_line)
-                .child(title_line)
-                .child(
-                    h_flex()
-                        .mt_0p5()
-                        .min_w_0()
-                        .gap_1p5()
-                        .child(
+            })
+            .relative()
+            .w_full()
+            .when(shows_all_projects, |card| card.h(CARD_HEIGHT))
+            .px_2p5()
+            .py_2()
+            .rounded_md()
+            .when(is_active, |card| card.bg(selected_background))
+            .when(!is_renaming && raised.is_none(), |card| {
+                card.cursor_pointer()
+                    .when(!is_dragging, |card| {
+                        card.hover(|card| card.bg(hover_background))
+                    })
+                    .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
+                    .on_drag(DraggedThread(thread_id), {
+                        let this = cx.entity().downgrade();
+                        move |dragged, _, window, cx| {
+                            let pointer = window.mouse_position().y;
+                            this.update(cx, |this, cx| {
+                                this.start_thread_drag(dragged.0, pointer, None, cx)
+                            })
+                            .ok();
+                            cx.new(|_| *dragged)
+                        }
+                    })
+            })
+            // Readable while its machine is unreachable, but plainly not live.
+            .when(is_offline, |card| card.opacity(0.5))
+            .children(project_line)
+            .child(title_line)
+            .child(
+                h_flex()
+                    .mt_0p5()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .children(checkout.as_ref().and_then(|checkout| {
+                                render_checkout_marker(thread_id, checkout, faint_text)
+                            }))
+                            .children(branch.map(|branch| {
+                                Label::new(branch)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Custom(faint_text))
+                                    .truncate_middle()
+                            })),
+                    )
+                    .when(subthreads.0 > 0, |this| {
+                        let (count, running) = subthreads;
+                        let tooltip = match (count, running) {
+                            (1, 0) => "1 agent".to_string(),
+                            (count, 0) => format!("{count} agents"),
+                            (count, running) => format!("{count} agents, {running} running"),
+                        };
+                        let color = if running > 0 {
+                            Color::Accent
+                        } else {
+                            Color::Custom(faint_text)
+                        };
+                        this.child(
                             h_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .children(checkout.as_ref().and_then(|checkout| {
-                                    render_checkout_marker(thread_id, checkout, faint_text)
-                                }))
-                                .children(branch.map(|branch| {
-                                    Label::new(branch)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Custom(faint_text))
-                                        .truncate_middle()
-                                })),
-                        )
-                        .when(subthreads.0 > 0, |this| {
-                            let (count, running) = subthreads;
-                            let tooltip = match (count, running) {
-                                (1, 0) => "1 agent".to_string(),
-                                (count, 0) => format!("{count} agents"),
-                                (count, running) => format!("{count} agents, {running} running"),
-                            };
-                            let color = if running > 0 {
-                                Color::Accent
-                            } else {
-                                Color::Custom(faint_text)
-                            };
-                            this.child(
-                                h_flex()
-                                    .id(thread_element_id("thread-agents", thread_id))
-                                    .flex_none()
-                                    .gap_0p5()
-                                    .tooltip(Tooltip::text(tooltip))
-                                    .child(
-                                        Icon::new(IconName::UserGroup)
-                                            .size(IconSize::XSmall)
-                                            .color(color),
-                                    )
-                                    .child(
-                                        Label::new(count.to_string())
-                                            .size(LabelSize::XSmall)
-                                            .color(color),
-                                    ),
-                            )
-                        })
-                        .when_some(started_by, |this, started_by| {
-                            this.child(
-                                div()
-                                    .id(thread_element_id("thread-started-by", thread_id))
-                                    .flex_none()
-                                    .tooltip(Tooltip::text(started_by))
-                                    .child(
-                                        Icon::new(IconName::Sparkle)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Custom(faint_text)),
-                                    ),
-                            )
-                        })
-                        .child(
-                            div()
+                                .id(thread_element_id("thread-agents", thread_id))
                                 .flex_none()
-                                .opacity(0.6)
-                                .child(machine_icon.size(IconSize::Small).color(Color::Muted)),
+                                .gap_0p5()
+                                .tooltip(Tooltip::text(tooltip))
+                                .child(
+                                    Icon::new(IconName::UserGroup)
+                                        .size(IconSize::XSmall)
+                                        .color(color),
+                                )
+                                .child(
+                                    Label::new(count.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(color),
+                                ),
                         )
-                        .child(
+                    })
+                    .when_some(started_by, |this, started_by| {
+                        this.child(
                             div()
+                                .id(thread_element_id("thread-started-by", thread_id))
                                 .flex_none()
-                                .opacity(0.6)
-                                .child(icon.size(IconSize::Small).color(Color::Muted)),
-                        ),
-                );
+                                .tooltip(Tooltip::text(started_by))
+                                .child(
+                                    Icon::new(IconName::Sparkle)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Custom(faint_text)),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .opacity(0.6)
+                            .child(machine_icon.size(IconSize::Small).color(Color::Muted)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .opacity(0.6)
+                            .child(icon.size(IconSize::Small).color(Color::Muted)),
+                    ),
+            );
+        if raised.is_some() {
+            return card.into_any_element();
+        }
 
         // The details popover stays hidden while the thread's menu is open.
-        let details_popover =
-            (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
+        let details_popover = (self.details_thread == Some(thread_id) && !is_dragging)
+            .then(|| render_details_popover(details, cx));
         let menu = self.thread_menu(machine, &thread, false, thread.terminal.is_some(), cx);
         right_click_menu(thread_element_id("thread-menu", thread_id))
             .trigger(move |is_menu_open, _, _| {
@@ -1378,10 +2008,11 @@ impl Sidebar {
         label: &'static str,
         count: usize,
         is_expanded: bool,
+        tone: HeaderTone,
         on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rule_color = cx.theme().colors().border_variant;
+        let (color, rule_color) = tone.colors(cx);
         h_flex()
             .id(id)
             .debug_selector(|| id.into())
@@ -1391,14 +2022,15 @@ impl Sidebar {
             .gap_2()
             .cursor_pointer()
             .child(
-                Label::new(if is_expanded {
+                // Archived shows while a thread is dragged, even with nothing in it.
+                Label::new(if is_expanded || count == 0 {
                     label.to_string()
                 } else {
                     format!("{label} ({count})")
                 })
                 .size(LabelSize::Small)
                 .weight(FontWeight::MEDIUM)
-                .color(Color::Muted),
+                .color(color),
             )
             .child(div().flex_1().min_w_2().h_px().bg(rule_color))
             .child(
@@ -1408,7 +2040,7 @@ impl Sidebar {
                     IconName::ChevronDown
                 })
                 .size(IconSize::XSmall)
-                .color(Color::Muted),
+                .color(color),
             )
             .on_click(cx.listener(move |this, _, _, cx| on_toggle(this, cx)))
             .into_any_element()
@@ -1417,12 +2049,14 @@ impl Sidebar {
     /// t3code's slim row for parked threads: the project's icon, dimmed until hovered, and for
     /// an archived thread a way back on hover. A shell's row adds where it works, and shows
     /// what runs in it in place of its last activity. A Workspaces thread's is one line, like
-    /// an archived one's, with the icon of the project its folder is in.
+    /// an archived one's, with the icon of the project its folder is in. `raised` is an
+    /// archived row's copy held above the list while it's dragged, as a card's.
     fn render_slim_row(
         &self,
         store: &Entity<ProjectStore>,
         thread: Thread,
         shelf: Shelf,
+        raised: Option<Option<DropVerb>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_archived = shelf == Shelf::Archived;
@@ -1436,7 +2070,9 @@ impl Sidebar {
             thread: thread.id,
         };
         let is_active = self.active_thread == Some(thread_id);
-        let is_renaming = self.renaming_thread == Some(thread_id);
+        let is_renaming = raised.is_none() && self.renaming_thread == Some(thread_id);
+        let is_dragging = self.thread_drag.is_some();
+        let drop_verb = raised.flatten();
         let is_offline = !self.machines.read(cx).is_online(machine, cx);
         let project = self.row_project(machine, &thread, cx);
         // Where a shell is now, once its server has said.
@@ -1560,19 +2196,20 @@ impl Sidebar {
                 )
             })
             .when_some(
-                time.filter(|_| !is_renaming && running.is_none()),
+                time.filter(|_| !is_renaming && running.is_none() && drop_verb.is_none()),
                 |row, time| {
                     row.child(
                         div()
                             .flex_none()
-                            .when(is_archived, |this| {
+                            .when(is_archived && !is_dragging, |this| {
                                 this.group_hover(group_name.clone(), |this| this.invisible())
                             })
                             .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
                     )
                 },
             )
-            .when(is_archived && !is_renaming, |row| {
+            .children(drop_verb.map(|verb| render_drop_badge(verb, cx)))
+            .when(is_archived && !is_renaming && !is_dragging, |row| {
                 row.child(
                     div()
                         .absolute()
@@ -1595,34 +2232,57 @@ impl Sidebar {
                         ),
                 )
             });
-        let row =
-            v_flex()
-                .id(thread_element_id(&format!("{prefix}-thread"), thread_id))
-                .debug_selector(|| format!("{prefix}-row-{}", thread_id.thread.0))
-                .group(group_name)
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
+        let row = v_flex()
+            .id(thread_element_id(&format!("{prefix}-thread"), thread_id))
+            .debug_selector(|| format!("{prefix}-row-{}", thread_id.thread.0))
+            .group(group_name)
+            .when(raised.is_none(), |row| {
+                row.on_hover(cx.listener(move |this, hovered, _, cx| {
                     this.thread_hovered(thread_id, *hovered, cx)
                 }))
                 .on_any_mouse_down(cx.listener(|this, _, _, cx| this.hide_details(cx)))
-                .relative()
-                .when(!is_shell, |row| row.h(ARCHIVED_ROW_HEIGHT))
-                .when(is_shell, |row| row.py_1p5())
-                .w_full()
-                .px_2p5()
-                .rounded_md()
-                .when(is_active, |row| row.bg(selected_background))
-                .when(!is_renaming, |row| {
-                    row.cursor_pointer()
-                        .hover(|row| row.bg(hover_background))
-                        .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
-                })
-                .when(is_offline, |row| row.opacity(0.5))
-                .child(main_line)
-                .children(detail_line);
+            })
+            .relative()
+            .when(!is_shell, |row| row.h(ARCHIVED_ROW_HEIGHT))
+            .when(is_shell, |row| row.py_1p5())
+            .w_full()
+            .px_2p5()
+            .rounded_md()
+            .when(is_active, |row| row.bg(selected_background))
+            .when(!is_renaming && raised.is_none(), |row| {
+                row.cursor_pointer()
+                    .when(!is_dragging, |row| {
+                        row.hover(|row| row.bg(hover_background))
+                    })
+                    .on_click(self.thread_click_handler(thread_id, title.clone(), cx))
+            })
+            // An archived thread comes back by dragging it up among the cards.
+            .when(
+                is_archived && !is_renaming && raised.is_none() && thread.can_arrange(),
+                |row| {
+                    row.on_drag(DraggedThread(thread_id), {
+                        let this = cx.entity().downgrade();
+                        move |dragged, grab: gpui::Point<Pixels>, window, cx| {
+                            let pointer = window.mouse_position().y;
+                            this.update(cx, |this, cx| {
+                                this.start_thread_drag(dragged.0, pointer, Some(grab.y), cx)
+                            })
+                            .ok();
+                            cx.new(|_| *dragged)
+                        }
+                    })
+                },
+            )
+            .when(is_offline, |row| row.opacity(0.5))
+            .child(main_line)
+            .children(detail_line);
+        if raised.is_some() {
+            return row.into_any_element();
+        }
 
         // The details popover stays hidden while the thread's menu is open.
-        let details_popover =
-            (self.details_thread == Some(thread_id)).then(|| render_details_popover(details, cx));
+        let details_popover = (self.details_thread == Some(thread_id) && !is_dragging)
+            .then(|| render_details_popover(details, cx));
         let menu = self.thread_menu(machine, &thread, is_archived, is_shell, cx);
         right_click_menu(thread_element_id(
             &format!("{prefix}-thread-menu"),
@@ -1832,35 +2492,22 @@ impl Sidebar {
     }
 
     fn render_threads(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.archived_top.set(None);
         // While searching, t3code swaps the list for the matching threads.
         if !self.search_query(cx).is_empty() {
             return self.render_search_results(window, cx);
         }
+        let drag = self.thread_drag.as_ref();
         let machines = self.machines.read(cx);
-        let drafts = machines.typed_drafts(cx);
-        let active = machines.active_threads(cx);
         let archived = machines.archived_threads(cx);
         let is_archived_expanded = machines.archived_expanded(cx);
 
         // t3code's draft block: interrupted new threads, one click away above the rest.
-        let mut draft_rows = Vec::with_capacity(drafts.len());
-        for (machine, thread) in drafts {
-            let key = ThreadKey {
-                machine,
-                thread: thread.id,
-            };
-            let thread = if self.active_thread == Some(key) {
-                match &self.frozen_draft {
-                    Some((frozen_key, frozen)) if *frozen_key == key => frozen.clone(),
-                    _ => continue,
-                }
-            } else {
-                thread
-            };
-            if let Some(store) = self.store(machine, cx) {
-                draft_rows.push(self.render_draft_row(&store, thread, cx));
-            }
-        }
+        let mut draft_rows: Vec<AnyElement> = self
+            .shown_drafts(cx)
+            .into_iter()
+            .map(|(store, thread)| self.render_draft_row(&store, thread, cx))
+            .collect();
         if !draft_rows.is_empty() {
             draft_rows.push(
                 div()
@@ -1872,26 +2519,74 @@ impl Sidebar {
             );
         }
 
-        let mut rows = Vec::with_capacity(active.len());
-        for (machine, thread) in active {
-            let Some(store) = self.store(machine, cx) else {
-                continue;
-            };
-            let project = store.read(cx).project(thread.project_id).cloned();
-            rows.push(self.render_thread_card(&store, thread, project, cx));
-        }
-        if rows.is_empty() {
-            rows.push(
-                h_flex()
-                    .h_8()
-                    .px_2p5()
-                    .child(
-                        Label::new("No threads yet")
-                            .size(LabelSize::Small)
-                            .color(Color::Placeholder),
-                    )
-                    .into_any_element(),
-            );
+        let cards = self.shown_cards(cx);
+        let mut rows = Vec::with_capacity(cards.len() + 2);
+        match drag {
+            None => {
+                for (store, thread) in cards {
+                    let project = store.read(cx).project(thread.project_id).cloned();
+                    rows.push(self.render_thread_card(&store, thread, project, None, cx));
+                }
+                if rows.is_empty() {
+                    rows.push(
+                        h_flex()
+                            .h_8()
+                            .px_2p5()
+                            .child(
+                                Label::new("No threads yet")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Placeholder),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+            // The cards in the order the drag shows them, sliding over to make room for the
+            // dragged one and the labels.
+            Some(drag) => {
+                let target = drag.target();
+                let mut cards: HashMap<ThreadKey, (Entity<ProjectStore>, Thread)> = cards
+                    .into_iter()
+                    .map(|(store, thread)| {
+                        let key = ThreadKey {
+                            machine: store.read(cx).machine(),
+                            thread: thread.id,
+                        };
+                        (key, (store, thread))
+                    })
+                    .collect();
+                let now = Instant::now();
+                let mut is_sliding = false;
+                for item in &drag.slide.order {
+                    let row = match item {
+                        DragItem::PinnedLabel => {
+                            render_drag_label("Pinned", target == DragSection::Pinned, cx)
+                        }
+                        DragItem::ActiveLabel => {
+                            render_drag_label("Active", target == DragSection::Active, cx)
+                        }
+                        // Its place, kept while it's held above.
+                        DragItem::Thread(key) if *key == drag.thread => div()
+                            .debug_selector(|| "dragged-thread-place".into())
+                            .flex_none()
+                            .h(drag.slide.length(*item))
+                            .into_any_element(),
+                        DragItem::Thread(key) => {
+                            let Some((store, thread)) = cards.remove(key) else {
+                                continue;
+                            };
+                            let project = store.read(cx).project(thread.project_id).cloned();
+                            self.render_thread_card(&store, thread, project, None, cx)
+                        }
+                    };
+                    let offset = drag.slide.offset(*item, now);
+                    is_sliding |= offset != px(0.);
+                    rows.push(div().relative().top(offset).child(row).into_any_element());
+                }
+                if is_sliding {
+                    window.request_animation_frame();
+                }
+            }
         }
 
         let mut shelf = Vec::new();
@@ -1904,6 +2599,7 @@ impl Sidebar {
                 "Shells",
                 shells.len(),
                 self.shells_expanded,
+                HeaderTone::Muted,
                 |this, cx| {
                     this.shells_expanded = !this.shells_expanded;
                     cx.notify();
@@ -1913,7 +2609,7 @@ impl Sidebar {
             if self.shells_expanded {
                 for (machine, thread) in shells {
                     if let Some(store) = self.store(machine, cx) {
-                        shelf.push(self.render_slim_row(&store, thread, Shelf::Shells, cx));
+                        shelf.push(self.render_slim_row(&store, thread, Shelf::Shells, None, cx));
                     }
                 }
             }
@@ -1927,6 +2623,7 @@ impl Sidebar {
                 "Workspaces",
                 workspaces_threads.len(),
                 is_expanded,
+                HeaderTone::Muted,
                 |this, cx| {
                     // Kept by this Mac's server, as Archived's is.
                     if let Some(store) = this.store(MachineId::Local, cx) {
@@ -1938,18 +2635,32 @@ impl Sidebar {
             if is_expanded {
                 for (machine, thread) in workspaces_threads {
                     if let Some(store) = self.store(machine, cx) {
-                        shelf.push(self.render_slim_row(&store, thread, Shelf::Workspaces, cx));
+                        shelf.push(self.render_slim_row(
+                            &store,
+                            thread,
+                            Shelf::Workspaces,
+                            None,
+                            cx,
+                        ));
                     }
                 }
             }
         }
+        // While a thread that can be archived is held, Archived reads at full strength, even
+        // with nothing in it, and takes the accent with the thread over it.
+        let archive_tone = match drag.filter(|drag| !drag.is_agent_cli) {
+            Some(drag) if drag.target() == DragSection::Archived => Some(HeaderTone::Accent),
+            Some(_) => Some(HeaderTone::Emphasized),
+            None => None,
+        };
         let archived_count = archived.len();
-        if archived_count > 0 {
-            shelf.push(Self::render_shelf_header(
+        if archived_count > 0 || archive_tone.is_some() {
+            let mut archived_rows = vec![Self::render_shelf_header(
                 "archived-shelf-toggle",
                 "Archived",
                 archived_count,
                 is_archived_expanded,
+                archive_tone.unwrap_or(HeaderTone::Muted),
                 |this, cx| {
                     // Kept by this Mac's server, like the thread order.
                     if let Some(store) = this.store(MachineId::Local, cx) {
@@ -1957,18 +2668,52 @@ impl Sidebar {
                     }
                 },
                 cx,
-            ));
+            )];
             if is_archived_expanded {
                 let hidden_count = archived_count.saturating_sub(self.archived_shown);
                 for (machine, thread) in archived.into_iter().take(self.archived_shown) {
-                    if let Some(store) = self.store(machine, cx) {
-                        shelf.push(self.render_slim_row(&store, thread, Shelf::Archived, cx));
+                    let key = ThreadKey {
+                        machine,
+                        thread: thread.id,
+                    };
+                    match drag.filter(|drag| drag.thread == key) {
+                        // A dragged row's place stays open while it's over Archived, and moves
+                        // among the cards with it.
+                        Some(drag) if drag.over_archived => archived_rows
+                            .push(div().flex_none().h(ARCHIVED_ROW_HEIGHT).into_any_element()),
+                        Some(_) => {}
+                        None => {
+                            if let Some(store) = self.store(machine, cx) {
+                                archived_rows.push(self.render_slim_row(
+                                    &store,
+                                    thread,
+                                    Shelf::Archived,
+                                    None,
+                                    cx,
+                                ));
+                            }
+                        }
                     }
                 }
                 if hidden_count > 0 {
-                    shelf.push(self.render_show_more_archived(hidden_count, cx));
+                    archived_rows.push(self.render_show_more_archived(hidden_count, cx));
                 }
             }
+            let archived_top = self.archived_top.clone();
+            shelf.push(
+                v_flex()
+                    .relative()
+                    .child(
+                        canvas(
+                            move |bounds, _, _| archived_top.set(Some(bounds.top())),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .children(archived_rows)
+                    .into_any_element(),
+            );
         }
 
         v_flex()
@@ -1979,6 +2724,12 @@ impl Sidebar {
             .pt_1()
             .pb_2()
             .overflow_y_scroll()
+            .track_scroll(&self.list_scroll)
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedThread>, _, cx| {
+                    this.drag_thread(event.event.position.y, cx)
+                }),
+            )
             .children(draft_rows)
             .children(rows)
             .when(!shelf.is_empty(), |list| {
@@ -1986,6 +2737,47 @@ impl Sidebar {
                 list.child(v_flex().mt_auto().pt_2().children(shelf))
             })
             .into_any_element()
+    }
+
+    /// The dragged card or row, raised above the list where the pointer holds it, saying what
+    /// letting go does.
+    fn render_raised_thread(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let drag = self.thread_drag.as_ref()?;
+        let store = self.store(drag.thread.machine, cx)?;
+        let thread = store.read(cx).thread(drag.thread.thread)?.clone();
+        let verb = drag.verb();
+        // A card sits in the space around it, and an archived row fills its own.
+        let (content, inset) = if drag.from == DragSection::Archived {
+            (
+                self.render_slim_row(&store, thread, Shelf::Archived, Some(verb), cx),
+                px(0.),
+            )
+        } else {
+            let project = store.read(cx).project(thread.project_id).cloned();
+            (
+                self.render_thread_card(&store, thread, project, Some(verb), cx),
+                px(2.),
+            )
+        };
+        let list = self.list_scroll.bounds();
+        let top = drag
+            .slide
+            .held_start()
+            .clamp(list.top(), (list.bottom() - drag.height).max(list.top()));
+        // `render_raised_rows` draws its background inset from the sides, as workspace rows
+        // are, so it spreads past the card's sides by as much, and the card keeps its width.
+        Some(
+            deferred(
+                anchored()
+                    .position(gpui::point(drag.left - px(4.), top + inset))
+                    .child(render_raised_rows(
+                        vec![div().px_1().child(content).into_any_element()],
+                        drag.width + px(8.),
+                        cx,
+                    )),
+            )
+            .with_priority(1),
+        )
     }
 }
 
@@ -2002,18 +2794,27 @@ impl Render for Sidebar {
             .any(|client| !client.read(cx).projects().read(cx).projects().is_empty());
 
         v_flex()
+            .id("sidebar")
             .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_none()
             .border_r_1()
             .border_color(border)
             .bg(panel_background)
+            // A dragged thread is dropped wherever the pointer is, even past the sidebar's
+            // edge, as a dragged workspace row is.
+            .on_drop(cx.listener(|this, _: &DraggedThread, _, cx| this.drop_thread(cx)))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.drop_thread(cx)),
+            )
             .child(self.render_header(cx))
             .child(if has_projects {
                 self.render_threads(window, cx)
             } else {
                 self.render_empty_state().into_any_element()
             })
+            .children(self.render_raised_thread(cx))
             .child(render_footer_item(
                 "open-settings",
                 IconName::Settings,
@@ -2142,6 +2943,82 @@ impl ThreadDetails {
         }
         details_card(self.title, rows, cx)
     }
+}
+
+/// How a shelf header or a drag label reads: muted, at full strength while a thread is
+/// dragged, or in the accent where it would land (t3code's header tones).
+#[derive(Clone, Copy, PartialEq)]
+enum HeaderTone {
+    Muted,
+    Emphasized,
+    Accent,
+}
+
+impl HeaderTone {
+    /// The label's color and the rule's.
+    fn colors(self, cx: &App) -> (Color, Hsla) {
+        let colors = cx.theme().colors();
+        match self {
+            Self::Muted => (Color::Muted, colors.border_variant),
+            Self::Emphasized => (
+                Color::Custom(colors.text.opacity(0.8)),
+                colors.text.opacity(0.25),
+            ),
+            Self::Accent => (Color::Accent, Color::Accent.color(cx).opacity(0.5)),
+        }
+    }
+}
+
+/// t3code's drag boundary: "Pinned" over the pinned cards or "Active" over the rest, with a
+/// rule, open while a thread is dragged.
+fn render_drag_label(label: &'static str, is_target: bool, cx: &App) -> AnyElement {
+    let tone = if is_target {
+        HeaderTone::Accent
+    } else {
+        HeaderTone::Emphasized
+    };
+    let (color, rule_color) = tone.colors(cx);
+    h_flex()
+        .debug_selector(move || format!("drag-label-{label}"))
+        .h(DRAG_LABEL_HEIGHT)
+        .mx_0p5()
+        .px_2()
+        .gap_2()
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .weight(FontWeight::MEDIUM)
+                .color(color),
+        )
+        .child(div().flex_1().h_px().bg(rule_color))
+        .into_any_element()
+}
+
+/// What letting go of a dragged thread does, in the accent, in place of its time or state.
+fn render_drop_badge(verb: DropVerb, cx: &App) -> AnyElement {
+    let accent = Color::Accent.color(cx);
+    h_flex()
+        .debug_selector(move || format!("drop-badge-{}", verb.label()))
+        .flex_none()
+        .h_5()
+        .px_1p5()
+        .gap_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(accent.opacity(0.4))
+        .bg(accent.opacity(0.1))
+        .child(
+            Icon::new(verb.icon())
+                .size(IconSize::XSmall)
+                .color(Color::Accent),
+        )
+        .child(
+            Label::new(verb.label())
+                .size(LabelSize::Small)
+                .weight(FontWeight::MEDIUM)
+                .color(Color::Accent),
+        )
+        .into_any_element()
 }
 
 /// A worktree's or pasture's icon before the card's branch, or the worktree icon when the
@@ -2400,12 +3277,20 @@ mod tests {
 
 #[cfg(test)]
 mod view_tests {
+    use std::time::{Duration, SystemTime};
+
+    use agentz_protocol::Request;
     use agentz_protocol::spaces::SpacesSnapshot;
-    use gpui::{Entity, TestAppContext, VisualTestContext};
-    use projects::{Project, ProjectId, ProjectsSnapshot, Thread, ThreadId};
+    use gpui::{
+        Bounds, Entity, Modifiers, MouseButton, Pixels, Point, TestAppContext, VisualTestContext,
+        point, px,
+    };
+    use projects::{
+        Project, ProjectId, ProjectsSnapshot, Thread, ThreadId, ThreadOrder, ThreadSection,
+    };
     use serde_json::json;
 
-    use super::Sidebar;
+    use super::{DRAG_LABEL_HEIGHT, DragSection, Sidebar, ThreadDrag};
     use crate::machines::{MachineId, Machines, Scope, ThreadKey};
     use crate::project_store::ProjectStore;
     use crate::server_client::ServerClient;
@@ -2432,6 +3317,23 @@ mod view_tests {
         workspaces_expanded: bool,
         cx: &mut VisualTestContext,
     ) {
+        show_snapshot(
+            store,
+            ProjectsSnapshot {
+                threads,
+                workspaces_expanded,
+                ..Default::default()
+            },
+            cx,
+        )
+    }
+
+    /// Shows `snapshot`, with the demo project its threads are in.
+    fn show_snapshot(
+        store: &Entity<ProjectStore>,
+        snapshot: ProjectsSnapshot,
+        cx: &mut VisualTestContext,
+    ) {
         cx.update(|_, cx| {
             store.update(cx, |store, cx| {
                 store.set_snapshot(
@@ -2444,15 +3346,88 @@ mod view_tests {
                             workspaces: Vec::new(),
                             repository: None,
                         }],
-                        threads,
-                        workspaces_expanded,
-                        ..Default::default()
+                        ..snapshot
                     },
                     cx,
                 )
             })
         });
         cx.run_until_parked();
+    }
+
+    fn pinned(mut thread: Thread, order_key: &str) -> Thread {
+        thread.pinned_at = Some(SystemTime::UNIX_EPOCH);
+        thread.pin_order_key = Some(order_key.to_string());
+        thread
+    }
+
+    fn bounds(cx: &mut VisualTestContext, name: &'static str) -> Bounds<Pixels> {
+        cx.debug_bounds(name)
+            .unwrap_or_else(|| panic!("{name} is drawn"))
+    }
+
+    /// The requests that pin, unpin, arrange, archive or unarchive threads.
+    fn organizing_requests(cx: &mut VisualTestContext) -> Vec<Request> {
+        cx.update(|_, cx| {
+            let Some(client) = Machines::global(cx).read(cx).client(MachineId::Local, cx) else {
+                return Vec::new();
+            };
+            client
+                .read(cx)
+                .sent_for_test()
+                .into_iter()
+                .filter(|request| {
+                    matches!(
+                        request,
+                        Request::PinThread { .. }
+                            | Request::UnpinThread(_)
+                            | Request::ReorderThreads { .. }
+                            | Request::ArchiveThread(_)
+                            | Request::UnarchiveThread(_)
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Presses on `at` and moves a little, which picks up what's there. Returns where the
+    /// pointer is then.
+    fn pick_up(at: Point<Pixels>, cx: &mut VisualTestContext) -> Point<Pixels> {
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        let start = at + point(px(0.), px(4.));
+        cx.simulate_mouse_move(start, MouseButton::Left, Modifiers::none());
+        start
+    }
+
+    fn hold(at: Point<Pixels>, cx: &mut VisualTestContext) {
+        cx.simulate_mouse_move(at, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(at, MouseButton::Left, Modifiers::none());
+    }
+
+    fn let_go(at: Point<Pixels>, cx: &mut VisualTestContext) {
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn drag_target(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) -> Option<DragSection> {
+        sidebar.read_with(cx, |sidebar, _| {
+            sidebar.thread_drag.as_ref().map(ThreadDrag::target)
+        })
+    }
+
+    /// The threads given order keys in `section`, in the order of their keys.
+    fn reordered(request: &Request, section: ThreadSection) -> Vec<u64> {
+        let Request::ReorderThreads {
+            section: written,
+            keys,
+        } = request
+        else {
+            panic!("a reorder, not {request:?}");
+        };
+        assert_eq!(*written, section);
+        let mut keys = keys.clone();
+        keys.sort_by(|(_, a), (_, b)| a.cmp(b));
+        keys.into_iter().map(|(thread, _)| thread.0).collect()
     }
 
     /// A thread started in a workspace pane, working in `folder`.
@@ -2612,6 +3587,284 @@ mod view_tests {
         );
         assert!(!shown("draft-row-2", cx));
         assert!(shown("thread-card-2", cx));
+    }
+
+    #[gpui::test]
+    fn a_pinned_card_leads_and_its_pin_unpins_it(cx: &mut TestAppContext) {
+        let (_, store, cx) = new_sidebar(cx);
+        show(
+            &store,
+            vec![pinned(thread(1, false, None), "m"), thread(2, false, None)],
+            cx,
+        );
+        let first = bounds(cx, "thread-card-1");
+        assert!(first.top() < bounds(cx, "thread-card-2").top());
+        assert!(cx.debug_bounds("pin-mark-1").is_some());
+        assert!(cx.debug_bounds("pin-mark-2").is_none());
+        assert!(cx.debug_bounds("unpin-thread-2").is_none());
+
+        cx.simulate_mouse_move(first.center(), None, Modifiers::none());
+        let unpin = bounds(cx, "unpin-thread-1");
+        cx.simulate_click(unpin.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(organizing_requests(cx), [Request::UnpinThread(ThreadId(1))]);
+        assert!(cx.debug_bounds("pin-mark-1").is_none());
+        assert!(bounds(cx, "thread-card-2").top() < bounds(cx, "thread-card-1").top());
+    }
+
+    #[gpui::test]
+    fn a_card_dragged_up_among_the_pinned_ones_is_pinned_where_it_is_let_go(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        // Shown 1, then the rest newest first: 3, 2.
+        show(
+            &store,
+            vec![
+                pinned(thread(1, false, None), "m"),
+                thread(2, false, None),
+                thread(3, false, None),
+            ],
+            cx,
+        );
+        let first = bounds(cx, "thread-card-1");
+        let last = bounds(cx, "thread-card-2");
+        assert!(cx.debug_bounds("drag-label-Pinned").is_none());
+
+        let start = pick_up(last.center(), cx);
+        // The labels open where the cards started, and the card is raised where it was.
+        let label = bounds(cx, "drag-label-Pinned");
+        assert_eq!(label.top(), first.top() - px(2.));
+        assert_eq!(label.size.height, DRAG_LABEL_HEIGHT);
+        assert!(cx.debug_bounds("drag-label-Active").is_some());
+        let raised = bounds(cx, "thread-card-2");
+        assert_eq!(raised.top(), last.top());
+        assert_eq!(
+            (raised.left(), raised.size.width),
+            (last.left(), last.size.width)
+        );
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Active));
+        assert!(cx.debug_bounds("drop-badge-Pin").is_none());
+
+        // Up to the top, past the pinned card.
+        let held = point(start.x, start.y - (last.top() - first.top()));
+        hold(held, cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Pinned));
+        assert!(cx.debug_bounds("drop-badge-Pin").is_some());
+
+        let_go(held, cx);
+        let requests = organizing_requests(cx);
+        let [
+            Request::PinThread {
+                thread_id,
+                order_key: Some(order_key),
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("one pin: {requests:?}");
+        };
+        assert_eq!(*thread_id, ThreadId(2));
+        assert!(order_key.as_str() < "m", "{order_key} goes before m");
+        // It shows there at once, and the labels close.
+        assert!(cx.debug_bounds("drag-label-Pinned").is_none());
+        assert_eq!(bounds(cx, "thread-card-2").top(), first.top());
+        assert!(cx.debug_bounds("pin-mark-2").is_some());
+        assert!(bounds(cx, "thread-card-1").top() < bounds(cx, "thread-card-3").top());
+    }
+
+    #[gpui::test]
+    fn a_pinned_card_dragged_among_the_rest_is_unpinned_and_stays_where_it_is_let_go(
+        cx: &mut TestAppContext,
+    ) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        show(
+            &store,
+            vec![
+                pinned(thread(1, false, None), "m"),
+                thread(2, false, None),
+                thread(3, false, None),
+            ],
+            cx,
+        );
+        let first = bounds(cx, "thread-card-1");
+        let second = bounds(cx, "thread-card-3");
+        let step = second.top() - first.top();
+
+        // Down between 3 and 2, past the Active label.
+        let start = pick_up(first.center(), cx);
+        hold(point(start.x, start.y + step + DRAG_LABEL_HEIGHT), cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Active));
+        assert!(cx.debug_bounds("drop-badge-Unpin").is_some());
+
+        let_go(point(start.x, start.y + step + DRAG_LABEL_HEIGHT), cx);
+        let requests = organizing_requests(cx);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(requests[0], Request::UnpinThread(ThreadId(1)));
+        // The rest had no keys of their own, so they all get one.
+        assert_eq!(reordered(&requests[1], ThreadSection::Active), [3, 1, 2]);
+        assert_eq!(bounds(cx, "thread-card-3").top(), first.top());
+        assert_eq!(bounds(cx, "thread-card-1").top(), second.top());
+        assert!(cx.debug_bounds("pin-mark-1").is_none());
+    }
+
+    #[gpui::test]
+    fn a_card_dragged_onto_archived_is_archived(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        show(
+            &store,
+            vec![thread(1, false, None), thread(2, false, None)],
+            cx,
+        );
+        // With nothing archived, Archived shows only while a card is held.
+        assert!(cx.debug_bounds("archived-shelf-toggle").is_none());
+        let card = bounds(cx, "thread-card-1");
+        let start = pick_up(card.center(), cx);
+        let header = bounds(cx, "archived-shelf-toggle");
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Active));
+
+        let held = point(start.x, header.center().y);
+        hold(held, cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Archived));
+        assert!(cx.debug_bounds("drop-badge-Archive").is_some());
+
+        let_go(held, cx);
+        assert_eq!(
+            organizing_requests(cx),
+            [Request::ArchiveThread(ThreadId(1))]
+        );
+        assert!(cx.debug_bounds("thread-card-1").is_none());
+        // Folded, it stays folded.
+        assert!(cx.debug_bounds("archived-shelf-toggle").is_some());
+        assert!(cx.debug_bounds("archived-row-1").is_none());
+    }
+
+    #[gpui::test]
+    fn an_archived_row_dragged_among_the_cards_is_unarchived_there(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let mut archived = thread(3, false, None);
+        archived.archived_at = Some(SystemTime::UNIX_EPOCH);
+        show_snapshot(
+            &store,
+            ProjectsSnapshot {
+                threads: vec![thread(1, false, None), thread(2, false, None), archived],
+                archived_expanded: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        // Shown 2, 1.
+        let first = bounds(cx, "thread-card-2");
+        let second = bounds(cx, "thread-card-1");
+        let row = bounds(cx, "archived-row-3");
+
+        let start = pick_up(row.center(), cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Archived));
+        assert!(cx.debug_bounds("drop-badge-Unarchive").is_none());
+        // Its top where the second card's place is, under the labels.
+        let held = point(
+            start.x,
+            start.y - (row.top() - second.top()) + DRAG_LABEL_HEIGHT * 2.,
+        );
+        hold(held, cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Active));
+        assert!(cx.debug_bounds("drop-badge-Unarchive").is_some());
+
+        let_go(held, cx);
+        let requests = organizing_requests(cx);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(requests[0], Request::UnarchiveThread(ThreadId(3)));
+        assert_eq!(reordered(&requests[1], ThreadSection::Active), [2, 3, 1]);
+        assert!(cx.debug_bounds("archived-row-3").is_none());
+        assert_eq!(bounds(cx, "thread-card-2").top(), first.top());
+        assert_eq!(bounds(cx, "thread-card-3").top(), second.top());
+    }
+
+    #[gpui::test]
+    fn latest_active_first_the_rest_keep_their_order(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let active = |id: u64, seconds: u64| {
+            let mut thread = thread(id, false, None);
+            thread.last_activity_at = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+            thread
+        };
+        show_snapshot(
+            &store,
+            ProjectsSnapshot {
+                threads: vec![active(1, 30), active(2, 20), active(3, 10)],
+                thread_order: ThreadOrder::LastActivity,
+                ..Default::default()
+            },
+            cx,
+        );
+        let first = bounds(cx, "thread-card-1");
+        let last = bounds(cx, "thread-card-3");
+
+        // Held above the others it stays last among them, so letting go there does nothing.
+        let start = pick_up(last.center(), cx);
+        let held = point(start.x, start.y - (last.top() - first.top()) + px(8.));
+        hold(held, cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Active));
+        let shown = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .thread_drag
+                .as_ref()
+                .map(|drag| drag.shown(DragSection::Active))
+        });
+        let key = |thread| ThreadKey {
+            machine: MachineId::Local,
+            thread: ThreadId(thread),
+        };
+        assert_eq!(shown, Some(vec![key(1), key(2), key(3)]));
+        let_go(held, cx);
+        assert_eq!(organizing_requests(cx), []);
+
+        // Above the Active label, it's pinned.
+        let start = pick_up(last.center(), cx);
+        let held = point(start.x, start.y - (last.top() - first.top()) - px(20.));
+        hold(held, cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Pinned));
+        let_go(held, cx);
+        assert!(matches!(
+            organizing_requests(cx).as_slice(),
+            [Request::PinThread {
+                thread_id: ThreadId(3),
+                ..
+            }]
+        ));
+    }
+
+    #[gpui::test]
+    fn an_agent_cli_card_moves_only_among_the_unpinned_cards(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let mut terminal = thread(4, false, None);
+        terminal.agent_id = None;
+        terminal.terminal = Some(projects::TerminalCommand {
+            command: Some("claude".to_string()),
+        });
+        show_snapshot(
+            &store,
+            ProjectsSnapshot {
+                threads: vec![
+                    pinned(thread(1, false, None), "m"),
+                    thread(2, false, None),
+                    terminal,
+                ],
+                terminal_agents: vec![(ThreadId(4), "Claude Code".to_string())],
+                ..Default::default()
+            },
+            cx,
+        );
+        let first = bounds(cx, "thread-card-1");
+        let card = bounds(cx, "thread-card-4");
+        let start = pick_up(card.center(), cx);
+        // Terminals aren't archived.
+        assert!(cx.debug_bounds("archived-shelf-toggle").is_none());
+        let held = point(start.x, start.y - (card.top() - first.top()) - px(40.));
+        hold(held, cx);
+        assert_eq!(drag_target(&sidebar, cx), Some(DragSection::Active));
+        assert!(cx.debug_bounds("drop-badge-Pin").is_none());
+        let_go(held, cx);
+        assert_eq!(organizing_requests(cx), []);
     }
 }
 

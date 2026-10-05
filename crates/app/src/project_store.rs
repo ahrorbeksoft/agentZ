@@ -17,7 +17,8 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Context, EventEmitter, Task, WeakEntity};
 use projects::{
-    ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder, WorkspaceKind,
+    ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder, ThreadSection,
+    WorkspaceKind,
 };
 use util::ResultExt as _;
 
@@ -539,13 +540,52 @@ impl ProjectStore {
         })
     }
 
+    // Archiving, pinning and arranging show at once, as the server will have them, so a
+    // dropped card stays where it was let go until the server's snapshot replaces this copy.
+
     pub fn archive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        self.store.archive_thread(id);
+        cx.notify();
         self.send(Request::ArchiveThread(id), cx);
         cx.emit(ProjectStoreEvent::Archiving(id));
     }
 
     pub fn unarchive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        self.store.unarchive_thread(id);
+        cx.notify();
         self.send(Request::UnarchiveThread(id), cx)
+    }
+
+    pub fn pin_thread(&mut self, id: ThreadId, order_key: Option<String>, cx: &mut Context<Self>) {
+        self.store.pin_thread(id, order_key.clone()).log_err();
+        cx.notify();
+        self.send(
+            Request::PinThread {
+                thread_id: id,
+                order_key,
+            },
+            cx,
+        )
+    }
+
+    pub fn unpin_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        self.store.unpin_thread(id);
+        cx.notify();
+        self.send(Request::UnpinThread(id), cx)
+    }
+
+    pub fn reorder_threads(
+        &mut self,
+        section: ThreadSection,
+        keys: Vec<(ThreadId, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        self.store.set_order_keys(section, keys.clone()).log_err();
+        cx.notify();
+        self.send(Request::ReorderThreads { section, keys }, cx)
     }
 
     pub fn delete_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {

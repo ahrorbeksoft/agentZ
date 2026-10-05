@@ -5,12 +5,13 @@
 //! Views of a single thread hold that thread's machine. The sidebar, the project switcher and
 //! New Thread show every machine's projects together, as t3code shows its environments.
 
+use std::cmp::Ordering;
 use std::time::SystemTime;
 
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription};
 pub use projects::project_at;
-use projects::{Project, ProjectId, Thread, ThreadId, ThreadOrder};
+use projects::{Project, ProjectId, Thread, ThreadId, ThreadOrder, ThreadSection, order_key};
 use serde::{Deserialize, Serialize};
 use ui::{IconName, SharedString};
 
@@ -640,9 +641,10 @@ impl Machines {
             .workspaces_expanded()
     }
 
-    /// Unarchived top-level threads of the visible projects, newest or latest active first.
-    /// Shells aren't threads until an agent CLI runs in them, nor drafts until their first
-    /// message.
+    /// Unarchived top-level threads of the visible projects: the pinned ones in the order the
+    /// user gave them, then the rest, as the user arranged them below the new ones or latest
+    /// active first. Shells aren't threads until an agent CLI runs in them, nor drafts until
+    /// their first message.
     pub fn active_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let groups = self.visible_groups(cx);
         let mut threads = self.threads_where(cx, |machine, thread| {
@@ -655,16 +657,66 @@ impl Machines {
         });
         let order = self.thread_order(cx);
         threads.sort_by(|(a_machine, a), (b_machine, b)| {
-            let key = |thread: &Thread| match order {
-                ThreadOrder::LastActivity => thread.last_activity_at,
-                ThreadOrder::Created => thread.created_at.or(thread.last_activity_at),
+            let created = |thread: &Thread| thread.created_at.or(thread.last_activity_at);
+            let placement = match (a.is_pinned(), b.is_pinned()) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (true, true) => order_key::compare(
+                    (a.pin_order_key.as_deref(), a.pinned_at),
+                    (b.pin_order_key.as_deref(), b.pinned_at),
+                    false,
+                ),
+                (false, false) => match order {
+                    ThreadOrder::LastActivity => {
+                        return by_latest_activity((*a_machine, a), (*b_machine, b));
+                    }
+                    ThreadOrder::Created => order_key::compare(
+                        (a.active_order_key.as_deref(), created(a)),
+                        (b.active_order_key.as_deref(), created(b)),
+                        true,
+                    ),
+                },
             };
-            key(b)
-                .cmp(&key(a))
+            placement
                 .then(b_machine.cmp(a_machine))
                 .then(b.id.cmp(&a.id))
         });
         threads
+    }
+
+    /// The order keys of every machine's threads in `section`, shown or not: those a reorder
+    /// leaves free.
+    pub fn order_keys(&self, section: ThreadSection, cx: &App) -> HashMap<ThreadKey, String> {
+        let mut keys = HashMap::default();
+        for (machine, thread) in self.threads_where(cx, |_, thread| thread.archived_at.is_none()) {
+            let key = match section {
+                ThreadSection::Pinned if thread.is_pinned() => thread.pin_order_key,
+                ThreadSection::Active if !thread.is_pinned() => thread.active_order_key,
+                _ => None,
+            };
+            if let Some(key) = key {
+                keys.insert(
+                    ThreadKey {
+                        machine,
+                        thread: thread.id,
+                    },
+                    key,
+                );
+            }
+        }
+        keys
+    }
+
+    /// Pins the thread above every pinned thread on any machine, as a menu does (t3code's
+    /// `topOfPinnedRunOrderKey`).
+    pub fn pin_thread(machines: &Entity<Self>, key: ThreadKey, cx: &mut App) {
+        let machines = machines.read(cx);
+        let keys = machines.order_keys(ThreadSection::Pinned, cx);
+        let order_key = order_key::before_all(keys.values().map(String::as_str));
+        let Some(store) = machines.projects(key.machine, cx) else {
+            return;
+        };
+        store.update(cx, |store, cx| store.pin_thread(key.thread, order_key, cx));
     }
 
     /// Drafts of the visible projects with something typed in them, newest first: the
@@ -808,6 +860,17 @@ impl Machines {
             })
             .max()
     }
+}
+
+/// How the unpinned threads follow [`ThreadOrder::LastActivity`]: latest active first.
+pub fn by_latest_activity(
+    (a_machine, a): (MachineId, &Thread),
+    (b_machine, b): (MachineId, &Thread),
+) -> Ordering {
+    b.last_activity_at
+        .cmp(&a.last_activity_at)
+        .then(b_machine.cmp(&a_machine))
+        .then(b.id.cmp(&a.id))
 }
 
 /// t3code's `buildProjectGroups`: a group per logical key, members in the order given, and

@@ -27,7 +27,8 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use projects::{
-    ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId, ThreadOrder, WorkspaceKind,
+    ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId, ThreadOrder, ThreadSection,
+    WorkspaceKind,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -370,6 +371,20 @@ pub enum Request {
     },
     ArchiveThread(ThreadId),
     UnarchiveThread(ThreadId),
+    /// [`projects::ProjectStore::pin_thread`]: at `order_key` among the pinned threads, or
+    /// after the arranged ones.
+    PinThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        order_key: Option<String>,
+    },
+    UnpinThread(ThreadId),
+    /// The order keys a drag writes on this machine ([`projects::order_key::plan_reorder`]),
+    /// all or none.
+    ReorderThreads {
+        section: ThreadSection,
+        keys: Vec<(ThreadId, String)>,
+    },
     DeleteThread(ThreadId),
     /// What's typed in the thread's composer and not sent ([`projects::Thread::unsent_text`]).
     SetUnsentText {

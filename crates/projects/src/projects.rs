@@ -4,6 +4,8 @@
 //! Plain Rust with no UI framework, so the server can own it. Whoever owns the store learns of
 //! changes through [`ProjectStore::revision`].
 
+pub mod order_key;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -171,6 +173,18 @@ pub struct Thread {
     /// Set when the thread is archived; archived threads only show in Thread History.
     #[serde(default)]
     pub archived_at: Option<SystemTime>,
+    /// Set while the thread is pinned (t3code's `pinnedAt`): the sidebar lists it above the
+    /// rest.
+    #[serde(default)]
+    pub pinned_at: Option<SystemTime>,
+    /// Where the user put the pinned thread among the pinned ones, as an [`order_key`]. Pinned
+    /// threads without one follow those with one.
+    #[serde(default)]
+    pub pin_order_key: Option<String>,
+    /// Where the user put the unpinned thread among the rest, as an [`order_key`]. Those
+    /// without one, like new threads, lead.
+    #[serde(default)]
+    pub active_order_key: Option<String>,
     /// The user renamed the thread, so automatic titles no longer replace it.
     #[serde(default)]
     pub has_custom_title: bool,
@@ -243,6 +257,22 @@ impl Thread {
     /// Started in a workspace pane, so listed in the Workspaces section.
     pub fn in_workspaces(&self) -> bool {
         self.project_id == ProjectId::WORKSPACES
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.pinned_at.is_some()
+    }
+
+    /// Listed among the threads, where the user can arrange it: not a subthread, a draft or a
+    /// Workspaces thread, which have places of their own.
+    pub fn can_arrange(&self) -> bool {
+        self.task.is_none() && !self.is_draft && !self.in_workspaces()
+    }
+
+    /// An agent thread the user can pin. Terminal threads aren't: a shell can't, and an agent
+    /// CLI running in one only arranges among the rest.
+    pub fn can_pin(&self) -> bool {
+        self.can_arrange() && self.terminal.is_none()
     }
 
     /// For a Workspaces thread, the folder it was started in, which may differ from the
@@ -321,6 +351,14 @@ pub enum ThreadOrder {
     /// Newest thread first.
     #[default]
     Created,
+}
+
+/// The parts of the thread list the user arranges by hand, each with its own order keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadSection {
+    Pinned,
+    /// The unpinned threads.
+    Active,
 }
 
 /// Which projects the sidebar shows threads for.
@@ -719,6 +757,9 @@ impl ProjectStore {
             created_at: Some(now),
             session_id: None,
             archived_at: None,
+            pinned_at: None,
+            pin_order_key: None,
+            active_order_key: None,
             has_custom_title: false,
             model: None,
             completed_at: None,
@@ -894,6 +935,10 @@ impl ProjectStore {
             && thread.archived_at.is_none()
         {
             thread.archived_at = Some(SystemTime::now());
+            // As t3code's settling does, so a thread brought back starts over among the rest.
+            thread.pinned_at = None;
+            thread.pin_order_key = None;
+            thread.active_order_key = None;
             self.working_threads.remove(&id);
             self.blocked_threads.remove(&id);
             self.awaiting_input_threads.remove(&id);
@@ -908,6 +953,89 @@ impl ProjectStore {
             thread.archived_at = None;
             self.changed();
         }
+    }
+
+    /// Pins the thread, at `order_key` among the pinned ones, or without one after those the
+    /// user arranged. An archived thread comes back to be pinned, as a settled one does in
+    /// t3code. Pinning a pinned thread moves it to `order_key`.
+    pub fn pin_thread(&mut self, id: ThreadId, order_key: Option<String>) -> Result<()> {
+        if order_key
+            .as_deref()
+            .is_some_and(|key| !order_key::is_valid(key))
+        {
+            anyhow::bail!("not an order key: {order_key:?}");
+        }
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+            .context("no such thread")?;
+        if !thread.can_pin() {
+            anyhow::bail!("only an agent thread in the thread list can be pinned");
+        }
+        let pinned_at = thread.pinned_at.or_else(|| Some(SystemTime::now()));
+        let pin_order_key = order_key.or_else(|| thread.pin_order_key.clone());
+        if thread.pinned_at == pinned_at
+            && thread.pin_order_key == pin_order_key
+            && thread.archived_at.is_none()
+        {
+            return Ok(());
+        }
+        thread.pinned_at = pinned_at;
+        thread.pin_order_key = pin_order_key;
+        thread.archived_at = None;
+        self.changed();
+        Ok(())
+    }
+
+    /// Unpins the thread, which goes back to where it was among the rest.
+    pub fn unpin_thread(&mut self, id: ThreadId) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.is_pinned()
+        {
+            thread.pinned_at = None;
+            thread.pin_order_key = None;
+            self.changed();
+        }
+    }
+
+    /// Writes the order keys of a reorder in `section` ([`order_key::plan_reorder`]): all of
+    /// them, or none if one of the threads isn't in that section.
+    pub fn set_order_keys(
+        &mut self,
+        section: ThreadSection,
+        keys: Vec<(ThreadId, String)>,
+    ) -> Result<()> {
+        for (id, key) in &keys {
+            if !order_key::is_valid(key) {
+                anyhow::bail!("not an order key: {key:?}");
+            }
+            let thread = self.thread(*id).context("no such thread")?;
+            let (in_section, name) = match section {
+                ThreadSection::Pinned => (thread.is_pinned(), "pinned"),
+                ThreadSection::Active => (!thread.is_pinned(), "unpinned"),
+            };
+            if !thread.can_arrange() || thread.archived_at.is_some() || !in_section {
+                anyhow::bail!("thread {} isn't among the {name} threads", id.0);
+            }
+        }
+        let mut changed = false;
+        for (id, key) in keys {
+            if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+                let slot = match section {
+                    ThreadSection::Pinned => &mut thread.pin_order_key,
+                    ThreadSection::Active => &mut thread.active_order_key,
+                };
+                if slot.as_ref() != Some(&key) {
+                    *slot = Some(key);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.changed();
+        }
+        Ok(())
     }
 
     /// Removes the thread for good, with its subthreads.
@@ -1669,6 +1797,82 @@ mod tests {
         store.remove_project(second);
         assert_eq!(store.scope(), ProjectScope::All);
         assert_eq!(store.projects().len(), 1);
+    }
+
+    #[test]
+    fn pinning_and_arranging_threads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let first = store.add_thread(project, "First", None).expect("thread");
+        let second = store.add_thread(project, "Second", None).expect("thread");
+        let pinned = |store: &ProjectStore, id| {
+            store
+                .thread(id)
+                .map(|thread| (thread.is_pinned(), thread.pin_order_key.clone()))
+        };
+
+        store.pin_thread(first, None).expect("pin");
+        assert_eq!(pinned(&store, first), Some((true, None)));
+        let pinned_at = store.thread(first).and_then(|thread| thread.pinned_at);
+        store.pin_thread(first, Some("m".into())).expect("move");
+        assert_eq!(pinned(&store, first), Some((true, Some("m".into()))));
+        assert_eq!(
+            store.thread(first).and_then(|thread| thread.pinned_at),
+            pinned_at,
+            "moving keeps when it was pinned"
+        );
+        assert!(store.pin_thread(second, Some("ma".into())).is_err());
+
+        // All the keys or none.
+        let revision = store.revision();
+        assert!(
+            store
+                .set_order_keys(
+                    ThreadSection::Pinned,
+                    vec![(first, "g".into()), (second, "t".into())],
+                )
+                .is_err()
+        );
+        assert_eq!(store.revision(), revision);
+        assert_eq!(pinned(&store, first), Some((true, Some("m".into()))));
+        store
+            .set_order_keys(ThreadSection::Active, vec![(second, "t".into())])
+            .expect("arrange");
+        assert_eq!(
+            store
+                .thread(second)
+                .and_then(|thread| thread.active_order_key.clone()),
+            Some("t".into())
+        );
+
+        // Unpinning keeps its place among the rest; archiving forgets both.
+        store
+            .set_order_keys(ThreadSection::Active, vec![(first, "f".into())])
+            .expect_err("pinned");
+        store.unpin_thread(first);
+        assert_eq!(pinned(&store, first), Some((false, None)));
+        store.pin_thread(second, Some("m".into())).expect("pin");
+        store.archive_thread(second);
+        let archived = store.thread(second).expect("thread");
+        assert_eq!(
+            (archived.is_pinned(), archived.active_order_key.clone()),
+            (false, None)
+        );
+        store.pin_thread(second, None).expect("pin from archived");
+        let thread = store.thread(second).expect("thread");
+        assert!(thread.is_pinned() && thread.archived_at.is_none());
+
+        let shell = store
+            .add_terminal_thread(project, TerminalCommand::default())
+            .expect("shell");
+        assert!(store.pin_thread(shell, None).is_err());
+        store
+            .set_order_keys(ThreadSection::Active, vec![(shell, "f".into())])
+            .expect("an agent CLI arranges among the rest");
+        let draft = store.add_thread(project, "Draft", None).expect("thread");
+        store.set_draft(draft, true);
+        assert!(store.pin_thread(draft, None).is_err());
     }
 
     #[test]

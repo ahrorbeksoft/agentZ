@@ -31,7 +31,9 @@ use agentz_protocol::{ConnectionId, ServerMessage, ToolCaller, ToolResult};
 use collections::HashMap;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
-use projects::{ProjectId, ProjectStore, Task, TaskEnd, TaskOutcome, ThreadCreator, ThreadId};
+use projects::{
+    ProjectId, ProjectStore, Task, TaskEnd, TaskOutcome, Thread, ThreadCreator, ThreadId,
+};
 use serde_json::{Map, Value, json};
 use util::ResultExt as _;
 
@@ -1495,20 +1497,26 @@ impl Server {
             Some(thread_id) => self.target(caller, Some(thread_id))?,
             None => self.target(caller, caller.thread_id)?,
         };
-        let archive = match arguments.string("action", 32)? {
-            Some("archive") => true,
-            Some("unarchive") => false,
+        match arguments.string("action", 32)? {
+            Some("pin") => self
+                .projects
+                .pin_thread(thread_id, None)
+                .map_err(|error| invalid(error.to_string()))?,
+            Some("unpin") => self.projects.unpin_thread(thread_id),
+            Some("archive") => self.projects.archive_thread(thread_id),
+            Some("unarchive") => self.projects.unarchive_thread(thread_id),
             Some(action) => return Err(invalid(format!("Unknown action {action}."))),
-            None => return Err(invalid("action is required: archive or unarchive.")),
-        };
-        if archive {
-            self.projects.archive_thread(thread_id);
-        } else {
-            self.projects.unarchive_thread(thread_id);
+            None => {
+                return Err(invalid(
+                    "action is required: pin, unpin, archive or unarchive.",
+                ));
+            }
         }
+        let thread = self.projects.thread(thread_id);
         Ok(Step::Done(json!({
             "threadId": thread_id.0,
-            "archived": archive,
+            "pinned": thread.is_some_and(Thread::is_pinned),
+            "archived": thread.is_some_and(|thread| thread.archived_at.is_some()),
         })))
     }
 
@@ -1646,6 +1654,7 @@ impl Server {
                 .as_ref()
                 .map(|id| self.agent_name(&AgentId::new(id.clone())).to_string()),
             "model": thread.model,
+            "pinned": thread.is_pinned(),
             "archived": thread.archived_at.is_some(),
             "createdBy": if thread.created_by.is_some() { "agent" } else { "user" },
             "createdByThreadId": match thread.created_by {
@@ -2041,13 +2050,13 @@ pub(super) fn definitions() -> Value {
         },
         {
             "name": "agentz_thread_organize",
-            "title": "Archive an agentZ thread",
-            "description": "Archive or unarchive a thread in the calling project. Omit threadId for this thread. Archived threads keep running and move to Thread History. Deleting threads is left to the user.",
+            "title": "Organize an agentZ thread",
+            "description": "Pin, unpin, archive or unarchive a thread in the calling project. Omit threadId for this thread. Pinned threads list first in the sidebar; pinning an archived thread brings it back. Archived threads keep running and move to Thread History, unpinned. Deleting threads is left to the user.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "threadId": thread_id,
-                    "action": {"type": "string", "enum": ["archive", "unarchive"]},
+                    "action": {"type": "string", "enum": ["pin", "unpin", "archive", "unarchive"]},
                     "clientRequestId": client_request_id,
                 },
                 "required": ["action"],

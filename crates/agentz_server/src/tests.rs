@@ -1407,13 +1407,26 @@ async fn agents_manage_the_threads_of_their_project() {
             json!({"threadId": worker.0, "title": "Renamed"}),
         )
         .await;
-    client
+    let pinned = client
+        .tool(
+            orchestrator,
+            "agentz_thread_organize",
+            json!({"threadId": worker.0, "action": "pin"}),
+        )
+        .await;
+    assert_eq!(pinned["pinned"], json!(true));
+    let organized = client
         .tool(
             orchestrator,
             "agentz_thread_organize",
             json!({"threadId": worker.0, "action": "archive"}),
         )
         .await;
+    assert_eq!(
+        (&organized["pinned"], &organized["archived"]),
+        (&json!(false), &json!(true)),
+        "archiving unpins"
+    );
     let archived = client
         .tool(
             orchestrator,

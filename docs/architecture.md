@@ -67,7 +67,7 @@ agentZ's own crates. Everything else in `crates/` is copied from Zed at the same
 | `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook. `test_support/mock_agent.py` is the scripted test agent. |
-| `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order; `state.json`. |
+| `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
 | `paths` | Data locations (`AGENTZ_DATA_DIR` overrides). |
 | `text_input` | The single-line text field. |
@@ -136,6 +136,27 @@ Each entry: what it does, where it lives, and where it comes from.
   shelf, title search, context menu. Automatic titles (the first prompt, the agent, a shell's
   folder, a terminal's agent CLI) keep updating under the user's own (`Thread::automatic_title`),
   which shows while set; clearing it shows the automatic one again, as with workspaces.
+- **Pinned threads** (`sidebar.rs`, `Machines::active_threads`, `projects::order_key`; t3code's
+  `pinnedAt`, order keys and `planSidebarThreadDrop`, the user's picks in `design/pins/`):
+  pinned cards come first, with nothing between them and the rest, each with a muted pin
+  before its time or state, which unpins it ("Unpin thread"). Pin (Unpin on a pinned thread)
+  is first in a card's menu and the title menu, and puts the thread above every pinned one on
+  any machine (`Machines::pin_thread`). Shells, drafts, Workspaces threads and agent CLI cards
+  can't be pinned (`Thread::can_pin`). Order keys (`Thread::{pin_order_key,
+  active_order_key}`, fractional keys as in t3code) keep where the user put each pinned card
+  and, in Newest first order, each other card; new threads lead the rest. A dragged card
+  (`ThreadDrag`, sliding with `SlideDrag` like workspace rows) is raised where it was picked
+  up, and the Pinned and Active labels open above the pinned cards and the rest, the section
+  it would land in in the accent. Over another section its time gives way to Pin, Unpin,
+  Archive or Unarchive. The Archived header shows while a card is held, at full strength, and
+  in the accent with the card over it; an archived row dragged up among the cards is
+  unarchived there, and pinned among the pinned ones. Letting go writes one key between its
+  neighbors', or new keys for the whole section beside a card without one
+  (`order_key::plan_reorder`; `Request::{PinThread, UnpinThread, ReorderThreads}`), and shows
+  the new order at once (`ProjectStore` applies it before the server answers). Latest
+  activity first, the rest keep that order, so a card dragged among them only unpins or
+  unarchives. An agent CLI card moves only among the rest. Archiving unpins and drops a
+  thread's keys. Agents pin and unpin with `agentz_thread_organize`.
 - **Draft rows** (`sidebar.rs`, `Machines::typed_drafts`; t3code's `SidebarDraftBlock`): drafts
   (below, under Agent threads) aren't cards. One with text typed in it is a row above the cards,
   newest first, with t3code's pen, its project, and the first line of the text on a warning
@@ -252,7 +273,8 @@ Each entry: what it does, where it lives, and where it comes from.
   removing the front message disarms it.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
-  thread's menu (Rename, Continue with Another Agent ▸ except on a draft, Archive, Delete…), and a double-click
+  thread's menu (Pin or Unpin where it can be pinned, Rename, Continue with Another Agent ▸
+  except on a draft, Archive, Delete…), and a double-click
   renames it in place, as you type, as the sidebar does (`TitleButton`: the second click closes
   the menu the first opened; the field takes focus after the menu's delayed focus). Then the
   branch with its worktree or pasture icon, the changes as +added −removed (the Diff icon when
@@ -634,7 +656,7 @@ since a thread's workspace is its checkout.
   (`SpaceRequest::MoveTab`; the bar keeps that order until the server's arrives). Held near an
   end of a bar with more tabs than fit, it scrolls the bar.
   A dragged workspace row does the same up and down the list (`SpaceDrag`; both slide with
-  `SlideDrag`): raised (opaque in the selected row's color, with a shadow), held in the list
+  `slide_drag::SlideDrag`, as the Agents sidebar's cards do): raised (opaque in the selected row's color, with a shadow), held in the list
   however far left or right the pointer goes, and among its machine's rows. A group's parent
   takes its worktrees and pastures along, folded or not, and they don't drag themselves
   (herdr's block move). Letting go sends a `SpaceRequest::MoveSpace` for each workspace that
@@ -747,7 +769,7 @@ Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 - **Opening files** from tool calls.
 - **Searching message text**, not only titles.
 - **Deleting sessions on the agent's side** when a thread is deleted.
-- **t3code's pin, snooze and drag-to-reorder** for threads.
+- **t3code's snooze** for threads.
 - **Automatic workspace cleanup**: t3code's inactive-days and merged rules, cow's `gc`.
 - **An app icon** for the bundle.
 

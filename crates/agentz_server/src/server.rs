@@ -618,6 +618,23 @@ impl Server {
                 self.projects.unarchive_thread(thread_id);
                 Ok(Response::Ok)
             }
+            Request::PinThread {
+                thread_id,
+                order_key,
+            } => {
+                self.existing_thread(thread_id)?;
+                self.projects.pin_thread(thread_id, order_key)?;
+                Ok(Response::Ok)
+            }
+            Request::UnpinThread(thread_id) => {
+                self.existing_thread(thread_id)?;
+                self.projects.unpin_thread(thread_id);
+                Ok(Response::Ok)
+            }
+            Request::ReorderThreads { section, keys } => {
+                self.projects.set_order_keys(section, keys)?;
+                Ok(Response::Ok)
+            }
             Request::DeleteThread(thread_id) => {
                 self.existing_thread(thread_id)?;
                 self.delete_thread(thread_id);

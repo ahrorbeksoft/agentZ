@@ -2046,8 +2046,31 @@ impl AgentView {
                 let store = store.clone();
                 let title = title.clone();
                 let rename = rename_from_menu.clone();
+                // Drafts, Workspaces threads and agents' subthreads aren't pinned.
+                let is_pinned = store
+                    .read(cx)
+                    .thread(thread_id)
+                    .filter(|thread| thread.can_pin())
+                    .map(Thread::is_pinned);
                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
                     let rename = rename.clone();
+                    let toggle_pinned = {
+                        let store = store.clone();
+                        move |is_pinned: bool| {
+                            let store = store.clone();
+                            move |_: &mut Window, cx: &mut App| {
+                                if is_pinned {
+                                    store.update(cx, |store, cx| store.unpin_thread(thread_id, cx));
+                                } else {
+                                    let key = ThreadKey {
+                                        machine: store.read(cx).machine(),
+                                        thread: thread_id,
+                                    };
+                                    Machines::pin_thread(&Machines::global(cx), key, cx);
+                                }
+                            }
+                        }
+                    };
                     let continue_with = {
                         let view = view.clone();
                         let agents = agents.clone();
@@ -2107,12 +2130,25 @@ impl AgentView {
                             confirm_delete_thread(&store, thread_id, &title, window, cx)
                         }
                     };
-                    let mut menu = menu.item(
-                        ContextMenuEntry::new("Rename")
-                            .icon(IconName::Pencil)
-                            .icon_color(Color::Muted)
-                            .handler(move |window, cx| rename(window, cx)),
-                    );
+                    let mut menu = menu
+                        .when_some(is_pinned, |menu, is_pinned| {
+                            menu.item(
+                                ContextMenuEntry::new(if is_pinned { "Unpin" } else { "Pin" })
+                                    .icon(if is_pinned {
+                                        IconName::Unpin
+                                    } else {
+                                        IconName::Pin
+                                    })
+                                    .icon_color(Color::Muted)
+                                    .handler(toggle_pinned(is_pinned)),
+                            )
+                        })
+                        .item(
+                            ContextMenuEntry::new("Rename")
+                                .icon(IconName::Pencil)
+                                .icon_color(Color::Muted)
+                                .handler(move |window, cx| rename(window, cx)),
+                        );
                     if !is_draft {
                         menu = menu.submenu_with_icon(
                             "Continue with Another Agent",
