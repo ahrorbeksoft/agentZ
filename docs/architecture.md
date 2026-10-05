@@ -49,8 +49,10 @@ script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─►
 - **Agent lifetimes** (`Server::update_thread`, `Server::stop_idle_agents`): a thread's agent
   starts when a client opens the thread or something is sent to it. It stops when the thread is
   deleted, or once it has had nothing to do (no turn, question, login, queued message, unfinished
-  task or running command in its terminals) and no client has had the thread open for 30
-  minutes, 3 seconds for an archived thread (t3code's idle release). Opening the thread again
+  task or running command in its terminals), sent nothing, and no client has had the thread
+  open for 30 minutes, 3 seconds for an archived thread (t3code's idle release). What it sends
+  counts because agents work after their turns (Claude Agent's background tasks); ACP has no
+  other sign of it, so work that stays silent that long is stopped. Opening the thread again
   starts it and loads its session. Each agent runs in its own process group, killed whole, so
   what it started stops with it (Zed's `util::process::Child`): Factory Droid's `acp-daemon`
   runs a worker per session.

@@ -5,7 +5,9 @@ It answers initialize and session/new, and replies to every prompt by streaming
 "permission" first asks the client for permission and reports the chosen option.
 A prompt of "mcp" starts the first stdio MCP server given in session/new (or
 session/load), calls its first tool, and replies "MCP: <tool result>"; "mcp <tool>
-<json arguments>" calls that tool instead. A prompt of "slow" streams
+<json arguments>" calls that tool instead. A prompt of "background" ends its turn at
+once, then goes on streaming a "." every half second for six seconds, as Claude Agent's
+background tasks report after the turn. A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
 word at a time, 500 ms apart, then replies. "write <path> <text>"
 writes the text and a newline to the file, relative to the session's folder, and
@@ -58,6 +60,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 LOGIN_FILE = os.environ.get("MOCK_LOGIN_FILE")
@@ -120,9 +123,21 @@ def config_options():
     ]
 
 
+# Background work writes too.
+send_lock = threading.Lock()
+
+
 def send(message):
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+    with send_lock:
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+
+
+def work_in_background(session_id):
+    for _ in range(12):
+        time.sleep(0.5)
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session_id, "update": text_chunk("agent_message_chunk", ".")}})
 
 
 def listed_sessions():
@@ -498,6 +513,11 @@ for line in sys.stdin:
             reply = ask_form(params["sessionId"])
             update(params["sessionId"], text_chunk("agent_message_chunk", reply))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "background":
+            update(params["sessionId"], text_chunk("agent_message_chunk", "Working in the background"))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+            threading.Thread(target=work_in_background, args=(params["sessionId"],),
+                             daemon=True).start()
         elif prompt_text == "slow":
             for word in ["One", " two", " three", " four", " five"]:
                 update(params["sessionId"], text_chunk("agent_message_chunk", word))

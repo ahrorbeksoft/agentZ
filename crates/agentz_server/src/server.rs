@@ -182,8 +182,8 @@ pub(crate) struct Server {
     draft_due: HashMap<ThreadId, Instant>,
     /// When a sweep of them is due.
     draft_sweep_at: Option<Instant>,
-    /// Since when each running agent has had nothing to do and no client watching its thread
-    /// (see [`Self::stop_idle_agents`]).
+    /// Since when each running agent has had nothing to do, sent nothing, and no client watching
+    /// its thread (see [`Self::stop_idle_agents`]).
     agents_idle_since: HashMap<ThreadId, Instant>,
     /// When the next of them is due to stop.
     agent_sweep_at: Option<Instant>,
@@ -551,6 +551,11 @@ impl Server {
                 if let Some(thread) = thread {
                     thread.handle(message);
                     self.thread_changed(connection);
+                    // Whatever the agent sends is activity, as for t3code's idle release: an
+                    // agent can work after its turn ends (Claude Agent's background tasks).
+                    if let ConnectionId::Thread(thread_id) = connection {
+                        self.agents_idle_since.remove(&thread_id);
+                    }
                 }
             }
         }
@@ -1407,9 +1412,10 @@ impl Server {
             .collect()
     }
 
-    /// Stops the agents of threads that have had nothing to do and no client watching them
-    /// for [`AGENT_IDLE_TIMEOUT`], or for a moment once archived, as t3code releases idle
-    /// provider sessions. Opening the thread again starts its agent and loads its session.
+    /// Stops the agents of threads that have had nothing to do, sent nothing, and no client
+    /// watching them for [`AGENT_IDLE_TIMEOUT`], or for a moment once archived, as t3code
+    /// releases idle provider sessions. Opening the thread again starts its agent and loads its
+    /// session.
     fn stop_idle_agents(&mut self) {
         let now = Instant::now();
         let watched = self.watched_threads();

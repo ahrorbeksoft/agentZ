@@ -503,6 +503,57 @@ async fn stops_the_agent_of_an_archived_thread_left_idle() {
         .await;
 }
 
+/// An agent that goes on sending after its turn, as Claude Agent's background tasks do, isn't
+/// idle: it stops once it has been quiet for as long as its thread allows.
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_an_agent_that_works_after_its_turn() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let closed = dir.path().join("closed");
+    command.env.insert(
+        "MOCK_CLOSED_FILE".into(),
+        closed.to_string_lossy().into_owned(),
+    );
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("background"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread).starts_with("Working in the background")
+        })
+        .await;
+    // Archived, so 3 seconds without work would stop it.
+    client.ok(Request::ArchiveThread(thread_id)).await;
+    client.ok(Request::UnsubscribeThread(connection)).await;
+
+    // It goes on for six seconds after its turn.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!closed.exists(), "the agent stopped while it worked");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !closed.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(closed.exists(), "the agent kept running once it went quiet");
+}
+
 /// A new thread is a draft until its first message, as in t3code: one left with nothing typed
 /// is removed, and one with typed text stays until that's cleared.
 #[tokio::test(flavor = "multi_thread")]
