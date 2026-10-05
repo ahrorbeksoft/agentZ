@@ -13,6 +13,7 @@ mod login_item;
 mod machine_icon_picker;
 mod machine_modal;
 mod machines;
+mod mention_menu;
 mod new_space_picker;
 mod new_thread_modal;
 mod project_info;

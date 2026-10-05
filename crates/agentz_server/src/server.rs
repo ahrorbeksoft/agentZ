@@ -3,6 +3,7 @@
 mod custom_agents;
 #[cfg(unix)]
 mod hand_off;
+mod prompt_requests;
 mod session_requests;
 mod space_requests;
 mod terminal_requests;
@@ -24,8 +25,8 @@ use agentz_protocol::agents::{
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::{
-    AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, Request,
-    Response, ServerMessage, SessionSnapshot,
+    AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, PromptPart,
+    Request, Response, ServerMessage, SessionSnapshot,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
@@ -145,6 +146,8 @@ pub(crate) struct Server {
     moving_threads: HashMap<ThreadId, Option<String>>,
     /// Tool calls waiting for a thread, answered as soon as it's ready or their time is up.
     pending_tool_calls: Vec<PendingToolCall>,
+    /// Messages waiting for the threads they mention to load.
+    pending_prompts: Vec<prompt_requests::PendingPrompt>,
     tool_results: ToolResults,
     /// Tool calls for other machines, relayed through app clients.
     relays: tools::Relays,
@@ -242,6 +245,7 @@ impl Server {
             follow_ups: HashMap::default(),
             moving_threads: HashMap::default(),
             pending_tool_calls: Vec::new(),
+            pending_prompts: Vec::new(),
             tool_results: ToolResults::default(),
             relays: tools::Relays::default(),
             projects_revision_sent: projects.revision(),
@@ -424,6 +428,11 @@ impl Server {
                 id,
                 request: Request::ListAgentSessions(agent_id),
             } => self.list_agent_sessions(client, id, agent_id),
+            Input::Request {
+                client,
+                id,
+                request: Request::ListFiles(thread_id),
+            } => self.list_files(client, id, thread_id),
             Input::Request {
                 client,
                 id,
@@ -632,7 +641,7 @@ impl Server {
                 Ok(Response::Ok)
             }
 
-            Request::Prompt { connection, text } => {
+            Request::Prompt { connection, prompt } => {
                 if let ConnectionId::Thread(thread_id) = connection
                     && self
                         .projects
@@ -643,7 +652,23 @@ impl Server {
                         "a subthread only takes its task; message its parent instead"
                     ));
                 }
-                self.update_thread(connection, |thread| thread.send(text))?;
+                if prompt
+                    .iter()
+                    .all(|part| matches!(part, PromptPart::Text(_)))
+                {
+                    let text = prompt
+                        .into_iter()
+                        .map(|part| match part {
+                            PromptPart::Text(text) => text,
+                            _ => String::new(),
+                        })
+                        .collect();
+                    self.update_thread(connection, |thread| thread.send(text))?;
+                } else {
+                    // Starts the thread's agent first, as plain text does.
+                    self.update_thread(connection, |_| ())?;
+                    self.queue_prompt(connection, prompt)?;
+                }
                 Ok(Response::Ok)
             }
             Request::Cancel(connection) => {
@@ -846,6 +871,7 @@ impl Server {
                 archived,
             } => self.import_agent_sessions(agent_id, sessions, archived),
             Request::ListAgentSessions(_) => Err(anyhow!("listing sessions is handled separately")),
+            Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
 
             Request::Shutdown => {
                 self.stopping = true;
@@ -1503,6 +1529,7 @@ impl Server {
         self.move_threads();
         self.finish_tasks();
         let answers = self.answer_waiting_tool_calls();
+        self.send_waiting_prompts();
         self.announce_finished_tasks();
         self.send_follow_ups();
         for (thread_id, thread) in &self.threads {

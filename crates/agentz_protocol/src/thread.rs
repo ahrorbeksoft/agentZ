@@ -663,6 +663,44 @@ pub fn handoff(
     agent_name: &str,
     title: &str,
 ) -> PendingHandoff {
+    let (body, messages) = conversation(view, agent_name);
+    let attribute = |value: &str| value.replace('"', "'");
+    let text = format!(
+        "{HANDOFF_OPENING} from=\"{agent}\" thread=\"{title}\">\n\
+         The user is continuing, with you, a conversation they had with {agent_name} in this \
+         same folder. This is what happened there, oldest first. Files may have changed since, \
+         so check them before relying on details. The user's message to you follows.\n\n\
+         {body}\n{HANDOFF_CLOSING}",
+        agent = attribute(agent_name),
+        title = attribute(title),
+    );
+    PendingHandoff {
+        from,
+        from_title: title.to_string(),
+        from_agent: agent_name.to_string(),
+        text,
+        messages,
+    }
+}
+
+/// Another thread's conversation where the user mentions it in a message (Zed's thread
+/// mentions): what a handoff sends, as context rather than a conversation to continue.
+pub fn mentioned_thread(view: &ThreadView, agent_name: &str, title: &str) -> String {
+    let (body, _) = conversation(view, agent_name);
+    let attribute = |value: &str| value.replace('"', "'");
+    format!(
+        "<agentz-thread from=\"{agent}\" thread=\"{title}\">\n\
+         A conversation the user had with {agent_name}, which they mention in their message. \
+         This is what happened there, oldest first. Files may have changed since.\n\n\
+         {body}\n</agentz-thread>",
+        agent = attribute(agent_name),
+        title = attribute(title),
+    )
+}
+
+/// A conversation as messages in tags, the first and the latest kept when it's long, and how
+/// many messages it had.
+fn conversation(view: &ThreadView, agent_name: &str) -> (String, usize) {
     enum Part {
         User(String),
         Agent { text: String, tools: Vec<String> },
@@ -768,23 +806,7 @@ pub fn handoff(
         body.push(format!("<plan>\n{}\n</plan>", plan.join("\n")));
     }
 
-    let text = format!(
-        "{HANDOFF_OPENING} from=\"{agent}\" thread=\"{title}\">\n\
-         The user is continuing, with you, a conversation they had with {agent_name} in this \
-         same folder. This is what happened there, oldest first. Files may have changed since, \
-         so check them before relying on details. The user's message to you follows.\n\n\
-         {body}\n{HANDOFF_CLOSING}",
-        agent = attribute(agent_name),
-        title = attribute(title),
-        body = body.join("\n\n"),
-    );
-    PendingHandoff {
-        from,
-        from_title: title.to_string(),
-        from_agent: agent_name.to_string(),
-        text,
-        messages,
-    }
+    (body.join("\n\n"), messages)
 }
 
 /// A user message without the handoff it began with, as an agent may replay it.

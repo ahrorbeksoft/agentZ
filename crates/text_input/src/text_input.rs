@@ -1571,6 +1571,7 @@ impl Render for TextInput {
         }
         let preview = self.render_chip_preview(cx);
         div()
+            .id("text-input")
             .flex()
             .w_full()
             .key_context({
@@ -1610,6 +1611,12 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            // Moves are only heard over the input, so leaving it ends a chip's hover.
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered && this.hovered_chip.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .when(self.is_multi_line(), |this| {
                 this.on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             })
@@ -1748,6 +1755,39 @@ mod tests {
         cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
         cx.simulate_keystrokes("cmd-v");
         assert_eq!(text(&input, cx), "a b");
+    }
+
+    #[gpui::test]
+    fn hovering_a_chip_shows_its_preview(cx: &mut TestAppContext) {
+        let (input, cx) = input(true, cx);
+        input.update(cx, |input, cx| {
+            input.insert_chip(
+                None,
+                "total.ts",
+                "icons/file.svg".into(),
+                ChipPreview::Text("~/storefront/src/total.ts".into()),
+                "@total.ts".into(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let chip = input.read_with(cx, |input, _| {
+            input
+                .layout
+                .as_ref()
+                .and_then(|layout| layout.chip_bounds.first().copied())
+        });
+        let (_, bounds) = chip.expect("the chip's bounds");
+        cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::none());
+        let hovered = input.read_with(cx, |input, _| input.hovered_chip.map(|(id, _)| id));
+        assert_eq!(hovered, Some(0));
+        cx.simulate_mouse_move(
+            bounds.center() + point(px(200.), px(0.)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        let hovered = input.read_with(cx, |input, _| input.hovered_chip);
+        assert!(hovered.is_none());
     }
 
     #[gpui::test]

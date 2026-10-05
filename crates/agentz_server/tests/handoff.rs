@@ -264,7 +264,7 @@ async fn hands_agents_to_a_new_server() {
     let response = connection
         .request(Request::Prompt {
             connection: thread,
-            text: "slow".into(),
+            prompt: agentz_protocol::PromptPart::text("slow"),
         })
         .await
         .expect("prompts");
@@ -310,7 +310,7 @@ async fn hands_agents_to_a_new_server() {
     let response = connection
         .request(Request::Prompt {
             connection: thread,
-            text: "hello".into(),
+            prompt: agentz_protocol::PromptPart::text("hello"),
         })
         .await
         .expect("prompts");

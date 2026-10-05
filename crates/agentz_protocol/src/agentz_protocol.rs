@@ -391,9 +391,12 @@ pub enum Request {
 
     Prompt {
         connection: ConnectionId,
-        text: String,
+        prompt: Vec<PromptPart>,
     },
     Cancel(ConnectionId),
+    /// The files and folders of the folder a thread works in, for its composer's @-mentions:
+    /// [`Response::Files`].
+    ListFiles(ThreadId),
     RespondToPermission {
         connection: ConnectionId,
         tool_call_id: acp::ToolCallId,
@@ -582,6 +585,49 @@ pub struct RelayToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// A part of a message to an agent, in the order typed: its text, and what the user mentioned
+/// in it (Zed's mentions).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptPart {
+    Text(String),
+    /// A file or folder on the thread's machine.
+    Path(PathBuf),
+    /// Another thread on the thread's machine, which goes along as its conversation.
+    Thread(ThreadId),
+    /// A pasted image: its MIME type, and its bytes in base64.
+    Image {
+        mime_type: String,
+        data: String,
+    },
+}
+
+impl PromptPart {
+    /// A message of only text.
+    pub fn text(text: impl Into<String>) -> Vec<PromptPart> {
+        vec![PromptPart::Text(text.into())]
+    }
+}
+
+/// What @ can mention in a thread's folder.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileListing {
+    pub root: PathBuf,
+    /// Relative to `root`, with `/` between names, as git lists them. Gitignored files are
+    /// left out, and the list stops at [`FileListing::LIMIT`].
+    pub entries: Vec<FileEntry>,
+}
+
+impl FileListing {
+    pub const LIMIT: usize = 50_000;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryListing {
     /// The folder listed, with `~` expanded.
@@ -648,6 +694,7 @@ pub enum Response {
     TerminalFrame(TerminalFrame),
     TerminalMatches(TerminalMatches),
     Directories(DirectoryListing),
+    Files(FileListing),
     SpacePane(PaneLocation),
     AgentIcons(Vec<AgentIcon>),
     AgentSessions(AgentSessions),
@@ -759,7 +806,7 @@ mod tests {
             id: 7,
             request: Request::Prompt {
                 connection: ConnectionId::Thread(ThreadId(3)),
-                text: "hello".into(),
+                prompt: PromptPart::text("hello"),
             },
         };
         write_message(&mut client, &hello).await.expect("write");

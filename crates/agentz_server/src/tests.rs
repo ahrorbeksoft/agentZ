@@ -21,8 +21,8 @@ use agentz_protocol::thread::{Entry, ThreadView};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, MachineKind,
-    PROTOCOL_VERSION, PeerCheckout, PeerCheckouts, PeerMachine, Peers, Request, Response,
-    ServerMessage, ServerWelcome, ToolCaller, ToolResult, read_message, write_message,
+    PROTOCOL_VERSION, PeerCheckout, PeerCheckouts, PeerMachine, Peers, PromptPart, Request,
+    Response, ServerMessage, ServerWelcome, ToolCaller, ToolResult, read_message, write_message,
 };
 use futures::FutureExt as _;
 use projects::{ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, WorkspaceKind};
@@ -308,7 +308,7 @@ async fn prompts_a_thread_and_names_it() {
     client
         .ok(Request::Prompt {
             connection,
-            text: "hello there".into(),
+            prompt: PromptPart::text("hello there"),
         })
         .await;
     client
@@ -352,7 +352,7 @@ async fn prompts_a_thread_and_names_it() {
     let error = client
         .request(Request::Prompt {
             connection,
-            text: "again".into(),
+            prompt: PromptPart::text("again"),
         })
         .await;
     assert!(error.is_err());
@@ -373,7 +373,7 @@ async fn continues_threads_with_another_agent() {
     client
         .ok(Request::Prompt {
             connection: old,
-            text: "build the page".into(),
+            prompt: PromptPart::text("build the page"),
         })
         .await;
     client
@@ -428,7 +428,7 @@ async fn continues_threads_with_another_agent() {
     client
         .ok(Request::Prompt {
             connection: new,
-            text: "next".into(),
+            prompt: PromptPart::text("next"),
         })
         .await;
     client
@@ -475,7 +475,7 @@ async fn removes_drafts_left_empty() {
     client
         .ok(Request::Prompt {
             connection: old,
-            text: "build the page".into(),
+            prompt: PromptPart::text("build the page"),
         })
         .await;
     client
@@ -579,7 +579,7 @@ async fn threads_outlive_their_clients() {
     client
         .ok(Request::Prompt {
             connection,
-            text: "permission".into(),
+            prompt: PromptPart::text("permission"),
         })
         .await;
     client
@@ -653,7 +653,7 @@ async fn threads_waiting_for_input_are_marked() {
     client
         .ok(Request::Prompt {
             connection,
-            text: "form".into(),
+            prompt: PromptPart::text("form"),
         })
         .await;
     let awaiting_input = move |client: &TestClient| {
@@ -1871,7 +1871,7 @@ async fn agents_delegate_tasks_to_subthreads() {
     let refused = client
         .request(Request::Prompt {
             connection: ConnectionId::Thread(helper),
-            text: "more".into(),
+            prompt: PromptPart::text("more"),
         })
         .await;
     assert!(refused.is_err());
@@ -2152,7 +2152,7 @@ impl TestClient {
         let before = self.user_messages(thread_id).len();
         self.ok(Request::Prompt {
             connection,
-            text: text.into(),
+            prompt: PromptPart::text(text),
         })
         .await;
         self.wait_until(|client| {
@@ -3337,6 +3337,59 @@ async fn terminal_agents_turns_are_checkpointed() {
     );
 }
 
+/// Zed's mentions: a file goes as its contents and another thread as its conversation, and the
+/// user's message shows them as links.
+#[tokio::test(flavor = "multi_thread")]
+async fn mentions_go_to_the_agent() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let notes = server.project_dir.path().join("notes.md");
+    std::fs::write(&notes, "remember the milk").expect("a file");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let earlier = client.create_thread_in(project_id).await;
+    client.wait_until_ready(earlier).await;
+    client.prompt_and_wait(earlier, "hello there").await;
+
+    let thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread).await;
+    let connection = ConnectionId::Thread(thread);
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: vec![
+                PromptPart::Text("look at ".into()),
+                PromptPart::Path(notes.clone()),
+                PromptPart::Text(" and ".into()),
+                PromptPart::Thread(earlier),
+            ],
+        })
+        .await;
+    let file_uri = format!("file://{}", notes.display());
+    let thread_uri = format!("agentz://thread/{}", earlier.0);
+    let expected = format!("[with {file_uri}, {thread_uri}]");
+    client
+        .wait_until(|client| {
+            let view = client.thread(connection);
+            !view.is_working() && agent_text(view).contains(&expected)
+        })
+        .await;
+    assert_eq!(
+        client.user_messages(thread),
+        [format!(
+            "look at [@notes.md]({file_uri}) and [@hello there]({thread_uri})"
+        )]
+    );
+
+    // The files @ can mention are the folder's.
+    let Response::Files(listing) = client.ok(Request::ListFiles(thread)).await else {
+        panic!("expected the thread's files");
+    };
+    assert!(listing.entries.iter().any(|entry| entry.path == "notes.md"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_run_commands_in_server_terminals() {
     let Some(server) = TestServer::start() else {
@@ -3350,7 +3403,7 @@ async fn agents_run_commands_in_server_terminals() {
     client
         .ok(Request::Prompt {
             connection,
-            text: "terminal printf 'built %s\\n' \"$PAGER-$GIT_PAGER\"; exit 4".into(),
+            prompt: PromptPart::text("terminal printf 'built %s\\n' \"$PAGER-$GIT_PAGER\"; exit 4"),
         })
         .await;
     client

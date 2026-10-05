@@ -30,6 +30,8 @@ Every login and logout is reported with `_auth/status_update`, as Claude Agent a
 
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
+So are resource links (their URIs) and images (their MIME types). With MOCK_IMAGES set, it
+takes images.
 
 A prompt of "form" asks the client to fill in a form (a session elicitation) and replies
 "Form: <action> <content as JSON>".
@@ -357,7 +359,8 @@ for line in sys.stdin:
                          "agentCapabilities": {
                              "loadSession": HISTORY_PATH is not None or SESSIONS_FILE is not None,
                              "sessionCapabilities": session_capabilities,
-                             "promptCapabilities": {"embeddedContext": True},
+                             "promptCapabilities": {"embeddedContext": True,
+                                                    "image": bool(os.environ.get("MOCK_IMAGES"))},
                              "auth": {"logout": {}}},
                          "authMethods": auth_methods}})
         send_auth_status()
@@ -411,9 +414,15 @@ for line in sys.stdin:
         params = message["params"]
         prompt_text = "".join(block.get("text", "") for block in params["prompt"]
                               if block.get("type", "text") == "text")
-        # Context embedded in the prompt (a handoff from another thread), named in the reply.
-        prompt_resources = [block["resource"]["uri"] for block in params["prompt"]
-                            if block.get("type") == "resource"]
+        # Context in the prompt (a handoff from another thread, mentions), named in the reply.
+        prompt_resources = []
+        for block in params["prompt"]:
+            if block.get("type") == "resource":
+                prompt_resources.append(block["resource"]["uri"])
+            elif block.get("type") == "resource_link":
+                prompt_resources.append(block["uri"])
+            elif block.get("type") == "image":
+                prompt_resources.append(block["mimeType"])
         record(text_chunk("user_message_chunk", prompt_text))
         if prompt_text == "permission":
             next_request_id += 1

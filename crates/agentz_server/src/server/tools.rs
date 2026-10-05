@@ -458,7 +458,7 @@ impl Server {
         });
     }
 
-    fn wake_at(&self, deadline: Instant) {
+    pub(super) fn wake_at(&self, deadline: Instant) {
         let inputs = self.inputs.clone();
         self.runtime.spawn(async move {
             tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;

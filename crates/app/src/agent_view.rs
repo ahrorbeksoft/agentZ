@@ -1,8 +1,9 @@
 //! The conversation with one agent. Layout, spacing and colors follow Zed's agent thread view
 //! (`agent_ui::conversation_view::thread_view`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
@@ -15,23 +16,28 @@ use agentz_protocol::thread::{
     without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
-use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
+use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardItem, Context,
-    DismissEvent, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding,
-    Pixels, Point, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred,
-    pulsating_between,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardEntry,
+    ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, Hsla, KeyBinding, Pixels, Point, PromptLevel, ScrollHandle,
+    Subscription, Task, Window, anchored, deferred, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, WorkspaceKind};
-use text_input::{TextInput, TextInputEvent};
+use text_input::{ChipId, ChipPreview, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
     IconPosition, PopoverMenu, PopoverMenuHandle, Severity, SpinnerLabel, Switch, ToggleState,
     Tooltip, prelude::*,
 };
 use util::ResultExt as _;
+
+use crate::mention_menu::{
+    Mention, MentionKind, MentionMatch, MentionQuery, MentionTarget, MentionableThread,
+    find_mentions, mention_query, render_mention_menu, target_icon,
+};
 
 use crate::agent_icons::agent_icon;
 use crate::agent_login::{AgentLogin, LoginLayout};
@@ -154,6 +160,24 @@ const UNSENT_TEXT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// The most subthreads the Agents control lists before it scrolls.
 const MAX_AGENT_ROWS_SHOWN: usize = 6;
 
+/// A message typed while the agent works: its text for the queue, and what it sends.
+struct QueuedMessage {
+    text: String,
+    prompt: Vec<PromptPart>,
+}
+
+/// The image formats agents take, by a file's extension.
+fn image_format(path: &Path) -> Option<gpui::ImageFormat> {
+    let extension = path.extension()?.to_str()?.to_lowercase();
+    Some(match extension.as_str() {
+        "png" => gpui::ImageFormat::Png,
+        "jpg" | "jpeg" => gpui::ImageFormat::Jpeg,
+        "gif" => gpui::ImageFormat::Gif,
+        "webp" => gpui::ImageFormat::Webp,
+        _ => return None,
+    })
+}
+
 pub struct AgentView {
     thread_id: ThreadId,
     /// Focused instead of the message editor on a subthread, which has none.
@@ -194,7 +218,22 @@ pub struct AgentView {
     plan_expanded: bool,
     edits_expanded: bool,
     /// Messages typed while the agent works; sent one at a time as each turn ends, like Zed.
-    queued_messages: Vec<String>,
+    queued_messages: Vec<QueuedMessage>,
+    /// What each of the composer's chips mentions.
+    mentions: HashMap<ChipId, Mention>,
+    /// The `@query` the composer's cursor is at, while its menu is open.
+    mention_query: Option<MentionQuery>,
+    mention_kind: MentionKind,
+    mention_matches: Vec<MentionMatch>,
+    mention_index: usize,
+    /// The `@` whose menu the user closed.
+    mention_dismissed_at: Option<usize>,
+    /// The thread folder's files, for @, once asked for.
+    files: Option<agentz_protocol::FileListing>,
+    files_loading: bool,
+    /// The files arrived, or the kind changed, since the matches were found.
+    files_changed: bool,
+    _files_load: Task<()>,
     queue_expanded: bool,
     command_menu_index: usize,
     /// The composer text for which the user dismissed the slash-command menu.
@@ -308,6 +347,7 @@ impl AgentView {
             |this, _, event: &TextInputEvent, cx| match event {
                 TextInputEvent::Changed => {
                     this.command_menu_index = 0;
+                    this.forget_removed_mentions(cx);
                     this.save_unsent_text(cx);
                     cx.notify();
                 }
@@ -360,6 +400,16 @@ impl AgentView {
             plan_expanded: false,
             edits_expanded: false,
             queued_messages: Vec::new(),
+            mentions: HashMap::default(),
+            mention_query: None,
+            mention_kind: MentionKind::Any,
+            mention_matches: Vec::new(),
+            mention_index: 0,
+            mention_dismissed_at: None,
+            files: None,
+            files_loading: false,
+            files_changed: false,
+            _files_load: Task::ready(()),
             queue_expanded: false,
             command_menu_index: 0,
             command_menu_dismissed_for: None,
@@ -1012,6 +1062,12 @@ impl AgentView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.mention_query.is_some() {
+            let count = self.mention_matches.len().max(1);
+            self.mention_index = (self.mention_index + 1) % count;
+            cx.notify();
+            return;
+        }
         let count = self.matching_commands(cx).len();
         if count == 0 {
             cx.propagate();
@@ -1027,6 +1083,12 @@ impl AgentView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.mention_query.is_some() {
+            let count = self.mention_matches.len().max(1);
+            self.mention_index = self.mention_index.checked_sub(1).unwrap_or(count - 1);
+            cx.notify();
+            return;
+        }
         let count = self.matching_commands(cx).len();
         if count == 0 {
             cx.propagate();
@@ -1042,6 +1104,10 @@ impl AgentView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.mention_query.is_some() && !self.mention_matches.is_empty() {
+            self.accept_mention(self.mention_index, cx);
+            return;
+        }
         let commands = self.matching_commands(cx);
         match commands.get(
             self.command_menu_index
@@ -1081,6 +1147,10 @@ impl AgentView {
     }
 
     fn send(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mention_query.is_some() && !self.mention_matches.is_empty() {
+            self.accept_mention(self.mention_index, cx);
+            return;
+        }
         if self.is_archived || !self.client.read(cx).is_online() || self.needs_login(cx) {
             return;
         }
@@ -1116,15 +1186,21 @@ impl AgentView {
                 return;
             }
         }
+        let message = QueuedMessage {
+            text,
+            prompt: self.composer_prompt(cx),
+        };
         self.composer
             .update(cx, |composer, cx| composer.set_text("", cx));
+        self.mentions.clear();
         if self.thread.read(cx).is_working() || !self.queued_messages.is_empty() {
-            self.queued_messages.push(text);
+            self.queued_messages.push(message);
             cx.notify();
             return;
         }
         self.scroll_handle.scroll_to_bottom();
-        self.thread.update(cx, |thread, cx| thread.send(text, cx));
+        self.thread
+            .update(cx, |thread, cx| thread.send(message.prompt, cx));
     }
 
     fn send_next_queued_message(&mut self, cx: &mut Context<Self>) {
@@ -1136,11 +1212,11 @@ impl AgentView {
         {
             return;
         }
-        let text = self.queued_messages.remove(0);
+        let message = self.queued_messages.remove(0);
         self.scroll_handle.scroll_to_bottom();
         // Deferred: this runs while the thread is notifying observers.
         let thread = self.thread.clone();
-        cx.defer(move |cx| thread.update(cx, |thread, cx| thread.send(text, cx)));
+        cx.defer(move |cx| thread.update(cx, |thread, cx| thread.send(message.prompt, cx)));
     }
 
     fn is_scrolled_to_bottom(&self) -> bool {
@@ -1150,6 +1226,12 @@ impl AgentView {
     }
 
     fn stop(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(query) = &self.mention_query {
+            self.mention_dismissed_at = Some(query.at);
+            self.mention_query = None;
+            cx.notify();
+            return;
+        }
         if !self.matching_commands(cx).is_empty() {
             self.command_menu_dismissed_for = Some(self.composer.read(cx).text().clone());
             cx.notify();
@@ -1158,12 +1240,381 @@ impl AgentView {
         self.thread.update(cx, |thread, cx| thread.cancel(cx));
     }
 
-    /// Pastes text as typed. Images and copied files come with mentions.
-    fn paste_into_composer(&mut self, item: &ClipboardItem, _plain: bool, cx: &mut Context<Self>) {
-        if let Some(text) = item.text() {
+    /// Zed's paste: images become Image chips and copied files mentions, unless pasted as
+    /// plain text.
+    fn paste_into_composer(&mut self, item: &ClipboardItem, plain: bool, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = item
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::ExternalPaths(paths) => Some(paths.paths().to_vec()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let images: Vec<gpui::Image> = item
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+            .collect();
+        if plain || (paths.is_empty() && images.is_empty()) {
+            if let Some(text) = item.text() {
+                self.composer
+                    .update(cx, |composer, cx| composer.insert(&text, cx));
+            }
+            return;
+        }
+        for path in paths {
+            self.mention_path(path, cx);
+        }
+        if self.thread.read(cx).supports_images() {
+            for image in images {
+                self.insert_image(image.format, image.bytes, cx);
+            }
+        }
+    }
+
+    /// A pasted or dropped file: an image becomes an Image chip, anything else a mention of
+    /// it. Another machine's thread can't see this Mac's files, so it gets the path as text.
+    fn mention_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(format) = image_format(&path)
+            && self.thread.read(cx).supports_images()
+        {
+            match std::fs::read(&path) {
+                Ok(bytes) => self.insert_image(format, bytes, cx),
+                Err(error) => log::error!("failed to read {}: {error}", path.display()),
+            }
+            return;
+        }
+        if self.client.read(cx).machine() != crate::machines::MachineId::Local {
+            let text = format!("{} ", path.display());
             self.composer
                 .update(cx, |composer, cx| composer.insert(&text, cx));
+            return;
         }
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let icon = if path.is_dir() {
+            IconName::Folder
+        } else {
+            IconName::File
+        };
+        let preview = ChipPreview::Text(compact_path(&path).into());
+        self.insert_mention(None, &label, icon, preview, Mention::Path(path), cx);
+    }
+
+    fn insert_image(&mut self, format: gpui::ImageFormat, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let image = Arc::new(gpui::Image::from_bytes(format, bytes));
+        let mention = Mention::Image {
+            mime_type: format.mime_type().to_string(),
+            data,
+        };
+        self.insert_mention(
+            None,
+            "Image",
+            IconName::Image,
+            ChipPreview::Image(image),
+            mention,
+            cx,
+        );
+    }
+
+    /// Puts a mention's chip in place of `range` (or the selection).
+    fn insert_mention(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        label: &str,
+        icon: IconName,
+        preview: ChipPreview,
+        mention: Mention,
+        cx: &mut Context<Self>,
+    ) {
+        let copy_text: SharedString = format!("@{label}").into();
+        let chip = self.composer.update(cx, |composer, cx| {
+            composer.insert_chip(range, label, icon.path().into(), preview, copy_text, cx)
+        });
+        self.mentions.insert(chip, mention);
+        self.mention_kind = MentionKind::Any;
+        cx.notify();
+    }
+
+    /// Forgets what the chips no longer in the composer mentioned.
+    fn forget_removed_mentions(&mut self, cx: &App) {
+        let chips: HashSet<ChipId> = self
+            .composer
+            .read(cx)
+            .chips()
+            .iter()
+            .map(|chip| chip.id)
+            .collect();
+        self.mentions.retain(|chip, _| chips.contains(chip));
+    }
+
+    /// The composer's message: its text, and what its chips mention, in order.
+    fn composer_prompt(&self, cx: &App) -> Vec<PromptPart> {
+        let composer = self.composer.read(cx);
+        let text = composer.text();
+        let mut prompt = Vec::new();
+        let mut index = 0;
+        for chip in composer.chips() {
+            if chip.range.start > index {
+                prompt.push(PromptPart::Text(text[index..chip.range.start].to_string()));
+            }
+            prompt.push(match self.mentions.get(&chip.id) {
+                Some(mention) => mention.prompt_part(),
+                None => PromptPart::Text(chip.copy_text.to_string()),
+            });
+            index = chip.range.end;
+        }
+        if index < text.len() {
+            prompt.push(PromptPart::Text(text[index..].to_string()));
+        }
+        prompt
+    }
+
+    /// Follows the `@query` at the composer's cursor, finding what it mentions.
+    fn sync_mention_query(&mut self, cx: &mut Context<Self>) {
+        let composer = self.composer.read(cx);
+        let query = mention_query(composer.text(), composer.cursor_offset())
+            .filter(|query| Some(query.at) != self.mention_dismissed_at);
+        if query.is_none() {
+            if self.mention_query.take().is_some() {
+                self.mention_kind = MentionKind::Any;
+            }
+            if self
+                .mention_dismissed_at
+                .is_some_and(|at| composer.text().get(at..at + 1) != Some("@"))
+            {
+                self.mention_dismissed_at = None;
+            }
+            return;
+        }
+        if query == self.mention_query && !self.files_changed {
+            return;
+        }
+        self.files_changed = false;
+        if self.mention_query.as_ref().map(|query| query.at) != query.as_ref().map(|query| query.at)
+            || self.mention_query.as_ref().map(|query| &query.query)
+                != query.as_ref().map(|query| &query.query)
+        {
+            self.mention_index = 0;
+        }
+        self.mention_query = query;
+        if self.files.is_none() && !self.files_loading {
+            self.load_files(cx);
+        }
+        let threads = self.mentionable_threads(cx);
+        let query = self
+            .mention_query
+            .as_ref()
+            .map(|query| query.query.clone())
+            .unwrap_or_default();
+        self.mention_matches =
+            find_mentions(&query, self.mention_kind, self.files.as_ref(), &threads);
+    }
+
+    fn load_files(&mut self, cx: &mut Context<Self>) {
+        self.files_loading = true;
+        let request = self
+            .client
+            .read(cx)
+            .request(Request::ListFiles(self.thread_id));
+        self._files_load = cx.spawn(async move |this, cx| {
+            let listing = match request.await {
+                Ok(Response::Files(listing)) => Some(listing),
+                Ok(response) => {
+                    log::error!("unexpected answer to listing files: {response:?}");
+                    None
+                }
+                Err(error) => {
+                    log::error!("failed to list the thread's files: {error:#}");
+                    None
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.files_loading = false;
+                this.files = listing.or(Some(agentz_protocol::FileListing::default()));
+                this.files_changed = true;
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
+    /// The project's other agent threads, the latest first.
+    fn mentionable_threads(&self, cx: &App) -> Vec<MentionableThread> {
+        let store = self.store.read(cx);
+        let Some(project_id) = store.thread(self.thread_id).map(|thread| thread.project_id) else {
+            return Vec::new();
+        };
+        let mut threads: Vec<&Thread> = store
+            .threads()
+            .iter()
+            .filter(|thread| {
+                thread.project_id == project_id
+                    && thread.id != self.thread_id
+                    && thread.terminal.is_none()
+                    && !thread.is_draft
+                    && thread.archived_at.is_none()
+            })
+            .collect();
+        threads.sort_by_key(|thread| std::cmp::Reverse(thread.last_activity_at));
+        let now = std::time::SystemTime::now();
+        threads
+            .into_iter()
+            .map(|thread| MentionableThread {
+                id: thread.id,
+                title: thread.title.clone().into(),
+                time: thread
+                    .last_activity_at
+                    .map(|time| crate::sidebar::format_relative_time(time, now))
+                    .unwrap_or_default()
+                    .into(),
+            })
+            .collect()
+    }
+
+    fn accept_mention(&mut self, index: usize, cx: &mut Context<Self>) {
+        let (Some(found), Some(query)) = (
+            self.mention_matches.get(index).cloned(),
+            self.mention_query.clone(),
+        ) else {
+            return;
+        };
+        let cursor = self.composer.read(cx).cursor_offset();
+        let icon = target_icon(&found.target);
+        let (mention, preview) = match &found.target {
+            MentionTarget::Path { path, .. } => {
+                let root = self
+                    .files
+                    .as_ref()
+                    .map(|files| files.root.clone())
+                    .unwrap_or_default();
+                let path = root.join(path);
+                let preview = ChipPreview::Text(compact_path(&path).into());
+                (Mention::Path(path), preview)
+            }
+            MentionTarget::Thread { id, title } => {
+                (Mention::Thread(*id), ChipPreview::Text(title.clone()))
+            }
+        };
+        self.mention_query = None;
+        self.insert_mention(
+            Some(query.at..cursor),
+            &found.label,
+            icon,
+            preview,
+            mention,
+            cx,
+        );
+    }
+
+    /// The + button's kinds: types `@`, narrowed to files or threads.
+    fn start_mention(&mut self, kind: MentionKind, window: &mut Window, cx: &mut Context<Self>) {
+        let composer = self.composer.read(cx);
+        let cursor = composer.cursor_offset();
+        let needs_space = composer
+            .text()
+            .get(..cursor)
+            .and_then(|before| before.chars().next_back())
+            .is_some_and(|character| !character.is_whitespace());
+        let text = if needs_space { " @" } else { "@" };
+        self.mention_dismissed_at = None;
+        self.composer
+            .update(cx, |composer, cx| composer.insert(text, cx));
+        self.mention_kind = kind;
+        self.files_changed = true;
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// The + button's Image: picks image files to attach.
+    fn pick_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Add Image".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                for path in paths {
+                    if image_format(&path).is_some() {
+                        this.mention_path(path, cx);
+                    }
+                }
+                window.focus(&this.composer.focus_handle(cx), cx);
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// Zed's Add Context button and menu.
+    fn render_add_context_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let supports_images = self.thread.read(cx).supports_images();
+        PopoverMenu::new("add-context-menu")
+            .trigger_with_tooltip(
+                IconButton::new("add-context", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted),
+                Tooltip::text("Add Context"),
+            )
+            .anchor(Anchor::BottomLeft)
+            .offset(gpui::Point {
+                x: px(0.0),
+                y: px(-2.0),
+            })
+            .menu(move |window, cx| {
+                let this = this.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let kind_entry = |label: &'static str, icon: IconName, kind: MentionKind| {
+                        let this = this.clone();
+                        ContextMenuEntry::new(label)
+                            .icon(icon)
+                            .icon_color(Color::Muted)
+                            .icon_size(IconSize::XSmall)
+                            .handler(move |window, cx| {
+                                this.update(cx, |this, cx| this.start_mention(kind, window, cx))
+                                    .ok();
+                            })
+                    };
+                    let images = this.clone();
+                    menu.item(kind_entry(
+                        "Files & Directories",
+                        IconName::File,
+                        MentionKind::Files,
+                    ))
+                    .item(kind_entry(
+                        "Threads",
+                        IconName::Thread,
+                        MentionKind::Threads,
+                    ))
+                    .item(
+                        ContextMenuEntry::new("Image")
+                            .icon(IconName::Image)
+                            .icon_color(Color::Muted)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!supports_images)
+                            .handler(move |window, cx| {
+                                images
+                                    .update(cx, |this, cx| this.pick_images(window, cx))
+                                    .ok();
+                            }),
+                    )
+                }))
+            })
     }
 
     /// Zed's menu for its message editor.
@@ -1206,6 +1657,21 @@ impl AgentView {
             .with_priority(1)
             .into_any_element(),
         )
+    }
+
+    fn render_mention_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.mention_query.as_ref()?;
+        let this = cx.entity().downgrade();
+        Some(render_mention_menu(
+            &self.mention_matches,
+            self.mention_index,
+            self.files_loading,
+            move |index, _, cx| {
+                this.update(cx, |this, cx| this.accept_mention(index, cx))
+                    .ok();
+            },
+            cx,
+        ))
     }
 
     fn render_command_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2987,7 +3453,7 @@ impl AgentView {
                             .flex_1()
                             .min_w_0()
                             .text_xs()
-                            .child(message.lines().next().unwrap_or_default().to_string()),
+                            .child(message.text.lines().next().unwrap_or_default().to_string()),
                     )
                     .child(
                         h_flex()
@@ -3012,9 +3478,9 @@ impl AgentView {
                                     .tooltip(Tooltip::text("Edit"))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if index < this.queued_messages.len() {
-                                            let text = this.queued_messages.remove(index);
+                                            let message = this.queued_messages.remove(index);
                                             this.composer.update(cx, |composer, cx| {
-                                                composer.set_text(text, cx)
+                                                composer.set_text(message.text, cx)
                                             });
                                             window.focus(&this.composer.focus_handle(cx), cx);
                                         }
@@ -3785,29 +4251,41 @@ impl AgentView {
                             .debug_selector(|| "composer".into())
                             .child(self.composer.clone())
                             .children(self.render_command_menu(cx))
-                            .children(self.render_composer_menu()),
+                            .children(self.render_mention_menu(cx))
+                            .children(self.render_composer_menu())
+                            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                                for path in paths.paths() {
+                                    this.mention_path(path.clone(), cx);
+                                }
+                                window.focus(&this.composer.focus_handle(cx), cx);
+                            })),
                     )
                     .child(
                         h_flex()
                             .w_full()
                             .justify_between()
-                            .child(match style {
-                                ComposerStyle::Bar => h_flex()
-                                    .gap_1()
-                                    .px_1()
-                                    .child(
-                                        self.agent_icon(cx)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(agent_name)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .into_any_element(),
-                                ComposerStyle::Card => self.render_agent_picker(cx),
-                            })
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(self.render_add_context_button(cx))
+                                    .child(match style {
+                                        ComposerStyle::Bar => h_flex()
+                                            .gap_1()
+                                            .px_1()
+                                            .child(
+                                                self.agent_icon(cx)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(agent_name)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .into_any_element(),
+                                        ComposerStyle::Card => self.render_agent_picker(cx),
+                                    }),
+                            )
                             .child(
                                 h_flex()
                                     .min_w_0()
@@ -4750,7 +5228,8 @@ impl Render for AgentView {
         if let Some(position) = self.pending_composer_menu.take() {
             self.deploy_composer_menu(position, window, cx);
         }
-        let menu_open = !self.matching_commands(cx).is_empty();
+        self.sync_mention_query(cx);
+        let menu_open = self.mention_query.is_some() || !self.matching_commands(cx).is_empty();
         self.composer
             .update(cx, |composer, cx| composer.set_menu_open(menu_open, cx));
         let panel_background = cx.theme().colors().panel_background;
@@ -5322,6 +5801,63 @@ mod tests {
         cx.simulate_input("two");
         let text = view.read_with(cx, |view, cx| view.composer.read(cx).text().to_string());
         assert_eq!(text, "one\ntwo");
+    }
+
+    #[gpui::test]
+    fn at_mentions_files_and_threads(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            client.answer_for_test(|request| match request {
+                Request::ListFiles(_) => Some(Response::Files(agentz_protocol::FileListing {
+                    root: "/tmp/demo".into(),
+                    entries: ["src/total.ts", "README.md"]
+                        .into_iter()
+                        .map(|path| agentz_protocol::FileEntry {
+                            path: path.into(),
+                            is_dir: false,
+                        })
+                        .collect(),
+                })),
+                _ => None,
+            })
+        });
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("look at @tot");
+        cx.run_until_parked();
+        let labels = view.read_with(cx, |view, _| {
+            view.mention_matches
+                .iter()
+                .map(|found| found.label.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(labels, ["total.ts"]);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        // Threads too: thread 1 is the project's other thread.
+        cx.simulate_input("and @new");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let (text, prompt) = view.read_with(cx, |view, cx| {
+            (
+                view.composer.read(cx).plain_text(),
+                view.composer_prompt(cx),
+            )
+        });
+        assert_eq!(text, "look at @total.ts and @New thread ");
+        assert_eq!(
+            prompt,
+            [
+                PromptPart::Text("look at ".into()),
+                PromptPart::Path("/tmp/demo/src/total.ts".into()),
+                PromptPart::Text(" and ".into()),
+                PromptPart::Thread(ThreadId(1)),
+                PromptPart::Text(" ".into()),
+            ]
+        );
     }
 
     #[gpui::test]

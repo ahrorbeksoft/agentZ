@@ -468,7 +468,7 @@ mod tests {
             &mut received,
             Request::Prompt {
                 connection: thread,
-                text: "slow".into(),
+                prompt: agentz_protocol::PromptPart::text("slow"),
             },
         )
         .await

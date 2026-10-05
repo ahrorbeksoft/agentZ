@@ -49,7 +49,7 @@ async fn mcp_call(
     let response = connection
         .request(Request::Prompt {
             connection: thread,
-            text: text.into(),
+            prompt: agentz_protocol::PromptPart::text(text),
         })
         .await
         .expect("prompt");

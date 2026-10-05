@@ -335,8 +335,8 @@ impl AgentThread {
         )
     }
 
-    pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
-        self.request(|connection| Request::Prompt { connection, text }, cx)
+    pub fn send(&mut self, prompt: Vec<agentz_protocol::PromptPart>, cx: &mut Context<Self>) {
+        self.request(|connection| Request::Prompt { connection, prompt }, cx)
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) {

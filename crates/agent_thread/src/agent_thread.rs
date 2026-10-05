@@ -12,7 +12,7 @@ mod wire;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -220,7 +220,7 @@ pub struct AgentThread {
     previous_session: Option<acp::SessionId>,
     session: Option<Session>,
     pending_title: Option<String>,
-    queued_prompts: Vec<String>,
+    queued_prompts: Vec<Vec<MessagePart>>,
     /// The conversation this thread continues, taken from [`ThreadState::handoff`] by the first
     /// message, to go with it once that's sent.
     handoff_to_send: Option<PendingHandoff>,
@@ -1426,8 +1426,13 @@ impl AgentThread {
     }
 
     pub fn send(&mut self, text: String) {
-        let text = text.trim().to_string();
-        if text.is_empty() || self.is_working() {
+        self.send_message(vec![MessagePart::Text(text)]);
+    }
+
+    /// Sends a message of text and what's mentioned in it.
+    pub fn send_message(&mut self, parts: Vec<MessagePart>) {
+        let parts = trim_message(parts);
+        if parts.is_empty() || self.is_working() {
             return;
         }
         if !self
@@ -1436,21 +1441,23 @@ impl AgentThread {
             .iter()
             .any(|entry| matches!(entry, Entry::UserMessage(_)))
         {
-            self.emit(AgentThreadEvent::FirstPrompt(text.clone()));
+            self.emit(AgentThreadEvent::FirstPrompt(message_title(&parts)));
         }
-        self.view.entries.push(Entry::UserMessage(text.clone()));
+        self.view
+            .entries
+            .push(Entry::UserMessage(message_markdown(&parts)));
         if let Some(handoff) = self.view.state.handoff.take() {
             self.handoff_to_send = Some(handoff);
         }
         self.view.state.turn_error = None;
         match self.view.state.status {
-            ConnectionStatus::Ready => self.send_to_agent(text),
+            ConnectionStatus::Ready => self.send_to_agent(parts),
             ConnectionStatus::Connecting => {
-                self.queued_prompts.push(text);
+                self.queued_prompts.push(parts);
                 self.set_working(true);
             }
             // Sent once the user has logged in and the session opens.
-            ConnectionStatus::AuthRequired => self.queued_prompts.push(text),
+            ConnectionStatus::AuthRequired => self.queued_prompts.push(parts),
             ConnectionStatus::Failed(_) => {}
         }
     }
@@ -1479,12 +1486,18 @@ impl AgentThread {
         self.emit(AgentThreadEvent::SessionStarted(session_id));
     }
 
-    fn send_to_agent(&mut self, text: String) {
+    fn send_to_agent(&mut self, parts: Vec<MessagePart>) {
         self.remember_session();
         if self.session.is_none() {
             return;
         }
-        let mut prompt = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+        let capabilities = &self.view.state.capabilities.prompt_capabilities;
+        let mut prompt: Vec<acp::ContentBlock> = parts
+            .into_iter()
+            .filter_map(|part| {
+                part.into_content_block(capabilities.embedded_context, capabilities.image)
+            })
+            .collect();
         if let Some(handoff) = self.handoff_to_send.take() {
             // Embedded, the agent tells it from the message: replays show only the message.
             let block = if self
@@ -1828,13 +1841,13 @@ impl AgentThread {
         new_entry: impl FnOnce(String) -> Entry,
         existing_text: impl FnOnce(&mut Entry) -> Option<&mut String>,
     ) {
-        let acp::ContentBlock::Text(text) = content else {
+        let Some(text) = content_markdown(content) else {
             return;
         };
         if let Some(existing) = self.view.entries.last_mut().and_then(existing_text) {
-            existing.push_str(&text.text);
+            existing.push_str(&text);
         } else {
-            self.view.entries.push(new_entry(text.text));
+            self.view.entries.push(new_entry(text));
         }
     }
 
@@ -1933,6 +1946,148 @@ fn raw_input_text(value: &serde_json::Value) -> Option<String> {
             Some(format!("```json\n{pretty}\n```"))
         }
     }
+}
+
+/// A part of a message to the agent: its text, or what the server made of something the user
+/// mentioned in it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MessagePart {
+    Text(String),
+    /// A file, with its contents when they're text.
+    File {
+        path: PathBuf,
+        contents: Option<String>,
+    },
+    Folder(PathBuf),
+    /// Another thread's conversation.
+    Thread {
+        uri: String,
+        title: String,
+        text: String,
+    },
+    /// An image's MIME type and its bytes in base64.
+    Image {
+        mime_type: String,
+        data: String,
+    },
+}
+
+impl MessagePart {
+    /// As Zed sends mentions: a file's contents embedded when the agent takes them, else a link
+    /// to it; an image only to an agent that takes images.
+    fn into_content_block(self, embedded_context: bool, images: bool) -> Option<acp::ContentBlock> {
+        Some(match self {
+            MessagePart::Text(text) => acp::ContentBlock::Text(acp::TextContent::new(text)),
+            MessagePart::File {
+                path,
+                contents: Some(contents),
+            } if embedded_context => acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new(contents, file_uri(&path)),
+                ),
+            )),
+            MessagePart::File { path, .. } | MessagePart::Folder(path) => {
+                acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                    path_name(&path),
+                    file_uri(&path),
+                ))
+            }
+            MessagePart::Thread { uri, text, .. } if embedded_context => {
+                acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents::new(text, uri)
+                            .mime_type("text/markdown".to_string()),
+                    ),
+                ))
+            }
+            MessagePart::Thread { text, .. } => {
+                acp::ContentBlock::Text(acp::TextContent::new(text))
+            }
+            MessagePart::Image { mime_type, data } if images => {
+                acp::ContentBlock::Image(acp::ImageContent::new(data, mime_type))
+            }
+            MessagePart::Image { .. } => return None,
+        })
+    }
+}
+
+/// A message without whitespace around it, and without empty text.
+fn trim_message(parts: Vec<MessagePart>) -> Vec<MessagePart> {
+    let mut parts: Vec<MessagePart> = parts
+        .into_iter()
+        .filter(|part| !matches!(part, MessagePart::Text(text) if text.is_empty()))
+        .collect();
+    if let Some(MessagePart::Text(text)) = parts.first_mut() {
+        *text = text.trim_start().to_string();
+    }
+    if let Some(MessagePart::Text(text)) = parts.last_mut() {
+        *text = text.trim_end().to_string();
+    }
+    parts.retain(|part| !matches!(part, MessagePart::Text(text) if text.is_empty()));
+    parts
+}
+
+/// A message as the user's entry shows it: each mention as Zed writes one, `[@name](uri)`.
+fn message_markdown(parts: &[MessagePart]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            MessagePart::Text(text) => text.clone(),
+            MessagePart::File { path, .. } | MessagePart::Folder(path) => {
+                format!("[@{}]({})", path_name(path), file_uri(path))
+            }
+            MessagePart::Thread { uri, title, .. } => format!("[@{title}]({uri})"),
+            MessagePart::Image { .. } => "`@Image`".to_string(),
+        })
+        .collect()
+}
+
+/// A message as plain text, each mention as `@name`, for naming the thread.
+fn message_title(parts: &[MessagePart]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            MessagePart::Text(text) => text.clone(),
+            MessagePart::File { path, .. } | MessagePart::Folder(path) => {
+                format!("@{}", path_name(path))
+            }
+            MessagePart::Thread { title, .. } => format!("@{title}"),
+            MessagePart::Image { .. } => "@Image".to_string(),
+        })
+        .collect()
+}
+
+/// A replayed chunk of a message as the user's entry shows it, mentions as links. The handoff
+/// a continued thread began with stays hidden.
+fn content_markdown(content: acp::ContentBlock) -> Option<String> {
+    match content {
+        acp::ContentBlock::Text(text) => Some(text.text),
+        acp::ContentBlock::ResourceLink(link) => Some(format!("[@{}]({})", link.name, link.uri)),
+        acp::ContentBlock::Resource(resource) => {
+            let uri = match resource.resource {
+                acp::EmbeddedResourceResource::TextResourceContents(contents) => contents.uri,
+                acp::EmbeddedResourceResource::BlobResourceContents(contents) => contents.uri,
+                _ => return None,
+            };
+            if uri == "agentz://handoff" {
+                return None;
+            }
+            let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
+            Some(format!("[@{name}]({uri})"))
+        }
+        acp::ContentBlock::Image(_) => Some("`@Image`".to_string()),
+        _ => None,
+    }
+}
+
+fn file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+fn path_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn set_tool_call_content(tool_call: &mut ToolCall, content: Vec<acp::ToolCallContent>) {

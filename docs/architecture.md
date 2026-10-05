@@ -190,6 +190,23 @@ Each entry: what it does, where it lives, and where it comes from.
   `use_modifier_to_send`), Cmd-Enter sends and Enter makes a new line. Pasted text keeps its
   line breaks, and Up/Down move between rows, unless a menu is open for the composer
   (`TextInput && menu`). Right-click gives Zed's Cut, Copy, Paste and Paste as Plain Text.
+- **Mentions** (`mention_menu.rs`, `agent_view.rs`, `server/prompt_requests.rs`; Zed's mentions
+  with t3code's menu, picked in `design/composer/`): @ lists matches at once, under Files and
+  Threads: the thread folder's files and folders (`Request::ListFiles`, gitignored ones left
+  out, fuzzy-matched in the app) and the project's other threads. A pick becomes a chip, an
+  outlined box with the kind's icon and the name in the code font, which the cursor steps over
+  and Backspace removes whole; hovering shows its path. Zed's + button (Add Context) types @
+  narrowed to Files & Directories or Threads, or picks images. Pasting an image, or pasting or
+  dropping an image file, makes an Image chip whose hover shows the picture, for agents that
+  take images (ACP's prompt capabilities); other copied files become mentions, except on
+  another machine's thread, which gets the path as text. Paste as Plain Text pastes only text.
+- **Sending mentions** (`PromptPart`, `agent_thread::MessagePart`): a message goes as its parts
+  in order. The server reads a mentioned file (up to 1 MB of text) and takes a mentioned
+  thread's conversation (`thread::mentioned_thread`, the handoff's summary), starting its agent
+  and waiting up to 30 seconds for it to load. As Zed sends them, a file is embedded for agents
+  that take embedded context and a link otherwise, a folder is a link, a thread is embedded or
+  plain text, and an image goes only to agents that take images. The user's message shows each
+  mention as Zed writes one, `[@name](uri)`, also when an agent replays it.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
   thread's menu (Rename, Continue with Another Agent ▸ except on a draft, Archive, Delete…), and a double-click
@@ -653,8 +670,7 @@ since a thread's workspace is its checkout.
 
 Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 
-- **@-mentions and adding context** (files, symbols, threads) to a message.
-- **Pasting images** into a message.
+- **@-mentions of symbols** (Zed's), which needs language servers.
 - **Opening files** from tool calls.
 - **Searching message text**, not only titles.
 - **Deleting sessions on the agent's side** when a thread is deleted.
