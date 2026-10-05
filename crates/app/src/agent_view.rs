@@ -21,8 +21,9 @@ use collections::{HashMap, HashSet};
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, Hsla, KeyBinding, Pixels, Point, PromptLevel, ScrollHandle,
-    Subscription, Task, Window, anchored, deferred, pulsating_between,
+    FocusHandle, Focusable, FollowMode, Hsla, KeyBinding, ListAlignment, ListOffset, ListState,
+    Pixels, Point, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, list,
+    pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, WorkspaceKind};
@@ -207,7 +208,11 @@ pub struct AgentView {
     /// The composer's right-click menu, where it was opened.
     composer_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     pending_composer_menu: Option<Point<Pixels>>,
-    scroll_handle: ScrollHandle,
+    /// The conversation: a head row, the entries, then a tail row, drawn only where visible
+    /// (Zed's thread list).
+    list_state: ListState,
+    /// The entries' revisions the rows and markdowns were last synced with.
+    synced_revisions: Vec<u64>,
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
     /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
@@ -310,14 +315,9 @@ impl AgentView {
                 this.apply_rename(cx)
             }),
             cx.observe(&thread, |this, thread, cx| {
-                // Only follow new output if the user hasn't scrolled up to read.
-                let follow = this.is_scrolled_to_bottom();
-                this.sync_markdowns(cx);
+                this.sync_entries(cx);
                 sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
                 this.sync_composer_placeholder(cx);
-                if follow {
-                    this.scroll_handle.scroll_to_bottom();
-                }
                 this.send_next_queued_message(cx);
                 cx.notify();
             }),
@@ -391,7 +391,12 @@ impl AgentView {
             composer,
             composer_menu: None,
             pending_composer_menu: None,
-            scroll_handle: ScrollHandle::new(),
+            list_state: {
+                let list_state = ListState::new(0, ListAlignment::Top, px(2048.));
+                list_state.set_follow_mode(FollowMode::Tail);
+                list_state
+            },
+            synced_revisions: Vec::new(),
             markdowns: HashMap::default(),
             toggled_tool_calls: HashSet::default(),
             expanded_raw_inputs: HashSet::default(),
@@ -452,7 +457,7 @@ impl AgentView {
         }
         this.saved_unsent_text = unsent_text.clone();
         this.observed_unsent_text = unsent_text;
-        this.sync_markdowns(cx);
+        this.sync_entries(cx);
         let thread = this.thread.clone();
         sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
         this.sync_composer_placeholder(cx);
@@ -956,9 +961,42 @@ impl AgentView {
     }
 
     /// Keeps a markdown entity per message so streamed text is appended instead of reparsed.
-    fn sync_markdowns(&mut self, cx: &mut Context<Self>) {
-        let entries = self.thread.read(cx).entries().to_vec();
-        for (index, entry) in entries.iter().enumerate() {
+    /// Follows the thread's entries, redoing only those whose revision changed: their
+    /// markdown, and the list's rows, which are measured again.
+    fn sync_entries(&mut self, cx: &mut Context<Self>) {
+        let revisions = self.thread.read(cx).entry_revisions().to_vec();
+        let entry_count = revisions.len();
+        let previous = self.synced_revisions.len();
+        if self.list_state.item_count() == 0 {
+            // The head and tail rows.
+            self.list_state.splice(0..0, 2);
+        }
+        if entry_count > previous {
+            self.list_state
+                .splice(previous + 1..previous + 1, entry_count - previous);
+        } else if entry_count < previous {
+            self.list_state.splice(entry_count + 1..previous + 1, 0);
+            self.synced_revisions.truncate(entry_count);
+        }
+        for (index, revision) in revisions.iter().enumerate() {
+            if self.synced_revisions.get(index) == Some(revision) {
+                continue;
+            }
+            let Some(entry) = self.thread.read(cx).entries().get(index).cloned() else {
+                continue;
+            };
+            self.sync_entry(index, &entry, cx);
+            self.list_state.remeasure_items(index + 1..index + 2);
+        }
+        self.synced_revisions = revisions;
+        // The head and tail follow the thread's state.
+        self.list_state.remeasure_items(0..1);
+        self.list_state
+            .remeasure_items(entry_count + 1..entry_count + 2);
+    }
+
+    fn sync_entry(&mut self, index: usize, entry: &Entry, cx: &mut Context<Self>) {
+        {
             match entry {
                 // An agent may replay a continued thread's first message with what it brought.
                 Entry::UserMessage(text) => {
@@ -1009,15 +1047,17 @@ impl AgentView {
     fn sync_markdown(&mut self, key: MarkdownKey, text: &str, cx: &mut Context<Self>) {
         match self.markdowns.get(&key) {
             Some(markdown) => {
-                let source = markdown.read(cx).source().to_string();
-                if source == text {
-                    return;
-                }
-                markdown.update(cx, |markdown, cx| {
-                    match text.strip_prefix(source.as_str()) {
-                        Some(appended) => markdown.append(appended, cx),
-                        None => markdown.replace(text.to_string(), cx),
+                // Streamed text only grows, so most changes are an append.
+                let appended = {
+                    let source = markdown.read(cx).source();
+                    if source == text {
+                        return;
                     }
+                    text.strip_prefix(source.as_ref()).map(str::to_string)
+                };
+                markdown.update(cx, |markdown, cx| match appended {
+                    Some(appended) => markdown.append(&appended, cx),
+                    None => markdown.replace(text.to_string(), cx),
                 });
             }
             None => {
@@ -1198,7 +1238,7 @@ impl AgentView {
             cx.notify();
             return;
         }
-        self.scroll_handle.scroll_to_bottom();
+        self.list_state.scroll_to_end();
         self.thread
             .update(cx, |thread, cx| thread.send(message.prompt, cx));
     }
@@ -1213,16 +1253,10 @@ impl AgentView {
             return;
         }
         let message = self.queued_messages.remove(0);
-        self.scroll_handle.scroll_to_bottom();
+        self.list_state.scroll_to_end();
         // Deferred: this runs while the thread is notifying observers.
         let thread = self.thread.clone();
         cx.defer(move |cx| thread.update(cx, |thread, cx| thread.send(message.prompt, cx)));
-    }
-
-    fn is_scrolled_to_bottom(&self) -> bool {
-        let offset = self.scroll_handle.offset();
-        let max_offset = self.scroll_handle.max_offset();
-        -offset.y >= max_offset.y - px(40.)
     }
 
     fn stop(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
@@ -1657,6 +1691,84 @@ impl AgentView {
             .with_priority(1)
             .into_any_element(),
         )
+    }
+
+    /// One of the conversation list's rows: the head (where the thread came from), an entry,
+    /// or the tail (what follows the entries).
+    fn render_conversation_row(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entry_count = self.thread.read(cx).entries().len();
+        let content = if index == 0 {
+            let continued_from = (entry_count > 0)
+                .then(|| self.render_continued_from(cx))
+                .flatten();
+            div().pt_2().children(continued_from).into_any_element()
+        } else if index <= entry_count {
+            let Some(entry) = self.thread.read(cx).entries().get(index - 1).cloned() else {
+                return div().into_any_element();
+            };
+            self.render_entry(index - 1, &entry, index == entry_count, window, cx)
+        } else {
+            let needs_login = self.needs_login(cx);
+            v_flex()
+                .w_full()
+                .pb_4()
+                .children(self.render_tail_rows(window, cx))
+                .when(needs_login, |this| {
+                    this.child(
+                        v_flex()
+                            .debug_selector(|| "thread-login".into())
+                            .w_full()
+                            .px_5()
+                            .py_8()
+                            .items_center()
+                            .child(self.login.clone()),
+                    )
+                })
+                .into_any_element()
+        };
+        div()
+            .debug_selector(|| format!("conversation-row-{index}"))
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(div().w_full().max_w(MAX_CONTENT_WIDTH).child(content))
+            .into_any_element()
+    }
+
+    /// What follows the entries: where the thread went on, permission requests without a tool
+    /// call or from subthreads, requests for input, and the working indicator.
+    fn render_tail_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let entry_count = self.thread.read(cx).entries().len();
+        let mut rows = self.render_continuations(cx);
+        let orphans: Vec<(acp::ToolCallId, String)> = self
+            .thread
+            .read(cx)
+            .orphan_permission_requests()
+            .map(|request| (request.tool_call_id.clone(), request.title.clone()))
+            .collect();
+        for (offset, (tool_call_id, title)) in orphans.iter().enumerate() {
+            if let Some(element) =
+                self.render_orphan_permission(entry_count + offset, tool_call_id, title, window, cx)
+            {
+                rows.push(element);
+            }
+        }
+        rows.extend(self.render_subthread_permissions(cx));
+        rows.extend(
+            self.elicitation_cards
+                .iter()
+                .filter(|card| !card.read(cx).is_for_request())
+                .map(|card| div().px_5().py_1p5().child(card.clone()).into_any_element()),
+        );
+        if let Some(generating) = self.render_generating(cx) {
+            rows.push(generating);
+        }
+        rows
     }
 
     fn render_mention_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2426,7 +2538,11 @@ impl AgentView {
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text("Scroll to User Message"))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.scroll_handle.scroll_to_top_of_item(user_message_index);
+                            // The list's rows start with the head row.
+                            this.list_state.scroll_to(ListOffset {
+                                item_ix: user_message_index + 1,
+                                offset_in_item: px(0.),
+                            });
                             cx.notify();
                         })),
                 )
@@ -2437,7 +2553,7 @@ impl AgentView {
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Scroll to Top"))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.scroll_handle.set_offset(gpui::point(px(0.), px(0.)));
+                        this.list_state.scroll_to(ListOffset::default());
                         cx.notify();
                     })),
             )
@@ -3003,11 +3119,8 @@ impl AgentView {
     fn render_generating(&self, cx: &App) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
         let started_at = thread.turn_started_at()?;
-        let awaiting_confirmation = thread.orphan_permission_requests().next().is_some()
-            || thread.entries().iter().any(|entry| {
-                matches!(entry, Entry::ToolCall(tool_call)
-                    if thread.permission_request(&tool_call.id).is_some())
-            });
+        // Any permission request, whether its tool call is shown or not.
+        let awaiting_confirmation = !thread.state.permission_requests.is_empty();
         let elapsed = started_at.elapsed().unwrap_or_default().as_secs();
         let elapsed_label = if elapsed >= 60 {
             format!("{}m {:02}s", elapsed / 60, elapsed % 60)
@@ -5233,44 +5346,8 @@ impl Render for AgentView {
         self.composer
             .update(cx, |composer, cx| composer.set_menu_open(menu_open, cx));
         let panel_background = cx.theme().colors().panel_background;
-        let entries: Vec<Entry> = self.thread.read(cx).entries().to_vec();
-        let entry_count = entries.len();
-        let mut rows = Vec::with_capacity(entry_count + 2);
-        for (index, entry) in entries.iter().enumerate() {
-            rows.push(self.render_entry(index, entry, index + 1 == entry_count, window, cx));
-        }
-        // Where this thread came from, once it has a message, and where it went on.
-        let continued_from = (entry_count > 0)
-            .then(|| self.render_continued_from(cx))
-            .flatten();
-        rows.extend(self.render_continuations(cx));
-        let orphans: Vec<(acp::ToolCallId, String)> = self
-            .thread
-            .read(cx)
-            .orphan_permission_requests()
-            .map(|request| (request.tool_call_id.clone(), request.title.clone()))
-            .collect();
-        for (offset, (tool_call_id, title)) in orphans.iter().enumerate() {
-            if let Some(element) =
-                self.render_orphan_permission(entry_count + offset, tool_call_id, title, window, cx)
-            {
-                rows.push(element);
-            }
-        }
-        rows.extend(self.render_subthread_permissions(cx));
-        rows.extend(
-            self.elicitation_cards
-                .iter()
-                .filter(|card| !card.read(cx).is_for_request())
-                .map(|card| div().px_5().py_1p5().child(card.clone()).into_any_element()),
-        );
-        if let Some(generating) = self.render_generating(cx) {
-            rows.push(generating);
-        }
-        let has_rows = !rows.is_empty();
-        if let Some(continued_from) = continued_from {
-            rows.insert(0, continued_from);
-        }
+        let entry_count = self.thread.read(cx).entries().len();
+        let has_rows = entry_count > 0 || !self.render_tail_rows(window, cx).is_empty();
         let is_connecting = self.thread.read(cx).status() == &ConnectionStatus::Connecting;
         let needs_login = self.needs_login(cx);
 
@@ -5323,21 +5400,26 @@ impl Render for AgentView {
             .when(!is_drawer_full_screen && !is_new_thread, |this| {
                 this.children(self.render_restore_notice(cx))
                     .child(
-                        // Each row is a direct child of the scrolled element, so rows can be scrolled to
-                        // by index (entries come first, in order).
+                        // Only the rows in view are drawn, so long threads stay quick (Zed's list).
                         v_flex()
                             .id("agent-conversation")
                             .flex_1()
                             .min_h_0()
-                            .pt_2()
-                            .pb_4()
+                            .when(!has_rows, |this| this.pt_2().pb_4())
                             .items_center()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                            .children(
-                                rows.into_iter()
-                                    .map(|row| div().w_full().max_w(MAX_CONTENT_WIDTH).child(row)),
-                            )
+                            .when(has_rows, |this| {
+                                this.child(
+                                    list(
+                                        self.list_state.clone(),
+                                        cx.processor(|this, index: usize, window, cx| {
+                                            this.render_conversation_row(index, window, cx)
+                                        }),
+                                    )
+                                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                                    .flex_1()
+                                    .w_full(),
+                                )
+                            })
                             .when(!has_rows && is_connecting, |this| {
                                 // Zed's loading state: while the agent starts and the session (and its
                                 // history) loads, not the empty-thread prompt.
@@ -5382,8 +5464,9 @@ impl Render for AgentView {
                                         .child(Label::new(prompt).color(Color::Muted)),
                                 )
                             })
-                            // The login takes the empty thread's middle, or follows its history.
-                            .when(needs_login, |this| {
+                            // The login takes the empty thread's middle, or follows its history
+                            // as the list's tail.
+                            .when(needs_login && !has_rows, |this| {
                                 this.child(
                                     v_flex()
                                         .debug_selector(|| "thread-login".into())
@@ -5392,7 +5475,8 @@ impl Render for AgentView {
                                         .px_5()
                                         .py_8()
                                         .items_center()
-                                        .when(!has_rows, |panel| panel.flex_1().justify_center())
+                                        .flex_1()
+                                        .justify_center()
                                         .child(self.login.clone()),
                                 )
                             }),
@@ -5858,6 +5942,28 @@ mod tests {
                 PromptPart::Text(" ".into()),
             ]
         );
+    }
+
+    /// A long thread draws only the rows in view, at its end, and follows new output.
+    #[gpui::test]
+    fn a_long_thread_draws_only_the_rows_in_view(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let entries: Vec<Entry> = (0..300)
+            .map(|index| Entry::AgentMessage(format!("Message {index}")))
+            .collect();
+        thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("conversation-row-300").is_some());
+        assert!(cx.debug_bounds("conversation-row-1").is_none());
+
+        let mut entries: Vec<Entry> = (0..301)
+            .map(|index| Entry::AgentMessage(format!("Message {index}")))
+            .collect();
+        entries.push(Entry::AgentMessage("The newest".into()));
+        thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("conversation-row-302").is_some());
     }
 
     #[gpui::test]

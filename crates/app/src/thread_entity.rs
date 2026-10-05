@@ -18,6 +18,9 @@ pub struct AgentThread {
     /// `None` until the server has opened an account connection.
     connection: Option<ConnectionId>,
     view: ThreadView,
+    /// A revision for each entry, raised when it changes, so views redo only what changed.
+    entry_revisions: Vec<u64>,
+    next_revision: u64,
     /// Updates that arrived while the snapshot they follow was on its way.
     queued_updates: Option<Vec<ThreadUpdate>>,
     /// Kept to unsubscribe on drop, when there's no context to look it up.
@@ -58,6 +61,8 @@ impl AgentThread {
                 },
                 entries: Vec::new(),
             },
+            entry_revisions: Vec::new(),
+            next_revision: 0,
             queued_updates: None,
             server: None,
             _subscribe: Task::ready(()),
@@ -156,8 +161,10 @@ impl AgentThread {
             this.update(cx, |this, cx| match response {
                 Ok(Response::Thread(view)) => {
                     this.view = view;
+                    this.entry_revisions.clear();
+                    this.note_changed(0..this.view.entries.len());
                     for update in this.queued_updates.take().unwrap_or_default() {
-                        this.view.apply(update);
+                        this.apply(update);
                     }
                     cx.notify();
                 }
@@ -186,14 +193,60 @@ impl AgentThread {
         match &mut self.queued_updates {
             Some(queued) => queued.push(update),
             None => {
-                self.view.apply(update);
+                self.apply(update);
                 cx.notify();
             }
         }
     }
 
+    fn apply(&mut self, update: ThreadUpdate) {
+        let changed: Vec<usize> = update
+            .entries
+            .iter()
+            .map(|(index, _)| *index)
+            .chain(update.appended.iter().map(|(index, _)| *index))
+            .collect();
+        self.view.apply(update);
+        self.entry_revisions.truncate(self.view.entries.len());
+        for index in changed {
+            self.note_changed(index..index + 1);
+        }
+    }
+
+    fn note_changed(&mut self, range: std::ops::Range<usize>) {
+        for index in range {
+            if index >= self.view.entries.len() {
+                break;
+            }
+            self.next_revision += 1;
+            if index < self.entry_revisions.len() {
+                self.entry_revisions[index] = self.next_revision;
+            } else {
+                self.entry_revisions.resize(index, 0);
+                self.entry_revisions.push(self.next_revision);
+            }
+        }
+    }
+
+    /// Each entry's revision: a view has an entry as it is when it has its revision.
+    pub fn entry_revisions(&self) -> &[u64] {
+        &self.entry_revisions
+    }
+
     pub(crate) fn closed(&mut self, cx: &mut Context<Self>) {
         self.fail("The agent's connection closed.".to_string(), cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_entries_for_test(
+        &mut self,
+        entries: Vec<agentz_protocol::thread::Entry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.entries = entries;
+        self.entry_revisions.clear();
+        self.note_changed(0..self.view.entries.len());
+        cx.notify();
     }
 
     #[cfg(test)]

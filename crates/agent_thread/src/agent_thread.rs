@@ -221,6 +221,9 @@ pub struct AgentThread {
     session: Option<Session>,
     pending_title: Option<String>,
     queued_prompts: Vec<Vec<MessagePart>>,
+    /// The first entry that changed since the server last sent this thread's changes, so it
+    /// doesn't compare a long conversation's every entry on each update.
+    entries_changed_from: Option<usize>,
     /// The conversation this thread continues, taken from [`ThreadState::handoff`] by the first
     /// message, to go with it once that's sent.
     handoff_to_send: Option<PendingHandoff>,
@@ -420,6 +423,7 @@ impl AgentThread {
             session: None,
             pending_title: None,
             queued_prompts: Vec::new(),
+            entries_changed_from: Some(0),
             handoff_to_send: None,
             mcp_servers: Vec::new(),
             terminal_host: None,
@@ -720,6 +724,7 @@ impl AgentThread {
         let stopping = self.stop_agent();
         self.generation += 1;
         self.view.entries.clear();
+        self.entry_changed(0);
         self.view.state.prompts_from_agents.clear();
         self.view.state.plan.clear();
         self.cancel_permission_requests();
@@ -842,6 +847,7 @@ impl AgentThread {
         self.queued_prompts = queued_prompts;
         if let Some((entries, prompts_from_agents)) = conversation {
             self.view.entries = entries;
+            self.entry_changed(0);
             self.view.state.prompts_from_agents = prompts_from_agents;
         }
     }
@@ -1443,9 +1449,7 @@ impl AgentThread {
         {
             self.emit(AgentThreadEvent::FirstPrompt(message_title(&parts)));
         }
-        self.view
-            .entries
-            .push(Entry::UserMessage(message_markdown(&parts)));
+        self.push_entry(Entry::UserMessage(message_markdown(&parts)));
         if let Some(handoff) = self.view.state.handoff.take() {
             self.handoff_to_send = Some(handoff);
         }
@@ -1803,7 +1807,7 @@ impl AgentThread {
                     })
                     .collect();
                 if !self.view.entries.contains(&Entry::Plan) {
-                    self.view.entries.push(Entry::Plan);
+                    self.push_entry(Entry::Plan);
                 }
             }
             acp::SessionUpdate::ConfigOptionUpdate(update) => {
@@ -1846,8 +1850,9 @@ impl AgentThread {
         };
         if let Some(existing) = self.view.entries.last_mut().and_then(existing_text) {
             existing.push_str(&text);
+            self.entry_changed(self.view.entries.len() - 1);
         } else {
-            self.view.entries.push(new_entry(text));
+            self.push_entry(new_entry(text));
         }
     }
 
@@ -1871,7 +1876,7 @@ impl AgentThread {
         if let Some(existing) = self.tool_call_mut(&entry.id) {
             *existing = entry;
         } else {
-            self.view.entries.push(Entry::ToolCall(entry));
+            self.push_entry(Entry::ToolCall(entry));
         }
     }
 
@@ -1895,7 +1900,7 @@ impl AgentThread {
                 terminals: Vec::new(),
             };
             set_tool_call_content(&mut entry, fields.content.unwrap_or_default());
-            self.view.entries.push(Entry::ToolCall(entry));
+            self.push_entry(Entry::ToolCall(entry));
             return;
         };
         if let Some(title) = fields.title {
@@ -1921,15 +1926,33 @@ impl AgentThread {
         }
     }
 
+    /// The tool call, noted as changed since the caller changes it.
     fn tool_call_mut(&mut self, id: &acp::ToolCallId) -> Option<&mut ToolCall> {
-        self.view
-            .entries
-            .iter_mut()
-            .rev()
-            .find_map(|entry| match entry {
-                Entry::ToolCall(tool_call) if &tool_call.id == id => Some(tool_call),
-                _ => None,
-            })
+        let index = self.view.entries.iter().rposition(
+            |entry| matches!(entry, Entry::ToolCall(tool_call) if &tool_call.id == id),
+        )?;
+        self.entry_changed(index);
+        match &mut self.view.entries[index] {
+            Entry::ToolCall(tool_call) => Some(tool_call),
+            _ => None,
+        }
+    }
+
+    fn push_entry(&mut self, entry: Entry) {
+        self.entry_changed(self.view.entries.len());
+        self.view.entries.push(entry);
+    }
+
+    fn entry_changed(&mut self, index: usize) {
+        self.entries_changed_from = Some(
+            self.entries_changed_from
+                .map_or(index, |changed_from| changed_from.min(index)),
+        );
+    }
+
+    /// The first entry that changed since this was last called, if any did.
+    pub fn take_entries_changed_from(&mut self) -> Option<usize> {
+        self.entries_changed_from.take()
     }
 }
 

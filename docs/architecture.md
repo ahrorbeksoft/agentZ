@@ -184,6 +184,13 @@ Each entry: what it does, where it lives, and where it comes from.
   commands, the "…" menu with Zed's Reauthenticate, Log Out and Reload Agent. The config
   selectors come with the agent's session, so while the agent starts "Loading options…" with a
   spinner stands in for them.
+- **Long threads** (`agent_view.rs`, `thread_entity.rs`; Zed's thread list): the conversation is
+  GPUI's `list` (a head row, the entries, a tail row) in Zed's tail-follow mode, so only the rows
+  in view are drawn, also while typing or as the cursor blinks. The app keeps a revision per
+  entry, and the view redoes only the changed entries' markdown and row heights. The server
+  diffs a thread from the first entry that changed (`AgentThread::take_entries_changed_from`)
+  and sends streamed text as what was appended (`ThreadUpdate::appended`), not the whole message
+  each chunk.
 - **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`):
   Zed's message editor. One line, growing with the text to eight, then scrolling. Shift-Enter
   makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's

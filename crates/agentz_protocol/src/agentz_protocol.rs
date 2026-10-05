@@ -860,6 +860,7 @@ mod tests {
                 state: None,
                 entry_count: 1,
                 entries: vec![(0, Entry::AgentMessage("hi".into()))],
+                appended: Vec::new(),
             },
         });
         let json = serde_json::to_string(&message).expect("encodes");

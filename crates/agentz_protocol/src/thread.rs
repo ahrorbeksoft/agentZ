@@ -37,6 +37,35 @@ pub enum Entry {
     Plan,
 }
 
+impl Entry {
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Entry::UserMessage(text) | Entry::AgentMessage(text) | Entry::AgentThought(text) => {
+                Some(text)
+            }
+            Entry::ToolCall(_) | Entry::Plan => None,
+        }
+    }
+
+    /// The text this message has beyond `previous`, the same kind of message it grew from.
+    fn appended_to<'a>(&'a self, previous: &Entry) -> Option<&'a str> {
+        let (Entry::UserMessage(text) | Entry::AgentMessage(text) | Entry::AgentThought(text)) =
+            self
+        else {
+            return None;
+        };
+        let (Entry::UserMessage(old) | Entry::AgentMessage(old) | Entry::AgentThought(old)) =
+            previous
+        else {
+            return None;
+        };
+        if std::mem::discriminant(self) != std::mem::discriminant(previous) {
+            return None;
+        }
+        text.strip_prefix(old.as_str())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: acp::ToolCallId,
@@ -341,26 +370,46 @@ pub struct ThreadUpdate {
     /// Entries that changed or were added, by index.
     #[serde(default)]
     pub entries: Vec<(usize, Entry)>,
+    /// Text streamed onto the end of messages, by index, so a long reply isn't sent whole for
+    /// each chunk.
+    #[serde(default)]
+    pub appended: Vec<(usize, String)>,
 }
 
 impl ThreadView {
     /// What changed since `previous`, or `None` if nothing did.
     pub fn changes_since(&self, previous: &ThreadView) -> Option<ThreadUpdate> {
+        self.changes_since_from(previous, 0)
+    }
+
+    /// Like [`Self::changes_since`], for a view whose entries before `from` are known to be as
+    /// they were, so a long conversation isn't compared whole on every update.
+    pub fn changes_since_from(&self, previous: &ThreadView, from: usize) -> Option<ThreadUpdate> {
         let state = (self.state != previous.state).then(|| self.state.clone());
-        let entries: Vec<_> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(index, entry)| previous.entries.get(*index) != Some(entry))
-            .map(|(index, entry)| (index, entry.clone()))
-            .collect();
-        if state.is_none() && entries.is_empty() && self.entries.len() == previous.entries.len() {
+        let mut entries = Vec::new();
+        let mut appended = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate().skip(from) {
+            let previous = previous.entries.get(index);
+            if previous == Some(entry) {
+                continue;
+            }
+            match previous.and_then(|previous| entry.appended_to(previous)) {
+                Some(text) => appended.push((index, text.to_string())),
+                None => entries.push((index, entry.clone())),
+            }
+        }
+        if state.is_none()
+            && entries.is_empty()
+            && appended.is_empty()
+            && self.entries.len() == previous.entries.len()
+        {
             return None;
         }
         Some(ThreadUpdate {
             state,
             entry_count: self.entries.len(),
             entries,
+            appended,
         })
     }
 
@@ -376,6 +425,12 @@ impl ThreadView {
                 self.entries.push(entry);
             } else {
                 log::error!("thread update skipped entries before {index}");
+            }
+        }
+        for (index, text) in update.appended {
+            match self.entries.get_mut(index).and_then(Entry::text_mut) {
+                Some(existing) => existing.push_str(&text),
+                None => log::error!("thread update appended to entry {index}, which has no text"),
             }
         }
     }
@@ -935,6 +990,31 @@ fn meta_terminal_auth(method: &acp::AuthMethod) -> Option<MetaTerminalAuth> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streamed_text_goes_as_what_was_appended() {
+        let previous = super::ThreadView {
+            state: Default::default(),
+            entries: vec![
+                super::Entry::UserMessage("hi".into()),
+                super::Entry::AgentMessage("Hello".into()),
+            ],
+        };
+        let mut current = previous.clone();
+        current.entries[1] = super::Entry::AgentMessage("Hello there".into());
+        current
+            .entries
+            .push(super::Entry::AgentThought("Hmm".into()));
+        let update = current.changes_since_from(&previous, 1).expect("changes");
+        assert_eq!(update.appended, vec![(1, " there".to_string())]);
+        assert_eq!(
+            update.entries,
+            vec![(2, super::Entry::AgentThought("Hmm".into()))]
+        );
+        let mut applied = previous;
+        applied.apply(update);
+        assert_eq!(applied, current);
+    }
+
     use super::*;
 
     fn tool_call(title: &str, status: acp::ToolCallStatus) -> Entry {
@@ -1091,13 +1171,12 @@ mod tests {
         client.apply(update);
         assert_eq!(client, server);
 
+        // A message that grew goes as what it gained.
         server.entries[1] = Entry::AgentMessage("Echo".into());
         let update = server.changes_since(&previous).expect("changes");
         assert_eq!(update.state, None);
-        assert_eq!(
-            update.entries,
-            vec![(1, Entry::AgentMessage("Echo".into()))]
-        );
+        assert!(update.entries.is_empty());
+        assert_eq!(update.appended, vec![(1, "o".to_string())]);
         client.apply(update);
         assert_eq!(client, server);
 

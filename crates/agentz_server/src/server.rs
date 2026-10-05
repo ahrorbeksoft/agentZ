@@ -1581,6 +1581,18 @@ impl Server {
         }
 
         for connection in std::mem::take(&mut self.changed_connections) {
+            // Entries before the first that changed are as every subscriber last got them.
+            let changed_from = match connection {
+                ConnectionId::Thread(thread_id) => self
+                    .threads
+                    .get_mut(&thread_id)
+                    .and_then(AgentThread::take_entries_changed_from),
+                ConnectionId::Account(account_id) => self
+                    .accounts
+                    .get_mut(&account_id)
+                    .and_then(|account| account.thread.take_entries_changed_from()),
+            }
+            .unwrap_or(usize::MAX);
             let view = match connection {
                 ConnectionId::Thread(thread_id) => self.threads.get(&thread_id),
                 ConnectionId::Account(account_id) => self
@@ -1595,7 +1607,7 @@ impl Server {
                 let Some(sent) = client.threads.get_mut(&connection) else {
                     continue;
                 };
-                if let Some(update) = view.changes_since(sent) {
+                if let Some(update) = view.changes_since_from(sent, changed_from) {
                     sent.apply(update.clone());
                     send_to(
                         &client.outgoing,
