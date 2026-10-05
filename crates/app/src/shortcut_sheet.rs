@@ -17,6 +17,7 @@ use crate::spaces_view::{
     self, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivateTab,
     ClosePane, NewTab, NewWorkspace, NextTab, PreviousTab, SplitDown, SplitRight, ToggleZoom,
 };
+use crate::terminal_thread_view::{self, CloseTerminal};
 use crate::terminal_view::{
     self, Clear, DecreaseFontSize, DismissFind, Find, IncreaseFontSize, ResetFontSize,
     ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
@@ -115,25 +116,27 @@ fn shortcut_groups(context_stack: &[KeyContext], cx: &App) -> Vec<ShortcutGroup>
     let entry = |label: &'static str, action: &dyn Action| (label, vec![action.boxed_clone()]);
     let mut groups = Vec::new();
     if has(terminal_view::KEY_CONTEXT) {
-        groups.push((
-            "Terminal",
-            vec![
-                entry("Find", &Find),
-                entry("Copy", &terminal_view::Copy),
-                entry("Paste", &terminal_view::Paste),
-                entry("Select All", &terminal_view::SelectAll),
-                entry("Clear", &Clear),
-                entry("Scroll Page Up", &ScrollPageUp),
-                entry("Scroll Page Down", &ScrollPageDown),
-                entry("Scroll Line Up", &ScrollLineUp),
-                entry("Scroll Line Down", &ScrollLineDown),
-                entry("Scroll to Top", &ScrollToTop),
-                entry("Scroll to Bottom", &ScrollToBottom),
-                entry("Increase Font Size", &IncreaseFontSize),
-                entry("Decrease Font Size", &DecreaseFontSize),
-                entry("Reset Font Size", &ResetFontSize),
-            ],
-        ));
+        let mut terminal = Vec::new();
+        if has(terminal_thread_view::KEY_CONTEXT) {
+            terminal.push(entry("Close Terminal", &CloseTerminal));
+        }
+        terminal.extend([
+            entry("Find", &Find),
+            entry("Copy", &terminal_view::Copy),
+            entry("Paste", &terminal_view::Paste),
+            entry("Select All", &terminal_view::SelectAll),
+            entry("Clear", &Clear),
+            entry("Scroll Page Up", &ScrollPageUp),
+            entry("Scroll Page Down", &ScrollPageDown),
+            entry("Scroll Line Up", &ScrollLineUp),
+            entry("Scroll Line Down", &ScrollLineDown),
+            entry("Scroll to Top", &ScrollToTop),
+            entry("Scroll to Bottom", &ScrollToBottom),
+            entry("Increase Font Size", &IncreaseFontSize),
+            entry("Decrease Font Size", &DecreaseFontSize),
+            entry("Reset Font Size", &ResetFontSize),
+        ]);
+        groups.push(("Terminal", terminal));
     }
     if has(terminal_view::FIND_KEY_CONTEXT) {
         groups.push((
@@ -460,5 +463,29 @@ mod tests {
         assert!(all.contains(&"Send Message"));
         assert!(all.contains(&"Toggle Changes"));
         assert!(!all.contains(&"Split Right"));
+    }
+
+    /// Cmd-W closes a terminal thread; a thread's drawer terminal has no such key.
+    #[gpui::test]
+    fn a_terminal_thread_closes_with_cmd_w(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            init(cx);
+        });
+        let in_terminal_thread = stack(&["Shell", "TerminalThread", "Terminal"]);
+        let (sheet, cx) =
+            cx.add_window_view(|window, cx| ShortcutSheet::new(in_terminal_thread, window, cx));
+        cx.simulate_input("cmd-w");
+        assert_eq!(labels(&sheet, cx), ["Close Terminal"]);
+
+        let in_drawer = stack(&["Shell", "Terminal"]);
+        let drawer_labels: Vec<&str> = cx.update(|_, cx| {
+            shortcut_groups(&in_drawer, cx)
+                .iter()
+                .flat_map(|group| group.shortcuts.iter().map(|shortcut| shortcut.label))
+                .collect()
+        });
+        assert!(drawer_labels.contains(&"Find"));
+        assert!(!drawer_labels.contains(&"Close Terminal"));
     }
 }

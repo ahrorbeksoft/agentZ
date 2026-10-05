@@ -139,6 +139,7 @@ fn init_for_test(cx: &mut App) {
     text_input::init(cx);
     agent_view::init(cx);
     terminal_view::init(cx);
+    terminal_thread_view::init(cx);
     spaces_view::init(cx);
     bind_keys(cx);
 }
@@ -232,6 +233,7 @@ fn main() {
             elicitation_card::init(cx);
             sidebar::init(cx);
             terminal_view::init(cx);
+            terminal_thread_view::init(cx);
             settings_page::init(cx);
             agent_icons::init(cx);
             machines::init(cx);

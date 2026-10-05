@@ -4,7 +4,10 @@ use std::time::SystemTime;
 
 use agentz_protocol::CAPABILITY_THREAD_DIFF;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Task, Window};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, KeyBinding, PromptLevel, Subscription, Task,
+    Window, actions,
+};
 use projects::ThreadId;
 use ui::{Tooltip, prelude::*};
 
@@ -13,6 +16,22 @@ use crate::server_client::ServerClient;
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
+
+pub const KEY_CONTEXT: &str = "TerminalThread";
+
+actions!(
+    terminal_thread,
+    [
+        /// Closes the terminal thread, ending its shell.
+        CloseTerminal,
+    ]
+);
+
+/// Cmd-W closes a terminal thread, as it closes a Workspaces pane. A thread's drawer terminals
+/// aren't in this context, so it leaves them alone.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("cmd-w", CloseTerminal, Some(KEY_CONTEXT))]);
+}
 
 pub struct TerminalThreadView {
     title: SharedString,
@@ -118,6 +137,37 @@ impl TerminalThreadView {
         }
     }
 
+    /// Deletes the thread, which ends its shell. As a Workspaces pane does, it asks first while a
+    /// program runs in front of the shell.
+    fn close(&mut self, _: &CloseTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.client.read(cx).projects().clone();
+        let thread_id = self.thread_id;
+        let running = {
+            let store = store.read(cx);
+            store
+                .terminal_agent(thread_id)
+                .or_else(|| store.terminal_command(thread_id))
+                .map(str::to_string)
+        };
+        let Some(program) = running else {
+            store.update(cx, |store, cx| store.delete_thread(thread_id, cx));
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Close “{program}”?"),
+            Some("It's still running, and closing the terminal ends it."),
+            &["Close", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                store.update(cx, |store, cx| store.delete_thread(thread_id, cx));
+            }
+        })
+        .detach();
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let terminal = self.terminal.read(cx);
         let exit = terminal.frame().and_then(|frame| frame.exited.clone());
@@ -195,9 +245,101 @@ impl Focusable for TerminalThreadView {
 impl Render for TerminalThreadView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::close))
             .size_full()
             .bg(cx.theme().colors().terminal_background)
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().py_1().child(self.view.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agentz_protocol::Request;
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::TestAppContext;
+    use projects::ProjectsSnapshot;
+
+    use super::*;
+    use crate::machines::MachineId;
+
+    /// Cmd-W ends an idle shell at once, and asks first while a program runs in it.
+    #[gpui::test]
+    fn cmd_w_closes_the_terminal_thread(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            )
+        });
+        let thread: projects::Thread = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "project_id": 1,
+            "title": "demo",
+            "terminal": {},
+        }))
+        .expect("a terminal thread");
+        let set_running = |running: Option<&str>, cx: &mut App| {
+            let projects = client.read(cx).projects().clone();
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        threads: vec![thread.clone()],
+                        terminal_commands: running
+                            .map(|program| (ThreadId(1), program.to_string()))
+                            .into_iter()
+                            .collect(),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+        };
+        cx.update(|cx| set_running(None, cx));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            TerminalThreadView::new(
+                &client,
+                ThreadId(1),
+                "demo".into(),
+                TerminalCommand::default(),
+                cx,
+            )
+        });
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        let deletes = |cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter(|request| matches!(request, Request::DeleteThread(_)))
+                    .count()
+            })
+        };
+
+        cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(deletes(cx), 1);
+
+        cx.update(|_, cx| set_running(Some("npm"), cx));
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Close “npm”?".to_string(),
+                "It's still running, and closing the terminal ends it.".to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(deletes(cx), 1);
+        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_prompt_answer("Close");
+        cx.run_until_parked();
+        assert_eq!(deletes(cx), 2);
     }
 }

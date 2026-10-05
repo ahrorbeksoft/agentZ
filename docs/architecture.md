@@ -510,7 +510,8 @@ Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
   again as the output moves, one search at a time, and keeps the selected match. The bar sits
   outside the terminal's key context so its keys don't reach the shell.
 - **Where they appear**: terminal threads (`terminal_thread_view.rs`, a login shell from New
-  Thread); the thread's terminal drawer (`terminal_drawer.rs`, t3code's: Cmd-J, groups of up to
+  Thread; Cmd-W closes one as it closes a Workspaces pane, deleting the thread and asking first
+  while a program runs in front of its shell); the thread's terminal drawer (`terminal_drawer.rs`, t3code's: Cmd-J, groups of up to
   four split terminals, a dot on its button while something runs with the drawer hidden); ACP
   client terminals, shown live in tool calls; terminal logins, under the login buttons.
 - **Agent detection** (`detect.rs`, `detect/`): herdr's manifests read the bottom of the screen;
