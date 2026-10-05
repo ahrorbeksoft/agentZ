@@ -567,7 +567,6 @@ fn render_row(
     cx: &App,
 ) -> AnyElement {
     let colors = cx.theme().colors();
-    let status = cx.theme().status();
     match row {
         Row::File(index) => {
             let file = &diff.files[index];
@@ -681,8 +680,8 @@ fn render_row(
             let line = &diff.files[file].hunks[hunk].lines[line];
             let (marker, background) = match line.kind {
                 DiffLineKind::Context => (" ", None),
-                DiffLineKind::Removed => ("-", Some(status.deleted_background)),
-                DiffLineKind::Added => ("+", Some(status.created_background)),
+                DiffLineKind::Removed => ("-", Some(colors.editor_diff_hunk_deleted_background)),
+                DiffLineKind::Added => ("+", Some(colors.editor_diff_hunk_added_background)),
             };
             let number = |number: Option<u32>| {
                 div()

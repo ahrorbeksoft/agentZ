@@ -1,6 +1,14 @@
 {
   "topics": {
     "diff": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "switch": {
       "pick": "B",
       "picks": [],
       "none": false,
@@ -9,5 +17,5 @@
       "also": []
     }
   },
-  "updated": "2026-10-05T01:28:30.689Z"
+  "updated": "2026-10-05T01:29:48.024Z"
 }

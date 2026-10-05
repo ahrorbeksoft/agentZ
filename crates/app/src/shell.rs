@@ -13,10 +13,7 @@ use gpui::{
     WindowControlArea,
 };
 use projects::{Thread, ThreadId};
-use ui::{
-    ButtonLike, PopoverMenu, PopoverMenuHandle, ToggleButtonGroup, ToggleButtonGroupSize,
-    ToggleButtonSimple, Tooltip, prelude::*,
-};
+use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
@@ -1292,33 +1289,26 @@ impl Shell {
             ),
         };
         let shell = cx.entity().downgrade();
-        let view_tabs = {
-            let agents = shell.clone();
-            let workspaces = shell.clone();
-            ToggleButtonGroup::single_row(
-                "main-view",
-                [
-                    ToggleButtonSimple::new("Agents", move |_, window, cx| {
-                        agents
-                            .update(cx, |shell, cx| shell.set_view(MainView::Agents, window, cx))
-                            .ok();
-                    }),
-                    ToggleButtonSimple::new("Workspaces", move |_, window, cx| {
-                        workspaces
-                            .update(cx, |shell, cx| {
-                                shell.set_view(MainView::Workspaces, window, cx)
-                            })
-                            .ok();
-                    }),
-                ],
-            )
-            .size(ToggleButtonGroupSize::Default)
-            .auto_width()
-            .selected_index(match self.view {
-                MainView::Agents => 0,
-                MainView::Workspaces => 1,
-            })
+        // Zed's toggle buttons, with the selected side gray rather than tinted with the
+        // accent (the user's pick in `design/jetbrains/`).
+        let view_tab = |index: usize, label: &'static str, view: MainView| {
+            let shell = shell.clone();
+            ButtonLike::new(("main-view", index))
+                .toggle_state(self.view == view)
+                .selected_style(ButtonStyle::Filled)
+                .child(div().px_2().child(Label::new(label).size(LabelSize::Small)))
+                .on_click(move |_, window, cx| {
+                    shell
+                        .update(cx, |shell, cx| shell.set_view(view, window, cx))
+                        .ok();
+                })
         };
+        let view_tabs = h_flex()
+            .rounded_md()
+            .overflow_hidden()
+            .gap_px()
+            .child(view_tab(0, "Agents", MainView::Agents))
+            .child(view_tab(1, "Workspaces", MainView::Workspaces));
         let shows_switcher = self.view == MainView::Agents;
         // The other view's agents waiting on the user, counted beside its side of the switch.
         let badge = match self.view {

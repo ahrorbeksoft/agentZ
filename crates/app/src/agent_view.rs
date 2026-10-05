@@ -4598,7 +4598,6 @@ fn render_plan_entries(plan: &[PlanItem], _window: &Window, cx: &App) -> AnyElem
 
 fn render_diff(diff: &FileDiff, cx: &App) -> AnyElement {
     let colors = cx.theme().colors();
-    let status = cx.theme().status();
     v_flex()
         .w_full()
         .border_t_1()
@@ -4612,8 +4611,12 @@ fn render_diff(diff: &FileDiff, cx: &App) -> AnyElement {
                 .map(|(kind, line)| {
                     let (marker, background) = match kind {
                         DiffLineKind::Context => (" ", None),
-                        DiffLineKind::Removed => ("-", Some(status.deleted_background)),
-                        DiffLineKind::Added => ("+", Some(status.created_background)),
+                        DiffLineKind::Removed => {
+                            ("-", Some(colors.editor_diff_hunk_deleted_background))
+                        }
+                        DiffLineKind::Added => {
+                            ("+", Some(colors.editor_diff_hunk_added_background))
+                        }
                     };
                     h_flex()
                         .px_2()
