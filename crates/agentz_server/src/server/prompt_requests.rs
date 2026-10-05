@@ -9,7 +9,7 @@ use agent_thread::MessagePart;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::thread::{ConnectionStatus, mentioned_thread};
 use agentz_protocol::{ConnectionId, FileEntry, FileListing, PromptPart, Response};
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use projects::ThreadId;
 use util::ResultExt as _;
 
@@ -24,16 +24,63 @@ const MENTIONED_FILE_LIMIT: u64 = 1024 * 1024;
 pub(super) struct PendingPrompt {
     connection: ConnectionId,
     prompt: Vec<PromptPart>,
+    /// Sent into the turn the agent is working on ([`agentz_protocol::Request::Steer`]).
+    steer: bool,
     deadline: Instant,
 }
 
 impl Server {
+    /// Sends a message to a thread's agent ([`agentz_protocol::Request::Prompt`]), or into the turn it's working
+    /// on ([`agentz_protocol::Request::Steer`]).
+    pub(super) fn prompt(
+        &mut self,
+        connection: ConnectionId,
+        prompt: Vec<PromptPart>,
+        steer: bool,
+    ) -> Result<Response> {
+        if let ConnectionId::Thread(thread_id) = connection
+            && self
+                .projects
+                .thread(thread_id)
+                .is_some_and(|thread| thread.task.is_some())
+        {
+            return Err(anyhow!(
+                "a subthread only takes its task; message its parent instead"
+            ));
+        }
+        if prompt
+            .iter()
+            .all(|part| matches!(part, PromptPart::Text(_)))
+        {
+            let text = prompt
+                .into_iter()
+                .map(|part| match part {
+                    PromptPart::Text(text) => text,
+                    _ => String::new(),
+                })
+                .collect();
+            self.update_thread(connection, |thread| {
+                if steer {
+                    thread.steer(text)
+                } else {
+                    thread.send(text)
+                }
+            })?;
+        } else {
+            // Starts the thread's agent first, as plain text does.
+            self.update_thread(connection, |_| ())?;
+            self.queue_prompt(connection, prompt, steer)?;
+        }
+        Ok(Response::Ok)
+    }
+
     /// Sends a message once the threads it mentions have their conversations, starting their
     /// agents if they aren't running.
     pub(super) fn queue_prompt(
         &mut self,
         connection: ConnectionId,
         prompt: Vec<PromptPart>,
+        steer: bool,
     ) -> Result<()> {
         for part in &prompt {
             if let PromptPart::Thread(thread_id) = part {
@@ -52,11 +99,19 @@ impl Server {
         self.pending_prompts.push(PendingPrompt {
             connection,
             prompt,
+            steer,
             deadline,
         });
         self.wake_at(deadline);
         self.send_waiting_prompts();
         Ok(())
+    }
+
+    /// Whether a message to the thread waits for the threads it mentions.
+    pub(super) fn has_waiting_prompt(&self, thread_id: ThreadId) -> bool {
+        self.pending_prompts
+            .iter()
+            .any(|pending| pending.connection == ConnectionId::Thread(thread_id))
     }
 
     /// Sends the waiting messages whose mentioned threads have loaded, or that waited long
@@ -79,14 +134,14 @@ impl Server {
             if is_loading && now < pending.deadline {
                 self.pending_prompts.push(pending);
             } else {
-                self.send_prompt(pending.connection, pending.prompt);
+                self.send_prompt(pending.connection, pending.prompt, pending.steer);
             }
         }
     }
 
     /// Takes the mentioned threads' conversations now, reads the mentioned files off the
     /// server's task, then sends.
-    fn send_prompt(&mut self, connection: ConnectionId, prompt: Vec<PromptPart>) {
+    fn send_prompt(&mut self, connection: ConnectionId, prompt: Vec<PromptPart>, steer: bool) {
         let parts: Vec<Result<MessagePart, PathBuf>> = prompt
             .into_iter()
             .map(|part| match part {
@@ -109,7 +164,13 @@ impl Server {
             },
             move |server, parts| {
                 server
-                    .update_thread(connection, |thread| thread.send_message(parts))
+                    .update_thread(connection, |thread| {
+                        if steer {
+                            thread.steer_message(parts)
+                        } else {
+                            thread.send_message(parts)
+                        }
+                    })
                     .log_err();
             },
         );

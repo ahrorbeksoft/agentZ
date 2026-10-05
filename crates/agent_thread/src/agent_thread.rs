@@ -48,6 +48,10 @@ const CLOSE_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 /// How Claude Agent and Codex report their login, unasked: an ACP extension notification.
 const AUTH_STATUS_NOTIFICATION: &str = "_auth/status_update";
 
+/// How Claude Agent and Codex take a message into a running turn: an ACP extension request,
+/// until ACP has its own.
+const STEERING_REQUEST: &str = "_session/steering";
+
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
     WorkingChanged(bool),
@@ -149,6 +153,11 @@ enum MessageKind {
         result: std::result::Result<(), agent_client_protocol::Error>,
     },
     PromptFinished(std::result::Result<acp::PromptResponse, agent_client_protocol::Error>),
+    /// The agent answered a message sent into its turn ([`AgentThread::steer_message`]).
+    Steered {
+        parts: Vec<MessagePart>,
+        result: std::result::Result<Value, agent_client_protocol::Error>,
+    },
     /// The pause's marker made it through the SDK.
     PauseMarker,
     /// The answer to an adopted agent's prompt arrived, after what the agent sent before it.
@@ -221,6 +230,8 @@ pub struct AgentThread {
     session: Option<Session>,
     pending_title: Option<String>,
     queued_prompts: Vec<Vec<MessagePart>>,
+    /// Messages sent into a turn that the agent didn't take, sent one a turn as turns end.
+    after_turn: VecDeque<Vec<MessagePart>>,
     /// The first entry that changed since the server last sent this thread's changes, so it
     /// doesn't compare a long conversation's every entry on each update.
     entries_changed_from: Option<usize>,
@@ -277,10 +288,17 @@ impl Drop for ProcessGuard {
     }
 }
 
+/// Kills the agent with what it started (Zed's `util::process::Child::kill`): Factory Droid's
+/// `acp-daemon` runs each session in a worker, and agents start tools and MCP servers.
 fn kill(pid: u32) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return;
     };
+    // SAFETY: only sends a signal to the agent's process group, which it leads.
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } == 0 {
+        return;
+    }
+    // An agent started by an older server, handed off from it, shares that server's group.
     // SAFETY: only sends a signal to the agent's process.
     if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
         log::warn!(
@@ -423,6 +441,7 @@ impl AgentThread {
             session: None,
             pending_title: None,
             queued_prompts: Vec::new(),
+            after_turn: VecDeque::new(),
             entries_changed_from: Some(0),
             handoff_to_send: None,
             mcp_servers: Vec::new(),
@@ -539,6 +558,7 @@ impl AgentThread {
                 self.process = Some(connected.process);
                 self.connection = Some(connected.connection);
                 self.view.state.capabilities = connected.capabilities;
+                self.view.state.supports_steering = connected.supports_steering;
                 self.view.state.auth_methods = connected.auth_methods;
                 self.view.state.agent_info = connected.agent_info;
                 // An account connection opens an empty session too: it is how the login
@@ -710,7 +730,11 @@ impl AgentThread {
                         )
                 });
                 self.set_working(false);
+                if let Some(parts) = self.after_turn.pop_front() {
+                    self.send_after_turn(parts);
+                }
             }
+            MessageKind::Steered { parts, result } => self.steered(parts, result),
         }
     }
 
@@ -732,6 +756,7 @@ impl AgentThread {
         self.cancel_permission_requests();
         self.cancel_elicitations(|_| true);
         self.queued_prompts.clear();
+        self.after_turn.clear();
         self.view.state.auth_error = None;
         self.view.state.auth_description = None;
         self.view.state.authenticating = None;
@@ -907,6 +932,7 @@ impl AgentThread {
             && self.session.is_some()
             && (self.process.is_some() || self.adopted_process.is_some())
             && self.queued_prompts.is_empty()
+            && self.after_turn.is_empty()
             && self.wire.as_ref().is_some_and(|wire| {
                 wire.prompt_in_flight()
                     .is_ok_and(|prompt| prompt.is_some() == self.is_working())
@@ -1474,6 +1500,103 @@ impl AgentThread {
         }
     }
 
+    pub fn steer(&mut self, text: String) {
+        self.steer_message(vec![MessagePart::Text(text)]);
+    }
+
+    /// Sends a message into the turn the agent is working on, when the agent takes one
+    /// ([`ThreadState::supports_steering`]). It shows in the thread once the agent takes it.
+    /// One it doesn't take goes once the turn ends, and one sent while the agent isn't working
+    /// goes at once, as [`Self::send_message`] sends it.
+    pub fn steer_message(&mut self, parts: Vec<MessagePart>) {
+        let parts = trim_message(parts);
+        if parts.is_empty() {
+            return;
+        }
+        if !self.is_working() {
+            self.send_message(parts);
+            return;
+        }
+        let Some(session) = self
+            .session
+            .as_ref()
+            .filter(|_| self.view.state.supports_steering)
+        else {
+            self.after_turn.push_back(parts);
+            return;
+        };
+        let request = agent_client_protocol::UntypedMessage::new(
+            STEERING_REQUEST,
+            serde_json::json!({
+                "sessionId": session.session_id,
+                "prompt": self.content_blocks(parts.clone()),
+                // Otherwise Claude Agent starts a turn of its own when the turn has just
+                // ended, one that no `session/prompt` waits for.
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            }),
+        );
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                log::error!("failed to write the message into the turn: {error:?}");
+                self.after_turn.push_back(parts);
+                return;
+            }
+        };
+        let response = session.connection.send_request(request).block_task();
+        self.spawn(async move {
+            MessageKind::Steered {
+                parts,
+                result: response.await,
+            }
+        });
+    }
+
+    /// The agent's answer to [`Self::steer_message`]: `injected` when the message joined the
+    /// turn, `promptRequired` when the turn had ended (Claude Agent), `startedNewTurn` when it
+    /// started a turn with it instead (Codex), or `failed`.
+    fn steered(
+        &mut self,
+        parts: Vec<MessagePart>,
+        result: std::result::Result<Value, agent_client_protocol::Error>,
+    ) {
+        let outcome = match &result {
+            Ok(response) => response.get("outcome").and_then(Value::as_str),
+            Err(_) => None,
+        };
+        match outcome {
+            Some("injected" | "startedNewTurn") => {
+                self.view
+                    .state
+                    .sent_times
+                    .push((self.view.entries.len(), SystemTime::now()));
+                self.push_entry(Entry::UserMessage(message_markdown(&parts)));
+            }
+            Some("promptRequired") => self.send_after_turn(parts),
+            _ => {
+                match &result {
+                    Ok(response) => {
+                        log::warn!("the agent didn't take a message into its turn: {response}")
+                    }
+                    Err(error) => log::warn!(
+                        "the agent didn't take a message into its turn: {}",
+                        error_message(error)
+                    ),
+                }
+                self.send_after_turn(parts);
+            }
+        }
+    }
+
+    /// Sends a message once no turn is running.
+    fn send_after_turn(&mut self, parts: Vec<MessagePart>) {
+        if self.is_working() {
+            self.after_turn.push_back(parts);
+        } else {
+            self.send_message(parts);
+        }
+    }
+
     /// Sends a message an agent wrote, marked as coming from it.
     pub fn send_from(&mut self, text: String, from: projects::ThreadCreator) {
         let index = self.view.entries.len();
@@ -1498,18 +1621,23 @@ impl AgentThread {
         self.emit(AgentThreadEvent::SessionStarted(session_id));
     }
 
+    /// The message as the agent takes it.
+    fn content_blocks(&self, parts: Vec<MessagePart>) -> Vec<acp::ContentBlock> {
+        let capabilities = &self.view.state.capabilities.prompt_capabilities;
+        parts
+            .into_iter()
+            .filter_map(|part| {
+                part.into_content_block(capabilities.embedded_context, capabilities.image)
+            })
+            .collect()
+    }
+
     fn send_to_agent(&mut self, parts: Vec<MessagePart>) {
         self.remember_session();
         if self.session.is_none() {
             return;
         }
-        let capabilities = &self.view.state.capabilities.prompt_capabilities;
-        let mut prompt: Vec<acp::ContentBlock> = parts
-            .into_iter()
-            .filter_map(|part| {
-                part.into_content_block(capabilities.embedded_context, capabilities.image)
-            })
-            .collect();
+        let mut prompt = self.content_blocks(parts);
         if let Some(handoff) = self.handoff_to_send.take() {
             // Embedded, the agent tells it from the message: replays show only the message.
             let block = if self
@@ -1689,6 +1817,7 @@ impl AgentThread {
         self.view.state.status = ConnectionStatus::Failed(message.into());
         self.session = None;
         self.queued_prompts.clear();
+        self.after_turn.clear();
         self.view.state.authenticating = None;
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
@@ -2273,11 +2402,12 @@ async fn connect(
     agent_tasks: &mut JoinSet<()>,
 ) -> Result<Connected> {
     // Stopped by `ProcessGuard` rather than on drop, so a handed-off agent can outlive this
-    // process.
+    // process. In a group of its own, so what it starts stops with it.
     let mut child = tokio::process::Command::new(&command.path)
         .args(&command.args)
         .envs(&command.env)
         .current_dir(&cwd)
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2342,10 +2472,19 @@ async fn connect(
         initialize_response.protocol_version >= ProtocolVersion::V1,
         "the agent speaks an unsupported ACP version"
     );
+    // Beside `agentCapabilities` rather than in them, as Claude Agent and Codex send it.
+    let supports_steering = initialize_response
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("steering"))
+        .and_then(|steering| steering.get("supported"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     Ok(Connected {
         connection,
         capabilities: initialize_response.agent_capabilities,
+        supports_steering,
         auth_methods: initialize_response.auth_methods,
         agent_info: initialize_response.agent_info,
         wire,
@@ -2642,6 +2781,7 @@ fn select_offers(select: &acp::SessionConfigSelect, value: &acp::SessionConfigVa
 struct Connected {
     connection: ConnectionTo<Agent>,
     capabilities: acp::AgentCapabilities,
+    supports_steering: bool,
     auth_methods: Vec<acp::AuthMethod>,
     agent_info: Option<acp::Implementation>,
     wire: Wire,
@@ -3121,6 +3261,127 @@ mod tests {
             .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
             .await;
         assert!(thread.thread.session.is_some());
+    }
+
+    fn user_messages(thread: &AgentThread) -> Vec<String> {
+        thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::UserMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn last_agent_message(thread: &AgentThread) -> Option<String> {
+        thread.entries().iter().rev().find_map(|entry| match entry {
+            Entry::AgentMessage(text) => Some(text.to_string()),
+            _ => None,
+        })
+    }
+
+    /// Stopping an agent stops what it started with it, as Factory Droid's session workers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stops_what_the_agent_started_with_it() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("worker");
+        command.env.insert(
+            "MOCK_CHILD_PID_FILE".into(),
+            pid_file.to_string_lossy().into_owned(),
+        );
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("the worker's pid")
+            .parse()
+            .expect("a pid");
+        // SAFETY: signal 0 only checks that the process exists.
+        let is_running = || unsafe { libc::kill(pid, 0) } == 0;
+        assert!(is_running());
+
+        drop(thread);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_running() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!is_running(), "the worker outlived its agent");
+    }
+
+    /// A message steered into a turn joins it, as Claude Agent and Codex take one, rather than
+    /// waiting for it to end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn steers_a_message_into_the_running_turn() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        command.env.insert("MOCK_STEERING".into(), "1".into());
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(thread.thread.state.supports_steering);
+
+        thread.update(|thread| thread.send("permission".into()));
+        let tool_call_id = acp::ToolCallId::new("call-2");
+        thread
+            .wait_until(|thread| thread.permission_request(&tool_call_id).is_some())
+            .await;
+        thread.update(|thread| thread.steer("use tabs".into()));
+        thread
+            .wait_until(|thread| user_messages(thread) == ["permission", "use tabs"])
+            .await;
+        thread.update(|thread| {
+            let allow = acp::PermissionOptionId::new("allow");
+            thread.respond_to_permission(&tool_call_id, allow);
+        });
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert_eq!(
+            agent_text(&thread.thread),
+            "Echo: permission (chose allow) (steered: use tabs)"
+        );
+        assert_eq!(user_messages(&thread.thread), ["permission", "use tabs"]);
+    }
+
+    /// A message the agent doesn't take into its turn goes as the next prompt once the turn
+    /// ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sends_a_refused_steering_message_after_the_turn() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        command.env.insert("MOCK_STEERING".into(), "1".into());
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("permission".into()));
+        let tool_call_id = acp::ToolCallId::new("call-2");
+        thread
+            .wait_until(|thread| thread.permission_request(&tool_call_id).is_some())
+            .await;
+        thread.update(|thread| thread.steer("refuse".into()));
+        thread
+            .wait_until(|thread| !thread.after_turn.is_empty())
+            .await;
+        // It shows once it's sent.
+        assert_eq!(user_messages(&thread.thread), ["permission"]);
+        thread.update(|thread| {
+            let allow = acp::PermissionOptionId::new("allow");
+            thread.respond_to_permission(&tool_call_id, allow);
+        });
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).as_deref() == Some("Echo: refuse")
+            })
+            .await;
+        assert_eq!(user_messages(&thread.thread), ["permission", "refuse"]);
     }
 
     /// A browser login that asks the client to open a URL, as Codex's device code login does,

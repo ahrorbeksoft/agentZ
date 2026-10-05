@@ -274,6 +274,12 @@ impl AgentThread {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_supports_steering_for_test(&mut self, cx: &mut Context<Self>) {
+        self.view.state.supports_steering = true;
+        cx.notify();
+    }
+
     fn fail(&mut self, error: String, cx: &mut Context<Self>) {
         self.queued_updates = None;
         self.view.state.status = ConnectionStatus::Failed(error.into());
@@ -409,6 +415,11 @@ impl AgentThread {
 
     pub fn send(&mut self, prompt: Vec<agentz_protocol::PromptPart>, cx: &mut Context<Self>) {
         self.request(|connection| Request::Prompt { connection, prompt }, cx)
+    }
+
+    /// Sends the message into the agent's running turn ([`Request::Steer`]).
+    pub fn steer(&mut self, prompt: Vec<agentz_protocol::PromptPart>, cx: &mut Context<Self>) {
+        self.request(|connection| Request::Steer { connection, prompt }, cx)
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) {

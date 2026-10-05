@@ -1319,7 +1319,7 @@ impl Server {
     }
 
     /// The thread has delegated tasks that are running, or have ended without it hearing.
-    fn has_unannounced_tasks(&self, thread_id: ThreadId) -> bool {
+    pub(super) fn has_unannounced_tasks(&self, thread_id: ThreadId) -> bool {
         self.projects.subthreads(thread_id).iter().any(|thread| {
             thread
                 .task
@@ -1379,8 +1379,8 @@ impl Server {
             .map_err(|error| failure("orchestration_error", format!("{error:#}")))?;
             "started"
         } else if restart {
-            // ACP has no steering, so a restart cancels the turn and sends the message once it
-            // has stopped (t3code's interrupt-and-restart).
+            // A restart cancels the turn and sends the message once it has stopped (t3code's
+            // interrupt-and-restart).
             self.follow_ups
                 .entry(thread_id)
                 .or_default()
@@ -2051,7 +2051,7 @@ pub(super) fn definitions() -> Value {
         {
             "name": "agentz_thread_organize",
             "title": "Organize an agentZ thread",
-            "description": "Pin, unpin, archive or unarchive a thread in the calling project. Omit threadId for this thread. Pinned threads list first in the sidebar; pinning an archived thread brings it back. Archived threads keep running and move to Thread History, unpinned. Deleting threads is left to the user.",
+            "description": "Pin, unpin, archive or unarchive a thread in the calling project. Omit threadId for this thread. Pinned threads list first in the sidebar; pinning an archived thread brings it back. Archiving doesn't stop a turn in progress; archived threads move to Thread History, unpinned. Deleting threads is left to the user.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

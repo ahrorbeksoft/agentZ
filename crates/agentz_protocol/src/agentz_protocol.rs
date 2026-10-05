@@ -408,6 +408,13 @@ pub enum Request {
         connection: ConnectionId,
         prompt: Vec<PromptPart>,
     },
+    /// Sends a message into the turn the agent is working on, for agents that take one
+    /// ([`thread::ThreadState::supports_steering`]). One the agent doesn't take goes once the
+    /// turn ends.
+    Steer {
+        connection: ConnectionId,
+        prompt: Vec<PromptPart>,
+    },
     Cancel(ConnectionId),
     /// The files and folders of the folder a thread works in, for its composer's @-mentions:
     /// [`Response::Files`].

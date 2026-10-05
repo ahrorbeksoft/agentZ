@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
@@ -17,7 +17,7 @@ use agentz_protocol::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalPoint,
     TerminalSelectionKind, TerminalSelectionUpdate,
 };
-use agentz_protocol::thread::{Entry, ThreadView};
+use agentz_protocol::thread::{ConnectionStatus, Entry, ThreadView};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, MachineKind,
@@ -445,6 +445,62 @@ async fn continues_threads_with_another_agent() {
     // Only the user's words are their message.
     assert!(matches!(thread.entries().first(), Some(Entry::UserMessage(text)) if text == "next"));
     assert!(!saved.exists());
+}
+
+/// An archived thread's agent stops once nothing needs it and no client has the thread open,
+/// and opening the thread again starts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_the_agent_of_an_archived_thread_left_idle() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let closed = dir.path().join("closed");
+    command.env.insert(
+        "MOCK_CLOSED_FILE".into(),
+        closed.to_string_lossy().into_owned(),
+    );
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == "Echo: hello"
+        })
+        .await;
+    client.ok(Request::ArchiveThread(thread_id)).await;
+    // It runs while it's open, past the moment a view takes to be rebuilt.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!closed.exists());
+
+    client.ok(Request::UnsubscribeThread(connection)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !closed.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let closed_sessions = std::fs::read_to_string(&closed).expect("the agent closed its session");
+    assert_eq!(closed_sessions.lines().count(), 1);
+
+    client.subscribe_thread(connection).await;
+    client
+        .wait_until(|client| client.thread(connection).status() == &ConnectionStatus::Ready)
+        .await;
 }
 
 /// A new thread is a draft until its first message, as in t3code: one left with nothing typed

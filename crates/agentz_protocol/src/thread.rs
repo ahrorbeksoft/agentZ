@@ -305,6 +305,9 @@ pub struct ThreadState {
     pub session_restore: Option<SessionRestore>,
     pub permission_requests: Vec<PermissionRequest>,
     pub capabilities: acp::AgentCapabilities,
+    /// Whether the agent takes messages into a running turn: the `_session/steering`
+    /// extension, which Claude Agent and Codex advertise in `initialize`'s `_meta`.
+    pub supports_steering: bool,
     pub auth_methods: Vec<acp::AuthMethod>,
     pub auth_error: Option<SharedString>,
     /// What the agent said when it asked for a login, if more than "authentication

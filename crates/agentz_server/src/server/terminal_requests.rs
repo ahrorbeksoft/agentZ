@@ -877,6 +877,15 @@ impl Server {
     }
 
     /// Closes the terminals of threads and panes that are gone.
+    /// Whether a command the thread's agent started in a terminal still runs.
+    pub(super) fn has_running_agent_terminal(&self, thread_id: ThreadId) -> bool {
+        self.terminals.running.iter().any(|(key, running)| {
+            matches!(key, TerminalKey::Agent { thread_id: id, .. } if *id == thread_id)
+                && !running.released
+                && running.terminal.exit().is_none()
+        })
+    }
+
     pub(super) fn close_orphaned_terminals(&mut self) {
         let orphaned: Vec<TerminalKey> = self
             .terminals

@@ -46,6 +46,14 @@ script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─►
   running. Settings › General › Restart Server ends it (and its agents), and Update Server hands
   it over (below); `agentz-server stop` stops it for good. `proxy` starts a remote server detached, so a dropped SSH connection never
   stops agents (Zed's design).
+- **Agent lifetimes** (`Server::update_thread`, `Server::stop_idle_agents`): a thread's agent
+  starts when a client opens the thread or something is sent to it. It stops when the thread is
+  deleted, or once it has had nothing to do (no turn, question, login, queued message, unfinished
+  task or running command in its terminals) and no client has had the thread open for 30
+  minutes, 3 seconds for an archived thread (t3code's idle release). Opening the thread again
+  starts it and loads its session. Each agent runs in its own process group, killed whole, so
+  what it started stops with it (Zed's `util::process::Child`): Factory Droid's `acp-daemon`
+  runs a worker per session.
 
 ### Protocol (`crates/agentz_protocol`)
 
@@ -270,8 +278,13 @@ Each entry: what it does, where it lives, and where it comes from.
   12s"; under a finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
   (`ThreadState::sent_times` by entry, `finished_turns` by each turn's end entry), so they
   survive reopening the thread; messages and turns an agent replays from history have none.
-- **Steer** (`agent_view.rs`, picked in `design/thread/`): a queued message has Steer beside
-  Send Now. ACP takes one prompt at a time, so Steer moves the message to the front and waits
+- **Steer** (`agent_view.rs`, `AgentThread::steer_message`, picked in `design/thread/`): a
+  queued message has Steer beside Send Now. An agent that advertises `_meta.steering` in
+  `initialize` (Claude Agent, Codex; `ThreadState::supports_steering`) takes it into the running
+  turn: `Request::Steer` sends the `_session/steering` extension request, and the message shows
+  in the thread once the agent answers `injected`. One it doesn't take (`promptRequired` when the
+  turn just ended, or an error) goes as the next prompt once the turn ends. Other agents (Factory
+  Droid, OpenCode) take one prompt at a time, so Steer moves the message to the front and waits
   for the step the agent is on: once no tool call since the last message is running (or it
   asks for permission), agentZ cancels the turn and the queue sends the message. Editing or
   removing the front message disarms it.
@@ -315,8 +328,9 @@ Each entry: what it does, where it lives, and where it comes from.
   list. What's typed in any thread's composer is kept on its machine (`Request::SetUnsentText`,
   half a second after typing pauses, and as the view closes) and comes back when it's opened,
   as t3code keeps composer drafts; a discard from elsewhere empties the composer
-  (`AgentView::follow_discarded_unsent_text`). The shell closes a draft it moves away from
-  (other views keep threads open), and the server deletes a draft with nothing typed once no
+  (`AgentView::follow_discarded_unsent_text`). The shell closes the view of any thread it moves
+  away from, unless messages are queued in it (other views keep threads open), so the server
+  can stop idle agents; it deletes a draft with nothing typed once no
   client has had it open for 3 seconds (60 after it's made, or found at start, for a far
   client to open it). Quitting counts as leaving; Settings and Workspaces don't. A draft with
   text stays, as a draft row in the sidebar. The first message makes it a thread

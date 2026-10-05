@@ -42,6 +42,14 @@ It supports `session/close`, and with MOCK_CLOSED_FILE set, notes each closed se
 With MOCK_REJECT_MCP set, `session/new` and `session/load` fail when given any MCP server, as
 Factory Droid 0.233.0's do.
 
+With MOCK_STEERING set, it takes messages into a running turn (`_session/steering`), as Claude
+Agent and Codex do: one sent while a "permission" turn waits for its answer joins that turn,
+whose reply ends " (steered: <text>)". With no turn running it answers `promptRequired`, as
+Claude Agent does when asked to, and it refuses a message of "refuse".
+
+With MOCK_CHILD_PID_FILE set, it starts a long `sleep` as Factory Droid starts a worker for each
+session, and writes its process id to that file.
+
 With MOCK_SESSIONS_FILE set, it lists the sessions in that file (`session/list`, two to a
 page): a JSON array of ACP session infos, each with an optional "history" of session updates
 that `session/load` replays for it. Listing needs a login, as sessions do.
@@ -69,6 +77,11 @@ if sys.argv[-1] == "--login":
     print("Logged in.", flush=True)
     sys.exit(0)
 
+if os.environ.get("MOCK_CHILD_PID_FILE"):
+    worker = subprocess.Popen(["sleep", "600"])
+    with open(os.environ["MOCK_CHILD_PID_FILE"], "w") as file:
+        file.write(str(worker.pid))
+
 # Optional path where conversations are recorded so `session/load` can replay them.
 HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
 
@@ -76,6 +89,8 @@ LONG_BUILD_OUTPUT = "".join(f"   Compiling page {n}/60\n" for n in range(1, 61))
 
 next_request_id = 1000
 pending = {}
+# Messages steered into the turn in progress.
+steered = []
 mcp_servers = []
 session_cwd = os.getcwd()
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
@@ -164,6 +179,9 @@ def finish_prompt(request_id, session_id, prompt_text, chosen=None):
                         "title": "Read README.md", "kind": "read", "status": "completed"})
     if chosen is not None:
         update(session_id, text_chunk("agent_message_chunk", f" (chose {chosen})"))
+    for text in steered:
+        update(session_id, text_chunk("agent_message_chunk", f" (steered: {text})"))
+    steered.clear()
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
@@ -355,6 +373,8 @@ for line in sys.stdin:
             session_capabilities["list"] = {}
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
+                         "_meta": ({"steering": {"supported": True}}
+                                   if os.environ.get("MOCK_STEERING") else {}),
                          "agentInfo": {"name": "mock-agent", "title": "Mock Agent",
                                        "version": "1.2.3"},
                          "agentCapabilities": {
@@ -407,6 +427,19 @@ for line in sys.stdin:
             with open(CLOSED_FILE, "a") as file:
                 file.write(message["params"]["sessionId"] + "\n")
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+    elif method == "_session/steering":
+        text = "".join(block.get("text", "") for block in message["params"]["prompt"]
+                       if block.get("type", "text") == "text")
+        if text == "refuse":
+            send({"jsonrpc": "2.0", "id": message["id"],
+                  "error": {"code": -32603, "message": "Internal error"}})
+        elif pending:
+            steered.append(text)
+            record(text_chunk("user_message_chunk", text))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"outcome": "injected"}})
+        else:
+            send({"jsonrpc": "2.0", "id": message["id"],
+                  "result": {"outcome": "promptRequired", "reason": "noRunningTurn"}})
     elif method == "session/set_config_option":
         params = message["params"]
         settings[params["configId"]] = params["value"]

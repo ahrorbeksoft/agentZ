@@ -3559,8 +3559,24 @@ impl AgentView {
     /// current turn if the agent is working.
     /// Zed's Steer: puts the message first, to go once the agent's current step is done.
     /// Steering the steering message again stops it.
+    /// An agent that takes messages into its turn gets the message at once.
     fn steer_queued_message(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.queued_messages.len() {
+            return;
+        }
+        let thread = self.thread.read(cx);
+        if thread.state.supports_steering
+            && thread.is_working()
+            && thread.status() == &ConnectionStatus::Ready
+        {
+            let message = self.queued_messages.remove(index);
+            if index == 0 {
+                self.steer_armed = false;
+            }
+            self.list_state.scroll_to_end();
+            self.thread
+                .update(cx, |thread, cx| thread.steer(message.prompt, cx));
+            cx.notify();
             return;
         }
         if index == 0 && self.steer_armed {
@@ -3574,9 +3590,9 @@ impl AgentView {
         cx.notify();
     }
 
-    /// Over ACP nothing joins a running turn, so a steering message ends the turn at the next
-    /// step: once no tool call is running (one waiting for approval is between steps). The queue
-    /// then sends it, as at any turn's end.
+    /// For an agent that can't take a message into its turn, a steering message ends the turn
+    /// at the next step: once no tool call is running (one waiting for approval is between
+    /// steps). The queue then sends it, as at any turn's end.
     fn steer_if_due(&mut self, cx: &mut Context<Self>) {
         if !self.steer_armed {
             return;
@@ -3979,6 +3995,19 @@ impl AgentView {
             && self.typed_text(cx).is_none()
             && self.replacing.is_none()
             && self.thread.read(cx).pending_handoff().is_none()
+    }
+
+    /// Whether messages typed while the agent works wait here for its turn to end.
+    pub(crate) fn has_queued_messages(&self) -> bool {
+        !self.queued_messages.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_message_for_test(&mut self, text: &str) {
+        self.queued_messages.push(QueuedMessage {
+            text: text.into(),
+            prompt: PromptPart::text(text),
+        });
     }
 
     /// A new thread nothing has been sent in yet (t3code's draft thread).
@@ -6759,6 +6788,44 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(cancels(cx), 1);
+    }
+
+    /// An agent that takes messages into its turn gets a steered message at once, and its turn
+    /// goes on.
+    #[gpui::test]
+    fn steering_sends_the_message_into_the_turn(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    tool_call(acp::ToolCallStatus::InProgress),
+                ],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+            thread.set_status_for_test(ConnectionStatus::Ready, cx);
+            thread.set_supports_steering_for_test(cx);
+        });
+        view.update(cx, |view, cx| {
+            view.queued_messages.push(QueuedMessage {
+                text: "Use the receipt's rounding".into(),
+                prompt: PromptPart::text("Use the receipt's rounding"),
+            });
+            view.steer_queued_message(0, cx);
+        });
+        cx.run_until_parked();
+        let sent = client.read_with(cx, |client, _| client.sent_for_test());
+        assert!(sent.iter().any(|request| matches!(request,
+            Request::Steer { prompt, .. } if *prompt == PromptPart::text("Use the receipt's rounding"))));
+        assert!(
+            !sent
+                .iter()
+                .any(|request| matches!(request, Request::Cancel(_)))
+        );
+        assert!(view.read_with(cx, |view, _| view.queued_messages.is_empty()));
     }
 
     #[gpui::test]

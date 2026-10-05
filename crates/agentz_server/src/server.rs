@@ -25,8 +25,8 @@ use agentz_protocol::agents::{
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::{
-    AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, PromptPart,
-    Request, Response, ServerMessage, SessionSnapshot,
+    AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, Request,
+    Response, ServerMessage, SessionSnapshot,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
@@ -176,6 +176,11 @@ pub(crate) struct Server {
     draft_due: HashMap<ThreadId, Instant>,
     /// When a sweep of them is due.
     draft_sweep_at: Option<Instant>,
+    /// Since when each running agent has had nothing to do and no client watching its thread
+    /// (see [`Self::stop_idle_agents`]).
+    agents_idle_since: HashMap<ThreadId, Instant>,
+    /// When the next of them is due to stop.
+    agent_sweep_at: Option<Instant>,
     stopping: bool,
     /// Pass the stores' and threads' background results on to `inputs`.
     forwarders: JoinSet<()>,
@@ -186,6 +191,10 @@ pub(crate) struct Server {
 const LEAVE_GRACE: Duration = Duration::from_secs(3);
 /// The same, for one just made or found at start: the client opening it may be far away.
 const OPEN_GRACE: Duration = Duration::from_secs(60);
+/// How long a thread's agent keeps running with nothing to do and no client watching it
+/// (t3code's idle timeout). An archived thread's stops after [`LEAVE_GRACE`], which lets a view
+/// be rebuilt.
+const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 impl Server {
     pub(crate) fn new(
@@ -267,6 +276,8 @@ impl Server {
             registry_changed: false,
             changed_connections: HashSet::default(),
             draft_due: HashMap::default(),
+            agents_idle_since: HashMap::default(),
+            agent_sweep_at: None,
             draft_sweep_at: None,
             stopping: false,
             forwarders: JoinSet::new(),
@@ -658,36 +669,8 @@ impl Server {
                 Ok(Response::Ok)
             }
 
-            Request::Prompt { connection, prompt } => {
-                if let ConnectionId::Thread(thread_id) = connection
-                    && self
-                        .projects
-                        .thread(thread_id)
-                        .is_some_and(|thread| thread.task.is_some())
-                {
-                    return Err(anyhow!(
-                        "a subthread only takes its task; message its parent instead"
-                    ));
-                }
-                if prompt
-                    .iter()
-                    .all(|part| matches!(part, PromptPart::Text(_)))
-                {
-                    let text = prompt
-                        .into_iter()
-                        .map(|part| match part {
-                            PromptPart::Text(text) => text,
-                            _ => String::new(),
-                        })
-                        .collect();
-                    self.update_thread(connection, |thread| thread.send(text))?;
-                } else {
-                    // Starts the thread's agent first, as plain text does.
-                    self.update_thread(connection, |_| ())?;
-                    self.queue_prompt(connection, prompt)?;
-                }
-                Ok(Response::Ok)
-            }
+            Request::Prompt { connection, prompt } => self.prompt(connection, prompt, false),
+            Request::Steer { connection, prompt } => self.prompt(connection, prompt, true),
             Request::Cancel(connection) => {
                 self.update_thread(connection, |thread| thread.cancel())?;
                 Ok(Response::Ok)
@@ -1316,15 +1299,7 @@ impl Server {
     /// open for a moment. Typed text keeps it, as a draft in the sidebar.
     pub(super) fn sweep_drafts(&mut self) {
         let now = Instant::now();
-        let watched: HashSet<ThreadId> = self
-            .clients
-            .values()
-            .flat_map(|client| client.threads.keys())
-            .filter_map(|connection| match connection {
-                ConnectionId::Thread(thread_id) => Some(*thread_id),
-                ConnectionId::Account(_) => None,
-            })
-            .collect();
+        let watched = self.watched_threads();
         let left_empty: Vec<ThreadId> = self
             .projects
             .threads()
@@ -1362,6 +1337,100 @@ impl Server {
                 },
             );
         }
+    }
+
+    /// The threads some client has open.
+    fn watched_threads(&self) -> HashSet<ThreadId> {
+        self.clients
+            .values()
+            .flat_map(|client| client.threads.keys())
+            .filter_map(|connection| match connection {
+                ConnectionId::Thread(thread_id) => Some(*thread_id),
+                ConnectionId::Account(_) => None,
+            })
+            .collect()
+    }
+
+    /// Stops the agents of threads that have had nothing to do and no client watching them
+    /// for [`AGENT_IDLE_TIMEOUT`], or for a moment once archived, as t3code releases idle
+    /// provider sessions. Opening the thread again starts its agent and loads its session.
+    fn stop_idle_agents(&mut self) {
+        let now = Instant::now();
+        let watched = self.watched_threads();
+        let idle: Vec<ThreadId> = self
+            .threads
+            .keys()
+            .copied()
+            .filter(|thread_id| !watched.contains(thread_id) && !self.needs_agent(*thread_id))
+            .collect();
+        self.agents_idle_since
+            .retain(|thread_id, _| idle.contains(thread_id));
+        let mut stopping = Vec::new();
+        let mut next_due: Option<Instant> = None;
+        for thread_id in idle {
+            let is_archived = self
+                .projects
+                .thread(thread_id)
+                .is_some_and(|thread| thread.archived_at.is_some());
+            let timeout = if is_archived {
+                LEAVE_GRACE
+            } else {
+                AGENT_IDLE_TIMEOUT
+            };
+            let due = *self.agents_idle_since.entry(thread_id).or_insert(now) + timeout;
+            if due <= now {
+                stopping.push((thread_id, is_archived));
+            } else {
+                next_due = Some(next_due.map_or(due, |next| next.min(due)));
+            }
+        }
+        for (thread_id, is_archived) in stopping {
+            if is_archived {
+                log::info!("stopping the agent of archived thread {}", thread_id.0);
+            } else {
+                log::info!(
+                    "stopping the agent of thread {}, idle for {} minutes",
+                    thread_id.0,
+                    AGENT_IDLE_TIMEOUT.as_secs() / 60
+                );
+            }
+            self.agents_idle_since.remove(&thread_id);
+            self.threads.remove(&thread_id);
+        }
+        if let Some(due) = next_due
+            && self.agent_sweep_at.is_none_or(|scheduled| scheduled > due)
+        {
+            self.agent_sweep_at = Some(due);
+            self.spawn_then(
+                tokio::time::sleep(due.saturating_duration_since(now)),
+                |server, ()| {
+                    server.agent_sweep_at = None;
+                    server.stop_idle_agents();
+                },
+            );
+        }
+    }
+
+    /// Whether a thread's agent has something to do or to finish: a turn, a question or login
+    /// waiting on the user, messages to send, a task to report, a command in its terminal.
+    fn needs_agent(&self, thread_id: ThreadId) -> bool {
+        let Some(thread) = self.threads.get(&thread_id) else {
+            return false;
+        };
+        let is_unfinished_task = self
+            .projects
+            .thread(thread_id)
+            .and_then(|thread| thread.task.as_ref())
+            .is_some_and(|task| task.outcome.is_none());
+        self.is_busy(thread_id)
+            || *thread.status() == agentz_protocol::thread::ConnectionStatus::Connecting
+            || thread.is_paused()
+            || thread.state.authenticating.is_some()
+            || is_unfinished_task
+            || self.has_unannounced_tasks(thread_id)
+            || self.moving_threads.contains_key(&thread_id)
+            || self.has_waiting_prompt(thread_id)
+            || self.has_running_agent_terminal(thread_id)
     }
 
     /// The command that starts the agent, with the environment from its settings. Threads
@@ -1534,7 +1603,6 @@ impl Server {
     /// Sends subscribers what changed since the last call.
     fn send_changes(&mut self) {
         // Stop the agents of threads that were deleted, or removed along with their project.
-        // Archived threads keep running.
         let projects = &self.projects;
         self.threads
             .retain(|thread_id, _| projects.thread(*thread_id).is_some());
@@ -1549,6 +1617,8 @@ impl Server {
         self.send_waiting_prompts();
         self.announce_finished_tasks();
         self.send_follow_ups();
+        // After the waiting tool calls, which may have started an agent to read its thread.
+        self.stop_idle_agents();
         for (thread_id, thread) in &self.threads {
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());
