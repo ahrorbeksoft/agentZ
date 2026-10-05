@@ -388,6 +388,11 @@ t3code's checkpoints (`apps/server/src/checkpointing/`).
   `refs/agentz/checkpoints/<machine>/<thread>/<turn>`. Turn 0 when the first turn starts, turn N
   when it ends, through `agent_thread`'s turn hook. Never touches branches or the user's index.
   Folders outside git get none.
+- **Terminal agents' turns** (`terminal_requests.rs`): an agent CLI in a terminal thread is
+  checkpointed in the folder its shell is in, with turns read by agent detection: the baseline
+  once the agent is seen or starts working, then a turn each time working ends. The thread
+  counts as done only once that checkpoint is taken, so the diff panel reloads with it. One
+  queue takes them in order.
 - **Diff panel** (`diff_panel.rs`, Cmd-D): latest turn or all, files and hunks, Viewed (a file
   reopens when it changes). Revert puts files back, only for a thread alone in its worktree or
   pasture; ACP can't rewind a conversation, so only files go back.

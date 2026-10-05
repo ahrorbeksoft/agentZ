@@ -473,6 +473,11 @@ impl AgentTracker {
         self.agent
     }
 
+    /// The state last published.
+    pub(crate) fn state(&self) -> Option<AgentState> {
+        self.state
+    }
+
     pub(crate) fn next_tick(&self) -> Duration {
         if self.pending_idle.is_some() {
             TICK_PENDING_IDLE

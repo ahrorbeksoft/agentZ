@@ -3241,6 +3241,102 @@ async fn terminal_threads_show_their_agents_state() {
         .await;
 }
 
+/// An agent CLI in a terminal thread gets checkpoints as an ACP agent's turns do, with its
+/// turns read from the screen.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_agents_turns_are_checkpointed() {
+    if tokio::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let repository = server.project_dir.path();
+    git(repository, &["init", "-q", "-b", "main"]).await;
+    git(repository, &["config", "user.name", "Test"]).await;
+    git(repository, &["config", "user.email", "test@example.com"]).await;
+    std::fs::write(repository.join("README.md"), "one\n").expect("a file");
+    git(repository, &["add", "."]).await;
+    git(repository, &["commit", "-q", "-m", "first"]).await;
+    // Codex shows its state in the terminal's title; "write <file>" edits as a turn would.
+    let bin = tempfile::tempdir().expect("temp dir");
+    let codex = bin.path().join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\necho codex ready\nwhile read line; do case \"$line\" in \
+         write\\ *) echo hello > \"${line#write }\" ;; \
+         *) printf '\\033]0;%s\\007' \"$line\" ;; esac; done\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("permissions");
+
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(repository).await;
+    let thread_id = match client
+        .ok(Request::CreateTerminalThread {
+            project_id,
+            command: TerminalCommand {
+                command: Some(codex.display().to_string()),
+            },
+            workspace: Default::default(),
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => thread_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let key = TerminalKey::Thread(thread_id);
+    client.subscribe_terminal(key.clone()).await;
+    client.wait_for_screen(&key, "codex ready").await;
+    let is_working = move |client: &TestClient| {
+        client
+            .projects
+            .as_ref()
+            .is_some_and(|projects| projects.working_threads.contains(&thread_id))
+    };
+
+    // The baseline is taken once the agent is seen.
+    client
+        .wait_until(move |client| {
+            client.projects.as_ref().is_some_and(|projects| {
+                projects
+                    .terminal_agents
+                    .iter()
+                    .any(|(id, _)| *id == thread_id)
+            })
+        })
+        .await;
+    client.type_into(&key, "⠋ project\n").await;
+    client.wait_until(is_working).await;
+    client.type_into(&key, "write a.txt\n").await;
+    client.type_into(&key, "project\n").await;
+    // Done only once the turn's checkpoint is there.
+    client.wait_until(move |client| !is_working(client)).await;
+    let diff = client.thread_diff(thread_id, DiffScope::All).await;
+    assert_eq!((diff.status.clone(), diff.turns), (DiffStatus::Ready, 1));
+    assert_eq!(diff_files(&diff), vec![("a.txt", FileChange::Added, 1, 0)]);
+
+    client.type_into(&key, "⠙ project\n").await;
+    client.wait_until(is_working).await;
+    client.type_into(&key, "write README.md\n").await;
+    client.type_into(&key, "project\n").await;
+    client.wait_until(move |client| !is_working(client)).await;
+    let latest = client.thread_diff(thread_id, DiffScope::LatestTurn).await;
+    assert_eq!(latest.turns, 2);
+    assert_eq!(
+        diff_files(&latest),
+        vec![("README.md", FileChange::Modified, 1, 1)]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_run_commands_in_server_terminals() {
     let Some(server) = TestServer::start() else {

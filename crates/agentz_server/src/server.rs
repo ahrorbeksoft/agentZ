@@ -904,10 +904,12 @@ impl Server {
             .context("the client disconnected")
     }
 
-    /// The thread's checkpoints, in the folder it works in.
+    /// The thread's checkpoints, in the folder it works in: a terminal thread's are where its
+    /// shell is, as the agent CLIs it runs work there.
     fn checkpoints(&self, thread_id: ThreadId) -> Option<Checkpoints> {
         Some(Checkpoints::new(
-            self.projects.thread_folder(thread_id)?,
+            self.terminal_folder(thread_id)
+                .or_else(|| self.projects.thread_folder(thread_id))?,
             &self.machine.id,
             thread_id,
         ))

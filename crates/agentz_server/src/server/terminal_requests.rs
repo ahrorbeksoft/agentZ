@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
-use agent_thread::{AgentThread, TerminalRequest};
+use agent_thread::{AgentThread, TerminalRequest, TurnPoint};
 use agentz_protocol::spaces::SpaceFolder;
 use agentz_protocol::terminal::{TerminalExit, TerminalKey};
 use agentz_protocol::{ConnectionId, Event, Request, Response, ServerMessage};
 use alacritty_terminal::event::Event as AlacEvent;
 use anyhow::{Context as _, Result, anyhow};
+use futures::StreamExt as _;
+use futures::channel::mpsc;
 use projects::ThreadId;
 use util::ResultExt as _;
 use util::shell::Shell;
@@ -20,6 +22,7 @@ use util::shell_builder::ShellBuilder;
 
 use super::{ClientId, Input, Server, send_to};
 use crate::browser;
+use crate::checkpoints::Checkpoints;
 use crate::detect::process::ForegroundProcess;
 use crate::detect::{self, Agent, AgentState, AgentTracker, DetectionInput, ProcessObservation};
 use crate::terminal_programs;
@@ -70,6 +73,16 @@ pub(super) struct Terminals {
     frames_sent_at: Option<Instant>,
     tick_scheduled: bool,
     detection_scheduled: bool,
+    /// Takes terminal threads' checkpoints one after another, so a turn's end follows its
+    /// start. Started with the first.
+    checkpoint_queue: Option<mpsc::UnboundedSender<CheckpointJob>>,
+}
+
+/// A checkpoint of a terminal thread's folder, and what to do on the server once it's taken.
+struct CheckpointJob {
+    checkpoints: Checkpoints,
+    point: TurnPoint,
+    then: Option<Box<dyn FnOnce(&mut Server) + Send>>,
 }
 
 impl Server {
@@ -702,6 +715,9 @@ impl Server {
     /// A terminal thread's agent CLI, which makes it a thread rather than a shell, and its
     /// state as the thread's own: working, waiting for an answer as a permission request
     /// waits, or done once working ends.
+    ///
+    /// Its turns are checkpointed as an ACP thread's are, with the turns read from the screen:
+    /// the baseline once the agent starts (or starts working), then each turn as working ends.
     fn publish_terminal_agent(
         &mut self,
         thread_id: ThreadId,
@@ -713,13 +729,93 @@ impl Server {
                 .unwrap_or(agent.label())
                 .to_string()
         });
+        let started = name.is_some() && self.projects.terminal_agent(thread_id).is_none();
         self.projects.set_terminal_agent(thread_id, name);
-        self.projects.set_thread_working(
-            thread_id,
-            matches!(state, AgentState::Working | AgentState::Blocked),
-        );
         self.projects
             .set_thread_blocked(thread_id, state == AgentState::Blocked);
+        let working = matches!(state, AgentState::Working | AgentState::Blocked);
+        let was_working = self.projects.is_thread_working(thread_id);
+        if started || (working && !was_working) {
+            self.take_terminal_checkpoint(thread_id, TurnPoint::Starting, None);
+        }
+        if working {
+            self.projects.set_thread_working(thread_id, true);
+        } else if was_working {
+            // Done once the turn's checkpoint is there, since the changes panel reloads then.
+            self.take_terminal_checkpoint(
+                thread_id,
+                TurnPoint::Ended,
+                Some(Box::new(move |server: &mut Server| {
+                    if !server.is_terminal_agent_working(thread_id) {
+                        server.projects.set_thread_working(thread_id, false);
+                    }
+                })),
+            );
+        }
+    }
+
+    /// Whether a terminal thread's agent CLI is working, or waiting for an answer, now.
+    fn is_terminal_agent_working(&self, thread_id: ThreadId) -> bool {
+        self.terminals
+            .running
+            .get(&TerminalKey::Thread(thread_id))
+            .and_then(|running| running.tracker.as_ref()?.state())
+            .is_some_and(|state| matches!(state, AgentState::Working | AgentState::Blocked))
+    }
+
+    /// The folder a terminal thread's shell is in, as last seen.
+    pub(super) fn terminal_folder(&self, thread_id: ThreadId) -> Option<PathBuf> {
+        self.terminals
+            .running
+            .get(&TerminalKey::Thread(thread_id))
+            .and_then(|running| running.folder.clone())
+            .or_else(|| {
+                let folder = self.projects.terminal_folder(thread_id)?;
+                Some(folder.path.clone())
+            })
+    }
+
+    /// Queues a checkpoint of a terminal thread's folder, then runs `then` on the server. A
+    /// deleted thread gets none.
+    fn take_terminal_checkpoint(
+        &mut self,
+        thread_id: ThreadId,
+        point: TurnPoint,
+        then: Option<Box<dyn FnOnce(&mut Server) + Send>>,
+    ) {
+        let checkpoints = self
+            .projects
+            .thread(thread_id)
+            .and_then(|_| self.checkpoints(thread_id));
+        let Some(checkpoints) = checkpoints else {
+            if let Some(then) = then {
+                then(self);
+            }
+            return;
+        };
+        let queue = self.terminals.checkpoint_queue.get_or_insert_with(|| {
+            let (queue, mut jobs) = mpsc::unbounded::<CheckpointJob>();
+            let inputs = self.inputs.clone();
+            self.runtime.spawn(async move {
+                while let Some(job) = jobs.next().await {
+                    job.checkpoints.on_turn(job.point).await;
+                    if let Some(then) = job.then {
+                        inputs.unbounded_send(Input::Run(then)).ok();
+                    }
+                }
+            });
+            queue
+        });
+        let job = CheckpointJob {
+            checkpoints,
+            point,
+            then,
+        };
+        if let Err(error) = queue.unbounded_send(job)
+            && let Some(then) = error.into_inner().then
+        {
+            then(self);
+        }
     }
 
     /// Looks up the branch of the folder a terminal thread is in, and shows the folder with it
