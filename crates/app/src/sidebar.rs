@@ -22,7 +22,7 @@ use crate::project_info::{
     GitHead, ProjectInfo, ProjectInfoStore, render_project_icon, workspace_icon,
 };
 use crate::project_switcher::compact_path;
-use crate::{NewThread, OpenFolder, OpenSettings};
+use crate::{NewThread, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -1691,19 +1691,14 @@ impl Sidebar {
         .detach();
     }
 
+    /// Only says so: the main area's Welcome page has Open Folder….
     fn render_empty_state(&self) -> impl IntoElement {
         v_flex()
             .flex_1()
             .items_center()
             .justify_center()
-            .gap_2()
             .p_4()
             .child(Label::new("No projects yet").color(Color::Muted))
-            .child(
-                Button::new("empty-open-folder", "Open Folder…")
-                    .style(ButtonStyle::Outlined)
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx)),
-            )
     }
 
     /// t3code's search result row: the project's icon, the title, and the time, highlighted

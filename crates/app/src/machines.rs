@@ -178,6 +178,8 @@ impl ProjectGroup {
 pub enum MachinesEvent {
     /// A thread finished a turn or started waiting for a permission answer.
     NeedsAttention(ThreadKey, ThreadStatus),
+    /// The user archived the thread from this app.
+    Archiving(ThreadKey),
 }
 
 pub struct Machines {
@@ -452,6 +454,12 @@ impl Machines {
                             },
                             *status,
                         ))
+                    }
+                    ProjectStoreEvent::Archiving(thread) => {
+                        cx.emit(MachinesEvent::Archiving(ThreadKey {
+                            machine,
+                            thread: *thread,
+                        }))
                     }
                 }),
             ],

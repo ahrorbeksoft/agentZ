@@ -34,6 +34,7 @@ mod terminal_mouse;
 mod terminal_thread_view;
 mod terminal_view;
 mod thread_entity;
+mod welcome;
 mod worktree_modal;
 
 use std::sync::Arc;

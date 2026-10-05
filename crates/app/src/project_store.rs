@@ -40,6 +40,8 @@ pub enum ThreadStatus {
 pub enum ProjectStoreEvent {
     /// The thread finished a turn, or started waiting for a permission answer or input.
     NeedsAttention(ThreadId, ThreadStatus),
+    /// The user archived the thread from this app, rather than an agent or another app.
+    Archiving(ThreadId),
 }
 
 pub struct ProjectStore {
@@ -86,6 +88,11 @@ impl ProjectStore {
 
     pub fn machine(&self) -> MachineId {
         self.machine
+    }
+
+    /// Whether the server's projects and threads have arrived, so an empty list means none.
+    pub fn has_snapshot(&self) -> bool {
+        self.has_snapshot
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: ProjectsSnapshot, cx: &mut Context<Self>) {
@@ -533,7 +540,8 @@ impl ProjectStore {
     }
 
     pub fn archive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
-        self.send(Request::ArchiveThread(id), cx)
+        self.send(Request::ArchiveThread(id), cx);
+        cx.emit(ProjectStoreEvent::Archiving(id));
     }
 
     pub fn unarchive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
@@ -621,8 +629,9 @@ mod tests {
         cx.update(|cx| {
             let attention = attention.clone();
             cx.subscribe(&project_store, move |_, event: &ProjectStoreEvent, _| {
-                let ProjectStoreEvent::NeedsAttention(id, status) = event;
-                attention.borrow_mut().push((*id, *status));
+                if let ProjectStoreEvent::NeedsAttention(id, status) = event {
+                    attention.borrow_mut().push((*id, *status));
+                }
             })
             .detach();
         });

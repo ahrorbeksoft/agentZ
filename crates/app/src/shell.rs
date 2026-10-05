@@ -35,6 +35,7 @@ use crate::sidebar::{AWAITING_INPUT_COLOR, SIDEBAR_WIDTH, Sidebar, SidebarEvent}
 use crate::spaces_view::{PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
+use crate::welcome::{Section, SectionButton, render_welcome};
 use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
     GoTo, NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleCommandPalette, ToggleDiff,
@@ -57,6 +58,15 @@ const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 enum MainView {
     Agents,
     Workspaces,
+}
+
+/// The project a draft opens in when the Agents view has no thread to show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DraftLanding {
+    /// That of the sidebar's first thread.
+    Latest,
+    /// This one while it's there, or else as `Latest`.
+    In(ProjectKey),
 }
 
 /// An open thread. Kept while the app runs so its agent keeps working in the background.
@@ -151,6 +161,11 @@ pub struct Shell {
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
     open_threads: HashMap<ThreadKey, OpenThread>,
     active_thread: Option<ThreadKey>,
+    /// The active thread's project, kept for after the thread is deleted.
+    active_project: Option<ProjectKey>,
+    /// A draft to open once the Agents view has no thread to show and one can start, as
+    /// t3code's index route drops into one: at launch, and after the open thread is deleted.
+    pending_draft: Option<DraftLanding>,
     /// Whether the active thread's changes show beside it. Stays on across threads.
     show_diff: bool,
     /// The active thread's changes while shown. Only one, so hidden threads don't reload theirs.
@@ -253,7 +268,28 @@ impl Shell {
                 if closed_active_thread {
                     window.focus(&this.focus_handle, cx);
                     this.sync_diff_panel(cx);
+                    // As t3code after deleting the open thread: the project's next thread, or
+                    // else a draft there. After the sidebar is told above.
+                    let project = this.active_project.take();
+                    let next = project.and_then(|project| this.latest_thread_in(project, cx));
+                    cx.defer_in(window, move |this, window, cx| {
+                        if this.active_thread.is_some() {
+                            return;
+                        }
+                        match next.filter(|_| this.shows_agents()) {
+                            Some(next) => this.open_thread(next, window, cx),
+                            None => {
+                                this.pending_draft =
+                                    Some(project.map_or(DraftLanding::Latest, DraftLanding::In));
+                                this.open_pending_draft(window, cx);
+                            }
+                        }
+                    });
+                } else if let Some(thread) = this.active_thread {
+                    // A terminal thread belongs to where its shell is now.
+                    this.active_project = this.project_of(thread, cx);
                 }
+                this.open_pending_draft(window, cx);
                 this.mark_active_thread_viewed(window, cx);
                 cx.notify();
             }),
@@ -263,6 +299,9 @@ impl Shell {
                 |this, _, event, window, cx| match event {
                     MachinesEvent::NeedsAttention(thread, status) => {
                         this.notify_attention(*thread, *status, window, cx)
+                    }
+                    MachinesEvent::Archiving(thread) => {
+                        this.open_draft_after_archiving(*thread, window, cx)
                     }
                 },
             ),
@@ -316,6 +355,8 @@ impl Shell {
             settings_page: None,
             open_threads: HashMap::default(),
             active_thread: None,
+            active_project: None,
+            pending_draft: Some(DraftLanding::Latest),
             show_diff: false,
             diff_panel: None,
             _diff_panel_events: None,
@@ -361,6 +402,62 @@ impl Shell {
             .read(cx)
             .thread(key.thread)
             .cloned()
+    }
+
+    /// The project the sidebar lists a thread under.
+    fn project_of(&self, key: ThreadKey, cx: &App) -> Option<ProjectKey> {
+        let thread = self.thread(key, cx)?;
+        let project = self
+            .machines
+            .read(cx)
+            .thread_project(key.machine, &thread, cx)?;
+        Some(ProjectKey {
+            machine: key.machine,
+            project,
+        })
+    }
+
+    /// The project's first thread in the sidebar, which t3code opens after deleting the open
+    /// thread.
+    fn latest_thread_in(&self, project: ProjectKey, cx: &App) -> Option<ThreadKey> {
+        let machines = self.machines.read(cx);
+        let group = machines.group_of(project.machine, project.project, cx)?;
+        machines
+            .active_threads(cx)
+            .into_iter()
+            .find_map(|(machine, thread)| {
+                let project = machines.thread_project(machine, &thread, cx)?;
+                group.contains(machine, project).then_some(ThreadKey {
+                    machine,
+                    thread: thread.id,
+                })
+            })
+    }
+
+    /// The project of the sidebar's first thread, as t3code lands in its most recently active
+    /// project, or else the first project shown.
+    fn latest_project(&self, cx: &App) -> Option<ProjectKey> {
+        let machines = self.machines.read(cx);
+        machines
+            .active_threads(cx)
+            .into_iter()
+            .find_map(|(machine, thread)| {
+                let project = machines.thread_project(machine, &thread, cx)?;
+                machines
+                    .is_online(machine, cx)
+                    .then_some(ProjectKey { machine, project })
+            })
+            .or_else(|| {
+                machines
+                    .visible_groups(cx)
+                    .iter()
+                    .find_map(|group| machines.new_thread_member(group, cx))
+            })
+    }
+
+    /// Whether the Agents view's thread area is on screen, rather than Workspaces or Settings.
+    fn shows_agents(&self) -> bool {
+        self.view == MainView::Agents && self.settings_page.is_none()
     }
 
     /// A draft in the shown project, as t3code's New Thread opens one; with several shown, the
@@ -446,6 +543,64 @@ impl Shell {
             store.create_thread(project.project, agent_id, choice, cx)
         });
         self.show_draft_when_made(project.machine, created, None, window, cx);
+    }
+
+    /// Opens the pending draft once the Agents view shows no thread and one can start: the
+    /// session has arrived, there's a project, and its machine has an agent. Until then it
+    /// waits, so the first project, or the first agent installed, opens it.
+    fn open_pending_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(landing) = self.pending_draft else {
+            return;
+        };
+        if !self.shows_agents() || self.active_thread.is_some() || self._starting_draft.is_some() {
+            return;
+        }
+        if !Machines::local(cx)
+            .read(cx)
+            .projects()
+            .read(cx)
+            .has_snapshot()
+        {
+            return;
+        }
+        let machines = self.machines.read(cx);
+        let project = match landing {
+            DraftLanding::In(project)
+                if machines.is_online(project.machine, cx)
+                    && machines
+                        .projects(project.machine, cx)
+                        .is_some_and(|store| store.read(cx).project(project.project).is_some()) =>
+            {
+                Some(project)
+            }
+            _ => self.latest_project(cx),
+        };
+        let Some(project) =
+            project.filter(|project| self.default_agent(project.machine, cx).is_some())
+        else {
+            return;
+        };
+        self.pending_draft = None;
+        self.start_draft(project, None, window, cx);
+    }
+
+    /// Archiving the open thread here opens a draft in its project, as t3code's does. The
+    /// thread stays on screen, read-only, until the draft is ready, and without an agent.
+    fn open_draft_after_archiving(
+        &mut self,
+        thread: ThreadKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_thread != Some(thread) || !self.shows_agents() {
+            return;
+        }
+        if let Some(project) = self
+            .project_of(thread, cx)
+            .filter(|project| self.default_agent(project.machine, cx).is_some())
+        {
+            self.start_draft(project, None, window, cx);
+        }
     }
 
     /// New Thread… in a pane: a draft of a Workspaces thread working in `folder`, shown in the
@@ -694,6 +849,7 @@ impl Shell {
         self.focus_main(window, cx);
         self.mark_active_thread_viewed(window, cx);
         self.sync_diff_panel(cx);
+        self.open_pending_draft(window, cx);
     }
 
     fn open_machine_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -728,6 +884,8 @@ impl Shell {
             self.open_threads.remove(&previous);
         }
         self.active_thread = Some(thread_id);
+        self.active_project = self.project_of(thread_id, cx);
+        self.pending_draft = None;
         // A subthread isn't in the sidebar, so its top-level thread is highlighted.
         let sidebar_thread = ThreadKey {
             machine: thread_id.machine,
@@ -1116,6 +1274,7 @@ impl Shell {
         self.focus_main(window, cx);
         self.mark_active_thread_viewed(window, cx);
         self.sync_diff_panel(cx);
+        self.open_pending_draft(window, cx);
     }
 
     /// With other machines, asks which machine the project is on first.
@@ -1528,6 +1687,62 @@ impl Shell {
         }
         icons
     }
+
+    /// The Agents view with no thread open. Before the first project, Zed's Welcome page.
+    /// Otherwise a draft is opening, as t3code's index route opens one, so nothing shows
+    /// meanwhile; with no agent to start it in, what to do.
+    fn render_no_thread(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_session = Machines::local(cx)
+            .read(cx)
+            .projects()
+            .read(cx)
+            .has_snapshot();
+        if !has_session || self._starting_draft.is_some() {
+            return div().into_any_element();
+        }
+        if self.machines.read(cx).project_groups(cx).is_empty() {
+            return self.render_welcome(cx).into_any_element();
+        }
+        render_no_thread_selected().into_any_element()
+    }
+
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = &self.focus_handle;
+        let has_agent = self
+            .machines
+            .read(cx)
+            .clients()
+            .iter()
+            .any(|client| self.default_agent(client.read(cx).machine(), cx).is_some());
+        let get_started = Section::new("Get Started")
+            .button(SectionButton::for_action(
+                "Open Folder…",
+                IconName::FolderOpen,
+                &OpenFolder,
+                focus,
+                cx,
+            ))
+            .when(!has_agent, |section| {
+                section.button(SectionButton::new(
+                    "Install an Agent…",
+                    IconName::Sparkle,
+                    cx.listener(|this, _, window, cx| this.open_agent_settings(window, cx)),
+                ))
+            })
+            .button(SectionButton::new(
+                "Add Machine…",
+                IconName::Server,
+                cx.listener(|this, _, window, cx| this.open_machine_modal(None, window, cx)),
+            ))
+            .button(SectionButton::for_action(
+                "Settings",
+                IconName::Settings,
+                &OpenSettings,
+                focus,
+                cx,
+            ));
+        render_welcome("agents-welcome", "Welcome to agentZ", [get_started])
+    }
 }
 
 impl Focusable for Shell {
@@ -1578,6 +1793,8 @@ impl Render for Shell {
             .and_then(|thread_id| self.open_threads.get(&thread_id))
             .map(|open_thread| open_thread.view.clone());
         let shows_workspaces = self.view == MainView::Workspaces && settings_page.is_none();
+        let no_thread = (!shows_workspaces && settings_page.is_none() && active_view.is_none())
+            .then(|| self.render_no_thread(cx));
 
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -1638,7 +1855,7 @@ impl Render for Shell {
                                     .map(|main| match (settings_page, active_view) {
                                         (Some(page), _) => main.child(page),
                                         (None, Some(view)) => main.child(view.into_any_element()),
-                                        (None, None) => main.child(render_no_thread_selected()),
+                                        (None, None) => main.children(no_thread),
                                     }),
                             )
                         })
@@ -2265,5 +2482,264 @@ mod modal_tests {
         cx.simulate_keystrokes("cmd-d");
         assert_eq!(dispatched.borrow().last(), Some(&"agentz::ToggleDiff"));
         assert!(shell.read_with(cx, |shell, _| shell.show_diff));
+    }
+
+    fn demo_project(id: u64, path: &str) -> Project {
+        Project {
+            id: ProjectId(id),
+            path: path.into(),
+            custom_name: None,
+            icon: None,
+            workspaces: Vec::new(),
+            repository: None,
+        }
+    }
+
+    fn demo_thread(id: u64, project: u64, active_at: u64, is_draft: bool) -> projects::Thread {
+        let time = serde_json::json!({ "secs_since_epoch": active_at, "nanos_since_epoch": 0 });
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "project_id": project,
+            "title": format!("Thread {id}"),
+            "agent_id": "mock",
+            "created_at": time,
+            "last_activity_at": time,
+            "is_draft": is_draft,
+        }))
+        .expect("a thread")
+    }
+
+    /// demo (1) and api (2), with api's thread 6 the latest; demo has 5, then 7. The drafts
+    /// a new thread is answered with: 8 in demo, 9 in api.
+    fn demo_snapshot(without: &[u64], archived: &[u64]) -> ProjectsSnapshot {
+        let threads = [(5, 1, 100), (6, 2, 200), (7, 1, 50)]
+            .into_iter()
+            .filter(|(id, _, _)| !without.contains(id))
+            .map(|(id, project, active_at)| {
+                let mut thread = demo_thread(id, project, active_at, false);
+                if archived.contains(&id) {
+                    thread.archived_at = thread.last_activity_at;
+                }
+                thread
+            })
+            .chain([demo_thread(8, 1, 0, true), demo_thread(9, 2, 0, true)])
+            .collect();
+        ProjectsSnapshot {
+            projects: vec![demo_project(1, "/tmp/demo"), demo_project(2, "/tmp/api")],
+            threads,
+            ..Default::default()
+        }
+    }
+
+    fn install_mock_agent(cx: &mut App) {
+        use agentz_protocol::agents::{AgentListing, RegistryAgentMetadata, RegistrySnapshot};
+
+        let registry = Machines::local(cx).read(cx).registry().clone();
+        registry.update(cx, |registry, cx| {
+            registry.set_snapshot(
+                RegistrySnapshot {
+                    agents: vec![AgentListing {
+                        metadata: RegistryAgentMetadata {
+                            id: AgentId::new("mock".to_string()),
+                            name: "Mock".into(),
+                            description: "Mock, for tests".into(),
+                            version: "1.0.0".into(),
+                            repository: None,
+                            website: None,
+                            license_url: None,
+                            icon: None,
+                        },
+                        supports_current_platform: true,
+                        install_state: InstallState::Installed {
+                            version: "1.0.0".into(),
+                            update_available: false,
+                        },
+                        custom_command: None,
+                    }],
+                    is_fetching: false,
+                    fetch_error: None,
+                },
+                cx,
+            )
+        });
+    }
+
+    /// This Mac, online, whose session hasn't arrived yet. A new thread in project `n` is
+    /// answered with draft `7 + n`; the projects asked for are returned.
+    fn init_for_drafts(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<crate::project_store::ProjectStore>,
+        Rc<RefCell<Vec<ProjectId>>>,
+    ) {
+        let created = Rc::new(RefCell::new(Vec::new()));
+        let store = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let created = created.clone();
+            client.update(cx, |client, cx| {
+                client.set_online_for_test(cx);
+                client.answer_for_test(move |request| match request {
+                    agentz_protocol::Request::CreateThread { project_id, .. } => {
+                        created.borrow_mut().push(*project_id);
+                        Some(agentz_protocol::Response::ThreadCreated(ThreadId(
+                            7 + project_id.0,
+                        )))
+                    }
+                    _ => None,
+                });
+            });
+            let store = client.read(cx).projects().clone();
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+            store
+        });
+        (store, created)
+    }
+
+    fn active_thread(shell: &Entity<Shell>, cx: &mut gpui::VisualTestContext) -> Option<u64> {
+        shell.read_with(cx, |shell, _| {
+            shell.active_thread.map(|thread| thread.thread.0)
+        })
+    }
+
+    fn local_thread(id: u64) -> ThreadKey {
+        ThreadKey {
+            machine: MachineId::Local,
+            thread: ThreadId(id),
+        }
+    }
+
+    #[gpui::test]
+    fn launch_opens_a_draft_in_the_latest_threads_project(cx: &mut TestAppContext) {
+        let (store, created) = init_for_drafts(cx);
+        cx.update(install_mock_agent);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        cx.run_until_parked();
+        // Nothing until the session says what there is.
+        assert!(created.borrow().is_empty());
+        assert!(cx.debug_bounds("welcome-Open Folder…").is_none());
+
+        store.update(cx, |store, cx| {
+            store.set_snapshot(demo_snapshot(&[], &[]), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(*created.borrow(), [ProjectId(2)]);
+        assert_eq!(active_thread(&shell, cx), Some(9));
+    }
+
+    #[gpui::test]
+    fn archiving_the_open_thread_here_opens_a_draft_in_its_project(cx: &mut TestAppContext) {
+        let (store, created) = init_for_drafts(cx);
+        cx.update(install_mock_agent);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        store.update(cx, |store, cx| {
+            store.set_snapshot(demo_snapshot(&[], &[]), cx)
+        });
+        cx.run_until_parked();
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_thread(local_thread(5), window, cx)
+        });
+
+        store.update(cx, |store, cx| store.archive_thread(ThreadId(5), cx));
+        cx.run_until_parked();
+        assert_eq!(*created.borrow(), [ProjectId(2), ProjectId(1)]);
+        assert_eq!(active_thread(&shell, cx), Some(8));
+
+        // Archived by an agent or another app, it stays on screen, read-only.
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_thread(local_thread(6), window, cx)
+        });
+        store.update(cx, |store, cx| {
+            store.set_snapshot(demo_snapshot(&[], &[5, 6]), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(active_thread(&shell, cx), Some(6));
+        assert_eq!(created.borrow().len(), 2);
+    }
+
+    #[gpui::test]
+    fn deleting_the_open_thread_opens_the_next_in_its_project(cx: &mut TestAppContext) {
+        let (store, created) = init_for_drafts(cx);
+        cx.update(install_mock_agent);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        store.update(cx, |store, cx| {
+            store.set_snapshot(demo_snapshot(&[], &[]), cx)
+        });
+        cx.run_until_parked();
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_thread(local_thread(5), window, cx)
+        });
+
+        // api's thread is newer, but 7 is demo's.
+        store.update(cx, |store, cx| {
+            store.set_snapshot(demo_snapshot(&[5], &[]), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(active_thread(&shell, cx), Some(7));
+        assert_eq!(created.borrow().len(), 1);
+
+        // With none left there, a draft in it.
+        store.update(cx, |store, cx| {
+            store.set_snapshot(demo_snapshot(&[5, 7], &[]), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(*created.borrow(), [ProjectId(2), ProjectId(1)]);
+        assert_eq!(active_thread(&shell, cx), Some(8));
+    }
+
+    #[gpui::test]
+    fn the_welcome_page_shows_until_the_first_project(cx: &mut TestAppContext) {
+        let (store, created) = init_for_drafts(cx);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        store.update(cx, |store, cx| {
+            store.set_snapshot(ProjectsSnapshot::default(), cx)
+        });
+        cx.run_until_parked();
+        let open_folder = cx
+            .debug_bounds("welcome-Open Folder…")
+            .expect("Open Folder is listed");
+        let install = cx
+            .debug_bounds("welcome-Install an Agent…")
+            .expect("installing an agent is listed");
+        let add_machine = cx
+            .debug_bounds("welcome-Add Machine…")
+            .expect("Add Machine is listed");
+        let settings = cx
+            .debug_bounds("welcome-Settings")
+            .expect("Settings is listed");
+        assert!(open_folder.top() < install.top());
+        assert!(install.top() < add_machine.top());
+        assert!(add_machine.top() < settings.top());
+
+        cx.simulate_click(install.center(), gpui::Modifiers::none());
+        assert!(shell.read_with(cx, |shell, _| shell.settings_page.is_some()));
+        shell.update_in(cx, |shell, window, cx| shell.close_settings(window, cx));
+        cx.update(|_, cx| install_mock_agent(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("welcome-Install an Agent…").is_none());
+        assert!(cx.debug_bounds("welcome-Open Folder…").is_some());
+
+        // The first project opens a draft in it.
+        store.update(cx, |store, cx| {
+            store.set_snapshot(
+                ProjectsSnapshot {
+                    projects: vec![demo_project(1, "/tmp/demo")],
+                    threads: vec![demo_thread(8, 1, 0, true)],
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("welcome-Open Folder…").is_none());
+        assert_eq!(*created.borrow(), [ProjectId(1)]);
+        assert_eq!(active_thread(&shell, cx), Some(8));
     }
 }

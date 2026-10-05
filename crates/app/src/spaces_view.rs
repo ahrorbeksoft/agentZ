@@ -32,7 +32,6 @@ use ui::{
     TabPosition, Tooltip, WithScrollbar as _, prelude::*, right_click_menu,
 };
 
-use crate::OpenSettings;
 use crate::agent_icons::agent_icon;
 use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
 use crate::app_settings::AppSettingsStore;
@@ -54,7 +53,9 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::{self, Terminal};
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
+use crate::welcome::{Section, SectionButton, render_welcome};
 use crate::worktree_modal::WorktreeModalMode;
+use crate::{GoTo, OpenSettings, ShowShortcuts, ToggleCommandPalette};
 use agentz_protocol::workspace::WorkspaceRemoval;
 
 pub(crate) const KEY_CONTEXT: &str = "Workspaces";
@@ -2116,20 +2117,35 @@ impl SpacesView {
                             .py_1()
                             .gap_0p5()
                             .children(rows)
+                            // As the Agents view's "No projects yet", with the button Zed's
+                            // threads sidebar has.
                             .when(!has_spaces, |list| {
                                 list.child(
-                                    div().px_3().py_2().child(
-                                        Label::new("No workspaces yet")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    ),
+                                    v_flex()
+                                        .debug_selector(|| "no-workspaces".into())
+                                        .flex_1()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_2()
+                                        .p_4()
+                                        .child(Label::new("No workspaces yet").color(Color::Muted))
+                                        .child(
+                                            Button::new("empty-new-workspace", "New Workspace…")
+                                                .style(ButtonStyle::Outlined)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.new_space_handle.show(window, cx)
+                                                })),
+                                        ),
                                 )
                             }),
                     )
                     .vertical_scrollbar_for(&self.sidebar_scroll, window, cx),
             )
             .children(raised_rows)
-            .child(self.render_agents(has_remotes, window, cx))
+            // Agents run in workspaces' panes, so with none it would only say there are none.
+            .when(has_spaces, |sidebar| {
+                sidebar.child(self.render_agents(has_remotes, window, cx))
+            })
             .child(render_footer_item(
                 "workspaces-open-settings",
                 IconName::Settings,
@@ -3205,6 +3221,7 @@ impl SpacesView {
         let rule_color = cx.theme().colors().border_variant;
 
         v_flex()
+            .debug_selector(|| "workspace-agents".into())
             .flex_none()
             .pt_1()
             .child(
@@ -3720,26 +3737,45 @@ impl SpacesView {
             )
     }
 
-    /// Zed's empty pane: what's missing, and the shortcut that makes one.
+    /// Zed's Welcome page Get Started, for this view: the keys that open a workspace or go to
+    /// one.
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .child(Label::new("No workspaces").color(Color::Muted))
-            .child(
-                Button::new("start-workspace", "New Workspace")
-                    .label_size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .key_binding(
-                        ui::KeyBinding::for_action_in(&NewWorkspace, &self.focus_handle, cx)
-                            .size(rems_from_px(12_f32)),
-                    )
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.new_space_handle.show(window, cx)),
-                    ),
+        let focus = &self.focus_handle;
+        let get_started = Section::new("Get Started")
+            .button(
+                SectionButton::new(
+                    "New Workspace…",
+                    IconName::Plus,
+                    cx.listener(|this, _, window, cx| this.new_space_handle.show(window, cx)),
+                )
+                .key_binding(ui::KeyBinding::for_action_in(
+                    &NewWorkspace,
+                    focus,
+                    cx,
+                )),
             )
+            .button(SectionButton::for_action(
+                "Go To…",
+                IconName::MagnifyingGlass,
+                &GoTo,
+                focus,
+                cx,
+            ))
+            .button(SectionButton::for_action(
+                "Command Palette",
+                IconName::Command,
+                &ToggleCommandPalette,
+                focus,
+                cx,
+            ))
+            .button(SectionButton::for_action(
+                "Shortcuts",
+                IconName::Keyboard,
+                &ShowShortcuts,
+                focus,
+                cx,
+            ));
+        render_welcome("workspaces-welcome", "No workspaces", [get_started])
     }
 
     /// The tabs in the order the bar shows them: while one is dragged, or after it's dropped
@@ -5529,6 +5565,8 @@ mod tests {
         assert_eq!(left.top(), top.top());
         assert_eq!(left.bottom(), bottom.bottom());
 
+        assert!(bounds(cx, "welcome-New Workspace…").is_none());
+        assert!(bounds(cx, "no-workspaces").is_none());
         // The agent in the bottom pane is listed, and clicking it focuses its pane.
         let row = bounds(cx, "agent-row-0").expect("the agent is listed");
         assert!(bounds(cx, "agent-row-1").is_none());
@@ -5559,6 +5597,44 @@ mod tests {
         cx.run_until_parked();
         let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
         assert_eq!(focused.map(|pane| pane.pane), Some(PaneId(3)));
+    }
+
+    #[gpui::test]
+    fn with_no_workspaces_the_view_lists_the_keys_to_get_going(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        cx.run_until_parked();
+
+        let new_workspace = cx
+            .debug_bounds("welcome-New Workspace…")
+            .expect("New Workspace is listed");
+        let go_to = cx.debug_bounds("welcome-Go To…").expect("Go To is listed");
+        let palette = cx
+            .debug_bounds("welcome-Command Palette")
+            .expect("the command palette is listed");
+        let shortcuts = cx
+            .debug_bounds("welcome-Shortcuts")
+            .expect("the shortcuts are listed");
+        assert!(new_workspace.top() < go_to.top());
+        assert!(go_to.top() < palette.top());
+        assert!(palette.top() < shortcuts.top());
+        // The sidebar says so once, over its own button, and has no Agents section.
+        assert!(cx.debug_bounds("no-workspaces").is_some());
+        assert!(cx.debug_bounds("workspace-agents").is_none());
+
+        cx.simulate_click(new_workspace.center(), gpui::Modifiers::none());
+        assert!(view.read_with(cx, |view, _| view.new_space_handle.is_deployed()));
     }
 
     #[test]

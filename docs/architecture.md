@@ -293,6 +293,20 @@ Each entry: what it does, where it lives, and where it comes from.
   text stays, as a draft row in the sidebar. The first message makes it a thread
   (`ThreadEvent::FirstPrompt`). A continuation is a draft too: a message queued for a login
   keeps it, and dropping the context makes it an ordinary draft.
+- **No thread open** (`Shell::open_pending_draft`, `Shell::open_draft_after_archiving`,
+  `Shell::render_no_thread`; t3code's index route, picked in `design/empty-states/`): the
+  Agents view drops into a draft rather than stay empty. At launch, once this Mac's session
+  arrives, it's in the project of the sidebar's first thread (else the first project shown).
+  Archiving the open thread from this app (`ProjectStoreEvent::Archiving`) opens one in its
+  project; an agent or another app archiving it leaves it on screen, read-only. Deleting it
+  opens the project's first thread in the sidebar, or else a draft there. A draft waits while
+  Settings or Workspaces is shown, and for an agent to be installed; until then the main area
+  says "Select a thread, or start a new one".
+- **Welcome** (`welcome.rs`, `Shell::render_welcome`; Zed's Welcome page, picked in
+  `design/empty-states/`): before the first project, the Agents view shows "Welcome to agentZ"
+  and Get Started: Open Folder…, Install an Agent… (Settings › Agents, until an agent is
+  installed on a machine), Add Machine… and Settings, with their keys. The sidebar only says
+  "No projects yet". The first project opens a draft in it.
 - **Agent registry** (`registry`, `registry_store.rs`): install, update, uninstall from the ACP
   Registry, binary archives or npm. An npm agent installs the registry's exact version, and
   Zed's range (`0.0.0 - <version>`) only when npm refuses it, as under a min-release-age
@@ -656,6 +670,11 @@ since a thread's workspace is its checkout.
   workspace open is marked Open, and Enter goes there; Cmd-Enter opens another.
 - **Needs you**: while an agent in a pane waits for an approval or an answer, a tinted strip
   above the workspaces lists each, with Go to focus its pane.
+- **No workspaces** (`SpacesView::render_empty_state`, `welcome.rs`; Zed's Welcome page, picked
+  in `design/empty-states/`): the main area says "No workspaces" over Get Started: New
+  Workspace… (the picker), Go To…, Command Palette and Shortcuts, with their keys. The sidebar's
+  list says "No workspaces yet" over a New Workspace… button, and the Agents section is left
+  out.
 - **Worktree groups** (herdr's `workspace_entries`): a workspace in a linked worktree of a
   repository (`SpaceGit::{checkout, main_checkout}`), or in a project's pasture, sits under the
   workspace on that repository's main checkout, however it was opened, with tree lines and its

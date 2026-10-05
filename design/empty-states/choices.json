@@ -1,0 +1,37 @@
+{
+  "topics": {
+    "no-thread": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "no-projects": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "no-workspace": {
+      "pick": "E",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "sidebar-empty": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-05T14:19:14.695Z"
+}
