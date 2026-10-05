@@ -256,3 +256,27 @@ pub fn is_sidebar_hidden(cx: &App) -> bool {
         .settings()
         .is_sidebar_hidden
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+    use theme::ThemeRegistry;
+
+    /// A bundled theme that doesn't parse is only logged, and left out of the list.
+    #[gpui::test]
+    fn bundled_themes_load(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let registry = ThemeRegistry::global(cx);
+            for name in [
+                "One Dark",
+                "One Light",
+                "Ayu Dark",
+                "Gruvbox Dark",
+                "JetBrains Dark",
+            ] {
+                assert!(registry.get(name).is_ok(), "{name} isn't loaded");
+            }
+        });
+    }
+}
