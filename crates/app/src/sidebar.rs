@@ -495,7 +495,7 @@ impl Sidebar {
     }
 
     /// Rename, Archive or Unarchive, the pasture's actions, Project Settings, and Delete, each
-    /// with its icon. A Workspaces thread's has Rename, Move to Agents and Delete.
+    /// with its icon. A Workspaces thread's has Rename, Move to Threads and Delete.
     fn thread_menu(
         &self,
         machine: MachineId,
@@ -609,7 +609,7 @@ impl Sidebar {
                     let sidebar = sidebar.clone();
                     return menu
                         .item(
-                            ContextMenuEntry::new("Move to Agents")
+                            ContextMenuEntry::new("Move to Threads")
                                 .icon(IconName::ArrowRight)
                                 .icon_color(Color::Muted)
                                 .handler(move |window, cx| {
@@ -717,7 +717,7 @@ impl Sidebar {
             window.prompt(
                 PromptLevel::Info,
                 &format!("Add “{}” as a project?", compact_path(&folder)),
-                Some("Threads in the Agents list belong to a project."),
+                Some("Threads in the threads list belong to a project."),
                 &["Add Project", "Cancel"],
                 cx,
             )

@@ -155,7 +155,7 @@ Each entry: what it does, where it lives, and where it comes from.
   first with its count and remembered by this Mac's server
   (`Request::ToggleWorkspacesExpanded`). Under a project, those whose folder is in it. They get
   no card, mark or waiting count in the Agents view; their panes show what they do. The row
-  menu is Rename, Move to Agents and Delete…: Move to Agents (`Request::MoveToAgents`) makes it
+  menu is Rename, Move to Threads and Delete…: Move to Threads (`Request::MoveToAgents`) makes it
   a thread of the project its folder is in, still working there, and outside every project
   first asks "Add “~/docs” as a project?". Search finds them, and labels them and archived
   threads in faint text.
