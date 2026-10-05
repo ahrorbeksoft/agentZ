@@ -183,6 +183,10 @@ From Zed's guidelines, which this code follows:
 - **`agentz-server proxy` must not wait for stdin when it exits.** Tokio reads stdin on a
   blocking thread and dropping the runtime waits for it, so the SSH session stayed open after
   the server quit. It ends with `shutdown_background`.
+- **A stopped terminal event loop must not keep its PTY.** alacritty's `tty::Pty` registers a
+  SIGCHLD handler that writes a byte to a socket its loop reads. Once the loop stops, nothing
+  reads it, and on macOS the handler blocks when it's full, freezing every thread that takes a
+  SIGCHLD: the whole server. `Terminal::end` drops a stopped loop's PTY at once.
 - **A running server outlives its binary.** Installing renames the new binary into place, so an
   older server keeps running; it reports the hash beside its executable at start
   (`ServerWelcome::build`), and the app compares it with the installed one.

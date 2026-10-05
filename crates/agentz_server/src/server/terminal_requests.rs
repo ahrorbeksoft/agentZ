@@ -1074,12 +1074,14 @@ impl Server {
                 });
             }
             TerminalRequest::Kill(request, responder) => {
-                match self.agent_terminal(thread_id, &request.terminal_id) {
-                    Ok(running) => {
+                let key = agent_terminal_key(thread_id, &request.terminal_id);
+                match self.terminals.running.get_mut(&key) {
+                    Some(running) if !running.released => {
                         running.terminal.kill();
+                        self.terminal_changed(key);
                         responder.respond(acp::KillTerminalResponse::new())
                     }
-                    Err(error) => responder.respond_with_internal_error(format!("{error:#}")),
+                    _ => responder.respond_with_internal_error("no such terminal"),
                 }
                 .log_err();
             }
@@ -1089,6 +1091,7 @@ impl Server {
                     Some(running) if !running.released => {
                         running.terminal.kill();
                         running.released = true;
+                        self.terminal_changed(key);
                         responder.respond(acp::ReleaseTerminalResponse::new())
                     }
                     _ => responder.respond_with_internal_error("no such terminal"),

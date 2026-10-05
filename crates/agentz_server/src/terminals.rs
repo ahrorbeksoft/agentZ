@@ -608,12 +608,43 @@ impl Terminal {
     }
 
     /// Ends the process, keeping the screen (ACP's `terminal/kill`), and everything else it
-    /// started, as herdr ends a closed pane's: a program that ignores the hangup, or one
-    /// started with `nohup`, would otherwise outlive its terminal.
-    pub(crate) fn kill(&self) {
+    /// started.
+    pub(crate) fn kill(&mut self) {
+        self.end();
+        if self.exit.is_none() {
+            // The status is the PTY's to collect, and the PTY is gone.
+            self.exited(TerminalExit {
+                code: None,
+                signal: None,
+            });
+        }
+    }
+
+    /// Stops the event loop and lets go of the PTY, which hangs up on the process, and ends
+    /// everything else the session started, as herdr ends a closed pane's: a program that
+    /// ignores the hangup, or one started with `nohup`, would otherwise outlive its terminal.
+    fn end(&mut self) {
         let session = self.session_processes();
-        // The event loop drops the PTY, which hangs up on the session.
         self.sender.send(Msg::Shutdown).ok();
+        // A stopped loop gives back its PTY, which must go at once: until then its SIGCHLD
+        // handler stays registered, writing to a socket nothing reads anymore, and once that
+        // fills, every thread that takes a SIGCHLD blocks in the handler. Dropping it waits for
+        // the process to end, which mustn't hold up the server.
+        let event_loop = self.event_loop.take();
+        let paused = self.paused.take();
+        if event_loop.is_some() || paused.is_some() {
+            std::thread::Builder::new()
+                .name("terminal-end".into())
+                .spawn(move || {
+                    if let Some(event_loop) = event_loop
+                        && event_loop.join().is_err()
+                    {
+                        log::error!("a terminal's event loop panicked");
+                    }
+                    drop(paused);
+                })
+                .log_err();
+        }
         #[cfg(unix)]
         if !session.is_empty() {
             std::thread::Builder::new()
@@ -904,28 +935,9 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if self.detached {
-            return;
+        if !self.detached {
+            self.end();
         }
-        self.kill();
-        // A stopped loop gives back its PTY, and dropping the PTY waits for the process to end:
-        // that mustn't hold up the server.
-        let event_loop = self.event_loop.take();
-        let paused = self.paused.take();
-        if event_loop.is_none() && paused.is_none() {
-            return;
-        }
-        std::thread::Builder::new()
-            .name("terminal-end".into())
-            .spawn(move || {
-                if let Some(event_loop) = event_loop
-                    && event_loop.join().is_err()
-                {
-                    log::error!("a terminal's event loop panicked");
-                }
-                drop(paused);
-            })
-            .log_err();
     }
 }
 
@@ -1820,6 +1832,38 @@ mod tests {
             }
         );
         assert!(terminal.frame().exited.is_some());
+    }
+
+    /// A killed terminal stays for its output, but its PTY must go: until it does, the PTY's
+    /// SIGCHLD handler writes to a socket nothing reads anymore, and once that's full every
+    /// thread that takes a SIGCHLD blocks in the handler, which stopped the whole server.
+    #[tokio::test]
+    async fn a_killed_terminal_keeps_its_screen_and_lets_go_of_its_pty() {
+        let (mut terminal, mut inbox) = start_sh(TerminalSize::default());
+        terminal.input(TerminalInput::Bytes(b"echo started; sleep 1000\n".to_vec()));
+        wait_for(&mut terminal, &mut inbox, |terminal| {
+            terminal.screen_text().contains("\nstarted")
+        })
+        .await;
+        let exit = terminal.wait_for_exit();
+        terminal.kill();
+        tokio::time::timeout(Duration::from_secs(10), exit)
+            .await
+            .expect("the kill was never reported")
+            .expect("an exit");
+        assert!(terminal.frame().exited.is_some());
+        assert!(terminal.screen_text().contains("\nstarted"));
+
+        // Dropping the PTY removes its handler before it collects the process.
+        let child = terminal.child_pid.expect("the terminal's process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while process_exists(child) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed terminal kept its PTY"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
