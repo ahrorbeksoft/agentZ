@@ -1,6 +1,7 @@
 //! The conversation with one agent. Layout, spacing and colors follow Zed's agent thread view
 //! (`agent_ui::conversation_view::thread_view`).
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1032,8 +1033,14 @@ impl AgentView {
                     self.sync_markdown((index, 0), text, cx);
                 }
                 Entry::ToolCall(tool_call) => {
+                    let is_read = matches!(tool_call.kind, acp::ToolKind::Read);
                     for (part, text) in tool_call.text.iter().enumerate() {
-                        self.sync_markdown((index, part + 1), text, cx);
+                        let text = if is_read {
+                            as_code_block(text)
+                        } else {
+                            Cow::Borrowed(text.as_str())
+                        };
+                        self.sync_markdown((index, part + 1), &text, cx);
                     }
                     if let Some(raw_input) = &tool_call.raw_input {
                         self.sync_markdown((index, RAW_INPUT_PART), raw_input, cx);
@@ -5458,6 +5465,39 @@ fn tool_output_style(is_terminal_tool: bool, window: &Window, cx: &App) -> Markd
     style
 }
 
+/// A read's text is the file as it is. Claude fences it as code, but Droid sends it bare, and
+/// as markdown its lines would join into paragraphs, `#` lines become headings and HTML show as
+/// loose text.
+fn as_code_block(text: &str) -> Cow<'_, str> {
+    if text.trim().is_empty() || is_code_block(text) {
+        return Cow::Borrowed(text);
+    }
+    // Longer than any run of backticks in the text, so none of its lines closes the block.
+    let longest_run = text
+        .split(|character: char| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    Cow::Owned(format!("{fence}\n{text}\n{fence}"))
+}
+
+/// Whether the text is a single fenced code block: its first line opens one, and the first line
+/// to close it is its last.
+fn is_code_block(text: &str) -> bool {
+    let lines: Vec<&str> = text.trim().lines().collect();
+    let [opening, body @ .., closing] = lines.as_slice() else {
+        return false;
+    };
+    let fence_length = opening.len() - opening.trim_start_matches('`').len();
+    let closes = |line: &str| {
+        let line = line.trim();
+        line.len() >= fence_length && line.bytes().all(|byte| byte == b'`')
+    };
+    fence_length >= 3 && closes(closing) && !body.iter().any(|line| closes(line))
+}
+
 fn setting_tooltip(
     title: SharedString,
     description: Option<SharedString>,
@@ -6374,6 +6414,53 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-call-row-1").is_some());
+    }
+
+    #[test]
+    fn a_read_file_is_one_code_block() {
+        assert_eq!(
+            as_code_block("<!doctype html>\n<html lang=\"en\">\n"),
+            "```\n<!doctype html>\n<html lang=\"en\">\n```"
+        );
+        // A fence inside the file doesn't end the block.
+        assert_eq!(
+            as_code_block("# Notes\n```rust\nfn main() {}\n```"),
+            "````\n# Notes\n```rust\nfn main() {}\n```\n````"
+        );
+        // Claude's read is fenced already.
+        let fenced = "```\n1\tfn main() {}\n```";
+        assert_eq!(as_code_block(fenced), fenced);
+        // A markdown file that opens and ends with code isn't one block.
+        assert_eq!(
+            as_code_block("```\na\n```\nText\n```\nb\n```"),
+            "````\n```\na\n```\nText\n```\nb\n```\n````"
+        );
+        assert_eq!(as_code_block(""), "");
+    }
+
+    #[gpui::test]
+    fn a_read_shows_the_file_as_code(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let mut read = tool_call(acp::ToolCallStatus::Completed);
+        if let Entry::ToolCall(tool_call) = &mut read {
+            tool_call.kind = acp::ToolKind::Read;
+            tool_call.title = "Read /tmp/demo/index.html".into();
+            tool_call.text = vec!["<!doctype html>\n<html lang=\"en\">".into()];
+        }
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Read it".into()), read], cx)
+        });
+        cx.run_until_parked();
+        let source = view.read_with(cx, |view, cx| {
+            view.markdowns
+                .get(&(1, 1))
+                .map(|markdown| markdown.read(cx).source().to_string())
+        });
+        assert_eq!(
+            source.as_deref(),
+            Some("```\n<!doctype html>\n<html lang=\"en\">\n```")
+        );
     }
 
     fn work(id: &str, kind: acp::ToolKind, path: Option<&str>) -> Entry {

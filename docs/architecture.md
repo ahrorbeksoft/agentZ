@@ -224,7 +224,9 @@ Each entry: what it does, where it lives, and where it comes from.
   spaces become one space, as t3code's truncated rows show a multi-line command, and a
   command's `\`-newline continuations too); a spinner while it runs, "Failed" when it fails, a
   chevron on hover. Every row starts closed and a click opens its output beside it (input,
-  diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. Rows are
+  diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. A read's
+  text is the file, so it shows as one code block (`as_code_block`): Claude fences it, but Droid
+  sends it bare, and as markdown it would lose its lines and indentation. Rows are
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
   from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
   "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
