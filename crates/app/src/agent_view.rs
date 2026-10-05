@@ -18,9 +18,10 @@ use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, DragMoveEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, PromptLevel, ScrollHandle,
-    Subscription, Task, Window, pulsating_between,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardItem, Context,
+    DismissEvent, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding,
+    Pixels, Point, PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred,
+    pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, WorkspaceKind};
@@ -91,6 +92,22 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", AcceptSlashCommand, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
+        // Zed's `use_modifier_to_send`: Cmd-Enter sends and Enter makes a new line.
+        KeyBinding::new(
+            "enter",
+            text_input::Newline,
+            Some("AgentComposer && use_modifier_to_send > TextInput"),
+        ),
+        KeyBinding::new(
+            "secondary-enter",
+            menu::Confirm,
+            Some("AgentComposer && use_modifier_to_send > TextInput"),
+        ),
+        // While a menu is open for the composer, its keys act in the menu rather than in the
+        // composer's lines.
+        KeyBinding::new("up", menu::SelectPrevious, Some("TextInput && menu")),
+        KeyBinding::new("down", menu::SelectNext, Some("TextInput && menu")),
+        KeyBinding::new("enter", menu::Confirm, Some("TextInput && menu")),
         // Zed's key for copying what's selected in a message.
         KeyBinding::new("secondary-c", markdown::Copy, Some("Markdown")),
     ]);
@@ -129,6 +146,8 @@ enum Starter {
 }
 
 const COMPOSER_PLACEHOLDER: &str = "Message the agent…";
+/// As picked in `design/composer/`: one line, growing with the text to eight, then scrolling.
+const COMPOSER_MAX_LINES: usize = 8;
 /// How long typing pauses before what's typed is kept on the server.
 const UNSENT_TEXT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
@@ -161,6 +180,9 @@ pub struct AgentView {
     registry: Entity<AgentRegistryStore>,
     agent_id: Option<AgentId>,
     composer: Entity<TextInput>,
+    /// The composer's right-click menu, where it was opened.
+    composer_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    pending_composer_menu: Option<Point<Pixels>>,
     scroll_handle: ScrollHandle,
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
     /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
@@ -236,7 +258,11 @@ impl AgentView {
         let client = thread.read(cx).client().clone();
         let store = client.read(cx).projects().clone();
         let registry = client.read(cx).registry().clone();
-        let composer = cx.new(|cx| TextInput::new(COMPOSER_PLACEHOLDER, cx));
+        let composer = cx.new(|cx| {
+            TextInput::new(COMPOSER_PLACEHOLDER, cx)
+                .multi_line(COMPOSER_MAX_LINES)
+                .handles_paste()
+        });
         let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let login = cx
             .new(|cx| AgentLogin::new(thread.clone(), LoginLayout::Centered, agent_id.clone(), cx));
@@ -277,11 +303,22 @@ impl AgentView {
         cx.on_release(|this, cx| this.save_unsent_text_now(cx))
             .detach();
         let mut subscriptions = subscriptions;
-        subscriptions.push(cx.subscribe(&composer, |this, _, _: &TextInputEvent, cx| {
-            this.command_menu_index = 0;
-            this.save_unsent_text(cx);
-            cx.notify();
-        }));
+        subscriptions.push(cx.subscribe(
+            &composer,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Changed => {
+                    this.command_menu_index = 0;
+                    this.save_unsent_text(cx);
+                    cx.notify();
+                }
+                TextInputEvent::Paste { item, plain } => this.paste_into_composer(item, *plain, cx),
+                // Built at the next render, which has the window.
+                TextInputEvent::ContextMenu(position) => {
+                    this.pending_composer_menu = Some(*position);
+                    cx.notify();
+                }
+            },
+        ));
         // Keeps the elapsed-time label ticking while the agent works.
         let elapsed_refresh = cx.spawn(async move |this, cx| {
             loop {
@@ -312,6 +349,8 @@ impl AgentView {
             registry,
             agent_id,
             composer,
+            composer_menu: None,
+            pending_composer_menu: None,
             scroll_handle: ScrollHandle::new(),
             markdowns: HashMap::default(),
             toggled_tool_calls: HashSet::default(),
@@ -1054,7 +1093,7 @@ impl AgentView {
             self.accept_command(&name, cx);
             return;
         }
-        let text = self.composer.read(cx).text().to_string();
+        let text = self.composer.read(cx).plain_text();
         if text.trim().is_empty() {
             return;
         }
@@ -1117,6 +1156,56 @@ impl AgentView {
             return;
         }
         self.thread.update(cx, |thread, cx| thread.cancel(cx));
+    }
+
+    /// Pastes text as typed. Images and copied files come with mentions.
+    fn paste_into_composer(&mut self, item: &ClipboardItem, _plain: bool, cx: &mut Context<Self>) {
+        if let Some(text) = item.text() {
+            self.composer
+                .update(cx, |composer, cx| composer.insert(&text, cx));
+        }
+    }
+
+    /// Zed's menu for its message editor.
+    fn deploy_composer_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = self.composer.focus_handle(cx);
+        let has_selection = self.composer.read(cx).has_selection();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.context(focus_handle)
+                .action("Cut", Box::new(text_input::Cut))
+                .action_disabled_when(!has_selection, "Copy", Box::new(text_input::Copy))
+                .action("Paste", Box::new(text_input::Paste))
+                .action("Paste as Plain Text", Box::new(text_input::PasteRaw))
+        });
+        let subscription =
+            cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, window, cx| {
+                this.composer_menu = None;
+                window.focus(&this.composer.focus_handle(cx), cx);
+                cx.notify();
+            });
+        window.focus(&menu.focus_handle(cx), cx);
+        self.composer_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn render_composer_menu(&self) -> Option<AnyElement> {
+        let (menu, position, _) = self.composer_menu.as_ref()?;
+        Some(
+            deferred(
+                anchored()
+                    .position(*position)
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu.clone()),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     fn render_command_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3641,7 +3730,18 @@ impl AgentView {
         };
 
         h_flex()
-            .key_context(KEY_CONTEXT)
+            .key_context({
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add(KEY_CONTEXT);
+                if crate::app_settings::AppSettingsStore::global(cx)
+                    .read(cx)
+                    .settings()
+                    .use_modifier_to_send
+                {
+                    context.add("use_modifier_to_send");
+                }
+                context
+            })
             .on_action(cx.listener(Self::send))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::select_next_command))
@@ -3682,8 +3782,10 @@ impl AgentView {
                             .pr_2p5()
                             .text_ui(cx)
                             .when(style == ComposerStyle::Card, |this| this.min_h(px(44.)))
+                            .debug_selector(|| "composer".into())
                             .child(self.composer.clone())
-                            .children(self.render_command_menu(cx)),
+                            .children(self.render_command_menu(cx))
+                            .children(self.render_composer_menu()),
                     )
                     .child(
                         h_flex()
@@ -4414,8 +4516,8 @@ impl AgentView {
     }
 
     fn typed_text(&self, cx: &App) -> Option<String> {
-        let text = self.composer.read(cx).text();
-        (!text.trim().is_empty()).then(|| text.to_string())
+        let text = self.composer.read(cx).plain_text();
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Keeps what's typed on the thread's machine once typing pauses, so it's there after the
@@ -4645,6 +4747,12 @@ impl EventEmitter<AgentViewEvent> for AgentView {}
 
 impl Render for AgentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(position) = self.pending_composer_menu.take() {
+            self.deploy_composer_menu(position, window, cx);
+        }
+        let menu_open = !self.matching_commands(cx).is_empty();
+        self.composer
+            .update(cx, |composer, cx| composer.set_menu_open(menu_open, cx));
         let panel_background = cx.theme().colors().panel_background;
         let entries: Vec<Entry> = self.thread.read(cx).entries().to_vec();
         let entry_count = entries.len();
@@ -5174,6 +5282,46 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(composer_text(cx), "");
         assert!(view.read_with(cx, |view, cx| view.is_untouched_draft(cx)));
+    }
+
+    #[gpui::test]
+    fn the_composer_takes_several_lines_and_has_a_menu(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("two");
+        let text = view.read_with(cx, |view, cx| view.composer.read(cx).text().to_string());
+        assert_eq!(text, "one\ntwo");
+
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("composer").expect("the composer");
+        let position = gpui::point(bounds.left() + px(4.), bounds.top() + px(8.));
+        cx.simulate_mouse_down(position, gpui::MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let menu = view.read_with(cx, |view, _| {
+            view.composer_menu.as_ref().map(|(menu, _, _)| menu.clone())
+        });
+        assert!(menu.is_some());
+    }
+
+    #[gpui::test]
+    fn enter_makes_a_new_line_when_a_modifier_sends(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(|settings| settings.use_modifier_to_send = true, cx)
+            })
+        });
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.run_until_parked();
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("two");
+        let text = view.read_with(cx, |view, cx| view.composer.read(cx).text().to_string());
+        assert_eq!(text, "one\ntwo");
     }
 
     #[gpui::test]

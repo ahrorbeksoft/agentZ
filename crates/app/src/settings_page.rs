@@ -774,12 +774,15 @@ impl SettingsPage {
         vec![
             render_section(
                 "Threads",
-                vec![render_row(
-                    "Thread order",
-                    "How threads are sorted in the sidebar.",
-                    DropdownMenu::new("thread-order", label, menu).into_any_element(),
-                    cx,
-                )],
+                vec![
+                    render_row(
+                        "Thread order",
+                        "How threads are sorted in the sidebar.",
+                        DropdownMenu::new("thread-order", label, menu).into_any_element(),
+                        cx,
+                    ),
+                    self.render_modifier_to_send_row(cx),
+                ],
                 cx,
             ),
             render_section("Projects", self.render_grouping_rows(window, cx), cx),
@@ -803,6 +806,26 @@ impl SettingsPage {
                 cx,
             ),
         ]
+    }
+
+    /// Zed's "Use Modifier To Send", in its words.
+    fn render_modifier_to_send_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = self.app_settings.read(cx).settings().use_modifier_to_send;
+        let app_settings = self.app_settings.clone();
+        render_row(
+            "Use modifier to send",
+            "Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send \
+             messages.",
+            Switch::new("use-modifier-to-send", enabled.into())
+                .on_click(move |state, _, cx| {
+                    let enabled = *state == ToggleState::Selected;
+                    app_settings.update(cx, |store, cx| {
+                        store.update(|settings| settings.use_modifier_to_send = enabled, cx)
+                    })
+                })
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// t3code's "Combine matching repositories" switch, which turns grouping off or back to

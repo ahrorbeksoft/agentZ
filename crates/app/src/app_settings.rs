@@ -78,6 +78,8 @@ pub struct AppSettings {
     pub is_sidebar_hidden: bool,
     /// Tabs saved with Save Layout…, which open in any workspace on any machine.
     pub saved_layouts: Vec<SavedLayout>,
+    /// Zed's `agent.use_modifier_to_send`: Cmd-Enter sends and Enter makes a new line.
+    pub use_modifier_to_send: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -99,6 +101,7 @@ impl Default for AppSettings {
             last_combined_grouping: ProjectGroupingMode::default(),
             terminal_font_size: None,
             is_sidebar_hidden: false,
+            use_modifier_to_send: false,
             saved_layouts: Vec::new(),
         }
     }

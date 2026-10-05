@@ -184,6 +184,12 @@ Each entry: what it does, where it lives, and where it comes from.
   commands, the "…" menu with Zed's Reauthenticate, Log Out and Reload Agent. The config
   selectors come with the agent's session, so while the agent starts "Loading options…" with a
   spinner stands in for them.
+- **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`):
+  Zed's message editor. One line, growing with the text to eight, then scrolling. Shift-Enter
+  makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's
+  `use_modifier_to_send`), Cmd-Enter sends and Enter makes a new line. Pasted text keeps its
+  line breaks, and Up/Down move between rows, unless a menu is open for the composer
+  (`TextInput && menu`). Right-click gives Zed's Cut, Copy, Paste and Paste as Plain Text.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
   thread's menu (Rename, Continue with Another Agent ▸ except on a draft, Archive, Delete…), and a double-click
@@ -647,9 +653,6 @@ since a thread's workspace is its checkout.
 
 Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 
-- **A multi-line composer**, Zed's message editor: Shift-Enter for a new line, Enter to send,
-  pasted text keeps its line breaks, the box grows a few lines then scrolls, Up/Down move between
-  lines.
 - **@-mentions and adding context** (files, symbols, threads) to a message.
 - **Pasting images** into a message.
 - **Opening files** from tool calls.
