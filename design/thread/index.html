@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="thread" data-title="Thread">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Thread <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>How a conversation reads. Today agentZ follows Zed's thread: every tool call is its own row or card, edits show their diff inline, thinking is a block, and your messages are full-width boxes. t3code reads the same agent output (from ACP: messages, thoughts, tool calls with a kind such as read, edit, execute, search) and folds the agent's work between its messages into one line that says what it did, such as "Read 3 files and changed 2 files", opening into compact one-line rows. The mocks show one turn: you ask for a checkout total, the agent thinks, reads three files, edits two, runs the tests, and answers. Colors are JetBrains Dark's.</p>
+<p>The last topic is steering a queued message. Over ACP an agent takes one message at a time, so nothing can be added to a turn while it runs; the choices are when the next message cuts in.</p>`;
+</script>
+<script src="topics-thread.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
