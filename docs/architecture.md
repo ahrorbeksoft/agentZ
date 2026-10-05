@@ -226,11 +226,12 @@ Each entry: what it does, where it lives, and where it comes from.
   from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
   "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
   opening to the text; Settings › General's "Show thinking" (`AppSettings::show_thinking`, Zed's
-  `thinking_display` as expanded or collapsed) opens them all. In a finished turn, each run of two
-  or more tool calls and thoughts between messages folds into one line that opens to them
-  (t3code's work groups, `AgentView::folded_run`), saying what it did in t3code's words
-  (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and performed 2 other
-  actions"); the running turn's rows show as they come, and a lone call stays a row. The
+  `thinking_display` as expanded or collapsed) opens them all. Each run of two or more tool
+  calls and thoughts folds into one line that opens to them once the agent writes a message
+  after it, also mid-turn (t3code's work groups, `AgentView::folded_run`), saying what it did in
+  t3code's words (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and
+  performed 2 other actions"); the running turn's last run shows its rows as they come and folds
+  when the turn ends, and a lone call stays a row. The
   user's message is a bubble on the right with its time ("09:07", "yesterday at
   23:30") and Copy on hover. The bubble is the thread's background a tenth of the way toward its
   text (`user_message_background`), so it shows in every theme: most themes give

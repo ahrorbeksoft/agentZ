@@ -17,3 +17,5 @@ Picked on the design board (`design/thread-rows/`, see `design/README.md`). Each
 **Today:** Rows sit right under and above the agent’s messages, with no space and nothing around them, so where a message ends and the work starts is unclear.
 
 **D. Folded once the turn ends** (from t3code work groups): While the agent works, rows show as they come. When the turn ends, each run folds into one line that says what it did ("Ran 5 commands"), opening to its rows on click. The thread round picked rows always open; this is t3code’s default.
+
+**Note:** Changed after the build (2026-10-05): a run folds as soon as the agent writes a message after it, also while the turn goes on; the turn's last run folds when it ends.

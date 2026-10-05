@@ -216,10 +216,10 @@ pub struct AgentView {
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
     /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
-    /// Finished runs of work the user opened, by their first entry.
+    /// Folded runs of work the user opened, by their first entry.
     opened_runs: HashSet<usize>,
-    /// Whether the agent was working when the rows were last measured: a turn's runs fold as
-    /// it ends.
+    /// Whether the agent was working when the rows were last measured: a turn's last run folds
+    /// as it ends.
     synced_working: bool,
     /// Settings › General's "Show thinking", as the rows were last measured with it.
     synced_show_thinking: bool,
@@ -993,8 +993,18 @@ impl AgentView {
             let Some(entry) = self.thread.read(cx).entries().get(index).cloned() else {
                 continue;
             };
+            let is_new = self.synced_revisions.get(index).is_none();
             self.sync_entry(index, &entry, cx);
             self.list_state.remeasure_items(index + 1..index + 2);
+            // A message after a run of work folds the run, also while the turn goes on.
+            if is_new
+                && !is_work(&entry)
+                && let Some(run) = index
+                    .checked_sub(1)
+                    .and_then(|previous| work_run(self.thread.read(cx).entries(), previous))
+            {
+                self.list_state.remeasure_items(run.start + 1..run.end + 1);
+            }
         }
         self.synced_revisions = revisions;
         // As a turn starts or ends, its runs of work open or fold.
@@ -2524,9 +2534,9 @@ impl AgentView {
         }
     }
 
-    /// A tool call, thought or the plan's marker. In a finished turn, a run of them between
-    /// messages folds into one line, as t3code folds a work group: the line draws at the run's
-    /// first entry, and the rest draw nothing until it's opened.
+    /// A tool call, thought or the plan's marker. Once a message follows it, a run of them
+    /// folds into one line, as t3code folds a work group: the line draws at the run's first
+    /// entry, and the rest draw nothing until it's opened.
     fn render_work_entry(
         &self,
         index: usize,
@@ -2555,14 +2565,14 @@ impl AgentView {
         }
     }
 
-    /// The run of work `index` is in, if it folds: a finished turn's run of at least two tool
-    /// calls or thoughts. A lone one stays as it is, as in t3code, and so does the turn that's
-    /// running, whose rows show as they come.
+    /// The run of work `index` is in, if it folds: a run of at least two tool calls or thoughts
+    /// that a message follows, or that ended its turn. A lone one stays as it is, as in t3code,
+    /// and so does the running turn's last run, whose rows show as they come.
     fn folded_run(&self, index: usize, cx: &App) -> Option<Range<usize>> {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
         let run = work_run(entries, index)?;
-        if thread.is_working() && run.start >= current_turn_start(entries) {
+        if thread.is_working() && run.end == entries.len() {
             return None;
         }
         let shown = entries[run.clone()]
@@ -6434,10 +6444,10 @@ mod tests {
         );
     }
 
-    /// The thread round's fold: rows show while the turn runs, and once it ends they fold
-    /// into a line that opens to them.
+    /// The thread round's fold: a run's rows show as they come, and once the agent writes after
+    /// them, or the turn ends, they fold into a line that opens to them.
     #[gpui::test]
-    fn a_finished_turns_work_folds_into_a_line(cx: &mut TestAppContext) {
+    fn work_folds_into_a_line_once_a_message_follows(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         thread.update(cx, |thread, cx| {
@@ -6446,7 +6456,6 @@ mod tests {
                     Entry::UserMessage("Run the tests".into()),
                     work("run-1", acp::ToolKind::Execute, None),
                     work("run-2", acp::ToolKind::Execute, None),
-                    Entry::AgentMessage("They pass.".into()),
                 ],
                 cx,
             );
@@ -6456,7 +6465,10 @@ mod tests {
         assert!(cx.debug_bounds("work-run-1").is_none());
         assert!(cx.debug_bounds("tool-call-row-2").is_some());
 
-        thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
+        // Mid-turn, a message folds the run before it.
+        thread.update(cx, |thread, cx| {
+            thread.push_entry_for_test(Entry::AgentMessage("They pass.".into()), cx)
+        });
         cx.run_until_parked();
         let header = cx.debug_bounds("work-run-1").expect("the folded run");
         assert!(cx.debug_bounds("tool-call-row-1").is_none());
@@ -6466,6 +6478,19 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-call-row-1").is_some());
         assert!(cx.debug_bounds("tool-call-row-2").is_some());
+
+        // The run after it shows its rows until the turn ends.
+        thread.update(cx, |thread, cx| {
+            thread.push_entry_for_test(work("run-3", acp::ToolKind::Execute, None), cx);
+            thread.push_entry_for_test(work("run-4", acp::ToolKind::Execute, None), cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("work-run-4").is_none());
+        assert!(cx.debug_bounds("tool-call-row-5").is_some());
+        thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("work-run-4").is_some());
+        assert!(cx.debug_bounds("tool-call-row-5").is_none());
     }
 
     /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.

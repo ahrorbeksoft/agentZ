@@ -249,6 +249,19 @@ impl AgentThread {
         cx.notify();
     }
 
+    /// Adds an entry as one streaming in would: the others keep their revisions.
+    #[cfg(test)]
+    pub(crate) fn push_entry_for_test(
+        &mut self,
+        entry: agentz_protocol::thread::Entry,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.entries.push(entry);
+        let index = self.view.entries.len() - 1;
+        self.note_changed(index..index + 1);
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn set_working_for_test(&mut self, working: bool, cx: &mut Context<Self>) {
         self.view.state.turn_started_at = working.then(std::time::SystemTime::now);
