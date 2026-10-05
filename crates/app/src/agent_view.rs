@@ -840,25 +840,10 @@ impl AgentView {
         if !client.has_capability(CAPABILITY_THREAD_DIFF) {
             return;
         }
-        let request = client.request(Request::ThreadDiff {
-            thread_id: self.thread_id,
-            scope: DiffScope::All,
-        });
+        let request = load_change_stat(client, self.thread_id);
         self._changed_files_load = cx.spawn(async move |this, cx| {
-            let changes = match request.await {
-                Ok(Response::ThreadDiff(diff)) => ChangeStat {
-                    files: diff.files.len(),
-                    additions: diff.files.iter().map(|file| file.additions as usize).sum(),
-                    deletions: diff.files.iter().map(|file| file.deletions as usize).sum(),
-                },
-                Ok(response) => {
-                    log::error!("expected a diff, got {response:?}");
-                    return;
-                }
-                Err(error) => {
-                    log::warn!("couldn't load the thread's changes: {error:#}");
-                    return;
-                }
+            let Some(changes) = request.await else {
+                return;
             };
             this.update(cx, |this, cx| {
                 if this.changes != changes {
@@ -2283,40 +2268,9 @@ impl AgentView {
 
     /// The changes, terminal and agent options buttons.
     fn render_toolbar_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let changes = self.changes;
-        let changes_tooltip: SharedString = match changes.files {
-            0 => "Show Changes".into(),
-            1 => "Show Changes · 1 file changed".into(),
-            count => format!("Show Changes · {count} files changed").into(),
-        };
         h_flex()
             .gap_1p5()
-            .child(if changes.files > 0 {
-                // What the thread changed, in lines, as t3code's header shows it.
-                ButtonLike::new("toggle-diff")
-                    .style(ButtonStyle::Outlined)
-                    .size(ButtonSize::Compact)
-                    .toggle_state(self.is_diff_open)
-                    .child(
-                        div()
-                            .px_1()
-                            .child(diff_stat(changes.additions, changes.deletions)),
-                    )
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action(changes_tooltip.clone(), &ToggleDiff, cx)
-                    })
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx))
-                    .into_any_element()
-            } else {
-                IconButton::new("toggle-diff", IconName::Diff)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.is_diff_open)
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action(changes_tooltip.clone(), &ToggleDiff, cx)
-                    })
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx))
-                    .into_any_element()
-            })
+            .child(render_changes_button(self.changes, self.is_diff_open))
             .child({
                 // With the drawer hidden, a dot says something still runs in its terminals.
                 let running: Vec<String> = if self.is_drawer_open {
@@ -5563,10 +5517,70 @@ fn humanize_token_count(count: u64) -> String {
 
 /// What a thread changed: files, and lines added and removed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ChangeStat {
+pub(crate) struct ChangeStat {
     files: usize,
     additions: usize,
     deletions: usize,
+}
+
+/// Asks the thread's server what the thread changed, for its header's button. `None` when it
+/// couldn't say.
+pub(crate) fn load_change_stat(
+    client: &ServerClient,
+    thread_id: ThreadId,
+) -> impl std::future::Future<Output = Option<ChangeStat>> + use<> {
+    let request = client.request(Request::ThreadDiff {
+        thread_id,
+        scope: DiffScope::All,
+    });
+    async move {
+        match request.await {
+            Ok(Response::ThreadDiff(diff)) => Some(ChangeStat {
+                files: diff.files.len(),
+                additions: diff.files.iter().map(|file| file.additions as usize).sum(),
+                deletions: diff.files.iter().map(|file| file.deletions as usize).sum(),
+            }),
+            Ok(response) => {
+                log::error!("expected a diff, got {response:?}");
+                None
+            }
+            Err(error) => {
+                log::warn!("couldn't load the thread's changes: {error:#}");
+                None
+            }
+        }
+    }
+}
+
+/// The header's changes button: what the thread changed, in lines, as t3code's header shows it,
+/// or the changes icon while it changed nothing.
+pub(crate) fn render_changes_button(changes: ChangeStat, is_open: bool) -> AnyElement {
+    let tooltip: SharedString = match changes.files {
+        0 => "Show Changes".into(),
+        1 => "Show Changes · 1 file changed".into(),
+        count => format!("Show Changes · {count} files changed").into(),
+    };
+    if changes.files > 0 {
+        ButtonLike::new("toggle-diff")
+            .style(ButtonStyle::Outlined)
+            .size(ButtonSize::Compact)
+            .toggle_state(is_open)
+            .child(
+                div()
+                    .px_1()
+                    .child(diff_stat(changes.additions, changes.deletions)),
+            )
+            .tooltip(move |_, cx| Tooltip::for_action(tooltip.clone(), &ToggleDiff, cx))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx))
+            .into_any_element()
+    } else {
+        IconButton::new("toggle-diff", IconName::Diff)
+            .icon_size(IconSize::Small)
+            .toggle_state(is_open)
+            .tooltip(move |_, cx| Tooltip::for_action(tooltip.clone(), &ToggleDiff, cx))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx))
+            .into_any_element()
+    }
 }
 
 /// The thread's title in its header, the trigger of the thread's menu. A double-click renames

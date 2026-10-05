@@ -422,7 +422,12 @@ t3code's checkpoints (`apps/server/src/checkpointing/`).
   checkpointed in the folder its shell is in, with turns read by agent detection: the baseline
   once the agent is seen or starts working, then a turn each time working ends. The thread
   counts as done only once that checkpoint is taken, so the diff panel reloads with it. One
-  queue takes them in order.
+  queue takes them in order. Its header's changes button shows the lines changed, as an agent
+  thread's does (`agent_view::render_changes_button`).
+- **Terminal threads' activity** (`terminal_requests.rs`): a shell's output counts, at most every
+  10 seconds, but not a redraw within a second of a resize or focus change (opening a thread
+  does both). An agent CLI's activity is its turns, since its screen also changes while it only
+  waits, as a focused prompt blinks.
 - **Diff panel** (`diff_panel.rs`, Cmd-D): latest turn or all, files and hunks, Viewed (a file
   reopens when it changes). Revert puts files back, only for a thread alone in its worktree or
   pasture; ACP can't rewind a conversation, so only files go back.

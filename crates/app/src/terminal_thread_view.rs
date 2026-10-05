@@ -1,12 +1,14 @@
 //! A terminal thread (herdr's panes): a toolbar like an agent thread's over its terminal.
 
+use std::time::SystemTime;
+
+use agentz_protocol::CAPABILITY_THREAD_DIFF;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Task, Window};
 use projects::ThreadId;
 use ui::{Tooltip, prelude::*};
 
-use crate::ToggleDiff;
-use crate::agent_view::TOOLBAR_HEIGHT;
+use crate::agent_view::{ChangeStat, TOOLBAR_HEIGHT, load_change_stat, render_changes_button};
 use crate::server_client::ServerClient;
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -18,6 +20,13 @@ pub struct TerminalThreadView {
     /// An agent CLI runs in it, whose session a restart would end.
     has_agent: bool,
     is_diff_open: bool,
+    client: Entity<ServerClient>,
+    thread_id: ThreadId,
+    /// What its agent CLIs changed, for the changes button, as an agent thread's header shows.
+    changes: ChangeStat,
+    /// The turn the changes were last asked for after, by when it finished.
+    changes_asked_for: Option<Option<SystemTime>>,
+    _changes_load: Task<()>,
     terminal: Entity<Terminal>,
     view: Entity<TerminalView>,
     _subscriptions: Vec<Subscription>,
@@ -33,16 +42,59 @@ impl TerminalThreadView {
     ) -> Self {
         let terminal = Terminal::shared(client, TerminalKey::Thread(thread_id), cx);
         let view = cx.new(|cx| TerminalView::new(terminal.clone(), TerminalMode::Scrollable, cx));
-        let subscriptions = vec![cx.observe(&terminal, |_, _, cx| cx.notify())];
-        Self {
+        let store = client.read(cx).projects().clone();
+        let subscriptions = vec![
+            cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.observe(&store, |this, _, cx| this.load_changes(cx)),
+        ];
+        let mut this = Self {
             title,
             command,
             has_agent: false,
             is_diff_open: false,
+            client: client.clone(),
+            thread_id,
+            changes: ChangeStat::default(),
+            changes_asked_for: None,
+            _changes_load: Task::ready(()),
             terminal,
             view,
             _subscriptions: subscriptions,
+        };
+        this.load_changes(cx);
+        this
+    }
+
+    /// Asks again what the thread changed whenever one of its turns finishes.
+    fn load_changes(&mut self, cx: &mut Context<Self>) {
+        let completed_at = self
+            .client
+            .read(cx)
+            .projects()
+            .read(cx)
+            .thread(self.thread_id)
+            .and_then(|thread| thread.completed_at);
+        if self.changes_asked_for == Some(completed_at) {
+            return;
         }
+        let client = self.client.read(cx);
+        if client.connection().is_none() || !client.has_capability(CAPABILITY_THREAD_DIFF) {
+            return;
+        }
+        self.changes_asked_for = Some(completed_at);
+        let request = load_change_stat(client, self.thread_id);
+        self._changes_load = cx.spawn(async move |this, cx| {
+            let Some(changes) = request.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if this.changes != changes {
+                    this.changes = changes;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
     }
 
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
@@ -130,13 +182,7 @@ impl TerminalThreadView {
                         })),
                 )
             })
-            .child(
-                IconButton::new("toggle-diff", IconName::Diff)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.is_diff_open)
-                    .tooltip(|_, cx| Tooltip::for_action("Show Changes", &ToggleDiff, cx))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx)),
-            )
+            .child(render_changes_button(self.changes, self.is_diff_open))
     }
 }
 

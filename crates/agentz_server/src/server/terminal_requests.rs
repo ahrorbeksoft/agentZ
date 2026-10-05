@@ -34,6 +34,8 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// A terminal thread's output counts as activity at most this often: a busy terminal
 /// shouldn't save the threads on every frame.
 const TERMINAL_ACTIVITY_INTERVAL: Duration = Duration::from_secs(10);
+/// How long after a resize or focus change a terminal's output counts as a redraw.
+const TERMINAL_REDRAW_GRACE: Duration = Duration::from_secs(1);
 
 pub(super) struct RunningTerminal {
     /// Tells this run's events from an earlier run's, after a restart.
@@ -54,6 +56,9 @@ pub(super) struct RunningTerminal {
     foreground_group: Option<u32>,
     /// When the terminal's output last counted as its thread's activity.
     activity_recorded_at: Option<Instant>,
+    /// Until when output is the program redrawing for a resize or a focus change, which
+    /// isn't activity.
+    redraw_until: Option<Instant>,
     /// For a terminal thread or workspace pane: the folder last seen in front. It names a
     /// shell, and a workspace follows the folders of its tabs.
     pub(super) folder: Option<PathBuf>,
@@ -125,13 +130,21 @@ impl Server {
                 if let agentz_protocol::terminal::TerminalInput::Palette(palette) = &input {
                     self.terminals.palette = Some(palette.clone());
                 }
-                let changed = self
+                let running = self
                     .terminals
                     .running
                     .get_mut(&terminal)
-                    .context("the terminal isn't running")?
-                    .terminal
-                    .input(input);
+                    .context("the terminal isn't running")?;
+                // Opening or focusing a thread resizes its terminal or tells the program, and
+                // the program redraws; that isn't the thread doing something.
+                if matches!(
+                    input,
+                    agentz_protocol::terminal::TerminalInput::Resize { .. }
+                        | agentz_protocol::terminal::TerminalInput::Focus(_)
+                ) {
+                    running.redraw_until = Some(Instant::now() + TERMINAL_REDRAW_GRACE);
+                }
+                let changed = running.terminal.input(input);
                 if changed {
                     self.terminal_changed(terminal);
                 }
@@ -301,6 +314,7 @@ impl Server {
                 tracker,
                 foreground_group: None,
                 activity_recorded_at: None,
+                redraw_until: None,
                 folder: None,
             },
         );
@@ -427,6 +441,7 @@ impl Server {
                     tracker,
                     foreground_group: None,
                     activity_recorded_at: None,
+                    redraw_until: None,
                     folder: handed.folder,
                 },
             );
@@ -478,11 +493,20 @@ impl Server {
             if let Some(tracker) = &mut running.tracker {
                 tracker.content_changed(now);
             }
+            // An agent CLI's activity is its turns, as an ACP agent's is: its screen also
+            // changes while it only waits, as a focused prompt blinks.
+            let runs_agent = running
+                .tracker
+                .as_ref()
+                .is_some_and(|tracker| tracker.agent().is_some());
+            let is_redraw = running.redraw_until.is_some_and(|until| now < until);
             let active_thread = match key {
                 TerminalKey::Thread(thread_id)
-                    if running.activity_recorded_at.is_none_or(|recorded| {
-                        now.duration_since(recorded) >= TERMINAL_ACTIVITY_INTERVAL
-                    }) =>
+                    if !runs_agent
+                        && !is_redraw
+                        && running.activity_recorded_at.is_none_or(|recorded| {
+                            now.duration_since(recorded) >= TERMINAL_ACTIVITY_INTERVAL
+                        }) =>
                 {
                     running.activity_recorded_at = Some(now);
                     Some(thread_id)
