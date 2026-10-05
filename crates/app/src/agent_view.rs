@@ -91,6 +91,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", AcceptSlashCommand, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
+        // Zed's key for copying what's selected in a message.
+        KeyBinding::new("secondary-c", markdown::Copy, Some("Markdown")),
     ]);
 }
 
@@ -5169,6 +5171,40 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(composer_text(cx), "");
         assert!(view.read_with(cx, |view, cx| view.is_untouched_draft(cx)));
+    }
+
+    #[gpui::test]
+    fn cmd_c_copies_text_selected_in_a_message(cx: &mut TestAppContext) {
+        cx.update(crate::init_for_test);
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            let markdown = cx.new(|cx| Markdown::new("Copy this reply".into(), None, None, cx));
+            MarkdownView(markdown)
+        });
+        // The text is parsed in the background.
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("markdown").expect("the message");
+        let start = gpui::point(bounds.left() + px(1.), bounds.top() + px(8.));
+        let end = gpui::point(bounds.right() - px(1.), bounds.top() + px(8.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("Copy this reply"));
+    }
+
+    struct MarkdownView(Entity<Markdown>);
+
+    impl Render for MarkdownView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(600.))
+                .debug_selector(|| "markdown".into())
+                .child(MarkdownElement::new(
+                    self.0.clone(),
+                    MarkdownStyle::default(),
+                ))
+        }
     }
 
     #[test]

@@ -136,6 +136,7 @@ fn init_for_test(cx: &mut App) {
     app_settings::init_for_test(cx);
     agent_icons::init(cx);
     text_input::init(cx);
+    agent_view::init(cx);
     terminal_view::init(cx);
     spaces_view::init(cx);
     bind_keys(cx);
