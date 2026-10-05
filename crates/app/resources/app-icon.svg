@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3048"/>
+      <stop offset="1" stop-color="#0f111a"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000000" flood-opacity="0.32"/>
+    </filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+  </defs>
+  <!-- macOS icon grid: an 824 px body inside a 1024 px canvas -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)" filter="url(#shadow)"/>
+  <rect x="102" y="102" width="820" height="820" rx="183" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="4"/>
+  <path d="M352 380 H672 L352 680 H672" fill="none" stroke="url(#mark)" stroke-opacity="0.45" stroke-width="84" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  <path d="M352 380 H672 L352 680 H672" fill="none" stroke="url(#mark)" stroke-width="84" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="744" cy="284" r="38" fill="#4ade80"/>
+</svg>

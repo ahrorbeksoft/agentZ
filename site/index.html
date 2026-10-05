@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentZ: coding agents on every machine, in one Mac app</title>
+<meta name="description" content="A native macOS app for coding agents over the Agent Client Protocol: install agents from the ACP Registry and run threads across projects and machines, with real terminals.">
+<meta property="og:title" content="agentZ">
+<meta property="og:description" content="Coding agents on every machine, in one native Mac app.">
+<meta property="og:image" content="https://ahrorbeksoft.github.io/agentZ/screenshot.png">
+<meta name="theme-color" content="#11131c">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+  :root {
+    --background: #0d0f16;
+    --surface: #161925;
+    --border: #262a3b;
+    --text: #e6e8f0;
+    --muted: #9aa0b4;
+    --accent: #8fb8fd;
+    --green: #4ade80;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 50% -200px, #1e2340 0%, var(--background) 70%);
+    color: var(--text);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  main { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+  nav { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; }
+  nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; color: var(--text); }
+  nav .brand img { width: 32px; height: 32px; }
+  nav .links { display: flex; gap: 20px; font-size: 15px; }
+  header { text-align: center; padding: 56px 0 40px; }
+  header img { width: 128px; height: 128px; }
+  h1 { font-size: clamp(34px, 6vw, 52px); line-height: 1.1; margin: 16px 0 12px; letter-spacing: -0.02em; }
+  .lead { color: var(--muted); font-size: 19px; max-width: 640px; margin: 0 auto 32px; }
+  .install {
+    display: inline-flex; align-items: center; gap: 12px; max-width: 100%;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 10px 10px 18px; font: 15px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .install code { overflow-x: auto; white-space: nowrap; }
+  .install code::before { content: "$ "; color: var(--muted); }
+  button {
+    flex: none; border: 1px solid var(--border); border-radius: 8px; background: #20243a;
+    color: var(--text); font: 600 13px/1 -apple-system, BlinkMacSystemFont, sans-serif;
+    padding: 9px 12px; cursor: pointer;
+  }
+  button:hover { background: #2a2f4b; }
+  .note { color: var(--muted); font-size: 14px; margin-top: 14px; }
+  .shot { margin: 48px auto 0; border-radius: 12px; overflow: hidden; border: 1px solid var(--border);
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55); }
+  .shot img { display: block; width: 100%; height: auto; }
+  section { padding: 64px 0 0; }
+  h2 { font-size: 26px; margin: 0 0 20px; letter-spacing: -0.01em; }
+  .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .feature { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .feature h3 { margin: 0 0 6px; font-size: 17px; }
+  .feature p { margin: 0; color: var(--muted); font-size: 15px; }
+  .steps { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); margin-top: 16px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+    overflow-x: auto; font: 14px/1.5 ui-monospace, "SF Mono", Menlo, monospace; margin: 0; }
+  .steps p { margin: 0; color: var(--muted); }
+  footer { color: var(--muted); font-size: 14px; text-align: center; padding: 64px 0 40px; }
+</style>
+</head>
+<body>
+<main>
+  <nav>
+    <a class="brand" href="./"><img src="icon.svg" alt="">agentZ</a>
+    <div class="links">
+      <a href="https://github.com/ahrorbeksoft/agentZ/releases/latest">Releases</a>
+      <a href="https://github.com/ahrorbeksoft/agentZ">GitHub</a>
+    </div>
+  </nav>
+
+  <header>
+    <img src="icon.svg" alt="agentZ icon">
+    <h1>Coding agents on every machine,<br>in one Mac app.</h1>
+    <p class="lead">agentZ runs Claude Code, Codex, Gemini, OpenCode and every other
+      <a href="https://agentclientprotocol.com">ACP</a> agent side by side, across your projects,
+      your Mac and your Linux servers, with real terminals next to them.</p>
+    <div class="install">
+      <code id="command">curl -fsSL https://ahrorbeksoft.github.io/agentZ/install.sh | sh</code>
+      <button type="button" id="copy">Copy</button>
+    </div>
+    <p class="note">Run it in Terminal on a Mac to install the app, or on a Linux machine to install its server.
+      Run it again to update.</p>
+    <div class="shot"><img src="screenshot.png" alt="agentZ: threads in the sidebar, an agent's turn with an edit and a command" width="1995" height="1074"></div>
+  </header>
+
+  <section>
+    <h2>What it does</h2>
+    <div class="features">
+      <div class="feature"><h3>Any ACP agent</h3><p>Install agents from the ACP Registry in a click, or add your own command. Log in the way each agent offers.</p></div>
+      <div class="feature"><h3>Threads across projects</h3><p>Every conversation is a thread in the sidebar, with its project, branch and status. Pin, search and archive them.</p></div>
+      <div class="feature"><h3>Your other machines</h3><p>Add a Mac or a Linux server over SSH. agentZ installs its server there and offers each update.</p></div>
+      <div class="feature"><h3>Agents keep running</h3><p>A background server on each machine owns the agents, so quitting the app or losing the connection doesn't stop them.</p></div>
+      <div class="feature"><h3>Worktrees and pastures</h3><p>Give a thread its own git worktree, or an instant copy-on-write copy of the project, and bring the work back.</p></div>
+      <div class="feature"><h3>Real terminals</h3><p>Terminals, split panes and workspaces beside the agents, and agent CLIs that run in a terminal.</p></div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <pre>curl -fsSL https://ahrorbeksoft.github.io/agentZ/install.sh | sh</pre>
+    <div class="steps">
+      <p><strong>On a Mac</strong> (Apple silicon or Intel, macOS 10.15.7 or later), it installs agentZ.app
+        in /Applications.</p>
+      <p><strong>On Linux</strong> (x86_64 or arm64), it installs agentz-server, so you can add the machine from
+        the app over SSH. The app also installs it on its own when you add a machine.</p>
+    </div>
+    <p class="note">Prefer to download it yourself? Every build is on the
+      <a href="https://github.com/ahrorbeksoft/agentZ/releases/latest">releases page</a>, with SHA256SUMS.
+      The app isn't notarized by Apple, so a copy downloaded with a browser needs
+      <code>xattr -dr com.apple.quarantine /Applications/agentZ.app</code> before it opens.</p>
+  </section>
+
+  <footer>
+    agentZ is free and open source, built on <a href="https://zed.dev">Zed</a>'s GPUI.
+    <a href="https://github.com/ahrorbeksoft/agentZ">Source on GitHub</a>.
+  </footer>
+</main>
+<script>
+  const button = document.getElementById("copy");
+  button.addEventListener("click", async () => {
+    await navigator.clipboard.writeText(document.getElementById("command").textContent);
+    button.textContent = "Copied";
+    setTimeout(() => (button.textContent = "Copy"), 1500);
+  });
+</script>
+</body>
+</html>

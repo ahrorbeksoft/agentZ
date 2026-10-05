@@ -86,8 +86,26 @@ agentZ's own crates. Everything else in `crates/` is copied from Zed at the same
 | `text_input` | The single-line text field. |
 | `theme_json` | The bundled JSON themes in `assets/themes`. |
 
-`tooling/bundle-mac.sh` makes `target/bundle/agentZ.app`; `tooling/build-remote-servers.sh`
-cross-builds the Linux servers.
+`tooling/bundle-mac.sh` makes `target/bundle/agentZ.app` with the icon
+(`crates/app/resources/app-icon.svg`, rendered to `app-icon.png`, which the script turns into
+`AppIcon.icns`); `--universal` is the published build, Apple silicon and Intel joined with lipo.
+`tooling/build-remote-servers.sh` cross-builds the Linux servers.
+
+### Releases and installing
+
+- **Releases** (`.github/workflows/release.yml`): a `v<version>` tag matching
+  `crates/app/Cargo.toml` builds the Linux servers, then the universal app with them in its
+  resources, and publishes a GitHub release with `agentZ-macos.zip`,
+  `agentz-server-<rust target>`, `install.sh` and `SHA256SUMS`. There's no update server: the
+  app carries every machine's server, so remote ones update over SSH (Machines over SSH below).
+- **Installing** (`site/install.sh`, served at `https://ahrorbeksoft.github.io/agentZ/install.sh`):
+  takes the latest release (or `AGENTZ_VERSION`) and checks it against `SHA256SUMS`. On a Mac it
+  puts `agentZ.app` in `/Applications` (curl doesn't quarantine it, so the ad-hoc signature is
+  enough). On Linux it puts the server where the app installs it over SSH,
+  `~/.agentz/server/<version>/agentz-server` with its `.sha256`, so the app finds it in place,
+  and links it from `~/.local/bin`.
+- **Website** (`site/`, `.github/workflows/pages.yml`): the landing page on GitHub Pages,
+  published when `site/` changes.
 
 ### Data
 
