@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinned Threads Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="pins" data-title="Pinned threads">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Pinned threads <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>Pinning keeps a thread at the top of the Agents sidebar until you unpin or archive it, as in t3code. What it does is settled: <b>Pin</b> and <b>Unpin</b> in a card’s menu and the thread’s title menu (no shortcut); pinned cards on top in the order you give them, the newest pin first; cards that <b>drag</b> to reorder the pinned ones, and the rest too while the thread order is Newest first (in Latest activity those follow their activity); a card dragged among the pinned ones is pinned, a pinned one dragged out is unpinned; a card dropped on <b>Archived</b> is archived (which unpins it), and an archived row dragged up into the list is unarchived. Shells, drafts, Workspaces threads and agent CLI cards aren’t pinned; CLI cards still drag among the rest.</p>
+<p>This round is how that looks. t3code shows a muted pin on the card that unpins on click, nothing around the pinned cards at rest, and “Pinned” and “Active” labels only while a card is dragged, with a badge on the card saying what letting go does. agentZ’s workspace rows already drag by lifting: the row is raised and held where it was grabbed, and the rows it passes slide over. The mocks use the board’s demo world: storefront on this Mac, api on Devbox 1, two threads pinned.</p>`;
+</script>
+<script src="topics-pins.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
