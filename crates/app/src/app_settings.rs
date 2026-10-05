@@ -321,6 +321,10 @@ mod tests {
                 "Gruvbox Dark",
                 "JetBrains Dark",
                 "JetBrains Light",
+                "Catppuccin Latte",
+                "Catppuccin Frappé",
+                "Catppuccin Macchiato",
+                "Catppuccin Mocha",
             ] {
                 assert!(registry.get(name).is_ok(), "{name} isn't loaded");
             }

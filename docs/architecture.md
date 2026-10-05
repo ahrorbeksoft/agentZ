@@ -214,6 +214,7 @@ Each entry: what it does, where it lives, and where it comes from.
   picker sits in the header. Registry icons are single-color (`currentColor`), so they are
   drawn in the text color on a neutral tile.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
+  Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
 
 ### Agent threads
 
