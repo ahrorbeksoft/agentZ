@@ -782,6 +782,7 @@ impl SettingsPage {
                         cx,
                     ),
                     self.render_modifier_to_send_row(cx),
+                    self.render_show_thinking_row(cx),
                 ],
                 cx,
             ),
@@ -821,6 +822,26 @@ impl SettingsPage {
                     let enabled = *state == ToggleState::Selected;
                     app_settings.update(cx, |store, cx| {
                         store.update(|settings| settings.use_modifier_to_send = enabled, cx)
+                    })
+                })
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    /// Zed's "Thinking Display", as a switch between its expanded and collapsed modes.
+    fn render_show_thinking_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = self.app_settings.read(cx).settings().show_thinking;
+        let app_settings = self.app_settings.clone();
+        render_row(
+            "Show thinking",
+            "Whether the agent's thinking shows open in threads. Otherwise it's a Thinking row \
+             that opens on click.",
+            Switch::new("show-thinking", enabled.into())
+                .on_click(move |state, _, cx| {
+                    let enabled = *state == ToggleState::Selected;
+                    app_settings.update(cx, |store, cx| {
+                        store.update(|settings| settings.show_thinking = enabled, cx)
                     })
                 })
                 .into_any_element(),

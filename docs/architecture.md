@@ -220,8 +220,11 @@ Each entry: what it does, where it lives, and where it comes from.
   title with the thread folder stripped; a spinner while it runs, "Failed" when it fails, a
   chevron on hover. Every row starts closed and a click opens its output beside it (input,
   diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. Rows are
-  one dim gray (`work_row_color`, t3code's secondary label: muted at 75%) so they read apart
-  from messages (`design/thread-rows/`). Thinking is Zed's. In a finished turn, each run of two
+  one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
+  from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
+  "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
+  opening to the text; Settings › General's "Show thinking" (`AppSettings::show_thinking`, Zed's
+  `thinking_display` as expanded or collapsed) opens them all. In a finished turn, each run of two
   or more tool calls and thoughts between messages folds into one line that opens to them
   (t3code's work groups, `AgentView::folded_run`), saying what it did in t3code's words
   (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and performed 2 other

@@ -80,6 +80,9 @@ pub struct AppSettings {
     pub saved_layouts: Vec<SavedLayout>,
     /// Zed's `agent.use_modifier_to_send`: Cmd-Enter sends and Enter makes a new line.
     pub use_modifier_to_send: bool,
+    /// Thoughts show open in threads: Zed's `thinking_display` as `always_expanded`, where
+    /// otherwise it's `always_collapsed`.
+    pub show_thinking: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -102,6 +105,7 @@ impl Default for AppSettings {
             terminal_font_size: None,
             is_sidebar_hidden: false,
             use_modifier_to_send: false,
+            show_thinking: false,
             saved_layouts: Vec::new(),
         }
     }

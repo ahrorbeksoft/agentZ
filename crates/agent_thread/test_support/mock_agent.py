@@ -6,7 +6,8 @@ It answers initialize and session/new, and replies to every prompt by streaming
 A prompt of "mcp" starts the first stdio MCP server given in session/new (or
 session/load), calls its first tool, and replies "MCP: <tool result>"; "mcp <tool>
 <json arguments>" calls that tool instead. A prompt of "slow" streams
-"One two three four five" a word at a time, 200 ms apart. "write <path> <text>"
+"One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
+word at a time, 500 ms apart, then replies. "write <path> <text>"
 writes the text and a newline to the file, relative to the session's folder, and
 "delete <path>" removes it. "terminal <command>" runs the command in a client
 terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
@@ -466,6 +467,13 @@ for line in sys.stdin:
             for word in ["One", " two", " three", " four", " five"]:
                 update(params["sessionId"], text_chunk("agent_message_chunk", word))
                 time.sleep(0.2)
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "think":
+            for word in ["The", " receipt", " rounds", " once,", " so", " sum", " the", " items",
+                         " first", " and", " round", " at", " the", " end."]:
+                update(params["sessionId"], text_chunk("agent_thought_chunk", word))
+                time.sleep(0.5)
+            update(params["sessionId"], text_chunk("agent_message_chunk", "It sums first, then rounds once."))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "demo":
             session_id = params["sessionId"]

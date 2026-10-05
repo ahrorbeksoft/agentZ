@@ -27,11 +27,11 @@
       "also": []
     },
     "thinking": {
-      "pick": "B",
+      "pick": "A",
       "picks": [],
       "none": false,
       "comments": {},
-      "note": "",
+      "note": "Changed after the build (2026-10-05): \"Thinking\" shimmers by default, and a setting, Show thinking, shows the thinking block open.",
       "also": []
     },
     "user": {

@@ -26,13 +26,15 @@ Picked on the design board (`design/thread/`, see `design/README.md`). Each sect
 
 **A. A row with its line counts, opening to the diff** (from t3code): "Edited cart/total.ts +4 −2" as a compact row; a click opens the diff under it, the same diff as the card has today.
 
-## 4. Thinking: B. As it is
+## 4. Thinking: A. "Thinking" while it thinks, then a Thought row
 
 *The agent's work*
 
 **Today:** A "Thinking" row that opens to the agent's thoughts, shown while they stream.
 
-**B. As it is** (from Zed (today)): A Thinking block that shows the thoughts as they stream, height-limited, closed after.
+**A. "Thinking" while it thinks, then a Thought row** (from t3code): While the agent thinks, one "Thinking" line with a shimmer. After, a "Thought" row among the work rows (with how long), opening to the text.
+
+**Note:** Changed after the build (2026-10-05): "Thinking" shimmers by default, and a setting, Show thinking, shows the thinking block open.
 
 ## 5. Your messages: A. A bubble on the right
 

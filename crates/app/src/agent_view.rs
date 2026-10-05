@@ -23,8 +23,7 @@ use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, FollowMode, Hsla, KeyBinding, ListAlignment, ListState, Pixels, Point,
-    PromptLevel, ScrollHandle, Subscription, Task, Window, anchored, deferred, list,
-    pulsating_between,
+    PromptLevel, Subscription, Task, Window, anchored, deferred, list, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, WorkspaceKind};
@@ -222,11 +221,10 @@ pub struct AgentView {
     /// Whether the agent was working when the rows were last measured: a turn's runs fold as
     /// it ends.
     synced_working: bool,
-    /// Keeps a streaming thought scrolled to its newest text while it's height-limited.
-    thought_scroll_handles: HashMap<usize, ScrollHandle>,
+    /// Settings › General's "Show thinking", as the rows were last measured with it.
+    synced_show_thinking: bool,
     toggled_thoughts: HashSet<usize>,
     plan_expanded: bool,
-    edits_expanded: bool,
     /// Messages typed while the agent works; sent one at a time as each turn ends, like Zed.
     queued_messages: Vec<QueuedMessage>,
     /// The first queued message steers: the agent's turn ends once its current step is done.
@@ -334,6 +332,18 @@ impl AgentView {
                 this.sync_composer_placeholder(cx);
                 cx.notify()
             }),
+            // Settings › General's "Show thinking" opens or closes every thought.
+            cx.observe(
+                &crate::app_settings::AppSettingsStore::global(cx),
+                |this, settings, cx| {
+                    let show_thinking = settings.read(cx).settings().show_thinking;
+                    if show_thinking != this.synced_show_thinking {
+                        this.synced_show_thinking = show_thinking;
+                        this.list_state.remeasure();
+                        cx.notify();
+                    }
+                },
+            ),
             cx.observe(&store, |this, _, cx| {
                 this.sync_blocked_subthreads(cx);
                 this.load_changed_files(false, cx);
@@ -409,10 +419,12 @@ impl AgentView {
             toggled_tool_calls: HashSet::default(),
             opened_runs: HashSet::default(),
             synced_working: false,
-            thought_scroll_handles: HashMap::default(),
+            synced_show_thinking: crate::app_settings::AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .show_thinking,
             toggled_thoughts: HashSet::default(),
             plan_expanded: false,
-            edits_expanded: false,
             queued_messages: Vec::new(),
             steer_armed: false,
             mentions: HashMap::default(),
@@ -1006,12 +1018,8 @@ impl AgentView {
                 Entry::UserMessage(text) => {
                     self.sync_markdown((index, 0), without_handoff(text), cx);
                 }
-                Entry::AgentMessage(text) => {
+                Entry::AgentMessage(text) | Entry::AgentThought(text) => {
                     self.sync_markdown((index, 0), text, cx);
-                }
-                Entry::AgentThought(text) => {
-                    self.sync_markdown((index, 0), text, cx);
-                    self.thought_scroll_handles.entry(index).or_default();
                 }
                 Entry::ToolCall(tool_call) => {
                     for (part, text) in tool_call.text.iter().enumerate() {
@@ -2653,6 +2661,9 @@ impl AgentView {
             .into_any_element()
     }
 
+    /// A thought, as a row among the tool calls (t3code's reasoning row): "Thinking" with a
+    /// shimmer while the agent thinks, then "Thought", opening to the text. Settings › General's
+    /// "Show thinking" opens every thought by default (Zed's `thinking_display`).
     fn render_thinking_block(
         &self,
         index: usize,
@@ -2660,106 +2671,80 @@ impl AgentView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Like Zed: a thought that is still streaming is open but height-limited and follows
-        // the newest text; once done it collapses. Clicking flips the default.
-        let open_by_default = is_last && self.thread.read(cx).is_working();
-        let is_toggled = self.toggled_thoughts.contains(&index);
-        let is_open = open_by_default != is_toggled;
-        let is_constrained = open_by_default && !is_toggled;
-        let scroll_handle = self.thought_scroll_handles.get(&index).cloned();
-        if is_constrained && let Some(scroll_handle) = &scroll_handle {
-            scroll_handle.scroll_to_bottom();
-        }
-        let panel_background = cx.theme().colors().panel_background;
-        let header_group = SharedString::from(format!("thinking-header-{index}"));
-        let line_height = window.line_height();
+        let is_thinking = is_last && self.thread.read(cx).is_working();
+        let open_by_default = crate::app_settings::AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .show_thinking;
+        let is_open = open_by_default != self.toggled_thoughts.contains(&index);
+        let color = work_row_color(cx);
+        let row_group = SharedString::from(format!("thinking-row-{index}"));
+        let label = if is_thinking {
+            shimmering_label(("thinking-shimmer", index), "Thinking", color, cx).into_any_element()
+        } else {
+            div().child("Thought").into_any_element()
+        };
+        let row = h_flex()
+            .id(("thinking-block", index))
+            .debug_selector(|| format!("thinking-row-{index}"))
+            .group(row_group.clone())
+            .min_h(px(24.))
+            .gap_1p5()
+            .px_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.toggled_thoughts.remove(&index) {
+                    this.toggled_thoughts.insert(index);
+                }
+                cx.notify();
+            }))
+            .child(
+                h_flex().w(px(24.)).flex_none().justify_center().child(
+                    Icon::new(IconName::ToolThink)
+                        .size(IconSize::Small)
+                        .color(Color::Custom(color)),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(rems_from_px(13_f32))
+                    .text_color(color)
+                    .child(label),
+            )
+            .child(
+                div().flex_none().visible_on_hover(row_group).child(
+                    Icon::new(if is_open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                ),
+            );
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx);
+        // The thoughts under the row, their left border under its icon, their text where a
+        // tool call's output starts.
+        let thoughts = is_open.then(|| {
+            div()
+                .id(("thinking-content", index))
+                .debug_selector(|| format!("thinking-content-{index}"))
+                .ml(px(13.))
+                .pl(px(16.))
+                .py_1()
+                .border_l_1()
+                .border_color(Self::tool_card_border_color(cx))
+                .children(self.markdown((index, 0), style))
+        });
 
         v_flex()
-            .px_5()
-            .py_1p5()
-            .w_full()
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .id(("thinking-block", index))
-                            .group(&header_group)
-                            .w_full()
-                            .pr_1()
-                            .justify_between()
-                            .cursor_pointer()
-                            .child(
-                                h_flex()
-                                    .h(line_height - px(2.))
-                                    .gap_1p5()
-                                    .child(
-                                        Icon::new(IconName::ToolThink)
-                                            .size(IconSize::Small)
-                                            .color(Color::Custom(work_row_color(cx))),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(rems_from_px(13_f32))
-                                            .text_color(work_row_color(cx))
-                                            .child("Thinking"),
-                                    ),
-                            )
-                            .child(
-                                Disclosure::new(("thinking-disclosure", index), is_open)
-                                    .opened_icon(IconName::ChevronUp)
-                                    .closed_icon(IconName::ChevronDown)
-                                    .visible_on_hover(&header_group),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.toggled_thoughts.remove(&index) {
-                                    this.toggled_thoughts.insert(index);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .when(is_open, |this| {
-                        this.child(
-                            div()
-                                .when(is_constrained, |this| this.relative())
-                                .child(
-                                    div()
-                                        .id(("thinking-content", index))
-                                        .ml_1p5()
-                                        .pl_3p5()
-                                        .border_l_1()
-                                        .border_color(Self::tool_card_border_color(cx))
-                                        .when(is_constrained, |this| this.max_h_64())
-                                        .when_some(scroll_handle, |this, scroll_handle| {
-                                            this.track_scroll(&scroll_handle)
-                                        })
-                                        .overflow_hidden()
-                                        .children(self.markdown((index, 0), style)),
-                                )
-                                .when(is_constrained, |this| {
-                                    this.child(
-                                        div()
-                                            .absolute()
-                                            .inset_0()
-                                            .size_full()
-                                            .bg(gpui::linear_gradient(
-                                                180.,
-                                                gpui::linear_color_stop(
-                                                    panel_background.opacity(0.8),
-                                                    0.,
-                                                ),
-                                                gpui::linear_color_stop(
-                                                    panel_background.opacity(0.),
-                                                    0.1,
-                                                ),
-                                            ))
-                                            .block_mouse_except_scroll(),
-                                    )
-                                }),
-                        )
-                    }),
-            )
+            .mx_5()
+            .child(row)
+            .children(thoughts)
             .into_any_element()
     }
 
@@ -3344,111 +3329,6 @@ impl AgentView {
         )
     }
 
-    /// Files the agent changed in this thread, with line counts, like Zed's edits summary.
-    fn render_edits_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let mut files: Vec<(String, usize, usize)> = Vec::new();
-        for entry in self.thread.read(cx).entries() {
-            let Entry::ToolCall(tool_call) = entry else {
-                continue;
-            };
-            for diff in &tool_call.diffs {
-                let path = diff.path.to_string_lossy().into_owned();
-                let (added, removed) = diff.line_counts();
-                match files.iter_mut().find(|(existing, _, _)| *existing == path) {
-                    Some(file) => {
-                        file.1 += added;
-                        file.2 += removed;
-                    }
-                    None => files.push((path, added, removed)),
-                }
-            }
-        }
-        if files.is_empty() {
-            return None;
-        }
-        let cwd = self.thread.read(cx).cwd().clone();
-        let colors = cx.theme().colors();
-        let total_added: usize = files.iter().map(|(_, added, _)| added).sum();
-        let total_removed: usize = files.iter().map(|(_, _, removed)| removed).sum();
-        let expanded = self.edits_expanded;
-        let file_count = files.len();
-
-        let summary = h_flex()
-            .id("edits-summary")
-            .p_1()
-            .w_full()
-            .gap_1()
-            .cursor_pointer()
-            .when(expanded, |this| {
-                this.border_b_1().border_color(colors.border)
-            })
-            .child(Disclosure::new("edits-disclosure", expanded))
-            .child(
-                Label::new("Edits")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(if file_count == 1 {
-                    "1 file".to_string()
-                } else {
-                    format!("{file_count} files")
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
-            .child(div().flex_1())
-            .child(diff_stat(total_added, total_removed))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.edits_expanded = !this.edits_expanded;
-                cx.notify();
-            }));
-
-        Some(
-            v_flex()
-                .child(summary)
-                .when(expanded, |this| {
-                    this.child(
-                        v_flex()
-                            .id("edited-files")
-                            .max_h_40()
-                            .overflow_y_scroll()
-                            .children(files.into_iter().enumerate().map(
-                                |(index, (path, added, removed))| {
-                                    let display_path = std::path::Path::new(&path)
-                                        .strip_prefix(&cwd)
-                                        .map(|relative| relative.to_string_lossy().into_owned())
-                                        .unwrap_or(path);
-                                    h_flex()
-                                        .py_1()
-                                        .px_2()
-                                        .gap_2()
-                                        .bg(colors.editor_background)
-                                        .when(index + 1 < file_count, |this| {
-                                            this.border_b_1().border_color(colors.border)
-                                        })
-                                        .child(
-                                            Icon::new(IconName::File)
-                                                .size(IconSize::Small)
-                                                .color(Color::Muted),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .text_xs()
-                                                .text_color(colors.text_muted)
-                                                .child(display_path),
-                                        )
-                                        .child(diff_stat(added, removed))
-                                },
-                            )),
-                    )
-                })
-                .into_any_element(),
-        )
-    }
-
     fn render_queue_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.queued_messages.is_empty() {
             return None;
@@ -3673,7 +3553,6 @@ impl AgentView {
         let sections: Vec<AnyElement> = [
             self.render_agents_section(cx),
             self.render_plan_section(window, cx),
-            self.render_edits_section(cx),
             self.render_queue_section(cx),
         ]
         .into_iter()
@@ -5865,7 +5744,55 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
 /// The gray of a tool call's row: t3code's secondary label, the muted gray a quarter of the way
 /// toward the background, dimmer than the agent's messages.
 fn work_row_color(cx: &App) -> Hsla {
-    cx.theme().colors().text_muted.opacity(0.75)
+    let colors = cx.theme().colors();
+    // Opaque, since a text highlight keeps its text's alpha and the shimmer's band would only
+    // reach three quarters of the text color.
+    mix(colors.text_muted, colors.panel_background, 0.25)
+}
+
+/// t3code's `live-tool-shine`: a band of the text color sweeps across a label in the row's
+/// gray, every 2.2 seconds, while the work it names goes on.
+fn shimmering_label(
+    id: impl Into<ElementId>,
+    text: &'static str,
+    color: Hsla,
+    cx: &App,
+) -> impl IntoElement {
+    let bright = cx.theme().colors().text;
+    // Half the band's width, in characters: t3code's band is a little wider than "Thinking".
+    const HALF_BAND: f32 = 4.;
+    div().with_animation(
+        id,
+        Animation::new(Duration::from_millis(2200)).repeat(),
+        move |label, delta| {
+            let length = text.chars().count() as f32;
+            let center = -HALF_BAND + delta * (length + 2. * HALF_BAND);
+            let mut highlights = Vec::new();
+            for (position, (byte, character)) in text.char_indices().enumerate() {
+                let distance = (position as f32 + 0.5 - center).abs();
+                let strength = (1. - distance / HALF_BAND).max(0.);
+                let style = gpui::HighlightStyle {
+                    color: Some(mix(color, bright, strength)),
+                    ..Default::default()
+                };
+                highlights.push((byte..byte + character.len_utf8(), style));
+            }
+            label.child(gpui::StyledText::new(text).with_highlights(highlights))
+        },
+    )
+}
+
+/// The color `amount` of the way from `from` to `to`, alpha included: the row's gray is
+/// translucent, so blending over it would leave the band translucent too.
+fn mix(from: Hsla, to: Hsla, amount: f32) -> Hsla {
+    let (from, to) = (gpui::Rgba::from(from), gpui::Rgba::from(to));
+    let channel = |from: f32, to: f32| from + (to - from) * amount;
+    Hsla::from(gpui::Rgba {
+        r: channel(from.r, to.r),
+        g: channel(from.g, to.g),
+        b: channel(from.b, to.b),
+        a: channel(from.a, to.a),
+    })
 }
 
 /// Whether an entry is the agent's work between messages, which t3code groups: tool calls and
@@ -6500,6 +6427,42 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-call-row-1").is_some());
         assert!(cx.debug_bounds("tool-call-row-2").is_some());
+    }
+
+    /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.
+    #[gpui::test]
+    fn thoughts_are_closed_unless_show_thinking_is_on(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Total it".into()),
+                    Entry::AgentThought("Sum first, then round once.".into()),
+                ],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("thinking-row-1")
+            .expect("the thought's row");
+        assert!(cx.debug_bounds("thinking-content-1").is_none());
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thinking-content-1").is_some());
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thinking-content-1").is_none());
+
+        cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(|settings| settings.show_thinking = true, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thinking-content-1").is_some());
     }
 
     /// Zed's Steer: the turn ends once the tool call running is done, not before.
