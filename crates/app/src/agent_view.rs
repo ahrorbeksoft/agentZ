@@ -2605,6 +2605,20 @@ impl AgentView {
         let Range { start, end } = run;
         let toggle = cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
             if !this.opened_runs.remove(&start) {
+                // Its rows open as they first showed, also those opened before it folded on its
+                // own as the agent wrote after them.
+                let entries = this.thread.read(cx).entries();
+                for (index, entry) in entries.iter().enumerate().take(end).skip(start) {
+                    match entry {
+                        Entry::ToolCall(tool_call) => {
+                            this.toggled_tool_calls.remove(&tool_call.id);
+                        }
+                        Entry::AgentThought(_) => {
+                            this.toggled_thoughts.remove(&index);
+                        }
+                        _ => {}
+                    }
+                }
                 this.opened_runs.insert(start);
             }
             this.list_state.remeasure_items(start + 1..end + 1);
@@ -6578,6 +6592,61 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("work-run-4").is_some());
         assert!(cx.debug_bounds("tool-call-row-5").is_none());
+    }
+
+    /// A run opens with its rows closed, also those the user opened before it folded.
+    #[gpui::test]
+    fn a_run_opens_with_its_rows_closed(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let command = |id: &str| {
+            let mut entry = tool_call(acp::ToolCallStatus::Completed);
+            if let Entry::ToolCall(tool_call) = &mut entry {
+                tool_call.id = acp::ToolCallId::new(id.to_string());
+            }
+            entry
+        };
+        let click = |name: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx.debug_bounds(name).expect(name);
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    command("run-1"),
+                    command("run-2"),
+                    Entry::AgentThought("Both pass.".into()),
+                ],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+        });
+        cx.run_until_parked();
+
+        // Opened while the run shows its rows, then folded as the agent writes.
+        click("tool-call-row-1", cx);
+        click("thinking-row-3", cx);
+        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+        assert!(cx.debug_bounds("thinking-content-3").is_some());
+        thread.update(cx, |thread, cx| {
+            thread.push_entry_for_test(Entry::AgentMessage("They pass.".into()), cx)
+        });
+        cx.run_until_parked();
+        click("work-run-1", cx);
+        assert!(cx.debug_bounds("tool-call-row-1").is_some());
+        assert!(cx.debug_bounds("tool-call-output-1").is_none());
+        assert!(cx.debug_bounds("thinking-content-3").is_none());
+
+        // Opened inside the open run, which is then folded and opened again.
+        click("tool-call-row-2", cx);
+        assert!(cx.debug_bounds("tool-call-output-2").is_some());
+        click("work-run-1", cx);
+        assert!(cx.debug_bounds("tool-call-row-2").is_none());
+        click("work-run-1", cx);
+        assert!(cx.debug_bounds("tool-call-row-2").is_some());
+        assert!(cx.debug_bounds("tool-call-output-2").is_none());
     }
 
     /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.
