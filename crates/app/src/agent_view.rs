@@ -1,6 +1,7 @@
 //! The conversation with one agent. Layout, spacing and colors follow Zed's agent thread view
 //! (`agent_ui::conversation_view::thread_view`).
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -216,6 +217,11 @@ pub struct AgentView {
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
     /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
+    /// Finished runs of work the user opened, by their first entry.
+    opened_runs: HashSet<usize>,
+    /// Whether the agent was working when the rows were last measured: a turn's runs fold as
+    /// it ends.
+    synced_working: bool,
     /// Keeps a streaming thought scrolled to its newest text while it's height-limited.
     thought_scroll_handles: HashMap<usize, ScrollHandle>,
     toggled_thoughts: HashSet<usize>,
@@ -401,6 +407,8 @@ impl AgentView {
             synced_revisions: Vec::new(),
             markdowns: HashMap::default(),
             toggled_tool_calls: HashSet::default(),
+            opened_runs: HashSet::default(),
+            synced_working: false,
             thought_scroll_handles: HashMap::default(),
             toggled_thoughts: HashSet::default(),
             plan_expanded: false,
@@ -964,6 +972,7 @@ impl AgentView {
         } else if entry_count < previous {
             self.list_state.splice(entry_count + 1..previous + 1, 0);
             self.synced_revisions.truncate(entry_count);
+            self.opened_runs.clear();
         }
         for (index, revision) in revisions.iter().enumerate() {
             if self.synced_revisions.get(index) == Some(revision) {
@@ -976,6 +985,14 @@ impl AgentView {
             self.list_state.remeasure_items(index + 1..index + 2);
         }
         self.synced_revisions = revisions;
+        // As a turn starts or ends, its runs of work open or fold.
+        let is_working = self.thread.read(cx).is_working();
+        if is_working != self.synced_working {
+            self.synced_working = is_working;
+            let turn_start = current_turn_start(self.thread.read(cx).entries());
+            self.list_state
+                .remeasure_items(turn_start + 1..entry_count + 1);
+        }
         // The head and tail follow the thread's state.
         self.list_state.remeasure_items(0..1);
         self.list_state
@@ -2494,11 +2511,117 @@ impl AgentView {
                     })
                     .into_any_element()
             }
+            Entry::AgentThought(_) | Entry::ToolCall(_) | Entry::Plan => {
+                self.render_work_entry(index, entry, is_last, window, cx)
+            }
+        }
+    }
+
+    /// A tool call, thought or the plan's marker. In a finished turn, a run of them between
+    /// messages folds into one line, as t3code folds a work group: the line draws at the run's
+    /// first entry, and the rest draw nothing until it's opened.
+    fn render_work_entry(
+        &self,
+        index: usize,
+        entry: &Entry,
+        is_last: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let run = self.folded_run(index, cx);
+        let is_open = run
+            .as_ref()
+            .is_none_or(|run| self.opened_runs.contains(&run.start));
+        let element = is_open.then(|| match entry {
             Entry::AgentThought(_) => self.render_thinking_block(index, is_last, window, cx),
             Entry::ToolCall(tool_call) => self.render_tool_call(index, tool_call, window, cx),
             // In Zed the plan lives in the activity bar above the message editor.
-            Entry::Plan => div().into_any_element(),
+            _ => div().into_any_element(),
+        });
+        match run {
+            Some(run) if run.start == index => v_flex()
+                .w_full()
+                .child(self.render_work_run_header(run, is_open, cx))
+                .children(element)
+                .into_any_element(),
+            _ => element.unwrap_or_else(|| div().into_any_element()),
         }
+    }
+
+    /// The run of work `index` is in, if it folds: a finished turn's run of at least two tool
+    /// calls or thoughts. A lone one stays as it is, as in t3code, and so does the turn that's
+    /// running, whose rows show as they come.
+    fn folded_run(&self, index: usize, cx: &App) -> Option<Range<usize>> {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let run = work_run(entries, index)?;
+        if thread.is_working() && run.start >= current_turn_start(entries) {
+            return None;
+        }
+        let shown = entries[run.clone()]
+            .iter()
+            .filter(|entry| !matches!(entry, Entry::Plan))
+            .count();
+        let needs_confirmation = entries[run.clone()].iter().any(|entry| {
+            matches!(entry, Entry::ToolCall(tool_call)
+                if thread.permission_request(&tool_call.id).is_some())
+        });
+        (shown >= 2 && !needs_confirmation).then_some(run)
+    }
+
+    /// t3code's work group header: what the run did, opening to its rows.
+    fn render_work_run_header(
+        &self,
+        run: Range<usize>,
+        is_open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let color = work_row_color(cx);
+        let summary = summarize_work(&self.thread.read(cx).entries()[run.clone()]);
+        let Range { start, end } = run;
+        let toggle = cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+            if !this.opened_runs.remove(&start) {
+                this.opened_runs.insert(start);
+            }
+            this.list_state.remeasure_items(start + 1..end + 1);
+            cx.notify();
+        });
+        div()
+            .mx_5()
+            .py_1()
+            .child(
+                h_flex()
+                    .id(("work-run", start))
+                    .debug_selector(|| format!("work-run-{start}"))
+                    .min_h(px(24.))
+                    .gap_1p5()
+                    .px_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .on_click(toggle)
+                    .child(
+                        h_flex().w(px(24.)).flex_none().justify_center().child(
+                            Icon::new(if is_open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Custom(color)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(rems_from_px(13_f32))
+                            .text_color(color)
+                            .child(summary),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Zed's controls under a finished reply: copy it, jump to the prompt, jump to the top.
@@ -2574,12 +2697,12 @@ impl AgentView {
                                     .child(
                                         Icon::new(IconName::ToolThink)
                                             .size(IconSize::Small)
-                                            .color(Color::Muted),
+                                            .color(Color::Custom(work_row_color(cx))),
                                     )
                                     .child(
                                         div()
                                             .text_size(rems_from_px(13_f32))
-                                            .text_color(cx.theme().colors().text_muted)
+                                            .text_color(work_row_color(cx))
                                             .child("Thinking"),
                                     ),
                             )
@@ -2694,7 +2817,7 @@ impl AgentView {
             _ => IconName::ToolHammer,
         })
         .size(IconSize::Small)
-        .color(Color::Muted);
+        .color(Color::Custom(work_row_color(cx)));
         let row = h_flex()
             .id(("tool-call-row", index))
             .debug_selector(|| format!("tool-call-row-{index}"))
@@ -2836,21 +2959,21 @@ impl AgentView {
             (None, Some(relative(&tool_call.title)))
         };
         let subject = subject.unwrap_or_default();
+        // One dim gray for the whole row, so rows read apart from the agent's messages; the
+        // command keeps the code font.
         h_flex()
             .flex_1()
             .min_w_0()
             .gap_1()
             .text_size(rems_from_px(13_f32))
-            .text_color(cx.theme().colors().text_muted)
+            .text_color(work_row_color(cx))
             .children(verb.map(|verb| div().flex_none().child(verb)))
             .child(
                 div()
                     .min_w_0()
                     .truncate()
                     .when(verb.is_some(), |this| {
-                        this.font_buffer(cx)
-                            .text_size(rems_from_px(12_f32))
-                            .text_color(cx.theme().colors().text)
+                        this.font_buffer(cx).text_size(rems_from_px(12_f32))
                     })
                     .child(subject),
             )
@@ -5739,6 +5862,164 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
         )
 }
 
+/// The gray of a tool call's row: t3code's secondary label, the muted gray a quarter of the way
+/// toward the background, dimmer than the agent's messages.
+fn work_row_color(cx: &App) -> Hsla {
+    cx.theme().colors().text_muted.opacity(0.75)
+}
+
+/// Whether an entry is the agent's work between messages, which t3code groups: tool calls and
+/// thoughts. The plan's marker draws nothing, so it doesn't split a run.
+fn is_work(entry: &Entry) -> bool {
+    matches!(
+        entry,
+        Entry::ToolCall(_) | Entry::AgentThought(_) | Entry::Plan
+    )
+}
+
+/// The run of work the entry at `index` is in: every entry between the messages around it.
+fn work_run(entries: &[Entry], index: usize) -> Option<Range<usize>> {
+    if !entries.get(index).is_some_and(is_work) {
+        return None;
+    }
+    let start = entries[..index]
+        .iter()
+        .rposition(|entry| !is_work(entry))
+        .map_or(0, |position| position + 1);
+    let end = entries[index..]
+        .iter()
+        .position(|entry| !is_work(entry))
+        .map_or(entries.len(), |position| index + position);
+    Some(start..end)
+}
+
+/// Where the last turn's entries start: after the user's last message.
+fn current_turn_start(entries: &[Entry]) -> usize {
+    entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::UserMessage(_)))
+        .map_or(0, |position| position + 1)
+}
+
+/// What a kind of tool call did, as t3code names it in a work group's summary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkAction {
+    Read,
+    Edit,
+    Command,
+    CodeSearch,
+    Other,
+}
+
+impl WorkAction {
+    /// t3code's `toolGroupAction` for ACP's tool kinds.
+    fn of(tool_call: &ToolCall) -> Self {
+        match tool_call.kind {
+            acp::ToolKind::Read => Self::Read,
+            acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move => Self::Edit,
+            acp::ToolKind::Execute => Self::Command,
+            acp::ToolKind::Search => Self::CodeSearch,
+            _ if !tool_call.diffs.is_empty() => Self::Edit,
+            _ => Self::Other,
+        }
+    }
+
+    /// Commands and edits lead the summary; tools it can't name come last.
+    fn priority(self) -> u8 {
+        match self {
+            Self::Command | Self::Edit => 0,
+            Self::Read | Self::CodeSearch => 1,
+            Self::Other => 2,
+        }
+    }
+
+    fn label(self, tool_calls: &[&ToolCall]) -> String {
+        let plural = |count: usize, one: &str, many: &str| {
+            format!("{count} {}", if count == 1 { one } else { many })
+        };
+        match self {
+            Self::Read => format!("Read {}", plural(tool_calls.len(), "file", "files")),
+            Self::Edit => {
+                // Each file once, and an edit that names none as one.
+                let mut paths = HashSet::default();
+                let mut unnamed = 0;
+                for tool_call in tool_calls {
+                    if tool_call.diffs.is_empty() {
+                        unnamed += 1;
+                    }
+                    paths.extend(tool_call.diffs.iter().map(|diff| diff.path.clone()));
+                }
+                format!("Changed {}", plural(paths.len() + unnamed, "file", "files"))
+            }
+            Self::Command => format!("Ran {}", plural(tool_calls.len(), "command", "commands")),
+            Self::CodeSearch => {
+                format!(
+                    "Searched code {}",
+                    plural(tool_calls.len(), "time", "times")
+                )
+            }
+            Self::Other => format!("Used {}", plural(tool_calls.len(), "tool", "tools")),
+        }
+    }
+}
+
+/// What a run of work did, in t3code's words (`summarizeToolGroup`): at most two kinds of tool
+/// call, commands and edits first, in the order they came, and a count of the rest ("Read 2
+/// files, changed 2 files, and performed 2 other actions"). Thoughts count only when there's
+/// nothing else.
+fn summarize_work(entries: &[Entry]) -> String {
+    let mut groups: Vec<(WorkAction, Vec<&ToolCall>)> = Vec::new();
+    let mut thoughts = 0;
+    for entry in entries {
+        match entry {
+            Entry::ToolCall(tool_call) => {
+                let action = WorkAction::of(tool_call);
+                match groups.iter_mut().find(|(other, _)| *other == action) {
+                    Some((_, tool_calls)) => tool_calls.push(tool_call),
+                    None => groups.push((action, vec![tool_call])),
+                }
+            }
+            Entry::AgentThought(_) => thoughts += 1,
+            _ => {}
+        }
+    }
+    if groups.is_empty() {
+        return if thoughts == 1 {
+            "Thought".to_string()
+        } else {
+            format!("Thought (×{thoughts})")
+        };
+    }
+    let mut selected: Vec<usize> = (0..groups.len()).collect();
+    selected.sort_by_key(|&index| (groups[index].0.priority(), index));
+    selected.truncate(2);
+    selected.sort();
+    let mut labels: Vec<String> = selected
+        .iter()
+        .map(|&index| groups[index].0.label(&groups[index].1))
+        .collect();
+    let total: usize = groups.iter().map(|(_, tool_calls)| tool_calls.len()).sum();
+    let summarized: usize = selected.iter().map(|&index| groups[index].1.len()).sum();
+    let remaining = total - summarized;
+    if remaining > 0 {
+        labels.push(format!(
+            "Performed {remaining} other {}",
+            if remaining == 1 { "action" } else { "actions" }
+        ));
+    }
+    for label in labels.iter_mut().skip(1) {
+        if let Some(first) = label.get(..1) {
+            let lowered = first.to_lowercase();
+            label.replace_range(..1, &lowered);
+        }
+    }
+    match labels.as_slice() {
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] if !rest.is_empty() => format!("{}, and {last}", rest.join(", ")),
+        _ => labels.concat(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
@@ -6117,6 +6398,108 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-call-row-1").is_some());
+    }
+
+    fn work(id: &str, kind: acp::ToolKind, path: Option<&str>) -> Entry {
+        Entry::ToolCall(ToolCall {
+            id: acp::ToolCallId::new(id.to_string()),
+            title: id.to_string(),
+            kind,
+            status: acp::ToolCallStatus::Completed,
+            text: Vec::new(),
+            diffs: path
+                .map(|path| FileDiff {
+                    path: path.into(),
+                    old_text: None,
+                    new_text: "a\n".into(),
+                })
+                .into_iter()
+                .collect(),
+            locations: Vec::new(),
+            raw_input: None,
+            terminals: Vec::new(),
+        })
+    }
+
+    /// t3code's summary of a work group: two kinds, commands and edits first, then the rest.
+    #[test]
+    fn a_run_of_work_is_summarized_as_t3code_does() {
+        use acp::ToolKind::{Edit, Execute, Other, Read, Search};
+        let commands: Vec<Entry> = (0..5)
+            .map(|index| work(&format!("run-{index}"), Execute, None))
+            .collect();
+        assert_eq!(summarize_work(&commands), "Ran 5 commands");
+        assert_eq!(
+            summarize_work(&[
+                work("read-1", Read, None),
+                work("read-2", Read, None),
+                work("search", Search, None),
+            ]),
+            "Read 2 files and searched code 1 time"
+        );
+        // An edited file counts once.
+        assert_eq!(
+            summarize_work(&[
+                work("read-1", Read, None),
+                work("edit-1", Edit, Some("/a.ts")),
+                work("edit-2", Edit, Some("/a.ts")),
+                work("edit-3", Edit, Some("/b.ts")),
+                work("read-2", Read, None),
+                work("run", Execute, None),
+                work("search", Search, None),
+                work("other", Other, None),
+            ]),
+            "Changed 2 files, ran 1 command, and performed 4 other actions"
+        );
+        assert_eq!(
+            summarize_work(&[
+                Entry::AgentThought("Hmm".into()),
+                work("read", Read, None),
+                work("read-2", Read, None),
+            ]),
+            "Read 2 files"
+        );
+        assert_eq!(
+            summarize_work(&[
+                Entry::AgentThought("Hmm".into()),
+                Entry::AgentThought("Ah".into())
+            ]),
+            "Thought (×2)"
+        );
+    }
+
+    /// The thread round's fold: rows show while the turn runs, and once it ends they fold
+    /// into a line that opens to them.
+    #[gpui::test]
+    fn a_finished_turns_work_folds_into_a_line(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    work("run-1", acp::ToolKind::Execute, None),
+                    work("run-2", acp::ToolKind::Execute, None),
+                    Entry::AgentMessage("They pass.".into()),
+                ],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("work-run-1").is_none());
+        assert!(cx.debug_bounds("tool-call-row-2").is_some());
+
+        thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
+        cx.run_until_parked();
+        let header = cx.debug_bounds("work-run-1").expect("the folded run");
+        assert!(cx.debug_bounds("tool-call-row-1").is_none());
+        assert!(cx.debug_bounds("tool-call-row-2").is_none());
+
+        cx.simulate_click(header.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-row-1").is_some());
+        assert!(cx.debug_bounds("tool-call-row-2").is_some());
     }
 
     /// Zed's Steer: the turn ends once the tool call running is done, not before.

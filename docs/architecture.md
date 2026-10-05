@@ -219,8 +219,14 @@ Each entry: what it does, where it lives, and where it comes from.
   code font, "Edited" and the path (or "Edited N files") with +added −removed, or the agent's
   title with the thread folder stripped; a spinner while it runs, "Failed" when it fails, a
   chevron on hover. Every row starts closed and a click opens its output beside it (input,
-  diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. Thinking
-  is Zed's. The user's message is a bubble on the right with its time ("09:07", "yesterday at
+  diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. Rows are
+  one dim gray (`work_row_color`, t3code's secondary label: muted at 75%) so they read apart
+  from messages (`design/thread-rows/`). Thinking is Zed's. In a finished turn, each run of two
+  or more tool calls and thoughts between messages folds into one line that opens to them
+  (t3code's work groups, `AgentView::folded_run`), saying what it did in t3code's words
+  (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and performed 2 other
+  actions"); the running turn's rows show as they come, and a lone call stays a row. The
+  user's message is a bubble on the right with its time ("09:07", "yesterday at
   23:30") and Copy on hover. While a turn runs the footer says "Working for 12s"; under a
   finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
   (`ThreadState::sent_times` by entry, `finished_turns` by each turn's end entry), so they
