@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread Rows Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="thread-rows" data-title="Thread rows">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Thread rows <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>Tool-call rows and the agent's messages read alike. Since the thread round, each tool call is a compact one-line row, always shown ("Ran npm test"). But a row's command is drawn in the message text's bright color, at almost its size, and JetBrains Dark's muted gray (#b0b1b3) is close to its text color (#dfe1e5), so a run of rows looks like more paragraphs. Rows also sit right against the messages, with no space between.</p>
+<p>t3code draws every row in one dimmer gray, in the UI font, and keeps bright text for messages. The first topic is a row's text; the second is what sets a run of rows apart from the messages around it. The mocks replay the turn in your screenshot, in JetBrains Dark's colors, at the app's sizes (messages 14px, rows 24px tall).</p>`;
+</script>
+<script src="topics-thread-rows.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
