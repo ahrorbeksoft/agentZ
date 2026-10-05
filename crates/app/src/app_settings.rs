@@ -277,6 +277,7 @@ mod tests {
                 "Ayu Dark",
                 "Gruvbox Dark",
                 "JetBrains Dark",
+                "JetBrains Light",
             ] {
                 assert!(registry.get(name).is_ok(), "{name} isn't loaded");
             }
