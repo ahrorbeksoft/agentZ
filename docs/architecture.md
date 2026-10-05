@@ -559,8 +559,10 @@ since a thread's workspace is its checkout.
   the pointer out of the tab it goes back where it was at once, where letting go leaves it. The tab keeps the dropped layout until the server's arrives. Terminals keep their
   size while a pane is dragged, cut to the place they're shown in, and take their new size once
   it's dropped (`terminal_entity::hold_sizes`).
-  An ACP thread's pane has one header: the thread's title, agent and toolbar buttons
-  (`AgentView::render_toolbar_buttons`) beside the pane's own, so its toolbar is hidden there.
+  An ACP thread's pane has one header: the thread's title and agent, with Agent Options
+  (`AgentView::render_agent_options`) first among the pane's buttons, so its toolbar is hidden
+  there (`AgentView::show_in_pane`). It has no changes or terminal drawer in a pane: the
+  workspace has shells beside it.
   A terminal pane's header names what runs there (its agent, the command it was opened with,
   or the program in front of its shell) and where it is, within the workspace as
   "storefront/src" (`Pane::{program, folder}`, which the server looks up with agent detection

@@ -139,9 +139,11 @@ pub struct AgentView {
     focus_handle: FocusHandle,
     /// Archived threads stay readable but take no new messages until they're unarchived.
     is_archived: bool,
-    /// A workspace pane shows the title and this toolbar's buttons in its own header,
-    /// so the thread doesn't stack a second header under it.
-    shows_toolbar: bool,
+    /// In a workspace pane, the pane's header shows the title and the agent options, so the
+    /// thread doesn't stack a second header under it. There it has no terminal drawer, as
+    /// the workspace has shells beside it, and no changes, which the shell shows only beside
+    /// the Agents view's thread.
+    is_in_pane: bool,
     /// Whether the shell shows this thread's changes beside it.
     is_diff_open: bool,
     /// What the thread has changed, for the header's counts.
@@ -298,7 +300,7 @@ impl AgentView {
             thread,
             title,
             is_archived: false,
-            shows_toolbar: true,
+            is_in_pane: false,
             is_diff_open: false,
             changes: ChangeStat::default(),
             changed_files_asked_for: None,
@@ -698,8 +700,9 @@ impl AgentView {
             .into_any_element()
     }
 
-    pub fn hide_toolbar(&mut self, cx: &mut Context<Self>) {
-        self.shows_toolbar = false;
+    pub fn show_in_pane(&mut self, cx: &mut Context<Self>) {
+        self.is_in_pane = true;
+        self._changed_files_load = Task::ready(());
         cx.notify();
     }
 
@@ -724,6 +727,9 @@ impl AgentView {
     /// Asks the server what the thread has changed, after each turn and on
     /// reconnecting, or now when `force`d.
     fn load_changed_files(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.is_in_pane {
+            return;
+        }
         let completed_at = self
             .store
             .read(cx)
@@ -1606,11 +1612,8 @@ impl AgentView {
         });
     }
 
-    /// The changes, terminal and options buttons, also shown in a workspace pane's header.
-    pub(crate) fn render_toolbar_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let thread = self.thread.clone();
-        let view = cx.weak_entity();
-        let agent_name = self.agent_name(cx);
+    /// The changes, terminal and agent options buttons.
+    fn render_toolbar_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let changes = self.changes;
         let changes_tooltip: SharedString = match changes.files {
             0 => "Show Changes".into(),
@@ -1682,64 +1685,66 @@ impl AgentView {
                         button.child(indicator_dot(cx))
                     })
             })
-            .child(
-                // Zed's agent options: log in again, log out, or restart the agent.
-                PopoverMenu::new("thread-options")
-                    .menu(move |window, cx| {
+            .child(self.render_agent_options(cx))
+    }
+
+    /// Zed's agent options: log in again, log out, or restart the agent. A workspace pane's
+    /// header shows them too.
+    pub(crate) fn render_agent_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let thread = self.thread.clone();
+        let view = cx.weak_entity();
+        let agent_name = self.agent_name(cx);
+        PopoverMenu::new("thread-options")
+            .menu(move |window, cx| {
+                let thread = thread.clone();
+                let view = view.clone();
+                let agent_name = agent_name.clone();
+                let (has_auth_methods, supports_logout, can_reload) = {
+                    let thread = thread.read(cx);
+                    (
+                        !thread.auth_methods().is_empty(),
+                        thread.supports_logout() && thread.status() == &ConnectionStatus::Ready,
+                        !matches!(thread.status(), ConnectionStatus::Connecting),
+                    )
+                };
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if has_auth_methods {
+                        let thread = thread.clone();
+                        menu = menu.entry("Reauthenticate", None, move |_, cx| {
+                            thread.update(cx, |thread, cx| thread.reauthenticate(cx))
+                        });
+                    }
+                    if supports_logout {
                         let thread = thread.clone();
                         let view = view.clone();
                         let agent_name = agent_name.clone();
-                        let (has_auth_methods, supports_logout, can_reload) = {
-                            let thread = thread.read(cx);
-                            (
-                                !thread.auth_methods().is_empty(),
-                                thread.supports_logout()
-                                    && thread.status() == &ConnectionStatus::Ready,
-                                !matches!(thread.status(), ConnectionStatus::Connecting),
-                            )
-                        };
-                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            if has_auth_methods {
-                                let thread = thread.clone();
-                                menu = menu.entry("Reauthenticate", None, move |_, cx| {
-                                    thread.update(cx, |thread, cx| thread.reauthenticate(cx))
-                                });
-                            }
-                            if supports_logout {
-                                let thread = thread.clone();
-                                let view = view.clone();
-                                let agent_name = agent_name.clone();
-                                // Asks first: logging out affects every thread with the agent.
-                                menu = menu.entry("Log Out…", None, move |_, cx| {
-                                    let thread = thread.clone();
-                                    let request =
-                                        ConfirmRequest::logout(&agent_name, move |_, cx| {
-                                            thread.update(cx, |thread, cx| thread.logout(cx))
-                                        });
-                                    view.update(cx, |_, cx| {
-                                        cx.emit(AgentViewEvent::Confirm(request))
-                                    })
-                                    .log_err();
-                                });
-                            }
-                            if has_auth_methods || supports_logout {
-                                menu = menu.separator();
-                            }
-                            menu.when(can_reload, |menu| {
-                                let thread = thread.clone();
-                                menu.entry("Reload Agent", None, move |_, cx| {
-                                    thread.update(cx, |thread, cx| thread.reload(cx))
-                                })
-                            })
-                        }))
+                        // Asks first: logging out affects every thread with the agent.
+                        menu = menu.entry("Log Out…", None, move |_, cx| {
+                            let thread = thread.clone();
+                            let request = ConfirmRequest::logout(&agent_name, move |_, cx| {
+                                thread.update(cx, |thread, cx| thread.logout(cx))
+                            });
+                            view.update(cx, |_, cx| cx.emit(AgentViewEvent::Confirm(request)))
+                                .log_err();
+                        });
+                    }
+                    if has_auth_methods || supports_logout {
+                        menu = menu.separator();
+                    }
+                    menu.when(can_reload, |menu| {
+                        let thread = thread.clone();
+                        menu.entry("Reload Agent", None, move |_, cx| {
+                            thread.update(cx, |thread, cx| thread.reload(cx))
+                        })
                     })
-                    .trigger_with_tooltip(
-                        IconButton::new("thread-options-trigger", IconName::Ellipsis)
-                            .icon_size(IconSize::Small),
-                        Tooltip::text("Agent Options"),
-                    )
-                    .anchor(gpui::Anchor::TopRight),
+                }))
+            })
+            .trigger_with_tooltip(
+                IconButton::new("thread-options-trigger", IconName::Ellipsis)
+                    .icon_size(IconSize::Small),
+                Tooltip::text("Agent Options"),
             )
+            .anchor(gpui::Anchor::TopRight)
     }
 
     fn render_entry(
@@ -4117,7 +4122,7 @@ impl AgentView {
     /// which belongs to its machine.
     fn render_machine_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let machines = Machines::global(cx).read(cx);
-        if !machines.has_remotes() || !self.shows_toolbar {
+        if !machines.has_remotes() || self.is_in_pane {
             return None;
         }
         let store = self.store.read(cx);
@@ -4703,7 +4708,9 @@ impl Render for AgentView {
             .when(is_subthread, |this| this.track_focus(&self.focus_handle))
             .size_full()
             .bg(panel_background)
-            .on_action(cx.listener(Self::toggle_terminal_drawer))
+            .when(!self.is_in_pane, |this| {
+                this.on_action(cx.listener(Self::toggle_terminal_drawer))
+            })
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDrawerEdge>, _, cx| {
                     let available = event.bounds.size.height - MIN_CONVERSATION_HEIGHT;
@@ -4716,9 +4723,7 @@ impl Render for AgentView {
                     }
                 }),
             )
-            .when(self.shows_toolbar, |this| {
-                this.child(self.render_toolbar(cx))
-            })
+            .when(!self.is_in_pane, |this| this.child(self.render_toolbar(cx)))
             .when(!is_drawer_full_screen && is_new_thread, |this| {
                 this.child(self.render_new_thread(cx))
             })

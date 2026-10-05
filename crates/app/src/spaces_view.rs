@@ -1188,7 +1188,7 @@ impl SpacesView {
                             cx,
                         );
                         view.set_archived(is_archived, cx);
-                        view.hide_toolbar(cx);
+                        view.show_in_pane(cx);
                         if let Some(text) = composer_text {
                             view.set_composer_text(text, cx);
                         }
@@ -4615,9 +4615,9 @@ impl SpacesView {
         };
         let split_right = split_menu(Direction::Horizontal, cx);
         let split_down = split_menu(Direction::Vertical, cx);
-        let thread_buttons = match &view {
+        let agent_options = match &view {
             Some(PaneView::Agent(view)) => Some(view.update(cx, |view, cx| {
-                view.render_toolbar_buttons(cx).into_any_element()
+                view.render_agent_options(cx).into_any_element()
             })),
             _ => None,
         };
@@ -4666,15 +4666,15 @@ impl SpacesView {
             }))
             .children(status.map(|status| render_status_dot(status, cx)))
             .child(div().flex_1())
-            .children(thread_buttons)
             .child(
-                // An unfocused pane's own buttons wait for the pointer.
+                // An unfocused pane's buttons wait for the pointer.
                 h_flex()
                     .flex_none()
                     .gap_1p5()
                     .when(!is_focused, |buttons| {
                         buttons.visible_on_hover(header_group.clone())
                     })
+                    .children(agent_options)
                     .child(split_right)
                     .child(split_down)
                     .when(shows_focus || is_zoomed, |buttons| {
