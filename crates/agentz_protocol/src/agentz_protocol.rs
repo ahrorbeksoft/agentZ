@@ -558,6 +558,9 @@ pub enum Request {
     AgentIcons(Vec<IconId>),
     UpdateAgentSettings {
         agent_id: AgentId,
+        /// The account whose settings change, `None` being the External one: the agent's.
+        #[serde(default)]
+        account: Option<AccountId>,
         change: AgentSettingsChange,
     },
     /// A new agentZ account for the agent, logged out until it logs in:

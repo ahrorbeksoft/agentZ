@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, Attachments, ThreadMessage, ThreadView};
+use agentz_protocol::accounts::AccountId;
 use agentz_protocol::agents::{
     AgentId, AgentListing, AgentSettings, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
@@ -913,7 +914,7 @@ impl Server {
                 self.client(client)?;
                 let login_session_id = self.next_login_session_id;
                 self.next_login_session_id += 1;
-                let command = self.agent_command(&agent_id, false);
+                let command = self.agent_command(&agent_id, None, false);
                 let command = self
                     .with_browser_programs(command, ConnectionId::LoginSession(login_session_id));
                 let (thread, inbox) = AgentThread::start_for_login_session(
@@ -967,31 +968,35 @@ impl Server {
                     .filter_map(|id| self.registry.icon(id).cloned())
                     .collect(),
             )),
-            Request::UpdateAgentSettings { agent_id, change } => {
-                match change {
-                    AgentSettingsChange::SetEnv(env) => self
-                        .agent_settings
-                        .update(&agent_id, |settings| settings.env = env),
-                    AgentSettingsChange::SetLoginMethod(method) => self
-                        .agent_settings
-                        .update(&agent_id, |settings| settings.login_method = method),
-                    AgentSettingsChange::SetDefaultConfigOption { config_id, value } => self
-                        .agent_settings
-                        .update(&agent_id, |settings| match value {
-                            Some(value) => {
-                                settings.default_config_options.insert(config_id, value);
-                            }
-                            None => {
-                                settings.default_config_options.remove(&config_id);
-                            }
-                        }),
-                    AgentSettingsChange::SetDefaultMode(mode) => self
-                        .agent_settings
-                        .update(&agent_id, |settings| settings.default_mode = mode),
-                    AgentSettingsChange::Unknown(change) => {
-                        return Err(anyhow!("unsupported agent settings change: {change}"));
-                    }
+            Request::UpdateAgentSettings {
+                agent_id,
+                account,
+                change,
+            } => {
+                if let Some(id) = account {
+                    self.accounts
+                        .get(&agent_id)
+                        .account(id)
+                        .context("there's no such account")?;
                 }
+                if let AgentSettingsChange::Unknown(change) = &change {
+                    return Err(anyhow!("unsupported agent settings change: {change}"));
+                }
+                self.update_account_settings(&agent_id, account, |settings| match change {
+                    AgentSettingsChange::SetEnv(env) => settings.env = env,
+                    AgentSettingsChange::SetLoginMethod(method) => settings.login_method = method,
+                    AgentSettingsChange::SetDefaultConfigOption { config_id, value } => match value
+                    {
+                        Some(value) => {
+                            settings.default_config_options.insert(config_id, value);
+                        }
+                        None => {
+                            settings.default_config_options.remove(&config_id);
+                        }
+                    },
+                    AgentSettingsChange::SetDefaultMode(mode) => settings.default_mode = mode,
+                    AgentSettingsChange::Unknown(_) => {}
+                });
                 Ok(Response::Ok)
             }
             request @ (Request::AddAccount(_)
@@ -1313,7 +1318,8 @@ impl Server {
                 "This thread has no agent.",
             ));
         };
-        let mut command = self.agent_command(&agent_id, true);
+        let account = thread.account;
+        let mut command = self.agent_command(&agent_id, account, true);
         let mut mcp_servers = Vec::new();
         if let Some(control) = self.agent_control.clone() {
             let token = uuid::Uuid::new_v4().to_string();
@@ -1378,7 +1384,7 @@ impl Server {
         agent_thread.set_attachments(Attachments::for_thread(&self.data_dir, thread_id));
         let (queued_messages, steering) = self.queues.state(thread_id);
         agent_thread.set_queued_messages(queued_messages, steering);
-        agent_thread.set_defaults(self.agent_settings.get(&agent_id).session_defaults());
+        agent_thread.set_defaults(self.account_settings(&agent_id, account).session_defaults());
         let connection = ConnectionId::Thread(thread_id);
         self.forward(inbox, move |message| Input::Thread(connection, message));
         Ok(agent_thread)
@@ -1662,15 +1668,21 @@ impl Server {
             || self.has_running_agent_terminal(thread_id)
     }
 
-    /// The command that starts the agent, with the environment from its settings. Threads
-    /// opened right after launch wait for the registry to load.
-    fn agent_command(&mut self, agent_id: &AgentId, when_loaded: bool) -> CommandFuture {
+    /// The command that starts the agent, with the environment from the account's settings
+    /// (`None` being the External account). Threads opened right after launch wait for the
+    /// registry to load.
+    fn agent_command(
+        &mut self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        when_loaded: bool,
+    ) -> CommandFuture {
         let command = match self.custom_agents.get(agent_id) {
             Some(agent) => futures::future::ready(Ok(agent.command.clone())).boxed(),
             None if when_loaded => self.registry.command_when_loaded(agent_id),
             None => self.registry.command(agent_id),
         };
-        let env = self.agent_settings.get(agent_id).env;
+        let env = self.account_settings(agent_id, account).env;
         async move {
             let mut command = command.await?;
             command.env.extend(env);
@@ -1711,30 +1723,26 @@ impl Server {
         .boxed()
     }
 
-    /// Applies what the thread reports to the projects and agent settings.
+    /// Applies what the thread reports to the projects and its account's settings.
     fn thread_changed(&mut self, connection: ConnectionId) {
         self.changed_connections.insert(connection);
-        let (thread, agent_id, on_external_account) = match connection {
+        let (thread, agent_id, account) = match connection {
             ConnectionId::Thread(thread_id) => {
                 let record = self.projects.thread(thread_id);
                 let agent_id = record
                     .and_then(|thread| thread.agent_id.clone())
                     .map(AgentId::new);
-                let on_external_account = record.is_some_and(|thread| thread.account.is_none());
-                (
-                    self.threads.get_mut(&thread_id),
-                    agent_id,
-                    on_external_account,
-                )
+                let account = record.and_then(|thread| thread.account);
+                (self.threads.get_mut(&thread_id), agent_id, account)
             }
             ConnectionId::LoginSession(login_session_id) => {
                 match self.login_sessions.get_mut(&login_session_id) {
                     Some(login_session) => (
                         Some(&mut login_session.thread),
                         Some(login_session.agent_id.clone()),
-                        true,
+                        None,
                     ),
-                    None => (None, None, false),
+                    None => (None, None, None),
                 }
             }
         };
@@ -1767,13 +1775,13 @@ impl Server {
                     self.projects.set_draft(thread_id, false);
                     self.draft_due.remove(&thread_id);
                 }
-                // As in Zed, the user's last choice becomes the agent's default.
+                // As in Zed, the user's last choice becomes the default, here the account's.
                 (
                     ConnectionId::Thread(_),
                     AgentThreadEvent::ConfigOptionChanged(config_id, value),
                 ) => {
                     if let Some(agent_id) = &agent_id {
-                        self.agent_settings.update(agent_id, |settings| {
+                        self.update_account_settings(agent_id, account, |settings| {
                             settings
                                 .default_config_options
                                 .insert(config_id.0.to_string(), value);
@@ -1782,27 +1790,29 @@ impl Server {
                 }
                 (ConnectionId::Thread(_), AgentThreadEvent::ModeChanged(mode)) => {
                     if let Some(agent_id) = &agent_id {
-                        self.agent_settings
-                            .update(agent_id, |settings| settings.default_mode = Some(mode));
+                        self.update_account_settings(agent_id, account, |settings| {
+                            settings.default_mode = Some(mode)
+                        });
                     }
                 }
                 // What agentZ logged in, until the agent is logged out or in again elsewhere.
                 (_, AgentThreadEvent::LoggedIn(method)) => {
                     if let Some(agent_id) = &agent_id {
-                        self.agent_settings
-                            .update(agent_id, |settings| settings.logged_in(method.to_string()));
+                        self.update_account_settings(agent_id, account, |settings| {
+                            settings.logged_in(method.to_string())
+                        });
                     }
                 }
                 (_, AgentThreadEvent::LoggedOut) => {
                     if let Some(agent_id) = &agent_id {
-                        self.agent_settings
-                            .update(agent_id, AgentSettings::logged_out);
+                        self.update_account_settings(agent_id, account, AgentSettings::logged_out);
                     }
                 }
                 (_, AgentThreadEvent::AccountReported(status)) => {
                     if let Some(agent_id) = &agent_id {
-                        self.agent_settings
-                            .update(agent_id, |settings| settings.account_reported(&status));
+                        self.update_account_settings(agent_id, account, |settings| {
+                            settings.account_reported(&status)
+                        });
                     }
                 }
                 (ConnectionId::Thread(_), AgentThreadEvent::Paused) => paused = true,
@@ -1829,18 +1839,17 @@ impl Server {
         if let (ConnectionId::Thread(thread_id), Some(model)) = (connection, model) {
             self.projects.set_thread_model(thread_id, model);
         }
-        // And so the agent's settings can list its options without starting it.
+        // And so the account's settings can list its options without starting it.
         if let Some(agent_id) = &agent_id
             && (!config_options.is_empty() || modes.is_some())
         {
-            self.agent_settings.update(agent_id, |settings| {
+            self.update_account_settings(agent_id, account, |settings| {
                 settings.known_config_options = config_options;
                 settings.known_modes = modes;
             });
         }
         // The External account is listed while the normal home is logged in.
-        if let (Some(agent_id), Some(logged_in), true) = (&agent_id, logged_in, on_external_account)
-        {
+        if let (Some(agent_id), Some(logged_in), None) = (&agent_id, logged_in, account) {
             self.accounts.update(agent_id, |accounts| {
                 accounts.external_logged_in = Some(logged_in)
             });

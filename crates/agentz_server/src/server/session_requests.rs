@@ -17,7 +17,7 @@ const UNTITLED_SESSION_TITLE: &str = "Imported thread";
 
 impl Server {
     pub(super) fn list_agent_sessions(&mut self, client: ClientId, id: u64, agent_id: AgentId) {
-        let command = self.agent_command(&agent_id, true);
+        let command = self.agent_command(&agent_id, None, true);
         self.spawn_then(
             async move {
                 let listing = agent_thread::list_sessions(command).await?;

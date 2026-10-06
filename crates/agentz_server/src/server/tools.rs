@@ -653,7 +653,7 @@ impl Server {
             .iter()
             .filter(|agent| matches!(agent.install_state, InstallState::Installed { .. }))
             .map(|agent| {
-                let settings = self.agent_settings.get(agent.id());
+                let settings = self.new_thread_settings(agent.id());
                 let models = model_choices(&settings.known_config_options)
                     .map(|(_, choices, _)| {
                         choices
@@ -960,7 +960,7 @@ impl Server {
         let mode_option = select_choices(&caller_options, acp::SessionConfigOptionCategory::Mode)
             .map(|(config_id, _, current)| (config_id, current));
         let known_options = if caller_options.is_empty() {
-            self.agent_settings.get(&agent_id).known_config_options
+            self.new_thread_settings(&agent_id).known_config_options
         } else {
             caller_options
         };
@@ -1051,7 +1051,9 @@ impl Server {
         }
         let account = self.accounts.get(&spec.agent_id).new_thread_account();
         self.projects.set_thread_account(thread_id, account);
-        let mut defaults = self.agent_settings.get(&spec.agent_id).session_defaults();
+        let mut defaults = self
+            .account_settings(&spec.agent_id, account)
+            .session_defaults();
         for (config_id, value) in spec.model.iter().chain(&spec.mode_option) {
             defaults.config_options.retain(|(id, _)| id != config_id);
             defaults.config_options.push((

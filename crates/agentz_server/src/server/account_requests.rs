@@ -1,7 +1,8 @@
-//! Adding, removing and changing an agent's accounts, and the account a new thread runs on.
+//! Adding, removing and changing an agent's accounts, the account a new thread runs on, and
+//! each account's settings.
 
 use agentz_protocol::accounts::{AccountChoice, AccountId, AgentAccounts};
-use agentz_protocol::agents::AgentId;
+use agentz_protocol::agents::{AgentId, AgentSettings};
 use agentz_protocol::{Request, Response};
 use anyhow::{Context as _, Result, anyhow};
 
@@ -48,5 +49,46 @@ impl Server {
         choice: AccountChoice,
     ) -> Result<Option<AccountId>> {
         self.accounts.get(agent_id).choose(choice)
+    }
+
+    /// The account's settings: the agent's for the External account (`None`), which keeps what
+    /// was set before accounts. A removed account has none.
+    pub(super) fn account_settings(
+        &self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+    ) -> AgentSettings {
+        match account {
+            None => self.agent_settings.get(agent_id),
+            Some(id) => self
+                .accounts
+                .get(agent_id)
+                .account(id)
+                .map(|account| account.settings.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The settings of the account a new thread with `agent_id` runs on.
+    pub(super) fn new_thread_settings(&self, agent_id: &AgentId) -> AgentSettings {
+        let account = self.accounts.get(agent_id).new_thread_account();
+        self.account_settings(agent_id, account)
+    }
+
+    /// Changes the account's settings, if it's still there.
+    pub(super) fn update_account_settings(
+        &mut self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        change: impl FnOnce(&mut AgentSettings),
+    ) {
+        match account {
+            None => self.agent_settings.update(agent_id, change),
+            Some(id) => self.accounts.update(agent_id, |accounts| {
+                if let Some(account) = accounts.account_mut(id) {
+                    change(&mut account.settings);
+                }
+            }),
+        }
     }
 }

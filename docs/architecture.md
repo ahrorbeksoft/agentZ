@@ -126,8 +126,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `queues.json` | server | Each thread's queued messages, and whether the first one steers |
 | `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turn times |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
-| `agents/settings.json` | server | Per-agent env, defaults and known options |
-| `agents/accounts.json` | server | Each agent's agentZ accounts, its account for new threads, and the External account's choices and last login check |
+| `agents/settings.json` | server | Per-agent env, defaults and known options: the External account's |
+| `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, its account for new threads, and the External account's choices and last login check |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
 | `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests) |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
@@ -511,7 +511,12 @@ Each entry: what it does, where it lives, and where it comes from.
   accounts share no sessions. New threads take the account marked Use for New Threads, else the
   External one while the agent's normal home is logged in, as its threads and login sessions
   last found, else the first agentZ account. Removing an account deletes its folder,
-  `accounts/<agent id>/<account id>/`.
+  `accounts/<agent id>/<account id>/`. Each account has its own `AgentSettings` (environment,
+  defaults, the options it last offered, its login), since accounts of one agent don't get the
+  same models; the External account's are the agent's settings from before
+  (`Server::{account_settings, update_account_settings}`). A thread starts with its account's
+  defaults, and a choice made in it becomes its account's default. Agent control lists and
+  checks the options of the account a launched thread will run on.
 - **Logging out** (`confirm_dialog.rs`, t3code's dialogs): Log Out on the agent's page or in a
   thread's "…" menu first asks in a dialog in the shell's modal layer, since it stops every
   thread that shares the login. Uninstall asks in the same dialog.

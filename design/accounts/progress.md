@@ -23,12 +23,15 @@ Notes for whoever continues:
   login sessions on the External account update `external_logged_in`. Item 4 also has to stop
   an account's agents before `RemoveAccount` deletes its folder, and refuse to start a thread
   whose account was removed. The app ignores `Event::Accounts` until item 8 shows them.
+- Login sessions (the agent's Settings panel) are on the External account until item 4 gives
+  `OpenLoginSession` an account; the app's settings tabs edit the External account's settings
+  until item 9's account menu.
 
 | Order | § | Item | Status |
 |---|---|---|---|
 | 1 | | Rename `Account` and `ConnectionId::Account` to `LoginSession` | done |
 | 2 | | Accounts data: `accounts.json`, `AccountId`, a thread's account, the External account from the normal home's login check | done |
-| 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | |
+| 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | done |
 | 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | |
 | 5 | | Login checks from the description | |
 | 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | |
@@ -37,7 +40,7 @@ Notes for whoever continues:
 | 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | |
 | 10 | 12 | The account in the strip under the composer; the default account for new threads | |
 | 11 | 13 | The account's color on its threads' agent icon | |
-| 12 | 15 | Accounts in Continue with Another Agent | |
+| 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | |
 | 13 | 14 | The limit notice over the composer (Continue on another account first) | |
 | 14 | 16 | Settings › Usage, the composer gauge, limits in the account picker | |
 | 15 | | Wave 1: Claude | |

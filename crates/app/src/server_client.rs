@@ -375,6 +375,7 @@ impl ServerClient {
             self.send(
                 Request::UpdateAgentSettings {
                     agent_id: AgentId::new(agent_id.to_string()),
+                    account: None,
                     change,
                 },
                 cx,

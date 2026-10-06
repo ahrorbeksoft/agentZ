@@ -21,9 +21,10 @@ use agentz_protocol::terminal::{
 use agentz_protocol::thread::{ConnectionStatus, Entry, ThreadView};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
-    ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse, Event, MachineKind,
-    PROTOCOL_VERSION, PeerCheckout, PeerCheckouts, PeerMachine, Peers, PromptPart, Request,
-    Response, ServerMessage, ServerWelcome, ToolCaller, ToolResult, read_message, write_message,
+    AgentSettingsChange, ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse,
+    Event, MachineKind, PROTOCOL_VERSION, PeerCheckout, PeerCheckouts, PeerMachine, Peers,
+    PromptPart, Request, Response, ServerMessage, ServerWelcome, ToolCaller, ToolResult,
+    read_message, write_message,
 };
 use futures::FutureExt as _;
 use projects::{ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, WorkspaceKind};
@@ -1230,6 +1231,107 @@ async fn accounts_decide_where_new_threads_run() {
     let saved: serde_json::Value = serde_json::from_str(&saved).expect("json");
     assert_eq!(saved["mock"]["accounts"][0]["label"], "Work");
     assert_eq!(saved["mock"]["accounts"].as_array().map(Vec::len), Some(1));
+}
+
+/// Each account has its own defaults for new threads, and a choice made in a thread becomes
+/// its account's default. The External account's are the agent's settings from before.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_account_keeps_its_own_defaults() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let Response::AccountAdded(work) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    client
+        .ok(Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account: Some(work),
+            change: AgentSettingsChange::SetDefaultConfigOption {
+                config_id: "model".into(),
+                value: Some(acp::SessionConfigOptionValue::value_id("opus")),
+            },
+        })
+        .await;
+    assert!(
+        client
+            .request(Request::UpdateAgentSettings {
+                agent_id: mock.clone(),
+                account: Some(AccountId(99)),
+                change: AgentSettingsChange::SetDefaultMode(None),
+            })
+            .await
+            .is_err()
+    );
+    let create = async |client: &mut TestClient, account| match client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: AgentId::new("mock"),
+            workspace: Default::default(),
+            account,
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => thread_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+
+    let on_work = create(&mut client, AccountChoice::Account(work)).await;
+    let external = create(&mut client, AccountChoice::External).await;
+    client.wait_until_ready(on_work).await;
+    client.wait_until_ready(external).await;
+    let model = |client: &TestClient, thread_id| {
+        config_value(client.thread(ConnectionId::Thread(thread_id)), "model")
+    };
+    assert_eq!(model(&client, on_work).as_deref(), Some("opus"));
+    assert_eq!(model(&client, external).as_deref(), Some("sonnet"));
+
+    client
+        .ok(Request::SetConfigOption {
+            connection: ConnectionId::Thread(on_work),
+            config_id: acp::SessionConfigId::new("effort"),
+            value: acp::SessionConfigOptionValue::value_id("high"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| match event {
+                Event::Accounts(accounts) => accounts
+                    .get(&AgentId::new("mock"))
+                    .and_then(|accounts| accounts.account(work))
+                    .is_some_and(|account| {
+                        account
+                            .settings
+                            .default_config_options
+                            .contains_key("effort")
+                            && !account.settings.known_config_options.is_empty()
+                    }),
+                _ => false,
+            })
+        })
+        .await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let external_settings = session
+        .agent_settings
+        .get(&mock)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !external_settings
+            .default_config_options
+            .contains_key("effort")
+    );
+    assert!(
+        !external_settings
+            .default_config_options
+            .contains_key("model")
+    );
 }
 
 /// Codex's device-code login asks the client to open a URL (an elicitation) while
