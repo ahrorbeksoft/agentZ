@@ -31,7 +31,7 @@ impl Server {
     }
 
     /// Runs the account's login check, `None` being the External account.
-    fn check_login(&mut self, agent_id: &AgentId, account: Option<AccountId>) {
+    pub(super) fn check_login(&mut self, agent_id: &AgentId, account: Option<AccountId>) {
         match self.login_check(agent_id) {
             LoginCheck::Session => {
                 let login_session_id = self.open_login_session(agent_id.clone(), account, None);

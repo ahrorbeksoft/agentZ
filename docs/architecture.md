@@ -127,7 +127,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turn times |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
 | `agents/settings.json` | server | Per-agent env, defaults and known options: the External account's |
-| `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings and last login check, its account for new threads, and the External account's choices and last login check |
+| `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, last login check and last identity and limits read, its account for new threads, and the same for the External account |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
 | `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests), with how each keeps accounts, if it can |
 | `accounts/<agent id>/<account id>/` | server | An agentZ account's home: the agent's login, sessions and own settings files |
@@ -518,16 +518,20 @@ Each entry: what it does, where it lives, and where it comes from.
   its threads and login sessions found, or, where the agent's sessions open logged out too,
   its own status command (`accounts/login_checks.rs`), run as the agent's settings open and
   after each login or logout. As the server starts, it checks the normal home of each agent
-  with agentZ accounts, with an empty session of its own or the status command. An agentZ
-  account's agent runs in the account's
+  with agentZ accounts, with an empty session of its own or the status command. The agent's
+  reader (`accounts/readers.rs`) reads each account's identity and limits (`AccountStatus`,
+  kept with when it was read): when an app opens and every 5 minutes while one is, for the
+  accounts not read lately, a few seconds apart (`server/usage_reads.rs`); after each turn on
+  the account; and on demand (`Request::RefreshUsage`). A read that fails, or finds the
+  account logged out, keeps the last numbers. An agentZ account's agent runs in the account's
   folder, `accounts/<agent id>/<account id>/`, so every account is a process of its own with
   its own login and sessions: its threads, login sessions (`OpenLoginSession`) and session
   listing and import (`ListAgentSessions`, `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
   `accounts/droid.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the switches that keep
-  its login in a file rather than a shared keychain entry, the variables that log it in, and
-  its login check.
+  its login in a file rather than a shared keychain entry, the variables that log it in, its
+  login check and its reader.
   `Server::agent_command` builds the account's environment from the server's without those
   login variables (`AgentCommand::env_remove`; a terminal login runs through `env -u`), then
   the account's Environment, where a login variable set on purpose stays, then the home

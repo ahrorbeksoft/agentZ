@@ -4,6 +4,7 @@
 mod descriptions;
 mod droid;
 mod login_checks;
+mod readers;
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -17,6 +18,7 @@ use crate::agent_settings::{read_json, write_json};
 
 pub use descriptions::{AgentDescription, built_in as built_in_description};
 pub use login_checks::{LoginCheck, StatusCommand};
+pub use readers::{Reader, ReaderCommand};
 
 pub struct AccountStore {
     accounts: BTreeMap<AgentId, AgentAccounts>,

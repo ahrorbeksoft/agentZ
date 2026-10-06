@@ -6,7 +6,7 @@ use std::path::Path;
 use agentz_protocol::agents::AgentCommand;
 use serde::{Deserialize, Serialize};
 
-use super::LoginCheck;
+use super::{LoginCheck, Reader};
 
 /// How an agent keeps its login, sessions and settings in a folder agentZ chooses. A custom
 /// agent can have one in `agents/custom.json`, under `accounts`.
@@ -22,6 +22,8 @@ pub struct AgentDescription {
     /// Variables the agent takes as a login, which would override the account's own.
     pub login_variables: Vec<String>,
     pub login_check: LoginCheck,
+    /// How agentZ reads the account's identity and limits, if it can.
+    pub reader: Option<Reader>,
 }
 
 /// The description of a registry agent, by its id.
@@ -86,6 +88,7 @@ mod tests {
             file_storage: BTreeMap::from([("AGENT_KEYRING".into(), "file".into())]),
             login_variables: vec!["AGENT_API_KEY".into(), "GITHUB_TOKEN".into()],
             login_check: LoginCheck::Session,
+            reader: None,
         };
         let mut command = AgentCommand {
             env: [

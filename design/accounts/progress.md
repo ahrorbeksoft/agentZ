@@ -29,6 +29,11 @@ Notes for whoever continues:
   settings tabs edit the External account's settings, until items 8 and 9 add the menus.
 - Only agents with a description can have more accounts (`AddAccount` refuses the rest).
   Droid's is `accounts/droid.rs`; wave 1 and later agents each add one beside it.
+- Readers (item 6): the reads, their storage and refreshes are built, with the one kind the
+  mock needs (`Reader::Command`, printing agentZ's own JSON). Each other kind comes with the
+  first agent that needs it. Droid's (the hidden terminal, kind 5) waits for captured
+  `/status` and `/limits` screens to parse and test against: driving Droid's terminal UI on
+  the user's real login needs their go-ahead, since `/limits` holds a billing choice.
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -37,7 +42,7 @@ Notes for whoever continues:
 | 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | done |
 | 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | done |
 | 5 | | Login checks from the description | done |
-| 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | |
+| 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | in progress: all but Droid's reader |
 | 7 | | API-key accounts (Droid with a Factory API key) | |
 | 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | |
 | 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | |

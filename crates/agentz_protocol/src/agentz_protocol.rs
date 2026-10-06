@@ -582,6 +582,13 @@ pub enum Request {
         account: Option<AccountId>,
         change: AccountChange,
     },
+    /// Refresh Usage: reads the account's identity and limits now. The read arrives with
+    /// [`Event::Accounts`].
+    RefreshUsage {
+        agent_id: AgentId,
+        /// `None` is the External account.
+        account: Option<AccountId>,
+    },
     /// The conversations the agent keeps on this machine for one account (`None` being the
     /// External one), to import as threads, as Zed's thread import lists them:
     /// [`Response::AgentSessions`]. The agent starts only for this.

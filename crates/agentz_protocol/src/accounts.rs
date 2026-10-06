@@ -1,6 +1,8 @@
 //! An agent's accounts: its own login (the External account) and the logins made in agentZ,
 //! each in its own home folder, with its own sessions, history and settings.
 
+use std::time::SystemTime;
+
 use anyhow::{Context as _, Result};
 pub use projects::AccountId;
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,7 @@ pub struct AgentAccounts {
     /// Whether the agent's normal home was logged in when last checked. The External account is
     /// listed unless it wasn't.
     pub external_logged_in: Option<bool>,
+    pub external_status: Option<StatusRead>,
     /// The last id given out, so none is given twice.
     pub last_id: u64,
 }
@@ -37,6 +40,39 @@ pub struct Account {
     /// Whether its home was logged in when last checked.
     #[serde(default)]
     pub logged_in: Option<bool>,
+    #[serde(default)]
+    pub status: Option<StatusRead>,
+}
+
+/// An account's last identity and quota read. A read that fails leaves it, so the account
+/// keeps its last numbers, with when they were read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StatusRead {
+    pub status: AccountStatus,
+    pub read_at: SystemTime,
+}
+
+/// Who the account is and how much of its limits is used, as its agent's reader found.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountStatus {
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub plan: Option<String>,
+    /// Empty for a login with no usage to read (an API key, say).
+    pub windows: Vec<LimitWindow>,
+    /// What's left to spend beyond the plan's limits, as the agent words it ("$12.40").
+    pub credits: Option<String>,
+}
+
+/// One of an account's limits, such as the 5-hour or the weekly one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitWindow {
+    /// As the agent names it.
+    pub label: String,
+    pub used_percent: f64,
+    #[serde(default)]
+    pub resets_at: Option<SystemTime>,
 }
 
 /// What the user chooses for any account, the External one included.
@@ -133,8 +169,30 @@ impl AgentAccounts {
             choices: AccountChoices::default(),
             settings: AgentSettings::default(),
             logged_in: None,
+            status: None,
         });
         id
+    }
+
+    /// The account's last read, `None` being the External account.
+    pub fn status(&self, account: Option<AccountId>) -> Option<&StatusRead> {
+        match account {
+            None => self.external_status.as_ref(),
+            Some(id) => self.account(id).and_then(|account| account.status.as_ref()),
+        }
+    }
+
+    /// Keeps a read of `account`, `None` being the External one. A removed account is left
+    /// removed.
+    pub fn set_status(&mut self, account: Option<AccountId>, read: StatusRead) {
+        match account {
+            None => self.external_status = Some(read),
+            Some(id) => {
+                if let Some(account) = self.account_mut(id) {
+                    account.status = Some(read);
+                }
+            }
+        }
     }
 
     /// What the last login check found for `account`, `None` being the External one.

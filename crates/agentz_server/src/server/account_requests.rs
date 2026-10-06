@@ -58,6 +58,22 @@ impl Server {
                     .update(&agent_id, |accounts| accounts.change(account, change))?;
                 Ok(Response::Ok)
             }
+            Request::RefreshUsage { agent_id, account } => {
+                if let Some(id) = account {
+                    self.accounts
+                        .get(&agent_id)
+                        .account(id)
+                        .context("there's no such account")?;
+                }
+                let reader = self
+                    .account_description(&agent_id)
+                    .and_then(|description| description.reader)
+                    .with_context(|| {
+                        format!("agentZ can't read {}'s usage", self.agent_name(&agent_id))
+                    })?;
+                self.read_account(&agent_id, account, reader);
+                Ok(Response::Ok)
+            }
             request => Err(anyhow!("not an account request: {request:?}")),
         }
     }

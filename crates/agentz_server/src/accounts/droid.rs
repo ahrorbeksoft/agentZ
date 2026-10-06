@@ -15,5 +15,7 @@ pub(super) fn description() -> AgentDescription {
         login_variables: vec!["FACTORY_API_KEY".into()],
         // Logged out, `session/new` fails and offers a pairing code.
         login_check: LoginCheck::Session,
+        // `/status` and `/limits` in its terminal UI come with captured screens to test on.
+        reader: None,
     }
 }

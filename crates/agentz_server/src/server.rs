@@ -12,6 +12,7 @@ mod session_requests;
 mod space_requests;
 mod terminal_requests;
 mod tools;
+mod usage_reads;
 mod workspace_requests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -177,6 +178,8 @@ pub(crate) struct Server {
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     accounts: AccountStore,
+    /// The accounts whose identity and limits are being read.
+    reading_accounts: HashSet<(AgentId, Option<AccountId>)>,
     threads: HashMap<ThreadId, AgentThread>,
     login_sessions: HashMap<u64, LoginSession>,
     next_login_session_id: u64,
@@ -303,6 +306,7 @@ impl Server {
             registry,
             agent_settings,
             accounts,
+            reading_accounts: HashSet::default(),
             threads: HashMap::default(),
             login_sessions: HashMap::default(),
             next_login_session_id: 1,
@@ -397,6 +401,7 @@ impl Server {
         });
         server.refresh_git_heads();
         server.check_external_logins();
+        server.start_usage_refreshes();
         server
     }
 
@@ -654,7 +659,12 @@ impl Server {
         match request {
             Request::SubscribeSession => {
                 let client = self.client(client)?;
+                let first = !client.subscribed_to_session;
                 client.subscribed_to_session = true;
+                // An app opened: what wasn't read lately is read now, then every 5 minutes.
+                if first {
+                    self.refresh_usage();
+                }
                 Ok(Response::Session(SessionSnapshot {
                     projects: self.projects.snapshot(),
                     registry: self.registry_snapshot(),
@@ -998,7 +1008,8 @@ impl Server {
             }
             request @ (Request::AddAccount(_)
             | Request::RemoveAccount { .. }
-            | Request::UpdateAccount { .. }) => self.account_request(request),
+            | Request::UpdateAccount { .. }
+            | Request::RefreshUsage { .. }) => self.account_request(request),
             Request::ImportAgentSessions {
                 agent_id,
                 account,
@@ -1810,11 +1821,13 @@ impl Server {
         );
         let mut logged_in_or_out = false;
         let mut reported_login = None;
+        let mut turn_ended = false;
 
         for event in events {
             match (connection, event) {
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::WorkingChanged(working)) => {
-                    self.projects.set_thread_working(thread_id, working)
+                    self.projects.set_thread_working(thread_id, working);
+                    turn_ended |= !working;
                 }
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::SessionStarted(session)) => {
                     self.projects
@@ -1914,6 +1927,10 @@ impl Server {
                 logged_in_or_out,
                 reported_login,
             );
+            // The turn moved its account's limits.
+            if turn_ended {
+                self.read_account_if_it_can(agent_id, account);
+            }
         }
         if let ConnectionId::LoginSession(login_session_id) = connection
             && (logged_in.is_some() || failed)

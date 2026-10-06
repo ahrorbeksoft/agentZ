@@ -35,7 +35,9 @@ MOCK_HOME is its home, as FACTORY_HOME_OVERRIDE is Factory Droid's: with it set,
 MOCK_LOGIN_FILE asks for is the file `login` there instead. MOCK_API_KEY logs it in whatever
 the file says, as FACTORY_API_KEY does. Run with `--status`, it prints {"logged_in": …} and
 exits with 1 when logged out, as agents' own status commands do. With MOCK_OPENS_LOGGED_OUT
-set, sessions open while it's logged out, as Claude Agent's do.
+set, sessions open while it's logged out, as Claude Agent's do. Run with `--usage`, it prints
+what agentZ reads of an account: the email, plan and a 5-hour window, of which each reply in
+the home uses 10% (kept in `usage` in MOCK_HOME).
 
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
@@ -83,11 +85,35 @@ SESSIONS_FILE = os.environ.get("MOCK_SESSIONS_FILE")
 SESSIONS_PER_PAGE = 2
 # Prompts that run another prompt's script.
 SCRIPTS = json.loads(os.environ.get("MOCK_SCRIPTS") or "{}")
+# How much of its 5-hour limit the home has used, in percent: each reply uses 10.
+USAGE_FILE = os.path.join(os.environ["MOCK_HOME"], "usage") if os.environ.get("MOCK_HOME") else None
+
+
+def stored_login():
+    return bool(os.environ.get("MOCK_API_KEY")) or not LOGIN_FILE or os.path.exists(LOGIN_FILE)
+
+
+def used_percent():
+    try:
+        with open(USAGE_FILE) as file:
+            return int(file.read())
+    except (TypeError, OSError, ValueError):
+        return 0
+
 
 if sys.argv[-1] == "--status":
-    status = bool(os.environ.get("MOCK_API_KEY")) or not LOGIN_FILE or os.path.exists(LOGIN_FILE)
-    print(json.dumps({"logged_in": status}), flush=True)
-    sys.exit(0 if status else 1)
+    print(json.dumps({"logged_in": stored_login()}), flush=True)
+    sys.exit(0 if stored_login() else 1)
+
+if sys.argv[-1] == "--usage":
+    if not stored_login():
+        print(json.dumps({"logged_in": False}), flush=True)
+        sys.exit(0)
+    resets_at = {"secs_since_epoch": int(time.time()) + 3600, "nanos_since_epoch": 0}
+    print(json.dumps({"logged_in": True, "email": "mock@example.com", "plan": "Pro",
+                      "windows": [{"label": "5-hour", "used_percent": used_percent(),
+                                   "resets_at": resets_at}]}), flush=True)
+    sys.exit(0)
 
 if sys.argv[-1] == "--login":
     if os.environ.get("MOCK_BROWSER_OPEN"):
@@ -220,6 +246,9 @@ def finish_prompt(request_id, session_id, prompt_text, chosen=None):
     for text in steered:
         update(session_id, text_chunk("agent_message_chunk", f" (steered: {text})"))
     steered.clear()
+    if USAGE_FILE:
+        with open(USAGE_FILE, "w") as file:
+            file.write(str(min(used_percent() + 10, 100)))
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
@@ -238,11 +267,7 @@ def client_request(method, params):
 
 
 def logged_in():
-    if logged_out:
-        return False
-    if os.environ.get("MOCK_API_KEY"):
-        return True
-    return not LOGIN_FILE or os.path.exists(LOGIN_FILE)
+    return not logged_out and stored_login()
 
 
 def log_in():

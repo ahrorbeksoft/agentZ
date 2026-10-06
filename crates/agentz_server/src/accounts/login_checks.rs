@@ -8,8 +8,8 @@ use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// A status command still running by then is taken to have hung.
-const STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// A status or usage command still running by then is taken to have hung.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,27 +39,7 @@ pub struct StatusCommand {
 impl StatusCommand {
     /// Runs it with the environment `agent`, the account's agent command, has.
     pub async fn run(&self, agent: AgentCommand) -> Result<bool> {
-        let program = self
-            .program
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or(agent.path);
-        let mut command = tokio::process::Command::new(&program);
-        command
-            .args(&self.args)
-            .envs(&agent.env)
-            .current_dir(std::env::temp_dir())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        for variable in &agent.env_remove {
-            command.env_remove(variable);
-        }
-        let output = tokio::time::timeout(STATUS_COMMAND_TIMEOUT, command.output())
-            .await
-            .with_context(|| format!("{} didn't finish", program.display()))?
-            .with_context(|| format!("running {}", program.display()))?;
+        let output = run_with_account_env(self.program.as_deref(), &self.args, agent).await?;
         self.logged_in(&output)
     }
 
@@ -74,6 +54,32 @@ impl StatusCommand {
             found => bail!("its output has {found:?} at {pointer}"),
         }
     }
+}
+
+/// Runs `program` (else the agent's own) with `args` and the environment `agent`, the account's
+/// agent command, has.
+pub(super) async fn run_with_account_env(
+    program: Option<&str>,
+    args: &[String],
+    agent: AgentCommand,
+) -> Result<Output> {
+    let program = program.map(PathBuf::from).unwrap_or(agent.path);
+    let mut command = tokio::process::Command::new(&program);
+    command
+        .args(args)
+        .envs(&agent.env)
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    for variable in &agent.env_remove {
+        command.env_remove(variable);
+    }
+    tokio::time::timeout(COMMAND_TIMEOUT, command.output())
+        .await
+        .with_context(|| format!("{} didn't finish", program.display()))?
+        .with_context(|| format!("running {}", program.display()))
 }
 
 #[cfg(test)]

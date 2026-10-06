@@ -299,6 +299,7 @@ fn mock_accounts() -> crate::AgentDescription {
         file_storage: BTreeMap::new(),
         login_variables: vec!["MOCK_API_KEY".into()],
         login_check: crate::LoginCheck::Session,
+        reader: None,
     }
 }
 
@@ -1718,6 +1719,124 @@ async fn status_commands_check_logins_where_sessions_open_logged_out() {
         .wait_until(|client| client.account_logged_in(Some(work)) == Some(false))
         .await;
     assert_eq!(client.account_logged_in(None), Some(true));
+}
+
+/// Each account's identity and limits are read with its agent's reader: as an app opens, after
+/// each turn on the account, and on demand. A logged-out account keeps what was read before.
+#[tokio::test(flavor = "multi_thread")]
+async fn accounts_read_their_identity_and_limits() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let external_login = data_dir.path().join("external-login");
+    std::fs::write(&external_login, "").expect("log in the normal home");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        external_login.to_string_lossy().into_owned(),
+    );
+    let mut usage_args = command.args.clone();
+    usage_args.push("--usage".into());
+    let description = crate::AgentDescription {
+        reader: Some(crate::Reader::Command(crate::ReaderCommand {
+            program: Some(command.path.to_string_lossy().into_owned()),
+            args: usage_args,
+        })),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    let home = data_dir.path().join("accounts/mock").join(work.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's home");
+    std::fs::write(home.join("login"), "").expect("log in the account");
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    let used = |client: &TestClient, account| {
+        client.accounts("mock").status(account).and_then(|read| {
+            read.status
+                .windows
+                .first()
+                .map(|window| window.used_percent)
+        })
+    };
+
+    // An app opened, so every account is read.
+    client.ok(Request::SubscribeSession).await;
+    client
+        .wait_until(|client| used(client, Some(work)) == Some(0.0) && used(client, None).is_some())
+        .await;
+    let read = client
+        .accounts("mock")
+        .status(Some(work))
+        .cloned()
+        .expect("a read");
+    assert_eq!(read.status.email.as_deref(), Some("mock@example.com"));
+    assert_eq!(read.status.plan.as_deref(), Some("Pro"));
+    assert!(read.status.windows[0].resets_at.is_some());
+    assert_eq!(client.account_logged_in(Some(work)), Some(true));
+
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let Response::ThreadCreated(thread_id) = client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: mock.clone(),
+            workspace: Default::default(),
+            account: AccountChoice::Account(work),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+    client
+        .wait_until(|client| used(client, Some(work)) == Some(10.0))
+        .await;
+
+    std::fs::write(home.join("usage"), "55").expect("use more elsewhere");
+    client
+        .ok(Request::RefreshUsage {
+            agent_id: mock.clone(),
+            account: Some(work),
+        })
+        .await;
+    client
+        .wait_until(|client| used(client, Some(work)) == Some(55.0))
+        .await;
+
+    std::fs::remove_file(home.join("login")).expect("log out elsewhere");
+    client
+        .ok(Request::RefreshUsage {
+            agent_id: mock.clone(),
+            account: Some(work),
+        })
+        .await;
+    client
+        .wait_until(|client| client.account_logged_in(Some(work)) == Some(false))
+        .await;
+    assert_eq!(used(&client, Some(work)), Some(55.0));
+    assert!(
+        client
+            .request(Request::RefreshUsage {
+                agent_id: mock,
+                account: Some(AccountId(9)),
+            })
+            .await
+            .is_err()
+    );
 }
 
 /// Codex's device-code login asks the client to open a URL (an elicitation) while
