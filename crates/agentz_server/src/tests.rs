@@ -1320,6 +1320,46 @@ async fn projects_learn_their_repository() {
         .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn projects_show_their_branch() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = server.project_dir.path();
+    crate::git::git(
+        folder,
+        &["init", "--quiet", "--initial-branch", "first"],
+        &[],
+    )
+    .await
+    .expect("git");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(folder).await;
+    let branch = |client: &TestClient| {
+        let projects = client.projects.as_ref()?;
+        let project = projects
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)?;
+        projects
+            .git_heads
+            .iter()
+            .find(|(folder, _)| *folder == project.path)
+            .map(|(_, head)| head.branch.clone())
+    };
+    client
+        .wait_until(|client| branch(client).as_deref() == Some("first"))
+        .await;
+    // A switch made outside agentZ shows at the next refresh.
+    crate::git::git(folder, &["checkout", "--quiet", "-b", "second"], &[])
+        .await
+        .expect("git");
+    client
+        .wait_until(|client| branch(client).as_deref() == Some("second"))
+        .await;
+}
+
 impl TestClient {
     async fn add_project(&mut self, path: &std::path::Path) -> ProjectId {
         match self

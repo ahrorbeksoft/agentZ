@@ -424,6 +424,10 @@ pub struct ProjectsSnapshot {
     pub terminal_commands: Vec<(ThreadId, String)>,
     /// Where each terminal thread's foreground process is.
     pub terminal_folders: Vec<(ThreadId, TerminalFolder)>,
+    /// The branches checked out where projects and threads work, by folder: projects' own
+    /// folders, their worktrees and pastures, and Workspaces threads' folders. Folders outside
+    /// git have none.
+    pub git_heads: Vec<(PathBuf, GitHead)>,
     /// Drawer terminals running a program in front of their shell: thread, terminal number,
     /// program.
     pub drawer_commands: Vec<(ThreadId, u32, String)>,
@@ -445,6 +449,16 @@ pub struct TerminalFolder {
     /// tell another machine's home.
     #[serde(default)]
     pub display_path: Option<String>,
+}
+
+/// The branch checked out in a folder, as its machine's server reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHead {
+    /// The branch name, or the abbreviated commit when HEAD is detached.
+    pub branch: String,
+    /// Set when the folder is in a linked worktree rather than the main checkout.
+    #[serde(default)]
+    pub worktree: Option<PathBuf>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -488,6 +502,8 @@ pub struct ProjectStore {
     terminal_commands: BTreeMap<ThreadId, String>,
     /// Where terminal threads' foreground processes are. Not persisted either.
     terminal_folders: BTreeMap<ThreadId, TerminalFolder>,
+    /// The branches of [`ProjectStore::git_head_folders`]. Not persisted either.
+    git_heads: BTreeMap<PathBuf, GitHead>,
     /// Drawer terminals running a program in front of their shell. Not persisted either.
     drawer_commands: BTreeMap<(ThreadId, u32), String>,
     /// Counts changes, so the owner can tell whether a call changed anything.
@@ -522,6 +538,7 @@ impl ProjectStore {
             terminal_agents: BTreeMap::new(),
             terminal_commands: BTreeMap::new(),
             terminal_folders: BTreeMap::new(),
+            git_heads: BTreeMap::new(),
             drawer_commands: BTreeMap::new(),
             revision: 0,
             saver: state_path.map(|path| Saver::new(path, "projects-saver")),
@@ -1482,6 +1499,34 @@ impl ProjectStore {
         }
     }
 
+    /// The branch checked out in one of [`Self::git_head_folders`], once its server has read it.
+    pub fn git_head(&self, folder: &Path) -> Option<&GitHead> {
+        self.git_heads.get(folder)
+    }
+
+    /// The folders whose branches are shown: projects' own folders, their worktrees and
+    /// pastures, and where threads work outside their project's folder.
+    pub fn git_head_folders(&self) -> impl Iterator<Item = &PathBuf> {
+        self.projects
+            .iter()
+            .flat_map(|project| {
+                std::iter::once(&project.path)
+                    .chain(project.workspaces.iter().map(|workspace| &workspace.path))
+            })
+            .chain(
+                self.threads
+                    .iter()
+                    .filter_map(|thread| thread.workspace.as_ref()),
+            )
+    }
+
+    pub fn set_git_heads(&mut self, heads: BTreeMap<PathBuf, GitHead>) {
+        if self.git_heads != heads {
+            self.git_heads = heads;
+            self.changed();
+        }
+    }
+
     pub fn record_thread_activity(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.last_activity_at = Some(SystemTime::now());
@@ -1523,6 +1568,11 @@ impl ProjectStore {
                 .iter()
                 .map(|(id, folder)| (*id, folder.clone()))
                 .collect(),
+            git_heads: self
+                .git_heads
+                .iter()
+                .map(|(folder, head)| (folder.clone(), head.clone()))
+                .collect(),
             drawer_commands: self
                 .drawer_commands
                 .iter()
@@ -1551,6 +1601,7 @@ impl ProjectStore {
         this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
         this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
         this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
+        this.git_heads = snapshot.git_heads.into_iter().collect();
         this.drawer_commands = snapshot
             .drawer_commands
             .into_iter()

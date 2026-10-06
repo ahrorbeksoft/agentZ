@@ -1,13 +1,14 @@
 //! Which repository each project is in, by its primary remote, so the app can show checkouts of
 //! one repository (on any machine) as one project. Ported from t3code's
-//! `RepositoryIdentityResolver` and `normalizeGitRemoteUrl`.
+//! `RepositoryIdentityResolver` and `normalizeGitRemoteUrl`. Also the branch checked out in
+//! each folder projects and threads work in.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use projects::RepositoryIdentity;
+use projects::{GitHead, RepositoryIdentity};
 use regex::Regex;
 
 /// Every project is checked again after this, so a changed remote shows up eventually.
@@ -151,6 +152,45 @@ fn azure_devops_repository_key(host: &str, segments: &[&str]) -> Option<String> 
     })
 }
 
+/// Reads HEAD from the repository containing `root`, which may be a subfolder of it. Only reads
+/// files, so the server can read every folder's often.
+pub(crate) fn read_git_head(root: &Path) -> Option<GitHead> {
+    let (checkout, dot_git) = root.ancestors().find_map(|directory| {
+        let dot_git = directory.join(".git");
+        dot_git.exists().then(|| (directory.to_path_buf(), dot_git))
+    })?;
+    let (git_dir, worktree) = if dot_git.is_dir() {
+        (dot_git, None)
+    } else {
+        // A linked worktree's `.git` is a file pointing at its git directory.
+        let contents = std::fs::read_to_string(&dot_git).ok()?;
+        let git_dir = PathBuf::from(contents.trim().strip_prefix("gitdir:")?.trim());
+        (checkout.join(git_dir), Some(checkout))
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    Some(GitHead {
+        branch: branch_from_head(&head)?,
+        worktree,
+    })
+}
+
+fn branch_from_head(head: &str) -> Option<String> {
+    let head = head.trim();
+    if head.is_empty() {
+        return None;
+    }
+    Some(match head.strip_prefix("ref:") {
+        Some(reference) => {
+            let reference = reference.trim();
+            reference
+                .strip_prefix("refs/heads/")
+                .unwrap_or(reference)
+                .to_string()
+        }
+        None => head.chars().take(7).collect(),
+    })
+}
+
 /// When each project's folder was last checked, so the regular sweep only runs git when a
 /// result is stale.
 #[derive(Default)]
@@ -197,6 +237,29 @@ impl RepositoryChecks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branches() {
+        assert_eq!(
+            branch_from_head("ref: refs/heads/main\n").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            branch_from_head("ref: refs/heads/feature/sidebar").as_deref(),
+            Some("feature/sidebar")
+        );
+        assert_eq!(
+            branch_from_head("57bfce2945aa\n").as_deref(),
+            Some("57bfce2")
+        );
+        assert_eq!(branch_from_head(""), None);
+    }
+
+    #[test]
+    fn reads_this_repository() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(read_git_head(root).is_some());
+    }
 
     #[test]
     fn normalizes_like_t3code() {

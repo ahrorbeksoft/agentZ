@@ -171,7 +171,12 @@ Each entry: what it does, where it lives, and where it comes from.
   focus goes back to what had it.
 - **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
   `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
-  favicons or monograms, git branches. The switcher is Zed's recent-projects popover.
+  favicons or monograms, git branches. The switcher is Zed's recent-projects popover. Each
+  machine's server reads the branch checked out in its projects' folders, worktrees and pastures
+  and Workspaces threads' folders every 5 seconds and when a new one appears
+  (`Server::refresh_git_heads`, `repositories::read_git_head`), and sends them with the
+  projects (`ProjectStore::git_head`), so remote machines' cards show theirs too. Favicons are
+  read from this Mac's disk only.
 - **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons, the thread's own
   branch with a worktree or pasture marker, attention state, details popover (a custom anchored
   element, since GPUI tooltips follow the cursor), rename, delete, archive with an Archived

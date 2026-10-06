@@ -20,16 +20,16 @@ use gpui::{
     Focusable as _, FontWeight, Hsla, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Stateful,
     Subscription, Task, Window, anchored, canvas, deferred, svg,
 };
-use projects::{Project, Thread, ThreadOrder, ThreadSection, Workspace, WorkspaceKind, order_key};
+use projects::{
+    GitHead, Project, Thread, ThreadOrder, ThreadSection, Workspace, WorkspaceKind, order_key,
+};
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,
     prelude::*, right_click_menu,
 };
 
-use crate::project_info::{
-    GitHead, ProjectInfo, ProjectInfoStore, render_project_icon, workspace_icon,
-};
+use crate::project_info::{ProjectInfo, ProjectInfoStore, render_project_icon, workspace_icon};
 use crate::project_switcher::compact_path;
 use crate::{NewThread, OpenSettings};
 
@@ -670,14 +670,7 @@ impl Sidebar {
         let store = store.read(cx);
         let folder = store.thread_folder(thread.id)?;
         let workspace = store.thread_workspace(thread.id).cloned();
-        let project_info = self.project_info.read(cx);
-        let head = if thread.workspace.is_some() {
-            project_info.workspace_head(machine, &folder).cloned()
-        } else {
-            project_info
-                .info(machine, thread.project_id)
-                .and_then(|info| info.git_head.clone())
-        };
+        let head = store.git_head(&folder).cloned();
         Some(ThreadCheckout {
             folder,
             workspace,

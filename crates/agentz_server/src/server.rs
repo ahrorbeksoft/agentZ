@@ -12,7 +12,7 @@ mod terminal_requests;
 mod tools;
 mod workspace_requests;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +56,9 @@ use tools::{PendingToolCall, ToolResults};
 const MAX_THREAD_TITLE_CHARS: usize = 48;
 /// t3code sweeps every project each minute; lookups that aren't stale are skipped.
 const REPOSITORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the branches checked out where projects and threads work are read again, so a
+/// switch made outside agentZ shows soon.
+const GIT_HEAD_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) type ClientId = u64;
 
@@ -160,6 +163,9 @@ pub(crate) struct Server {
     relays: tools::Relays,
     projects: ProjectStore,
     repository_checks: RepositoryChecks,
+    /// The folders whose branches were last read, so a new one is read at once.
+    git_head_folders: BTreeSet<PathBuf>,
+    reading_git_heads: bool,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     threads: HashMap<ThreadId, AgentThread>,
@@ -280,6 +286,8 @@ impl Server {
             agent_settings_revision_sent: agent_settings.revision(),
             projects,
             repository_checks: RepositoryChecks::default(),
+            git_head_folders: BTreeSet::new(),
+            reading_git_heads: false,
             registry,
             agent_settings,
             threads: HashMap::default(),
@@ -363,6 +371,18 @@ impl Server {
                 }
             }
         });
+        let inputs = server.inputs.clone();
+        server.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(GIT_HEAD_INTERVAL).await;
+                let refresh =
+                    Input::Run(Box::new(|server: &mut Server| server.refresh_git_heads()));
+                if inputs.unbounded_send(refresh).is_err() {
+                    break;
+                }
+            }
+        });
+        server.refresh_git_heads();
         server
     }
 
@@ -389,6 +409,41 @@ impl Server {
                     server.projects.set_project_repository(project, repository);
                 }
             });
+        }
+    }
+
+    /// Reads the branch checked out in each folder projects and threads work in.
+    fn refresh_git_heads(&mut self) {
+        if self.reading_git_heads {
+            return;
+        }
+        self.reading_git_heads = true;
+        let folders: BTreeSet<PathBuf> = self.projects.git_head_folders().cloned().collect();
+        let read = self.runtime.spawn_blocking(move || {
+            let heads = folders
+                .iter()
+                .filter_map(|folder| Some((folder.clone(), repositories::read_git_head(folder)?)))
+                .collect();
+            (folders, heads)
+        });
+        self.spawn_then(read, |server, read| {
+            server.reading_git_heads = false;
+            if let Some((folders, heads)) = read.log_err() {
+                server.git_head_folders = folders;
+                server.projects.set_git_heads(heads);
+            }
+        });
+    }
+
+    /// Reads the branches at once when a project, worktree, pasture or thread works in a folder
+    /// that wasn't read yet.
+    fn refresh_new_git_heads(&mut self) {
+        let has_new_folder = self
+            .projects
+            .git_head_folders()
+            .any(|folder| !self.git_head_folders.contains(folder));
+        if has_new_folder {
+            self.refresh_git_heads();
         }
     }
 
@@ -1792,6 +1847,7 @@ impl Server {
         // After the waiting tool calls, which may have started an agent to read its thread.
         self.stop_idle_agents();
         self.schedule_transcript_saves();
+        self.refresh_new_git_heads();
         for (thread_id, thread) in &self.threads {
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());

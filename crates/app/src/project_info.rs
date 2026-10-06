@@ -1,6 +1,6 @@
 //! What t3code's sidebar shows about a project besides its name: an icon (the project's
-//! favicon, or a colored monogram when it has none) and the checked-out git branch, also of
-//! each of its worktrees and pastures.
+//! favicon, or a colored monogram when it has none). The branches checked out come from each
+//! machine's server (`projects::ProjectStore::git_head`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,15 +18,6 @@ use ui::{StyledImage as _, prelude::*};
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectInfo {
     pub favicon: Option<PathBuf>,
-    pub git_head: Option<GitHead>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct GitHead {
-    /// The branch name, or the abbreviated commit when HEAD is detached.
-    pub branch: String,
-    /// Set when the project folder is a linked worktree rather than the main checkout.
-    pub worktree: Option<PathBuf>,
 }
 
 impl ProjectInfo {
@@ -34,7 +25,6 @@ impl ProjectInfo {
     pub fn read(root: &Path) -> Self {
         Self {
             favicon: find_favicon(root),
-            git_head: read_git_head(root),
         }
     }
 }
@@ -47,16 +37,13 @@ pub fn workspace_icon(kind: WorkspaceKind) -> IconName {
     }
 }
 
-/// How often icons and checked-out branches are re-read.
+/// How often icons are re-read.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Every project's [`ProjectInfo`], kept current for the sidebar, the project switcher and
 /// settings. Read from this Mac's disk, so only this Mac's projects have any.
 pub struct ProjectInfoStore {
     info: HashMap<ProjectId, ProjectInfo>,
-    /// The branches of the projects' worktrees and pastures, and of other folders threads work
-    /// in, by folder: `None` outside git, so it isn't read again until the next refresh.
-    workspace_heads: HashMap<PathBuf, Option<GitHead>>,
     refresh: Task<()>,
     _projects_subscription: Subscription,
 }
@@ -75,16 +62,13 @@ pub fn init(cx: &mut App) {
             let is_stale = current.len() != this.info.len()
                 || current
                     .iter()
-                    .any(|project| !this.info.contains_key(&project.id))
-                || head_folders(projects.read(cx))
-                    .any(|folder| !this.workspace_heads.contains_key(folder));
+                    .any(|project| !this.info.contains_key(&project.id));
             if is_stale {
                 this.refresh = ProjectInfoStore::refresh_loop(projects, cx);
             }
         });
         ProjectInfoStore {
             info: HashMap::default(),
-            workspace_heads: HashMap::default(),
             refresh: ProjectInfoStore::refresh_loop(projects.clone(), cx),
             _projects_subscription: subscription,
         }
@@ -104,48 +88,27 @@ impl ProjectInfoStore {
         }
     }
 
-    /// The branch checked out in a project's worktree or pasture, or another folder a thread
-    /// works in.
-    pub fn workspace_head(&self, machine: MachineId, folder: &Path) -> Option<&GitHead> {
-        match machine {
-            MachineId::Local => self.workspace_heads.get(folder)?.as_ref(),
-            MachineId::Remote(_) => None,
-        }
-    }
-
     fn refresh_loop(projects: Entity<ProjectStore>, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let (roots, folders) = projects.read_with(cx, |projects, _| {
-                    let roots: Vec<(ProjectId, PathBuf)> = projects
+                let roots: Vec<(ProjectId, PathBuf)> = projects.read_with(cx, |projects, _| {
+                    projects
                         .projects()
                         .iter()
                         .map(|project| (project.id, project.path.clone()))
-                        .collect();
-                    let folders: collections::HashSet<PathBuf> =
-                        head_folders(projects).cloned().collect();
-                    (roots, folders)
+                        .collect()
                 });
-                let (info, workspace_heads) = cx
+                let info = cx
                     .background_spawn(async move {
-                        let info = roots
+                        roots
                             .into_iter()
                             .map(|(id, root)| (id, ProjectInfo::read(&root)))
-                            .collect::<HashMap<_, _>>();
-                        let heads = folders
-                            .into_iter()
-                            .map(|folder| {
-                                let head = read_git_head(&folder);
-                                (folder, head)
-                            })
-                            .collect::<HashMap<_, _>>();
-                        (info, heads)
+                            .collect::<HashMap<_, _>>()
                     })
                     .await;
                 let updated = this.update(cx, |this, cx| {
-                    if this.info != info || this.workspace_heads != workspace_heads {
+                    if this.info != info {
                         this.info = info;
-                        this.workspace_heads = workspace_heads;
                         cx.notify();
                     }
                 });
@@ -156,22 +119,6 @@ impl ProjectInfoStore {
             }
         })
     }
-}
-
-/// The folders whose branches are kept besides the projects': their worktrees and pastures, and
-/// where threads work outside their project's own folder.
-fn head_folders(projects: &ProjectStore) -> impl Iterator<Item = &PathBuf> {
-    projects
-        .projects()
-        .iter()
-        .flat_map(|project| &project.workspaces)
-        .map(|workspace| &workspace.path)
-        .chain(
-            projects
-                .threads()
-                .iter()
-                .filter_map(|thread| thread.workspace.as_ref()),
-        )
 }
 
 /// Well-known favicon paths, checked in order (t3code's list).
@@ -303,44 +250,6 @@ fn attribute_value<'a>(text: &'a str, name: &str, separator: char) -> Option<&'a
         return Some(&value[..end]);
     }
     None
-}
-
-/// Reads HEAD from the repository containing `root`, which may be a subfolder of it.
-fn read_git_head(root: &Path) -> Option<GitHead> {
-    let (checkout, dot_git) = root.ancestors().find_map(|directory| {
-        let dot_git = directory.join(".git");
-        dot_git.exists().then(|| (directory.to_path_buf(), dot_git))
-    })?;
-    let (git_dir, worktree) = if dot_git.is_dir() {
-        (dot_git, None)
-    } else {
-        // A linked worktree's `.git` is a file pointing at its git directory.
-        let contents = std::fs::read_to_string(&dot_git).ok()?;
-        let git_dir = PathBuf::from(contents.trim().strip_prefix("gitdir:")?.trim());
-        (checkout.join(git_dir), Some(checkout))
-    };
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    Some(GitHead {
-        branch: branch_from_head(&head)?,
-        worktree,
-    })
-}
-
-fn branch_from_head(head: &str) -> Option<String> {
-    let head = head.trim();
-    if head.is_empty() {
-        return None;
-    }
-    Some(match head.strip_prefix("ref:") {
-        Some(reference) => {
-            let reference = reference.trim();
-            reference
-                .strip_prefix("refs/heads/")
-                .unwrap_or(reference)
-                .to_string()
-        }
-        None => head.chars().take(7).collect(),
-    })
 }
 
 /// The icon picked in the project's settings, else its favicon, else t3code's monogram tile
@@ -546,28 +455,5 @@ mod tests {
             Some("fav.ico")
         );
         assert_eq!(icon_href("<p>no icon</p>"), None);
-    }
-
-    #[test]
-    fn branches() {
-        assert_eq!(
-            branch_from_head("ref: refs/heads/main\n").as_deref(),
-            Some("main")
-        );
-        assert_eq!(
-            branch_from_head("ref: refs/heads/feature/sidebar").as_deref(),
-            Some("feature/sidebar")
-        );
-        assert_eq!(
-            branch_from_head("57bfce2945aa\n").as_deref(),
-            Some("57bfce2")
-        );
-        assert_eq!(branch_from_head(""), None);
-    }
-
-    #[test]
-    fn reads_this_repository() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(read_git_head(root).is_some());
     }
 }

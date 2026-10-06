@@ -509,10 +509,9 @@ impl SettingsPage {
             .iter()
             .enumerate()
             .map(|(index, workspace)| {
-                let branch = self
-                    .project_info
+                let branch = store
                     .read(cx)
-                    .workspace_head(machine, &workspace.path)
+                    .git_head(&workspace.path)
                     .map(|head| head.branch.clone())
                     .or_else(|| workspace.branch.clone())
                     .unwrap_or_else(|| "No branch".to_string());

@@ -2405,19 +2405,11 @@ impl AgentView {
     /// project's own folder), and its folder.
     fn thread_branch(&self, cx: &App) -> Option<(SharedString, IconName, PathBuf)> {
         let store = self.store.read(cx);
-        let thread = store.thread(self.thread_id)?;
         let folder = store.thread_folder(self.thread_id)?;
         let workspace = store.thread_workspace(self.thread_id).cloned();
-        let machine = store.machine();
-        let info = ProjectInfoStore::global(cx).read(cx);
-        let head = if thread.workspace.is_some() {
-            info.workspace_head(machine, &folder).cloned()
-        } else {
-            info.info(machine, thread.project_id)
-                .and_then(|info| info.git_head.clone())
-        };
-        let branch = head
-            .map(|head| head.branch)
+        let branch = store
+            .git_head(&folder)
+            .map(|head| head.branch.clone())
             .or_else(|| workspace.as_ref()?.branch.clone())?;
         let icon = workspace.as_ref().map_or(IconName::GitBranch, |workspace| {
             workspace_icon(workspace.kind)
@@ -5156,7 +5148,6 @@ impl AgentView {
     /// one of its worktrees and pastures.
     fn render_checkout_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
-        let machine = store.machine();
         let current = store
             .thread(self.thread_id)
             .and_then(|thread| thread.workspace.clone());
@@ -5165,7 +5156,6 @@ impl AgentView {
             None => (IconName::Folder, "Local"),
         };
         let existing: Vec<(PathBuf, WorkspaceKind, SharedString)> = {
-            let heads = ProjectInfoStore::global(cx).read(cx);
             store
                 .thread(self.thread_id)
                 .and_then(|thread| store.project(thread.project_id))
@@ -5173,8 +5163,8 @@ impl AgentView {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|workspace| {
-                    let branch = heads
-                        .workspace_head(machine, &workspace.path)
+                    let branch = store
+                        .git_head(&workspace.path)
                         .map(|head| head.branch.clone())
                         .or_else(|| workspace.branch.clone())
                         .unwrap_or_else(|| workspace.kind.label().to_string());
