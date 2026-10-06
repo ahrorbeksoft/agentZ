@@ -10,7 +10,7 @@ running. It is built on GPUI, [Zed](https://zed.dev)'s UI framework.
 
 Website: <https://ahrorbeksoft.github.io/agentZ/>
 
-![agentZ](site/screenshot.png)
+![agentZ](site/screenshot-threads.png)
 
 ## Install
 

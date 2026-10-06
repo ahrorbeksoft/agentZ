@@ -3,23 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agentZ: coding agents on every machine, in one Mac app</title>
-<meta name="description" content="A native macOS app for coding agents over the Agent Client Protocol: install agents from the ACP Registry and run threads across projects and machines, with real terminals.">
+<title>agentZ: all your coding agents, in one Mac app</title>
+<meta name="description" content="A native macOS app for coding agents over the Agent Client Protocol: run Claude, Codex, Gemini CLI, OpenCode and any ACP agent side by side, across your projects and machines, with real terminals.">
 <meta property="og:title" content="agentZ">
-<meta property="og:description" content="Coding agents on every machine, in one native Mac app.">
-<meta property="og:image" content="https://ahrorbeksoft.github.io/agentZ/screenshot.png">
-<meta name="theme-color" content="#0a0a0a">
+<meta property="og:description" content="All your coding agents, in one Mac app.">
+<meta property="og:image" content="https://ahrorbeksoft.github.io/agentZ/screenshot-threads.png">
+<meta name="theme-color" content="#09090b">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <style>
   :root {
-    --background: #0a0a0a;
-    --surface: #141414;
-    --border: #262626;
-    --border-strong: #3a3a3a;
-    --text: #ededed;
-    --muted: #a3a3a3;
-    --faint: #737373;
+    --background: #09090b;
+    --surface: #131316;
+    --border: #232328;
+    --border-strong: #34343b;
+    --text: #fafafa;
+    --muted: #a1a1aa;
+    --faint: #71717a;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
     color-scheme: dark;
@@ -33,35 +33,68 @@
     -webkit-font-smoothing: antialiased;
   }
   a { color: inherit; }
-  .page { padding: 0 24px; }
-  nav, header, .features, footer { max-width: 760px; margin-left: auto; margin-right: auto; }
 
-  nav { display: flex; align-items: center; justify-content: space-between; height: 72px; }
-  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; text-decoration: none; }
-  .brand img { width: 24px; height: 24px; }
+  nav {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    max-width: 1180px;
+    height: 64px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; letter-spacing: -0.01em; text-decoration: none; }
+  .brand img { width: 26px; height: 26px; }
   nav .links { display: flex; gap: 24px; font-size: 14px; }
   nav .links a { color: var(--muted); text-decoration: none; }
   nav .links a:hover { color: var(--text); }
 
-  header { padding: 80px 0 0; }
+  main { position: relative; padding: 0 24px; }
+  /* t3code's hero grid: faint lines that fade out toward the edges. */
+  .grid {
+    position: absolute;
+    inset: -64px 0 auto;
+    height: 760px;
+    pointer-events: none;
+    background-image:
+      linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse 70% 60% at 50% 30%, black 35%, transparent 100%);
+    -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 30%, black 35%, transparent 100%);
+  }
+
+  .hero { position: relative; max-width: 760px; margin: 0 auto; padding: 88px 0 64px; text-align: center; }
   h1 {
-    margin: 0 0 16px;
-    font-size: clamp(32px, 6vw, 44px);
+    margin: 0 0 20px;
+    font-size: clamp(40px, 6.4vw, 72px);
     font-weight: 600;
-    line-height: 1.12;
-    letter-spacing: -0.025em;
+    line-height: 1.04;
+    letter-spacing: -0.04em;
     text-wrap: balance;
   }
-  .lead { margin: 0 0 40px; max-width: 620px; color: var(--muted); font-size: 18px; text-wrap: pretty; }
+  .lead {
+    max-width: 600px;
+    margin: 0 auto 40px;
+    color: var(--muted);
+    font-size: clamp(16px, 1.5vw, 19px);
+    line-height: 1.55;
+    text-wrap: pretty;
+  }
 
   .install {
     display: flex;
     align-items: flex-start;
     gap: 16px;
+    max-width: 700px;
+    margin: 0 auto;
     padding: 14px 14px 14px 18px;
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 12px;
+    text-align: left;
   }
   .install code {
     flex: 1;
@@ -85,31 +118,26 @@
   .note { margin: 14px 0 0; color: var(--faint); font-size: 14px; }
   .note span { white-space: nowrap; }
 
-  .screenshot {
-    max-width: 960px;
-    margin: 72px auto 0;
-    overflow: hidden;
+  .shots { display: grid; gap: 56px; max-width: 1180px; margin: 0 auto; }
+  figure { margin: 0; }
+  figure img {
+    display: block;
+    width: 100%;
+    height: auto;
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 12px;
+    box-shadow: 0 28px 64px -28px rgba(0, 0, 0, 0.8);
   }
-  .screenshot img { display: block; width: 100%; height: auto; }
-
-  .features {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 36px 48px;
-    margin: 88px auto 0;
-  }
-  .features h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
-  .features p { margin: 0; color: var(--muted); font-size: 15px; }
+  figcaption { margin-top: 16px; color: var(--faint); font-size: 14px; text-align: center; }
 
   footer {
     display: flex;
     flex-wrap: wrap;
     justify-content: space-between;
     gap: 8px 24px;
+    max-width: 1180px;
     margin: 96px auto 0;
-    padding: 24px 0 48px;
+    padding: 24px 24px 48px;
     border-top: 1px solid var(--border);
     color: var(--faint);
     font-size: 13px;
@@ -118,27 +146,26 @@
   footer a:hover { color: var(--text); }
 
   @media (max-width: 600px) {
-    header { padding-top: 48px; }
-    .lead { font-size: 17px; }
+    .hero { padding: 48px 0 48px; }
     .install code { font-size: 13.5px; }
-    .screenshot { margin-top: 56px; }
-    .features { grid-template-columns: 1fr; gap: 28px; margin-top: 64px; }
+    .shots { gap: 40px; }
   }
 </style>
 </head>
 <body>
-<div class="page">
-  <nav>
-    <a class="brand" href="./"><img src="icon.svg" alt="">agentZ</a>
-    <div class="links">
-      <a href="https://github.com/ahrorbeksoft/agentZ/releases/latest">Releases</a>
-      <a href="https://github.com/ahrorbeksoft/agentZ">GitHub</a>
-    </div>
-  </nav>
+<nav>
+  <a class="brand" href="./"><img src="icon.svg" alt="">agentZ</a>
+  <div class="links">
+    <a href="https://github.com/ahrorbeksoft/agentZ/releases/latest">Releases</a>
+    <a href="https://github.com/ahrorbeksoft/agentZ">GitHub</a>
+  </div>
+</nav>
 
-  <header>
-    <h1>Coding agents on every machine,<br> in one Mac app.</h1>
-    <p class="lead">agentZ runs Claude Agent, Codex, Gemini CLI, OpenCode and every other
+<main>
+  <div class="grid" aria-hidden="true"></div>
+  <section class="hero">
+    <h1>All your coding agents, in one Mac app.</h1>
+    <p class="lead">Run Claude, Codex, Gemini CLI, OpenCode and any other
       <a href="https://agentclientprotocol.com">ACP</a> agent side by side, across your projects,
       your Mac and your Linux servers, with real terminals next to them.</p>
     <div class="install">
@@ -146,45 +173,25 @@
       <button type="button" id="copy">Copy</button>
     </div>
     <p class="note"><span>macOS: installs agentZ.app</span> · <span>Linux: installs agentz-server</span></p>
-  </header>
-
-  <figure class="screenshot">
-    <img src="screenshot.png" width="1995" height="1050"
-      alt="agentZ: threads from several projects in the sidebar, and an agent's turn with an edit and a command">
-  </figure>
-
-  <section class="features">
-    <div>
-      <h2>Any ACP agent</h2>
-      <p>Install agents from the ACP Registry, or add your own command. Log in the way each agent offers.</p>
-    </div>
-    <div>
-      <h2>Threads across projects</h2>
-      <p>Every conversation is a thread in the sidebar, with its project, branch and status.</p>
-    </div>
-    <div>
-      <h2>Your other machines</h2>
-      <p>Add a Mac or a Linux server over SSH. agentZ installs its server there and keeps it updated.</p>
-    </div>
-    <div>
-      <h2>Agents keep running</h2>
-      <p>A background server on each machine owns the agents, so quitting the app or losing the connection doesn't stop them.</p>
-    </div>
-    <div>
-      <h2>Worktrees and pastures</h2>
-      <p>Give a thread its own git worktree, or an instant copy-on-write copy of the project.</p>
-    </div>
-    <div>
-      <h2>Real terminals</h2>
-      <p>Terminals and split panes beside the agents, for the agent CLIs that run in one.</p>
-    </div>
   </section>
 
-  <footer>
-    <span>Free and open source, built on <a href="https://zed.dev">Zed</a>'s GPUI.</span>
-    <a href="https://github.com/ahrorbeksoft/agentZ">github.com/ahrorbeksoft/agentZ</a>
-  </footer>
-</div>
+  <div class="shots">
+    <figure>
+      <img src="screenshot-threads.png" width="2624" height="1640"
+        alt="agentZ: threads from several projects and machines in the sidebar, agents working and waiting for input">
+    </figure>
+    <figure>
+      <img src="screenshot-workspaces.png" width="2624" height="1640" loading="lazy"
+        alt="agentZ's Workspaces view: agents, agent CLIs and terminals in split panes">
+      <figcaption>Workspaces: agents, agent CLIs and terminals in split panes, one space per project.</figcaption>
+    </figure>
+  </div>
+</main>
+
+<footer>
+  <span>Free and open source, built on <a href="https://zed.dev">Zed</a>'s GPUI.</span>
+  <a href="https://github.com/ahrorbeksoft/agentZ">github.com/ahrorbeksoft/agentZ</a>
+</footer>
 <script>
   const button = document.getElementById("copy");
   const command = document.getElementById("command");
