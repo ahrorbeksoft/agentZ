@@ -1182,18 +1182,8 @@ impl SpacesView {
         }
     }
 
-    /// Goes to the folder's open workspace, or opens one there.
+    /// Opens a workspace with a shell in the chosen folder, beside any open there.
     fn create_space(&mut self, choice: SpaceChoice, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(space) = choice.existing {
-            let key = SpaceKey {
-                machine: choice.machine,
-                space,
-            };
-            if self.space(key, cx).is_some() {
-                self.activate_space(key, window, cx);
-                return;
-            }
-        }
         self.request(
             choice.machine,
             SpaceRequest::CreateSpace {
@@ -2006,7 +1996,6 @@ impl SpacesView {
             .border_color(colors.border)
             .bg(colors.panel_background)
             .child(self.render_sidebar_header(cx))
-            .children(self.render_needs_you(has_remotes, cx))
             .child(
                 div()
                     .id("workspaces-scroll")
@@ -3187,75 +3176,6 @@ impl SpacesView {
             })
             .collect();
         (statuses.len(), rolled_up(statuses.into_iter()))
-    }
-
-    /// The agents waiting on the user (an approval or an answer), in a tinted strip above the
-    /// workspaces, each with Go. Nothing shows while none waits.
-    fn render_needs_you(&self, has_remotes: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let waiting: Vec<AgentEntry> = self
-            .agent_entries(cx)
-            .into_iter()
-            .filter(|entry| {
-                matches!(
-                    entry.status,
-                    Some(ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput)
-                )
-            })
-            .collect();
-        if waiting.is_empty() {
-            return None;
-        }
-        let warning = cx.theme().status().warning;
-        let rows = waiting.into_iter().enumerate().map(|(index, entry)| {
-            let pane = entry.pane;
-            let location = match has_remotes.then(|| self.machines.read(cx).label(pane.machine, cx))
-            {
-                Some(machine) => format!("{machine} · {} › {}", entry.space, entry.tab),
-                None => format!("{} › {}", entry.space, entry.tab),
-            };
-            h_flex()
-                .h(px(34.))
-                .px_1p5()
-                .gap_2()
-                .child(render_state_slot(entry.status, cx))
-                .child(entry.icon.size(IconSize::Small).color(Color::Muted))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Label::new(entry.title).size(LabelSize::Small).truncate())
-                        .child(
-                            Label::new(location)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .truncate(),
-                        ),
-                )
-                .child(
-                    Button::new(
-                        ElementId::Name(format!("needs-you-go-{index}").into()),
-                        "Go",
-                    )
-                    .style(ButtonStyle::Outlined)
-                    .label_size(LabelSize::Small)
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.focus_pane(pane, window, cx)),
-                    ),
-                )
-        });
-        Some(
-            v_flex()
-                .id("needs-you")
-                .mx_1p5()
-                .mt_1p5()
-                .p_0p5()
-                .rounded_md()
-                .border_1()
-                .border_color(warning.opacity(0.35))
-                .bg(warning.opacity(0.07))
-                .children(rows)
-                .into_any_element(),
-        )
     }
 
     /// herdr's default agent row: the state and where it is (machine, workspace, tab), then
@@ -5497,6 +5417,48 @@ mod tests {
 
         cx.simulate_click(new_workspace.center(), gpui::Modifiers::none());
         assert!(view.read_with(cx, |view, _| view.new_space_handle.is_deployed()));
+    }
+
+    #[gpui::test]
+    fn choosing_a_folder_with_a_workspace_opens_another(cx: &mut TestAppContext) {
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client =
+                ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(), cx);
+            let requests = requests.clone();
+            client.update(cx, |client, _| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    None
+                })
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
+        view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.new_space_handle.show(window, cx)
+        });
+        cx.run_until_parked();
+        // The workspace on screen is first, under Recent.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let created: Vec<Request> = requests
+            .borrow()
+            .iter()
+            .filter(|request| matches!(request, Request::Spaces(_)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            created,
+            [Request::Spaces(SpaceRequest::CreateSpace {
+                folder: PathBuf::from("/tmp/demo"),
+                project_id: None,
+                content: new_shell(),
+            })]
+        );
     }
 
     #[test]

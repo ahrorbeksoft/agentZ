@@ -12,7 +12,9 @@ Notes for whoever continues:
   (collapsed, only the focused child stays, and the parent shows the group's most urgent
   state); a child is labeled by its branch unless renamed. herdr: `src/client/shell/sidebar.rs`
   `workspace_entries`, `displayed_workspace_status`, `workspace_rows`.
-- §3 is A plus E's "Needs you" strip (the user's "E too" on §17 meant §3's E).
+- §3 is A plus E's "Needs you" strip (the user's "E too" on §17 meant §3's E). The user later
+  dropped the strip.
+- §13: the user later asked for + to always make a new workspace, so the Open marks went.
 - §15 is A plus C's dialog, without C's "Open with".
 - §19E: the sheet shows the shortcuts for what's focused (terminal, thread, sidebar) too.
 - §11: after it was built, the user dropped the agent CLIs: Split Right and Split Down offer a

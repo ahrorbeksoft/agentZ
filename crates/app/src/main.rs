@@ -144,6 +144,7 @@ fn init_for_test(cx: &mut App) {
     agent_view::init(cx);
     terminal_view::init(cx);
     terminal_thread_view::init(cx);
+    new_space_picker::init(cx);
     spaces_view::init(cx);
     bind_keys(cx);
 }

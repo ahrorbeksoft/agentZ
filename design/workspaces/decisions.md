@@ -32,6 +32,8 @@ Picked on the design board (`design/workspaces/`, see `design/README.md`). Each 
 
 **Comment on E:** Keep A's list at the bottom and add E's "Needs you" strip on top, as an attention signal (the user's pick on Getting your attention)
 
+**Changed after it was built:** the user didn't like the strip, so it's gone. Waiting agents show in their workspace's row and in the Agents list.
+
 ## 4. Collapsed sidebar: A. Hidden (today)
 
 *Sidebar*
@@ -111,6 +113,8 @@ Picked on the design board (`design/workspaces/`, see `design/README.md`). Each 
 **Today:** The sidebar's + opens a popover: a search field, then each machine's home folder and each project's checkout, worktrees and pastures, under their machine. Picking one opens a workspace with a shell there.
 
 **A. Today's picker, refined** (from Zed recent projects): Recent folders first, then projects and homes. A folder that already has a workspace is marked Open, and picking it goes there instead of making another.
+
+**Changed after it was built:** the user wants + to make a workspace every time, so picking a folder that has one opens another beside it, and the Open marks (and Cmd-Enter) are gone.
 
 ## 14. Layouts and templates: B. Save a tab as a layout
 

@@ -828,11 +828,9 @@ since a thread's workspace is its checkout.
   Close; an unfocused pane's show on hover.
   Every header along the top of a view (toolbars, tabs, pane headers, the sidebars' search and
   settings rows) is `agent_view::TOOLBAR_HEIGHT`, so their borders line up.
-- **New Workspace** (`new_space_picker.rs`, Zed's recent projects): the workspaces used here
-  most recently first, then each machine's home and projects' checkouts. A folder with a
-  workspace open is marked Open, and Enter goes there; Cmd-Enter opens another.
-- **Needs you**: while an agent in a pane waits for an approval or an answer, a tinted strip
-  above the workspaces lists each, with Go to focus its pane.
+- **New Workspace** (`new_space_picker.rs`, Zed's recent projects): the folders of the
+  workspaces used here most recently first, then each machine's home and projects' checkouts.
+  Picking one always opens a new workspace there, even beside one already open.
 - **No workspaces** (`SpacesView::render_empty_state`, `welcome.rs`; Zed's Welcome page, picked
   in `design/empty-states/`): the main area says "No workspaces" over Get Started: New
   Workspace… (the picker), Go To…, Command Palette and Shortcuts, with their keys. The sidebar's
