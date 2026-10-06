@@ -31,7 +31,7 @@ homes, or read from their source and docs. Anything not tested is marked *(unver
 ## Which agents it makes sense for
 
 A second account is worth having when a login carries its own allowance: a subscription with
-usage windows (Claude, ChatGPT, Factory, Devin, Grok, Copilot, Gemini, Cursor, …), monthly
+usage windows (Claude, ChatGPT, Factory, Devin, Grok, Copilot, Cursor, …), monthly
 credits (Kilo Pass, Augment, Amp), or a vendor's coding plan sold as a key with windows (GLM,
 MiniMax, Kimi). A pay-per-token API key doesn't need it: a second key just bills the same way.
 
@@ -89,8 +89,7 @@ What an account's environment needs, per agent:
 - **File storage switches.** Some agents keep the login in the macOS keychain under a fixed
   name, which every home would share. Most have a switch to keep it in a file in the home
   instead: `AGY_ACP_FORCE_FILE_STORAGE=1` (Antigravity), `AGENT_CLI_CREDENTIAL_STORE=file`
-  (Cursor), `GEMINI_FORCE_FILE_STORAGE=true` (Gemini API keys), `VIBE_TEST_DISABLE_KEYRING=1`
-  (Mistral Vibe), `GOOSE_DISABLE_KEYRING` (goose).
+  (Cursor), `VIBE_TEST_DISABLE_KEYRING=1` (Mistral Vibe), `GOOSE_DISABLE_KEYRING` (goose).
 - **Login variables removed.** A login in the environment overrides the account's own. The
   user's environment has `GITHUB_TOKEN`, which Copilot, OpenCode and Kilo take as a login. For
   every agentZ account, the server removes the agent's login variables
@@ -223,8 +222,8 @@ Readers come in seven kinds:
 5. **Hidden terminal script:** start the agent's terminal UI in a PTY nobody sees, wait for it
    to be ready, type a slash command, press Enter only once the command menu shows the
    expected entry, read the screen, then close it with Esc and quit. This is for numbers that
-   only exist in the terminal UI (Droid `/status` and `/limits`, Devin `/usage`, Gemini
-   `/stats model`, Kimi `/usage`, Cursor `/usage`, Qoder `/usage`). The server already runs
+   only exist in the terminal UI (Droid `/status` and `/limits`, Devin `/usage`, Kimi
+   `/usage`, Cursor `/usage`, Qoder `/usage`). The server already runs
    terminals (`alacritty_terminal`), so this reuses them.
 6. **HTTP with a key agentZ holds** (API-key accounts, above).
 7. **HTTP with the agent's stored login:** read the token from where the agent keeps it in the
@@ -275,9 +274,8 @@ that is still used.
   - `claude -p "/usage"` writes a transcript under `<config dir>/projects/<folder>/`. It gets
     the same cleanup, unless Claude has a flag that skips saving the session.
   - Codex's `app-server` and Devin's status command leave nothing.
-- Hidden terminal readers have to handle first-run prompts: Droid's folder trust, Codex's
-  update prompt (`-c check_for_update_on_startup=false`), and Gemini opening a browser login
-  (`NO_BROWSER=true`).
+- Hidden terminal readers have to handle first-run prompts: Droid's folder trust and Codex's
+  update prompt (`-c check_for_update_on_startup=false`).
 
 ### Actions when a limit runs out
 
@@ -355,7 +353,7 @@ Any action that spends a reset or can bill money asks first. What the design rou
 - agentZ doesn't write into the shared `~/.agents/skills`. Many agents read it whatever their
   home: Codex, Devin, Grok, OpenCode, Kilo, Qoder, Amp, Cline and others. Skills already there
   show up in every account of those agents, and the import above makes them reach Droid,
-  Claude, Gemini and Cursor accounts, which don't read it.
+  Claude and Cursor accounts, which don't read it.
 
 ### MCP servers
 
@@ -375,7 +373,6 @@ Any action that spends a reset or can bill money asks first. What the design rou
   the server.
 - Some agents ignore `mcpServers` from ACP (Cline, Cortex Code, the pi and Autohand adapters).
   They get no app-managed MCP servers, and Settings says so.
-- Gemini starts MCP servers only in trusted folders (`GEMINI_CLI_TRUST_WORKSPACE`).
 - These servers only load in agentZ threads, not when the user runs the agent's CLI in a
   terminal.
 
@@ -438,10 +435,10 @@ Decided in the design round; `decisions.md` is the spec. In short:
 | Wave | Agents | Why |
 |---|---|---|
 | 1 | Factory Droid, Claude, Codex, Devin | Researched in depth; the user's main agents |
-| 2 | Grok Build, GitHub Copilot, Gemini CLI, Kilo, GLM Agent, Qoder | A clean home variable, and the identity and quota can be read without a prompt |
+| 2 | Grok Build, GitHub Copilot, Kilo, GLM Agent, Qoder | A clean home variable, and the identity and quota can be read without a prompt |
 | 3 | Cursor, Google Antigravity, Kimi CLI, Auggie, MiniMax Code, Amp, Junie, OpenCode | Each has a catch: HOME has to move, there's no quota source, or nothing was tested |
 | Later | Cline, Codebuddy Code, Cortex Code, Mistral Vibe, Qwen Code, Kimchi, pi, Stakpak, Dirac, fast-agent, goose, VT Code, Corust Agent, siGit Code | Weak fit: no quota, ACP ignores MCP, the login is only through other vendors, or there are no docs |
-| Skip | Nova, Autohand, Poolside, DimCode, Harn, DeepAgents, Minion Code, crow-cli, Agoragentic | Keys only, nothing to show, or not a coding agent |
+| Skip | Gemini CLI, Nova, Autohand, Poolside, DimCode, Harn, DeepAgents, Minion Code, crow-cli, Agoragentic | Deprecated, keys only, nothing to show, or not a coding agent |
 
 ### Wave 1
 
@@ -500,20 +497,6 @@ Notes:
   - Quota: `account.getQuota` returns chat, completions and premium-request snapshots, each
     with entitlement, used, remaining percentage and reset date *(fields from source)*.
   - Skills: `$COPILOT_HOME/skills`. MCP: http and sse.
-- **Gemini CLI** (`gemini --acp`):
-  - Home: `GEMINI_CLI_HOME`, the parent of `.gemini`, so it also moves `.agents` (verified).
-    The Google login is the file `.gemini/oauth_creds.json`. Add
-    `GEMINI_FORCE_FILE_STORAGE=true` so saved API keys don't go to a shared keychain entry.
-  - Logged out: `session/new` fails. With a Google login selected but no credentials it opens
-    a browser instead, so readers set `NO_BROWSER=true`.
-  - Identity: `/about`, answered locally: email and tier.
-  - Quota: terminal `/stats model`: per-model remaining and reset time *(unverified on a real
-    login)*.
-  - Skills: `<home>/.gemini/skills`, `<home>/.agents/skills` (symlinks verified; the real
-    `~/.agents/skills` isn't read).
-  - MCP: http and sse, started only in trusted folders. `session/new` waits for MCP servers to
-    start.
-  - The user's Homebrew `gemini` is 0.47.0; the registry's is 0.62.0.
 - **Kilo** (`kilo acp`, an OpenCode fork):
   - Home: `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` (each gets
     a `kilo/` folder); the login is `auth.json`. Remove `GITHUB_TOKEN`.
@@ -634,11 +617,11 @@ Notes:
 
 ### Skip
 
-Nova (obfuscated, 462 MB of dependencies, keychain), Autohand (two packages, ignores MCP, no
-quota), Poolside (no identity or quota), DimCode (keys only; its coding plan is "coming soon"),
-Harn, DeepAgents, Minion Code and crow-cli (keys only), Agoragentic (a paid-services
-marketplace, not a coding agent; its README warns against the npm package the registry
-installs).
+Gemini CLI (deprecated, the user said), Nova (obfuscated, 462 MB of dependencies, keychain),
+Autohand (two packages, ignores MCP, no quota), Poolside (no identity or quota), DimCode (keys
+only; its coding plan is "coming soon"), Harn, DeepAgents, Minion Code and crow-cli (keys
+only), Agoragentic (a paid-services marketplace, not a coding agent; its README warns against
+the npm package the registry installs).
 
 ## Open questions
 
@@ -654,8 +637,8 @@ Decided by the user:
 - "Copy settings from" also copies the agent's own settings files.
 - On Droid, Stop or Continue at reset applies only when Droid itself stops, and there's no
   separate extra usage switch.
+- The waves are in the right order. Gemini CLI is deprecated, so it's skipped.
 
 Still open:
 
 1. Should the MCP servers in the agents' own configs be imported too, as skills are?
-2. Are the waves in the right order (see Agents)?
