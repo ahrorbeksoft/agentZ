@@ -63,8 +63,8 @@ There are two kinds of account (the user's decision):
 
 New threads start on the account marked Use for New Threads (§5), else the External account
 when it's listed, else the first agentZ account. The strip under the composer changes it (§12).
-agentZ doesn't share the external login with its own homes: that would mean linking or copying
-the agent's login file, which agentZ doesn't touch. (t3code's Codex "shadow home" does the
+agentZ doesn't share the external login with its own homes: accounts share nothing, so a login
+is never linked or copied from one home to another. (t3code's Codex "shadow home" does the
 opposite: extra accounts share the main home's sessions and keep only `auth.json` separate.)
 
 Existing threads ran in the normal home, so they stay on the External account. If that login
@@ -102,7 +102,7 @@ What an account's environment needs, per agent:
   exports only `CLAUDE_CONFIG_DIR` for this reason: with HOME moved, Claude reports "Not
   logged in"). Those agents come last. Each one is tested first for whether it passes the real
   HOME to its shell. If it doesn't, the account folder gets symlinks to the user's `.gitconfig`,
-  `.ssh` and `.config`.
+  `.ssh` and `.config` (the user accepted this).
 
 ### API-key accounts
 
@@ -169,8 +169,9 @@ What changes:
 - The agent's own settings files are in the home, so they're per account already: Claude's
   `settings.json` (model, permissions, hooks, `env`), Codex's `config.toml` (model, profiles,
   providers), Droid's `settings.json` (custom models, session defaults) and Devin's
-  `config.json`. A new agentZ account starts without the user's CLI settings, because agentZ
-  doesn't copy the agent's files (open question 6).
+  `config.json`. "Copy settings from" (below) copies them too, from the picked account's home
+  (the normal home for the External account), but never the login. They can hold API keys
+  (Droid's custom models); the user accepted that.
 - The agent's Threads tab (importing its sessions) lists one account's sessions, since each
   account has its own.
 - Agent control: `agentz_thread_launch` and `delegate_task` list each account with its models
@@ -180,9 +181,9 @@ What changes:
   whose settings (or sessions) they show, opening on the default account. The model menu lists
   only what that account offers (§6).
 - A new account's card has "Copy settings from": an existing account (the default one first)
-  or Nothing. Its Environment and defaults are copied once; defaults it doesn't offer are
-  dropped when its first session lists its models. After that each account's settings are its
-  own (§7).
+  or Nothing. Its Environment, defaults and the agent's settings files are copied once; defaults
+  it doesn't offer are dropped when its first session lists its models. After that each
+  account's settings are its own (§7).
 
 ### The server
 
@@ -203,10 +204,11 @@ Each supported agent gets a small description in `crates/agentz_server/src/accou
 - **Environment:** home variables, file storage switches, login variables to remove.
 - **Skills folders** to link into, relative to the home, and the folders outside the home the
   agent reads anyway (for clash checks).
+- **Settings files** that "Copy settings from" copies, relative to the home.
 - **Login check:** how to tell the account is logged out.
 - **Identity reader** and **quota reader**.
 
-Readers come in six kinds:
+Readers come in seven kinds:
 
 1. **Command:** run a program with the account's env and parse its output, JSON or text
    (`claude auth status --json`, `devin auth status`, `cursor-agent status --format json`,
@@ -225,13 +227,14 @@ Readers come in six kinds:
    `/stats model`, Kimi `/usage`, Cursor `/usage`, Qoder `/usage`). The server already runs
    terminals (`alacritty_terminal`), so this reuses them.
 6. **HTTP with a key agentZ holds** (API-key accounts, above).
+7. **HTTP with the agent's stored login:** read the token from where the agent keeps it in the
+   account's home, and call the vendor's usage API with it. Only where nothing else gives the
+   quota: Antigravity (Google's APIs), Cline, OpenCode's provider logins, Kimi's API. agentZ
+   only reads the login; it never changes, refreshes or copies it. The user lifted the rule
+   against reading agents' credentials for this.
 
 Readers return one shape: `AccountStatus { logged_in, email, name, plan, windows, credits }`,
 with each window `{ label, used_percent, resets_at }`.
-
-agentZ still never reads an agent's credential files. Where the only quota source is the
-vendor's API called with the agent's stored token (Antigravity, Cline, OpenCode's provider
-logins), that agent shows no quota.
 
 Parsers keep captured real outputs, with personal data replaced, as test fixtures. A new agent
 version that changes its output then fails a test instead of showing wrong numbers.
@@ -249,7 +252,8 @@ For those, the description names another check:
 - **A key agentZ holds** (GLM).
 
 This changes the AGENTS.md pitfall "Stay within ACP for agent status": agentZ also runs the
-agent's own status commands. It still never reads credential files. Claude and Codex keep
+agent's own status commands, and reads a stored login where that's the only quota source
+(reader kind 7). AGENTS.md is updated with the first reader that does. Claude and Codex keep
 sending `_auth/status_update` during a session (`agentz_protocol::thread::AuthStatus`), and
 that is still used.
 
@@ -312,10 +316,12 @@ Any action that spends a reset or can bill money asks first. What the design rou
 - **Limit resets** (§9): a line under the limits says how many resets the account has and when
   the next expires, with Use Reset, which always asks first. The thread's notice offers it too.
 - **Extra usage** (§10): a switch per account, "Use extra usage when limits run out", which asks
-  first because it bills the card on file. agentZ changes it through the agent: Droid's
-  preference, and Claude's only through its terminal app *(untested)*.
+  first because it bills the card on file. agentZ changes it through the agent: Claude's only
+  through its terminal app *(untested)*. Droid gets no separate switch: its "When limit is
+  reached" choice (§8) is already its extra usage setting.
 - **Waiting** (§11): a setting per account, Stop (today) or Continue at reset, for every thread
-  on it. agentZ never moves a thread to another account by itself.
+  on it. agentZ never moves a thread to another account by itself. On Droid it applies only
+  when Droid itself stops, since its own choice at the limit comes first.
 - **The thread** (§14): a yellow notice over the composer says which account ran out, when it
   resets, and the ways on: "Continue on <the account with the most left>", whose arrow lists
   the others, and the agent's own actions (§8, §9). Continue with Another Agent ▸ lists the
@@ -336,14 +342,20 @@ Any action that spends a reset or can bill money asks first. What the design rou
   Settings shows why.
 - Links are synced when a skill is added or removed, when an account is created, and when the
   server starts. New sessions pick them up.
+- Existing skills are imported. When agentZ's skills folder is first made, the server copies
+  in every skill it finds in the agents' normal homes and in `~/.agents/skills`; the originals
+  stay where they are. A name it already has is skipped. An agent that has the original then
+  skips agentZ's copy (the clash rule above), and every other agent and account gets it.
+- Skills are per machine, like agent settings. Settings can import them from another of the
+  user's machines, as a copy.
 - Each skill and MCP server has an accounts menu on its row: "Every account" at first, or the
   accounts it loads on, grouped by agent (§20). It's stored as the accounts it's kept off, so a
   new account starts checked. A skill is linked only into the accounts it loads on, and a
   server is passed only to their sessions.
 - agentZ doesn't write into the shared `~/.agents/skills`. Many agents read it whatever their
   home: Codex, Devin, Grok, OpenCode, Kilo, Qoder, Amp, Cline and others. Skills already there
-  show up in every account of those agents. Importing them into agentZ also makes them reach
-  Droid, Claude, Gemini and Cursor accounts, which don't read it.
+  show up in every account of those agents, and the import above makes them reach Droid,
+  Claude, Gemini and Cursor accounts, which don't read it.
 
 ### MCP servers
 
@@ -351,6 +363,7 @@ Any action that spends a reset or can bill money asks first. What the design rou
   command or URL) with configure, delete and a switch to turn it off, and a line naming the
   agents that can't take it. Add Server offers Add Local Server (name, command, arguments,
   environment variables) and Add Remote Server (URL and headers), each a dialog.
+- MCP servers are per machine too, and can be imported from another machine, as skills can.
 - The server adds them to the `mcpServers` of every `session/new` and `session/load`, beside
   agentZ's own `agentz` server (`server.rs`, where `agent_control` is added). This is how Zed
   passes its context servers. It covers every agent and account without editing their config
@@ -394,8 +407,12 @@ Decided in the design round; `decisions.md` is the spec. In short:
   untouched, clashes are skipped, and stale links are removed.
 - MCP: the mock agent reports the `mcpServers` it got, and a server test checks that the user's
   servers arrive beside `agentz`, and not on an account the server is kept off.
-- A new account copies the settings of the account picked in "Copy settings from", and drops a
-  copied default its first session doesn't offer.
+- A new account copies the settings and the agent's settings files of the account picked in
+  "Copy settings from" (but no login), and drops a copied default its first session doesn't
+  offer.
+- Importing existing skills, run on temporary stand-ins for the agents' homes and
+  `~/.agents/skills`, copies them once, leaves the originals, and skips names agentZ already
+  has.
 - Continue at reset: a thread stopped by a limit gets its message sent when the window resets
   (the clock is advanced in the test).
 
@@ -548,7 +565,7 @@ Notes:
     current login is.
   - Logged out: `session/new` fails.
   - Identity and quota: nothing over ACP. The only source is Google's APIs with the stored
-    token, so it shows no quota.
+    token (reader kind 7).
   - Skills: `<home>/config/skills`, `<home>/antigravity-cli/skills`. MCP: http and sse,
     accepted.
 - **Kimi CLI** (`kimi acp`):
@@ -591,7 +608,7 @@ Notes:
   - Logged out: the session opens with free models; `opencode auth list --format json` is
     empty.
   - Identity: only the login's label (org name or "API key").
-  - Quota: none without the stored tokens. Accounts work, without quota.
+  - Quota: only through the vendors' APIs with its stored tokens (reader kind 7).
   - Skills: `$XDG_CONFIG_HOME/opencode/skills` (symlinks verified), plus the real
     `~/.claude/skills` and `~/.agents/skills`.
   - MCP: http, accepted.
@@ -625,23 +642,20 @@ installs).
 
 ## Open questions
 
-Decided: the agent's own login is the External account, listed only while it's logged in;
-everything else lives in agentZ's homes (see The home folder). Quota refreshes every 5 minutes,
-after each turn ends, and on demand (§5).
+Decided by the user:
 
-1. Should existing skills (such as `~/.agents/skills/find-skills`) and the MCP servers in the
-   agents' own configs be imported into agentZ's lists?
-2. For agents that need HOME moved (Cursor, Auggie, MiniMax, Kimi), is linking the user's
-   `.gitconfig`, `.ssh` and `.config` into the account acceptable, or should they wait?
-3. Should agentZ keep never reading agents' credentials, which leaves Antigravity, Cline and
-   OpenCode's provider logins without quota?
-4. Should skills and MCP servers be per machine, like agent settings, or copied from the Mac to
-   every machine?
-5. Are the waves in the right order?
-6. Should a new account start with a copy of the agent's own settings file from its normal home
-   (Claude's `settings.json`, Codex's `config.toml`, Droid's `settings.json`)? They aren't
-   logins, but some can hold API keys (Droid's custom models). "Copy settings from" (§7) copies
-   only what agentZ keeps.
-7. On a Droid card, Factory's "When limit is reached" (§8) and agentZ's Stop or Continue at
-   reset (§11) would sit together, and Droid's choice already includes extra usage (§10). Show
-   agentZ's setting there only for when Droid itself stops, and no separate extra usage switch?
+- The agent's own login is the External account, listed only while it's logged in; everything
+  else lives in agentZ's homes (see The home folder).
+- Quota refreshes every 5 minutes, after each turn ends, and on demand (§5).
+- Existing skills are imported into agentZ (see Skills).
+- Agents that need HOME moved get links to the user's `.gitconfig`, `.ssh` and `.config`.
+- agentZ may read an agent's stored login where that's the only quota source (reader kind 7).
+- Skills and MCP servers are per machine, and can be imported from another machine.
+- "Copy settings from" also copies the agent's own settings files.
+- On Droid, Stop or Continue at reset applies only when Droid itself stops, and there's no
+  separate extra usage switch.
+
+Still open:
+
+1. Should the MCP servers in the agents' own configs be imported too, as skills are?
+2. Are the waves in the right order (see Agents)?

@@ -11,8 +11,14 @@ Notes for whoever continues:
   reader is checked against captured screens, not by spending usage.
 - An agent with one account looks and behaves as today everywhere.
 - §20 is stored as the accounts a skill or server is kept off, so a new account starts with it.
-- §8, §10 and §11 overlap on a Droid card; plan.md's open question 7 asks how. Until the user
-  answers, build §8 for Droid and §11 for every agent, and leave Droid out of §10.
+- Droid (the user's answer): §8 is its limit choice, §11 applies only when Droid itself stops,
+  and §10 has no Droid switch.
+- §7 also copies the agent's own settings files (never the login), as the user decided.
+- The user lifted the rule against reading agents' stored logins (reader kind 7). Rewrite the
+  AGENTS.md pitfall "Stay within ACP for agent status" in the commit that first needs it
+  (item 5 runs status commands; kind 7 comes with wave 3).
+- Importing skills and servers from another machine isn't on the design board yet: add a topic
+  and let the user pick before building item 26.
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -38,7 +44,9 @@ Notes for whoever continues:
 | 20 | 9 | Limit resets (Codex) | |
 | 21 | 10 | Extra usage switch | |
 | 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | |
-| 23 | 19 | Settings › MCP Servers, passed to every session | |
-| 24 | 20 | The accounts menu on each skill and server | |
-| 25 | | Wave 2, one agent per commit | |
-| 26 | | Wave 3, one agent per commit | |
+| 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | |
+| 24 | 19 | Settings › MCP Servers, passed to every session | |
+| 25 | 20 | The accounts menu on each skill and server | |
+| 26 | | Importing skills and servers from another machine (board topic first) | |
+| 27 | | Wave 2, one agent per commit | |
+| 28 | | Wave 3, one agent per commit | |
