@@ -105,7 +105,9 @@ agentZ's own crates. Everything else in `crates/` is copied from Zed at the same
   `~/.agentz/server/<version>/agentz-server` with its `.sha256`, so the app finds it in place,
   and links it from `~/.local/bin`.
 - **Website** (`site/`, `.github/workflows/pages.yml`): the landing page on GitHub Pages,
-  published when `site/` changes.
+  published when `site/` changes. Its screenshots show demo data only: custom agents running the
+  mock agent under real agents' names, with `MOCK_SCRIPTS` giving their scripted turns
+  real-looking prompts, taken as in Testing in `AGENTS.md`.
 
 ### Data
 
@@ -862,7 +864,6 @@ Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 - **Deleting sessions on the agent's side** when a thread is deleted.
 - **t3code's snooze** for threads.
 - **Automatic workspace cleanup**: t3code's inactive-days and merged rules, cow's `gc`.
-- **An app icon** for the bundle.
 
 Open questions for the user:
 
