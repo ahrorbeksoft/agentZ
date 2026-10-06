@@ -274,6 +274,17 @@ impl AgentThread {
         cx.notify();
     }
 
+    /// Sets the permission requests as a state update would: no entry changes with them.
+    #[cfg(test)]
+    pub(crate) fn set_permission_requests_for_test(
+        &mut self,
+        requests: Vec<agentz_protocol::thread::PermissionRequest>,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.state.permission_requests = requests;
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn set_queued_messages_for_test(
         &mut self,

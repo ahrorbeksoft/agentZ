@@ -240,6 +240,9 @@ pub struct AgentView {
     /// Whether the agent was working when the rows were last measured: a turn's last run folds
     /// as it ends.
     synced_working: bool,
+    /// The running turn's folded last run and the entry its live line showed when the rows were
+    /// last measured.
+    synced_live_line: Option<LiveLine>,
     /// Settings › General's "Show thinking", as the rows were last measured with it.
     synced_show_thinking: bool,
     toggled_thoughts: HashSet<usize>,
@@ -449,6 +452,7 @@ impl AgentView {
             toggled_tool_calls: HashSet::default(),
             opened_runs: HashSet::default(),
             synced_working: false,
+            synced_live_line: None,
             synced_show_thinking: crate::app_settings::AppSettingsStore::global(cx)
                 .read(cx)
                 .settings()
@@ -1024,6 +1028,7 @@ impl AgentView {
             self.synced_revisions.truncate(entry_count);
             self.opened_runs.clear();
         }
+        let mut changed = Vec::new();
         for (index, revision) in revisions.iter().enumerate() {
             if self.synced_revisions.get(index) == Some(revision) {
                 continue;
@@ -1031,6 +1036,7 @@ impl AgentView {
             let Some(entry) = self.thread.read(cx).entries().get(index).cloned() else {
                 continue;
             };
+            changed.push(index);
             let is_new = self.synced_revisions.get(index).is_none();
             self.sync_entry(index, &entry, cx);
             self.list_state.remeasure_items(index + 1..index + 2);
@@ -1053,6 +1059,27 @@ impl AgentView {
             self.list_state
                 .remeasure_items(turn_start + 1..entry_count + 1);
         }
+        // The live line draws in its run's first row whichever entry it shows: that row follows
+        // every entry of the run, and all of the run's rows change as the line moves to another
+        // entry, or the run grows, folds or ends.
+        let live_line = self.live_line(cx);
+        if live_line != self.synced_live_line {
+            for line in [self.synced_live_line.take(), live_line.clone()]
+                .into_iter()
+                .flatten()
+            {
+                let end = line.run.end.min(entry_count);
+                if line.run.start < end {
+                    self.list_state.remeasure_items(line.run.start + 1..end + 1);
+                }
+            }
+        } else if let Some(line) = &live_line
+            && changed.iter().any(|index| line.run.contains(index))
+        {
+            self.list_state
+                .remeasure_items(line.run.start + 1..line.run.start + 2);
+        }
+        self.synced_live_line = live_line;
         // The head and tail follow the thread's state.
         self.list_state.remeasure_items(0..1);
         self.list_state
@@ -2742,7 +2769,8 @@ impl AgentView {
 
     /// A tool call, thought or the plan's marker. Once a message follows it, a run of them
     /// folds into one line, as t3code folds a work group: the line draws at the run's first
-    /// entry, and the rest draw nothing until it's opened.
+    /// entry, and the rest draw nothing until it's opened. While the turn runs, its last run
+    /// folds into a live line instead, t3code's `work-live` row.
     fn render_work_entry(
         &self,
         index: usize,
@@ -2751,29 +2779,73 @@ impl AgentView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let run = self.folded_run(index, cx);
+        let live_line = self.live_line(cx).filter(|line| line.run.contains(&index));
+        let run = match &live_line {
+            Some(line) => Some(line.run.clone()),
+            None => self.folded_run(index, cx),
+        };
         let is_open = run
             .as_ref()
             .is_none_or(|run| self.opened_runs.contains(&run.start));
-        let element = is_open.then(|| match entry {
-            Entry::AgentThought(_) => self.render_thinking_block(index, is_last, window, cx),
-            Entry::ToolCall(tool_call) => self.render_tool_call(index, tool_call, window, cx),
-            // In Zed the plan lives in the activity bar above the message editor.
-            _ => div().into_any_element(),
-        });
+        let element =
+            is_open.then(|| self.render_work_row(index, entry, is_last, None, window, cx));
         match run {
-            Some(run) if run.start == index => v_flex()
-                .w_full()
-                .child(self.render_work_run_header(run, is_open, cx))
-                .children(element)
-                .into_any_element(),
+            Some(run) if run.start == index => {
+                // Open, a live run reads as any other: what it did, then its rows.
+                let header = match live_line {
+                    Some(line) if !is_open => {
+                        let entries = self.thread.read(cx).entries();
+                        let is_last = line.entry + 1 == entries.len();
+                        match entries.get(line.entry).cloned() {
+                            Some(entry) => self.render_work_row(
+                                line.entry,
+                                &entry,
+                                is_last,
+                                Some(run),
+                                window,
+                                cx,
+                            ),
+                            None => div().into_any_element(),
+                        }
+                    }
+                    _ => self.render_work_run_header(run, is_open, cx),
+                };
+                v_flex()
+                    .w_full()
+                    .child(header)
+                    .children(element)
+                    .into_any_element()
+            }
             _ => element.unwrap_or_else(|| div().into_any_element()),
         }
     }
 
+    /// A thought's or a tool call's own row. As a live line, it stands for `live_run`, and
+    /// clicking it opens the run instead of the entry.
+    fn render_work_row(
+        &self,
+        index: usize,
+        entry: &Entry,
+        is_last: bool,
+        live_run: Option<Range<usize>>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match entry {
+            Entry::AgentThought(_) => {
+                self.render_thinking_block(index, is_last, live_run, window, cx)
+            }
+            Entry::ToolCall(tool_call) => {
+                self.render_tool_call(index, tool_call, live_run, window, cx)
+            }
+            // In Zed the plan lives in the activity bar above the message editor.
+            _ => div().into_any_element(),
+        }
+    }
+
     /// The run of work `index` is in, if it folds: a run of at least two tool calls or thoughts
-    /// that a message follows, or that ended its turn. A lone one stays as it is, as in t3code,
-    /// and so does the running turn's last run, whose rows show as they come.
+    /// that a message follows, or that ended its turn. A lone one stays as it is, as in t3code.
+    /// The running turn's last run folds into its live line instead (`live_line`).
     fn folded_run(&self, index: usize, cx: &App) -> Option<Range<usize>> {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
@@ -2781,15 +2853,82 @@ impl AgentView {
         if thread.is_working() && run.end == entries.len() {
             return None;
         }
-        let shown = entries[run.clone()]
-            .iter()
-            .filter(|entry| !matches!(entry, Entry::Plan))
-            .count();
-        let needs_confirmation = entries[run.clone()].iter().any(|entry| {
-            matches!(entry, Entry::ToolCall(tool_call)
-                if thread.permission_request(&tool_call.id).is_some())
-        });
-        (shown >= 2 && !needs_confirmation).then_some(run)
+        let needs_confirmation = run.clone().any(|index| self.awaits_confirmation(index, cx));
+        (shown_work(&entries[run.clone()]) >= 2 && !needs_confirmation).then_some(run)
+    }
+
+    /// The running turn's last run of work, when it has two tool calls or thoughts, folded into
+    /// one live line, as t3code's `activeWorkRow`: the line shows the tool call awaiting
+    /// confirmation, with its buttons, or else the latest entry still running, or else the
+    /// latest one.
+    fn live_line(&self, cx: &App) -> Option<LiveLine> {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let last = entries.len().checked_sub(1)?;
+        let run = work_run(entries, last).filter(|_| thread.is_working())?;
+        if shown_work(&entries[run.clone()]) < 2 {
+            return None;
+        }
+        let awaiting: Vec<usize> = run
+            .clone()
+            .filter(|&index| self.awaits_confirmation(index, cx))
+            .collect();
+        let entry = match awaiting.as_slice() {
+            [] => run
+                .clone()
+                .rev()
+                .find(|&index| match &entries[index] {
+                    Entry::ToolCall(tool_call) => matches!(
+                        tool_call.status,
+                        acp::ToolCallStatus::InProgress | acp::ToolCallStatus::Pending
+                    ),
+                    Entry::AgentThought(_) => index == last,
+                    _ => false,
+                })
+                .or_else(|| {
+                    run.clone()
+                        .rev()
+                        .find(|&index| !matches!(entries[index], Entry::Plan))
+                })?,
+            [entry] => *entry,
+            // One line can't hold several requests' buttons, so the rows show.
+            _ => return None,
+        };
+        Some(LiveLine {
+            run,
+            entry,
+            awaits_confirmation: !awaiting.is_empty(),
+        })
+    }
+
+    fn awaits_confirmation(&self, index: usize, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        matches!(thread.entries().get(index), Some(Entry::ToolCall(tool_call))
+            if thread.permission_request(&tool_call.id).is_some())
+    }
+
+    /// Opens or folds a run of work.
+    fn toggle_run(&mut self, run: Range<usize>, cx: &mut Context<Self>) {
+        let Range { start, end } = run;
+        if !self.opened_runs.remove(&start) {
+            // Its rows open as they first showed, also those opened before it folded on its
+            // own as the agent wrote after them.
+            let entries = self.thread.read(cx).entries();
+            for (index, entry) in entries.iter().enumerate().take(end).skip(start) {
+                match entry {
+                    Entry::ToolCall(tool_call) => {
+                        self.toggled_tool_calls.remove(&tool_call.id);
+                    }
+                    Entry::AgentThought(_) => {
+                        self.toggled_thoughts.remove(&index);
+                    }
+                    _ => {}
+                }
+            }
+            self.opened_runs.insert(start);
+        }
+        self.list_state.remeasure_items(start + 1..end + 1);
+        cx.notify();
     }
 
     /// t3code's work group header: what the run did, opening to its rows.
@@ -2801,28 +2940,9 @@ impl AgentView {
     ) -> AnyElement {
         let color = work_row_color(cx);
         let summary = summarize_work(&self.thread.read(cx).entries()[run.clone()]);
-        let Range { start, end } = run;
-        let toggle = cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-            if !this.opened_runs.remove(&start) {
-                // Its rows open as they first showed, also those opened before it folded on its
-                // own as the agent wrote after them.
-                let entries = this.thread.read(cx).entries();
-                for (index, entry) in entries.iter().enumerate().take(end).skip(start) {
-                    match entry {
-                        Entry::ToolCall(tool_call) => {
-                            this.toggled_tool_calls.remove(&tool_call.id);
-                        }
-                        Entry::AgentThought(_) => {
-                            this.toggled_thoughts.remove(&index);
-                        }
-                        _ => {}
-                    }
-                }
-                this.opened_runs.insert(start);
-            }
-            this.list_state.remeasure_items(start + 1..end + 1);
-            cx.notify();
-        });
+        let start = run.start;
+        let toggle =
+            cx.listener(move |this, _: &gpui::ClickEvent, _, cx| this.toggle_run(run.clone(), cx));
         div()
             .mx_5()
             .py_1()
@@ -2897,6 +3017,7 @@ impl AgentView {
         &self,
         index: usize,
         is_last: bool,
+        live_run: Option<Range<usize>>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2905,7 +3026,8 @@ impl AgentView {
             .read(cx)
             .settings()
             .show_thinking;
-        let is_open = open_by_default != self.toggled_thoughts.contains(&index);
+        let is_live = live_run.is_some();
+        let is_open = open_by_default != (!is_live && self.toggled_thoughts.contains(&index));
         let color = work_row_color(cx);
         let row_group = SharedString::from(format!("thinking-row-{index}"));
         let label = if is_thinking {
@@ -2923,11 +3045,14 @@ impl AgentView {
             .rounded_md()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.toggled_thoughts.remove(&index) {
-                    this.toggled_thoughts.insert(index);
+            .on_click(cx.listener(move |this, _, _, cx| match &live_run {
+                Some(run) => this.toggle_run(run.clone(), cx),
+                None => {
+                    if !this.toggled_thoughts.remove(&index) {
+                        this.toggled_thoughts.insert(index);
+                    }
+                    cx.notify();
                 }
-                cx.notify();
             }))
             .child(
                 h_flex().w(px(24.)).flex_none().justify_center().child(
@@ -2946,7 +3071,7 @@ impl AgentView {
             )
             .child(
                 div().flex_none().visible_on_hover(row_group).child(
-                    Icon::new(if is_open {
+                    Icon::new(if is_open && !is_live {
                         IconName::ChevronUp
                     } else {
                         IconName::ChevronDown
@@ -2981,6 +3106,7 @@ impl AgentView {
         &self,
         index: usize,
         tool_call: &ToolCall,
+        live_run: Option<Range<usize>>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3001,8 +3127,10 @@ impl AgentView {
             || !tool_call.terminals.is_empty()
             || !tool_call.images.is_empty()
             || tool_call.raw_input.is_some();
-        let is_openable = has_content && !needs_confirmation;
-        let is_open = needs_confirmation || self.toggled_tool_calls.contains(&tool_call.id);
+        let is_live = live_run.is_some();
+        let is_openable = is_live || (has_content && !needs_confirmation);
+        let is_open =
+            needs_confirmation || (!is_live && self.toggled_tool_calls.contains(&tool_call.id));
         let (added, removed) = tool_call.diffs.iter().map(FileDiff::line_counts).fold(
             (0, 0),
             |(added, removed), (more_added, more_removed)| {
@@ -3012,11 +3140,14 @@ impl AgentView {
         let row_group = SharedString::from(format!("tool-call-row-{index}"));
         let toggle = {
             let tool_call_id = tool_call.id.clone();
-            cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                if !this.toggled_tool_calls.remove(&tool_call_id) {
-                    this.toggled_tool_calls.insert(tool_call_id.clone());
+            cx.listener(move |this, _: &gpui::ClickEvent, _, cx| match &live_run {
+                Some(run) => this.toggle_run(run.clone(), cx),
+                None => {
+                    if !this.toggled_tool_calls.remove(&tool_call_id) {
+                        this.toggled_tool_calls.insert(tool_call_id.clone());
+                    }
+                    cx.notify();
                 }
-                cx.notify();
             })
         };
         let icon = Icon::new(match tool_call.kind {
@@ -3069,7 +3200,7 @@ impl AgentView {
             .when(is_openable, |this| {
                 this.child(
                     div().flex_none().visible_on_hover(row_group).child(
-                        Icon::new(if is_open {
+                        Icon::new(if is_open && !is_live {
                             IconName::ChevronUp
                         } else {
                             IconName::ChevronDown
@@ -3249,6 +3380,7 @@ impl AgentView {
         }
         Some(
             v_flex()
+                .debug_selector(|| format!("permission-buttons-{index}"))
                 .p_1()
                 .border_t_1()
                 .border_color(Self::tool_card_border_color(cx))
@@ -6431,6 +6563,25 @@ fn work_run(entries: &[Entry], index: usize) -> Option<Range<usize>> {
     Some(start..end)
 }
 
+/// How many of a run's entries draw a row: the plan's marker doesn't.
+fn shown_work(entries: &[Entry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| !matches!(entry, Entry::Plan))
+        .count()
+}
+
+/// The running turn's last run of work, folded into the row of one of its entries.
+#[derive(Clone, Debug, PartialEq)]
+struct LiveLine {
+    run: Range<usize>,
+    /// The entry whose row the line is.
+    entry: usize,
+    /// Whether that entry shows a permission request's buttons, which a request's coming and
+    /// going doesn't mark as a change to the entry.
+    awaits_confirmation: bool,
+}
+
 /// Where the last turn's entries start: after the user's last message.
 fn current_turn_start(entries: &[Entry]) -> usize {
     entries
@@ -7074,8 +7225,8 @@ mod tests {
         );
     }
 
-    /// The thread round's fold: a run's rows show as they come, and once the agent writes after
-    /// them, or the turn ends, they fold into a line that opens to them.
+    /// The thread round's fold: while the turn runs, a run shows only its latest row, and once
+    /// the agent writes after it, or the turn ends, it folds into a line that opens to its rows.
     #[gpui::test]
     fn work_folds_into_a_line_once_a_message_follows(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -7093,6 +7244,7 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("work-run-1").is_none());
+        assert!(cx.debug_bounds("tool-call-row-1").is_none());
         assert!(cx.debug_bounds("tool-call-row-2").is_some());
 
         // Mid-turn, a message folds the run before it.
@@ -7109,13 +7261,14 @@ mod tests {
         assert!(cx.debug_bounds("tool-call-row-1").is_some());
         assert!(cx.debug_bounds("tool-call-row-2").is_some());
 
-        // The run after it shows its rows until the turn ends.
+        // The run after it shows its latest row until the turn ends.
         thread.update(cx, |thread, cx| {
             thread.push_entry_for_test(work("run-3", acp::ToolKind::Execute, None), cx);
             thread.push_entry_for_test(work("run-4", acp::ToolKind::Execute, None), cx);
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("work-run-4").is_none());
+        assert!(cx.debug_bounds("tool-call-row-4").is_none());
         assert!(cx.debug_bounds("tool-call-row-5").is_some());
         thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
         cx.run_until_parked();
@@ -7154,7 +7307,10 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Opened while the run shows its rows, then folded as the agent writes.
+        // Opened from the live line, its rows opened, and then the agent writes: the run stays
+        // open as it folds, and opens again with its rows closed.
+        click("thinking-row-3", cx);
+        assert!(cx.debug_bounds("work-run-1").is_some());
         click("tool-call-row-1", cx);
         click("thinking-row-3", cx);
         assert!(cx.debug_bounds("tool-call-output-1").is_some());
@@ -7163,6 +7319,9 @@ mod tests {
             thread.push_entry_for_test(Entry::AgentMessage("They pass.".into()), cx)
         });
         cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+        click("work-run-1", cx);
+        assert!(cx.debug_bounds("tool-call-row-1").is_none());
         click("work-run-1", cx);
         assert!(cx.debug_bounds("tool-call-row-1").is_some());
         assert!(cx.debug_bounds("tool-call-output-1").is_none());
@@ -7176,6 +7335,73 @@ mod tests {
         click("work-run-1", cx);
         assert!(cx.debug_bounds("tool-call-row-2").is_some());
         assert!(cx.debug_bounds("tool-call-output-2").is_none());
+    }
+
+    /// t3code's `work-live` row: the running turn's last run is one line, the tool call awaiting
+    /// confirmation, else the latest one running, else the latest entry; it opens to the run.
+    #[gpui::test]
+    fn the_running_turns_last_run_is_one_live_line(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let click = |name: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx.debug_bounds(name).expect(name);
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let mut running = work("run-1", acp::ToolKind::Execute, None);
+        if let Entry::ToolCall(tool_call) = &mut running {
+            tool_call.status = acp::ToolCallStatus::InProgress;
+        }
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    running,
+                    work("read-1", acp::ToolKind::Read, None),
+                ],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-row-1").is_some());
+        assert!(cx.debug_bounds("tool-call-row-2").is_none());
+
+        // Open, it's the run's line and its rows; folded again, the live line.
+        click("tool-call-row-1", cx);
+        assert!(cx.debug_bounds("work-run-1").is_some());
+        assert!(cx.debug_bounds("tool-call-row-2").is_some());
+        click("work-run-1", cx);
+        assert!(cx.debug_bounds("work-run-1").is_none());
+        assert!(cx.debug_bounds("tool-call-row-2").is_none());
+
+        // A thought as the latest entry is the agent thinking.
+        thread.update(cx, |thread, cx| {
+            thread.push_entry_for_test(Entry::AgentThought("Next, the build.".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thinking-row-3").is_some());
+        assert!(cx.debug_bounds("tool-call-row-1").is_none());
+
+        // A request for permission shows its buttons on the line.
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_requests_for_test(
+                vec![agentz_protocol::thread::PermissionRequest {
+                    tool_call_id: acp::ToolCallId::new("read-1"),
+                    title: "Read the file".into(),
+                    options: vec![agentz_protocol::thread::PermissionOption {
+                        id: acp::PermissionOptionId::new("allow"),
+                        name: "Allow".into(),
+                        kind: acp::PermissionOptionKind::AllowOnce,
+                    }],
+                }],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-row-2").is_some());
+        assert!(cx.debug_bounds("permission-buttons-2").is_some());
+        assert!(cx.debug_bounds("thinking-row-3").is_none());
     }
 
     /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.

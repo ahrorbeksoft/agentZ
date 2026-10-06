@@ -314,9 +314,12 @@ Each entry: what it does, where it lives, and where it comes from.
   calls and thoughts folds into one line that opens to them once the agent writes a message
   after it, also mid-turn (t3code's work groups, `AgentView::folded_run`), saying what it did in
   t3code's words (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and
-  performed 2 other actions"); the running turn's last run shows its rows as they come and folds
-  when the turn ends, and a lone call stays a row. A run opens with its rows as they first
-  showed: rows opened in it before it folded are closed again. The
+  performed 2 other actions"), and a lone call stays a row. While the turn runs, its last run is
+  one live line (t3code's `work-live` row, `AgentView::live_line`): the row of the tool call
+  awaiting confirmation, with its buttons, else of the latest entry still running, else of the
+  latest one; clicking it opens the run, and the run folds as usual when a message follows or
+  the turn ends. A run opens with its rows as they first showed: rows opened in it before it
+  folded are closed again. The
   user's message is a bubble on the right with its time ("09:07", "yesterday at
   23:30") and Copy on hover. The bubble is the thread's background a tenth of the way toward its
   text (`user_message_background`), so it shows in every theme: most themes give

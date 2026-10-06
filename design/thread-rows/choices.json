@@ -13,7 +13,7 @@
       "picks": [],
       "none": false,
       "comments": {},
-      "note": "Changed after the build (2026-10-05): a run folds as soon as the agent writes a message after it, also while the turn goes on; the turn's last run folds when it ends.",
+      "note": "Changed after the build (2026-10-05): a run folds as soon as the agent writes a message after it, also while the turn goes on; the turn's last run folds when it ends. Changed again (2026-10-07): while the turn goes on, its last run is one live line, t3code's work-live row: the tool call awaiting confirmation, else the latest one running, else the latest entry. It opens to the run's rows.",
       "also": []
     }
   },

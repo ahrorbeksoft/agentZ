@@ -18,4 +18,4 @@ Picked on the design board (`design/thread-rows/`, see `design/README.md`). Each
 
 **D. Folded once the turn ends** (from t3code work groups): While the agent works, rows show as they come. When the turn ends, each run folds into one line that says what it did ("Ran 5 commands"), opening to its rows on click. The thread round picked rows always open; this is t3code’s default.
 
-**Note:** Changed after the build (2026-10-05): a run folds as soon as the agent writes a message after it, also while the turn goes on; the turn's last run folds when it ends.
+**Note:** Changed after the build (2026-10-05): a run folds as soon as the agent writes a message after it, also while the turn goes on; the turn's last run folds when it ends. Changed again (2026-10-07): while the turn goes on, its last run is one live line, t3code's work-live row: the tool call awaiting confirmation, else the latest one running, else the latest entry. It opens to the run's rows.
