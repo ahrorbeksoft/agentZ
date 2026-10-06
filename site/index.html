@@ -8,70 +8,126 @@
 <meta property="og:title" content="agentZ">
 <meta property="og:description" content="Coding agents on every machine, in one native Mac app.">
 <meta property="og:image" content="https://ahrorbeksoft.github.io/agentZ/screenshot.png">
-<meta name="theme-color" content="#11131c">
+<meta name="theme-color" content="#0a0a0a">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <style>
   :root {
-    --background: #0d0f16;
-    --surface: #161925;
-    --border: #262a3b;
-    --text: #e6e8f0;
-    --muted: #9aa0b4;
-    --accent: #8fb8fd;
-    --green: #4ade80;
+    --background: #0a0a0a;
+    --surface: #141414;
+    --border: #262626;
+    --border-strong: #3a3a3a;
+    --text: #ededed;
+    --muted: #a3a3a3;
+    --faint: #737373;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    background: radial-gradient(1200px 600px at 50% -200px, #1e2340 0%, var(--background) 70%);
+    background: var(--background);
     color: var(--text);
-    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    font: 16px/1.6 var(--sans);
+    -webkit-font-smoothing: antialiased;
   }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  main { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
-  nav { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; }
-  nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; color: var(--text); }
-  nav .brand img { width: 32px; height: 32px; }
-  nav .links { display: flex; gap: 20px; font-size: 15px; }
-  header { text-align: center; padding: 56px 0 40px; }
-  header img { width: 128px; height: 128px; }
-  h1 { font-size: clamp(34px, 6vw, 52px); line-height: 1.1; margin: 16px 0 12px; letter-spacing: -0.02em; }
-  .lead { color: var(--muted); font-size: 19px; max-width: 640px; margin: 0 auto 32px; }
+  a { color: inherit; }
+  .page { padding: 0 24px; }
+  nav, header, .features, footer { max-width: 760px; margin-left: auto; margin-right: auto; }
+
+  nav { display: flex; align-items: center; justify-content: space-between; height: 72px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; text-decoration: none; }
+  .brand img { width: 24px; height: 24px; }
+  nav .links { display: flex; gap: 24px; font-size: 14px; }
+  nav .links a { color: var(--muted); text-decoration: none; }
+  nav .links a:hover { color: var(--text); }
+
+  header { padding: 80px 0 0; }
+  h1 {
+    margin: 0 0 16px;
+    font-size: clamp(32px, 6vw, 44px);
+    font-weight: 600;
+    line-height: 1.12;
+    letter-spacing: -0.025em;
+    text-wrap: balance;
+  }
+  .lead { margin: 0 0 40px; max-width: 620px; color: var(--muted); font-size: 18px; text-wrap: pretty; }
+
   .install {
-    display: inline-flex; align-items: center; gap: 12px; max-width: 100%;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    padding: 10px 10px 10px 18px; font: 15px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 14px 14px 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
   }
-  .install code { overflow-x: auto; white-space: nowrap; }
-  .install code::before { content: "$ "; color: var(--muted); }
-  button {
-    flex: none; border: 1px solid var(--border); border-radius: 8px; background: #20243a;
-    color: var(--text); font: 600 13px/1 -apple-system, BlinkMacSystemFont, sans-serif;
-    padding: 9px 12px; cursor: pointer;
+  .install code {
+    flex: 1;
+    min-width: 0;
+    padding: 3px 0;
+    font: 14.5px/1.6 var(--mono);
+    overflow-wrap: anywhere;
   }
-  button:hover { background: #2a2f4b; }
-  .note { color: var(--muted); font-size: 14px; margin-top: 14px; }
-  .shot { margin: 48px auto 0; border-radius: 12px; overflow: hidden; border: 1px solid var(--border);
-    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55); }
-  .shot img { display: block; width: 100%; height: auto; }
-  section { padding: 64px 0 0; }
-  h2 { font-size: 26px; margin: 0 0 20px; letter-spacing: -0.01em; }
-  .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-  .feature { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
-  .feature h3 { margin: 0 0 6px; font-size: 17px; }
-  .feature p { margin: 0; color: var(--muted); font-size: 15px; }
-  .steps { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); margin-top: 16px; }
-  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
-    overflow-x: auto; font: 14px/1.5 ui-monospace, "SF Mono", Menlo, monospace; margin: 0; }
-  .steps p { margin: 0; color: var(--muted); }
-  footer { color: var(--muted); font-size: 14px; text-align: center; padding: 64px 0 40px; }
+  .install code::before { content: "$ "; color: var(--faint); user-select: none; }
+  .install button {
+    flex: none;
+    padding: 4px 10px;
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    color: var(--muted);
+    font: 500 13px/1.6 var(--sans);
+    cursor: pointer;
+  }
+  .install button:hover { color: var(--text); border-color: var(--faint); }
+  .note { margin: 14px 0 0; color: var(--faint); font-size: 14px; }
+  .note span { white-space: nowrap; }
+
+  .screenshot {
+    max-width: 960px;
+    margin: 72px auto 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .screenshot img { display: block; width: 100%; height: auto; }
+
+  .features {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 36px 48px;
+    margin: 88px auto 0;
+  }
+  .features h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+  .features p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  footer {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px 24px;
+    margin: 96px auto 0;
+    padding: 24px 0 48px;
+    border-top: 1px solid var(--border);
+    color: var(--faint);
+    font-size: 13px;
+  }
+  footer a { text-decoration: none; }
+  footer a:hover { color: var(--text); }
+
+  @media (max-width: 600px) {
+    header { padding-top: 48px; }
+    .lead { font-size: 17px; }
+    .install code { font-size: 13.5px; }
+    .screenshot { margin-top: 56px; }
+    .features { grid-template-columns: 1fr; gap: 28px; margin-top: 64px; }
+  }
 </style>
 </head>
 <body>
-<main>
+<div class="page">
   <nav>
     <a class="brand" href="./"><img src="icon.svg" alt="">agentZ</a>
     <div class="links">
@@ -81,58 +137,66 @@
   </nav>
 
   <header>
-    <img src="icon.svg" alt="agentZ icon">
-    <h1>Coding agents on every machine,<br>in one Mac app.</h1>
-    <p class="lead">agentZ runs Claude Code, Codex, Gemini, OpenCode and every other
+    <h1>Coding agents on every machine,<br> in one Mac app.</h1>
+    <p class="lead">agentZ runs Claude Agent, Codex, Gemini CLI, OpenCode and every other
       <a href="https://agentclientprotocol.com">ACP</a> agent side by side, across your projects,
       your Mac and your Linux servers, with real terminals next to them.</p>
     <div class="install">
-      <code id="command">curl -fsSL https://ahrorbeksoft.github.io/agentZ/install.sh | sh</code>
+      <code id="command">curl -fsSL https://<wbr>ahrorbeksoft.github.io/<wbr>agentZ/<wbr>install.sh | sh</code>
       <button type="button" id="copy">Copy</button>
     </div>
-    <p class="note">Run it in Terminal on a Mac to install the app, or on a Linux machine to install its server.
-      Run it again to update.</p>
-    <div class="shot"><img src="screenshot.png" alt="agentZ: threads in the sidebar, an agent's turn with an edit and a command" width="1995" height="1074"></div>
+    <p class="note"><span>macOS: installs agentZ.app</span> · <span>Linux: installs agentz-server</span></p>
   </header>
 
-  <section>
-    <h2>What it does</h2>
-    <div class="features">
-      <div class="feature"><h3>Any ACP agent</h3><p>Install agents from the ACP Registry in a click, or add your own command. Log in the way each agent offers.</p></div>
-      <div class="feature"><h3>Threads across projects</h3><p>Every conversation is a thread in the sidebar, with its project, branch and status. Pin, search and archive them.</p></div>
-      <div class="feature"><h3>Your other machines</h3><p>Add a Mac or a Linux server over SSH. agentZ installs its server there and offers each update.</p></div>
-      <div class="feature"><h3>Agents keep running</h3><p>A background server on each machine owns the agents, so quitting the app or losing the connection doesn't stop them.</p></div>
-      <div class="feature"><h3>Worktrees and pastures</h3><p>Give a thread its own git worktree, or an instant copy-on-write copy of the project, and bring the work back.</p></div>
-      <div class="feature"><h3>Real terminals</h3><p>Terminals, split panes and workspaces beside the agents, and agent CLIs that run in a terminal.</p></div>
-    </div>
-  </section>
+  <figure class="screenshot">
+    <img src="screenshot.png" width="1995" height="1050"
+      alt="agentZ: threads from several projects in the sidebar, and an agent's turn with an edit and a command">
+  </figure>
 
-  <section id="install">
-    <h2>Install</h2>
-    <pre>curl -fsSL https://ahrorbeksoft.github.io/agentZ/install.sh | sh</pre>
-    <div class="steps">
-      <p><strong>On a Mac</strong> (Apple silicon or Intel, macOS 10.15.7 or later), it installs agentZ.app
-        in /Applications.</p>
-      <p><strong>On Linux</strong> (x86_64 or arm64), it installs agentz-server, so you can add the machine from
-        the app over SSH. The app also installs it on its own when you add a machine.</p>
+  <section class="features">
+    <div>
+      <h2>Any ACP agent</h2>
+      <p>Install agents from the ACP Registry, or add your own command. Log in the way each agent offers.</p>
     </div>
-    <p class="note">Prefer to download it yourself? Every build is on the
-      <a href="https://github.com/ahrorbeksoft/agentZ/releases/latest">releases page</a>, with SHA256SUMS.
-      The app isn't notarized by Apple, so a copy downloaded with a browser needs
-      <code>xattr -dr com.apple.quarantine /Applications/agentZ.app</code> before it opens.</p>
+    <div>
+      <h2>Threads across projects</h2>
+      <p>Every conversation is a thread in the sidebar, with its project, branch and status.</p>
+    </div>
+    <div>
+      <h2>Your other machines</h2>
+      <p>Add a Mac or a Linux server over SSH. agentZ installs its server there and keeps it updated.</p>
+    </div>
+    <div>
+      <h2>Agents keep running</h2>
+      <p>A background server on each machine owns the agents, so quitting the app or losing the connection doesn't stop them.</p>
+    </div>
+    <div>
+      <h2>Worktrees and pastures</h2>
+      <p>Give a thread its own git worktree, or an instant copy-on-write copy of the project.</p>
+    </div>
+    <div>
+      <h2>Real terminals</h2>
+      <p>Terminals and split panes beside the agents, for the agent CLIs that run in one.</p>
+    </div>
   </section>
 
   <footer>
-    agentZ is free and open source, built on <a href="https://zed.dev">Zed</a>'s GPUI.
-    <a href="https://github.com/ahrorbeksoft/agentZ">Source on GitHub</a>.
+    <span>Free and open source, built on <a href="https://zed.dev">Zed</a>'s GPUI.</span>
+    <a href="https://github.com/ahrorbeksoft/agentZ">github.com/ahrorbeksoft/agentZ</a>
   </footer>
-</main>
+</div>
 <script>
   const button = document.getElementById("copy");
+  const command = document.getElementById("command");
   button.addEventListener("click", async () => {
-    await navigator.clipboard.writeText(document.getElementById("command").textContent);
-    button.textContent = "Copied";
-    setTimeout(() => (button.textContent = "Copy"), 1500);
+    try {
+      await navigator.clipboard.writeText(command.textContent);
+      button.textContent = "Copied";
+      setTimeout(() => (button.textContent = "Copy"), 1500);
+    } catch {
+      // Without clipboard access, select the command so it can be copied by hand.
+      window.getSelection().selectAllChildren(command);
+    }
   });
 </script>
 </body>
