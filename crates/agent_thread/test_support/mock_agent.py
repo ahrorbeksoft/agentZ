@@ -55,6 +55,10 @@ session, and writes its process id to that file.
 With MOCK_SESSIONS_FILE set, it lists the sessions in that file (`session/list`, two to a
 page): a JSON array of ACP session infos, each with an optional "history" of session updates
 that `session/load` replays for it. Listing needs a login, as sessions do.
+
+With MOCK_SCRIPTS set to a JSON object of prompts and the prompts above they stand for, such
+as {"Add a checkout page": "demo"}, those prompts run their scripts, so a demo thread shows a
+real-looking prompt.
 """
 import json
 import os
@@ -69,6 +73,8 @@ CLOSED_FILE = os.environ.get("MOCK_CLOSED_FILE")
 # The sessions `session/list` reports.
 SESSIONS_FILE = os.environ.get("MOCK_SESSIONS_FILE")
 SESSIONS_PER_PAGE = 2
+# Prompts that run another prompt's script.
+SCRIPTS = json.loads(os.environ.get("MOCK_SCRIPTS") or "{}")
 
 if sys.argv[-1] == "--login":
     if os.environ.get("MOCK_BROWSER_OPEN"):
@@ -475,6 +481,7 @@ for line in sys.stdin:
             elif block.get("type") == "image":
                 prompt_resources.append(block["mimeType"])
         record(text_chunk("user_message_chunk", prompt_text))
+        prompt_text = SCRIPTS.get(prompt_text, prompt_text)
         if prompt_text == "permission":
             next_request_id += 1
             pending[next_request_id] = (message["id"], params["sessionId"], prompt_text)
