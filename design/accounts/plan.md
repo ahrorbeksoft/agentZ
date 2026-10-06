@@ -199,6 +199,37 @@ that is still used.
   update prompt (`-c check_for_update_on_startup=false`), and Gemini opening a browser login
   (`NO_BROWSER=true`).
 
+### Actions when a limit runs out
+
+The subscription agents let the user do something about a used-up limit, mostly only in their
+own terminal app. None of these was used on a real account: each one spends a reset or can
+bill money.
+
+- **Droid: what happens at the limit.** `/limits` has a "When limit is reached" choice:
+  "Switch to Droid Core" (cheaper models, no extra cost) or "Enable Extra Usage" (billed from
+  the extra usage balance). It's saved on Factory's server, so it's per account and the CLI
+  follows it too: `POST /api/organization/subscription/set-overage-preference` with
+  `droidCore` or `extraUsage` *(read in the binary, not called)*. Enterprise orgs set it on
+  Factory's dashboard. `/limits` shows the Droid Core models' windows beside the standard ones.
+- **Codex: limit resets and credits.** The app-server reports `rateLimitResetCredits` with the
+  limits (one on the test account), and `account/rateLimitResetCredit/consume` uses one.
+  `/usage` offers "Use this reset?", and t3code shows "1 reset credit banked · Use reset" with a
+  confirm. Purchased credits (`credits.balance`) are spent after the plan's limits.
+- **Claude: credits, resets and waiting.** Only in the terminal app: `/usage-credits` turns on
+  usage credits (reported as `extra_usage`), the hidden `/limit-reset` resets the limits once a
+  week, and at the limit `/rate-limit-options` offers switching to usage credits or "Stop and
+  wait for limit to reset", with an automatic resume at the reset. agentZ could only reach
+  these through a hidden terminal *(untested)*.
+- **Devin:** overage billing, once the org allows it, set on Devin's site.
+- **Grok:** a prepaid balance and an on-demand cap, read from `_x.ai/billing`.
+- **Waiting for the reset** works for every agent without its help: the server queues a message
+  in the thread and sends it when the account's window resets, even with the app closed.
+  t3code does this: at a limit its banner offers "Resume at reset" and "Snooze until reset"
+  (`UsageLimitRecoveryBanner`), and it never moves a thread to another account.
+
+Any action that spends a reset or can bill money asks first. Which of these agentZ offers, and
+where, is decided in the design round (topics under "When limits run out").
+
 ### Skills
 
 - agentZ keeps one skills folder per machine: `<data dir>/skills/<name>/SKILL.md`. Settings
@@ -246,6 +277,8 @@ Starts with a design round in `design/accounts/` (see `design/README.md`). Topic
 - Picking the account for a new thread (where the agent is picked today).
 - Showing a thread's account (thread card, details popover) when an agent has more than one.
 - What a thread shows when its account's quota runs out.
+- The actions when a limit runs out (above): Droid's choice at the limit, limit resets, extra
+  usage and credits, and waiting for the reset.
 - Settings → Skills, and Settings → MCP servers.
 
 ### Tests
