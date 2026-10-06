@@ -2215,9 +2215,7 @@ impl AgentThread {
     fn content_markdown(&self, content: acp::ContentBlock) -> Option<String> {
         match content {
             acp::ContentBlock::Text(text) => Some(text.text),
-            acp::ContentBlock::ResourceLink(link) => {
-                Some(format!("[@{}]({})", link.name, link.uri))
-            }
+            acp::ContentBlock::ResourceLink(link) => Some(mention_link(&link.name, &link.uri)),
             acp::ContentBlock::Resource(resource) => {
                 let uri = match resource.resource {
                     acp::EmbeddedResourceResource::TextResourceContents(contents) => contents.uri,
@@ -2227,8 +2225,12 @@ impl AgentThread {
                 if uri == "agentz://handoff" {
                     return None;
                 }
-                let name = uri.rsplit('/').next().unwrap_or(&uri).to_string();
-                Some(format!("[@{name}]({uri})"))
+                let name = url::Url::parse(&uri)
+                    .ok()
+                    .and_then(|url| url.to_file_path().ok())
+                    .map(|path| path_name(&path))
+                    .unwrap_or_else(|| uri.rsplit('/').next().unwrap_or(&uri).to_string());
+                Some(mention_link(&name, &uri))
             }
             acp::ContentBlock::Image(image) => Some(
                 self.keep_image(&image.mime_type, &image.data)
@@ -2407,8 +2409,19 @@ fn message_title(parts: &[MessagePart]) -> String {
         .collect()
 }
 
+/// As Zed writes one (`MentionUri::to_uri`): percent-encoded, so a path with spaces stays one
+/// link in markdown.
 fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    url::Url::from_file_path(path)
+        .map_or_else(|()| format!("file://{}", path.display()), String::from)
+}
+
+/// A mention from an agent's history as a link. Its URI is parsed again, which percent-encodes
+/// one sent with spaces in it (as before `file_uri` encoded them): markdown ends a link at the
+/// first space.
+fn mention_link(name: &str, uri: &str) -> String {
+    let uri = url::Url::parse(uri).map_or_else(|_| uri.to_string(), String::from);
+    format!("[@{name}]({uri})")
 }
 
 fn path_name(path: &Path) -> String {
@@ -3195,6 +3208,29 @@ pub async fn list_sessions(command: CommandFuture) -> Result<SessionListing> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mentions_of_paths_with_spaces_stay_one_link() {
+        let path = PathBuf::from("/Users/me/Desktop/Screen Recording 1.mov");
+        assert_eq!(
+            message_markdown(&[
+                MessagePart::Text("look at ".into()),
+                MessagePart::File {
+                    path,
+                    contents: None,
+                },
+            ]),
+            "look at [@Screen Recording 1.mov](file:///Users/me/Desktop/Screen%20Recording%201.mov)"
+        );
+        assert_eq!(
+            mention_link("a b.md", "file:///tmp/a b.md"),
+            "[@a b.md](file:///tmp/a%20b.md)"
+        );
+        assert_eq!(
+            mention_link("hello there", "agentz://thread/7"),
+            "[@hello there](agentz://thread/7)"
+        );
+    }
 
     #[test]
     fn diff_line_counts() {
