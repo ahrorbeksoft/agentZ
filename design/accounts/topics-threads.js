@@ -23,7 +23,7 @@ const agentItem = (kind, name, { sub = false, check = false, hl = false } = {}) 
 const menuFoot = (items) => `<div class="hr"></div>${items.map(([icon, label]) => `<div class="it">${ic(icon, 'sm')}<span class="grow">${label}</span></div>`).join('')}`;
 const accountMenu = (style, { current = ACCTS.ext, foot = true, width = 310 } = {}) => `<div class="menu" style="${style};min-width:${width}px">${CLAUDE_ACCOUNTS.map((a) => accountItem(a, { check: a === current })).join('')}${foot ? menuFoot([['plus', 'Add Account…'], ['settings', 'Manage Accounts…']]) : ''}</div>`;
 
-// 10. Picking the account ------------------------------------------------------------------
+// 12. Picking the account ------------------------------------------------------------------
 TOPICS.push({
   id: 'picker', section: 'Threads', title: 'Picking the account for a new thread', size: 'wide', rec: 'A',
   now: 'The new thread’s composer has an agent chip; its menu lists the installed agents, then Terminal and Manage Agents…. A thread keeps its agent once it starts, and would keep its account too: accounts share no sessions. New threads start on the agent’s default account: the one marked “Use for New Threads”, else the External one, else the first.',
@@ -52,7 +52,7 @@ TOPICS.push({
   ],
 });
 
-// 11. A thread's account -------------------------------------------------------------------
+// 13. A thread's account -------------------------------------------------------------------
 const THREADS = [
   { project: 'storefront', title: 'Add the checkout page', state: 'working', a: ACCTS.ext, active: true },
   { project: 'storefront', title: 'Rate-limit the checkout API', state: 'awaiting', a: ACCTS.work },
@@ -93,7 +93,7 @@ TOPICS.push({
   ],
 });
 
-// 12. When the account runs out ------------------------------------------------------------
+// 14. When the account runs out ------------------------------------------------------------
 const OUT_BUTTONS = `${obtn(`Continue on Side · 97% left`)}${obtn('Continue at 4:10 PM')}<span class="row g1 sm mu" style="margin-left:4px">Usage${ic('external', 'xs')}</span>`;
 
 TOPICS.push({
@@ -115,7 +115,7 @@ TOPICS.push({
   ],
 });
 
-// 13. Continuing on another account --------------------------------------------------------
+// 15. Continuing on another account --------------------------------------------------------
 const titleMenu = (items) => `<div class="menu" style="top:32px;left:110px;min-width:250px">${items}</div>`;
 const titleItems = (extra = '', continueHl = false) => `${['pin', 'Pin'] && `<div class="it">${ic('pin', 'sm')}<span class="grow">Pin</span></div>`}<div class="it">${ic('pencil', 'sm')}<span class="grow">Rename</span></div><div class="it ${continueHl ? 'hl' : ''}">${ic('arrow', 'sm')}<span class="grow">Continue with Another Agent</span>${ic('chev-right', 'xs')}</div>${extra}<div class="hr"></div><div class="it">${ic('archive', 'sm')}<span class="grow">Archive</span></div><div class="it">${ic('trash', 'sm')}<span class="grow">Delete…</span></div>`;
 const threadWithMenu = (menus) => frame(`<div class="col" style="height:100%">${threadHeader('Rate-limit the checkout API')}<div class="grow" style="min-height:0;overflow:hidden;opacity:.6">${conversation()}</div>${composerBar()}</div>${menus}`, { w: 760, h: 400 });
@@ -140,7 +140,7 @@ TOPICS.push({
   ],
 });
 
-// 14. Usage at a glance --------------------------------------------------------------------
+// 16. Usage at a glance --------------------------------------------------------------------
 const poolSegment = (a, left, reset) => `<div style="flex:1;position:relative;height:30px;border-radius:6px;background:#3b414d;overflow:hidden"><i style="position:absolute;left:0;top:0;bottom:0;width:${left}%;background:rgba(116,173,232,.35)"></i><span class="row g15 xs" style="position:relative;height:100%;padding:0 8px">${avatar(a, 16)}<b class="b5">${accountName(a)}</b>${left}%<span class="grow"></span>${reset ? `↻ ${reset}` : ''}</span></div>`;
 const poolCard = (label, total, segments) => `<div class="card" style="padding:14px 16px;display:grid;grid-template-columns:150px 1fr;gap:16px;align-items:center;background:none"><div class="col" style="gap:2px"><span class="sm">${label}</span><span><span style="font-size:24px;font-weight:600">${total}%</span> <span class="sm mu">left</span></span><span class="xs mu">across ${segments.length} accounts</span></div><div class="row" style="gap:4px">${segments.join('')}</div></div>`;
 
@@ -157,7 +157,7 @@ TOPICS.push({
       good: 'You see what’s left while you work.', cost: 'Another item in the composer row.',
       mock: () => threadView('', { composer: { agentLabel: `${glyph('claude')}Claude Agent</span><span class="row g1 sm" style="padding:1px 6px;border-radius:5px;background:var(--hov);color:var(--t)">${ic('gauge', 'xs')}62%` }, overlay: `<div class="pop" style="left:120px;bottom:64px;width:400px;padding:12px 14px"><div class="row g2" style="margin-bottom:10px">${avatar(ACCTS.ext, 18)}<span>alex@hey.com</span><span class="sm mu">Max 5x</span></div>${windowsGrid(ACCTS.ext.windows, { labelW: 120, resetW: 110 })}</div>` }) },
     { key: 'C', name: 'In the account picker', from: 'the picker topic',
-      desc: 'Already in the account picker (topic 10, options A–C): each account with its tightest window. Pick this to keep that and nothing more.',
+      desc: 'Already in the account picker (“Picking the account for a new thread”, options A–C): each account with its tightest window. Pick this to keep that and nothing more.',
       good: 'No new place.', cost: 'Only seen when starting a thread.',
       mock: () => newThread({ accountChip: chipText(`${avatar(ACCTS.ext, 16)}alex@hey.com`), menu: accountMenu('top:84px;left:150px', { foot: false }) }) },
   ],

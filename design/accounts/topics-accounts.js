@@ -152,7 +152,7 @@ TOPICS.push({
       ])]))) },
     { key: 'E', name: 'Each account its own agent', from: 't3code provider instances',
       desc: 'As t3code adds a second Codex: every account is an entry in the Agents list (“Claude Agent · Work”), with an initials badge on the icon and its own page with its own defaults and environment.',
-      good: 'Per-account defaults and environment for free.', cost: 'Agents multiply in the list and in every picker, and each account’s settings must be set again.',
+      good: 'Each account already has a whole page, like any agent.', cost: 'Agents multiply in the list and in every picker.',
       mock: () => piece(`<div class="col" style="padding:24px 32px 28px;gap:12px"><div style="font-size:17px">Agents</div><div class="row" style="justify-content:space-between"><span class="sm mu">Installed</span><span class="row g1 sm mu">${ic('plus', 'xs')}Add Agent</span></div>${card([
         ['Claude Agent', 'registry · v0.33.1', null], ['Claude Agent · Work', 'alex@acme.co · Team', ACCTS.work], ['Claude Agent · Side', 'alex.side@gmail.com · Pro', ACCTS.side], ['Codex', 'registry · v2.1.1', null, 'codex'],
       ].map(([name, sub, a, kind = 'claude']) => `<div class="row g3" style="padding:10px 16px"><span style="position:relative;width:30px;height:30px;border-radius:7px;border:1px solid var(--b);display:grid;place-items:center;flex:none">${GLYPHS[kind]}${a ? `<span style="position:absolute;right:-5px;bottom:-5px">${avatar(a, 15)}</span>` : ''}</span><div class="col grow" style="gap:2px"><span>${name}</span><span class="sm mu">${sub}</span></div>${ic('chev-right', 'sm mu')}</div>`))}</div>`) },
@@ -190,8 +190,9 @@ TOPICS.push({
 // 3. Adding an account ---------------------------------------------------------------------
 const LOGIN_ROWS = [['terminal', 'Log in with Claude.ai', 'Runs Claude’s login in a terminal where it runs.', true], ['terminal', 'Log in with the Anthropic Console', 'For an API plan billed by the Console.', false]];
 const loginRows = (rows = LOGIN_ROWS) => rows.map(([icon, title, desc, primary]) => `<div class="row g3" style="padding:10px 16px"><span style="width:24px;height:24px;border-radius:6px;border:1px solid var(--bv);display:grid;place-items:center" class="mu">${ic(icon, 'xs')}</span><div class="col grow" style="gap:2px"><span>${title}</span><span class="sm mu">${desc}</span></div>${primary ? pbtn('Log In') : obtn('Log In')}</div>`).join('');
-const newAccountCard = () => card([
+const newAccountCard = (extraRows = []) => card([
   `<div class="row g3" style="padding:12px 16px"><span style="width:28px;height:28px;border-radius:50%;border:1.5px dashed var(--b);display:grid;place-items:center" class="mu">${ic('plus', 'xs')}</span><div class="col grow" style="gap:2px"><span>New account</span><span class="sm mu">Choose how Claude Agent logs in. The account takes its email once it’s logged in.</span></div>${gbtn('Cancel')}</div>`,
+  ...extraRows,
   `<div style="border-top:0">${loginRows()}</div>`,
 ]);
 
@@ -282,5 +283,100 @@ TOPICS.push({
       desc: 'Asks first, then deletes the account’s folder: its login, sessions and history. Its threads stay in the sidebar but can’t continue (Continue on another account still works). Not offered for the External account.',
       good: 'Accounts don’t pile up.', cost: 'Removing is final; the confirm says so.',
       mock: () => menuMock('G') },
+  ],
+});
+
+// 6. Each account's defaults and environment -----------------------------------------------
+// What the demo accounts offer: Work's organization allows fewer models, and Side's Pro plan
+// bills Fable to usage credits.
+Object.assign(ACCTS.ext, { models: ['Default (recommended)', 'Opus 5.5', 'Sonnet 5.5', 'Haiku 4.5', 'Fable 5.1'],
+  defaults: { Mode: 'Default', Model: 'Opus 5.5', Effort: 'High', Fast: 'Off' }, env: [] });
+Object.assign(ACCTS.work, { models: ['Default (recommended)', 'Sonnet 5.5', 'Haiku 4.5'],
+  defaults: { Mode: 'Default', Model: 'Sonnet 5.5', Effort: 'Medium', Fast: 'Agent’s choice' },
+  env: [['HTTPS_PROXY', 'http://proxy.acme.co:3128'], ['NODE_EXTRA_CA_CERTS', '/etc/acme/ca.pem']] });
+Object.assign(ACCTS.side, { models: ['Default (recommended)', 'Opus 5.5', 'Sonnet 5.5', 'Haiku 4.5', 'Fable 5.1 · usage credits'],
+  defaults: { Mode: 'Agent’s choice', Model: 'Agent’s choice', Effort: 'Agent’s choice', Fast: 'Agent’s choice' }, env: [] });
+
+/** Today's DropdownMenu button, with a menu hanging from it. */
+const dropdown = (label, menu = '') => `<span class="row" style="position:relative;display:inline-flex;gap:6px;height:26px;padding:0 8px;border:1px solid var(--b);border-radius:6px;background:var(--panel);font-size:13px;white-space:nowrap">${label}${ic('chev-down', 'xs mu')}${menu}</span>`;
+const settingRow = (title, control) => `<div class="row g3" style="padding:10px 16px"><span class="grow">${title}</span><span class="none" style="position:relative">${control}</span></div>`;
+const sectionHead = (title, action = '') => `<div class="row" style="justify-content:space-between"><span class="sm mu">${title}</span>${action}</div>`;
+const modelMenu = (a, style = 'top:30px;right:0') => menuList([['', 'Agent’s choice'], ...a.models.map((name) => ['', name, { check: name === a.defaults.Model }])], style, 230);
+/** The Defaults tab's section (render_agent_defaults), for one account. */
+function defaultsSection(a, { menu = false } = {}) {
+  const rows = Object.entries(a.defaults).map(([name, value]) => settingRow(name, dropdown(value, menu && name === 'Model' ? modelMenu(a) : '')));
+  return `<div class="col" style="gap:8px">${sectionHead('Defaults for New Threads')}${card(rows)}<span class="xs mu">Choosing one in a thread on this account also makes it the default.</span></div>`;
+}
+const envRow = ([key, value]) => `<div class="row g2" style="padding:8px 16px"><span class="field mono-font sm" style="width:190px;height:28px">${key}</span><span class="mu">=</span><span class="field grow mono-font sm" style="height:28px">${value}</span>${ibtn('x')}</div>`;
+/** The Environment tab's section (render_agent_env), for one account. */
+function envSection(a) {
+  const rows = a.env.length ? a.env.map(envRow) : ['<div class="sm mu" style="padding:12px 16px">No variables.</div>'];
+  return `<div class="col" style="gap:8px">${sectionHead('Environment Variables', `<span class="row g1 sm mu">${ic('plus', 'xs')}Add Variable</span>`)}${card(rows)}<span class="xs mu">Passed to Claude Agent when it starts on this account. Running threads pick them up after Reload Agent.</span></div>`;
+}
+const accountPicker = (a, menu = '') => `<div class="row g2" style="position:relative"><span class="sm mu">Account</span><span class="chip" style="color:var(--t)">${avatar(a, 16)}${accountName(a)}${chev}</span>${menu}</div>`;
+const pickerMenu = (current) => menuList(CLAUDE_ACCOUNTS.map((a) => ['', `${avatar(a, 16)}&nbsp; ${accountName(a)}`, { check: a === current }]), 'top:26px;left:58px', 220);
+/** An account's own page, under its agent's (Zed's settings sub-pages). */
+function accountPage(a, body, { tab = 'Defaults' } = {}) {
+  const tabRow = ['Usage', 'Defaults', 'Environment', 'Threads'].map((name) => `<span style="padding:0 0 9px;${name === tab ? 'color:var(--t);border-bottom:2px solid var(--ac);margin-bottom:-1px' : 'color:var(--mu)'}">${name}</span>`).join('');
+  return `<div class="col" style="padding:24px 32px 28px;gap:20px">
+    <div class="col" style="gap:22px">
+      <span class="row g15 sm mu">${ic('arrow-left', 'xs')}Claude Agent</span>
+      <div class="row g3">${avatar(a, 46)}<div class="col grow" style="gap:4px"><span class="row g2"><span style="font-size:17px;font-weight:600">${accountName(a)}</span>${tag(a.plan)}</span><span class="sm mu">${a.email} · Claude Agent</span></div><span class="ibtn" style="border:1px solid var(--b);width:28px;height:28px">${ic('more', 'sm')}</span></div>
+      <div class="row" style="gap:22px;border-bottom:1px solid var(--b);font-size:14px">${tabRow}</div>
+    </div>${body}</div>`;
+}
+const disclosure = (open) => `<div class="row g15 sm mu" style="padding:0 16px 12px 56px">${ic(open ? 'chev-down' : 'chev-right', 'xs')}Defaults and environment</div>`;
+const cardSettings = (a) => `<div class="col" style="padding:0 16px 14px 56px;gap:8px"><div style="display:grid;grid-template-columns:repeat(4, max-content);gap:8px 14px">${Object.entries(a.defaults).map(([name, value]) => `<span class="col" style="gap:4px"><span class="xs mu">${name}</span>${dropdown(value)}</span>`).join('')}</div><span class="xs mu" style="margin-top:6px">Environment</span>${a.env.map(([key, value]) => `<span class="mono-font xs">${key}=${value}</span>`).join('')}<span class="row g1 xs mu">${ic('plus', 'xs')}Add Variable</span></div>`;
+function settingsTable() {
+  const columns = 'grid-template-columns:90px repeat(3, minmax(0, 1fr))';
+  const head = `<div style="display:grid;${columns};gap:12px;padding:10px 16px;align-items:center"><span></span>${CLAUDE_ACCOUNTS.map((a) => `<span class="row g15 sm" style="min-width:0">${avatar(a, 18)}<span class="trunc">${accountName(a)}</span></span>`).join('')}</div>`;
+  const rows = Object.keys(ACCTS.ext.defaults).map((name) => `<div style="display:grid;${columns};gap:12px;padding:8px 16px;align-items:center"><span>${name}</span>${CLAUDE_ACCOUNTS.map((a) => `<span style="position:relative">${dropdown(a.defaults[name], name === 'Model' && a === ACCTS.work ? modelMenu(a, 'top:30px;left:0') : '')}</span>`).join('')}</div>`);
+  return card([head, ...rows]);
+}
+
+TOPICS.push({
+  id: 'settings', section: 'Agent page', title: 'Each account’s defaults and environment', size: 'wide', rec: 'A',
+  now: 'One set per agent: the Defaults tab (“Defaults for New Threads”: a menu per option the agent offers, “Agent’s choice” until you pick) and the Environment tab (variables passed to the agent when it starts). Picking a model in a thread also makes it the default. With accounts, each has its own set: accounts of one agent offer different models (a Team plan whose organization allows fewer, a Pro plan that bills Fable to usage credits, an API key), and some need their own variables (a work proxy). In the mocks, Work offers three models where alex@hey.com offers five.',
+  nowImg: 'img/now-defaults.png',
+  options: [
+    { key: 'A', name: 'An account picker on the tabs', from: 'today’s tabs',
+      desc: 'The Defaults, Environment and Threads tabs stay, each with an account menu over it that picks whose settings (or sessions) it shows. It opens on the default account. The model menu lists only what that account offers.',
+      good: 'Today’s layout; switching the menu shows how the accounts differ.', cost: 'Easy to miss which account you’re editing.',
+      mock: () => settingsWindow(agentPage(`<div class="col" style="gap:18px">${accountPicker(ACCTS.work)}${defaultsSection(ACCTS.work, { menu: true })}</div>`, { tab: 'Defaults' }), { h: 640 }) },
+    { key: 'B', name: 'A page per account', from: 'Zed’s settings sub-pages',
+      desc: 'Clicking an account’s card opens its own page under the agent’s, with its avatar, name, plan and ⋯ menu, and its tabs: Usage, Defaults, Environment and Threads. The agent’s page keeps the list of accounts.',
+      good: 'Everything about one account in one place.', cost: 'One more level to click through.',
+      mock: () => settingsWindow(accountPage(ACCTS.work, defaultsSection(ACCTS.work, { menu: true })), { h: 640 }) },
+    { key: 'C', name: 'Inside each account’s card', from: 'today’s Account card',
+      desc: 'Under its limits, each card has “Defaults and environment”, closed at first. Opened, it shows the account’s defaults as menus and its variables. The Defaults and Environment tabs go away.',
+      good: 'Nothing to pick; each account’s settings sit with its limits.', cost: 'Open cards get long, and the Account tab becomes the whole page.',
+      mock: () => piece(agentPage(accountsList([accountCard(ACCTS.ext, { body: windowsBlock(ACCTS.ext) + disclosure(false) }), accountCard(ACCTS.work, { body: windowsBlock(ACCTS.work) + disclosure(true) + cardSettings(ACCTS.work) }), accountCard(ACCTS.side, { body: windowsBlock(ACCTS.side) + disclosure(false) })]), { tabs: ['Account', 'Threads'] })) },
+    { key: 'D', name: 'Side by side', from: 'new',
+      desc: 'The Defaults tab is a table: a row per option, a column per account, each cell its own menu. The Environment tab lists variables the same way.',
+      good: 'Shows at once how the accounts differ.', cost: 'Cramped with four or more accounts; long values don’t fit.',
+      mock: () => settingsWindow(agentPage(`<div class="col" style="gap:8px">${sectionHead('Defaults for New Threads')}${settingsTable()}<span class="xs mu">Choosing one in a thread also makes it that account’s default.</span></div>`, { tab: 'Defaults' }), { h: 640 }) },
+  ],
+});
+
+// 7. A new account's settings --------------------------------------------------------------
+const copyRow = (menu = '') => `<div class="row g3" style="padding:10px 16px"><div class="col grow" style="gap:2px"><span>Copy settings from</span><span class="sm mu">Its defaults and environment variables. Defaults this account doesn’t offer are dropped.</span></div><span class="none" style="position:relative">${dropdown(`${avatar(ACCTS.ext, 16)} alex@hey.com`, menu)}</span></div>`;
+
+TOPICS.push({
+  id: 'new-settings', section: 'Agent page', title: 'What a new account’s settings start as', size: 'wide', rec: 'B',
+  now: 'Today there’s one set of defaults and variables per agent; the External account keeps it. A new account’s folder also starts without the agent’s own settings file (Claude’s <code>settings.json</code>, Codex’s <code>config.toml</code>), since agentZ doesn’t copy the agent’s files (an open question in the plan). Here Side is the new account.',
+  nowImg: 'img/now-environment.png',
+  options: [
+    { key: 'A', name: 'Empty', from: 't3code’s new provider instance',
+      desc: 'A new account has no variables and no defaults. Its threads start on the agent’s own choices, and its defaults then follow what you pick in its threads.',
+      good: 'Nothing carries over that the account may not offer.', cost: 'Variables every account needs (a proxy, a certificate file) are typed again.',
+      mock: () => piece(agentPage(`<div class="col" style="gap:18px">${accountPicker(ACCTS.side)}${envSection(ACCTS.side)}</div>`, { tab: 'Environment' })) },
+    { key: 'B', name: 'Copied from an account you pick', from: 'new',
+      desc: 'The new account’s card (“Adding an account”) gets “Copy settings from”: an existing account, the default one first, or Nothing. Its variables and defaults are copied once; defaults the new account doesn’t offer are dropped when its first session lists its models. After that each account’s settings are its own.',
+      good: 'Set up once, reused; still separate afterwards.', cost: 'One more choice while adding.',
+      mock: () => piece(agentPage(accountsList([accountCard(ACCTS.ext), newAccountCard([copyRow(menuList([['', `${avatar(ACCTS.ext, 16)}&nbsp; alex@hey.com`, { check: true }], ['', `${avatar(ACCTS.work, 16)}&nbsp; Work`], 'hr', ['', 'Nothing']], 'top:30px;right:0', 200))])]), { pad: 60 })) },
+    { key: 'C', name: 'Copy From, any time', from: 'new',
+      desc: 'Accounts start empty, as in A. The Defaults and Environment tabs get a Copy From menu that replaces this account’s values with another account’s, after asking. Shown with the account picker (option A of “Each account’s defaults and environment”).',
+      good: 'Copy whenever, not only when adding.', cost: 'Overwrites what’s there; easy to forget it exists.',
+      mock: () => piece(agentPage(`<div class="col" style="gap:18px"><div class="row" style="justify-content:space-between;position:relative">${accountPicker(ACCTS.side)}<span class="row g1 sm" style="padding:2px 6px;border-radius:5px;background:var(--hov)">${ic('copy', 'xs')}Copy From${chev}</span>${menuList([['', `${avatar(ACCTS.ext, 16)}&nbsp; alex@hey.com`], ['', `${avatar(ACCTS.work, 16)}&nbsp; Work`, { hl: true }]], 'top:26px;right:0', 200)}</div>${envSection(ACCTS.side)}</div>`, { tab: 'Environment' })) },
   ],
 });

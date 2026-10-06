@@ -18,7 +18,7 @@ const settingsPage = (selected, body) => settingsWindow(`<div class="col" style=
 const agentGlyphRow = (skipOn = '') => ['claude', 'codex', 'droid', 'devin'].map((kind) => `<span style="position:relative;display:inline-flex;${kind === skipOn ? 'opacity:.4' : ''}">${glyph(kind, 'sm')}${kind === skipOn ? `<span class="warnc" style="position:absolute;right:-5px;top:-5px;display:inline-flex">${ic('warn', 'xs')}</span>` : ''}</span>`).join('');
 const addMenuButton = (label, menu = '') => `<span class="row g1 sm mu" style="position:relative">${ic('plus', 'xs')}${label}${ic('chev-down', 'xs')}${menu}</span>`;
 
-// 15. Where skills live --------------------------------------------------------------------
+// 18. Where skills live --------------------------------------------------------------------
 TOPICS.push({
   id: 'skills-home', section: 'Skills and MCP servers', title: 'Where agentZ’s skills live', size: 'wide', rec: 'B',
   now: 'agentZ has no skills of its own. Each agent loads skills from its own folders (<code>~/.claude/skills</code>, <code>~/.factory/skills</code>, …), and many also read the shared <code>~/.agents/skills</code>, where you have <code>find-skills</code>. Either way agentZ links each skill into every account’s skills folder, one link per skill, so the agents’ own skills stay beside them, and skips a skill when the agent has its own of the same name. The plan picked A; Zed does B.',
@@ -34,7 +34,7 @@ TOPICS.push({
   ],
 });
 
-// 16. Settings › Skills --------------------------------------------------------------------
+// 19. Settings › Skills --------------------------------------------------------------------
 const skillRow = (skill, { trailing = '', index = 0 } = {}) => `<div class="row g3" style="padding:11px 14px;${index ? 'border-top:1px solid var(--bv)' : ''}"><span class="col grow" style="gap:2px;min-width:0"><span class="row g15">${skill.name}${skill.skipped ? `<span class="warnc" style="display:inline-flex">${ic('warn', 'xs')}</span>` : ''}</span><span class="sm mu">${skill.description}</span>${skill.skipped ? `<span class="xs warnc">${skill.skipped}</span>` : ''}</span>${trailing}</div>`;
 const skillButtons = () => `<span class="row g1 none">${ibtn('trash')}${obtn(`Open${ic('arrow-up-right', 'xs')}`)}</span>`;
 const SKILL_ADD_MENU = `<div class="menu" style="top:22px;right:0;min-width:200px"><div class="it hl">${ic('folder', 'sm')}<span class="grow">Add from Folder…</span></div><div class="it">${ic('plus', 'sm')}<span class="grow">Create a Skill</span></div></div>`;
@@ -58,7 +58,7 @@ TOPICS.push({
   ],
 });
 
-// 17. Settings › MCP Servers ---------------------------------------------------------------
+// 20. Settings › MCP Servers ---------------------------------------------------------------
 const MCP_SERVERS = [
   { name: 'github', kind: 'Local', detail: 'npx -y @modelcontextprotocol/server-github', on: true },
   { name: 'linear', kind: 'Remote', detail: 'https://mcp.linear.app/mcp', on: true, note: 'Not given to Factory Droid, which takes local servers only.' },
@@ -85,5 +85,40 @@ TOPICS.push({
       desc: 'Add Server and each server’s row open a page like Add Custom Agent: name, command, arguments, environment variables (or URL and headers), saved as you type.',
       good: 'Matches a page agentZ already has.', cost: 'A whole page for a few fields; the list and the form are never in view together.',
       mock: () => settingsWindow(`<div class="col" style="padding:28px 32px;gap:16px"><span class="row g15 sm mu">${ic('arrow-left', 'xs')}MCP Servers</span>${pageTitle('github')}<div class="col" style="gap:14px">${formField('Server Name', 'github')}${formField('Command', '<span class="mono-font sm">npx</span>', 'The program that starts the server, on the machine the agent runs on.')}${formField('Arguments', '<span class="mono-font sm">-y @modelcontextprotocol/server-github</span>')}<div class="col" style="gap:4px"><span class="sm">Environment Variables</span><div class="row g2"><span class="field grow mono-font sm">GITHUB_PERSONAL_ACCESS_TOKEN</span><span class="field grow mono-font sm">••••••••••••</span>${ibtn('x')}</div><span class="row g1 sm mu">${ic('plus', 'xs')}Add Variable</span></div></div></div>`, { selected: 'MCP Servers', extraNav: EXTRA_NAV, h: 600 }) },
+  ],
+});
+
+// 21. Which accounts get a skill or server ---------------------------------------------------
+const ACME_DOCS = { name: 'acme-docs', kind: 'Remote', detail: 'https://mcp.acme.co/mcp', on: true, note: 'The company’s docs. Also loads on Side, a personal account.' };
+/** The "which accounts" menu on a row: a section per agent, a check where it loads. */
+const reachMenu = (style = 'top:28px;right:0') => menuList([
+  ['lbl', 'Claude Agent'],
+  ['', `${avatar(ACCTS.ext, 16)}&nbsp; alex@hey.com`, { check: true }],
+  ['', `${avatar(ACCTS.work, 16)}&nbsp; Work`, { check: true }],
+  ['', `${avatar(ACCTS.side, 16)}&nbsp; Side`, { hl: true }],
+  ['lbl', 'Codex'],
+  ['', `${avatar(CODEX_WORK, 16)}&nbsp; Work`, { check: true }],
+], style, 240);
+
+TOPICS.push({
+  id: 'reach', section: 'Skills and MCP servers', title: 'Keeping one to some accounts', size: 'wide', rec: 'A',
+  now: 'Everything agentZ manages loads everywhere: skills are linked into every account’s skills folder, and MCP servers go to every session’s agent. A work-only server (the company’s docs, a database) then also loads on a personal account, and its tools fill every thread’s tool list.',
+  options: [
+    { key: 'A', name: 'Every account', from: 't3code',
+      desc: 'One list, no choice: every account of every agent loads agentZ’s skills and MCP servers. t3code does the same: its MCP servers go to every provider instance.',
+      good: 'Nothing to set; nothing to forget to turn on.', cost: 'A work-only server reaches personal accounts too.',
+      mock: () => settingsPage('MCP Servers', `<div class="col" style="gap:8px">${listHead(MCP_NOTE, addMenuButton('Add Server', MCP_ADD_MENU))}<div class="card" style="overflow:visible">${[...MCP_SERVERS, ACME_DOCS].map(serverRow).join('')}</div></div>`) },
+    { key: 'B', name: 'An accounts menu on each row', from: 'new',
+      desc: 'Each skill and server gets a menu beside its controls: “Every account” at first, or the accounts it loads on, grouped by agent, with a check each. A new account starts checked, as Zed’s new threads follow the default profile.',
+      good: 'Keeps work tools off personal accounts.', cost: 'A control on every row; the answer to “why doesn’t the agent see it” lives in a menu.',
+      mock: () => settingsPage('Skills', `<div class="col" style="gap:8px">${listHead('agentZ’s skills, and the accounts that load them.', addMenuButton('Add Skill'))}<div class="card" style="overflow:visible">${SKILL_LIST.slice(0, 3).map((skill, index) => skillRow(skill, { index, trailing: `<span class="row g2 none" style="margin-right:6px">${dropdown(skill.name === 'release-notes' ? '3 of 4' : 'Every account', skill.name === 'release-notes' ? reachMenu() : '')}${skillButtons()}</span>` })).join('')}</div></div>`) },
+    { key: 'C', name: 'Switches on each account', from: 'Zed’s profiles',
+      desc: 'Zed’s tool profiles work the other way around: the profile names the tools it keeps. Here each account’s card gets “Skills and MCP servers” with a switch per item, on at first.',
+      good: 'One account’s whole toolset in one place, as in Zed.', cost: 'Adding a skill for every account means visiting each account; nothing shows it on the Skills page.',
+      mock: () => piece(agentPage(accountsList([
+        accountCard(ACCTS.ext),
+        accountCard(ACCTS.work, { body: windowsBlock(ACCTS.work) + `<div style="padding:0 16px 14px 56px"><div class="sm mu" style="margin-bottom:8px">Skills and MCP servers</div>${[['review', true], ['release-notes', true], ['github', true], ['acme-docs', true], ['postgres', false]].map(([name, on], index) => `<div class="row g3" style="height:26px"><span class="grow sm">${name}</span>${toggle(on)}</div>`).join('')}</div>` }),
+        accountCard(ACCTS.side),
+      ]))) },
   ],
 });

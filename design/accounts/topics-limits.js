@@ -23,7 +23,7 @@ const limitBanner = ({ title, body, buttons = '', icon = 'hourglass' }) => `<div
 const threadView = (notice, { w = 760, h = 420, composer = {}, header = threadHeader(), overlay = '' } = {}) => frame(`<div class="col" style="height:100%">${header}<div class="grow" style="min-height:0;overflow:hidden">${conversation()}</div>${notice}${composerBar(composer)}</div>${overlay}`, { w, h });
 const WORK_OUT = { title: 'Work reached its 5-hour limit', body: 'Claude Agent stopped. The limit resets at 4:10 PM, in 1h 52m.' };
 
-// 6. When a limit is reached ---------------------------------------------------------------
+// 8. When a limit is reached ---------------------------------------------------------------
 const droidCard = ({ prefLine = '', tabs = false } = {}) => card([
   `${accountHead(DROID_WORK)}<div style="padding:0 16px 12px 56px">${tabs ? `<div class="seg" style="margin-bottom:10px"><span class="on">Standard</span><span>Droid Core</span><span>Extra usage</span></div>` : groupLabel('Standard models')}${windowsGrid(DROID_WORK.windows)}${tabs ? '' : `<div style="height:10px"></div>${groupLabel('Droid Core models')}${windowsGrid(DROID_CORE)}`}</div>`,
   prefLine || null,
@@ -53,7 +53,7 @@ TOPICS.push({
   ],
 });
 
-// 7. Limit resets ----------------------------------------------------------------------------
+// 9. Limit resets ----------------------------------------------------------------------------
 const resetLine = (button = obtn('Use Reset')) => `<div class="row g2 sm mu" style="margin-top:12px">${ic('ticket', 'sm')}<span>1 limit reset available · expires in 27d</span><span class="grow"></span>${button}</div>`;
 
 TOPICS.push({
@@ -79,7 +79,7 @@ TOPICS.push({
   ],
 });
 
-// 8. Extra usage and credits -----------------------------------------------------------------
+// 10. Extra usage and credits -----------------------------------------------------------------
 const extraLine = (right) => `<div class="row g2 sm" style="margin-top:12px"><span class="mu" style="display:inline-flex">${ic('coins', 'sm')}</span><span class="mu">Extra usage</span><span>$12.40 of $50.00 left this month</span><span class="grow"></span>${right}</div>`;
 
 TOPICS.push({
@@ -103,7 +103,7 @@ TOPICS.push({
   ],
 });
 
-// 9. Waiting for the reset -------------------------------------------------------------------
+// 11. Waiting for the reset -------------------------------------------------------------------
 TOPICS.push({
   id: 'resume', section: 'When limits run out', title: 'Waiting for the reset', size: 'wide', rec: 'A',
   now: 'A thread that hits a limit stops with the agent’s error, and nothing happens at the reset. Claude’s terminal app offers “Continue automatically at reset”, and t3code’s limit banner has “Resume at reset”; no ACP agent offers it. agentZ already queues messages (sent when the turn ends), so it can send one at the reset time for any agent.',

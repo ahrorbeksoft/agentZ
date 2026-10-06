@@ -14,6 +14,9 @@ homes, or read from their source and docs. Anything not tested is marked *(unver
 - **Quota per account.** Each account shows its plan's usage windows (5-hour, weekly,
   monthly, credits, …): how much is used and when each resets. agentZ reads it from the agent,
   using the agent's own terminal commands where ACP has nothing.
+- **Settings per account.** Accounts of the same agent can offer different models, so each
+  account has its own defaults for new threads, its own environment variables and its own list
+  of models and options.
 - **Who the account is.** The account's email (or name) and plan are read automatically.
 - **Switching.** The user picks the account for a new thread. There is no automatic switching
   (t3code has none either).
@@ -66,7 +69,7 @@ because that's where their sessions are. It's the only time agentZ logs in the n
 
 The External account can't be removed; Log Out on it also logs out the CLI, as the confirm
 dialog says today. It replaces the "Logged in outside agentZ" note under the Account card, and
-`AgentSettings::{login_method, login_identity}` move to each agentZ account.
+`AgentSettings` becomes per account (see Settings per account).
 
 Agents with no home variable (DeepAgents, crow-cli, Agoragentic) and agents without a
 description keep today's behavior: one login, in the normal home.
@@ -112,11 +115,64 @@ Because agentZ holds the key, it can call the vendor's quota API itself.
 - Accounts are per machine, like logins and agent settings today: the homes live where the
   agent runs.
 
+### Settings per account
+
+Accounts of one agent don't get the same models, so what agentZ keeps per agent today moves to
+each account. What decides an account's models, per agent:
+
+- **Claude:** the Default model depends on the account type (Pro, Max, Team, Enterprise, the
+  API, Bedrock, …). Organizations restrict models (`availableModels` and organization model
+  restrictions) and cap effort per role. Fable bills to usage credits on some plans, and access
+  to Opus 4.6 with 1M context depends on the plan
+  ([model configuration](https://code.claude.com/docs/en/model-config)).
+- **Codex:** models follow the sign-in. With ChatGPT, the workspace, seat and role decide;
+  Enterprise admins turn GPT-6 Sol, Luna and Astra on per workspace. With an API key, the key's
+  organization and project decide. GPT-5.4 left Codex for ChatGPT sign-ins on August 31, 2026,
+  but not for API keys
+  ([workspace model availability](https://learn.chatgpt.com/docs/enterprise/workspace-model-availability)).
+- **Factory Droid:** the organization's `modelPolicy` allows and blocks models, per user too,
+  and its `customModels` add more. The user's own custom models (BYOK) are in the home's
+  `settings.json`
+  ([enterprise controls](https://docs.factory.ai/enterprise/hierarchical-settings-and-org-control)).
+- **Devin:** Enterprise teams restrict models in Team Settings
+  ([models](https://docs.devin.ai/cli/models)).
+
+What changes:
+
+- Everything in `AgentSettings` (`agents/settings.json`) becomes per account: the environment
+  (the Environment tab), the defaults for new threads (`default_mode` and
+  `default_config_options`, the Defaults tab), the options and modes the agent last offered
+  (`known_config_options` and `known_modes`, which hold the model list), and the login method
+  and identity. Nothing is shared between accounts, as in t3code, where every provider instance
+  has its own environment, home and models.
+- The External account keeps today's settings, so nothing the user set is lost and existing
+  threads keep their defaults.
+- A thread takes its account's defaults, and a choice made in a thread becomes that account's
+  default (as Zed does per agent). Values the account doesn't offer are skipped, as
+  `AgentThread::apply_defaults` does already.
+- A new thread's model, mode and other selectors come from its account's session. Changing the
+  account opens the session on the other account, as changing the agent does today.
+- The environment is built in this order: the server's, without the agent's login variables;
+  the account's Environment; then the account's home variables and file storage switches. A
+  login variable the user sets in the account's Environment on purpose stays.
+- The agent's own settings files are in the home, so they're per account already: Claude's
+  `settings.json` (model, permissions, hooks, `env`), Codex's `config.toml` (model, profiles,
+  providers), Droid's `settings.json` (custom models, session defaults) and Devin's
+  `config.json`. A new agentZ account starts without the user's CLI settings, because agentZ
+  doesn't copy the agent's files (open question 7).
+- The agent's Threads tab (importing its sessions) lists one account's sessions, since each
+  account has its own.
+- Agent control: `agentz_thread_launch` and `delegate_task` list each account with its models
+  and modes, take an optional account (the default account otherwise), and check a model
+  against that account's options.
+- Where an account's defaults and environment are edited, and what a new account's start as,
+  are topics in the design round.
+
 ### The server
 
 - `Server::agent_command` (`crates/agentz_server/src/server.rs`) takes the account and builds
-  its environment (above) after the agent's settings env. Each (agent, account) pair is its own
-  agent process, so accounts run in parallel.
+  its environment (above). Each (agent, account) pair is its own agent process, so accounts run
+  in parallel.
 - Login, logout and the agent's settings page work per account. The existing `Account` struct
   and `ConnectionId::Account` (the agent started from Settings to log in or out) are renamed
   to `LoginSession` and `ConnectionId::LoginSession`, freeing the word "account".
@@ -235,14 +291,16 @@ where, is decided in the design round (topics under "When limits run out").
 - agentZ keeps one skills folder per machine: `<data dir>/skills/<name>/SKILL.md`. Settings
   gets a Skills section to add (from a folder or by import), view and remove them.
 - The server symlinks each skill into every account's skills folders, including the agent's
-  normal home while its External account is listed, so every agent loads them. Symlinked skills were checked in Droid,
-  Claude, Codex, Devin, Gemini, Grok, OpenCode and Kilo.
+  normal home while its External account is listed, so every agent loads them. Symlinked skills
+  were checked in Droid, Claude, Codex, Devin, Gemini, Grok, OpenCode and Kilo.
 - It links skill by skill, never the whole folder, so the agent's own skills stay beside ours.
   It only ever removes links that point into `<data dir>/skills`. If the agent already has a
   skill with the same name, in its home or in a folder it reads anyway, ours is skipped and
   Settings shows why.
 - Links are synced when a skill is added or removed, when an account is created, and when the
   server starts. New sessions pick them up.
+- Whether a skill can be kept to some accounts is a topic in the design round; the same goes
+  for MCP servers.
 - agentZ doesn't write into the shared `~/.agents/skills`. Many agents read it whatever their
   home: Codex, Devin, Grok, OpenCode, Kilo, Qoder, Amp, Cline and others. Skills already there
   show up in every account of those agents. Importing them into agentZ also makes them reach
@@ -274,18 +332,22 @@ Starts with a design round in `design/accounts/` (see `design/README.md`). Topic
 - The agent's settings page: the Account card becomes a list of accounts. Each shows its email,
   plan and quota bars, with Log In / Log Out, rename and remove, and there is an Add Account
   button.
+- Where each account's defaults and environment are edited, and what a new account's start as.
 - Picking the account for a new thread (where the agent is picked today).
 - Showing a thread's account (thread card, details popover) when an agent has more than one.
 - What a thread shows when its account's quota runs out.
 - The actions when a limit runs out (above): Droid's choice at the limit, limit resets, extra
   usage and credits, and waiting for the reset.
-- Settings → Skills, and Settings → MCP servers.
+- Settings → Skills, and Settings → MCP servers, and whether one can be kept to some accounts.
 
 ### Tests
 
 - The mock agent (`crates/agent_thread/test_support/mock_agent.py`) gets a home variable
   (`MOCK_HOME`), keeps its login file there, and offers a status command and a quota command.
   Server tests can then run two accounts at once and check they stay separate.
+- The mock agent offers different models per home (from a file in it), so a server test can
+  check that each account keeps its own model list and defaults, and that a default the
+  account doesn't offer is skipped.
 - Reader parsers are unit-tested on the captured fixtures.
 - Skills sync runs on temporary folders: links are created, the agent's own skills stay
   untouched, clashes are skipped, and stale links are removed.
@@ -295,8 +357,9 @@ Starts with a design round in `design/accounts/` (see `design/README.md`). Topic
 ## Order of work
 
 1. **Core, with Droid:** rename `LoginSession`, then build accounts data, the External account,
-   per-account environments, agent descriptions, readers and login checks. Droid works end to
-   end, both with a login and with an API key. The UI comes only after its design round.
+   per-account settings and environments, agent descriptions, readers and login checks. Droid
+   works end to end, both with a login and with an API key. The UI comes only after its design
+   round.
 2. **Claude, Codex, Devin** (wave 1).
 3. **Skills and MCP servers.**
 4. **Wave 2**, one agent per commit.
@@ -527,3 +590,6 @@ everything else lives in agentZ's homes (see The home folder).
 5. Should skills and MCP servers be per machine, like agent settings, or copied from the Mac to
    every machine?
 6. Are the waves in the right order?
+7. Should a new account start with a copy of the agent's own settings file from its normal home
+   (Claude's `settings.json`, Codex's `config.toml`, Droid's `settings.json`)? They aren't
+   logins, but some can hold API keys (Droid's custom models).
