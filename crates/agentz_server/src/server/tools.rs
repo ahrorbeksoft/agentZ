@@ -1049,6 +1049,8 @@ impl Server {
         if let Some(title) = spec.title {
             self.projects.set_custom_title(thread_id, title);
         }
+        let account = self.accounts.get(&spec.agent_id).new_thread_account();
+        self.projects.set_thread_account(thread_id, account);
         let mut defaults = self.agent_settings.get(&spec.agent_id).session_defaults();
         for (config_id, value) in spec.model.iter().chain(&spec.mode_option) {
             defaults.config_options.retain(|(id, _)| id != config_id);

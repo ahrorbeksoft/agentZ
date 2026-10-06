@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
+use agentz_protocol::accounts::{AccountChange, AccountChoice, AccountId};
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::layout::{Direction, Node};
@@ -238,6 +239,7 @@ impl TestClient {
                 project_id,
                 agent_id: AgentId::new("mock"),
                 workspace: Default::default(),
+                account: Default::default(),
             })
             .await
         {
@@ -612,6 +614,7 @@ async fn removes_drafts_left_empty() {
                 project_id,
                 agent_id: AgentId::new("mock"),
                 workspace: Default::default(),
+                account: Default::default(),
             })
             .await
         {
@@ -1091,6 +1094,144 @@ async fn custom_agents_are_saved_after_they_start() {
     assert!(!stored.contains_key(&agent_id));
 }
 
+/// New threads start on Use for New Threads' account, else the External one while the normal
+/// home is logged in, else the first agentZ account, and keep it.
+#[tokio::test(flavor = "multi_thread")]
+async fn accounts_decide_where_new_threads_run() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    // Never written, so the normal home stays logged out.
+    let login_file = data_dir.path().join("logged-in");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        login_file.to_string_lossy().into_owned(),
+    );
+    let Some(server) =
+        TestServer::start_with_agent(data_dir, tempfile::tempdir().expect("temp dir"), command)
+    else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    assert!(session.accounts.is_empty());
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let create = |account| Request::CreateThread {
+        project_id,
+        agent_id: AgentId::new("mock"),
+        workspace: Default::default(),
+        account,
+    };
+    let account_of = |client: &TestClient, thread_id: ThreadId| {
+        client
+            .projects
+            .as_ref()
+            .and_then(|projects| {
+                projects
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == thread_id)
+            })
+            .expect("the thread")
+            .account
+    };
+
+    let mut added = Vec::new();
+    for _ in 0..2 {
+        match client.ok(Request::AddAccount(mock.clone())).await {
+            Response::AccountAdded(id) => added.push(id),
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+    let [work, side] = added[..] else {
+        panic!("expected two accounts");
+    };
+    client
+        .ok(Request::UpdateAccount {
+            agent_id: mock.clone(),
+            account: Some(work),
+            change: AccountChange::Rename(Some("Work".into())),
+        })
+        .await;
+
+    // Before the normal home is checked, the External account is listed, as the agent's login
+    // was before it had accounts.
+    let Response::ThreadCreated(external) = client.ok(create(AccountChoice::Default)).await else {
+        panic!("expected a thread");
+    };
+    assert_eq!(account_of(&client, external), None);
+    client
+        .subscribe_thread(ConnectionId::Thread(external))
+        .await;
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| match event {
+                Event::Accounts(accounts) => accounts
+                    .get(&AgentId::new("mock"))
+                    .is_some_and(|accounts| accounts.external_logged_in == Some(false)),
+                _ => false,
+            })
+        })
+        .await;
+
+    let Response::ThreadCreated(on_work) = client.ok(create(AccountChoice::Default)).await else {
+        panic!("expected a thread");
+    };
+    assert_eq!(account_of(&client, on_work), Some(work));
+    client
+        .ok(Request::UpdateAccount {
+            agent_id: mock.clone(),
+            account: Some(side),
+            change: AccountChange::MakeDefault,
+        })
+        .await;
+    let Response::ThreadCreated(on_side) = client.ok(create(AccountChoice::Default)).await else {
+        panic!("expected a thread");
+    };
+    assert_eq!(account_of(&client, on_side), Some(side));
+    let Response::ThreadCreated(chosen) = client.ok(create(AccountChoice::External)).await else {
+        panic!("expected a thread");
+    };
+    assert_eq!(account_of(&client, chosen), None);
+    assert!(
+        client
+            .request(create(AccountChoice::Account(AccountId(99))))
+            .await
+            .is_err()
+    );
+
+    // Removing an account deletes its folder; its threads keep it.
+    let home = server
+        .data_dir
+        .path()
+        .join("accounts")
+        .join("mock")
+        .join(side.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's folder");
+    client
+        .ok(Request::RemoveAccount {
+            agent_id: mock.clone(),
+            account: side,
+        })
+        .await;
+    assert!(!home.exists());
+    assert_eq!(account_of(&client, on_side), Some(side));
+    let Response::ThreadCreated(after) = client.ok(create(AccountChoice::Default)).await else {
+        panic!("expected a thread");
+    };
+    assert_eq!(account_of(&client, after), Some(work));
+
+    let saved = std::fs::read_to_string(server.data_dir.path().join("agents/accounts.json"))
+        .expect("accounts.json");
+    let saved: serde_json::Value = serde_json::from_str(&saved).expect("json");
+    assert_eq!(saved["mock"]["accounts"][0]["label"], "Work");
+    assert_eq!(saved["mock"]["accounts"].as_array().map(Vec::len), Some(1));
+}
+
 /// Codex's device-code login asks the client to open a URL (an elicitation) while
 /// `authenticate` waits. The request reaches the app through the server, and so does the
 /// answer.
@@ -1379,6 +1520,7 @@ impl TestClient {
                 project_id,
                 agent_id: AgentId::new("mock"),
                 workspace: Default::default(),
+                account: Default::default(),
             })
             .await
         {
@@ -2580,6 +2722,7 @@ async fn threads_work_in_worktrees_and_pastures() {
                 base: None,
                 branch: Some("feature".into()),
             },
+            account: Default::default(),
         })
         .await
     else {
@@ -2856,6 +2999,7 @@ async fn threads_work_in_worktrees_and_pastures() {
                     base: None,
                     branch: Some("grazing".into()),
                 },
+                account: Default::default(),
             })
             .await
         else {
@@ -2915,6 +3059,7 @@ async fn threads_started_in_panes_work_in_any_folder() {
         folder,
         agent_id: AgentId::new("mock"),
         workspace,
+        account: Default::default(),
     };
     let new_worktree = || WorkspaceChoice::New {
         kind: WorkspaceKind::Worktree,

@@ -19,11 +19,15 @@ Notes for whoever continues:
   (item 5 runs status commands; kind 7 comes with wave 3).
 - Importing skills and servers from another machine isn't on the design board yet: add a topic
   and let the user pick before building item 26.
+- Until item 4, every account's threads still run in the normal home, and only threads and
+  login sessions on the External account update `external_logged_in`. Item 4 also has to stop
+  an account's agents before `RemoveAccount` deletes its folder, and refuse to start a thread
+  whose account was removed. The app ignores `Event::Accounts` until item 8 shows them.
 
 | Order | § | Item | Status |
 |---|---|---|---|
 | 1 | | Rename `Account` and `ConnectionId::Account` to `LoginSession` | done |
-| 2 | | Accounts data: `accounts.json`, `AccountId`, a thread's account, the External account from the normal home's login check | |
+| 2 | | Accounts data: `accounts.json`, `AccountId`, a thread's account, the External account from the normal home's login check | done |
 | 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | |
 | 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | |
 | 5 | | Login checks from the description | |

@@ -643,6 +643,8 @@ impl ServerClient {
                 .update(cx, |store, cx| store.set_snapshot(projects, cx)),
             Event::Registry(registry) => self.set_registry(registry, cx),
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
+            // Nothing shows an agent's accounts yet.
+            Event::Accounts(_) => {}
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::Thread { connection, update } => {

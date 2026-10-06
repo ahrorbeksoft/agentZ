@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use agentz_protocol::accounts::AccountChoice;
 use agentz_protocol::agents::{AgentId, AgentSession, AgentSessions};
 use agentz_protocol::terminal::TerminalCommand;
 use agentz_protocol::workspace::{
@@ -309,6 +310,7 @@ impl ProjectStore {
                 project_id,
                 agent_id,
                 workspace,
+                account: AccountChoice::Default,
             },
             |response| match response {
                 Response::ThreadCreated(thread_id) => Some(thread_id),
@@ -332,6 +334,7 @@ impl ProjectStore {
                 folder,
                 agent_id,
                 workspace,
+                account: AccountChoice::Default,
             },
             |response| match response {
                 Response::ThreadCreated(thread_id) => Some(thread_id),

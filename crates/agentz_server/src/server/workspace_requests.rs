@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use agentz_protocol::accounts::{AccountChoice, AccountId};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{ConnectionStatus, handoff};
@@ -21,7 +22,8 @@ use util::ResultExt as _;
 
 /// What a new thread runs.
 pub(super) enum NewThread {
-    Agent(AgentId),
+    /// On the agent's account, `None` being the External one.
+    Agent(AgentId, Option<AccountId>),
     Terminal(TerminalCommand),
 }
 
@@ -39,13 +41,20 @@ impl Server {
                 project_id,
                 agent_id,
                 workspace,
-            } => self.create_thread(
-                client,
-                id,
-                project_id,
-                NewThread::Agent(agent_id),
-                workspace,
-            ),
+                account,
+            } => {
+                let account = match self.choose_account(&agent_id, account) {
+                    Ok(account) => account,
+                    Err(error) => return self.respond(client, id, Err(error)),
+                };
+                self.create_thread(
+                    client,
+                    id,
+                    project_id,
+                    NewThread::Agent(agent_id, account),
+                    workspace,
+                )
+            }
             Request::CreateTerminalThread {
                 project_id,
                 command,
@@ -61,7 +70,8 @@ impl Server {
                 folder,
                 agent_id,
                 workspace,
-            } => self.create_workspaces_thread(client, id, folder, agent_id, workspace),
+                account,
+            } => self.create_workspaces_thread(client, id, folder, agent_id, workspace, account),
             Request::ProjectGit(project_id) => {
                 let repo = match self.project_path(project_id) {
                     Ok(repo) => repo,
@@ -177,13 +187,18 @@ impl Server {
         folder: PathBuf,
         agent_id: AgentId,
         workspace: WorkspaceChoice,
+        account: AccountChoice,
     ) {
         let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
         if !folder.is_dir() {
             let error = anyhow!("{} isn't a folder here", folder.display());
             return self.respond(client, id, Err(error));
         }
-        let new = NewThread::Agent(agent_id);
+        let account = match self.choose_account(&agent_id, account) {
+            Ok(account) => account,
+            Err(error) => return self.respond(client, id, Err(error)),
+        };
+        let new = NewThread::Agent(agent_id, account);
         let start = {
             let folder = folder.clone();
             move |server: &mut Server, path: PathBuf| {
@@ -302,7 +317,7 @@ impl Server {
         folder: Option<PathBuf>,
     ) -> Result<ThreadId> {
         let thread_id = match &new {
-            NewThread::Agent(agent_id) => self.projects.add_thread(
+            NewThread::Agent(agent_id, _) => self.projects.add_thread(
                 project_id,
                 projects::NEW_THREAD_TITLE,
                 Some(agent_id.0.to_string()),
@@ -314,7 +329,8 @@ impl Server {
         .context("no such project")?;
         self.projects.set_thread_workspace(thread_id, folder);
         match new {
-            NewThread::Agent(_) => {
+            NewThread::Agent(_, account) => {
+                self.projects.set_thread_account(thread_id, account);
                 self.projects.set_draft(thread_id, true);
                 self.draft_due
                     .insert(thread_id, Instant::now() + OPEN_GRACE);
@@ -371,8 +387,12 @@ impl Server {
         else {
             return Err(anyhow!("the thread's workspace isn't ready"));
         };
-        let new_thread =
-            self.create_thread_in(thread.project_id, NewThread::Agent(agent_id), folder)?;
+        let account = self.choose_account(&agent_id, AccountChoice::Default)?;
+        let new_thread = self.create_thread_in(
+            thread.project_id,
+            NewThread::Agent(agent_id, account),
+            folder,
+        )?;
         self.projects.set_started_in(new_thread, thread.started_in);
         // Its first message links it to this thread.
         continuations::save(&self.data_dir, new_thread, &handoff).log_err();

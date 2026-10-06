@@ -83,7 +83,7 @@ frame and made scrolling lag (zed-industries/zed#7940). Keep this when updating 
 |---|---|
 | `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
-| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
+| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
@@ -127,6 +127,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turn times |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
 | `agents/settings.json` | server | Per-agent env, defaults and known options |
+| `agents/accounts.json` | server | Each agent's agentZ accounts, its account for new threads, and the External account's choices and last login check |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
 | `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests) |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
@@ -502,6 +503,15 @@ Each entry: what it does, where it lives, and where it comes from.
   a login) or reports another account. While logged in with nothing recorded, the note under
   the Account card is a callout: "Logged in outside agentZ", found on that machine, and that
   logging out here logs out the CLI too. Otherwise it says "Logged in from agentZ with <method>".
+- **Accounts** (`agentz_protocol::accounts`, `agentz_server::accounts`,
+  `server/account_requests.rs`; the accounts round in `design/accounts/`, being built as its
+  `progress.md` says): an agent's own login is its External account; agentZ adds more
+  (`Request::AddAccount`, `RemoveAccount`, `UpdateAccount`), kept in `agents/accounts.json`.
+  Each thread keeps the account it started on (`Thread::account`, `None` for External), since
+  accounts share no sessions. New threads take the account marked Use for New Threads, else the
+  External one while the agent's normal home is logged in, as its threads and login sessions
+  last found, else the first agentZ account. Removing an account deletes its folder,
+  `accounts/<agent id>/<account id>/`.
 - **Logging out** (`confirm_dialog.rs`, t3code's dialogs): Log Out on the agent's page or in a
   thread's "…" menu first asks in a dialog in the shell's modal layer, since it stops every
   thread that shares the login. Uninstall asks in the same dialog.

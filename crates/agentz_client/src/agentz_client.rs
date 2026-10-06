@@ -444,6 +444,7 @@ mod tests {
                 project_id,
                 agent_id: AgentId::new("mock"),
                 workspace: Default::default(),
+                account: Default::default(),
             },
         )
         .await

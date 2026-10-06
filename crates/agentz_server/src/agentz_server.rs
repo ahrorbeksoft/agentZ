@@ -5,6 +5,7 @@
 //! One task owns all the state. Client requests and the results of background work arrive on
 //! its channel; after each batch it sends subscribers what changed.
 
+mod accounts;
 mod agent_settings;
 pub mod browser;
 mod checkpoints;

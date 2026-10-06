@@ -12,6 +12,7 @@
 //!   off features the server's [`ServerWelcome::capabilities`] don't list (herdr's and t3code's
 //!   rule).
 
+pub mod accounts;
 pub mod agents;
 pub mod attachments;
 pub mod diff;
@@ -35,6 +36,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+use crate::accounts::{AccountChange, AccountChoice, AccountId, AgentAccounts};
 use crate::agents::{
     AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, CustomAgentChange, IconId,
     RegistrySnapshot,
@@ -241,8 +243,9 @@ pub struct ErrorResponse {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
-    /// Projects, threads, the registry and agent settings: a [`Response::Session`] snapshot,
-    /// then [`Event::Projects`], [`Event::Registry`] and [`Event::AgentSettings`].
+    /// Projects, threads, the registry, agent settings and accounts: a [`Response::Session`]
+    /// snapshot, then [`Event::Projects`], [`Event::Registry`], [`Event::AgentSettings`] and
+    /// [`Event::Accounts`].
     SubscribeSession,
     /// One connection's conversation: a [`Response::Thread`] snapshot, then
     /// [`Event::Thread`]s. Subscribing to a thread starts its agent if it isn't running.
@@ -278,6 +281,8 @@ pub enum Request {
         agent_id: AgentId,
         #[serde(default)]
         workspace: WorkspaceChoice,
+        #[serde(default)]
+        account: AccountChoice,
     },
     /// A thread started in a workspace pane ([`ProjectId::WORKSPACES`]), from `folder`, any
     /// folder. [`WorkspaceChoice::Checkout`] works in `folder` itself; a new worktree or pasture
@@ -288,6 +293,8 @@ pub enum Request {
         agent_id: AgentId,
         #[serde(default)]
         workspace: WorkspaceChoice,
+        #[serde(default)]
+        account: AccountChoice,
     },
     /// Makes a Workspaces thread one of the project its folder is in, adding the folder as a
     /// project when it's in none (the user agreed first).
@@ -553,6 +560,21 @@ pub enum Request {
         agent_id: AgentId,
         change: AgentSettingsChange,
     },
+    /// A new agentZ account for the agent, logged out until it logs in:
+    /// [`Response::AccountAdded`].
+    AddAccount(AgentId),
+    /// Deletes an agentZ account and its folder: its login, sessions and history. Its threads
+    /// stay, but can't continue.
+    RemoveAccount {
+        agent_id: AgentId,
+        account: AccountId,
+    },
+    UpdateAccount {
+        agent_id: AgentId,
+        /// `None` is the External account.
+        account: Option<AccountId>,
+        change: AccountChange,
+    },
     /// The conversations the agent keeps on this machine, to import as threads, as Zed's
     /// thread import lists them: [`Response::AgentSessions`]. The agent starts only for this.
     ListAgentSessions(AgentId),
@@ -763,6 +785,7 @@ pub enum Response {
     AgentSessions(AgentSessions),
     ThreadsImported(Vec<ThreadId>),
     CustomAgentSaved(AgentId),
+    AccountAdded(AccountId),
     Attachment(AttachmentId),
     AttachmentData(AttachmentData),
     /// Where the server keeps a file sent with [`Request::UploadFile`].
@@ -782,6 +805,8 @@ pub struct SessionSnapshot {
     pub registry: RegistrySnapshot,
     pub agent_settings: BTreeMap<AgentId, AgentSettings>,
     #[serde(default)]
+    pub accounts: BTreeMap<AgentId, AgentAccounts>,
+    #[serde(default)]
     pub spaces: SpacesSnapshot,
     #[serde(default)]
     pub machine_icon: MachineIcon,
@@ -792,6 +817,7 @@ pub enum Event {
     Projects(ProjectsSnapshot),
     Registry(RegistrySnapshot),
     AgentSettings(BTreeMap<AgentId, AgentSettings>),
+    Accounts(BTreeMap<AgentId, AgentAccounts>),
     Spaces(SpacesSnapshot),
     MachineIcon(MachineIcon),
     Thread {

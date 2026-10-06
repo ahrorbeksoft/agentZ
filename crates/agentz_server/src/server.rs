@@ -1,5 +1,6 @@
 //! The state the server owns, and how requests and background results change it.
 
+mod account_requests;
 mod attachment_requests;
 mod custom_agents;
 #[cfg(unix)]
@@ -41,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use util::ResultExt as _;
 
+use crate::accounts::AccountStore;
 use crate::agent_settings::AgentSettingsStore;
 use crate::browser;
 use crate::checkpoints::Checkpoints;
@@ -168,6 +170,7 @@ pub(crate) struct Server {
     reading_git_heads: bool,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
+    accounts: AccountStore,
     threads: HashMap<ThreadId, AgentThread>,
     login_sessions: HashMap<u64, LoginSession>,
     next_login_session_id: u64,
@@ -181,6 +184,7 @@ pub(crate) struct Server {
     spaces_revision_sent: u64,
     registry_sent: RegistrySnapshot,
     agent_settings_revision_sent: u64,
+    accounts_revision_sent: u64,
     machine_icon_sent: MachineIcon,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
@@ -231,6 +235,7 @@ impl Server {
             Some(data_dir.join("agents").join("settings.json")),
             Some(&data_dir.join("settings.json")),
         );
+        let accounts = AccountStore::load(Some(data_dir.join("agents").join("accounts.json")));
         let (mut registry, registry_inbox) = AgentRegistryStore::new(
             runtime.clone(),
             config.http_client,
@@ -284,12 +289,14 @@ impl Server {
             projects_revision_sent: projects.revision(),
             registry_sent: RegistrySnapshot::default(),
             agent_settings_revision_sent: agent_settings.revision(),
+            accounts_revision_sent: accounts.revision(),
             projects,
             repository_checks: RepositoryChecks::default(),
             git_head_folders: BTreeSet::new(),
             reading_git_heads: false,
             registry,
             agent_settings,
+            accounts,
             threads: HashMap::default(),
             login_sessions: HashMap::default(),
             next_login_session_id: 1,
@@ -645,6 +652,7 @@ impl Server {
                     projects: self.projects.snapshot(),
                     registry: self.registry_snapshot(),
                     agent_settings: self.agent_settings.all().clone(),
+                    accounts: self.accounts.all().clone(),
                     spaces: self.spaces.snapshot(),
                     machine_icon: self.machine_icon.clone(),
                 }))
@@ -986,6 +994,9 @@ impl Server {
                 }
                 Ok(Response::Ok)
             }
+            request @ (Request::AddAccount(_)
+            | Request::RemoveAccount { .. }
+            | Request::UpdateAccount { .. }) => self.account_request(request),
             Request::ImportAgentSessions {
                 agent_id,
                 sessions,
@@ -1703,22 +1714,27 @@ impl Server {
     /// Applies what the thread reports to the projects and agent settings.
     fn thread_changed(&mut self, connection: ConnectionId) {
         self.changed_connections.insert(connection);
-        let (thread, agent_id) = match connection {
+        let (thread, agent_id, on_external_account) = match connection {
             ConnectionId::Thread(thread_id) => {
-                let agent_id = self
-                    .projects
-                    .thread(thread_id)
+                let record = self.projects.thread(thread_id);
+                let agent_id = record
                     .and_then(|thread| thread.agent_id.clone())
                     .map(AgentId::new);
-                (self.threads.get_mut(&thread_id), agent_id)
+                let on_external_account = record.is_some_and(|thread| thread.account.is_none());
+                (
+                    self.threads.get_mut(&thread_id),
+                    agent_id,
+                    on_external_account,
+                )
             }
             ConnectionId::LoginSession(login_session_id) => {
                 match self.login_sessions.get_mut(&login_session_id) {
                     Some(login_session) => (
                         Some(&mut login_session.thread),
                         Some(login_session.agent_id.clone()),
+                        true,
                     ),
-                    None => (None, None),
+                    None => (None, None, false),
                 }
             }
         };
@@ -1730,6 +1746,7 @@ impl Server {
         let model = thread.model_name();
         let config_options = thread.config_options().to_vec();
         let modes = thread.modes().cloned();
+        let logged_in = thread.state.logged_in;
 
         for event in events {
             match (connection, event) {
@@ -1821,6 +1838,13 @@ impl Server {
                 settings.known_modes = modes;
             });
         }
+        // The External account is listed while the normal home is logged in.
+        if let (Some(agent_id), Some(logged_in), true) = (&agent_id, logged_in, on_external_account)
+        {
+            self.accounts.update(agent_id, |accounts| {
+                accounts.external_logged_in = Some(logged_in)
+            });
+        }
     }
 
     /// Sends subscribers what changed since the last call.
@@ -1892,6 +1916,10 @@ impl Server {
         if self.agent_settings.revision() != self.agent_settings_revision_sent {
             self.agent_settings_revision_sent = self.agent_settings.revision();
             self.broadcast(Event::AgentSettings(self.agent_settings.all().clone()));
+        }
+        if self.accounts.revision() != self.accounts_revision_sent {
+            self.accounts_revision_sent = self.accounts.revision();
+            self.broadcast(Event::Accounts(self.accounts.all().clone()));
         }
         if self.machine_icon != self.machine_icon_sent {
             self.machine_icon_sent = self.machine_icon.clone();

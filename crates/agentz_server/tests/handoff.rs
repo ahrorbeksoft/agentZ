@@ -247,6 +247,7 @@ async fn hands_agents_to_a_new_server() {
             project_id,
             agent_id: AgentId::new("mock"),
             workspace: Default::default(),
+            account: Default::default(),
         })
         .await
         .expect("creates a thread")

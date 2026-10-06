@@ -35,6 +35,18 @@ impl ProjectId {
 #[serde(transparent)]
 pub struct ThreadId(pub u64);
 
+/// One of an agent's agentZ accounts, a login in its own home folder. Never reused within an
+/// agent, so the threads of a removed account can't land on a newer one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AccountId(pub u64);
+
+impl std::fmt::Display for AccountId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
@@ -161,6 +173,10 @@ pub struct Thread {
     /// The registry id of the agent the thread was started with.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// The agent's account the thread runs on, for good: accounts share no sessions. `None` is
+    /// the External account, the agent's own login in its normal home.
+    #[serde(default)]
+    pub account: Option<AccountId>,
     /// When the thread was created or its agent last did something.
     #[serde(default)]
     pub last_activity_at: Option<SystemTime>,
@@ -793,6 +809,7 @@ impl ProjectStore {
             automatic_title: Some(title.clone()),
             title,
             agent_id,
+            account: None,
             last_activity_at: Some(now),
             created_at: Some(now),
             session_id: None,
@@ -1219,6 +1236,16 @@ impl ProjectStore {
             && thread.workspace != workspace
         {
             thread.workspace = workspace;
+            self.changed();
+        }
+    }
+
+    /// Before its agent starts, since the account decides where it runs.
+    pub fn set_thread_account(&mut self, id: ThreadId, account: Option<AccountId>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.account != account
+        {
+            thread.account = account;
             self.changed();
         }
     }
