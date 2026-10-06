@@ -993,8 +993,26 @@ impl Server {
         if let Some(directory) = &self.browser_programs {
             env.extend(browser::agent_env(directory, connection, path.as_deref()));
         }
+        let program = command.path.to_string_lossy().into_owned();
+        let removed: Vec<&String> = command
+            .env_remove
+            .iter()
+            .filter(|variable| !env.contains_key(*variable))
+            .collect();
+        // A terminal only adds to the server's environment, so `env` leaves these out.
+        let program = if removed.is_empty() {
+            (program, command.args)
+        } else {
+            let mut args = Vec::new();
+            for variable in removed {
+                args.extend(["-u".to_string(), variable.clone()]);
+            }
+            args.push(program);
+            args.extend(command.args);
+            ("/usr/bin/env".to_string(), args)
+        };
         let spawn = TerminalSpawn {
-            program: Some((command.path.to_string_lossy().into_owned(), command.args)),
+            program: Some(program),
             cwd: thread.state.cwd.clone(),
             env,
         };

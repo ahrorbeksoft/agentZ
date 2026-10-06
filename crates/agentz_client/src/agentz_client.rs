@@ -292,8 +292,10 @@ mod tests {
                 path: python,
                 args: vec![script.to_string_lossy().into_owned()],
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
             info: None,
+            accounts: None,
         })
     }
 

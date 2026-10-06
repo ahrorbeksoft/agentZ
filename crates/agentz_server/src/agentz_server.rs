@@ -40,6 +40,7 @@ use registry::{AgentCommand, ShellEnvironmentReady};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub use accounts::AgentDescription;
 pub use agent_settings::AgentSettingsStore;
 
 use crate::server::{Input, Server};
@@ -85,6 +86,9 @@ pub struct CustomAgent {
     /// What the agent said it is (ACP's `agentInfo`) when it was last saved from Settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub info: Option<agent_client_protocol::schema::v1::Implementation>,
+    /// How it keeps an account in a folder of agentZ's, if it can have several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<AgentDescription>,
 }
 
 /// A running server. Cloning it is cheap.
@@ -99,7 +103,7 @@ pub struct ServerHandle {
 }
 
 /// Reads `agents/custom.json`: agent ids, each with a `name` and a `command` (`path`, `args`,
-/// `env`).
+/// `env`), and optionally how it keeps `accounts` ([`AgentDescription`]).
 pub fn load_custom_agents(data_dir: &Path) -> Result<BTreeMap<AgentId, CustomAgent>> {
     let path = custom_agents_path(data_dir);
     match std::fs::read(&path) {

@@ -94,12 +94,17 @@ impl Server {
         }
         let agent_id = agent_id.unwrap_or_else(|| self.new_custom_agent_id(&name));
         let mut agents = self.custom_agents.clone();
+        // Settings doesn't edit it, so it's kept from `custom.json`.
+        let accounts = agents
+            .get(&agent_id)
+            .and_then(|agent| agent.accounts.clone());
         agents.insert(
             agent_id.clone(),
             CustomAgent {
                 name: name.into(),
                 command,
                 info,
+                accounts,
             },
         );
         write_custom_agents(&self.data_dir, &agents)?;

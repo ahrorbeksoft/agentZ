@@ -1,6 +1,9 @@
 //! Each agent's accounts, kept by the server in `agents/accounts.json`, and their home folders
 //! in `accounts/<agent id>/<account id>/`.
 
+mod descriptions;
+mod droid;
+
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -10,6 +13,8 @@ use anyhow::{Context as _, Result};
 use util::ResultExt as _;
 
 use crate::agent_settings::{read_json, write_json};
+
+pub use descriptions::{AgentDescription, built_in as built_in_description};
 
 pub struct AccountStore {
     accounts: BTreeMap<AgentId, AgentAccounts>,

@@ -390,8 +390,12 @@ impl ProjectStore {
     /// The conversations the agent keeps on this machine, each with the project it would be
     /// imported into. The server starts the agent only to ask.
     pub fn list_agent_sessions(&self, agent_id: AgentId, cx: &App) -> Task<Result<AgentSessions>> {
+        // The External account's, until the Threads tab picks an account.
         self.request(
-            Request::ListAgentSessions(agent_id),
+            Request::ListAgentSessions {
+                agent_id,
+                account: None,
+            },
             |response| match response {
                 Response::AgentSessions(sessions) => Some(sessions),
                 _ => None,
@@ -411,6 +415,7 @@ impl ProjectStore {
         self.request(
             Request::ImportAgentSessions {
                 agent_id,
+                account: None,
                 sessions,
                 archived: true,
             },

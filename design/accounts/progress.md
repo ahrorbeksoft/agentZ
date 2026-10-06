@@ -19,20 +19,21 @@ Notes for whoever continues:
   (item 5 runs status commands; kind 7 comes with wave 3).
 - Importing skills and servers from another machine isn't on the design board yet: add a topic
   and let the user pick before building item 26.
-- Until item 4, every account's threads still run in the normal home, and only threads and
-  login sessions on the External account update `external_logged_in`. Item 4 also has to stop
-  an account's agents before `RemoveAccount` deletes its folder, and refuse to start a thread
-  whose account was removed. The app ignores `Event::Accounts` until item 8 shows them.
-- Login sessions (the agent's Settings panel) are on the External account until item 4 gives
-  `OpenLoginSession` an account; the app's settings tabs edit the External account's settings
-  until item 9's account menu.
+- Only threads and login sessions on the External account update `external_logged_in`; an
+  agentZ account's own login state comes with item 5. The app ignores `Event::Accounts` until
+  item 8 shows them.
+- The server takes an account for login sessions (`OpenLoginSession`) and for listing and
+  importing sessions, but the app still sends the External account (`None`) for both, and its
+  settings tabs edit the External account's settings, until items 8 and 9 add the menus.
+- Only agents with a description can have more accounts (`AddAccount` refuses the rest).
+  Droid's is `accounts/droid.rs`; wave 1 and later agents each add one beside it.
 
 | Order | § | Item | Status |
 |---|---|---|---|
 | 1 | | Rename `Account` and `ConnectionId::Account` to `LoginSession` | done |
 | 2 | | Accounts data: `accounts.json`, `AccountId`, a thread's account, the External account from the normal home's login check | done |
 | 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | done |
-| 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | |
+| 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | done |
 | 5 | | Login checks from the description | |
 | 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | |
 | 7 | | API-key accounts (Droid with a Factory API key) | |

@@ -36,7 +36,8 @@ before changing it, and keep the document current when you add or change a featu
 
 Agents run from a fixed command go in `agents/custom.json` in the data directory and show as
 installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "args":
-["…/mock_agent.py"], "env": {}}}}`.
+["…/mock_agent.py"], "env": {}}}}`. To give it accounts, add `"accounts": {"home_variables":
+{"MOCK_HOME": ""}, "login_variables": ["MOCK_API_KEY"]}`.
 
 ## Build, run, test
 
@@ -119,6 +120,8 @@ From Zed's guidelines, which this code follows:
   names context embedded in a prompt in its echo ("Echo: next [with agentz://handoff]"). With
   `MOCK_SESSIONS_FILE` (a JSON array of ACP session infos, each with an optional `history` to
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
+  For accounts, `MOCK_HOME` is its home (the login is then `login` there) and `MOCK_API_KEY`
+  logs it in; the server tests' mock is described with both, so it can have accounts.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.

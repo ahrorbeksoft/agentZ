@@ -539,7 +539,11 @@ pub enum Request {
 
     /// Starts an agent only to log in or out. Answered with [`Response::LoginSessionOpened`]. It
     /// closes with [`Request::CloseLoginSession`], or when the client disconnects.
-    OpenLoginSession(AgentId),
+    OpenLoginSession {
+        agent_id: AgentId,
+        /// The account it logs in or out, `None` being the External one.
+        account: Option<AccountId>,
+    },
     CloseLoginSession(u64),
 
     RefreshRegistry {
@@ -578,15 +582,20 @@ pub enum Request {
         account: Option<AccountId>,
         change: AccountChange,
     },
-    /// The conversations the agent keeps on this machine, to import as threads, as Zed's
-    /// thread import lists them: [`Response::AgentSessions`]. The agent starts only for this.
-    ListAgentSessions(AgentId),
-    /// Adds a thread for each of the agent's sessions from [`Request::ListAgentSessions`], in
-    /// the project its folder belongs to. The agent loads the session when its thread opens.
-    /// Sessions that have a thread already, or no project, are left out:
-    /// [`Response::ThreadsImported`].
+    /// The conversations the agent keeps on this machine for one account (`None` being the
+    /// External one), to import as threads, as Zed's thread import lists them:
+    /// [`Response::AgentSessions`]. The agent starts only for this.
+    ListAgentSessions {
+        agent_id: AgentId,
+        account: Option<AccountId>,
+    },
+    /// Adds a thread on the account for each of the agent's sessions from
+    /// [`Request::ListAgentSessions`], in the project its folder belongs to. The agent loads
+    /// the session when its thread opens. Sessions that have a thread already, or no project,
+    /// are left out: [`Response::ThreadsImported`].
     ImportAgentSessions {
         agent_id: AgentId,
+        account: Option<AccountId>,
         sessions: Vec<AgentSession>,
         /// Straight into Archived.
         #[serde(default)]

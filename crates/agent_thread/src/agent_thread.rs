@@ -2553,7 +2553,11 @@ async fn connect(
 ) -> Result<Connected> {
     // Stopped by `ProcessGuard` rather than on drop, so a handed-off agent can outlive this
     // process. In a group of its own, so what it starts stops with it.
-    let mut child = tokio::process::Command::new(&command.path)
+    let mut process_command = tokio::process::Command::new(&command.path);
+    for variable in &command.env_remove {
+        process_command.env_remove(variable);
+    }
+    let mut child = process_command
         .args(&command.args)
         .envs(&command.env)
         .current_dir(&cwd)
@@ -3282,6 +3286,7 @@ mod tests {
             path: python,
             args: command_args,
             env: Default::default(),
+            env_remove: Vec::new(),
         })
     }
 

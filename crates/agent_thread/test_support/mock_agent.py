@@ -31,6 +31,10 @@ logins, as real agents offer them:
   with a `baseUrl`, as Claude Agent's does.
 Every login and logout is reported with `_auth/status_update`, as Claude Agent and Codex do.
 
+MOCK_HOME is its home, as FACTORY_HOME_OVERRIDE is Factory Droid's: with it set, the login
+MOCK_LOGIN_FILE asks for is the file `login` there instead. MOCK_API_KEY logs it in whatever
+the file says, as FACTORY_API_KEY does.
+
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
 So are resource links (their URIs) and images (their MIME types). With MOCK_IMAGES set, it
@@ -68,6 +72,8 @@ import threading
 import time
 
 LOGIN_FILE = os.environ.get("MOCK_LOGIN_FILE")
+if LOGIN_FILE and os.environ.get("MOCK_HOME"):
+    LOGIN_FILE = os.path.join(os.environ["MOCK_HOME"], "login")
 # Where `session/close` notes the sessions it closed, a line each.
 CLOSED_FILE = os.environ.get("MOCK_CLOSED_FILE")
 # The sessions `session/list` reports.
@@ -80,7 +86,9 @@ if sys.argv[-1] == "--login":
     if os.environ.get("MOCK_BROWSER_OPEN"):
         # As `claude /login` does, before it offers a link to open by hand.
         subprocess.run(["xdg-open", "https://example.com/terminal-login"])
-    print("Press Enter to log in to the mock agent.", flush=True)
+    # Says whether the key reached it, which an account's login leaves out.
+    key = " with MOCK_API_KEY set" if os.environ.get("MOCK_API_KEY") else ""
+    print(f"Press Enter to log in to the mock agent{key}.", flush=True)
     sys.stdin.readline()
     open(LOGIN_FILE, "w").close()
     print("Logged in.", flush=True)
@@ -225,6 +233,8 @@ def client_request(method, params):
 def logged_in():
     if logged_out:
         return False
+    if os.environ.get("MOCK_API_KEY"):
+        return True
     return not LOGIN_FILE or os.path.exists(LOGIN_FILE)
 
 

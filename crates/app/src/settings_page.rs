@@ -2305,6 +2305,7 @@ impl SettingsPage {
                     .map(str::to_string)
                     .collect(),
                 env,
+                env_remove: Vec::new(),
             },
         };
         let save = registry.read(cx).save_custom_agent(change, cx);
@@ -3134,8 +3135,11 @@ impl SettingsPage {
                 let threads: HashMap<&str, ThreadId> = sessions
                     .iter()
                     .filter_map(|session| {
-                        let thread =
-                            store.thread_for_session(&panel.agent_id.0, &session.session_id)?;
+                        let thread = store.thread_for_session(
+                            &panel.agent_id.0,
+                            None,
+                            &session.session_id,
+                        )?;
                         Some((session.session_id.as_str(), thread))
                     })
                     .collect();
@@ -5063,6 +5067,7 @@ mod tests {
             env: [("OPENCODE_LOG".to_string(), "debug".to_string())]
                 .into_iter()
                 .collect(),
+            env_remove: Vec::new(),
         });
         cx.update(|cx| {
             crate::init_for_test(cx);
@@ -5239,6 +5244,7 @@ mod tests {
                 project_id: project,
                 workspace: None,
                 agent_id: "mock".into(),
+                account: None,
                 session_id: "s-03".into(),
                 title: "Session s-03".into(),
                 updated_at: None,

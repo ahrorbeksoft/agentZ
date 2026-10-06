@@ -35,6 +35,9 @@ pub struct AgentCommand {
     pub path: PathBuf,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    /// Left out of the environment the agent inherits, unless `env` sets them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_remove: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

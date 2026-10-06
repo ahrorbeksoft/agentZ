@@ -121,6 +121,8 @@ struct Client {
 /// An agent started only to log in or out, from its settings.
 struct LoginSession {
     agent_id: AgentId,
+    /// `None` is the External account.
+    account: Option<AccountId>,
     owner: ClientId,
     thread: AgentThread,
 }
@@ -535,8 +537,8 @@ impl Server {
             Input::Request {
                 client,
                 id,
-                request: Request::ListAgentSessions(agent_id),
-            } => self.list_agent_sessions(client, id, agent_id),
+                request: Request::ListAgentSessions { agent_id, account },
+            } => self.list_agent_sessions(client, id, agent_id, account),
             Input::Request {
                 client,
                 id,
@@ -910,11 +912,17 @@ impl Server {
                 Ok(Response::Ok)
             }
 
-            Request::OpenLoginSession(agent_id) => {
+            Request::OpenLoginSession { agent_id, account } => {
                 self.client(client)?;
+                if let Some(id) = account {
+                    self.accounts
+                        .get(&agent_id)
+                        .account(id)
+                        .context("there's no such account")?;
+                }
                 let login_session_id = self.next_login_session_id;
                 self.next_login_session_id += 1;
-                let command = self.agent_command(&agent_id, None, false);
+                let command = self.agent_command(&agent_id, account, false);
                 let command = self
                     .with_browser_programs(command, ConnectionId::LoginSession(login_session_id));
                 let (thread, inbox) = AgentThread::start_for_login_session(
@@ -926,6 +934,7 @@ impl Server {
                     login_session_id,
                     LoginSession {
                         agent_id,
+                        account,
                         owner: client,
                         thread,
                     },
@@ -1004,10 +1013,13 @@ impl Server {
             | Request::UpdateAccount { .. }) => self.account_request(request),
             Request::ImportAgentSessions {
                 agent_id,
+                account,
                 sessions,
                 archived,
-            } => self.import_agent_sessions(agent_id, sessions, archived),
-            Request::ListAgentSessions(_) => Err(anyhow!("listing sessions is handled separately")),
+            } => self.import_agent_sessions(agent_id, account, sessions, archived),
+            Request::ListAgentSessions { .. } => {
+                Err(anyhow!("listing sessions is handled separately"))
+            }
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
 
             Request::Shutdown => {
@@ -1669,14 +1681,22 @@ impl Server {
     }
 
     /// The command that starts the agent, with the environment from the account's settings
-    /// (`None` being the External account). Threads opened right after launch wait for the
-    /// registry to load.
+    /// (`None` being the External account). An agentZ account's agent runs in the account's
+    /// home, so each account is an agent process of its own. Threads opened right after launch
+    /// wait for the registry to load.
     fn agent_command(
         &mut self,
         agent_id: &AgentId,
         account: Option<AccountId>,
         when_loaded: bool,
     ) -> CommandFuture {
+        let home = match account
+            .map(|account| self.account_home(agent_id, account))
+            .transpose()
+        {
+            Ok(home) => home,
+            Err(error) => return futures::future::ready(Err(error)).boxed(),
+        };
         let command = match self.custom_agents.get(agent_id) {
             Some(agent) => futures::future::ready(Ok(agent.command.clone())).boxed(),
             None if when_loaded => self.registry.command_when_loaded(agent_id),
@@ -1685,7 +1705,14 @@ impl Server {
         let env = self.account_settings(agent_id, account).env;
         async move {
             let mut command = command.await?;
-            command.env.extend(env);
+            match home {
+                None => command.env.extend(env),
+                Some((description, home)) => {
+                    std::fs::create_dir_all(&home)
+                        .with_context(|| format!("creating {}", home.display()))?;
+                    description.apply(&mut command, env, &home);
+                }
+            }
             Ok(command)
         }
         .boxed()
@@ -1740,7 +1767,7 @@ impl Server {
                     Some(login_session) => (
                         Some(&mut login_session.thread),
                         Some(login_session.agent_id.clone()),
-                        None,
+                        login_session.account,
                     ),
                     None => (None, None, None),
                 }

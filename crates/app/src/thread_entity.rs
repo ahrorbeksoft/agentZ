@@ -121,7 +121,11 @@ impl AgentThread {
         agent_name: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
-        let response = client.read(cx).request(Request::OpenLoginSession(agent_id));
+        // The External account's, until Settings picks an account.
+        let response = client.read(cx).request(Request::OpenLoginSession {
+            agent_id,
+            account: None,
+        });
         let mut this = Self::new(client, agent_name);
         this._subscribe = cx.spawn(async move |this, cx| {
             let result = match response.await {

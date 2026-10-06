@@ -279,6 +279,8 @@ pub struct ImportedSession {
     /// The project's worktree or pasture the session ran in, or `None` for its own folder.
     pub workspace: Option<PathBuf>,
     pub agent_id: String,
+    /// The account whose home keeps the session, `None` being the External one.
+    pub account: Option<AccountId>,
     pub session_id: String,
     pub title: String,
     /// When the agent last worked on it, which orders it among the other threads.
@@ -870,6 +872,7 @@ impl ProjectStore {
         let id = self.add_thread(session.project_id, session.title, Some(session.agent_id))?;
         let archived_at = session.archived.then(SystemTime::now);
         let thread = self.threads.iter_mut().find(|thread| thread.id == id)?;
+        thread.account = session.account;
         thread.session_id = Some(session.session_id);
         thread.workspace = session.workspace;
         if let Some(updated_at) = session.updated_at {
@@ -881,12 +884,18 @@ impl ProjectStore {
         Some(id)
     }
 
-    /// The thread that has the agent's session.
-    pub fn thread_for_session(&self, agent_id: &str, session_id: &str) -> Option<ThreadId> {
+    /// The thread that has the session the agent keeps for the account.
+    pub fn thread_for_session(
+        &self,
+        agent_id: &str,
+        account: Option<AccountId>,
+        session_id: &str,
+    ) -> Option<ThreadId> {
         self.threads
             .iter()
             .find(|thread| {
                 thread.agent_id.as_deref() == Some(agent_id)
+                    && thread.account == account
                     && thread.session_id.as_deref() == Some(session_id)
             })
             .map(|thread| thread.id)
@@ -2259,6 +2268,7 @@ mod tests {
                 project_id: project,
                 workspace: Some(worktree.clone()),
                 agent_id: "codex".into(),
+                account: None,
                 session_id: "session-a".into(),
                 title: "Fix the login".into(),
                 updated_at: Some(earlier),
@@ -2279,16 +2289,21 @@ mod tests {
         );
 
         assert_eq!(
-            store.thread_for_session("codex", "session-a"),
+            store.thread_for_session("codex", None, "session-a"),
             Some(imported)
         );
-        assert_eq!(store.thread_for_session("claude", "session-a"), None);
+        assert_eq!(store.thread_for_session("claude", None, "session-a"), None);
+        assert_eq!(
+            store.thread_for_session("codex", Some(AccountId(1)), "session-a"),
+            None
+        );
 
         let archived = store
             .add_imported_thread(ImportedSession {
                 project_id: project,
                 workspace: None,
                 agent_id: "codex".into(),
+                account: Some(AccountId(1)),
                 session_id: "session-b".into(),
                 title: "Old work".into(),
                 updated_at: None,
@@ -2302,6 +2317,10 @@ mod tests {
                 .map(|thread| thread.id)
                 .collect::<Vec<_>>(),
             vec![archived]
+        );
+        assert_eq!(
+            store.thread(archived).and_then(|thread| thread.account),
+            Some(AccountId(1))
         );
     }
 }

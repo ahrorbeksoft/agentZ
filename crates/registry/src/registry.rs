@@ -1009,6 +1009,7 @@ async fn agent_command(
                 path: binary_command_path(&version_dir, &target.cmd)?,
                 args: target.args.clone(),
                 env: target.env.clone(),
+                env_remove: Vec::new(),
             })
         }
         RegistryAgent::Npx(agent) => {
@@ -1026,6 +1027,7 @@ async fn agent_command(
                     path: executable,
                     args: agent.args.clone(),
                     env,
+                    env_remove: Vec::new(),
                 });
             }
             let mut args = vec![executable.to_string_lossy().into_owned()];
@@ -1034,6 +1036,7 @@ async fn agent_command(
                 path: node.node_path(),
                 args,
                 env,
+                env_remove: Vec::new(),
             })
         }
     }

@@ -6,8 +6,9 @@ use std::time::SystemTime;
 
 use agent_thread::SessionListing;
 use agentz_protocol::Response;
+use agentz_protocol::accounts::AccountId;
 use agentz_protocol::agents::{AgentId, AgentSession, AgentSessions};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use projects::ImportedSession;
 
 use super::{ClientId, Server, thread_title_from_prompt};
@@ -16,8 +17,14 @@ use super::{ClientId, Server, thread_title_from_prompt};
 const UNTITLED_SESSION_TITLE: &str = "Imported thread";
 
 impl Server {
-    pub(super) fn list_agent_sessions(&mut self, client: ClientId, id: u64, agent_id: AgentId) {
-        let command = self.agent_command(&agent_id, None, true);
+    pub(super) fn list_agent_sessions(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+    ) {
+        let command = self.agent_command(&agent_id, account, true);
         self.spawn_then(
             async move {
                 let listing = agent_thread::list_sessions(command).await?;
@@ -36,13 +43,19 @@ impl Server {
                 })
             },
             move |server, listing: Result<Listing>| {
-                let sessions = listing.map(|listing| server.agent_sessions(&agent_id, listing));
+                let sessions =
+                    listing.map(|listing| server.agent_sessions(&agent_id, account, listing));
                 server.respond(client, id, sessions.map(Response::AgentSessions));
             },
         );
     }
 
-    fn agent_sessions(&self, agent_id: &AgentId, listing: Listing) -> AgentSessions {
+    fn agent_sessions(
+        &self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        listing: Listing,
+    ) -> AgentSessions {
         let sessions = match listing {
             Listing::Listed(sessions) => sessions,
             Listing::Unsupported => return AgentSessions::Unsupported,
@@ -60,7 +73,11 @@ impl Server {
                     AgentSession {
                         project_id,
                         workspace,
-                        thread_id: self.projects.thread_for_session(&agent_id.0, &session_id),
+                        thread_id: self.projects.thread_for_session(
+                            &agent_id.0,
+                            account,
+                            &session_id,
+                        ),
                         updated_at: session.updated_at.as_deref().and_then(parse_timestamp),
                         title: session.title.filter(|title| !title.trim().is_empty()),
                         cwd: session.cwd,
@@ -74,14 +91,21 @@ impl Server {
     pub(super) fn import_agent_sessions(
         &mut self,
         agent_id: AgentId,
+        account: Option<AccountId>,
         sessions: Vec<AgentSession>,
         archived: bool,
     ) -> Result<Response> {
+        if let Some(id) = account {
+            self.accounts
+                .get(&agent_id)
+                .account(id)
+                .context("the account was removed")?;
+        }
         let mut imported = Vec::new();
         for session in sessions {
             if self
                 .projects
-                .thread_for_session(&agent_id.0, &session.session_id)
+                .thread_for_session(&agent_id.0, account, &session.session_id)
                 .is_some()
             {
                 continue;
@@ -101,6 +125,7 @@ impl Server {
                 project_id,
                 workspace,
                 agent_id: agent_id.0.to_string(),
+                account,
                 session_id: session.session_id,
                 title,
                 updated_at: session.updated_at,

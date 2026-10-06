@@ -1030,6 +1030,7 @@ pub fn terminal_login_command(
         path,
         args: meta.args,
         env,
+        env_remove: agent.env_remove.clone(),
     })
 }
 
@@ -1288,6 +1289,7 @@ mod tests {
             env: [("KEY".to_string(), "agent".to_string())]
                 .into_iter()
                 .collect(),
+            env_remove: Vec::new(),
         };
         let terminal = acp::AuthMethod::Terminal(
             acp::AuthMethodTerminal::new("claude-ai-login", "Claude subscription")

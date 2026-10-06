@@ -66,6 +66,7 @@ impl TestServer {
                 name: "Mock".into(),
                 command,
                 info: None,
+                accounts: Some(mock_accounts()),
             },
         )]);
         let handle = crate::start(
@@ -260,6 +261,15 @@ fn agent_text(view: &ThreadView) -> String {
         .collect()
 }
 
+/// The mock agent keeps an account's login in `MOCK_HOME`, and takes `MOCK_API_KEY` as one.
+fn mock_accounts() -> crate::AgentDescription {
+    crate::AgentDescription {
+        home_variables: BTreeMap::from([("MOCK_HOME".into(), String::new())]),
+        file_storage: BTreeMap::new(),
+        login_variables: vec!["MOCK_API_KEY".into()],
+    }
+}
+
 fn mock_agent() -> Option<AgentCommand> {
     let path = std::env::var_os("PATH")?;
     let Some(python) = std::env::split_paths(&path)
@@ -275,6 +285,7 @@ fn mock_agent() -> Option<AgentCommand> {
         path: python,
         args: vec![script.to_string_lossy().into_owned()],
         env: Default::default(),
+        env_remove: Vec::new(),
     })
 }
 
@@ -813,7 +824,10 @@ async fn login_sessions_log_in_and_close_with_their_client() {
     let mut client = server.connect().await;
     client.ok(Request::SubscribeSession).await;
     let Response::LoginSessionOpened(login_session_id) = client
-        .ok(Request::OpenLoginSession(AgentId::new("mock")))
+        .ok(Request::OpenLoginSession {
+            agent_id: AgentId::new("mock"),
+            account: None,
+        })
         .await
     else {
         panic!("expected a login session");
@@ -908,7 +922,10 @@ async fn lists_and_imports_an_agents_sessions() {
     );
 
     let list = async |client: &mut TestClient| match client
-        .ok(Request::ListAgentSessions(AgentId::new("mock")))
+        .ok(Request::ListAgentSessions {
+            agent_id: AgentId::new("mock"),
+            account: None,
+        })
         .await
     {
         Response::AgentSessions(AgentSessions::Listed(sessions)) => sessions,
@@ -946,6 +963,7 @@ async fn lists_and_imports_an_agents_sessions() {
     let Response::ThreadsImported(imported) = client
         .ok(Request::ImportAgentSessions {
             agent_id: AgentId::new("mock"),
+            account: None,
             sessions: sessions.clone(),
             archived: false,
         })
@@ -974,6 +992,7 @@ async fn lists_and_imports_an_agents_sessions() {
     let Response::ThreadsImported(again) = client
         .ok(Request::ImportAgentSessions {
             agent_id: AgentId::new("mock"),
+            account: None,
             sessions,
             archived: false,
         })
@@ -1053,6 +1072,7 @@ async fn custom_agents_are_saved_after_they_start() {
             "echo 'no such column: project_id' >&2; exit 3".into(),
         ],
         env: Default::default(),
+        env_remove: Vec::new(),
     };
     let failed = client
         .request(save(None, "Broken", &broken))
@@ -1334,6 +1354,184 @@ async fn each_account_keeps_its_own_defaults() {
     );
 }
 
+/// Each agentZ account runs the agent in a home of its own and logs in there, without the
+/// login in the server's environment unless its Environment sets one. Removing an account
+/// stops its agents before its folder goes, and its threads can't start again.
+#[tokio::test(flavor = "multi_thread")]
+async fn accounts_run_in_homes_of_their_own() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let external_login = data_dir.path().join("external-login");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        external_login.to_string_lossy().into_owned(),
+    );
+    // Stands for a key in the server's environment, which logs in the normal home.
+    command
+        .env
+        .insert("MOCK_API_KEY".into(), "from-the-server".into());
+    let Some(server) =
+        TestServer::start_with_agent(data_dir, tempfile::tempdir().expect("temp dir"), command)
+    else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let add = async |client: &mut TestClient| match client
+        .ok(Request::AddAccount(AgentId::new("mock")))
+        .await
+    {
+        Response::AccountAdded(id) => id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let work = add(&mut client).await;
+    let side = add(&mut client).await;
+    let keyed = add(&mut client).await;
+    let create = async |client: &mut TestClient, account| match client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: AgentId::new("mock"),
+            workspace: Default::default(),
+            account,
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => ConnectionId::Thread(thread_id),
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let open = async |client: &mut TestClient, account| {
+        let connection = create(client, account).await;
+        client.subscribe_thread(connection).await;
+        client
+            .wait_until(|client| {
+                let view = client.thread(connection);
+                *view.status() == ConnectionStatus::AuthRequired
+                    || !view.config_options().is_empty()
+            })
+            .await;
+        connection
+    };
+    let logged_in = |client: &TestClient, connection| {
+        *client.thread(connection).status() != ConnectionStatus::AuthRequired
+    };
+    let home = |account: AccountId| {
+        server
+            .data_dir
+            .path()
+            .join("accounts")
+            .join("mock")
+            .join(account.to_string())
+    };
+
+    let external = open(&mut client, AccountChoice::External).await;
+    assert!(logged_in(&client, external));
+    let on_work = open(&mut client, AccountChoice::Account(work)).await;
+    assert!(!logged_in(&client, on_work));
+    client
+        .ok(Request::Authenticate {
+            connection: on_work,
+            method_id: acp::AuthMethodId::new("mock-login"),
+            meta: None,
+        })
+        .await;
+    client
+        .wait_until(|client| !client.thread(on_work).config_options().is_empty())
+        .await;
+    assert!(home(work).join("login").exists());
+    assert!(!external_login.exists());
+
+    // The other account shares nothing. The agent's settings log it in, here with a terminal
+    // login, which runs without the server's key too.
+    let on_side = open(&mut client, AccountChoice::Account(side)).await;
+    assert!(!logged_in(&client, on_side));
+    let Response::LoginSessionOpened(login_session_id) = client
+        .ok(Request::OpenLoginSession {
+            agent_id: mock.clone(),
+            account: Some(side),
+        })
+        .await
+    else {
+        panic!("expected a login session");
+    };
+    let login = ConnectionId::LoginSession(login_session_id);
+    client.subscribe_thread(login).await;
+    let method_id = acp::AuthMethodId::new("mock-terminal-login");
+    client
+        .wait_until(|client| {
+            let thread = client.thread(login);
+            thread.logged_in() == Some(false)
+                && thread
+                    .auth_methods()
+                    .iter()
+                    .any(|method| *method.id() == method_id)
+        })
+        .await;
+    client
+        .ok(Request::TerminalLogin {
+            connection: login,
+            method_id,
+        })
+        .await;
+    let key = TerminalKey::Login(login);
+    client.subscribe_terminal(key.clone()).await;
+    client
+        .wait_for_screen(&key, "Press Enter to log in to the mock agent.")
+        .await;
+    client.type_into(&key, "\r").await;
+    client
+        .wait_until(|client| client.thread(login).logged_in() == Some(true))
+        .await;
+    assert!(home(side).join("login").exists());
+
+    // A key an account's Environment sets on purpose stays.
+    client
+        .ok(Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account: Some(keyed),
+            change: AgentSettingsChange::SetEnv(BTreeMap::from([(
+                "MOCK_API_KEY".to_string(),
+                "on-purpose".to_string(),
+            )])),
+        })
+        .await;
+    let on_keyed = open(&mut client, AccountChoice::Account(keyed)).await;
+    assert!(logged_in(&client, on_keyed));
+    assert!(!home(keyed).join("login").exists());
+
+    client
+        .ok(Request::RemoveAccount {
+            agent_id: mock.clone(),
+            account: side,
+        })
+        .await;
+    assert!(!home(side).exists());
+    client
+        .wait_until(|client| {
+            matches!(
+                client.thread(on_side).status(),
+                ConnectionStatus::Failed(error) if error.contains("account was removed")
+            ) && client
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ConnectionClosed(closed) if *closed == login))
+        })
+        .await;
+    assert!(home(work).join("login").exists());
+    assert!(
+        client
+            .request(Request::OpenLoginSession {
+                agent_id: mock.clone(),
+                account: Some(side),
+            })
+            .await
+            .is_err()
+    );
+}
+
 /// Codex's device-code login asks the client to open a URL (an elicitation) while
 /// `authenticate` waits. The request reaches the app through the server, and so does the
 /// answer.
@@ -1356,7 +1554,10 @@ async fn url_logins_relay_the_agents_elicitation() {
     let mut client = server.connect().await;
     client.ok(Request::SubscribeSession).await;
     let Response::LoginSessionOpened(login_session_id) = client
-        .ok(Request::OpenLoginSession(AgentId::new("mock")))
+        .ok(Request::OpenLoginSession {
+            agent_id: AgentId::new("mock"),
+            account: None,
+        })
         .await
     else {
         panic!("expected a login session");
@@ -1440,7 +1641,10 @@ async fn terminal_logins_run_on_the_server_and_restart_the_agent() {
     let mut client = server.connect().await;
     client.ok(Request::SubscribeSession).await;
     let Response::LoginSessionOpened(login_session_id) = client
-        .ok(Request::OpenLoginSession(AgentId::new("mock")))
+        .ok(Request::OpenLoginSession {
+            agent_id: AgentId::new("mock"),
+            account: None,
+        })
         .await
     else {
         panic!("expected a login session");

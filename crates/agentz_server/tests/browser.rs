@@ -43,6 +43,7 @@ fn mock_agent(login_file: &Path) -> Option<AgentCommand> {
         ]
         .into_iter()
         .collect(),
+        env_remove: Vec::new(),
     })
 }
 
@@ -115,6 +116,7 @@ async fn remote_agents_hand_their_login_pages_to_the_clients() {
                     name: "Mock".into(),
                     command,
                     info: None,
+                    accounts: None,
                 },
             )]),
             agent_control: Some(AgentControl {
@@ -147,7 +149,10 @@ async fn remote_agents_hand_their_login_pages_to_the_clients() {
         }
     });
     let Response::LoginSessionOpened(login_session_id) = client
-        .request(Request::OpenLoginSession(AgentId::new("mock")))
+        .request(Request::OpenLoginSession {
+            agent_id: AgentId::new("mock"),
+            account: None,
+        })
         .await
         .expect("open the agent")
     else {

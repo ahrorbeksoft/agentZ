@@ -34,6 +34,7 @@ fn mock_agent() -> Option<AgentCommand> {
         path: python,
         args: vec![script.to_string_lossy().into_owned()],
         env: Default::default(),
+        env_remove: Vec::new(),
     })
 }
 
@@ -101,6 +102,7 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
                     name: "Mock".into(),
                     command,
                     info: None,
+                    accounts: None,
                 },
             )]),
             agent_control: Some(AgentControl {
