@@ -1,5 +1,5 @@
 //! The project picker behind the title bar's project button, modeled on Zed's recent-projects
-//! popover: search, "All projects", the projects with their icons, and Open Folder. With other
+//! popover: search, "All projects", the projects with their icons, and Add Project. With other
 //! machines, projects are listed under their machine, and combined ones above them.
 
 use std::rc::Rc;
@@ -430,7 +430,7 @@ impl Render for ProjectSwitcher {
                     .border_t_1()
                     .border_color(border_variant)
                     .child(
-                        ButtonLike::new("open-folder")
+                        ButtonLike::new("add-project")
                             .full_width()
                             .child(
                                 h_flex()
@@ -446,7 +446,7 @@ impl Render for ProjectSwitcher {
                                                     .size(IconSize::Small)
                                                     .color(Color::Muted),
                                             )
-                                            .child(Label::new("Open Folder…")),
+                                            .child(Label::new("Add Project…")),
                                     )
                                     .child(KeyBindingHint::for_action(&OpenFolder, cx)),
                             )

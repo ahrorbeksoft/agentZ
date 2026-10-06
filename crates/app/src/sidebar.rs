@@ -1452,8 +1452,6 @@ impl Sidebar {
         let has_unsent_text = thread.unsent_text.is_some() && !is_active;
         let thread_status = store.read(cx).thread_status(thread.id);
         let icon = thread_agent_icon(&thread, cx);
-        // Which machine it runs on, just before the agent.
-        let machine_icon = Icon::new(self.machines.read(cx).machine_icon(machine, cx));
         // A terminal thread is described by where it is now, which may not be where it
         // started: that folder's project, or the folder itself outside every project.
         let folder = store.read(cx).terminal_folder(thread.id).cloned();
@@ -1471,11 +1469,11 @@ impl Sidebar {
         // the status moves next to the title.
         let shows_all_projects = machines.scope(cx) == Scope::All;
         let is_offline = !machines.is_online(machine, cx);
-        let machine_label = (machine != MachineId::Local).then(|| {
-            (
-                machines.machine_icon(machine, cx),
-                machines.label(machine, cx),
-            )
+        // Which machine it runs on, just before the agent: the only place a card names it.
+        let machine_icon = Icon::new(if is_offline {
+            IconName::Disconnected
+        } else {
+            machines.machine_icon(machine, cx)
         });
         let faint_text = cx.theme().colors().text_muted.opacity(0.4);
         let time = thread
@@ -1721,26 +1719,18 @@ impl Sidebar {
                     None => self.render_project_icon(machine, project.as_ref(), cx),
                 })
                 .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_1()
-                        .children(
-                            project
-                                .as_ref()
-                                .map(|project| project.name())
-                                .or(folder_name.clone())
-                                .map(|name| {
-                                    Label::new(name)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate()
-                                }),
-                        )
-                        .children(
-                            machine_label
-                                .map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
-                        ),
+                    h_flex().flex_1().min_w_0().children(
+                        project
+                            .as_ref()
+                            .map(|project| project.name())
+                            .or(folder_name.clone())
+                            .map(|name| {
+                                Label::new(name)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate()
+                            }),
+                    ),
                 )
                 .children(pin)
                 .child(status_slot)
@@ -1748,16 +1738,12 @@ impl Sidebar {
             let title_line = h_flex().mt_1().min_w_0().child(title_element);
             (Some(project_line), title_line)
         } else {
-            // A project combined across machines keeps telling its threads apart.
             let title_line = h_flex()
                 .relative()
                 .min_w_0()
                 .gap_1p5()
                 .children(unsent_marker)
                 .child(title_element)
-                .children(
-                    machine_label.map(|(icon, label)| render_machine_tag(icon, label, is_offline)),
-                )
                 .children(pin)
                 .child(status_slot)
                 .children(hover_buttons);

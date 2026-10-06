@@ -1476,7 +1476,7 @@ impl Shell {
         self.switcher_handle.toggle(window, cx);
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let tabs_border = colors.border;
         let machines = self.machines.read(cx);
@@ -1555,7 +1555,14 @@ impl Shell {
             .h(TITLE_BAR_HEIGHT)
             .flex_none()
             .w_full()
-            .pl(TRAFFIC_LIGHTS_WIDTH)
+            // Full screen hides the traffic lights, so nothing needs their room (as in Zed).
+            .map(|title_bar| {
+                if window.is_fullscreen() {
+                    title_bar.pl_2()
+                } else {
+                    title_bar.pl(TRAFFIC_LIGHTS_WIDTH)
+                }
+            })
             .pr_3()
             .gap_2()
             .border_b_1()
@@ -1584,6 +1591,7 @@ impl Shell {
             .child(
                 // Keeps a press on the button from starting a window drag.
                 div()
+                    .debug_selector(|| "toggle-sidebar".into())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         IconButton::new(
@@ -1834,7 +1842,7 @@ fn render_waiting_badge(count: usize, status: ThreadStatus, cx: &App) -> Div {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().colors().background;
         let text_color = cx.theme().colors().text;
         let main_background = cx.theme().colors().editor_background;
@@ -1890,7 +1898,7 @@ impl Render for Shell {
             .text_color(text_color)
             .font_ui(cx)
             .text_ui(cx)
-            .child(self.render_title_bar(cx))
+            .child(self.render_title_bar(window, cx))
             .when(shows_workspaces, |shell| {
                 shell.child(div().flex_1().min_h_0().child(self.spaces_view.clone()))
             })
@@ -2173,6 +2181,35 @@ mod modal_tests {
         cx.simulate_click(point(px(20.), px(500.)), Modifiers::none());
         cx.run_until_parked();
         assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
+    }
+
+    #[gpui::test]
+    fn full_screen_moves_the_title_bar_left(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+            crate::sidebar::init(cx);
+        });
+        let (_shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        cx.run_until_parked();
+        let toggle_left = |cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds("toggle-sidebar")
+                .expect("the sidebar toggle is shown")
+                .left()
+        };
+        // Past the traffic lights.
+        assert_eq!(toggle_left(cx), TRAFFIC_LIGHTS_WIDTH);
+        cx.update(|window, _| window.toggle_fullscreen());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(toggle_left(cx) < px(20.));
     }
 
     #[gpui::test]

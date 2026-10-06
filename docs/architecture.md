@@ -144,7 +144,9 @@ Each entry: what it does, where it lives, and where it comes from.
 
 ### Window, sidebar and settings
 
-- **Window** (`shell.rs`): title bar with the sidebar toggle (Cmd-B), project switcher,
+- **Window** (`shell.rs`): title bar (past the traffic lights, or at the left edge in full
+  screen as in Zed) with the sidebar toggle (Cmd-B), project switcher (its footer is Add
+  Project…),
   connection status, and Agents | Workspaces tabs, the view not shown counting its agents
   waiting for an approval or an answer beside its side, in the most urgent one's color; the
   sidebar; the open thread or settings; the
@@ -179,7 +181,8 @@ Each entry: what it does, where it lives, and where it comes from.
   (`Server::refresh_git_heads`, `repositories::read_git_head`), and sends them with the
   projects (`ProjectStore::git_head`), so remote machines' cards show theirs too. Favicons are
   read from this Mac's disk only.
-- **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons, the thread's own
+- **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons (the machine's only
+  mark on a card, Disconnected while it's offline; draft rows name it), the thread's own
   branch with a worktree or pasture marker, attention state, details popover (a custom anchored
   element, since GPUI tooltips follow the cursor), rename, delete, archive with an Archived
   shelf, title search, context menu. Automatic titles (the first prompt, the agent, a shell's
