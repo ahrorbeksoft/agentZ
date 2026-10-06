@@ -104,7 +104,7 @@ enum AgentsPage {
     /// Zed's ACP Registry page, to install more agents.
     Registry,
     /// One agent's settings, with the connection made to log in or out.
-    Agent(AccountPanel),
+    Agent(AgentPanel),
     /// Zed's Add Custom Agent form, which also changes one.
     CustomAgent(CustomAgentForm),
 }
@@ -1858,7 +1858,7 @@ impl SettingsPage {
     /// One agent's page: what it is and whether it's logged in, over tabs for its account, the
     /// defaults new threads start with, and its environment.
     fn render_agent_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let Some(panel) = self.account() else {
+        let Some(panel) = self.agent_panel() else {
             return Vec::new();
         };
         let listing = self.registry(cx).read(cx).agent(&panel.agent_id).cloned();
@@ -1885,7 +1885,7 @@ impl SettingsPage {
         listing: Option<&AgentListing>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(panel) = self.account() else {
+        let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
         let colors = cx.theme().colors().clone();
@@ -2083,14 +2083,14 @@ impl SettingsPage {
     }
 
     /// The agent whose page is open.
-    fn account(&self) -> Option<&AccountPanel> {
+    fn agent_panel(&self) -> Option<&AgentPanel> {
         match &self.agents_page {
             AgentsPage::Agent(panel) => Some(panel),
             _ => None,
         }
     }
 
-    fn account_mut(&mut self) -> Option<&mut AccountPanel> {
+    fn agent_panel_mut(&mut self) -> Option<&mut AgentPanel> {
         match &mut self.agents_page {
             AgentsPage::Agent(panel) => Some(panel),
             _ => None,
@@ -2126,15 +2126,15 @@ impl SettingsPage {
         let client = self.agents_client(cx);
         let agent_settings = client.read(cx).agent_settings(&id.0);
         let name = name.clone();
-        let account_agent_id = id.clone();
+        let login_agent_id = id.clone();
         let connection =
-            cx.new(|cx| AgentThread::open_account(client.clone(), account_agent_id, name, cx));
+            cx.new(|cx| AgentThread::open_login_session(client.clone(), login_agent_id, name, cx));
         let login = cx
             .new(|cx| AgentLogin::new(connection.clone(), LoginLayout::Rows, Some(id.clone()), cx));
         // The server remembers the options and modes the agent offers, and logins made in
         // the panel.
         let subscription = cx.observe(&connection, |this, connection, cx| {
-            if let Some(panel) = this.account_mut() {
+            if let Some(panel) = this.agent_panel_mut() {
                 sync_elicitation_cards(&mut panel.elicitation_cards, &connection, cx);
                 let thread = connection.read(cx);
                 let was_authenticating =
@@ -2154,7 +2154,7 @@ impl SettingsPage {
             .iter()
             .map(|(key, value)| self.new_env_row(key, value, cx))
             .collect();
-        let panel = AccountPanel {
+        let panel = AgentPanel {
             agent_id: id.clone(),
             tab: AgentTab::Account,
             connection,
@@ -2189,7 +2189,7 @@ impl SettingsPage {
 
     /// Writes the panel's variables to the agent's settings; rows without a name are skipped.
     fn save_env(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.account() else {
+        let Some(panel) = self.agent_panel() else {
             return;
         };
         let env: BTreeMap<String, String> = panel
@@ -2501,7 +2501,7 @@ impl SettingsPage {
     /// changes these too.
     fn render_agent_defaults(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         const TITLE: &str = "Defaults for New Threads";
-        let Some(panel) = self.account() else {
+        let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
         let agent_id = panel.agent_id.0.to_string();
@@ -2663,7 +2663,7 @@ impl SettingsPage {
 
     /// The variables the agent starts with, one row each.
     fn render_agent_env(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(panel) = self.account() else {
+        let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
         let colors = cx.theme().colors().clone();
@@ -2698,7 +2698,7 @@ impl SettingsPage {
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Remove Variable"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(panel) = this.account_mut()
+                                if let Some(panel) = this.agent_panel_mut()
                                     && index < panel.env_rows.len()
                                 {
                                     panel.env_rows.remove(index);
@@ -2730,7 +2730,7 @@ impl SettingsPage {
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 let row = this.new_env_row("", "", cx);
-                if let Some(panel) = this.account_mut() {
+                if let Some(panel) = this.agent_panel_mut() {
                     panel.env_rows.push(row);
                 }
                 cx.notify();
@@ -2758,7 +2758,7 @@ impl SettingsPage {
     /// that it isn't, with a row for each way it offers to log in; or the login in progress.
     /// The page a login asks to open shows in the card, other requests for input under it.
     fn render_account_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(account) = self.account() else {
+        let Some(account) = self.agent_panel() else {
             return div().into_any_element();
         };
         let colors = cx.theme().colors().clone();
@@ -2789,7 +2789,7 @@ impl SettingsPage {
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text("Check Again"))
             .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(account) = this.account_mut() {
+                if let Some(account) = this.agent_panel_mut() {
                     account
                         .connection
                         .update(cx, |connection, cx| connection.check_login(cx));
@@ -2954,7 +2954,7 @@ impl SettingsPage {
     }
 
     fn set_changing_account(&mut self, changing_account: bool, cx: &mut Context<Self>) {
-        if let Some(account) = self.account_mut() {
+        if let Some(account) = self.agent_panel_mut() {
             account.changing_account = changing_account;
         }
         cx.notify();
@@ -2962,7 +2962,7 @@ impl SettingsPage {
 
     /// Starts the agent again for its page, on the tab that was open.
     fn reopen_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(account) = self.account() else {
+        let Some(account) = self.agent_panel() else {
             return;
         };
         let id = account.agent_id.clone();
@@ -2975,7 +2975,7 @@ impl SettingsPage {
     /// Shows one of the agent page's tabs. Threads lists the agent's sessions the first time,
     /// and again after the agent couldn't list them.
     fn select_agent_tab(&mut self, tab: AgentTab, cx: &mut Context<Self>) {
-        let Some(panel) = self.account_mut() else {
+        let Some(panel) = self.agent_panel_mut() else {
             return;
         };
         panel.tab = tab;
@@ -2991,7 +2991,7 @@ impl SettingsPage {
     }
 
     fn list_agent_sessions(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.account() else {
+        let Some(panel) = self.agent_panel() else {
             return;
         };
         let agent_id = panel.agent_id.clone();
@@ -3000,7 +3000,7 @@ impl SettingsPage {
         let is_outdated = client.read(cx).connection().is_some()
             && !client.read(cx).has_capability(CAPABILITY_IMPORT_SESSIONS);
         if is_outdated {
-            if let Some(panel) = self.account_mut() {
+            if let Some(panel) = self.agent_panel_mut() {
                 panel.sessions = Some(SessionList::Failed(
                     "This machine's agentz-server can't list threads. Update it to import them."
                         .into(),
@@ -3018,7 +3018,7 @@ impl SettingsPage {
             let listing = listing.await;
             this.update(cx, |this, cx| {
                 let Some(panel) = this
-                    .account_mut()
+                    .agent_panel_mut()
                     .filter(|panel| panel.agent_id == agent_id)
                 else {
                     return;
@@ -3032,7 +3032,7 @@ impl SettingsPage {
             })
             .log_err();
         });
-        if let Some(panel) = self.account_mut() {
+        if let Some(panel) = self.agent_panel_mut() {
             panel.sessions = Some(SessionList::Listing { _task: task });
             panel.import_error = None;
         }
@@ -3041,7 +3041,7 @@ impl SettingsPage {
 
     /// Adds an archived thread for each of the sessions.
     fn import_agent_sessions(&mut self, sessions: Vec<AgentSession>, cx: &mut Context<Self>) {
-        let Some(panel) = self.account_mut() else {
+        let Some(panel) = self.agent_panel_mut() else {
             return;
         };
         let agent_id = panel.agent_id.clone();
@@ -3063,7 +3063,7 @@ impl SettingsPage {
             let imported = import.await;
             this.update(cx, |this, cx| {
                 let Some(panel) = this
-                    .account_mut()
+                    .agent_panel_mut()
                     .filter(|panel| panel.agent_id == agent_id)
                 else {
                     return;
@@ -3085,7 +3085,7 @@ impl SettingsPage {
     /// The agent's sessions on the Threads tab: those in the chosen project, newest first,
     /// each with Import, or Open once agentZ has it.
     fn render_agent_threads(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(panel) = self.account() else {
+        let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
         let status_colors = cx.theme().status().clone();
@@ -3297,7 +3297,7 @@ impl SettingsPage {
                     None,
                     move |_, cx| {
                         page.update(cx, |page, cx| {
-                            if let Some(panel) = page.account_mut() {
+                            if let Some(panel) = page.agent_panel_mut() {
                                 panel.sessions_project = Some(id);
                                 panel.sessions_shown = SESSIONS_INITIAL_COUNT;
                             }
@@ -3316,7 +3316,7 @@ impl SettingsPage {
         };
         let import_count = to_import.len();
         let is_importing = self
-            .account()
+            .agent_panel()
             .is_some_and(|panel| !panel.importing.is_empty());
         h_flex()
             .gap_3()
@@ -3488,7 +3488,7 @@ impl SettingsPage {
 
     /// Asks first, as t3code does: logging out affects every thread with the agent.
     fn confirm_logout(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(account) = self.account() else {
+        let Some(account) = self.agent_panel() else {
             return;
         };
         let agent_name = account.connection.read(cx).agent_name().clone();
@@ -3497,7 +3497,7 @@ impl SettingsPage {
             &agent_name,
             move |_, cx| {
                 page.update(cx, |page, cx| {
-                    if let Some(account) = page.account_mut() {
+                    if let Some(account) = page.agent_panel_mut() {
                         account.changing_account = false;
                         account
                             .connection
@@ -3542,7 +3542,7 @@ impl SettingsPage {
                     }
                 });
                 page.update(cx, |page, cx| {
-                    if page.account().is_some_and(|panel| panel.agent_id == id) {
+                    if page.agent_panel().is_some_and(|panel| panel.agent_id == id) {
                         page.show_agents_page(AgentsPage::Installed, window, cx);
                     }
                 })
@@ -4231,7 +4231,7 @@ impl AccountState {
     }
 }
 
-struct AccountPanel {
+struct AgentPanel {
     agent_id: AgentId,
     tab: AgentTab,
     /// A session-less connection to the agent, alive only while the panel is open.
@@ -4668,7 +4668,7 @@ fn render_show_more_sessions(hidden: usize, cx: &mut Context<SettingsPage>) -> A
                 .color(Color::Muted),
         )
         .on_click(cx.listener(|this, _, _, cx| {
-            if let Some(panel) = this.account_mut() {
+            if let Some(panel) = this.agent_panel_mut() {
                 panel.sessions_shown += SESSIONS_PAGE_COUNT;
             }
             cx.notify();
@@ -4834,7 +4834,7 @@ mod tests {
         cx: &mut gpui::VisualTestContext,
     ) -> Option<String> {
         page.read_with(cx, |page, _| {
-            page.account().map(|panel| panel.agent_id.0.to_string())
+            page.agent_panel().map(|panel| panel.agent_id.0.to_string())
         })
     }
 
@@ -5308,10 +5308,12 @@ mod tests {
         cx.run_until_parked();
         // Opening the tab lists the sessions, which fails without a server.
         let sessions = |page: &Entity<SettingsPage>, cx: &mut gpui::VisualTestContext| {
-            page.read_with(cx, |page, _| match page.account()?.sessions.as_ref()? {
-                SessionList::Listing { .. } => Some("listing"),
-                SessionList::Listed(_) => Some("listed"),
-                SessionList::Failed(_) => Some("failed"),
+            page.read_with(cx, |page, _| {
+                match page.agent_panel()?.sessions.as_ref()? {
+                    SessionList::Listing { .. } => Some("listing"),
+                    SessionList::Listed(_) => Some("listed"),
+                    SessionList::Failed(_) => Some("failed"),
+                }
             })
         };
         assert_eq!(sessions(&page, cx), Some("failed"));
@@ -5323,7 +5325,7 @@ mod tests {
             .collect();
         listed.push(agent_session("elsewhere", None, 0));
         page.update(cx, |page, cx| {
-            if let Some(panel) = page.account_mut() {
+            if let Some(panel) = page.agent_panel_mut() {
                 panel.sessions = Some(SessionList::Listed(AgentSessions::Listed(listed)));
             }
             cx.notify();
@@ -5368,7 +5370,8 @@ mod tests {
         cx.simulate_click(import.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let import_error = page.read_with(cx, |page, _| {
-            page.account().and_then(|panel| panel.import_error.clone())
+            page.agent_panel()
+                .and_then(|panel| panel.import_error.clone())
         });
         assert!(
             import_error.is_some_and(|error| error.contains("not connected")),
@@ -5378,7 +5381,7 @@ mod tests {
 
         // Another project shows its own sessions.
         page.update(cx, |page, cx| {
-            if let Some(panel) = page.account_mut() {
+            if let Some(panel) = page.agent_panel_mut() {
                 panel.sessions_project = Some(empty);
             }
             cx.notify();

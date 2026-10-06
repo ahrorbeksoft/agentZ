@@ -47,7 +47,7 @@ impl TerminalKey {
             Self::DrawerTerminal { thread_id, .. } => Some(*thread_id),
             Self::Agent { thread_id, .. } => Some(*thread_id),
             Self::Login(crate::ConnectionId::Thread(thread_id)) => Some(*thread_id),
-            Self::Pane(_) | Self::Login(crate::ConnectionId::Account(_)) => None,
+            Self::Pane(_) | Self::Login(crate::ConnectionId::LoginSession(_)) => None,
         }
     }
 }

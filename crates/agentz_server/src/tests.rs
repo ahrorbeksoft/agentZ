@@ -802,18 +802,19 @@ async fn threads_waiting_for_input_are_marked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn accounts_log_in_and_close_with_their_client() {
+async fn login_sessions_log_in_and_close_with_their_client() {
     let Some(server) = TestServer::start() else {
         return;
     };
     let mut client = server.connect().await;
     client.ok(Request::SubscribeSession).await;
-    let Response::AccountOpened(account_id) =
-        client.ok(Request::OpenAccount(AgentId::new("mock"))).await
+    let Response::LoginSessionOpened(login_session_id) = client
+        .ok(Request::OpenLoginSession(AgentId::new("mock")))
+        .await
     else {
-        panic!("expected an account");
+        panic!("expected a login session");
     };
-    let connection = ConnectionId::Account(account_id);
+    let connection = ConnectionId::LoginSession(login_session_id);
     client.subscribe_thread(connection).await;
     client
         .wait_until(|client| !client.thread(connection).auth_methods().is_empty())
@@ -1111,12 +1112,13 @@ async fn url_logins_relay_the_agents_elicitation() {
     };
     let mut client = server.connect().await;
     client.ok(Request::SubscribeSession).await;
-    let Response::AccountOpened(account_id) =
-        client.ok(Request::OpenAccount(AgentId::new("mock"))).await
+    let Response::LoginSessionOpened(login_session_id) = client
+        .ok(Request::OpenLoginSession(AgentId::new("mock")))
+        .await
     else {
-        panic!("expected an account");
+        panic!("expected a login session");
     };
-    let connection = ConnectionId::Account(account_id);
+    let connection = ConnectionId::LoginSession(login_session_id);
     client.subscribe_thread(connection).await;
     // The agent's words when its session asked for a login.
     client
@@ -1194,12 +1196,13 @@ async fn terminal_logins_run_on_the_server_and_restart_the_agent() {
     };
     let mut client = server.connect().await;
     client.ok(Request::SubscribeSession).await;
-    let Response::AccountOpened(account_id) =
-        client.ok(Request::OpenAccount(AgentId::new("mock"))).await
+    let Response::LoginSessionOpened(login_session_id) = client
+        .ok(Request::OpenLoginSession(AgentId::new("mock")))
+        .await
     else {
-        panic!("expected an account");
+        panic!("expected a login session");
     };
-    let connection = ConnectionId::Account(account_id);
+    let connection = ConnectionId::LoginSession(login_session_id);
     client.subscribe_thread(connection).await;
     let method_id = acp::AuthMethodId::new("mock-terminal-login");
     // The agent reports its account apart from answering `initialize`, so it can say it's
@@ -1236,7 +1239,7 @@ async fn terminal_logins_run_on_the_server_and_restart_the_agent() {
     assert_eq!(
         client
             .thread(connection)
-            .account_notice()
+            .login_notice()
             .map(|notice| notice.as_ref()),
         Some("Logged in.")
     );

@@ -15,7 +15,7 @@ use crate::server_client::ServerClient;
 pub struct AgentThread {
     /// The server of the thread's machine.
     client: Entity<ServerClient>,
-    /// `None` until the server has opened an account connection.
+    /// `None` until the server has opened a login session.
     connection: Option<ConnectionId>,
     view: ThreadView,
     /// A revision for each entry, raised when it changes, so views redo only what changed.
@@ -43,8 +43,8 @@ impl Drop for AgentThread {
         };
         // Sent now; nobody waits for the answers.
         drop(server.request(Request::UnsubscribeThread(connection)));
-        if let ConnectionId::Account(account_id) = connection {
-            drop(server.request(Request::CloseAccount(account_id)));
+        if let ConnectionId::LoginSession(login_session_id) = connection {
+            drop(server.request(Request::CloseLoginSession(login_session_id)));
         }
     }
 }
@@ -115,22 +115,24 @@ impl AgentThread {
     }
 
     /// Starts the agent only to log in or out. It stops when this is dropped.
-    pub fn open_account(
+    pub fn open_login_session(
         client: Entity<ServerClient>,
         agent_id: AgentId,
         agent_name: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
-        let response = client.read(cx).request(Request::OpenAccount(agent_id));
+        let response = client.read(cx).request(Request::OpenLoginSession(agent_id));
         let mut this = Self::new(client, agent_name);
         this._subscribe = cx.spawn(async move |this, cx| {
             let result = match response.await {
-                Ok(Response::AccountOpened(account_id)) => Ok(account_id),
+                Ok(Response::LoginSessionOpened(login_session_id)) => Ok(login_session_id),
                 Ok(response) => Err(anyhow::anyhow!("unexpected response: {response:?}")),
                 Err(error) => Err(error),
             };
             this.update(cx, |this, cx| match result {
-                Ok(account_id) => this.attach(ConnectionId::Account(account_id), cx),
+                Ok(login_session_id) => {
+                    this.attach(ConnectionId::LoginSession(login_session_id), cx)
+                }
                 Err(error) => this.fail(format!("{error:#}"), cx),
             })
             .ok();
@@ -175,7 +177,7 @@ impl AgentThread {
         });
     }
 
-    /// The server is back. Threads pick up where they are; account connections ended with the
+    /// The server is back. Threads pick up where they are; login sessions ended with the
     /// old connection.
     pub fn client(&self) -> &Entity<ServerClient> {
         &self.client
@@ -184,7 +186,7 @@ impl AgentThread {
     pub(crate) fn reconnected(&mut self, cx: &mut Context<Self>) {
         match self.connection {
             Some(ConnectionId::Thread(_)) => self.subscribe(cx),
-            Some(ConnectionId::Account(_)) => self.closed(cx),
+            Some(ConnectionId::LoginSession(_)) => self.closed(cx),
             None => {}
         }
     }

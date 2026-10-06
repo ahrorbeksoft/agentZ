@@ -893,8 +893,8 @@ impl Server {
             .keys()
             .filter(|key| match key {
                 TerminalKey::Pane(pane) => self.spaces.pane(*pane).is_none(),
-                TerminalKey::Login(ConnectionId::Account(account_id)) => {
-                    !self.accounts.contains_key(account_id)
+                TerminalKey::Login(ConnectionId::LoginSession(login_session_id)) => {
+                    !self.login_sessions.contains_key(login_session_id)
                 }
                 key => key
                     .thread_id()
@@ -976,10 +976,10 @@ impl Server {
     ) -> Result<()> {
         let thread = match connection {
             ConnectionId::Thread(thread_id) => self.threads.get(&thread_id),
-            ConnectionId::Account(account_id) => self
-                .accounts
-                .get(&account_id)
-                .map(|account| &account.thread),
+            ConnectionId::LoginSession(login_session_id) => self
+                .login_sessions
+                .get(&login_session_id)
+                .map(|login_session| &login_session.thread),
         }
         .context("the agent isn't running")?;
         let command = thread

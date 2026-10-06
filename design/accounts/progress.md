@@ -22,7 +22,7 @@ Notes for whoever continues:
 
 | Order | § | Item | Status |
 |---|---|---|---|
-| 1 | | Rename `Account` and `ConnectionId::Account` to `LoginSession` | |
+| 1 | | Rename `Account` and `ConnectionId::Account` to `LoginSession` | done |
 | 2 | | Accounts data: `accounts.json`, `AccountId`, a thread's account, the External account from the normal home's login check | |
 | 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | |
 | 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | |

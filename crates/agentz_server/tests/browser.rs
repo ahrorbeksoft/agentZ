@@ -146,14 +146,14 @@ async fn remote_agents_hand_their_login_pages_to_the_clients() {
             event_sender.unbounded_send(event).ok();
         }
     });
-    let Response::AccountOpened(account_id) = client
-        .request(Request::OpenAccount(AgentId::new("mock")))
+    let Response::LoginSessionOpened(login_session_id) = client
+        .request(Request::OpenLoginSession(AgentId::new("mock")))
         .await
         .expect("open the agent")
     else {
-        panic!("expected an account");
+        panic!("expected a login session");
     };
-    let connection = ConnectionId::Account(account_id);
+    let connection = ConnectionId::LoginSession(login_session_id);
     let Response::Thread(mut view) = client
         .request(Request::SubscribeThread(connection))
         .await
@@ -185,7 +185,7 @@ async fn remote_agents_hand_their_login_pages_to_the_clients() {
         .arg("https://example.com/docs")
         .env("PATH", &path)
         .env("AGENTZ_SOCKET", &socket)
-        .env("AGENTZ_CONNECTION", format!("account:{account_id}"))
+        .env("AGENTZ_CONNECTION", format!("login:{login_session_id}"))
         .status()
         .await
         .expect("run xdg-open");

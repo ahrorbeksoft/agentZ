@@ -85,7 +85,7 @@ pub fn agent_env(
 pub fn connection_to_string(connection: ConnectionId) -> String {
     match connection {
         ConnectionId::Thread(thread_id) => format!("thread:{}", thread_id.0),
-        ConnectionId::Account(account_id) => format!("account:{account_id}"),
+        ConnectionId::LoginSession(login_session_id) => format!("login:{login_session_id}"),
     }
 }
 
@@ -94,7 +94,7 @@ pub fn connection_from_string(text: &str) -> Option<ConnectionId> {
     let id = id.parse().ok()?;
     match kind {
         "thread" => Some(ConnectionId::Thread(projects::ThreadId(id))),
-        "account" => Some(ConnectionId::Account(id)),
+        "login" => Some(ConnectionId::LoginSession(id)),
         _ => None,
     }
 }
@@ -134,7 +134,7 @@ mod tests {
     fn connections_round_trip() {
         for connection in [
             ConnectionId::Thread(projects::ThreadId(12)),
-            ConnectionId::Account(3),
+            ConnectionId::LoginSession(3),
         ] {
             assert_eq!(
                 connection_from_string(&connection_to_string(connection)),

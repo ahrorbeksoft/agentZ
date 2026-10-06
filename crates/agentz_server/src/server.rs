@@ -113,7 +113,7 @@ struct Client {
 }
 
 /// An agent started only to log in or out, from its settings.
-struct Account {
+struct LoginSession {
     agent_id: AgentId,
     owner: ClientId,
     thread: AgentThread,
@@ -163,8 +163,8 @@ pub(crate) struct Server {
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     threads: HashMap<ThreadId, AgentThread>,
-    accounts: HashMap<u64, Account>,
-    next_account_id: u64,
+    login_sessions: HashMap<u64, LoginSession>,
+    next_login_session_id: u64,
     terminals: Terminals,
     spaces: SpaceStore,
     /// The kind of machine this is, as detected and as chosen.
@@ -283,8 +283,8 @@ impl Server {
             registry,
             agent_settings,
             threads: HashMap::default(),
-            accounts: HashMap::default(),
-            next_account_id: 1,
+            login_sessions: HashMap::default(),
+            next_login_session_id: 1,
             terminals: Terminals::default(),
             spaces_revision_sent: spaces.revision(),
             spaces,
@@ -543,8 +543,9 @@ impl Server {
             Input::Disconnected(client) => {
                 self.clients.remove(&client);
                 self.relays.client_gone(client);
-                // Nobody is left to see an account panel's agent.
-                self.accounts.retain(|_, account| account.owner != client);
+                // Nobody is left to see these login sessions.
+                self.login_sessions
+                    .retain(|_, login_session| login_session.owner != client);
                 self.sweep_drafts();
             }
             Input::Registry(message) => {
@@ -561,12 +562,12 @@ impl Server {
             Input::Thread(connection, message) => {
                 let thread = match connection {
                     ConnectionId::Thread(id) => self.threads.get_mut(&id),
-                    ConnectionId::Account(id) => self
-                        .accounts
+                    ConnectionId::LoginSession(id) => self
+                        .login_sessions
                         .get_mut(&id)
-                        .map(|account| &mut account.thread),
+                        .map(|login_session| &mut login_session.thread),
                 };
-                // Otherwise the thread was deleted or the account closed.
+                // Otherwise the thread was deleted or the login session closed.
                 if let Some(thread) = thread {
                     thread.handle(message);
                     self.thread_changed(connection);
@@ -811,7 +812,9 @@ impl Server {
                 // Only a connection that's running: this mustn't start a thread's agent.
                 let runs = match connection {
                     ConnectionId::Thread(thread_id) => self.threads.contains_key(&thread_id),
-                    ConnectionId::Account(account_id) => self.accounts.contains_key(&account_id),
+                    ConnectionId::LoginSession(login_session_id) => {
+                        self.login_sessions.contains_key(&login_session_id)
+                    }
                 };
                 if !runs {
                     return Err(anyhow!("the agent isn't running"));
@@ -843,35 +846,35 @@ impl Server {
                 Ok(Response::Ok)
             }
 
-            Request::OpenAccount(agent_id) => {
+            Request::OpenLoginSession(agent_id) => {
                 self.client(client)?;
-                let account_id = self.next_account_id;
-                self.next_account_id += 1;
+                let login_session_id = self.next_login_session_id;
+                self.next_login_session_id += 1;
                 let command = self.agent_command(&agent_id, false);
-                let command =
-                    self.with_browser_programs(command, ConnectionId::Account(account_id));
-                let (thread, inbox) = AgentThread::start_for_account(
+                let command = self
+                    .with_browser_programs(command, ConnectionId::LoginSession(login_session_id));
+                let (thread, inbox) = AgentThread::start_for_login_session(
                     self.runtime.clone(),
                     self.agent_name(&agent_id),
                     command,
                 );
-                self.accounts.insert(
-                    account_id,
-                    Account {
+                self.login_sessions.insert(
+                    login_session_id,
+                    LoginSession {
                         agent_id,
                         owner: client,
                         thread,
                     },
                 );
-                let connection = ConnectionId::Account(account_id);
+                let connection = ConnectionId::LoginSession(login_session_id);
                 self.forward(inbox, move |message| Input::Thread(connection, message));
                 self.thread_changed(connection);
-                Ok(Response::AccountOpened(account_id))
+                Ok(Response::LoginSessionOpened(login_session_id))
             }
-            Request::CloseAccount(account_id) => {
-                self.accounts
-                    .remove(&account_id)
-                    .context("no such account")?;
+            Request::CloseLoginSession(login_session_id) => {
+                self.login_sessions
+                    .remove(&login_session_id)
+                    .context("no such login session")?;
                 Ok(Response::Ok)
             }
 
@@ -1205,11 +1208,11 @@ impl Server {
                 }
                 self.threads.get_mut(&thread_id).context("no such thread")?
             }
-            ConnectionId::Account(account_id) => {
+            ConnectionId::LoginSession(login_session_id) => {
                 &mut self
-                    .accounts
-                    .get_mut(&account_id)
-                    .context("no such account")?
+                    .login_sessions
+                    .get_mut(&login_session_id)
+                    .context("no such login session")?
                     .thread
             }
         };
@@ -1442,7 +1445,7 @@ impl Server {
             .flat_map(|client| client.threads.keys())
             .filter_map(|connection| match connection {
                 ConnectionId::Thread(thread_id) => Some(*thread_id),
-                ConnectionId::Account(_) => None,
+                ConnectionId::LoginSession(_) => None,
             })
             .collect()
     }
@@ -1654,10 +1657,15 @@ impl Server {
                     .map(AgentId::new);
                 (self.threads.get_mut(&thread_id), agent_id)
             }
-            ConnectionId::Account(account_id) => match self.accounts.get_mut(&account_id) {
-                Some(account) => (Some(&mut account.thread), Some(account.agent_id.clone())),
-                None => (None, None),
-            },
+            ConnectionId::LoginSession(login_session_id) => {
+                match self.login_sessions.get_mut(&login_session_id) {
+                    Some(login_session) => (
+                        Some(&mut login_session.thread),
+                        Some(login_session.agent_id.clone()),
+                    ),
+                    None => (None, None),
+                }
+            }
         };
         let Some(thread) = thread else {
             return;
@@ -1735,7 +1743,7 @@ impl Server {
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffDropped) => {
                     continuations::remove(&self.data_dir, thread_id).log_err();
                 }
-                (ConnectionId::Account(_), _) => {}
+                (ConnectionId::LoginSession(_), _) => {}
             }
         }
         #[cfg(unix)]
@@ -1791,12 +1799,14 @@ impl Server {
                 .set_thread_awaiting_input(*thread_id, thread.is_awaiting_input());
         }
         let projects = &self.projects;
-        let accounts = &self.accounts;
+        let login_sessions = &self.login_sessions;
         for client in self.clients.values_mut() {
             client.threads.retain(|connection, _| {
                 let is_live = match connection {
                     ConnectionId::Thread(thread_id) => projects.thread(*thread_id).is_some(),
-                    ConnectionId::Account(account_id) => accounts.contains_key(account_id),
+                    ConnectionId::LoginSession(login_session_id) => {
+                        login_sessions.contains_key(login_session_id)
+                    }
                 };
                 if !is_live {
                     send_to(
@@ -1839,18 +1849,18 @@ impl Server {
                     .threads
                     .get_mut(&thread_id)
                     .and_then(AgentThread::take_entries_changed_from),
-                ConnectionId::Account(account_id) => self
-                    .accounts
-                    .get_mut(&account_id)
-                    .and_then(|account| account.thread.take_entries_changed_from()),
+                ConnectionId::LoginSession(login_session_id) => self
+                    .login_sessions
+                    .get_mut(&login_session_id)
+                    .and_then(|login_session| login_session.thread.take_entries_changed_from()),
             }
             .unwrap_or(usize::MAX);
             let view = match connection {
                 ConnectionId::Thread(thread_id) => self.threads.get(&thread_id),
-                ConnectionId::Account(account_id) => self
-                    .accounts
-                    .get(&account_id)
-                    .map(|account| &account.thread),
+                ConnectionId::LoginSession(login_session_id) => self
+                    .login_sessions
+                    .get(&login_session_id)
+                    .map(|login_session| &login_session.thread),
             };
             let Some(view) = view else {
                 continue;

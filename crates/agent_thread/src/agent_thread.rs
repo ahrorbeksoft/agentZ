@@ -417,7 +417,7 @@ impl AgentThread {
 
     /// Starts the agent only to log in or out of it, as from its settings. No session is opened,
     /// so the agent starts in a scratch directory.
-    pub fn start_for_account(
+    pub fn start_for_login_session(
         runtime: tokio::runtime::Handle,
         agent_name: SharedString,
         command: CommandFuture,
@@ -649,7 +649,7 @@ impl AgentThread {
                 self.view.state.supports_steering = connected.supports_steering;
                 self.view.state.auth_methods = connected.auth_methods;
                 self.view.state.agent_info = connected.agent_info;
-                // An account connection opens an empty session too: it is how the login
+                // A login session opens an empty session too: it is how the login
                 // status (and the agent's settings) can be learned over ACP.
                 self.open_session();
             }
@@ -721,7 +721,7 @@ impl AgentThread {
                         }
                         self.view.state.auth_description = None;
                         if !self.opens_session {
-                            self.view.state.account_notice = Some("Logged in.".into());
+                            self.view.state.login_notice = Some("Logged in.".into());
                             self.session = None;
                         }
                         if self.session.is_some() {
@@ -765,7 +765,7 @@ impl AgentThread {
                     if self.opens_session {
                         self.view.state.status = ConnectionStatus::AuthRequired;
                     } else {
-                        self.view.state.account_notice = Some("Logged out.".into());
+                        self.view.state.login_notice = Some("Logged out.".into());
                         self.drop_session();
                     }
                 }
@@ -1216,7 +1216,7 @@ impl AgentThread {
         }
         self.view.state.status = ConnectionStatus::AuthRequired;
         self.view.state.auth_error = None;
-        self.view.state.account_notice = None;
+        self.view.state.login_notice = None;
     }
 
     /// Logs out of the agent. A thread then asks to log in again, as in Zed.
@@ -1230,7 +1230,7 @@ impl AgentThread {
         let request = connection
             .send_request(acp::LogoutRequest::new())
             .block_task();
-        self.view.state.account_notice = None;
+        self.view.state.login_notice = None;
         self.spawn(async move { MessageKind::LoggedOut(request.await.map(|_| ())) });
     }
 
@@ -1241,7 +1241,7 @@ impl AgentThread {
             return;
         }
         self.drop_session();
-        self.view.state.account_notice = None;
+        self.view.state.login_notice = None;
         self.open_session();
     }
 
@@ -1383,7 +1383,7 @@ impl AgentThread {
         let request = connection
             .send_request(acp::AuthenticateRequest::new(method_id.clone()).meta(meta))
             .block_task();
-        self.view.state.account_notice = None;
+        self.view.state.login_notice = None;
         self.view.state.auth_error = None;
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
@@ -1451,7 +1451,7 @@ impl AgentThread {
             self.emit(AgentThreadEvent::LoggedIn(method_name));
         }
         if !self.opens_session {
-            self.view.state.account_notice = Some("Logged in.".into());
+            self.view.state.login_notice = Some("Logged in.".into());
         }
         self.reload();
     }
@@ -3302,23 +3302,23 @@ mod tests {
 
     /// Logging in and out from settings, against `test_support/mock_agent.py`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn logs_in_and_out_of_an_account() {
+    async fn logs_in_and_out_of_a_login_session() {
         let Some(command) = mock_agent(&[]) else {
             return;
         };
-        let mut account = TestThread::new(AgentThread::start_for_account(
+        let mut login = TestThread::new(AgentThread::start_for_login_session(
             tokio::runtime::Handle::current(),
             "Mock".into(),
             ready(command),
         ));
 
-        account
-            .wait_until(|account| account.status() == &ConnectionStatus::Ready)
+        login
+            .wait_until(|login| login.status() == &ConnectionStatus::Ready)
             .await;
-        assert!(account.thread.supports_logout());
+        assert!(login.thread.supports_logout());
         // The terminal, browser and gateway logins are offered because the client says it
         // takes them.
-        let methods: Vec<&str> = account
+        let methods: Vec<&str> = login
             .thread
             .auth_methods()
             .iter()
@@ -3335,15 +3335,15 @@ mod tests {
             ]
         );
         assert_eq!(
-            account.thread.logged_in(),
+            login.thread.logged_in(),
             Some(true),
             "the mock opens sessions freely"
         );
-        assert_eq!(account.thread.config_options().len(), 4);
-        account
-            .wait_until(|account| account.auth_status().is_some())
+        assert_eq!(login.thread.config_options().len(), 4);
+        login
+            .wait_until(|login| login.auth_status().is_some())
             .await;
-        let status = account.thread.auth_status().expect("a status");
+        let status = login.thread.auth_status().expect("a status");
         assert!(status.is_logged_in());
         assert_eq!(
             status
@@ -3353,43 +3353,43 @@ mod tests {
             Some("mock@example.com")
         );
 
-        account.update(|account| account.authenticate(acp::AuthMethodId::new("mock-login"), None));
-        account
-            .wait_until(|account| {
-                account.account_notice().is_some() && account.status() == &ConnectionStatus::Ready
+        login.update(|login| login.authenticate(acp::AuthMethodId::new("mock-login"), None));
+        login
+            .wait_until(|login| {
+                login.login_notice().is_some() && login.status() == &ConnectionStatus::Ready
             })
             .await;
         assert_eq!(
-            account.thread.account_notice().map(|n| n.as_ref()),
+            login.thread.login_notice().map(|n| n.as_ref()),
             Some("Logged in.")
         );
-        assert_eq!(account.thread.logged_in(), Some(true));
+        assert_eq!(login.thread.logged_in(), Some(true));
         assert!(
-            account
+            login
                 .events
                 .iter()
                 .any(|event| matches!(event, AgentThreadEvent::LoggedIn(_)))
         );
 
-        account.update(|account| account.logout());
-        account
-            .wait_until(|account| {
-                account.account_notice().map(|n| n.as_ref()) == Some("Logged out.")
-                    && account
+        login.update(|login| login.logout());
+        login
+            .wait_until(|login| {
+                login.login_notice().map(|n| n.as_ref()) == Some("Logged out.")
+                    && login
                         .auth_status()
                         .is_some_and(|status| !status.is_logged_in())
             })
             .await;
-        assert_eq!(account.thread.logged_in(), Some(false));
+        assert_eq!(login.thread.logged_in(), Some(false));
 
-        account.update(|account| account.check_login());
-        account
-            .wait_until(|account| account.status() == &ConnectionStatus::AuthRequired)
+        login.update(|login| login.check_login());
+        login
+            .wait_until(|login| login.status() == &ConnectionStatus::AuthRequired)
             .await;
-        assert_eq!(account.thread.logged_in(), Some(false));
-        account.update(|account| account.authenticate(acp::AuthMethodId::new("mock-login"), None));
-        account
-            .wait_until(|account| account.logged_in() == Some(true))
+        assert_eq!(login.thread.logged_in(), Some(false));
+        login.update(|login| login.authenticate(acp::AuthMethodId::new("mock-login"), None));
+        login
+            .wait_until(|login| login.logged_in() == Some(true))
             .await;
     }
 

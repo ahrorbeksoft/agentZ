@@ -208,7 +208,7 @@ impl MachineIcon {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ConnectionId {
     Thread(ThreadId),
-    Account(u64),
+    LoginSession(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -527,13 +527,13 @@ pub enum Request {
     Logout(ConnectionId),
     RetrySession(ConnectionId),
     Reload(ConnectionId),
-    /// From an account connection: checks again whether the agent is logged in.
+    /// From a login session: checks again whether the agent is logged in.
     CheckLogin(ConnectionId),
 
-    /// Starts an agent only to log in or out. Answered with [`Response::AccountOpened`]. It
-    /// closes with [`Request::CloseAccount`], or when the client disconnects.
-    OpenAccount(AgentId),
-    CloseAccount(u64),
+    /// Starts an agent only to log in or out. Answered with [`Response::LoginSessionOpened`]. It
+    /// closes with [`Request::CloseLoginSession`], or when the client disconnects.
+    OpenLoginSession(AgentId),
+    CloseLoginSession(u64),
 
     RefreshRegistry {
         /// Only if the last refresh was over an hour ago.
@@ -745,7 +745,7 @@ pub enum Response {
     Thread(ThreadView),
     ThreadCreated(ThreadId),
     ProjectAdded(ProjectId),
-    AccountOpened(u64),
+    LoginSessionOpened(u64),
     Tools(serde_json::Value),
     ToolResult(ToolResult),
     ThreadDiff(ThreadDiff),
@@ -798,7 +798,7 @@ pub enum Event {
         connection: ConnectionId,
         update: ThreadUpdate,
     },
-    /// The connection is gone (its thread was deleted, or its account closed).
+    /// The connection is gone (its thread was deleted, or its login session closed).
     ConnectionClosed(ConnectionId),
     /// What changed on a subscribed terminal's screen.
     TerminalFrame {
@@ -922,7 +922,7 @@ mod tests {
     #[test]
     fn thread_events_round_trip() {
         let message = ServerMessage::Event(Event::Thread {
-            connection: ConnectionId::Account(2),
+            connection: ConnectionId::LoginSession(2),
             update: ThreadUpdate {
                 state: None,
                 entry_count: 1,

@@ -360,7 +360,7 @@ pub struct ThreadState {
     pub last_stop_reason: Option<acp::StopReason>,
     pub turn_error: Option<SharedString>,
     /// The outcome of the last log in or out on a connection made only for that.
-    pub account_notice: Option<SharedString>,
+    pub login_notice: Option<SharedString>,
     /// What the agent says about itself when it starts.
     pub agent_info: Option<acp::Implementation>,
     /// Whether the agent let a session open (logged in) or asked for a login. ACP has no way to
@@ -597,9 +597,9 @@ impl ThreadView {
         &self.state.elicitations
     }
 
-    /// What happened on the last log in or out of an account connection.
-    pub fn account_notice(&self) -> Option<&SharedString> {
-        self.state.account_notice.as_ref()
+    /// What happened on the last log in or out of a login session.
+    pub fn login_notice(&self) -> Option<&SharedString> {
+        self.state.login_notice.as_ref()
     }
 
     pub fn agent_info(&self) -> Option<&acp::Implementation> {

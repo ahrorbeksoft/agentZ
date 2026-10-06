@@ -151,7 +151,7 @@ impl Server {
             ConnectionId::Thread(thread_id) => {
                 Some(Attachments::for_thread(&self.data_dir, thread_id))
             }
-            ConnectionId::Account(_) => None,
+            ConnectionId::LoginSession(_) => None,
         };
         let parts: Vec<UnreadPart> = prompt
             .into_iter()

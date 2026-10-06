@@ -103,7 +103,7 @@ pub struct ServerClient {
     unseen_panes: BTreeSet<PaneId>,
     /// What kind of machine the server says it's on, and the kind chosen for it.
     machine_icon: MachineIcon,
-    /// Open threads and account connections, which get the server's updates.
+    /// Open threads and login sessions, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
     terminals: HashMap<TerminalKey, WeakEntity<Terminal>>,
