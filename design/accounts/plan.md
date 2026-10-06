@@ -93,9 +93,12 @@ What an account's environment needs, per agent:
   (`FACTORY_API_KEY`, `XAI_API_KEY`, `CURSOR_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`, …).
 - **HOME itself**, for agents with no other variable (Cursor, Auggie, MiniMax Code, Kimchi,
   Codebuddy). This is the weakest kind: the agent's shell commands may then see the account
-  folder as their home and miss the user's `.gitconfig`, `.ssh` and `.config`. Those agents come
-  last. Each one is tested first for whether it passes the real HOME to its shell. If it
-  doesn't, the account folder gets symlinks to the user's `.gitconfig`, `.ssh` and `.config`.
+  folder as their home and miss the user's `.gitconfig`, `.ssh` and `.config`. A moved HOME
+  also moves the macOS keychain lookup, and keychain logins break (t3code's Claude driver
+  exports only `CLAUDE_CONFIG_DIR` for this reason: with HOME moved, Claude reports "Not
+  logged in"). Those agents come last. Each one is tested first for whether it passes the real
+  HOME to its shell. If it doesn't, the account folder gets symlinks to the user's `.gitconfig`,
+  `.ssh` and `.config`.
 
 ### API-key accounts
 
@@ -243,6 +246,10 @@ that is still used.
   the email. When a window is used up, threads on that account show when it resets.
 - Refreshed every 5 minutes while the app is open (t3code's interval), after each turn ends on
   that account, and on demand. Reads of different accounts are staggered.
+- A read that fails keeps the account's last numbers, with when they were read. A login that
+  has no usage to read (the External account on an API key or Bedrock, say) shows none.
+  (t3code separates the two: a failed probe keeps the last bars, an unsupported login clears
+  them.)
 - Some readers leave files behind, which the server deletes after each read:
   - Droid's terminal UI writes an empty session file (~250 bytes) under
     `<home>/.factory/sessions/<folder>/` each time it starts, and it must start in a trusted
