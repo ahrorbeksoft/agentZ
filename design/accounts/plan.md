@@ -43,9 +43,33 @@ sessions into another folder. Each account is one such folder:
 <data dir>/accounts/<agent id>/<account id>/
 ```
 
-The **Default** account is the user's existing login. It uses the agent's normal home (no
-variables set), so existing threads and the agent's own CLI keep working unchanged. New accounts
-start empty and log in through agentZ's existing login flow, run inside the account's home.
+There are two kinds of account (the user's decision):
+
+- **External:** the login the user made outside agentZ, in the agent's own CLI or app. It uses
+  the agent's normal home (no variables set), and it's only listed while the agent is logged
+  in there. agentZ runs the agent's login check against the normal home when the server starts,
+  when the agent's settings open, and with each quota refresh. Threads on it put their sessions
+  in the CLI's history, like today.
+- **agentZ accounts:** every login made from agentZ goes into a new home under the data
+  directory. They start empty and log in through agentZ's existing login flow, run inside that
+  home. If the agent isn't logged in outside agentZ, agentZ never uses its normal home, so
+  agentZ's sessions never fill the CLI's or app's history.
+
+New threads pick the External account when it's listed, and otherwise the first agentZ account.
+agentZ doesn't share the external login with its own homes: that would mean linking or copying
+the agent's login file, which agentZ doesn't touch. (t3code's Codex "shadow home" does the
+opposite: extra accounts share the main home's sessions and keep only `auth.json` separate.)
+
+Existing threads ran in the normal home, so they stay on the External account. If that login
+goes away, they show as logged out, and logging in from one of them logs in the normal home,
+because that's where their sessions are. It's the only time agentZ logs in the normal home.
+
+The External account can't be removed; Log Out on it also logs out the CLI, as the confirm
+dialog says today. It replaces the "Logged in outside agentZ" note under the Account card, and
+`AgentSettings::{login_method, login_identity}` move to each agentZ account.
+
+Agents with no home variable (DeepAgents, crow-cli, Agoragentic) and agents without a
+description keep today's behavior: one login, in the normal home.
 
 Two Droid daemons with different homes ran at once and stayed fully separate (each asked for
 its own pairing code). Claude's keychain entry is named after its folder, so homes don't share
@@ -62,7 +86,7 @@ What an account's environment needs, per agent:
   (Mistral Vibe), `GOOSE_DISABLE_KEYRING` (goose).
 - **Login variables removed.** A login in the environment overrides the account's own. The
   user's environment has `GITHUB_TOKEN`, which Copilot, OpenCode and Kilo take as a login. For
-  every non-Default account, the server removes the agent's login variables
+  every agentZ account, the server removes the agent's login variables
   (`FACTORY_API_KEY`, `XAI_API_KEY`, `CURSOR_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`, …).
 - **HOME itself**, for agents with no other variable (Cursor, Auggie, MiniMax Code, Kimchi,
   Codebuddy). This is the weakest kind: the agent's shell commands may then see the account
@@ -82,8 +106,9 @@ Because agentZ holds the key, it can call the vendor's quota API itself.
 - `accounts.json` in the data directory: for each agent, its accounts in order. Each has an id,
   a label (defaulting to the email), and the last identity and quota read, with when they were
   read. New fields get `#[serde(default)]`.
-- Each thread records its account (`account: Option<AccountId>`, where `None` is Default), so
-  every existing thread stays on the Default account.
+- Each thread records its account (`account: Option<AccountId>`, where `None` is External), so
+  every existing thread stays on the External account.
+- The External account isn't stored; it's listed whenever the normal home is logged in.
 - Accounts are per machine, like logins and agent settings today: the homes live where the
   agent runs.
 
@@ -95,7 +120,7 @@ Because agentZ holds the key, it can call the vendor's quota API itself.
 - Login, logout and the agent's settings page work per account. The existing `Account` struct
   and `ConnectionId::Account` (the agent started from Settings to log in or out) are renamed
   to `LoginSession` and `ConnectionId::LoginSession`, freeing the word "account".
-- Removing an account asks first, then deletes its home folder. It doesn't log out first,
+- Removing an agentZ account asks first, then deletes its home folder. It doesn't log out first,
   because for some agents (Copilot, Cursor's keychain store) that could end the same login
   elsewhere.
 
@@ -178,8 +203,8 @@ that is still used.
 
 - agentZ keeps one skills folder per machine: `<data dir>/skills/<name>/SKILL.md`. Settings
   gets a Skills section to add (from a folder or by import), view and remove them.
-- The server symlinks each skill into every account's skills folders, including the Default
-  accounts' real homes, so every agent loads them. Symlinked skills were checked in Droid,
+- The server symlinks each skill into every account's skills folders, including the agent's
+  normal home while its External account is listed, so every agent loads them. Symlinked skills were checked in Droid,
   Claude, Codex, Devin, Gemini, Grok, OpenCode and Kilo.
 - It links skill by skill, never the whole folder, so the agent's own skills stay beside ours.
   It only ever removes links that point into `<data dir>/skills`. If the agent already has a
@@ -236,7 +261,7 @@ Starts with a design round in `design/accounts/` (see `design/README.md`). Topic
 
 ## Order of work
 
-1. **Core, with Droid:** rename `LoginSession`, then build accounts data, the Default account,
+1. **Core, with Droid:** rename `LoginSession`, then build accounts data, the External account,
    per-account environments, agent descriptions, readers and login checks. Droid works end to
    end, both with a login and with an API key. The UI comes only after its design round.
 2. **Claude, Codex, Devin** (wave 1).
@@ -456,14 +481,16 @@ installs).
 
 ## Open questions
 
-1. Should the current logins become each agent's "Default" account?
-2. Should existing skills (such as `~/.agents/skills/find-skills`) and the MCP servers in the
+Decided: the agent's own login is the External account, listed only while it's logged in;
+everything else lives in agentZ's homes (see The home folder).
+
+1. Should existing skills (such as `~/.agents/skills/find-skills`) and the MCP servers in the
    agents' own configs be imported into agentZ's lists?
-3. Should quota refresh every 5 minutes, after each turn ends, and on demand?
-4. For agents that need HOME moved (Cursor, Auggie, MiniMax, Kimi), is linking the user's
+2. Should quota refresh every 5 minutes, after each turn ends, and on demand?
+3. For agents that need HOME moved (Cursor, Auggie, MiniMax, Kimi), is linking the user's
    `.gitconfig`, `.ssh` and `.config` into the account acceptable, or should they wait?
-5. Should agentZ keep never reading agents' credentials, which leaves Antigravity, Cline and
+4. Should agentZ keep never reading agents' credentials, which leaves Antigravity, Cline and
    OpenCode's provider logins without quota?
-6. Should skills and MCP servers be per machine, like agent settings, or copied from the Mac to
+5. Should skills and MCP servers be per machine, like agent settings, or copied from the Mac to
    every machine?
-7. Are the waves in the right order?
+6. Are the waves in the right order?
