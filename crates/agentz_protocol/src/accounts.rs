@@ -34,6 +34,9 @@ pub struct Account {
     pub choices: AccountChoices,
     #[serde(default)]
     pub settings: AgentSettings,
+    /// Whether its home was logged in when last checked.
+    #[serde(default)]
+    pub logged_in: Option<bool>,
 }
 
 /// What the user chooses for any account, the External one included.
@@ -129,8 +132,30 @@ impl AgentAccounts {
             id,
             choices: AccountChoices::default(),
             settings: AgentSettings::default(),
+            logged_in: None,
         });
         id
+    }
+
+    /// What the last login check found for `account`, `None` being the External one.
+    pub fn logged_in(&self, account: Option<AccountId>) -> Option<bool> {
+        match account {
+            None => self.external_logged_in,
+            Some(id) => self.account(id).and_then(|account| account.logged_in),
+        }
+    }
+
+    /// What a login check found for `account`, `None` being the External one. A removed
+    /// account is left removed.
+    pub fn set_logged_in(&mut self, account: Option<AccountId>, logged_in: bool) {
+        match account {
+            None => self.external_logged_in = Some(logged_in),
+            Some(id) => {
+                if let Some(account) = self.account_mut(id) {
+                    account.logged_in = Some(logged_in);
+                }
+            }
+        }
     }
 
     pub fn remove(&mut self, id: AccountId) -> Result<()> {
@@ -196,8 +221,13 @@ mod tests {
         assert_eq!((first, second), (AccountId(1), AccountId(2)));
         assert_eq!(accounts.new_thread_account(), None);
 
-        accounts.external_logged_in = Some(false);
+        accounts.set_logged_in(None, false);
         assert_eq!(accounts.new_thread_account(), Some(first));
+        accounts.set_logged_in(Some(first), true);
+        accounts.set_logged_in(Some(AccountId(9)), true);
+        assert_eq!(accounts.logged_in(Some(first)), Some(true));
+        assert_eq!(accounts.logged_in(Some(second)), None);
+        assert_eq!(accounts.logged_in(None), Some(false));
 
         accounts
             .change(Some(second), AccountChange::MakeDefault)

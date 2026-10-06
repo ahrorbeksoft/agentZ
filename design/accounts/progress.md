@@ -14,14 +14,16 @@ Notes for whoever continues:
 - Droid (the user's answer): §8 is its limit choice, §11 applies only when Droid itself stops,
   and §10 has no Droid switch.
 - §7 also copies the agent's own settings files (never the login), as the user decided.
-- The user lifted the rule against reading agents' stored logins (reader kind 7). Rewrite the
-  AGENTS.md pitfall "Stay within ACP for agent status" in the commit that first needs it
-  (item 5 runs status commands; kind 7 comes with wave 3).
+- The user lifted the rule against reading agents' stored logins (reader kind 7). AGENTS.md's
+  pitfall now allows status commands and points at kind 7, which comes with wave 3.
 - Importing skills and servers from another machine isn't on the design board yet: add a topic
   and let the user pick before building item 26.
-- Only threads and login sessions on the External account update `external_logged_in`; an
-  agentZ account's own login state comes with item 5. The app ignores `Event::Accounts` until
-  item 8 shows them.
+- Login checks (item 5) are an empty session (`LoginCheck::Session`, Droid's) or the agent's
+  status command (`LoginCheck::Command`). The other two in plan.md › Login checks come with
+  the agents that need them: an empty model list with Devin (17), a key agentZ holds with GLM
+  (wave 2). As the server starts, it checks only the External account, and only of
+  agents that have agentZ accounts: without any, nothing depends on it, and every agent would
+  be started at each server start. The app ignores `Event::Accounts` until item 8 shows them.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
   importing sessions, but the app still sends the External account (`None`) for both, and its
   settings tabs edit the External account's settings, until items 8 and 9 add the menus.
@@ -34,7 +36,7 @@ Notes for whoever continues:
 | 2 | | Accounts data: `accounts.json`, `AccountId`, a thread's account, the External account from the normal home's login check | done |
 | 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | done |
 | 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | done |
-| 5 | | Login checks from the description | |
+| 5 | | Login checks from the description | done |
 | 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | |
 | 7 | | API-key accounts (Droid with a Factory API key) | |
 | 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | |

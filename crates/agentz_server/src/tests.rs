@@ -1,12 +1,12 @@
 //! The server driven over in-memory streams, with `agent_thread`'s mock agent.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::accounts::{AccountChange, AccountChoice, AccountId};
+use agentz_protocol::accounts::{AccountChange, AccountChoice, AccountId, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::layout::{Direction, Node};
@@ -60,13 +60,22 @@ impl TestServer {
         project_dir: tempfile::TempDir,
         command: AgentCommand,
     ) -> Option<Self> {
+        Self::start_with_description(data_dir, project_dir, command, mock_accounts())
+    }
+
+    fn start_with_description(
+        data_dir: tempfile::TempDir,
+        project_dir: tempfile::TempDir,
+        command: AgentCommand,
+        description: crate::AgentDescription,
+    ) -> Option<Self> {
         let custom_agents = BTreeMap::from_iter([(
             AgentId::new("mock"),
             CustomAgent {
                 name: "Mock".into(),
                 command,
                 info: None,
-                accounts: Some(mock_accounts()),
+                accounts: Some(description),
             },
         )]);
         let handle = crate::start(
@@ -226,6 +235,28 @@ impl TestClient {
         &self.threads[&connection]
     }
 
+    /// The agent's accounts, as the server last sent them.
+    fn accounts(&self, agent_id: &str) -> AgentAccounts {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Accounts(accounts) => Some(
+                    accounts
+                        .get(&AgentId::new(agent_id))
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the server last found the account logged in, `None` being the External one.
+    fn account_logged_in(&self, account: Option<AccountId>) -> Option<bool> {
+        self.accounts("mock").logged_in(account)
+    }
+
     async fn create_thread(&mut self, server: &TestServer) -> ThreadId {
         let project_id = match self
             .ok(Request::AddProject {
@@ -267,6 +298,7 @@ fn mock_accounts() -> crate::AgentDescription {
         home_variables: BTreeMap::from([("MOCK_HOME".into(), String::new())]),
         file_storage: BTreeMap::new(),
         login_variables: vec!["MOCK_API_KEY".into()],
+        login_check: crate::LoginCheck::Session,
     }
 }
 
@@ -1432,6 +1464,9 @@ async fn accounts_run_in_homes_of_their_own() {
     let on_work = open(&mut client, AccountChoice::Account(work)).await;
     assert!(!logged_in(&client, on_work));
     client
+        .wait_until(|client| client.account_logged_in(Some(work)) == Some(false))
+        .await;
+    client
         .ok(Request::Authenticate {
             connection: on_work,
             method_id: acp::AuthMethodId::new("mock-login"),
@@ -1443,6 +1478,13 @@ async fn accounts_run_in_homes_of_their_own() {
         .await;
     assert!(home(work).join("login").exists());
     assert!(!external_login.exists());
+    // Each account's threads tell whether it's logged in.
+    client
+        .wait_until(|client| {
+            client.account_logged_in(Some(work)) == Some(true)
+                && client.account_logged_in(None) == Some(true)
+        })
+        .await;
 
     // The other account shares nothing. The agent's settings log it in, here with a terminal
     // login, which runs without the server's key too.
@@ -1483,7 +1525,10 @@ async fn accounts_run_in_homes_of_their_own() {
         .await;
     client.type_into(&key, "\r").await;
     client
-        .wait_until(|client| client.thread(login).logged_in() == Some(true))
+        .wait_until(|client| {
+            client.thread(login).logged_in() == Some(true)
+                && client.account_logged_in(Some(side)) == Some(true)
+        })
         .await;
     assert!(home(side).join("login").exists());
 
@@ -1530,6 +1575,149 @@ async fn accounts_run_in_homes_of_their_own() {
             .await
             .is_err()
     );
+}
+
+/// Gives the mock agent an agentZ account before the server starts, so it checks the External
+/// one as it starts.
+fn add_an_account_before_start(data_dir: &Path) -> AccountId {
+    let agents = data_dir.join("agents");
+    std::fs::create_dir_all(&agents).expect("create agents");
+    std::fs::write(
+        agents.join("accounts.json"),
+        json!({"mock": {"accounts": [{"id": 1}], "last_id": 1}}).to_string(),
+    )
+    .expect("write accounts.json");
+    AccountId(1)
+}
+
+/// Waits until the server has found the account logged in or out, `None` being the External
+/// one. It may have before the client subscribed.
+async fn wait_for_login_check(
+    client: &mut TestClient,
+    account: Option<AccountId>,
+    logged_in: bool,
+) {
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let found = session
+        .accounts
+        .get(&AgentId::new("mock"))
+        .and_then(|accounts| accounts.logged_in(account));
+    if found != Some(logged_in) {
+        client
+            .wait_until(|client| client.account_logged_in(account) == Some(logged_in))
+            .await;
+    }
+}
+
+/// As the server starts, it opens an empty session in the normal home of each agent with agentZ
+/// accounts, since whether it's logged in decides whether the External account is listed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_checks_the_external_login_as_it_starts() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    // Never written, so the normal home is logged out.
+    let external_login = data_dir.path().join("external-login");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        external_login.to_string_lossy().into_owned(),
+    );
+    let work = add_an_account_before_start(data_dir.path());
+    let Some(server) =
+        TestServer::start_with_agent(data_dir, tempfile::tempdir().expect("temp dir"), command)
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    wait_for_login_check(&mut client, None, false).await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let accounts = &session.accounts[&AgentId::new("mock")];
+    assert!(!accounts.lists_external());
+    assert_eq!(accounts.new_thread_account(), Some(work));
+    // Only the normal home is checked as the server starts.
+    assert_eq!(accounts.account(work).expect("account").logged_in, None);
+}
+
+/// Where the agent's sessions open while it's logged out, as Claude's do, its status command
+/// checks the login instead: as the server starts, as the agent's settings open, and after a
+/// login or logout.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_commands_check_logins_where_sessions_open_logged_out() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let external_login = data_dir.path().join("external-login");
+    std::fs::write(&external_login, "").expect("log in the normal home");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        external_login.to_string_lossy().into_owned(),
+    );
+    command
+        .env
+        .insert("MOCK_OPENS_LOGGED_OUT".into(), "1".into());
+    let mut status_args = command.args.clone();
+    status_args.push("--status".into());
+    let description = crate::AgentDescription {
+        login_check: crate::LoginCheck::Command(crate::StatusCommand {
+            program: Some(command.path.to_string_lossy().into_owned()),
+            args: status_args,
+            logged_in: Some("/logged_in".into()),
+        }),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    // No session was opened for it, so the status command said so.
+    wait_for_login_check(&mut client, None, true).await;
+
+    let Response::LoginSessionOpened(login_session_id) = client
+        .ok(Request::OpenLoginSession {
+            agent_id: AgentId::new("mock"),
+            account: Some(work),
+        })
+        .await
+    else {
+        panic!("expected a login session");
+    };
+    let login = ConnectionId::LoginSession(login_session_id);
+    client.subscribe_thread(login).await;
+    // Its session opened, but the account isn't logged in.
+    client
+        .wait_until(|client| {
+            client.thread(login).status() == &ConnectionStatus::Ready
+                && client.account_logged_in(Some(work)) == Some(false)
+        })
+        .await;
+
+    client
+        .ok(Request::Authenticate {
+            connection: login,
+            method_id: acp::AuthMethodId::new("mock-login"),
+            meta: None,
+        })
+        .await;
+    client
+        .wait_until(|client| client.account_logged_in(Some(work)) == Some(true))
+        .await;
+    client.ok(Request::Logout(login)).await;
+    client
+        .wait_until(|client| client.account_logged_in(Some(work)) == Some(false))
+        .await;
+    assert_eq!(client.account_logged_in(None), Some(true));
 }
 
 /// Codex's device-code login asks the client to open a URL (an elicitation) while

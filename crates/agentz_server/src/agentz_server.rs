@@ -40,7 +40,7 @@ use registry::{AgentCommand, ShellEnvironmentReady};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub use accounts::AgentDescription;
+pub use accounts::{AgentDescription, LoginCheck, StatusCommand};
 pub use agent_settings::AgentSettingsStore;
 
 use crate::server::{Input, Server};

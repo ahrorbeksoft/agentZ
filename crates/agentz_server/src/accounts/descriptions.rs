@@ -6,6 +6,8 @@ use std::path::Path;
 use agentz_protocol::agents::AgentCommand;
 use serde::{Deserialize, Serialize};
 
+use super::LoginCheck;
+
 /// How an agent keeps its login, sessions and settings in a folder agentZ chooses. A custom
 /// agent can have one in `agents/custom.json`, under `accounts`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -19,6 +21,7 @@ pub struct AgentDescription {
     pub file_storage: BTreeMap<String, String>,
     /// Variables the agent takes as a login, which would override the account's own.
     pub login_variables: Vec<String>,
+    pub login_check: LoginCheck,
 }
 
 /// The description of a registry agent, by its id.
@@ -82,6 +85,7 @@ mod tests {
             ]),
             file_storage: BTreeMap::from([("AGENT_KEYRING".into(), "file".into())]),
             login_variables: vec!["AGENT_API_KEY".into(), "GITHUB_TOKEN".into()],
+            login_check: LoginCheck::Session,
         };
         let mut command = AgentCommand {
             env: [
@@ -120,6 +124,7 @@ mod tests {
         .expect("parse");
         assert_eq!(description.home_variables["MOCK_HOME"], "");
         assert!(description.file_storage.is_empty());
+        assert_eq!(description.login_check, LoginCheck::Session);
         assert!(built_in("factory-droid").is_some());
         assert!(built_in("mock").is_none());
     }

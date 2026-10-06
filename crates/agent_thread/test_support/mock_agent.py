@@ -33,7 +33,9 @@ Every login and logout is reported with `_auth/status_update`, as Claude Agent a
 
 MOCK_HOME is its home, as FACTORY_HOME_OVERRIDE is Factory Droid's: with it set, the login
 MOCK_LOGIN_FILE asks for is the file `login` there instead. MOCK_API_KEY logs it in whatever
-the file says, as FACTORY_API_KEY does.
+the file says, as FACTORY_API_KEY does. Run with `--status`, it prints {"logged_in": …} and
+exits with 1 when logged out, as agents' own status commands do. With MOCK_OPENS_LOGGED_OUT
+set, sessions open while it's logged out, as Claude Agent's do.
 
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
@@ -81,6 +83,11 @@ SESSIONS_FILE = os.environ.get("MOCK_SESSIONS_FILE")
 SESSIONS_PER_PAGE = 2
 # Prompts that run another prompt's script.
 SCRIPTS = json.loads(os.environ.get("MOCK_SCRIPTS") or "{}")
+
+if sys.argv[-1] == "--status":
+    status = bool(os.environ.get("MOCK_API_KEY")) or not LOGIN_FILE or os.path.exists(LOGIN_FILE)
+    print(json.dumps({"logged_in": status}), flush=True)
+    sys.exit(0 if status else 1)
 
 if sys.argv[-1] == "--login":
     if os.environ.get("MOCK_BROWSER_OPEN"):
@@ -426,7 +433,8 @@ for line in sys.stdin:
             os.remove(LOGIN_FILE)
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
         send_auth_status()
-    elif method in ("session/new", "session/load", "session/list") and not logged_in():
+    elif (method in ("session/new", "session/load", "session/list") and not logged_in()
+          and not os.environ.get("MOCK_OPENS_LOGGED_OUT")):
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32000, "message": "\n\nYour code: MOCK-1234\n\nClick Log In."}})
     elif (method in ("session/new", "session/load") and os.environ.get("MOCK_REJECT_MCP")

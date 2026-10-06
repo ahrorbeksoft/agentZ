@@ -5,6 +5,7 @@ mod attachment_requests;
 mod custom_agents;
 #[cfg(unix)]
 mod hand_off;
+mod login_checks;
 mod prompt_requests;
 mod queue_requests;
 mod session_requests;
@@ -118,12 +119,14 @@ struct Client {
     terminals: HashMap<TerminalKey, TerminalFrame>,
 }
 
-/// An agent started only to log in or out, from its settings.
+/// An agent started only to log in or out, from its settings, or by the server to check its
+/// login.
 struct LoginSession {
     agent_id: AgentId,
     /// `None` is the External account.
     account: Option<AccountId>,
-    owner: ClientId,
+    /// `None` for the server's own login check, which closes once it has its answer.
+    owner: Option<ClientId>,
     thread: AgentThread,
 }
 
@@ -393,6 +396,7 @@ impl Server {
             }
         });
         server.refresh_git_heads();
+        server.check_external_logins();
         server
     }
 
@@ -610,7 +614,7 @@ impl Server {
                 self.relays.client_gone(client);
                 // Nobody is left to see these login sessions.
                 self.login_sessions
-                    .retain(|_, login_session| login_session.owner != client);
+                    .retain(|_, login_session| login_session.owner != Some(client));
                 self.sweep_drafts();
             }
             Input::Registry(message) => {
@@ -909,6 +913,9 @@ impl Server {
             }
             Request::CheckLogin(connection) => {
                 self.update_thread(connection, |thread| thread.check_login())?;
+                if let ConnectionId::LoginSession(login_session_id) = connection {
+                    self.check_login_session_with_command(login_session_id);
+                }
                 Ok(Response::Ok)
             }
 
@@ -920,28 +927,9 @@ impl Server {
                         .account(id)
                         .context("there's no such account")?;
                 }
-                let login_session_id = self.next_login_session_id;
-                self.next_login_session_id += 1;
-                let command = self.agent_command(&agent_id, account, false);
-                let command = self
-                    .with_browser_programs(command, ConnectionId::LoginSession(login_session_id));
-                let (thread, inbox) = AgentThread::start_for_login_session(
-                    self.runtime.clone(),
-                    self.agent_name(&agent_id),
-                    command,
-                );
-                self.login_sessions.insert(
-                    login_session_id,
-                    LoginSession {
-                        agent_id,
-                        account,
-                        owner: client,
-                        thread,
-                    },
-                );
-                let connection = ConnectionId::LoginSession(login_session_id);
-                self.forward(inbox, move |message| Input::Thread(connection, message));
-                self.thread_changed(connection);
+                let login_session_id = self.open_login_session(agent_id, account, Some(client));
+                // Opening the agent's settings checks its login.
+                self.check_login_session_with_command(login_session_id);
                 Ok(Response::LoginSessionOpened(login_session_id))
             }
             Request::CloseLoginSession(login_session_id) => {
@@ -1718,6 +1706,40 @@ impl Server {
         .boxed()
     }
 
+    /// Starts the agent on the account to log in or out (or, without an `owner`, for the
+    /// server's own login check), and opens an empty session to learn whether it's logged in.
+    fn open_login_session(
+        &mut self,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+        owner: Option<ClientId>,
+    ) -> u64 {
+        let login_session_id = self.next_login_session_id;
+        self.next_login_session_id += 1;
+        // The server checks logins as it starts, before the registry may have loaded.
+        let command = self.agent_command(&agent_id, account, owner.is_none());
+        let command =
+            self.with_browser_programs(command, ConnectionId::LoginSession(login_session_id));
+        let (thread, inbox) = AgentThread::start_for_login_session(
+            self.runtime.clone(),
+            self.agent_name(&agent_id),
+            command,
+        );
+        self.login_sessions.insert(
+            login_session_id,
+            LoginSession {
+                agent_id,
+                account,
+                owner,
+                thread,
+            },
+        );
+        let connection = ConnectionId::LoginSession(login_session_id);
+        self.forward(inbox, move |message| Input::Thread(connection, message));
+        self.thread_changed(connection);
+        login_session_id
+    }
+
     /// Puts agentZ's `xdg-open` and the like first for the agent of `connection`, when agents'
     /// login pages go to the clients.
     fn with_browser_programs(
@@ -1782,6 +1804,12 @@ impl Server {
         let config_options = thread.config_options().to_vec();
         let modes = thread.modes().cloned();
         let logged_in = thread.state.logged_in;
+        let failed = matches!(
+            thread.status(),
+            agentz_protocol::thread::ConnectionStatus::Failed(_)
+        );
+        let mut logged_in_or_out = false;
+        let mut reported_login = None;
 
         for event in events {
             match (connection, event) {
@@ -1824,6 +1852,7 @@ impl Server {
                 }
                 // What agentZ logged in, until the agent is logged out or in again elsewhere.
                 (_, AgentThreadEvent::LoggedIn(method)) => {
+                    logged_in_or_out = true;
                     if let Some(agent_id) = &agent_id {
                         self.update_account_settings(agent_id, account, |settings| {
                             settings.logged_in(method.to_string())
@@ -1831,11 +1860,13 @@ impl Server {
                     }
                 }
                 (_, AgentThreadEvent::LoggedOut) => {
+                    logged_in_or_out = true;
                     if let Some(agent_id) = &agent_id {
                         self.update_account_settings(agent_id, account, AgentSettings::logged_out);
                     }
                 }
                 (_, AgentThreadEvent::AccountReported(status)) => {
+                    reported_login = Some(status.is_logged_in());
                     if let Some(agent_id) = &agent_id {
                         self.update_account_settings(agent_id, account, |settings| {
                             settings.account_reported(&status)
@@ -1875,11 +1906,19 @@ impl Server {
                 settings.known_modes = modes;
             });
         }
-        // The External account is listed while the normal home is logged in.
-        if let (Some(agent_id), Some(logged_in), None) = (&agent_id, logged_in, account) {
-            self.accounts.update(agent_id, |accounts| {
-                accounts.external_logged_in = Some(logged_in)
-            });
+        if let Some(agent_id) = &agent_id {
+            self.thread_login_changed(
+                agent_id,
+                account,
+                logged_in,
+                logged_in_or_out,
+                reported_login,
+            );
+        }
+        if let ConnectionId::LoginSession(login_session_id) = connection
+            && (logged_in.is_some() || failed)
+        {
+            self.finish_login_check(login_session_id);
         }
     }
 

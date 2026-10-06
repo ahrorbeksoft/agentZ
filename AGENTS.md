@@ -121,7 +121,9 @@ From Zed's guidelines, which this code follows:
   `MOCK_SESSIONS_FILE` (a JSON array of ACP session infos, each with an optional `history` to
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
   For accounts, `MOCK_HOME` is its home (the login is then `login` there) and `MOCK_API_KEY`
-  logs it in; the server tests' mock is described with both, so it can have accounts.
+  logs it in; the server tests' mock is described with both, so it can have accounts. Run with
+  `--status`, it prints `{"logged_in": …}` as agents' status commands do, and with
+  `MOCK_OPENS_LOGGED_OUT` its sessions open while it's logged out, as Claude Agent's do.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.
@@ -179,8 +181,11 @@ From Zed's guidelines, which this code follows:
   Opening an agent's Settings panel opens an empty session (no prompt). If it works, the agent is
   logged in, and its settings are learned; "authentication required" means it's logged out. The
   method shown ("Logged in with ChatGPT") is the one last used from agentZ.
-- **Stay within ACP for agent status.** Don't read agents' own credential files: every agent stores
-  its login differently.
+- **Agent status comes from ACP and the agent's own commands.** Some agents' sessions open while
+  they're logged out (Claude, Devin), so their description (`crates/agentz_server/src/accounts/`)
+  names their own status command as the login check. Read a stored login only where nothing else
+  gives the quota (`design/accounts/plan.md`, reader kind 7), and never change, refresh or copy
+  it: every agent stores its login differently.
 - **Threads from older builds may lack `session_id` or `model`.** They fill in the next time the
   thread is opened.
 - **`agentz-server proxy` must not wait for stdin when it exits.** Tokio reads stdin on a
