@@ -864,6 +864,8 @@ Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 - **Deleting sessions on the agent's side** when a thread is deleted.
 - **t3code's snooze** for threads.
 - **Automatic workspace cleanup**: t3code's inactive-days and merged rules, cow's `gc`.
+- **Accounts**: several logins per agent with their quota, plus skills and MCP servers managed in
+  agentZ. Planned in [`design/accounts/plan.md`](../design/accounts/plan.md).
 
 Open questions for the user:
 

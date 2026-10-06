@@ -1,0 +1,469 @@
+# Accounts: plan
+
+Status: planned, nothing built. The research was done on 2026-10-06 against the ACP Registry of
+that day (41 agents). Factory Droid 0.234.0, Claude Code, Codex and Devin 3000.11.3 were tested
+in depth on real logins (read-only, no prompts). The other agents were tested in throwaway
+homes, or read from their source and docs. Anything not tested is marked *(unverified)*.
+
+## What the user asked for
+
+- **Several accounts per agent.** More than one login to the same agent (two Factory accounts,
+  two Claude subscriptions, …). Accounts share nothing: each has its own login, its own
+  sessions and its own history. A thread can't move between accounts.
+- **Accounts run side by side.** Threads on different accounts of the same agent run at once.
+- **Quota per account.** Each account shows its plan's usage windows (5-hour, weekly,
+  monthly, credits, …): how much is used and when each resets. agentZ reads it from the agent,
+  using the agent's own terminal commands where ACP has nothing.
+- **Who the account is.** The account's email (or name) and plan are read automatically.
+- **Switching.** The user picks the account for a new thread. There is no automatic switching
+  (t3code has none either).
+- **One generic account manager.** It works for any agent that can keep its login in a folder
+  agentZ chooses. Adding an agent means describing it, not writing a new feature.
+- **Skills and MCP servers managed in agentZ**, loaded by every agent and every account.
+- **Every agent where it makes sense**, mostly the ones with subscriptions.
+
+## Which agents it makes sense for
+
+A second account is worth having when a login carries its own allowance: a subscription with
+usage windows (Claude, ChatGPT, Factory, Devin, Grok, Copilot, Gemini, Cursor, …), monthly
+credits (Kilo Pass, Augment, Amp), or a vendor's coding plan sold as a key with windows (GLM,
+MiniMax, Kimi). A pay-per-token API key doesn't need it: a second key just bills the same way.
+
+Accounts also work for agents with no quota to show. The home folder, login, skills and MCP
+parts are the same; the quota part is optional.
+
+## How it works
+
+### The home folder
+
+Every supported agent has an environment variable (or a few) that moves its config, login and
+sessions into another folder. Each account is one such folder:
+
+```
+<data dir>/accounts/<agent id>/<account id>/
+```
+
+The **Default** account is the user's existing login. It uses the agent's normal home (no
+variables set), so existing threads and the agent's own CLI keep working unchanged. New accounts
+start empty and log in through agentZ's existing login flow, run inside the account's home.
+
+Two Droid daemons with different homes ran at once and stayed fully separate (each asked for
+its own pairing code). Claude's keychain entry is named after its folder, so homes don't share
+a login either.
+
+What an account's environment needs, per agent:
+
+- **Home variables.** For example `CLAUDE_CONFIG_DIR=<home>`, or Devin's
+  `XDG_DATA_HOME=<home>/data` and `XDG_CONFIG_HOME=<home>/config`.
+- **File storage switches.** Some agents keep the login in the macOS keychain under a fixed
+  name, which every home would share. Most have a switch to keep it in a file in the home
+  instead: `AGY_ACP_FORCE_FILE_STORAGE=1` (Antigravity), `AGENT_CLI_CREDENTIAL_STORE=file`
+  (Cursor), `GEMINI_FORCE_FILE_STORAGE=true` (Gemini API keys), `VIBE_TEST_DISABLE_KEYRING=1`
+  (Mistral Vibe), `GOOSE_DISABLE_KEYRING` (goose).
+- **Login variables removed.** A login in the environment overrides the account's own. The
+  user's environment has `GITHUB_TOKEN`, which Copilot, OpenCode and Kilo take as a login. For
+  every non-Default account, the server removes the agent's login variables
+  (`FACTORY_API_KEY`, `XAI_API_KEY`, `CURSOR_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`, …).
+- **HOME itself**, for agents with no other variable (Cursor, Auggie, MiniMax Code, Kimchi,
+  Codebuddy). This is the weakest kind: the agent's shell commands may then see the account
+  folder as their home and miss the user's `.gitconfig`, `.ssh` and `.config`. Those agents come
+  last. Each one is tested first for whether it passes the real HOME to its shell. If it
+  doesn't, the account folder gets symlinks to the user's `.gitconfig`, `.ssh` and `.config`.
+
+### API-key accounts
+
+Some accounts are just a key: Droid with a Factory API key, GLM, MiniMax with a key, Mistral.
+For those, agentZ keeps the key in the account's folder (mode 0600, as the agents keep their
+own logins) and passes it in the agent's key variable (`FACTORY_API_KEY`, `Z_AI_API_KEY`, …).
+Because agentZ holds the key, it can call the vendor's quota API itself.
+
+### Data
+
+- `accounts.json` in the data directory: for each agent, its accounts in order. Each has an id,
+  a label (defaulting to the email), and the last identity and quota read, with when they were
+  read. New fields get `#[serde(default)]`.
+- Each thread records its account (`account: Option<AccountId>`, where `None` is Default), so
+  every existing thread stays on the Default account.
+- Accounts are per machine, like logins and agent settings today: the homes live where the
+  agent runs.
+
+### The server
+
+- `Server::agent_command` (`crates/agentz_server/src/server.rs`) takes the account and builds
+  its environment (above) after the agent's settings env. Each (agent, account) pair is its own
+  agent process, so accounts run in parallel.
+- Login, logout and the agent's settings page work per account. The existing `Account` struct
+  and `ConnectionId::Account` (the agent started from Settings to log in or out) are renamed
+  to `LoginSession` and `ConnectionId::LoginSession`, freeing the word "account".
+- Removing an account asks first, then deletes its home folder. It doesn't log out first,
+  because for some agents (Copilot, Cursor's keychain store) that could end the same login
+  elsewhere.
+
+### Agent descriptions
+
+Each supported agent gets a small description in `crates/agentz_server/src/accounts/`:
+
+- **Environment:** home variables, file storage switches, login variables to remove.
+- **Skills folders** to link into, relative to the home, and the folders outside the home the
+  agent reads anyway (for clash checks).
+- **Login check:** how to tell the account is logged out.
+- **Identity reader** and **quota reader**.
+
+Readers come in six kinds:
+
+1. **Command:** run a program with the account's env and parse its output, JSON or text
+   (`claude auth status --json`, `devin auth status`, `cursor-agent status --format json`,
+   `kilo profile --json`, `auggie account status --json`).
+2. **JSON-RPC:** start the agent's own server and send requests (`codex app-server` with
+   `account/read` and `account/rateLimits/read`; `copilot --headless --stdio` with
+   `auth.getStatus` and `account.getQuota`).
+3. **ACP extension request** on the account's agent connection (Grok's
+   `_x.ai/auth/check_subscription` and `_x.ai/billing`).
+4. **Local HTTP server** started by the agent (`kilo serve`, then
+   `GET /kilocode/provider-usage`).
+5. **Hidden terminal script:** start the agent's terminal UI in a PTY nobody sees, wait for it
+   to be ready, type a slash command, press Enter only once the command menu shows the
+   expected entry, read the screen, then close it with Esc and quit. This is for numbers that
+   only exist in the terminal UI (Droid `/status` and `/limits`, Devin `/usage`, Gemini
+   `/stats model`, Kimi `/usage`, Cursor `/usage`, Qoder `/usage`). The server already runs
+   terminals (`alacritty_terminal`), so this reuses them.
+6. **HTTP with a key agentZ holds** (API-key accounts, above).
+
+Readers return one shape: `AccountStatus { logged_in, email, name, plan, windows, credits }`,
+with each window `{ label, used_percent, resets_at }`.
+
+agentZ still never reads an agent's credential files. Where the only quota source is the
+vendor's API called with the agent's stored token (Antigravity, Cline, OpenCode's provider
+logins), that agent shows no quota.
+
+Parsers keep captured real outputs, with personal data replaced, as test fixtures. A new agent
+version that changes its output then fails a test instead of showing wrong numbers.
+
+### Login checks
+
+agentZ treats "a session opened" as "logged in". That holds for most agents: their
+`session/new` fails with "Authentication required" when logged out. It doesn't for Claude,
+Devin, Kilo, OpenCode, Amp, Cortex Code and GLM Agent, whose sessions open while logged out.
+For those, the description names another check:
+
+- **The agent's own status command:** `claude auth status --json`, `devin auth status`,
+  `kilo profile --json`, `opencode auth list --format json`.
+- **An empty model list** in the session (Devin, Cortex Code).
+- **A key agentZ holds** (GLM).
+
+This changes the AGENTS.md pitfall "Stay within ACP for agent status": agentZ also runs the
+agent's own status commands. It still never reads credential files. Claude and Codex keep
+sending `_auth/status_update` during a session (`agentz_protocol::thread::AuthStatus`), and
+that is still used.
+
+### Quota
+
+- Shown like t3code: each window as a bar with "n% left" and "resets in …", the plan beside
+  the email. When a window is used up, threads on that account show when it resets.
+- Refreshed every 5 minutes while the app is open (t3code's interval), after each turn ends on
+  that account, and on demand. Reads of different accounts are staggered.
+- Some readers leave files behind, which the server deletes after each read:
+  - Droid's terminal UI writes an empty session file (~250 bytes) under
+    `<home>/.factory/sessions/<folder>/` each time it starts, and it must start in a trusted
+    folder. The reader runs it in a fixed folder inside the account's home and deletes the
+    session file the run created.
+  - `claude -p "/usage"` writes a transcript under `<config dir>/projects/<folder>/`. It gets
+    the same cleanup, unless Claude has a flag that skips saving the session.
+  - Codex's `app-server` and Devin's status command leave nothing.
+- Hidden terminal readers have to handle first-run prompts: Droid's folder trust, Codex's
+  update prompt (`-c check_for_update_on_startup=false`), and Gemini opening a browser login
+  (`NO_BROWSER=true`).
+
+### Skills
+
+- agentZ keeps one skills folder per machine: `<data dir>/skills/<name>/SKILL.md`. Settings
+  gets a Skills section to add (from a folder or by import), view and remove them.
+- The server symlinks each skill into every account's skills folders, including the Default
+  accounts' real homes, so every agent loads them. Symlinked skills were checked in Droid,
+  Claude, Codex, Devin, Gemini, Grok, OpenCode and Kilo.
+- It links skill by skill, never the whole folder, so the agent's own skills stay beside ours.
+  It only ever removes links that point into `<data dir>/skills`. If the agent already has a
+  skill with the same name, in its home or in a folder it reads anyway, ours is skipped and
+  Settings shows why.
+- Links are synced when a skill is added or removed, when an account is created, and when the
+  server starts. New sessions pick them up.
+- agentZ doesn't write into the shared `~/.agents/skills`. Many agents read it whatever their
+  home: Codex, Devin, Grok, OpenCode, Kilo, Qoder, Amp, Cline and others. Skills already there
+  show up in every account of those agents. Importing them into agentZ also makes them reach
+  Droid, Claude, Gemini and Cursor accounts, which don't read it.
+
+### MCP servers
+
+- Settings gets an MCP servers section: name, command, arguments and env (local, stdio), or a
+  URL and headers (remote, HTTP).
+- The server adds them to the `mcpServers` of every `session/new` and `session/load`, beside
+  agentZ's own `agentz` server (`server.rs`, where `agent_control` is added). This is how Zed
+  passes its context servers. It covers every agent and account without editing their config
+  files.
+- Remote servers go only to agents that announce `mcpCapabilities.http`. Droid announces none,
+  so it only gets local servers.
+- The existing fallback stays: if the agent rejects the MCP servers, the session opens without
+  them. It was added for Droid 0.233.0. Droid 0.234.0 was checked: it accepts them and starts
+  the server.
+- Some agents ignore `mcpServers` from ACP (Cline, Cortex Code, the pi and Autohand adapters).
+  They get no app-managed MCP servers, and Settings says so.
+- Gemini starts MCP servers only in trusted folders (`GEMINI_CLI_TRUST_WORKSPACE`).
+- These servers only load in agentZ threads, not when the user runs the agent's CLI in a
+  terminal.
+
+### UI
+
+Starts with a design round in `design/accounts/` (see `design/README.md`). Topics:
+
+- The agent's settings page: the Account card becomes a list of accounts. Each shows its email,
+  plan and quota bars, with Log In / Log Out, rename and remove, and there is an Add Account
+  button.
+- Picking the account for a new thread (where the agent is picked today).
+- Showing a thread's account (thread card, details popover) when an agent has more than one.
+- What a thread shows when its account's quota runs out.
+- Settings → Skills, and Settings → MCP servers.
+
+### Tests
+
+- The mock agent (`crates/agent_thread/test_support/mock_agent.py`) gets a home variable
+  (`MOCK_HOME`), keeps its login file there, and offers a status command and a quota command.
+  Server tests can then run two accounts at once and check they stay separate.
+- Reader parsers are unit-tested on the captured fixtures.
+- Skills sync runs on temporary folders: links are created, the agent's own skills stay
+  untouched, clashes are skipped, and stale links are removed.
+- MCP: the mock agent reports the `mcpServers` it got, and a server test checks that the user's
+  servers arrive beside `agentz`.
+
+## Order of work
+
+1. **Core, with Droid:** rename `LoginSession`, then build accounts data, the Default account,
+   per-account environments, agent descriptions, readers and login checks. Droid works end to
+   end, both with a login and with an API key. The UI comes only after its design round.
+2. **Claude, Codex, Devin** (wave 1).
+3. **Skills and MCP servers.**
+4. **Wave 2**, one agent per commit.
+5. **Wave 3**, one agent per commit, each tested first for its catch.
+6. **Later** agents when asked for.
+
+## Agents
+
+### Overview
+
+| Wave | Agents | Why |
+|---|---|---|
+| 1 | Factory Droid, Claude, Codex, Devin | Researched in depth; the user's main agents |
+| 2 | Grok Build, GitHub Copilot, Gemini CLI, Kilo, GLM Agent, Qoder | A clean home variable, and the identity and quota can be read without a prompt |
+| 3 | Cursor, Google Antigravity, Kimi CLI, Auggie, MiniMax Code, Amp, Junie, OpenCode | Each has a catch: HOME has to move, there's no quota source, or nothing was tested |
+| Later | Cline, Codebuddy Code, Cortex Code, Mistral Vibe, Qwen Code, Kimchi, pi, Stakpak, Dirac, fast-agent, goose, VT Code, Corust Agent, siGit Code | Weak fit: no quota, ACP ignores MCP, the login is only through other vendors, or there are no docs |
+| Skip | Nova, Autohand, Poolside, DimCode, Harn, DeepAgents, Minion Code, crow-cli, Agoragentic | Keys only, nothing to show, or not a coding agent |
+
+### Wave 1
+
+| | Factory Droid | Claude | Codex | Devin |
+|---|---|---|---|---|
+| Home | `FACTORY_HOME_OVERRIDE` | `CLAUDE_CONFIG_DIR` | `CODEX_HOME` | `XDG_DATA_HOME` + `XDG_CONFIG_HOME` |
+| Login stored | `<home>/.factory/auth.v2.loginkeychain`, encrypted with one shared keychain key | Keychain entry named after the folder | `<home>/auth.json` | `<data>/devin/credentials.toml` |
+| Logged out | `session/new` fails | Session opens; `claude auth status --json` | `session/new` fails | Session opens with no models; `devin auth status` |
+| Identity | Terminal `/status` *(unverified, read in code)*; API key: `GET /api/cli/whoami` | `claude auth status --json`: email, org, plan, method | `account/read`: email, plan | `devin auth status`: name, email, plan |
+| Quota | Terminal `/limits`: 5-hour, weekly, monthly, extra usage; API key: `GET /api/billing/limits` | `claude -p "/usage"`: session and week, % used, resets | `account/rateLimits/read`: windows with `usedPercent`, `windowDurationMins`, `resetsAt`, credits | Terminal `/usage`: daily and weekly; also the status line |
+| Skills | `<home>/.factory/skills`, `<home>/.agents/skills` | `<home>/skills` | `<home>/skills`, plus real `~/.agents/skills` | `<config>/devin/skills`, plus real `~/.agents/skills` and `~/.claude/skills` |
+| MCP | Stdio only; accepted and started | Accepted | Accepted | Accepted |
+
+Notes:
+
+- **Droid:**
+  - Logins are device pairing or an API key. `FACTORY_API_KEY` overrides a stored login.
+  - The `/limits` panel has a "When limit is reached" choice: close it with Esc, never Enter.
+  - For API-key accounts, both endpoints take `Authorization: Bearer <key>`. Both exist (an
+    invalid key gets 401); the response fields weren't seen.
+  - `droid doctor --auth --json` shows the email only masked.
+- **Claude:** `/usage` returns plain text: "Current session: n% used · resets …" and "Current
+  week (all models): n% used · resets …". During turns the ACP adapter also sends
+  `usage_update._meta["_claude/rateLimit"]`.
+- **Codex:** `codex-acp` runs `codex app-server`, which the reader starts directly with the
+  same `CODEX_HOME`. Nothing is left behind.
+- **Devin:**
+  - `XDG_CONFIG_HOME` also reaches the tools Devin runs (`gh` and others). Test whether
+    `XDG_DATA_HOME` alone, which holds the login, is enough. If it isn't, link the user's other
+    `~/.config` entries into the account.
+
+### Wave 2
+
+- **Grok Build** (`grok agent stdio`):
+  - Home: `GROK_HOME`; the login is a plain `auth.json` there (verified). Remove `XAI_API_KEY`.
+  - Logged out: `session/new` fails, and `_x.ai/auth/check_subscription` returns
+    `authenticated: false`.
+  - Identity: `_x.ai/auth/check_subscription` returns the email, tier and team, sent right
+    after `initialize`.
+  - Quota: `_x.ai/billing` returns the current period (for example weekly), on-demand cap and
+    used, prepaid balance and billing dates.
+  - Skills: `$GROK_HOME/skills` (symlinks verified). It also reads the real
+    `~/.claude/skills`, `~/.agents/skills` and `~/.cursor/skills`; turn off the first and last
+    with `GROK_CLAUDE_SKILLS_ENABLED=false` and `GROK_CURSOR_SKILLS_ENABLED=false`.
+  - MCP: http and sse.
+  - The probe on the real login refreshed its token; harmless.
+- **GitHub Copilot** (`copilot --acp`):
+  - Home: `COPILOT_HOME` (verified).
+  - The token is in the keychain (service `copilot-cli`), keyed by user and host. Different
+    GitHub users don't collide, but the same user in two homes would share it.
+  - Use `--no-auto-login`, and remove `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` and `GITHUB_TOKEN`,
+    or the `gh` CLI's login and the environment leak in.
+  - Logged out: `session/new` fails.
+  - Identity: `copilot --headless --stdio` (Content-Length framing), `auth.getStatus`, gives the
+    login.
+  - Quota: `account.getQuota` returns chat, completions and premium-request snapshots, each
+    with entitlement, used, remaining percentage and reset date *(fields from source)*.
+  - Skills: `$COPILOT_HOME/skills`. MCP: http and sse.
+- **Gemini CLI** (`gemini --acp`):
+  - Home: `GEMINI_CLI_HOME`, the parent of `.gemini`, so it also moves `.agents` (verified).
+    The Google login is the file `.gemini/oauth_creds.json`. Add
+    `GEMINI_FORCE_FILE_STORAGE=true` so saved API keys don't go to a shared keychain entry.
+  - Logged out: `session/new` fails. With a Google login selected but no credentials it opens
+    a browser instead, so readers set `NO_BROWSER=true`.
+  - Identity: `/about`, answered locally: email and tier.
+  - Quota: terminal `/stats model`: per-model remaining and reset time *(unverified on a real
+    login)*.
+  - Skills: `<home>/.gemini/skills`, `<home>/.agents/skills` (symlinks verified; the real
+    `~/.agents/skills` isn't read).
+  - MCP: http and sse, started only in trusted folders. `session/new` waits for MCP servers to
+    start.
+  - The user's Homebrew `gemini` is 0.47.0; the registry's is 0.62.0.
+- **Kilo** (`kilo acp`, an OpenCode fork):
+  - Home: `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` (each gets
+    a `kilo/` folder); the login is `auth.json`. Remove `GITHUB_TOKEN`.
+  - Logins: Kilo account (Kilo Pass credits, coding plans), ChatGPT, Copilot, SuperGrok,
+    provider keys.
+  - Logged out: the session opens with free models; `kilo profile --json` exits 1.
+  - Identity: `kilo profile --json` gives the name, email, team and balance *(from source)*.
+  - Quota: `kilo serve`, then `GET /kilocode/provider-usage`. Each window has used, remaining,
+    limit, period and `resetAt`, covering Kilo coding plans, ChatGPT and MiniMax.
+  - Skills: `$XDG_CONFIG_HOME/kilo/skills` (symlinks verified), plus the real
+    `~/.claude/skills` and `~/.agents/skills` unless `KILO_DISABLE_EXTERNAL_SKILLS` is set.
+  - MCP: http and sse, accepted.
+- **GLM Agent** (`glm-acp-agent`, a community package for Z.AI's GLM Coding Plan):
+  - An account is a key: pass `Z_AI_API_KEY`, and move sessions with `XDG_STATE_HOME`.
+  - Logged out: the session opens without a key, so agentZ checks its own key.
+  - Quota: `GET https://api.z.ai/api/monitor/usage/quota/limit` with `Authorization: <key>`
+    (no "Bearer"). It returns `data.limits[]` with a type, window, percentage and
+    `nextResetTime`, plus the plan level. The endpoint is undocumented;
+    `zai-org/zai-coding-plugins` uses it.
+  - Skills: it only reads `.claude` folders as slash commands, so app skills don't reach it.
+  - MCP: http.
+- **Qoder** (`qodercli --acp`):
+  - Home: `QODER_CONFIG_DIR`. It also edits the real `~/.config/git/ignore`.
+  - Whether it uses the keychain is unknown; `QODER_FORCE_ENCRYPTED_FILE_STORAGE` exists.
+  - Logged out: `session/new` fails.
+  - Identity: `qodercli status -o json` gives `logged_in`, plus the username, email, plan and
+    org when logged in *(from source)*.
+  - Quota: terminal `/usage` *(unverified)*.
+  - Skills: `$QODER_CONFIG_DIR/skills`, plus the real `~/.agents/skills`.
+  - MCP: http and sse; whether it's honored is unverified.
+
+### Wave 3
+
+- **Cursor** (`cursor-agent acp`):
+  - Login stays shared unless HOME moves: `CURSOR_CONFIG_DIR` moves only the config, and the
+    keychain tokens are shared, so a config-only home still reported logged in.
+  - Use `HOME=<home>` with `AGENT_CLI_CREDENTIAL_STORE=file` (verified as logged out in a new
+    home). Remove `CURSOR_API_KEY` and `CURSOR_AUTH_TOKEN`.
+  - With the default keychain store, `agent logout` in any home logs out the user's real
+    account.
+  - Identity: `cursor-agent status --format json` gives the email and name;
+    `about --format json` gives the tier.
+  - Quota: terminal `/usage`: the monthly allowance for Auto, API and total, plus on-demand
+    spend.
+  - Skills: `$HOME/.cursor/skills`, `$HOME/.agents/skills`. MCP: http and sse.
+- **Google Antigravity** (`agy-acp-server`):
+  - Home: `GEMINI_HOME` plus `AGY_ACP_FORCE_FILE_STORAGE=1`. Without the switch, the login
+    goes to one fixed keychain entry that every home shares, and that's where the user's
+    current login is.
+  - Logged out: `session/new` fails.
+  - Identity and quota: nothing over ACP. The only source is Google's APIs with the stored
+    token, so it shows no quota.
+  - Skills: `<home>/config/skills`, `<home>/antigravity-cli/skills`. MCP: http and sse,
+    accepted.
+- **Kimi CLI** (`kimi acp`):
+  - Home: `KIMI_SHARE_DIR` plus HOME, because two paths ignore it. The login is a file.
+  - Plans have 5-hour and weekly windows.
+  - Logged out: `session/new` fails.
+  - Quota: terminal `/usage`. The API needs the stored OAuth token.
+  - Skills: the first of `~/.kimi/skills`, `~/.claude/skills`, `~/.codex/skills` that exists
+    (under the moved HOME), plus `~/.agents/skills`. MCP: http.
+- **Auggie** (`auggie --acp`):
+  - Home: HOME plus `--augment-cache-dir`. Credit-based plans.
+  - Logged out: `session/new` fails. It offers its login only when the client sends
+    `_meta["terminal-auth"]`.
+  - Quota: `auggie account status --json` gives the plan, amount remaining, included per
+    cycle and cycle end *(from source)*.
+  - Identity: only the terminal's `/account` *(unverified)*.
+  - MCP: converts `mcpServers` though it doesn't announce it.
+- **MiniMax Code** (`mcode acp`):
+  - Home: `MINIMAX_DATA_DIR` plus HOME. Without HOME it appends a `PATH` export to the real
+    `~/.bashrc` and `~/.zshrc` (verified).
+  - 5-hour and weekly windows.
+  - Logged out: `session/new` fails.
+  - Quota with a key: `GET https://api.minimax.io/v1/api/openplatform/coding_plan/remains`
+    with `Bearer <key>` *(from a GitHub issue)*. The subscription login has no reader.
+  - MCP: http and sse; whether it's honored is unverified.
+- **Amp** (`amp-acp`, a third-party wrapper around Sourcegraph's `amp`):
+  - Home: `XDG_DATA_HOME` and `XDG_CONFIG_HOME`; logins are files.
+  - Logged out: the session opens, and logged-out commands open a browser.
+  - Identity and quota: `amp usage` gives "Signed in as …" and the credits remaining *(from
+    docs)*.
+  - MCP: passed to `amp` on each prompt.
+- **Junie** (JetBrains):
+  - Home: `JUNIE_HOME`. Keychain use is unclear.
+  - Quota: terminal `/usage` (remaining balance).
+  - Everything is from docs only (the download is 334 MB). Test it first.
+- **OpenCode** (installed by the user):
+  - Home: `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`; the login is
+    in `opencode.db` (v2). Remove `GITHUB_TOKEN`.
+  - Subscription logins: OpenCode Go (5-hour, weekly, monthly), ChatGPT, Copilot, SuperGrok.
+  - Logged out: the session opens with free models; `opencode auth list --format json` is
+    empty.
+  - Identity: only the login's label (org name or "API key").
+  - Quota: none without the stored tokens. Accounts work, without quota.
+  - Skills: `$XDG_CONFIG_HOME/opencode/skills` (symlinks verified), plus the real
+    `~/.claude/skills` and `~/.agents/skills`.
+  - MCP: http, accepted.
+
+### Later
+
+| Agent | Home | Why later |
+|---|---|---|
+| Cline | `CLINE_DIR`, `CLINE_DATA_DIR` | ACP ignores `mcpServers`; identity and quota need the stored token; one fixed hub port (25463) for every home |
+| Codebuddy Code | HOME + `CODEBUDDY_CONFIG_DIR` | China-focused logins; quota only in its terminal UI |
+| Cortex Code | `SNOWFLAKE_HOME`, or named connections (`-c`) | Snowflake accounts; no quota source; ignores ACP MCP; session opens without a connection |
+| Mistral Vibe | `VIBE_HOME` + `VIBE_TEST_DISABLE_KEYRING=1` | Identity through its API with the key, but no quota |
+| Qwen Code | `QWEN_HOME` | Coding Plan keys have windows, but no quota API was found; the free login ended 2026-04-15 |
+| Kimchi | HOME only | Credits, no LLM quota |
+| pi | `PI_CODING_AGENT_DIR` | Logs in to other vendors' subscriptions; the adapter ignores `mcpServers` |
+| Stakpak | HOME only | Has its own profiles; account pricing unknown |
+| Dirac | `DIRAC_DIR` | ChatGPT login (could read ChatGPT usage); no MCP |
+| fast-agent | `FAST_AGENT_HOME` | ChatGPT plan login, kept in the keychain |
+| goose | `GOOSE_PATH_ROOT` + `GOOSE_DISABLE_KEYRING` | Mostly keys; ChatGPT, Copilot and Gemini logins |
+| VT Code | `VTCODE_CONFIG`, `VTCODE_DATA` | Keychain; already supports several keys per provider |
+| Corust Agent | `CORUST_HOME` | Own plan with a quota, but no docs: only binary strings |
+| siGit Code | `SIGIT_CONFIG_DIR` | Local models first; whether the cloud tier has a quota is unknown |
+
+### Skip
+
+Nova (obfuscated, 462 MB of dependencies, keychain), Autohand (two packages, ignores MCP, no
+quota), Poolside (no identity or quota), DimCode (keys only; its coding plan is "coming soon"),
+Harn, DeepAgents, Minion Code and crow-cli (keys only), Agoragentic (a paid-services
+marketplace, not a coding agent; its README warns against the npm package the registry
+installs).
+
+## Open questions
+
+1. Should the current logins become each agent's "Default" account?
+2. Should existing skills (such as `~/.agents/skills/find-skills`) and the MCP servers in the
+   agents' own configs be imported into agentZ's lists?
+3. Should quota refresh every 5 minutes, after each turn ends, and on demand?
+4. For agents that need HOME moved (Cursor, Auggie, MiniMax, Kimi), is linking the user's
+   `.gitconfig`, `.ssh` and `.config` into the account acceptable, or should they wait?
+5. Should agentZ keep never reading agents' credentials, which leaves Antigravity, Cline and
+   OpenCode's provider logins without quota?
+6. Should skills and MCP servers be per machine, like agent settings, or copied from the Mac to
+   every machine?
+7. Are the waves in the right order?
