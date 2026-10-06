@@ -1,24 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <defs>
     <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2b3048"/>
-      <stop offset="1" stop-color="#0f111a"/>
+      <stop offset="0" stop-color="#383737"/>
+      <stop offset="0.35" stop-color="#1f1f1f"/>
+      <stop offset="0.7" stop-color="#121212"/>
+      <stop offset="1" stop-color="#0b0b0c"/>
     </linearGradient>
-    <linearGradient id="mark" x1="0.15" y1="0" x2="0.85" y2="1">
-      <stop offset="0" stop-color="#7dd3fc"/>
-      <stop offset="1" stop-color="#a78bfa"/>
+    <linearGradient id="ink" gradientUnits="userSpaceOnUse" x1="300" y1="300" x2="724" y2="724">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.6" stop-color="#f0f0f0"/>
+      <stop offset="1" stop-color="#a8a8a8"/>
     </linearGradient>
-    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
-      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000000" flood-opacity="0.32"/>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity="0.35"/>
     </filter>
-    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="22"/>
+    <filter id="grain" filterUnits="userSpaceOnUse" x="100" y="100" width="824" height="824" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="3"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0.5 0 0 0 -0.22"/>
     </filter>
+    <clipPath id="squircle"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+    <linearGradient id="fade-down" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.6"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="fade-up" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#a8a8a8" stop-opacity="0.75"/><stop offset="1" stop-color="#a8a8a8" stop-opacity="0"/></linearGradient>
   </defs>
   <!-- macOS icon grid: an 824 px body inside a 1024 px canvas -->
-  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)" filter="url(#shadow)"/>
-  <rect x="102" y="102" width="820" height="820" rx="183" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="4"/>
-  <path d="M352 380 H672 L352 680 H672" fill="none" stroke="url(#mark)" stroke-opacity="0.45" stroke-width="84" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
-  <path d="M352 380 H672 L352 680 H672" fill="none" stroke="url(#mark)" stroke-width="84" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="744" cy="284" r="38" fill="#4ade80"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#000" filter="url(#shadow)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)"/>
+  <g clip-path="url(#squircle)"><rect x="100" y="100" width="824" height="824" filter="url(#grain)" opacity="0.45"/></g>
+  <rect x="102" y="102" width="820" height="820" rx="183" fill="none" stroke="#fff" stroke-opacity="0.08" stroke-width="4"/>
+  <rect x="300" y="360" width="34" height="300" fill="url(#fade-down)"/>
+  <rect x="690" y="364" width="34" height="300" fill="url(#fade-up)"/>
+  <polygon points="300.0,300.0 724.0,300.0 724.0,360.0 403.0,664.0 724.0,664.0 724.0,724.0 300.0,724.0 300.0,664.0 621.0,360.0 300.0,360.0" fill="url(#ink)" />
 </svg>
