@@ -6,6 +6,7 @@ use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
+use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
@@ -20,9 +21,21 @@ use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
     NSUInteger,
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::{
+        Arc,
+        atomic::{self, AtomicBool},
+    },
+    thread,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -106,9 +119,109 @@ impl InstanceBufferPool {
     }
 }
 
+/// Fetches the layer's drawables on a helper thread, so frames never block the
+/// main thread in `nextDrawable`. Fullscreen windows scan their drawables out
+/// directly, and the display then holds each one for a whole frame; presenting
+/// on every vsync, as any animation does, exhausts the three-drawable pool, and
+/// each `nextDrawable` waits out most of a frame with the main thread stuck
+/// inside it, delaying input by as much (zed-industries/zed#7940). The helper
+/// absorbs that wait; a frame that finds no drawable ready skips its present
+/// and retries on a later display tick.
+struct DrawableProvider {
+    shared: Arc<DrawableShared>,
+}
+
+struct DrawableShared {
+    slot: Mutex<Option<metal::MetalDrawable>>,
+    /// Signalled when the slot empties, the layer is resized, or `stop` is set.
+    emptied: Condvar,
+    /// Set while holding `slot`, so the helper can't check it just before the
+    /// signal and then wait forever.
+    stop: AtomicBool,
+}
+
+impl DrawableProvider {
+    fn start(layer: &metal::MetalLayerRef) -> Option<Self> {
+        let shared = Arc::new(DrawableShared {
+            slot: Mutex::new(None),
+            emptied: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let layer = layer.to_owned();
+        thread::Builder::new()
+            .name("drawable provider".into())
+            .spawn({
+                let shared = shared.clone();
+                move || {
+                    let mut slot = shared.slot.lock();
+                    loop {
+                        if shared.stop.load(atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        // The layer has no usable size until the window's first layout.
+                        let size = layer.drawable_size();
+                        if slot.is_none() && size.width > 0. && size.height > 0. {
+                            drop(slot);
+                            // The wait for a free drawable happens here, off the
+                            // main thread. A nil is the layer's one-second timeout
+                            // (see configure_layer); loop around and try again.
+                            // This thread has no autorelease pool of its own.
+                            let drawable = objc2::rc::autoreleasepool(|_| {
+                                layer.next_drawable().map(|drawable| drawable.to_owned())
+                            });
+                            slot = shared.slot.lock();
+                            if drawable.is_some() {
+                                *slot = drawable;
+                            }
+                        } else {
+                            // Hold at most one drawable, fetched at the layer's
+                            // current size; a second would shrink the pool that
+                            // frames draw from.
+                            shared.emptied.wait(&mut slot);
+                        }
+                    }
+                }
+            })
+            .log_err()
+            .map(|_| Self { shared })
+    }
+
+    /// The drawable fetched ahead, if one is ready. Wakes the helper to fetch
+    /// the next.
+    fn take(&self) -> Option<metal::MetalDrawable> {
+        let drawable = self.shared.slot.lock().take();
+        if drawable.is_some() {
+            self.shared.emptied.notify_all();
+        }
+        drawable
+    }
+
+    /// Drops a drawable fetched before a resize; its texture has the old size.
+    /// Also wakes the helper out of its initial no-size wait.
+    fn discard(&self) {
+        *self.shared.slot.lock() = None;
+        self.shared.emptied.notify_all();
+    }
+}
+
+impl Drop for DrawableProvider {
+    fn drop(&mut self) {
+        {
+            let mut slot = self.shared.slot.lock();
+            self.shared.stop.store(true, atomic::Ordering::SeqCst);
+            *slot = None;
+        }
+        self.shared.emptied.notify_all();
+        // The thread can be inside `nextDrawable`; the layer's one-second timeout
+        // bounds that wait, so it exits on its own instead of blocking whoever
+        // drops the renderer.
+    }
+}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
+    drawable_provider: Option<DrawableProvider>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -186,9 +299,12 @@ impl MetalRenderer {
         #[cfg(all(feature = "test-support", debug_assertions))]
         layer.set_framebuffer_only(false);
         // metal-rs doesn't bind these setters, so view the same object through
-        // objc2's typed CAMetalLayer binding.
+        // objc2's typed CAMetalLayer binding. The timeout stays enabled (one
+        // second): the drawable provider's thread must notice window teardown
+        // while it waits, and an unbounded wait can hang the whole process when
+        // the pool stays exhausted (zed-industries/zed#53390).
         let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
-        objc2_layer.setAllowsNextDrawableTimeout(false);
+        objc2_layer.setAllowsNextDrawableTimeout(true);
         objc2_layer.setNeedsDisplayOnBoundsChange(true);
         // UIKit sizes a view's backing layer itself; only AppKit-hosted
         // layers need to track their superlayer's bounds.
@@ -364,10 +480,14 @@ impl MetalRenderer {
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
+        let drawable_provider = layer
+            .as_ref()
+            .and_then(|layer| DrawableProvider::start(layer.as_ref()));
 
         Self {
             device,
             layer,
+            drawable_provider,
             presents_with_transaction: false,
             is_apple_gpu,
             is_unified_memory,
@@ -418,6 +538,10 @@ impl MetalRenderer {
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
+        }
+        // A drawable fetched before this resize has the old size; drop it.
+        if let Some(provider) = &self.drawable_provider {
+            provider.discard();
         }
         self.update_path_intermediate_textures(size);
     }
@@ -471,14 +595,29 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// The drawable the helper thread fetched ahead, unless a resize made its
+    /// texture stale. The layer's size is always set to whole pixels, so the
+    /// comparison is exact. A dropped stale drawable wakes the helper to fetch
+    /// one at the current size.
+    fn take_drawable(&self, viewport_size: Size<DevicePixels>) -> Option<metal::MetalDrawable> {
+        let drawable = self.drawable_provider.as_ref()?.take()?;
+        let texture = drawable.texture();
+        (texture.width() == viewport_size.width.0 as u64
+            && texture.height() == viewport_size.height.0 as u64)
+            .then_some(drawable)
+    }
+
+    /// Renders the scene into the next drawable and presents it. Returns false
+    /// when no drawable was ready and the frame was skipped; the window retries
+    /// it on a later display tick.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return false;
             }
         };
         let viewport_size = layer.drawable_size();
@@ -486,21 +625,34 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
+        // AppKit's transaction-backed redraws (window activation, displayLayer)
+        // must present inside the transaction, so they keep waiting on the pool.
+        // Any other frame skips rather than wait out an exhausted pool on the
+        // main thread. Without a provider (its thread failed to spawn) there is
+        // no choice but to wait.
+        let wait_for_pool = self.presents_with_transaction || self.drawable_provider.is_none();
+        let drawable = if let Some(drawable) = self.take_drawable(viewport_size) {
             drawable
+        } else if wait_for_pool {
+            match layer.next_drawable() {
+                Some(drawable) => drawable.to_owned(),
+                None => {
+                    log::error!(
+                        "failed to retrieve next drawable, drawable size: {:?}",
+                        viewport_size
+                    );
+                    return false;
+                }
+            }
         } else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return;
+            return false;
         };
 
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
-                return;
+                return false;
             }
         };
 
@@ -509,9 +661,10 @@ impl MetalRenderer {
             command_buffer.wait_until_scheduled();
             drawable.present();
         } else {
-            command_buffer.present_drawable(drawable);
+            command_buffer.present_drawable(&drawable);
             command_buffer.commit();
         }
+        true
     }
 
     fn render_frame(
@@ -1669,5 +1822,68 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn test_layer() -> metal::MetalLayer {
+        let device = metal::Device::system_default().expect("a Metal device");
+        let layer = metal::MetalLayer::new();
+        layer.set_device(&device);
+        layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        layer.set_opaque(true);
+        layer.set_maximum_drawable_count(3);
+        let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
+        objc2_layer.setAllowsNextDrawableTimeout(true);
+        layer.set_drawable_size(CGSize::new(64., 64.));
+        layer
+    }
+
+    fn take_within(provider: &DrawableProvider, timeout: Duration) -> metal::MetalDrawable {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(drawable) = provider.take() {
+                return drawable;
+            }
+            assert!(Instant::now() < deadline, "no drawable arrived");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn drawable_provider_fetches_drawables_off_the_calling_thread() {
+        let layer = test_layer();
+        let provider = DrawableProvider::start(&layer).expect("provider thread");
+
+        let drawable = take_within(&provider, Duration::from_secs(5));
+        assert_eq!(drawable.texture().width(), 64);
+        drop(drawable);
+
+        // Once the slot empties, the helper fetches another.
+        let drawable = take_within(&provider, Duration::from_secs(5));
+        assert_eq!(drawable.texture().width(), 64);
+        drop(drawable);
+
+        // Dropping the provider stops the thread instead of leaking it; the
+        // layer's timeout bounds a `nextDrawable` wait in progress.
+        drop(provider);
+    }
+
+    #[test]
+    fn drawable_provider_waits_for_a_layer_size() {
+        let layer = test_layer();
+        layer.set_drawable_size(CGSize::new(0., 0.));
+        let provider = DrawableProvider::start(&layer).expect("provider thread");
+        // A zero-sized layer has nothing to fetch.
+        assert!(provider.take().is_none());
+
+        layer.set_drawable_size(CGSize::new(32., 32.));
+        provider.discard();
+        let drawable = take_within(&provider, Duration::from_secs(5));
+        assert_eq!(drawable.texture().width(), 32);
     }
 }

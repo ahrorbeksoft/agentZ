@@ -73,6 +73,12 @@ script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─►
 
 agentZ's own crates. Everything else in `crates/` is copied from Zed at the same relative path.
 
+The copies match Zed except here: `gpui_apple`'s `MetalRenderer` fetches drawables on a helper
+thread (`DrawableProvider`) and skips a present when none is ready, and `gpui_macos`'s window
+retries it on the next display tick (`present_skipped`). Zed waits in `nextDrawable` on the main
+thread; fullscreen, while a spinner or shimmer redraws every frame, that wait took most of each
+frame and made scrolling lag (zed-industries/zed#7940). Keep this when updating those crates.
+
 | Crate | What it is |
 |---|---|
 | `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
