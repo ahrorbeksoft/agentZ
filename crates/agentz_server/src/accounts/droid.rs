@@ -68,6 +68,9 @@ pub(super) fn description() -> AgentDescription {
 /// (`🔐`, `%`, `↻`, the bars), numbers, emails and ids. The only keys sent are the two commands,
 /// Enter to run them (and to trust `folder`), and Esc: Enter in `/limits` would change what
 /// Droid does at a limit.
+///
+/// Droid opens a session each time it starts, and keeps it in its own indexes of sessions even
+/// once its files are deleted, so reads resume the one session a past read opened in the home.
 pub(super) async fn read(agent: AgentCommand, folder: &Path) -> Result<Read> {
     std::fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
     // Droid asks about the folder, and keeps its sessions, by its real path (`/private/tmp`
@@ -89,14 +92,31 @@ pub(super) async fn read(agent: AgentCommand, folder: &Path) -> Result<Read> {
         .cloned()
         .collect();
     args.extend(["--settings".into(), settings.to_string_lossy().into_owned()]);
+    let sessions = sessions_folder(&agent, &folder);
+    let resumed = reads_sessions(&sessions, &folder)
+        .context("finding the session Droid opened for past reads")
+        .log_err()
+        .and_then(|sessions| sessions.into_iter().next());
+    if let Some(resumed) = &resumed {
+        args.extend(["--resume".into(), resumed.clone()]);
+    }
     let mut terminal = HiddenTerminal::start(&agent, args, folder.clone(), SCREEN)?;
     let mut session = None;
     let read = read_screens(&mut terminal, &folder, &mut session).await;
     terminal.end(END_TIMEOUT).await;
-    if let Some(session) = session {
-        remove_sessions(&sessions_folder(&agent), &session, &folder)
-            .context("removing the sessions Droid opened to read accounts")
-            .log_err();
+    match (&read, session, resumed) {
+        (Ok(_), Some(session), _) => {
+            keep_only_session(&sessions, &session, &folder)
+                .context("removing the other sessions Droid opened to read accounts")
+                .log_err();
+        }
+        // The session may be why it failed: the next read opens a new one.
+        (Err(_), _, Some(resumed)) => {
+            remove_session(&sessions, &resumed)
+                .context("removing the session Droid opened to read accounts")
+                .log_err();
+        }
+        _ => {}
     }
     read
 }
@@ -391,15 +411,19 @@ fn dollars(text: &str) -> Option<f64> {
     number.parse().ok()
 }
 
-/// Where Droid keeps the sessions of the home `agent` runs in.
-fn sessions_folder(agent: &AgentCommand) -> PathBuf {
+/// Where Droid keeps the sessions it opens in `folder` (a real path) in the home `agent` runs
+/// in: a folder named by the path, with `-` for each `/`.
+fn sessions_folder(agent: &AgentCommand, folder: &Path) -> PathBuf {
     let home = agent
         .env
         .get("FACTORY_HOME_OVERRIDE")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("FACTORY_HOME_OVERRIDE").map(PathBuf::from))
         .unwrap_or_else(|| util::paths::home_dir().clone());
-    home.join(".factory").join("sessions")
+    let name = folder.to_string_lossy().trim_matches('/').replace('/', "-");
+    home.join(".factory")
+        .join("sessions")
+        .join(format!("-{name}"))
 }
 
 /// The first line of a session's log.
@@ -416,42 +440,20 @@ fn session_start(log: &Path) -> Result<SessionStart> {
         .with_context(|| format!("reading {}", log.display()))
 }
 
-/// Deletes the sessions reads opened, once the one this read opened (`session`) is found in
-/// `sessions`: the folder it's in keeps `folder`'s sessions, which are all reads', those of
-/// reads that failed too. Only those whose log says they were opened in `folder` go.
-fn remove_sessions(sessions: &Path, session: &str, folder: &Path) -> Result<()> {
-    let projects = match std::fs::read_dir(sessions) {
-        Ok(projects) => projects,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+/// The ids of the sessions in `sessions` whose logs say they were opened in `folder`, which
+/// are reads', in order.
+fn reads_sessions(sessions: &Path, folder: &Path) -> Result<Vec<String>> {
+    let logs = match std::fs::read_dir(sessions) {
+        Ok(logs) => logs,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(error).with_context(|| format!("reading {}", sessions.display()));
         }
     };
-    let mut project = None;
-    for entry in projects {
-        let entry = entry.with_context(|| format!("reading {}", sessions.display()))?;
-        // Droid keeps other files there too (`.favorites`).
-        if entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && entry.path().join(format!("{session}.jsonl")).is_file()
-        {
-            project = Some(entry.path());
-            break;
-        }
-    }
-    let Some(project) = project else {
-        return Ok(());
-    };
-    let start = session_start(&project.join(format!("{session}.jsonl")))?;
-    anyhow::ensure!(
-        start.id == session && start.cwd == folder,
-        "{} doesn't keep the reads' sessions",
-        project.display()
-    );
-    let logs =
-        std::fs::read_dir(&project).with_context(|| format!("reading {}", project.display()))?;
+    let mut ids = Vec::new();
     for log in logs {
         let log = log
-            .with_context(|| format!("reading {}", project.display()))?
+            .with_context(|| format!("reading {}", sessions.display()))?
             .path();
         let Some(id) = log
             .file_name()
@@ -459,24 +461,43 @@ fn remove_sessions(sessions: &Path, session: &str, folder: &Path) -> Result<()> 
         else {
             continue;
         };
-        if session_start(&log)?.cwd != folder {
+        let Some(start) = session_start(&log).log_err() else {
             continue;
-        }
-        for path in [log.clone(), project.join(format!("{id}.settings.json"))] {
-            match std::fs::remove_file(&path) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error).with_context(|| format!("removing {}", path.display()));
-                }
-                _ => {}
-            }
+        };
+        if start.id == id && start.cwd == folder {
+            ids.push(id.to_string());
         }
     }
-    let is_empty = std::fs::read_dir(&project)
-        .with_context(|| format!("reading {}", project.display()))?
-        .next()
-        .is_none();
-    if is_empty {
-        std::fs::remove_dir(&project).with_context(|| format!("removing {}", project.display()))?;
+    ids.sort();
+    Ok(ids)
+}
+
+/// Deletes the sessions reads opened other than `session`, the one this read used: those of
+/// reads that failed, or that Droid didn't resume.
+fn keep_only_session(sessions: &Path, session: &str, folder: &Path) -> Result<()> {
+    let ids = reads_sessions(sessions, folder)?;
+    anyhow::ensure!(
+        ids.iter().any(|id| id == session),
+        "{} doesn't keep the reads' sessions",
+        sessions.display()
+    );
+    for id in ids.iter().filter(|id| *id != session) {
+        remove_session(sessions, id)?;
+    }
+    Ok(())
+}
+
+fn remove_session(sessions: &Path, id: &str) -> Result<()> {
+    for path in [
+        sessions.join(format!("{id}.jsonl")),
+        sessions.join(format!("{id}.settings.json")),
+    ] {
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("removing {}", path.display()));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -615,46 +636,65 @@ mod tests {
         assert_eq!(reset_after(""), None);
     }
 
+    fn write_session(sessions: &Path, id: &str, cwd: &Path) {
+        std::fs::create_dir_all(sessions).expect("create");
+        let start = serde_json::json!({"type": "session_start", "id": id, "cwd": cwd});
+        std::fs::write(sessions.join(format!("{id}.jsonl")), format!("{start}\n")).expect("write");
+        std::fs::write(sessions.join(format!("{id}.settings.json")), "{}").expect("write");
+    }
+
     #[test]
-    fn only_the_reads_sessions_are_removed() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let sessions = dir.path().join("sessions");
-        let reader = sessions.join("-reader");
-        let work = sessions.join("-work");
-        let folder = Path::new("/data/accounts/factory-droid/reader");
-        let write_session = |project: &Path, id: &str, cwd: &str| {
-            std::fs::create_dir_all(project).expect("create");
-            let start = serde_json::json!({"type": "session_start", "id": id, "cwd": cwd});
-            std::fs::write(project.join(format!("{id}.jsonl")), format!("{start}\n"))
-                .expect("write");
-            std::fs::write(project.join(format!("{id}.settings.json")), "{}").expect("write");
+    fn reads_keep_one_session() {
+        let agent = AgentCommand {
+            env: [("FACTORY_HOME_OVERRIDE".to_string(), "/home".to_string())]
+                .into_iter()
+                .collect(),
+            ..AgentCommand::default()
         };
-        let exists = |project: &Path, id: &str| project.join(format!("{id}.jsonl")).exists();
+        assert_eq!(
+            sessions_folder(
+                &agent,
+                Path::new("/Users/me/Application Support/agentZ/reader")
+            ),
+            Path::new("/home/.factory/sessions/-Users-me-Application Support-agentZ-reader")
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sessions = dir.path().join("-reader");
+        let folder = Path::new("/data/accounts/factory-droid/reader");
+        let exists = |id: &str| sessions.join(format!("{id}.jsonl")).exists();
         let failed_read = "00000000-0000-4000-8000-000000000002";
         let elsewhere = "00000000-0000-4000-8000-000000000003";
-        let work_session = "00000000-0000-4000-8000-000000000004";
-        write_session(&reader, SESSION, &folder.to_string_lossy());
-        write_session(&reader, failed_read, &folder.to_string_lossy());
-        write_session(&reader, elsewhere, "/Users/me/elsewhere");
-        write_session(&work, work_session, "/Users/me/work");
-        std::fs::write(sessions.join(".favorites"), "[]").expect("write");
+        write_session(&sessions, failed_read, folder);
+        write_session(&sessions, SESSION, folder);
+        write_session(&sessions, elsewhere, Path::new("/Users/me/elsewhere"));
+        std::fs::write(sessions.join("broken.jsonl"), "").expect("write");
+        assert_eq!(
+            reads_sessions(&sessions, folder).expect("sessions"),
+            [SESSION, failed_read]
+        );
 
-        remove_sessions(&sessions, work_session, folder).expect_err("not a read's session");
-        assert!(exists(&work, work_session));
-        remove_sessions(&sessions, SESSION, folder).expect("remove");
-        assert!(!exists(&reader, SESSION));
-        assert!(!reader.join(format!("{SESSION}.settings.json")).exists());
-        assert!(!exists(&reader, failed_read));
-        assert!(exists(&reader, elsewhere));
-        assert!(exists(&work, work_session));
+        keep_only_session(&sessions, elsewhere, folder).expect_err("not a read's session");
+        assert!(exists(failed_read));
+        keep_only_session(&sessions, SESSION, folder).expect("keep one");
+        assert!(exists(SESSION));
+        assert!(!exists(failed_read));
+        assert!(
+            !sessions
+                .join(format!("{failed_read}.settings.json"))
+                .exists()
+        );
+        assert!(exists(elsewhere));
 
-        std::fs::remove_file(reader.join(format!("{elsewhere}.jsonl"))).expect("remove");
-        std::fs::remove_file(reader.join(format!("{elsewhere}.settings.json"))).expect("remove");
-        write_session(&reader, SESSION, &folder.to_string_lossy());
-        remove_sessions(&sessions, SESSION, folder).expect("remove");
-        assert!(!reader.exists());
-        remove_sessions(&sessions, SESSION, folder).expect("already gone");
-        remove_sessions(&dir.path().join("none"), SESSION, folder).expect("no sessions");
+        remove_session(&sessions, SESSION).expect("remove");
+        assert!(!exists(SESSION));
+        assert!(!sessions.join(format!("{SESSION}.settings.json")).exists());
+        remove_session(&sessions, SESSION).expect("already gone");
+        assert!(
+            reads_sessions(&dir.path().join("none"), folder)
+                .expect("no sessions")
+                .is_empty()
+        );
     }
 
     /// Droid's terminal UI as the reader sees it: the captured screens, in turn, each after
@@ -665,8 +705,12 @@ import json, os, sys, time, tty
 screens = os.environ["DROID_SCREENS"]
 cwd = os.getcwd()
 session = "00000000-0000-4000-8000-000000000001"
+resumes = "--resume" in sys.argv
 with open("args.json", "w") as file:
     json.dump(sys.argv[1:], file)
+if os.environ.get("DROID_BROKEN"):
+    print("It broke")
+    sys.exit(1)
 
 def show(name, command=None):
     with open(os.path.join(screens, name + ".txt")) as file:
@@ -689,20 +733,24 @@ tty.setraw(0)
 if os.environ.get("DROID_LOGGED_OUT"):
     show("logged-out")
     time.sleep(60)
-show("trust")
-expect("\r")
+# A folder it opened a session in is trusted.
+if not resumes:
+    show("trust")
+    expect("\r")
+    project = os.path.join(
+        os.environ["FACTORY_HOME_OVERRIDE"], ".factory", "sessions", "-" + cwd.strip("/").replace("/", "-")
+    )
+    os.makedirs(project, exist_ok=True)
+    with open(os.path.join(project, session + ".jsonl"), "w") as file:
+        file.write(json.dumps({"type": "session_start", "id": session, "cwd": cwd}) + "\n")
+    with open(os.path.join(project, session + ".settings.json"), "w") as file:
+        file.write("{}")
 show("ready")
 expect("/status")
 show("menu-status-unfiltered")
 time.sleep(0.3)
 show("menu-limits", "/status")
 expect("\r")
-project = os.path.join(os.environ["FACTORY_HOME_OVERRIDE"], ".factory", "sessions", "-reader")
-os.makedirs(project, exist_ok=True)
-with open(os.path.join(project, session + ".jsonl"), "w") as file:
-    file.write(json.dumps({"type": "session_start", "id": session, "cwd": cwd}) + "\n")
-with open(os.path.join(project, session + ".settings.json"), "w") as file:
-    file.write("{}")
 show("status")
 expect("\x1b")
 show("ready")
@@ -754,26 +802,51 @@ time.sleep(60)
         let Some(agent) = fake_droid(dir.path(), &home) else {
             return;
         };
+        let args = || -> Vec<String> {
+            serde_json::from_str(&std::fs::read_to_string(folder.join("args.json")).expect("args"))
+                .expect("json")
+        };
         let found = read(agent.clone(), &folder).await.expect("read");
         assert!(!folder.join("unexpected").exists());
         assert_eq!(found.logged_in, Some(true));
         assert_eq!(found.status.email.as_deref(), Some("work@example.com"));
         assert_eq!(found.status.windows.len(), 3);
 
-        let args: Vec<String> =
-            serde_json::from_str(&std::fs::read_to_string(folder.join("args.json")).expect("args"))
-                .expect("json");
-        let settings = std::fs::canonicalize(&folder)
-            .expect("folder")
-            .join(READER_SETTINGS_FILE);
-        assert_eq!(args, ["--settings", &*settings.to_string_lossy()]);
+        let real_folder = std::fs::canonicalize(&folder).expect("folder");
+        let settings = real_folder.join(READER_SETTINGS_FILE);
+        let settings = settings.to_string_lossy();
+        assert_eq!(args(), ["--settings", &*settings]);
         assert_eq!(
-            std::fs::read_to_string(&settings).expect("settings"),
+            std::fs::read_to_string(&*settings).expect("settings"),
             READER_SETTINGS
         );
-        // Its session is gone.
-        assert!(!home.join(".factory/sessions/-reader").exists());
-        assert!(home.join(".factory/sessions").exists());
+        let sessions = sessions_folder(&agent, &real_folder);
+        assert_eq!(
+            reads_sessions(&sessions, &real_folder).expect("sessions"),
+            [SESSION]
+        );
+
+        // The next read resumes its session, and removes one a failed read left.
+        let failed_read = "00000000-0000-4000-8000-000000000002";
+        write_session(&sessions, failed_read, &real_folder);
+        let found = read(agent.clone(), &folder).await.expect("read");
+        assert!(!folder.join("unexpected").exists());
+        assert_eq!(found.logged_in, Some(true));
+        assert_eq!(args(), ["--settings", &*settings, "--resume", SESSION]);
+        assert_eq!(
+            reads_sessions(&sessions, &real_folder).expect("sessions"),
+            [SESSION]
+        );
+
+        // A read that fails doesn't resume that session again.
+        let mut broken = agent.clone();
+        broken.env.insert("DROID_BROKEN".into(), "1".into());
+        read(broken, &folder).await.expect_err("it broke");
+        assert!(
+            reads_sessions(&sessions, &real_folder)
+                .expect("sessions")
+                .is_empty()
+        );
 
         let mut logged_out = agent;
         logged_out.env.insert("DROID_LOGGED_OUT".into(), "1".into());

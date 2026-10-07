@@ -37,10 +37,14 @@ Notes for whoever continues:
   on Standard Usage, and its windows are always drawn 5-hour, weekly, monthly, so they're
   named by position. It runs in `accounts/factory-droid/reader/`, answering the trust
   question once per home (for the External account, an entry in the user's own
-  `~/.factory/settings.json`), with cloud session sync off by `--settings`, and deletes its
-  sessions afterwards. Checked once against the real Droid (a new key home and the user's own
-  login): the same numbers as Factory's API, in 3 to 8 seconds; weekly and monthly resets are
-  only as exact as Droid's whole days. The limit choice stayed `droidCore`.
+  `~/.factory/settings.json`), with cloud session sync off by `--settings`. It resumes one
+  session per home instead of opening one each time: Droid keeps every session it opened in
+  `cache/session-discovery-index.json` and `cache/session-index/index.db` even after its files
+  are deleted, so deleting them after each read (the first version) grew those by one entry
+  every 5 minutes. Checked against the real Droid (a new key home and the user's own login):
+  the same numbers as Factory's API, in 3 to 8 seconds (a resumed read about 3, with no new
+  session or index entry); weekly and monthly resets are only as exact as Droid's whole
+  days. The limit choice stayed `droidCore`.
 - New Droid accounts start with `cloudSessionSync: false` in their `.factory/settings.json`
   (the user's request; Droid's `/settings` turns it back on). It's a description's
   `home_files`, written at `AddAccount`.

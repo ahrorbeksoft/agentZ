@@ -531,12 +531,14 @@ Each entry: what it does, where it lives, and where it comes from.
   (`🔐`, `%`, `↻`, the bars); the screens it's tested on are in `accounts/droid_screens/`, and
   a fake Droid in its tests shows them in turn. It answers the folder trust question for that
   folder only, sends Esc and never Enter in `/limits` (Enter there changes the limit choice),
-  runs with `--settings` turning cloud session sync off, and then deletes the sessions it
-  opened, which are all those opened in that folder. An agentZ account's agent runs in the
-  account's folder, `accounts/<agent id>/<account id>/`, so every account is a process of its
-  own with its own login and sessions: its threads, login sessions (`OpenLoginSession`) and
-  session listing and import (`ListAgentSessions`, `ImportAgentSessions`) all take the
-  account. Only
+  runs with `--settings` turning cloud session sync off, and resumes (`--resume`) the one
+  session a past read opened in that folder: Droid opens a session each time it starts and
+  keeps it in its own session indexes even once its files are deleted. A read removes any
+  other session opened in that folder, and a read that fails removes the one it resumed. An
+  agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
+  so every account is a process of its own with its own login and sessions: its threads,
+  login sessions (`OpenLoginSession`) and session listing and import (`ListAgentSessions`,
+  `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
   `accounts/droid.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the switches that keep
