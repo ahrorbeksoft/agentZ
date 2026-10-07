@@ -18,6 +18,9 @@ Notes for whoever continues:
   pitfall now allows status commands and points at kind 7, which comes with wave 3.
 - Importing skills and servers from another machine isn't on the design board yet: add a topic
   and let the user pick before building item 26.
+- The agents' own skills and MCP servers are never imported (the user's answer, which dropped
+  item 23): they stay as the agent has them, and may be agent-specific. agentZ only adds its
+  own, for every agent (items 22, 24, 25).
 - Login checks (item 5) are an empty session (`LoginCheck::Session`, Droid's) or the agent's
   status command (`LoginCheck::Command`). The other two in plan.md › Login checks come with
   the agents that need them: an empty model list with Devin (17), a key agentZ holds with GLM
@@ -109,7 +112,7 @@ Notes for whoever continues:
 | 20 | 9 | Limit resets (Codex) | |
 | 21 | 10 | Extra usage switch | |
 | 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | |
-| 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | |
+| 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | dropped |
 | 24 | 19 | Settings › MCP Servers, passed to every session | |
 | 25 | 20 | The accounts menu on each skill and server | |
 | 26 | | Importing skills and servers from another machine (board topic first) | |

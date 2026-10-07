@@ -25,7 +25,7 @@ homes, or read from their source and docs. Anything not tested is marked *(unver
 - **One generic account manager.** It works for any agent that can keep its login in a folder
   agentZ chooses. Adding an agent means describing it, not writing a new feature.
 - **Skills and MCP servers managed in agentZ**, loaded by every agent and every account unless
-  kept to some accounts (§20).
+  kept to some accounts (§20). The agents' own skills and MCP servers stay as they are.
 - **Every agent where it makes sense**, mostly the ones with subscriptions.
 
 ## Which agents it makes sense for
@@ -340,10 +340,9 @@ Any action that spends a reset or can bill money asks first. What the design rou
   Settings shows why.
 - Links are synced when a skill is added or removed, when an account is created, and when the
   server starts. New sessions pick them up.
-- Existing skills are imported. When agentZ's skills folder is first made, the server copies
-  in every skill it finds in the agents' normal homes and in `~/.agents/skills`; the originals
-  stay where they are. A name it already has is skipped. An agent that has the original then
-  skips agentZ's copy (the clash rule above), and every other agent and account gets it.
+- Skills already in the agents' homes or in `~/.agents/skills` aren't imported (the user's
+  answer): they stay the agent's own, and may only suit that agent. agentZ's page only adds
+  skills of its own, for every agent.
 - Skills are per machine, like agent settings. Settings can import them from another of the
   user's machines, as a copy.
 - Each skill and MCP server has an accounts menu on its row: "Every account" at first, or the
@@ -352,8 +351,8 @@ Any action that spends a reset or can bill money asks first. What the design rou
   server is passed only to their sessions.
 - agentZ doesn't write into the shared `~/.agents/skills`. Many agents read it whatever their
   home: Codex, Devin, Grok, OpenCode, Kilo, Qoder, Amp, Cline and others. Skills already there
-  show up in every account of those agents, and the import above makes them reach Droid,
-  Claude and Cursor accounts, which don't read it.
+  show up in every account of those agents, and not in Droid, Claude and Cursor accounts,
+  which don't read it.
 
 ### MCP servers
 
@@ -362,6 +361,8 @@ Any action that spends a reset or can bill money asks first. What the design rou
   agents that can't take it. Add Server offers Add Local Server (name, command, arguments,
   environment variables) and Add Remote Server (URL and headers), each a dialog.
 - MCP servers are per machine too, and can be imported from another machine, as skills can.
+  The servers in the agents' own configs aren't imported (the user's answer): those stay the
+  agent's own.
 - The server adds them to the `mcpServers` of every `session/new` and `session/load`, beside
   agentZ's own `agentz` server (`server.rs`, where `agent_control` is added). This is how Zed
   passes its context servers. It covers every agent and account without editing their config
@@ -407,9 +408,6 @@ Decided in the design round; `decisions.md` is the spec. In short:
 - A new account copies the settings and the agent's settings files of the account picked in
   "Copy settings from" (but no login), and drops a copied default its first session doesn't
   offer.
-- Importing existing skills, run on temporary stand-ins for the agents' homes and
-  `~/.agents/skills`, copies them once, leaves the originals, and skips names agentZ already
-  has.
 - Continue at reset: a thread stopped by a limit gets its message sent when the window resets
   (the clock is advanced in the test).
 
@@ -630,7 +628,8 @@ Decided by the user:
 - The agent's own login is the External account, listed only while it's logged in; everything
   else lives in agentZ's homes (see The home folder).
 - Quota refreshes every 5 minutes, after each turn ends, and on demand (§5).
-- Existing skills are imported into agentZ (see Skills).
+- The agents' own skills and MCP servers aren't imported: their configs stay as they are, and
+  may be agent-specific. agentZ only adds skills and servers of its own, for every agent.
 - Agents that need HOME moved get links to the user's `.gitconfig`, `.ssh` and `.config`.
 - agentZ may read an agent's stored login where that's the only quota source (reader kind 7).
 - Skills and MCP servers are per machine, and can be imported from another machine.
@@ -639,6 +638,4 @@ Decided by the user:
   separate extra usage switch.
 - The waves are in the right order. Gemini CLI is deprecated, so it's skipped.
 
-Still open:
-
-1. Should the MCP servers in the agents' own configs be imported too, as skills are?
+Nothing is open.
