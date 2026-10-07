@@ -8,11 +8,11 @@ use std::time::{Duration, Instant, SystemTime};
 use agentz_protocol::Response;
 use agentz_protocol::accounts::{AccountId, OveragePreference, StatusRead};
 use agentz_protocol::agents::{AgentId, InstallState};
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use util::ResultExt as _;
 
 use super::{ClientId, Input, Server};
-use crate::accounts::{self, Read, Reader};
+use crate::accounts::{self, LimitResetOutcome, LimitResetUse, Read, Reader};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A refresh reads the accounts not read for this long. Less than the interval, so an account
@@ -162,6 +162,81 @@ impl Server {
             });
             server.respond(client, id, switched);
         });
+    }
+
+    /// Uses one of the account's limit resets through its reader, answered with the outcome.
+    /// Tries of one use share an attempt, kept until the agent answers it (t3code's
+    /// `ResetCreditCoordinator`), so one that timed out and is tried again can't spend twice.
+    pub(super) fn use_limit_reset(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+    ) {
+        let reader = self.limit_reset_reader(&agent_id, account);
+        let reader = match reader {
+            Ok(reader) => reader,
+            Err(error) => return self.respond(client, id, Err(error)),
+        };
+        let attempt = self
+            .limit_reset_attempts
+            .entry((agent_id.clone(), account))
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        let command = self.agent_command(&agent_id, account, true);
+        let http = self.http_client.clone();
+        let folder = accounts::reader_folder(&self.data_dir, &agent_id);
+        let lock = self.account_lock(&agent_id, account);
+        let reset = {
+            let attempt = attempt.clone();
+            async move {
+                let _held = lock.lock().await;
+                reader
+                    .use_limit_reset(command.await?, http, &folder?, &attempt)
+                    .await
+            }
+        };
+        self.spawn_then(reset, move |server, used: Result<LimitResetUse>| {
+            let answer = used.and_then(|used| {
+                let key = (agent_id.clone(), account);
+                // A later click has its own attempt once this one is answered.
+                if server.limit_reset_attempts.get(&key) == Some(&attempt) {
+                    server.limit_reset_attempts.remove(&key);
+                }
+                if let Some(read) = used
+                    .read
+                    .with_context(|| format!("reading {agent_id}'s usage after a reset"))
+                    .log_err()
+                {
+                    server.keep_read(&agent_id, account, read);
+                }
+                match used.outcome {
+                    LimitResetOutcome::Reset | LimitResetOutcome::AlreadyRedeemed => {
+                        Ok(Response::Ok)
+                    }
+                    LimitResetOutcome::NothingToReset => {
+                        Err(anyhow!("no limit is used enough to reset yet"))
+                    }
+                    LimitResetOutcome::NoCredit => Err(anyhow!("the account has no resets left")),
+                }
+            });
+            server.respond(client, id, answer);
+        });
+    }
+
+    /// The reader of an account whose last read says it has a limit reset.
+    fn limit_reset_reader(&self, agent_id: &AgentId, account: Option<AccountId>) -> Result<Reader> {
+        let accounts = self.accounts.get(agent_id);
+        if let Some(id) = account {
+            accounts.account(id).context("there's no such account")?;
+        }
+        accounts
+            .status(account)
+            .and_then(|read| read.status.limit_resets)
+            .context("the account has no limit resets")?;
+        self.usage_reader(agent_id, account)
+            .with_context(|| format!("agentZ can't read {}'s usage", self.agent_name(agent_id)))
     }
 
     /// The reader of an account whose last read says it can change what Droid does at a limit.

@@ -152,6 +152,68 @@ impl Reader {
             }
         }
     }
+
+    /// Uses one of the account's limit resets (decisions.md §9), then reads it. `attempt` is
+    /// the same for every try of one use, so a retry can't spend a second reset.
+    pub async fn use_limit_reset(
+        &self,
+        agent: AgentCommand,
+        http: Arc<dyn HttpClient>,
+        folder: &Path,
+        attempt: &str,
+    ) -> Result<LimitResetUse> {
+        match self {
+            Reader::CodexAppServer => super::codex::use_limit_reset(agent, folder, attempt).await,
+            // The mock agent's `--usage` uses one when given the attempt, and prints the outcome.
+            Reader::Command(command) => {
+                let mut using = agent.clone();
+                using
+                    .env
+                    .insert("AGENTZ_LIMIT_RESET_ATTEMPT".into(), attempt.into());
+                let output =
+                    run_with_account_env(command.program.as_deref(), &command.args, using).await?;
+                if !output.status.success() {
+                    bail!("it exited with {}", output.status);
+                }
+                let answer: OutcomeAnswer = serde_json::from_slice(&output.stdout)
+                    .context("its output isn't an outcome")?;
+                Ok(LimitResetUse {
+                    outcome: answer.outcome,
+                    read: self.read(agent, http, folder).await,
+                })
+            }
+            Reader::FactoryApi { .. }
+            | Reader::DroidTerminal
+            | Reader::ClaudeCode
+            | Reader::DevinTerminal => bail!("only Codex has limit resets"),
+        }
+    }
+}
+
+/// What came of using a limit reset, and the read after it.
+pub struct LimitResetUse {
+    pub outcome: LimitResetOutcome,
+    /// Apart from the outcome: the reset is used even if the read after it fails.
+    pub read: Result<Read>,
+}
+
+/// Codex's `ConsumeAccountRateLimitResetCreditOutcome`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LimitResetOutcome {
+    /// One was used, and the limits it covers cleared.
+    Reset,
+    /// No limit is used enough to reset.
+    NothingToReset,
+    /// The account has none left.
+    NoCredit,
+    /// This attempt already used one.
+    AlreadyRedeemed,
+}
+
+#[derive(Deserialize)]
+struct OutcomeAnswer {
+    outcome: LimitResetOutcome,
 }
 
 fn factory_key(agent: &AgentCommand) -> Result<&str> {

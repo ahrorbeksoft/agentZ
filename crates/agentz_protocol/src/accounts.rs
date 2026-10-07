@@ -89,6 +89,18 @@ pub struct AccountStatus {
     /// What the vendor does once the limits run out, where the account chooses it: Droid's
     /// "When limit is reached".
     pub overage: Option<Overage>,
+    /// Resets the vendor granted the account, each clearing its limits at once: Codex's.
+    /// `None` without any.
+    pub limit_resets: Option<LimitResets>,
+}
+
+/// An account's limit resets (decisions.md §9), as Codex's `rateLimitResetCredits` counts them.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitResets {
+    pub available: u32,
+    /// When the first of them expires.
+    #[serde(default)]
+    pub next_expires_at: Option<SystemTime>,
 }
 
 /// Limits that apply to some of an account's models.

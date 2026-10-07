@@ -55,8 +55,7 @@ Notes for whoever continues:
   in a temporary home) has no limits to read, and its read shows none. The API Key method
   takes the key in `authenticate` and Codex keeps it, so Codex has no key login. Window
   names and lengths are t3code's, as are the plans, without "ChatGPT … Subscription". Not
-  read: credits (none on the test account, and agentZ shows none yet), reset credits (item
-  20), other limits than `codex` (a model's own) and the `-c check_for_update_on_startup`
+  read: credits (none on the test account, and agentZ shows none yet), other limits than `codex` (a model's own) and the `-c check_for_update_on_startup`
   switch plan.md names, which only the terminal UI needs. Logging a new account in wasn't
   tried: it needs the user's browser.
 - Item 17 (Devin, `accounts/devin.rs`): both home variables move, since `XDG_CONFIG_HOME`'s
@@ -137,6 +136,27 @@ Notes for whoever continues:
   already `droidCore`); and the look of the card and notice, since this session couldn't
   take screenshots (no Screen Recording permission from inside agentZ's terminal). The
   layout is checked in headless tests only.
+- Item 20 (`accounts/codex.rs`, `Reader::use_limit_reset`, `server/usage_reads.rs`,
+  `usage_limits::render_limit_resets`, `ConfirmRequest::use_limit_reset`): Codex's
+  `account/rateLimits/read` has `rateLimitResetCredits`; the reader counts them as t3code
+  does (none unless the count is above 0; the next expiry is the earliest `expiresAt` of
+  the available ones). Use Reset sends `account/rateLimitResetCredit/consume` with an
+  idempotency key and no `creditId` (Codex picks, as in t3code), then reads the account
+  again in the same app-server. The server keeps one attempt per account until Codex
+  answers it (t3code's `ResetCreditCoordinator`), so a try that timed out and is tried again
+  can't spend a second reset; `alreadyRedeemed` counts as done, and `nothingToReset` and
+  `noCredit` are errors. A reset and a read of one account hold the same lock. The card's
+  line sits under its limits ("1 limit reset available · expires in 27d 23h", t3code's
+  duration), with `RotateCcw` for the mock's ticket, which agentZ's icons don't have. Use
+  Reset asks in agentZ's confirm dialog with the mock's text ("This clears Work's 5-hour and
+  weekly limits now (alex@acme.co, Codex). It uses your only reset and can't be undone.").
+  The notice offers Use Reset whenever the account has resets, and then sends the thread's
+  last message again, as Switch to Droid Core does. The gauge's popover has the card's line;
+  it closes for the question, and nothing goes again unless the thread is at its limit. The
+  mock's `limit_resets` file gives it resets. Not verified: no real reset was used (the
+  user's Codex has one, and using it can't be undone), so the request and its outcomes come
+  from t3code's copy of Codex's app-server schema and are tested against a fake app-server;
+  and the look of the line and dialog, checked in headless tests only (no screenshots).
 - `tests/browser.rs`'s `remote_agents_hand_their_login_pages_to_the_clients` failed once in
   a full run and passes alone: `agent_settings::write_json` writes `agents/settings.json` in
   place, and the test read it empty mid-write.
@@ -252,7 +272,7 @@ Notes for whoever continues:
 | 17 | | Wave 1: Devin | done |
 | 18 | 11 | Stop or Continue at reset, per account | done |
 | 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | done |
-| 20 | 9 | Limit resets (Codex) | |
+| 20 | 9 | Limit resets (Codex) | done |
 | 21 | 10 | Extra usage switch | |
 | 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | |
 | 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | dropped |

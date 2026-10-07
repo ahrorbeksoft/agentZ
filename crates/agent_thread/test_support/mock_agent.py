@@ -50,6 +50,12 @@ choice, which is the file's text: empty for none, "DroidCore" or "ExtraUsage". W
 one, prompts go on past the limit, as Droid's do. `--usage` with AGENTZ_OVERAGE_PREFERENCE set
 first saves that choice, as agentZ's Switch to Droid Core does through Droid.
 
+A `limit_resets` file in MOCK_HOME holds how many limit resets the home has, as Codex grants
+them: `--usage` reports them, the first expiring in 27 days. `--usage` with
+AGENTZ_LIMIT_RESET_ATTEMPT set uses one instead, clearing the window, and prints the outcome
+as Codex answers it: {"outcome": "reset"}, "nothingToReset" while none of the window is used,
+"noCredit" without any left, or "alreadyRedeemed" for the attempt that last used one.
+
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
 So are resource links (their URIs) and images (their MIME types). With MOCK_IMAGES set, it
@@ -104,6 +110,11 @@ RESETS_AT_FILE = (os.path.join(os.environ["MOCK_HOME"], "resets_at")
 # Droid's "When limit is reached", when the home has one.
 OVERAGE_FILE = (os.path.join(os.environ["MOCK_HOME"], "overage")
                 if os.environ.get("MOCK_HOME") else None)
+# How many limit resets the home has, and the attempt that last used one.
+LIMIT_RESETS_FILE = (os.path.join(os.environ["MOCK_HOME"], "limit_resets")
+                     if os.environ.get("MOCK_HOME") else None)
+LIMIT_RESET_ATTEMPT_FILE = (os.path.join(os.environ["MOCK_HOME"], "limit_reset_attempt")
+                            if os.environ.get("MOCK_HOME") else None)
 
 
 def stored_login():
@@ -136,6 +147,42 @@ def overage():
         return None
 
 
+def read_text(path):
+    try:
+        with open(path) as file:
+            return file.read().strip()
+    except (TypeError, OSError):
+        return None
+
+
+def limit_resets():
+    try:
+        return int(read_text(LIMIT_RESETS_FILE))
+    except (TypeError, ValueError):
+        return None
+
+
+def use_limit_reset(attempt):
+    """Codex's `account/rateLimitResetCredit/consume`."""
+    if attempt == read_text(LIMIT_RESET_ATTEMPT_FILE):
+        return "alreadyRedeemed"
+    available = limit_resets() or 0
+    if available <= 0:
+        return "noCredit"
+    if used_percent() == 0:
+        return "nothingToReset"
+    with open(LIMIT_RESETS_FILE, "w") as file:
+        file.write(str(available - 1))
+    with open(LIMIT_RESET_ATTEMPT_FILE, "w") as file:
+        file.write(attempt)
+    for path in (USAGE_FILE, RESETS_AT_FILE):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    return "reset"
+
+
 def stops_at_limit():
     return USAGE_FILE and used_percent() >= 100 and overage() not in ("DroidCore", "ExtraUsage")
 
@@ -164,6 +211,10 @@ if sys.argv[-1] == "--usage":
     if not stored_login():
         print(json.dumps({"logged_in": False}), flush=True)
         sys.exit(0)
+    if os.environ.get("AGENTZ_LIMIT_RESET_ATTEMPT"):
+        outcome = use_limit_reset(os.environ["AGENTZ_LIMIT_RESET_ATTEMPT"])
+        print(json.dumps({"outcome": outcome}), flush=True)
+        sys.exit(0)
     if os.environ.get("AGENTZ_OVERAGE_PREFERENCE") and OVERAGE_FILE:
         with open(OVERAGE_FILE, "w") as file:
             file.write(os.environ["AGENTZ_OVERAGE_PREFERENCE"])
@@ -181,6 +232,11 @@ if sys.argv[-1] == "--usage":
         read["credits"] = "$18.20"
         read["overage"] = {"preference": overage() or None, "can_change": True,
                            "extra_usage_allowed": True}
+    if limit_resets():
+        expires_at = int(time.time()) + 27 * 24 * 3600
+        read["limit_resets"] = {"available": limit_resets(),
+                                "next_expires_at": {"secs_since_epoch": expires_at,
+                                                    "nanos_since_epoch": 0}}
     print(json.dumps(read), flush=True)
     sys.exit(0)
 

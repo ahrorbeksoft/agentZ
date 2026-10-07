@@ -2,13 +2,14 @@
 //! and what's left, a bar of what's left with a hairline where even spending would be, and when
 //! it resets. Also the popover of the composer's usage gauge, which shows them.
 
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::{AccountId, LimitWindow};
+use agentz_protocol::accounts::{AccountId, LimitResets, LimitWindow};
 use agentz_protocol::agents::AgentId;
 use gpui::{
-    AnyElement, App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    KeyDownEvent, Subscription, relative,
+    AnyElement, App, ClickEvent, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, Hsla, KeyDownEvent, Subscription, relative,
 };
 use ui::{Tooltip, prelude::*};
 
@@ -101,6 +102,70 @@ pub(crate) fn render_balance(key: &str, credits: Option<&str>) -> AnyElement {
                 .weight(FontWeight::MEDIUM),
         )
         .into_any_element()
+}
+
+/// t3code's `ResetCredits` under an account's limits: how many limit resets it has and when
+/// the next expires, with Use Reset, which asks first.
+pub(crate) fn render_limit_resets(
+    key: &str,
+    resets: LimitResets,
+    using: bool,
+    now: SystemTime,
+    on_use: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let selector = format!("limit-resets-{key}");
+    let button_selector = format!("use-limit-reset-{key}");
+    h_flex()
+        .debug_selector(move || selector)
+        .gap_2()
+        .child(
+            Icon::new(IconName::RotateCcw)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        // Wraps rather than pushing the button out of a narrow popover.
+        .child(
+            div().flex_1().min_w_0().child(
+                Label::new(limit_resets_summary(resets, now))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .debug_selector(move || button_selector)
+                .child(
+                    Button::new(
+                        SharedString::from(format!("use-limit-reset-{key}")),
+                        if using { "Using Reset…" } else { "Use Reset" },
+                    )
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .disabled(using)
+                    .on_click(on_use),
+                ),
+        )
+        .into_any_element()
+}
+
+/// `1 limit reset available · expires in 27d 23h`.
+pub(crate) fn limit_resets_summary(resets: LimitResets, now: SystemTime) -> String {
+    let count = if resets.available == 1 {
+        "1 limit reset available".to_string()
+    } else {
+        format!("{} limit resets available", resets.available)
+    };
+    let expires_in = resets
+        .next_expires_at
+        .and_then(|expires_at| expires_at.duration_since(now).ok())
+        .filter(|remaining| !remaining.is_zero())
+        .map(format_duration);
+    match expires_in {
+        Some(expires_in) if resets.available == 1 => format!("{count} · expires in {expires_in}"),
+        Some(expires_in) => format!("{count} · the next expires in {expires_in}"),
+        None => count,
+    }
 }
 
 /// The fill is what's left; the hairline is the share of the window still to come, where
@@ -202,15 +267,24 @@ fn render_bar(
 }
 
 /// What the composer's usage gauge opens: the thread's account, its plan and its windows, and
-/// the agent's usage page.
+/// the agent's usage page, with the account's limit resets.
 pub(crate) struct UsagePopover {
     client: Entity<ServerClient>,
     agent_id: AgentId,
     /// `None` being the External one.
     account: Option<AccountId>,
     usage_page: Option<String>,
+    limit_reset: LimitResetAction,
     focus_handle: FocusHandle,
     _subscription: Subscription,
+}
+
+/// What the popover's Use Reset does: the thread asks first, so it closes the popover for the
+/// thread's dialog.
+#[derive(Clone)]
+pub(crate) struct LimitResetAction {
+    pub(crate) using: bool,
+    pub(crate) ask: Rc<dyn Fn(&mut Window, &mut App)>,
 }
 
 impl EventEmitter<DismissEvent> for UsagePopover {}
@@ -227,6 +301,7 @@ impl UsagePopover {
         agent_id: AgentId,
         account: Option<AccountId>,
         usage_page: Option<String>,
+        limit_reset: LimitResetAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -239,6 +314,7 @@ impl UsagePopover {
             agent_id,
             account,
             usage_page,
+            limit_reset,
             focus_handle,
             _subscription: subscription,
         }
@@ -300,6 +376,19 @@ impl Render for UsagePopover {
                 SystemTime::now(),
                 cx,
             ))
+            .children(entry.limit_resets.map(|resets| {
+                let ask = self.limit_reset.ask.clone();
+                div().pt_0p5().child(render_limit_resets(
+                    "gauge",
+                    resets,
+                    self.limit_reset.using,
+                    SystemTime::now(),
+                    cx.listener(move |_, _, window, cx| {
+                        cx.emit(DismissEvent);
+                        ask(window, cx);
+                    }),
+                ))
+            }))
     }
 }
 
@@ -429,5 +518,37 @@ mod tests {
             ..window
         };
         assert_eq!(format_resets_in(&without_reset, now), None);
+    }
+
+    #[test]
+    fn limit_resets_say_how_many_and_when_the_next_expires() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let hours = |hours: u64| Duration::from_secs(hours * 3600);
+        let one = LimitResets {
+            available: 1,
+            next_expires_at: Some(now + hours(27 * 24 + 23)),
+        };
+        assert_eq!(
+            limit_resets_summary(one, now),
+            "1 limit reset available · expires in 27d 23h"
+        );
+        let two = LimitResets {
+            available: 2,
+            next_expires_at: Some(now + hours(5)),
+        };
+        assert_eq!(
+            limit_resets_summary(two, now),
+            "2 limit resets available · the next expires in 5h 0m"
+        );
+        // Past its expiry, or without one, only the count.
+        assert_eq!(
+            limit_resets_summary(two, now + hours(6)),
+            "2 limit resets available"
+        );
+        let never = LimitResets {
+            next_expires_at: None,
+            ..one
+        };
+        assert_eq!(limit_resets_summary(never, now), "1 limit reset available");
     }
 }

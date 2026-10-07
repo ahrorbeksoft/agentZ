@@ -5,14 +5,16 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::{AccountStatus, LimitWindow};
+use agentz_protocol::accounts::{AccountStatus, LimitResets, LimitWindow};
 use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use util::ResultExt as _;
 
 use super::login_checks::account_command;
-use super::readers::Read;
+use super::readers::{LimitResetOutcome, LimitResetUse, Read};
 use super::{AgentDescription, LoginCheck, Reader};
 
 /// The adapter runs Codex itself with the arguments after this one.
@@ -23,8 +25,11 @@ const APP_SERVER: &str = "app-server";
 const INITIALIZE_REQUEST: u64 = 1;
 const ACCOUNT_REQUEST: u64 = 2;
 const RATE_LIMITS_REQUEST: u64 = 3;
+const CONSUME_REQUEST: u64 = 4;
 /// It asks OpenAI for the limits, in 2 to 3 seconds.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// t3code gives the reset alone 20 seconds; the read after it comes in the same run.
+const RESET_TIMEOUT: Duration = Duration::from_secs(50);
 /// The limit every model counts against. Others, such as one model's own, come beside it.
 const MAIN_LIMIT: &str = "codex";
 const SESSION_MINUTES: u64 = 5 * 60;
@@ -59,62 +64,149 @@ pub(super) fn description() -> AgentDescription {
 /// logged in from `account/read`, and the limits from `account/rateLimits/read`, as Codex's
 /// `/status` and t3code's provider probe read them.
 pub(super) async fn read(agent: AgentCommand, folder: &Path) -> Result<Read> {
-    std::fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
-    let args: Vec<String> = agent
-        .args
-        .iter()
-        .cloned()
-        .chain([CLI.to_string(), APP_SERVER.to_string()])
-        .collect();
-    let mut command = account_command(&agent.path, &args, &agent);
-    command.current_dir(folder).stdin(Stdio::piped());
-    let mut child = command.spawn().context("starting Codex")?;
-    let mut input = child.stdin.take().context("Codex has no input")?;
-    let output = child.stdout.take().context("Codex has no output")?;
+    let mut app_server = AppServer::start(&agent, folder)?;
     let answers = async move {
-        // Its messages leave out `"jsonrpc"`.
-        let requests = [
-            serde_json::json!({
-                "id": INITIALIZE_REQUEST,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {
-                        "name": "agentz",
-                        "title": "agentZ",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": null,
-                },
-            }),
-            serde_json::json!({"method": "initialized"}),
-            // Never a refresh: reading the account mustn't change its login.
-            serde_json::json!({
-                "id": ACCOUNT_REQUEST,
-                "method": "account/read",
-                "params": {"refreshToken": false},
-            }),
-            serde_json::json!({"id": RATE_LIMITS_REQUEST, "method": "account/rateLimits/read"}),
-        ];
-        for request in requests {
-            input
-                .write_all(format!("{request}\n").as_bytes())
-                .await
-                .context("asking Codex about the account")?;
-        }
-        input
-            .flush()
-            .await
-            .context("asking Codex about the account")?;
-        let answers = collect_answers(BufReader::new(output)).await?;
-        // At the end of its input it quits.
-        drop(input);
-        child.wait().await.context("waiting for Codex to quit")?;
+        app_server
+            .send(&[
+                initialize(),
+                initialized(),
+                account_read_request(),
+                rate_limits_request(),
+            ])
+            .await?;
+        let answers = collect_answers(&mut app_server.output).await?;
+        app_server.quit().await?;
         anyhow::Ok(answers)
     };
     let answers = tokio::time::timeout(READ_TIMEOUT, answers)
         .await
         .map_err(|_| anyhow!("Codex didn't answer in {}s", READ_TIMEOUT.as_secs()))??;
     account_read(answers)
+}
+
+/// Uses one of the account's limit resets, as Codex's `/usage` and t3code's Use reset do
+/// (`account/rateLimitResetCredit/consume`), then reads the account in the same run.
+/// `attempt` is the request's idempotency key.
+pub(super) async fn use_limit_reset(
+    agent: AgentCommand,
+    folder: &Path,
+    attempt: &str,
+) -> Result<LimitResetUse> {
+    let mut app_server = AppServer::start(&agent, folder)?;
+    let consume = serde_json::json!({
+        "id": CONSUME_REQUEST,
+        "method": "account/rateLimitResetCredit/consume",
+        "params": {"idempotencyKey": attempt},
+    });
+    let used = async move {
+        app_server
+            .send(&[initialize(), initialized(), consume])
+            .await?;
+        let answer = answer_to(&mut app_server.output, CONSUME_REQUEST)
+            .await?
+            .map_err(|error| anyhow!("Codex couldn't use the reset: {error}"))?;
+        let ConsumeResponse { outcome } = serde_json::from_value(answer)
+            .context("Codex's answer to the reset isn't in the expected shape")?;
+        // Asked only now, so the read sees the reset.
+        let read = async {
+            app_server
+                .send(&[account_read_request(), rate_limits_request()])
+                .await?;
+            account_read(collect_answers(&mut app_server.output).await?)
+        }
+        .await;
+        app_server.quit().await.log_err();
+        anyhow::Ok(LimitResetUse { outcome, read })
+    };
+    tokio::time::timeout(RESET_TIMEOUT, used)
+        .await
+        .map_err(|_| anyhow!("Codex didn't answer in {}s", RESET_TIMEOUT.as_secs()))?
+}
+
+/// Codex's app-server, run through the adapter.
+struct AppServer {
+    child: Child,
+    input: ChildStdin,
+    output: Lines<BufReader<ChildStdout>>,
+}
+
+impl AppServer {
+    fn start(agent: &AgentCommand, folder: &Path) -> Result<Self> {
+        std::fs::create_dir_all(folder)
+            .with_context(|| format!("creating {}", folder.display()))?;
+        let args: Vec<String> = agent
+            .args
+            .iter()
+            .cloned()
+            .chain([CLI.to_string(), APP_SERVER.to_string()])
+            .collect();
+        let mut command = account_command(&agent.path, &args, agent);
+        command.current_dir(folder).stdin(Stdio::piped());
+        let mut child = command.spawn().context("starting Codex")?;
+        let input = child.stdin.take().context("Codex has no input")?;
+        let output = child.stdout.take().context("Codex has no output")?;
+        Ok(Self {
+            child,
+            input,
+            output: BufReader::new(output).lines(),
+        })
+    }
+
+    async fn send(&mut self, messages: &[serde_json::Value]) -> Result<()> {
+        for message in messages {
+            self.input
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .context("asking Codex about the account")?;
+        }
+        self.input
+            .flush()
+            .await
+            .context("asking Codex about the account")
+    }
+
+    /// At the end of its input it quits.
+    async fn quit(self) -> Result<()> {
+        let Self {
+            mut child, input, ..
+        } = self;
+        drop(input);
+        child.wait().await.context("waiting for Codex to quit")?;
+        Ok(())
+    }
+}
+
+// Its messages leave out `"jsonrpc"`.
+fn initialize() -> serde_json::Value {
+    serde_json::json!({
+        "id": INITIALIZE_REQUEST,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "agentz",
+                "title": "agentZ",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": null,
+        },
+    })
+}
+
+fn initialized() -> serde_json::Value {
+    serde_json::json!({"method": "initialized"})
+}
+
+/// Never a refresh: reading the account mustn't change its login.
+fn account_read_request() -> serde_json::Value {
+    serde_json::json!({
+        "id": ACCOUNT_REQUEST,
+        "method": "account/read",
+        "params": {"refreshToken": false},
+    })
+}
+
+fn rate_limits_request() -> serde_json::Value {
+    serde_json::json!({"id": RATE_LIMITS_REQUEST, "method": "account/rateLimits/read"})
 }
 
 /// What Codex answered to `account/read` and `account/rateLimits/read`: each a result, or the
@@ -124,30 +216,34 @@ struct Answers {
     rate_limits: Result<serde_json::Value, String>,
 }
 
+/// One answer from Codex's output: its id, and its result or the message of its error. `None`
+/// for a notification.
+fn parse_answer(line: &str) -> Option<(u64, Result<serde_json::Value, String>)> {
+    let mut message = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let id = message["id"].as_u64()?;
+    let answer = match message.get_mut("error") {
+        Some(error) => Err(error["message"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string())),
+        None => Ok(message["result"].take()),
+    };
+    Some((id, answer))
+}
+
 /// Reads Codex's output up to its answers, among the notifications it sends.
-async fn collect_answers(output: impl tokio::io::AsyncBufRead + Unpin) -> Result<Answers> {
-    let mut lines = output.lines();
+async fn collect_answers(output: &mut Lines<impl AsyncBufRead + Unpin>) -> Result<Answers> {
     let mut account = None;
     let mut rate_limits = None;
-    while let Some(line) = lines.next_line().await.context("reading Codex's answers")? {
-        let Ok(mut message) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let answer = match message.get_mut("error") {
-            Some(error) => Err(error["message"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| error.to_string())),
-            None => Ok(message["result"].take()),
-        };
-        match message["id"].as_u64() {
-            Some(INITIALIZE_REQUEST) => {
-                if let Err(error) = answer {
-                    bail!("Codex didn't start: {error}");
-                }
-            }
-            Some(ACCOUNT_REQUEST) => account = Some(answer),
-            Some(RATE_LIMITS_REQUEST) => rate_limits = Some(answer),
+    while let Some(line) = output
+        .next_line()
+        .await
+        .context("reading Codex's answers")?
+    {
+        match parse_answer(&line) {
+            Some((INITIALIZE_REQUEST, Err(error))) => bail!("Codex didn't start: {error}"),
+            Some((ACCOUNT_REQUEST, answer)) => account = Some(answer),
+            Some((RATE_LIMITS_REQUEST, answer)) => rate_limits = Some(answer),
             _ => {}
         }
         if account.is_some() && rate_limits.is_some() {
@@ -161,6 +257,31 @@ async fn collect_answers(output: impl tokio::io::AsyncBufRead + Unpin) -> Result
         }),
         _ => bail!("Codex ended without answering"),
     }
+}
+
+/// Reads Codex's output up to its answer to `id`.
+async fn answer_to(
+    output: &mut Lines<impl AsyncBufRead + Unpin>,
+    id: u64,
+) -> Result<Result<serde_json::Value, String>> {
+    while let Some(line) = output
+        .next_line()
+        .await
+        .context("reading Codex's answers")?
+    {
+        match parse_answer(&line) {
+            Some((INITIALIZE_REQUEST, Err(error))) => bail!("Codex didn't start: {error}"),
+            Some((answered, answer)) if answered == id => return Ok(answer),
+            _ => {}
+        }
+    }
+    bail!("Codex ended without answering")
+}
+
+/// `account/rateLimitResetCredit/consume`.
+#[derive(Deserialize)]
+struct ConsumeResponse {
+    outcome: LimitResetOutcome,
 }
 
 /// `account/read`.
@@ -190,6 +311,44 @@ struct RateLimitsResponse {
     rate_limits: RateLimitSnapshot,
     #[serde(default)]
     rate_limits_by_limit_id: Option<BTreeMap<String, RateLimitSnapshot>>,
+    #[serde(default)]
+    rate_limit_reset_credits: Option<ResetCredits>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCredits {
+    available_count: i64,
+    #[serde(default)]
+    credits: Option<Vec<ResetCredit>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCredit {
+    status: String,
+    /// Seconds since the epoch.
+    expires_at: Option<i64>,
+}
+
+/// t3code's summary of them: how many, and when the first available one expires.
+fn limit_resets(credits: Option<ResetCredits>) -> Option<LimitResets> {
+    let credits = credits?;
+    let available = u32::try_from(credits.available_count)
+        .ok()
+        .filter(|count| *count > 0)?;
+    let next_expires_at = credits
+        .credits
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|credit| credit.status == "available")
+        .filter_map(|credit| u64::try_from(credit.expires_at?).ok())
+        .min()
+        .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+    Some(LimitResets {
+        available,
+        next_expires_at,
+    })
 }
 
 #[derive(Deserialize)]
@@ -232,14 +391,16 @@ fn account_read(answers: Answers) -> Result<Read> {
     let rate_limits = answers
         .rate_limits
         .map_err(|error| anyhow!("Codex couldn't read the limits: {error}"))?;
-    let rate_limits: RateLimitsResponse = serde_json::from_value(rate_limits)
+    let mut rate_limits: RateLimitsResponse = serde_json::from_value(rate_limits)
         .context("Codex's limits aren't in the expected shape")?;
+    let limit_resets = limit_resets(rate_limits.rate_limit_reset_credits.take());
     Ok(Read {
         logged_in: Some(true),
         status: AccountStatus {
             email: account.email,
             plan: account.plan_type.as_deref().and_then(plan_label),
             windows: windows(rate_limits),
+            limit_resets,
             ..AccountStatus::default()
         },
     })
@@ -422,6 +583,46 @@ mod tests {
     }
 
     #[test]
+    fn limit_resets_are_counted_as_t3code_does() {
+        let read = read_answers(fixture(ACCOUNT), Ok(fixture(RATE_LIMITS))).expect("read");
+        assert_eq!(
+            read.status.limit_resets,
+            Some(LimitResets {
+                available: 1,
+                next_expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1793293254)),
+            })
+        );
+
+        // The first to expire of those still available.
+        let mut rate_limits = fixture(RATE_LIMITS);
+        rate_limits["rateLimitResetCredits"] = serde_json::json!({
+            "availableCount": 2,
+            "credits": [
+                {"status": "available", "expiresAt": 1793300000},
+                {"status": "redeemed", "expiresAt": 1793000000},
+                {"status": "available", "expiresAt": 1793200000},
+            ],
+        });
+        let read = read_answers(fixture(ACCOUNT), Ok(rate_limits.clone())).expect("read");
+        assert_eq!(
+            read.status.limit_resets,
+            Some(LimitResets {
+                available: 2,
+                next_expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1793200000)),
+            })
+        );
+
+        for none in [
+            serde_json::json!({"availableCount": 0, "credits": []}),
+            serde_json::Value::Null,
+        ] {
+            rate_limits["rateLimitResetCredits"] = none;
+            let read = read_answers(fixture(ACCOUNT), Ok(rate_limits.clone())).expect("read");
+            assert_eq!(read.status.limit_resets, None);
+        }
+    }
+
+    #[test]
     fn logins_without_chatgpt_have_no_limits() {
         let read = read_answers(
             fixture(LOGGED_OUT),
@@ -457,8 +658,9 @@ mod tests {
     }
 
     /// The adapter as the reader sees it: with `cli app-server`, Codex's app-server answers
-    /// the captured account and limits, after a notification and the other way around. It
-    /// writes down how it was run and what it was sent.
+    /// the captured account and limits, after a notification and the other way around, and
+    /// uses a limit reset with the outcome in CODEX_RESET_OUTCOME. It writes down how it was
+    /// run and what it was sent.
     const FAKE_ADAPTER: &str = r#"
 import json, os, sys
 
@@ -482,6 +684,8 @@ for line in sys.stdin:
     if method == "initialize":
         send({"id": message["id"], "result": {"userAgent": "agentz/0.160.0", "codexHome": os.environ.get("CODEX_HOME")}})
         send({"method": "remoteControl/status/changed", "params": {"status": "disabled"}})
+    elif method == "account/rateLimitResetCredit/consume":
+        send({"id": message["id"], "result": {"outcome": os.environ.get("CODEX_RESET_OUTCOME", "reset")}})
     elif method == "account/read":
         account_read = message
     elif method == "account/rateLimits/read":
@@ -559,6 +763,54 @@ with open("run.json", "w") as file:
         let found = read(logged_out, &folder).await.expect("read");
         assert_eq!(found.logged_in, Some(false));
         assert_eq!(found.status, AccountStatus::default());
+    }
+
+    #[tokio::test]
+    async fn uses_a_limit_reset_through_the_adapter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path().join("reader");
+        let Some(agent) = fake_adapter(dir.path()) else {
+            return;
+        };
+        let used = use_limit_reset(agent.clone(), &folder, "attempt-1")
+            .await
+            .expect("used");
+        assert_eq!(used.outcome, LimitResetOutcome::Reset);
+        let read = used.read.expect("the read after it");
+        assert_eq!(read.status.email.as_deref(), Some("work@example.com"));
+        // The account is read once Codex has answered the reset.
+        let run: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(folder.join("run.json")).expect("run"))
+                .expect("json");
+        let methods: Vec<&str> = run["received"]
+            .as_array()
+            .expect("received")
+            .iter()
+            .filter_map(|message| message["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "initialized",
+                "account/rateLimitResetCredit/consume",
+                "account/read",
+                "account/rateLimits/read"
+            ]
+        );
+        assert_eq!(
+            run["received"][2]["params"],
+            serde_json::json!({"idempotencyKey": "attempt-1"})
+        );
+
+        let mut nothing_to_reset = agent;
+        nothing_to_reset
+            .env
+            .insert("CODEX_RESET_OUTCOME".into(), "nothingToReset".into());
+        let used = use_limit_reset(nothing_to_reset, &folder, "attempt-2")
+            .await
+            .expect("used");
+        assert_eq!(used.outcome, LimitResetOutcome::NothingToReset);
     }
 
     #[test]

@@ -69,7 +69,9 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
-use crate::usage_limits::{LOW_PERCENT, UsagePopover, left_label, reset_phrase, tightest_window};
+use crate::usage_limits::{
+    LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, tightest_window,
+};
 use crate::{ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
@@ -321,12 +323,14 @@ pub struct AgentView {
     _rename_blur: Option<Subscription>,
     /// The composer's handoff chip shows what goes to the agent.
     handoff_expanded: bool,
-    /// Why "Continue with another agent", or the limit notice's Continue at the reset or
-    /// Switch to Droid Core, didn't work.
+    /// Why "Continue with another agent", or the limit notice's Continue at the reset, Switch
+    /// to Droid Core or Use Reset, didn't work.
     continue_error: Option<SharedString>,
     _continuing: Task<()>,
     /// The limit notice's Switch to Droid Core, while it's on its way.
     switching_to_core: Option<Task<()>>,
+    /// Use Reset, from the limit notice or the usage gauge, while it's on its way.
+    using_limit_reset: Option<Task<()>>,
     /// The limit notice was closed, until the next turn.
     limit_notice_dismissed: bool,
     /// The project's repository, for the new thread screen's checkout picker. Asked for the
@@ -522,6 +526,7 @@ impl AgentView {
             continue_error: None,
             _continuing: Task::ready(()),
             switching_to_core: None,
+            using_limit_reset: None,
             limit_notice_dismissed: false,
             draft_git: None,
             _draft_git_load: None,
@@ -3706,6 +3711,70 @@ impl AgentView {
         cx.notify();
     }
 
+    /// Use Reset, which asks first: a reset can't be given back. At the limit, the thread's
+    /// last message goes again once the limits are cleared, as with Switch to Droid Core.
+    fn confirm_limit_reset(
+        &mut self,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+        cx: &mut Context<Self>,
+    ) {
+        let accounts = self.client.read(cx).accounts(&agent_id);
+        let Some(status) = accounts.status(account).map(|read| read.status.clone()) else {
+            return;
+        };
+        let entry = account_entry(&accounts, account);
+        let sends_again = self.limit_reached(SystemTime::now(), cx).is_some();
+        let view = cx.weak_entity();
+        let request = ConfirmRequest::use_limit_reset(
+            &entry.name,
+            &self.agent_name(cx),
+            &status,
+            move |_, cx| {
+                let agent_id = agent_id.clone();
+                view.update(cx, |view, cx| {
+                    view.use_limit_reset(agent_id, account, sends_again, cx)
+                })
+                .log_err();
+            },
+        );
+        cx.emit(AgentViewEvent::Confirm(request));
+    }
+
+    fn use_limit_reset(
+        &mut self,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+        sends_again: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.using_limit_reset.is_some() {
+            return;
+        }
+        self.continue_error = None;
+        let response = self
+            .client
+            .read(cx)
+            .request(Request::UseLimitReset { agent_id, account });
+        self.using_limit_reset = Some(cx.spawn(async move |this, cx| {
+            let result = response.await;
+            this.update(cx, |this, cx| {
+                this.using_limit_reset = None;
+                match result {
+                    Ok(_) if sends_again => this.send_last_message_again(cx),
+                    Ok(_) => {}
+                    Err(error) => {
+                        this.continue_error =
+                            Some(format!("Couldn't use the limit reset: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
     fn send_last_message_again(&mut self, cx: &mut Context<Self>) {
         let thread = self.thread.read(cx);
         let Some(text) = thread.entries().iter().rev().find_map(|entry| match entry {
@@ -3754,8 +3823,8 @@ impl AgentView {
 
     /// t3code's banner for a thread stopped by a usage limit, as Zed's warning callout over the
     /// composer: whose limit ran out and when it resets, then Continue on the agent's account
-    /// with the most left, its arrow listing the others, and Continue at the reset (or its
-    /// cancel, once agentZ waits for it).
+    /// with the most left, its arrow listing the others, the account's own ways on (Use Reset,
+    /// Droid's), and Continue at the reset (or its cancel, once agentZ waits for it).
     fn render_limit_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.limit_notice_dismissed {
             return None;
@@ -3803,6 +3872,23 @@ impl AgentView {
         if can_switch || extra_usage_page.is_some() {
             body.push_str(&format!(" {agent_name} can keep going:"));
         }
+        let limit_reset_button = reached.status.limit_resets.map(|_| {
+            let agent_id = reached.agent_id.clone();
+            let account = reached.account;
+            let using = self.using_limit_reset.is_some();
+            div().debug_selector(|| "limit-use-reset".into()).child(
+                Button::new(
+                    "limit-use-reset",
+                    if using { "Using Reset…" } else { "Use Reset" },
+                )
+                .style(ButtonStyle::Outlined)
+                .label_size(LabelSize::Small)
+                .disabled(using)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.confirm_limit_reset(agent_id.clone(), account, cx)
+                })),
+            )
+        });
         let switch_button = can_switch.then(|| {
             let agent_id = reached.agent_id.clone();
             let account = reached.account;
@@ -3957,6 +4043,7 @@ impl AgentView {
                 )
         });
         let has_buttons = continue_button.is_some()
+            || limit_reset_button.is_some()
             || switch_button.is_some()
             || extra_usage_button.is_some()
             || reset_button.is_some()
@@ -3983,6 +4070,7 @@ impl AgentView {
                                 .flex_wrap()
                                 .gap_1()
                                 .children(continue_button)
+                                .children(limit_reset_button)
                                 .children(switch_button)
                                 .children(extra_usage_button)
                                 .children(reset_button)
@@ -5008,6 +5096,20 @@ impl AgentView {
             .and_then(|agent| agent.accounts.as_ref())
             .and_then(|support| support.usage_page.clone());
         let client = self.client.clone();
+        let limit_reset = LimitResetAction {
+            using: self.using_limit_reset.is_some(),
+            ask: Rc::new({
+                let view = cx.weak_entity();
+                let agent_id = agent_id.clone();
+                move |_, cx| {
+                    let agent_id = agent_id.clone();
+                    view.update(cx, |view, cx| {
+                        view.confirm_limit_reset(agent_id, account, cx)
+                    })
+                    .log_err();
+                }
+            }),
+        };
         Some(
             div()
                 .debug_selector(|| "usage-gauge".into())
@@ -5040,6 +5142,7 @@ impl AgentView {
                                     agent_id.clone(),
                                     account,
                                     usage_page.clone(),
+                                    limit_reset.clone(),
                                     window,
                                     cx,
                                 )
@@ -8331,6 +8434,156 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("limit-switch-to-droid-core").is_none());
+    }
+
+    /// Codex's way on: Use Reset, from the notice or the gauge's popover, asks first. From the
+    /// notice, the thread's last message goes again once it's used.
+    #[gpui::test]
+    fn limit_resets_are_used_from_the_notice_and_the_gauge(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, LimitResets, StatusRead};
+        use std::cell::RefCell;
+
+        let (view, cx) = open(2, false, cx);
+        let mock = AgentId::new("mock");
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+        let accounts = |used_percent| AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    email: Some("alex@hey.com".into()),
+                    windows: vec![
+                        LimitWindow {
+                            label: "5-hour".into(),
+                            used_percent,
+                            resets_at: Some(now + 2 * hour),
+                            length: Some(5 * hour),
+                        },
+                        LimitWindow {
+                            label: "Weekly".into(),
+                            used_percent: 40.,
+                            resets_at: Some(now + 72 * hour),
+                            length: Some(168 * hour),
+                        },
+                    ],
+                    limit_resets: Some(LimitResets {
+                        available: 2,
+                        next_expires_at: Some(now + 27 * 24 * hour),
+                    }),
+                    ..AccountStatus::default()
+                },
+                read_at: now,
+            }),
+            ..AgentAccounts::default()
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                matches!(
+                    request,
+                    Request::UseLimitReset { .. } | Request::Prompt { .. }
+                )
+                .then_some(Response::Ok)
+            });
+            client.set_accounts_for_test([(mock.clone(), accounts(100.))].into(), cx);
+        });
+        cx.update(|_, cx| {
+            let confirms = confirms.clone();
+            cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
+                if let AgentViewEvent::Confirm(request) = event {
+                    confirms.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx);
+            thread.set_turn_error_for_test("Usage limit reached", cx);
+        });
+        cx.run_until_parked();
+        let sent = || -> Vec<Request> {
+            requests
+                .borrow()
+                .iter()
+                .filter(|request| {
+                    matches!(
+                        request,
+                        Request::UseLimitReset { .. } | Request::Prompt { .. }
+                    )
+                })
+                .cloned()
+                .collect()
+        };
+
+        let button = cx
+            .debug_bounds("limit-use-reset")
+            .expect("the notice offers the reset");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(sent().is_empty());
+        let confirm = confirms
+            .borrow_mut()
+            .pop()
+            .expect("using a reset asks first");
+        assert_eq!(
+            confirm.message.as_ref(),
+            "This clears alex@hey.com's 5-hour and weekly limits now (mock). It uses one of \
+             your 2 resets and can't be undone."
+        );
+        cx.update(|window, cx| (confirm.on_confirm)(window, cx));
+        cx.run_until_parked();
+        let reset = Request::UseLimitReset {
+            agent_id: mock.clone(),
+            account: None,
+        };
+        assert!(
+            matches!(&sent()[..], [
+                used,
+                Request::Prompt { prompt, .. },
+            ] if *used == reset && *prompt == PromptPart::text("Fix the login")),
+            "{:?}",
+            sent()
+        );
+
+        // With room left, the gauge's popover offers it too, and closes for the question.
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts(10.))].into(), cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-notice").is_none());
+        let gauge = cx
+            .debug_bounds("usage-gauge")
+            .expect("the composer has the gauge");
+        cx.simulate_click(gauge.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-resets-gauge").is_some());
+        let button = cx
+            .debug_bounds("use-limit-reset-gauge")
+            .expect("the popover offers the reset");
+        let popover = cx
+            .debug_bounds("usage-gauge-popover")
+            .expect("the popover is open");
+        assert!(
+            button.right() <= popover.right(),
+            "{button:?} in {popover:?}"
+        );
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("usage-gauge-popover").is_none());
+        let confirm = confirms
+            .borrow_mut()
+            .pop()
+            .expect("using a reset asks first");
+        cx.update(|window, cx| (confirm.on_confirm)(window, cx));
+        cx.run_until_parked();
+        // Not at the limit, nothing goes again.
+        assert_eq!(sent().len(), 3);
+        assert_eq!(sent()[2], reset);
     }
 
     /// The composer gauges the thread's account by its window closest to running out, and opens

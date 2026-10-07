@@ -4,6 +4,7 @@
 
 use std::rc::Rc;
 
+use agentz_protocol::accounts::AccountStatus;
 use gpui::{
     App, BoxShadow, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, FontWeight,
     KeyBinding, SharedString, Window,
@@ -68,6 +69,56 @@ impl ConfirmRequest {
             title: format!("Log out of {account_name}?").into(),
             message: message.into(),
             confirm_label: "Log Out".into(),
+            on_confirm: Rc::new(on_confirm),
+        }
+    }
+
+    /// Using one of an account's limit resets, which can't be given back (decisions.md §9).
+    /// `status` is the account's last read, with its windows and resets.
+    pub fn use_limit_reset(
+        account_name: &str,
+        agent_name: &str,
+        status: &AccountStatus,
+        on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        let mut names: Vec<String> = status
+            .windows
+            .iter()
+            .map(|window| {
+                let mut chars = window.label.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_lowercase().chain(chars).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let limits = match names.pop() {
+            None => "limits".to_string(),
+            Some(last) if names.is_empty() => format!("{last} limit"),
+            Some(last) => format!("{} and {last} limits", names.join(", ")),
+        };
+        // Which login it is, when its name doesn't say.
+        let mut about: Vec<&str> = status
+            .email
+            .as_deref()
+            .filter(|email| *email != account_name)
+            .into_iter()
+            .collect();
+        about.push(agent_name);
+        let spends = match status.limit_resets.map_or(1, |resets| resets.available) {
+            1 => "your only reset".to_string(),
+            available => format!("one of your {available} resets"),
+        };
+        Self {
+            icon: IconName::RotateCcw,
+            title: "Use a limit reset?".into(),
+            message: format!(
+                "This clears {account_name}'s {limits} now ({}). It uses {spends} and can't be \
+                 undone.",
+                about.join(", ")
+            )
+            .into(),
+            confirm_label: "Use Reset".into(),
             on_confirm: Rc::new(on_confirm),
         }
     }

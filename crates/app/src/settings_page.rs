@@ -14,7 +14,7 @@ use crate::project_store::ProjectStore;
 use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
 use agentz_protocol::accounts::{
     AccountChange, AccountChoice, AccountChoices, AccountId, AccountStatus, AccountSupport,
-    AgentAccounts, AtLimit, LimitWindow, Overage, OveragePreference, SettingsSource,
+    AgentAccounts, AtLimit, LimitResets, LimitWindow, Overage, OveragePreference, SettingsSource,
 };
 use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
@@ -64,7 +64,8 @@ use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
 use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
 use crate::usage_limits::{
-    format_short_resets_in, limit_color, render_balance, render_limit_windows, reset_phrase,
+    format_short_resets_in, limit_color, render_balance, render_limit_resets, render_limit_windows,
+    reset_phrase,
 };
 
 const KEY_CONTEXT: &str = "SettingsPage";
@@ -2279,6 +2280,7 @@ impl SettingsPage {
             import_error: None,
             limit_tabs: HashMap::new(),
             switching_to_core: HashSet::new(),
+            using_limit_reset: HashSet::new(),
             _subscriptions: vec![accounts_changed],
         };
         self.show_agents_page(AgentsPage::Agent(panel), window, cx);
@@ -3669,6 +3671,19 @@ impl SettingsPage {
                 let tab = panel.limit_tabs.get(&account).copied().unwrap_or_default();
                 self.render_limits(&selector, account, status, tab, cx)
             });
+        let limit_resets = status.as_ref().and_then(|status| {
+            let resets = status.limit_resets?;
+            let (name, agent_name, status) = (title.clone(), agent_name.clone(), status.clone());
+            Some(render_limit_resets(
+                &selector,
+                resets,
+                panel.using_limit_reset.contains(&account),
+                SystemTime::now(),
+                cx.listener(move |this, _, _, cx| {
+                    this.confirm_limit_reset(account, &name, &agent_name, &status, cx)
+                }),
+            ))
+        });
         let overage = status.as_ref().and_then(|status| {
             let overage = status.overage?;
             Some(self.render_overage(
@@ -3722,14 +3737,18 @@ impl SettingsPage {
                 )
                 .children(actions),
         )
-        .children(limits.map(|limits| {
+        .when(limits.is_some() || limit_resets.is_some(), |card| {
             // Under the name, past the avatar.
-            div()
-                .pl(px(16.) + AVATAR_SIZE + px(12.))
-                .pr_4()
-                .pb(px(14.))
-                .child(limits)
-        }))
+            card.child(
+                v_flex()
+                    .pl(px(16.) + AVATAR_SIZE + px(12.))
+                    .pr_4()
+                    .pb(px(14.))
+                    .gap_3()
+                    .children(limits)
+                    .children(limit_resets),
+            )
+        })
         .children(overage)
         .children(at_limit)
         .when(shows_login, |card| card.child(session.login.clone()))
@@ -3928,21 +3947,60 @@ impl SettingsPage {
 
     /// The card's Switch to Droid Core, which takes a moment: Droid's terminal UI saves it.
     fn switch_to_droid_core(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+        self.send_pending_account_request(
+            account,
+            |agent_id| Request::SwitchToDroidCore { agent_id, account },
+            |panel| &mut panel.switching_to_core,
+            "Couldn't switch to Droid Core",
+            cx,
+        );
+    }
+
+    /// The card's Use Reset, which asks first: a reset can't be given back.
+    fn confirm_limit_reset(
+        &mut self,
+        account: Option<AccountId>,
+        name: &str,
+        agent_name: &str,
+        status: &AccountStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let page = cx.weak_entity();
+        let request = ConfirmRequest::use_limit_reset(name, agent_name, status, move |_, cx| {
+            page.update(cx, |page, cx| page.use_limit_reset(account, cx))
+                .log_err();
+        });
+        cx.emit(SettingsPageEvent::Confirm(request));
+    }
+
+    fn use_limit_reset(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+        self.send_pending_account_request(
+            account,
+            |agent_id| Request::UseLimitReset { agent_id, account },
+            |panel| &mut panel.using_limit_reset,
+            "Couldn't use the limit reset",
+            cx,
+        );
+    }
+
+    /// An account's request that its card shows on its way (in `pending`), once at a time.
+    fn send_pending_account_request(
+        &mut self,
+        account: Option<AccountId>,
+        request: impl FnOnce(AgentId) -> Request,
+        pending: fn(&mut AgentPanel) -> &mut HashSet<Option<AccountId>>,
+        failure: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         let Some(panel) = self.agent_panel_mut() else {
             return;
         };
-        if !panel.switching_to_core.insert(account) {
+        if !pending(panel).insert(account) {
             return;
         }
         panel.account_error = None;
         let agent_id = panel.agent_id.clone();
-        let response = panel
-            .client(cx)
-            .read(cx)
-            .request(Request::SwitchToDroidCore {
-                agent_id: agent_id.clone(),
-                account,
-            });
+        let response = panel.client(cx).read(cx).request(request(agent_id.clone()));
         cx.spawn(async move |this, cx| {
             let result = response.await;
             this.update(cx, |this, cx| {
@@ -3952,10 +4010,9 @@ impl SettingsPage {
                 else {
                     return;
                 };
-                panel.switching_to_core.remove(&account);
+                pending(panel).remove(&account);
                 if let Err(error) = result {
-                    panel.account_error =
-                        Some(format!("Couldn't switch to Droid Core: {error:#}").into());
+                    panel.account_error = Some(format!("{failure}: {error:#}").into());
                 }
                 cx.notify();
             })
@@ -5983,6 +6040,8 @@ struct AgentPanel {
     limit_tabs: HashMap<Option<AccountId>, usize>,
     /// Accounts whose Switch to Droid Core is on its way.
     switching_to_core: HashSet<Option<AccountId>>,
+    /// Accounts whose Use Reset is on its way.
+    using_limit_reset: HashSet<Option<AccountId>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -6281,6 +6340,7 @@ pub(crate) struct AccountEntry {
     /// From its last read.
     pub(crate) plan: Option<String>,
     pub(crate) windows: Vec<LimitWindow>,
+    pub(crate) limit_resets: Option<LimitResets>,
     /// Found logged out when last checked.
     pub(crate) is_logged_out: bool,
 }
@@ -6322,6 +6382,7 @@ pub(crate) fn account_entry(accounts: &AgentAccounts, account: Option<AccountId>
         windows: status
             .map(|status| status.windows.clone())
             .unwrap_or_default(),
+        limit_resets: status.and_then(|status| status.limit_resets),
         is_logged_out: logged_in == Some(false),
     }
 }
@@ -7694,6 +7755,7 @@ mod tests {
                 } else {
                     ConnectionStatus::AuthRequired
                 },
+                agent_name: "Mock".into(),
                 logged_in: Some(logged_in),
                 auth_methods: if logged_in {
                     Vec::new()
@@ -7734,6 +7796,11 @@ mod tests {
                 limit("5-hour", 100., 2 * hour, 5 * hour),
                 limit("Weekly", 56., 72 * hour, 168 * hour),
             ],
+            // Codex-like: a reset it was granted.
+            limit_resets: Some(LimitResets {
+                available: 1,
+                next_expires_at: Some(SystemTime::now() + 27 * 24 * hour),
+            }),
             ..AccountStatus::default()
         };
         let mut accounts = AgentAccounts {
@@ -7805,7 +7872,8 @@ mod tests {
                         Request::RemoveAccount { .. }
                         | Request::UpdateAccount { .. }
                         | Request::RefreshUsage { .. }
-                        | Request::SwitchToDroidCore { .. } => Some(Response::Ok),
+                        | Request::SwitchToDroidCore { .. }
+                        | Request::UseLimitReset { .. } => Some(Response::Ok),
                         _ => None,
                     }
                 });
@@ -7900,6 +7968,44 @@ mod tests {
         assert!(sent(&Request::SwitchToDroidCore {
             agent_id: mock.clone(),
             account: None,
+        }));
+
+        // An account with limit resets has a line for them under its limits, whose Use Reset
+        // asks first.
+        assert!(cx.debug_bounds("limit-resets-external").is_none());
+        let resets = cx
+            .debug_bounds("limit-resets-1")
+            .expect("Work's resets are under its limits");
+        let weekly = cx
+            .debug_bounds("limit-1-window-1")
+            .expect("Work has a weekly window");
+        assert!(resets.top() >= weekly.bottom());
+        let use_reset = cx
+            .debug_bounds("use-limit-reset-1")
+            .expect("a reset can be used");
+        cx.simulate_click(use_reset.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            !requests
+                .borrow()
+                .iter()
+                .any(|request| matches!(request, Request::UseLimitReset { .. }))
+        );
+        let confirm = confirms
+            .borrow_mut()
+            .pop()
+            .expect("using a reset asks first");
+        assert_eq!(confirm.title.as_ref(), "Use a limit reset?");
+        assert_eq!(
+            confirm.message.as_ref(),
+            "This clears Work's 5-hour and weekly limits now (alex@acme.co, Mock). It uses your \
+             only reset and can't be undone."
+        );
+        cx.update(|window, cx| (confirm.on_confirm)(window, cx));
+        cx.run_until_parked();
+        assert!(sent(&Request::UseLimitReset {
+            agent_id: mock.clone(),
+            account: Some(AccountId(1)),
         }));
 
         // An account that hasn't logged in yet is the New account card, which Cancel removes

@@ -265,6 +265,10 @@ Each entry: what it does, where it lives, and where it comes from.
   Factory's page (`AccountSupport::extra_usage_page`), as Droid's own does, since Droid never
   saves it; read-only with "Set by your organization." when the login can't change it.
   agentZ's own Stop or Continue at reset is then titled "When <agent> stops at a limit".
+  An account with limit resets (`AccountStatus::limit_resets`, Codex's; t3code's
+  `ResetCredits`, accounts topic 9) has a line under its bars, "1 limit reset available ·
+  expires in 27d 23h" (`usage_limits::render_limit_resets`), whose Use Reset asks first
+  (`ConfirmRequest::use_limit_reset`), then sends `Request::UseLimitReset`.
   Each account has its own login session (`OpenLoginSession` with the account) while the page
   is open, and its login rows while logged out. Add Account makes a "New account" card that
   Cancel removes, with "Copy settings from" (the other accounts, the default one first, or
@@ -451,7 +455,8 @@ Each entry: what it does, where it lives, and where it comes from.
   can keep going:" with Droid's ways on (accounts topic 8): Switch to Droid Core (unless it's
   chosen already or Droid Core's pool is used up too), which saves it, then sends the
   thread's last message again, as Copy Message copies it; and Use Extra Usage · <balance>
-  left, which opens Factory's page.
+  left, which opens Factory's page. An account with limit resets gets Use Reset, which asks
+  as the card's does, then sends the last message again too.
 - **Continue at reset** (`server/limit_waits.rs`, `Thread::continues_at`,
   `Request::ContinueAtReset`, `AtLimit`, `SettingsPage::render_at_limit`; t3code's "Resume
   at reset", accounts topic 11): each account's card has "When a limit is reached", Stop (the
@@ -471,7 +476,9 @@ Each entry: what it does, where it lives, and where it comes from.
   or less and red when used up, with the window's name in its tooltip. It shows once the
   account has a read, and not while it's found logged out. A click opens that account's
   windows (avatar, name, plan, `render_limit_windows`) with Usage ↗ for the agent's usage
-  page; Escape or a click outside closes it without stopping the turn. A new thread shows the
+  page, and the card's limit resets line, whose Use Reset closes it for the thread's question
+  (`usage_limits::LimitResetAction`); Escape or a click outside closes it without stopping
+  the turn. A new thread shows the
   accounts' limits in its account picker instead.
 - **New Thread** (`Shell::new_thread`, `Shell::start_draft`, `new_thread_modal.rs`; t3code's
   `useHandleNewThread`, the user's choice): opens a draft right away in the shown project, or
@@ -646,8 +653,12 @@ Each entry: what it does, where it lives, and where it comes from.
   reader (`Reader::CodexAppServer`, t3code's provider probe) runs Codex's app-server through
   the adapter's `cli` and asks it `account/read` (never refreshing the login) and
   `account/rateLimits/read`. Its windows are t3code's: the main limit's two, named Session,
-  Weekly or Monthly by their length. An API key has none; the outputs it's tested on are in
-  `accounts/codex_reads/`. Devin's description (`accounts/devin.rs`) moves its config with
+  Weekly or Monthly by their length, and it counts the limit resets Codex granted
+  (`rateLimitResetCredits`). Use Reset (`Reader::use_limit_reset`, `codex::use_limit_reset`)
+  sends `account/rateLimitResetCredit/consume`, then reads again in the same app-server. Its
+  idempotency key is one attempt per account (`Server::limit_reset_attempts`), kept until
+  Codex answers, so a retry after a timeout can't spend a second reset. An API key has none;
+  the outputs it's tested on are in `accounts/codex_reads/`. Devin's description (`accounts/devin.rs`) moves its config with
   `XDG_CONFIG_HOME` and its login and sessions with `XDG_DATA_HOME`. Other programs keep
   their files in those folders too, and the tools Devin runs see the same variables, so the
   account's `.config` and `.local/share` link every entry of the user's own except Devin's

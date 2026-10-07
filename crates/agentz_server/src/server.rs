@@ -185,6 +185,9 @@ pub(crate) struct Server {
     /// Held by each read of an account and each change to it, so two never run its agent's
     /// terminal UI at once: Droid's reads all resume one session.
     account_locks: HashMap<(AgentId, Option<AccountId>), Arc<tokio::sync::Mutex<()>>>,
+    /// The attempt each account's limit reset is on until the agent answers it, so a retry
+    /// after a timeout (or a second click) is the same attempt and can't spend a second reset.
+    limit_reset_attempts: HashMap<(AgentId, Option<AccountId>), String>,
     /// When threads' turns ended with an error, until a read of their account since then says
     /// whether a limit stopped them ([`limit_waits`]).
     failed_turns: HashMap<ThreadId, Instant>,
@@ -319,6 +322,7 @@ impl Server {
             accounts,
             reading_accounts: HashSet::default(),
             account_locks: HashMap::default(),
+            limit_reset_attempts: HashMap::default(),
             failed_turns: HashMap::default(),
             http_client,
             threads: HashMap::default(),
@@ -568,6 +572,11 @@ impl Server {
                 id,
                 request: Request::SwitchToDroidCore { agent_id, account },
             } => self.switch_to_droid_core(client, id, agent_id, account),
+            Input::Request {
+                client,
+                id,
+                request: Request::UseLimitReset { agent_id, account },
+            } => self.use_limit_reset(client, id, agent_id, account),
             Input::Request {
                 client,
                 id,
@@ -1050,6 +1059,9 @@ impl Server {
             }
             Request::SwitchToDroidCore { .. } => {
                 Err(anyhow!("switching to Droid Core is handled separately"))
+            }
+            Request::UseLimitReset { .. } => {
+                Err(anyhow!("using a limit reset is handled separately"))
             }
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
 

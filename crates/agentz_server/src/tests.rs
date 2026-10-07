@@ -2290,6 +2290,93 @@ async fn droid_core_is_chosen_through_the_reader() {
     }
 }
 
+/// Use Reset spends one of the account's limit resets through its reader, as Codex's does,
+/// and is answered with the account read again. Without any left, or with nothing used, it
+/// fails and spends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn limit_resets_are_used_through_the_reader() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    let home = data_dir.path().join("accounts/mock").join(work.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's home");
+    std::fs::write(home.join("usage"), "100").expect("use the account up");
+    std::fs::write(home.join("limit_resets"), "2").expect("grant resets");
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    let resets = |client: &TestClient| {
+        client
+            .accounts("mock")
+            .status(Some(work))
+            .and_then(|read| read.status.limit_resets)
+    };
+    let used = |client: &TestClient, account| {
+        client.accounts("mock").status(account).and_then(|read| {
+            read.status
+                .windows
+                .first()
+                .map(|window| window.used_percent)
+        })
+    };
+    client.ok(Request::SubscribeSession).await;
+    client.wait_until(|client| resets(client).is_some()).await;
+    let granted = resets(&client).expect("resets");
+    assert_eq!(granted.available, 2);
+    assert!(granted.next_expires_at.is_some());
+    assert_eq!(used(&client, Some(work)), Some(100.0));
+
+    client
+        .ok(Request::UseLimitReset {
+            agent_id: mock.clone(),
+            account: Some(work),
+        })
+        .await;
+    assert_eq!(used(&client, Some(work)), Some(0.0));
+    assert_eq!(resets(&client).map(|resets| resets.available), Some(1));
+
+    // With nothing used, Codex has nothing to reset, and the reset stays.
+    assert!(
+        client
+            .request(Request::UseLimitReset {
+                agent_id: mock.clone(),
+                account: Some(work),
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("limit_resets")).expect("resets"),
+        "1"
+    );
+
+    // The External account has none, and an account that isn't there can't have any.
+    for account in [None, Some(AccountId(9))] {
+        assert!(
+            client
+                .request(Request::UseLimitReset {
+                    agent_id: mock.clone(),
+                    account,
+                })
+                .await
+                .is_err()
+        );
+    }
+}
+
 /// A thread stopped by its account's limit gets "Continue." from the server when the limit
 /// resets: every thread on an account set to Continue at reset, or one the limit notice asked
 /// for. On an account set to Stop, it waits for the user.

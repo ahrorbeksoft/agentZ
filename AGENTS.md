@@ -130,7 +130,9 @@ From Zed's guidelines, which this code follows:
   prompts fail with "Usage limit reached" until it resets (`resets_at` in the home sets
   when, in seconds since the epoch). An `overage` file in the home (empty, `DroidCore` or
   `ExtraUsage`) makes it Droid-like at its limit: the read has Droid's pools, a balance and
-  that choice, and with a choice, prompts go on past the limit. A `models` list in
+  that choice, and with a choice, prompts go on past the limit. A `limit_resets` file (a
+  count) gives it Codex's limit resets, which `--usage` with `AGENTZ_LIMIT_RESET_ATTEMPT`
+  uses, answering with Codex's outcome. A `models` list in
   `.mock/settings.json` in its home limits the models it offers, as a plan can.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data

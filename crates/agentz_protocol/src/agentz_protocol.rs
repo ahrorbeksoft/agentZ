@@ -616,6 +616,14 @@ pub enum Request {
         /// `None` is the External account.
         account: Option<AccountId>,
     },
+    /// Uses one of the account's limit resets ([`accounts::LimitResets`]), which clears its
+    /// limits now and can't be given back. Answered once the agent says it's used, with the
+    /// account read again.
+    UseLimitReset {
+        agent_id: AgentId,
+        /// `None` is the External account.
+        account: Option<AccountId>,
+    },
     /// The conversations the agent keeps on this machine for one account (`None` being the
     /// External one), to import as threads, as Zed's thread import lists them:
     /// [`Response::AgentSessions`]. The agent starts only for this.
