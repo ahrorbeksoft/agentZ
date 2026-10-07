@@ -1,15 +1,22 @@
 //! An account's limits as t3code's `LimitWindows` shows them: a row per window with its name
 //! and what's left, a bar of what's left with a hairline where even spending would be, and when
-//! it resets.
+//! it resets. Also the popover of the composer's usage gauge, which shows them.
 
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::LimitWindow;
-use gpui::{AnyElement, App, FontWeight, relative};
+use agentz_protocol::accounts::{AccountId, LimitWindow};
+use agentz_protocol::agents::AgentId;
+use gpui::{
+    AnyElement, App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
+    KeyDownEvent, Subscription, relative,
+};
 use ui::{Tooltip, prelude::*};
 
+use crate::server_client::ServerClient;
+use crate::settings_page::{account_entry, render_entry_avatar};
+
 /// At or under this much left, a bar turns yellow.
-const LOW_PERCENT: u8 = 15;
+pub(crate) const LOW_PERCENT: u8 = 15;
 const LABEL_WIDTH: Pixels = px(140.);
 const RESET_WIDTH: Pixels = px(116.);
 
@@ -87,11 +94,7 @@ fn render_bar(
     let status = cx.theme().status();
     let left = window.left_percent();
     let time_left = window.time_left(now);
-    let fill = if left <= LOW_PERCENT {
-        status.warning
-    } else {
-        colors.text_accent
-    };
+    let fill = limit_color(left, cx);
     let track = if left == 0 {
         status.error.opacity(0.35)
     } else {
@@ -176,6 +179,117 @@ fn render_bar(
         .into_any_element()
 }
 
+/// What the composer's usage gauge opens: the thread's account, its plan and its windows, and
+/// the agent's usage page.
+pub(crate) struct UsagePopover {
+    client: Entity<ServerClient>,
+    agent_id: AgentId,
+    /// `None` being the External one.
+    account: Option<AccountId>,
+    usage_page: Option<String>,
+    focus_handle: FocusHandle,
+    _subscription: Subscription,
+}
+
+impl EventEmitter<DismissEvent> for UsagePopover {}
+
+impl Focusable for UsagePopover {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl UsagePopover {
+    pub(crate) fn new(
+        client: Entity<ServerClient>,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+        usage_page: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
+        // A read that lands while it's open shows in it.
+        let subscription = cx.observe(&client, |_, _, cx| cx.notify());
+        Self {
+            client,
+            agent_id,
+            account,
+            usage_page,
+            focus_handle,
+            _subscription: subscription,
+        }
+    }
+}
+
+impl Render for UsagePopover {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let accounts = self.client.read(cx).accounts(&self.agent_id);
+        let entry = account_entry(&accounts, self.account);
+        let usage_button = self.usage_page.clone().map(|url| {
+            Button::new("usage-gauge-page", "Usage")
+                .label_size(LabelSize::Small)
+                .color(Color::Muted)
+                .end_icon(
+                    Icon::new(IconName::ArrowUpRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(move |_, _, cx| cx.open_url(&url))
+        });
+        v_flex()
+            .debug_selector(|| "usage-gauge-popover".into())
+            .track_focus(&self.focus_handle)
+            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+            // The composer binds Escape to Cancel, which would stop the turn.
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.emit(DismissEvent)
+                }
+            }))
+            .elevation_3(cx)
+            .w(px(420.))
+            .px_3p5()
+            .py_3()
+            .gap_2p5()
+            .child(
+                h_flex()
+                    .min_h(px(22.))
+                    .gap_2()
+                    .child(render_entry_avatar(&entry, px(18.), cx))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .child(Label::new(entry.name.clone()).truncate()),
+                    )
+                    .children(
+                        entry.plan.clone().map(|plan| {
+                            Label::new(plan).size(LabelSize::Small).color(Color::Muted)
+                        }),
+                    )
+                    .child(div().flex_1())
+                    .children(usage_button),
+            )
+            .child(render_limit_windows(
+                "gauge",
+                &entry.windows,
+                SystemTime::now(),
+                cx,
+            ))
+    }
+}
+
+/// What's left's color: the accent, or yellow once it's low.
+pub(crate) fn limit_color(left: u8, cx: &App) -> Hsla {
+    if left <= LOW_PERCENT {
+        cx.theme().status().warning
+    } else {
+        cx.theme().colors().text_accent
+    }
+}
+
 /// The window closest to running out, which pickers show.
 pub(crate) fn tightest_window(windows: &[LimitWindow]) -> Option<&LimitWindow> {
     windows.iter().min_by_key(|window| window.left_percent())
@@ -236,6 +350,15 @@ pub(crate) fn format_resets_in(window: &LimitWindow, now: SystemTime) -> Option<
             format!("resets in {}", format_duration(remaining))
         }
         _ => "resets now".to_string(),
+    })
+}
+
+/// t3code's countdown on a segment: `↻ 2h 13m`.
+pub(crate) fn format_short_resets_in(window: &LimitWindow, now: SystemTime) -> Option<String> {
+    let resets_at = window.resets_at?;
+    Some(match resets_at.duration_since(now) {
+        Ok(remaining) if !remaining.is_zero() => format!("↻ {}", format_duration(remaining)),
+        _ => "↻ now".to_string(),
     })
 }
 

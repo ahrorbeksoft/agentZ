@@ -1,6 +1,6 @@
 //! The settings page, laid out like t3code's: a list of sections on the left (General,
-//! Appearance, Agents, Machines, then one entry per project) and the chosen section's rows on
-//! the right.
+//! Appearance, Notifications, Agents, Usage, Machines, then one entry per project) and the
+//! chosen section's rows on the right.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -63,7 +63,9 @@ use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
 use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
 use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
-use crate::usage_limits::render_limit_windows;
+use crate::usage_limits::{
+    format_short_resets_in, limit_color, render_limit_windows, reset_phrase,
+};
 
 const KEY_CONTEXT: &str = "SettingsPage";
 const ACCOUNT_RENAME_KEY_CONTEXT: &str = "AccountRename";
@@ -109,6 +111,7 @@ enum Section {
     Appearance,
     Notifications,
     Agents,
+    Usage,
     Machines,
     Project(ProjectKey),
 }
@@ -656,6 +659,7 @@ impl SettingsPage {
                 cx,
             ),
             self.render_nav_item("Agents", Some(IconName::Sparkle), None, Section::Agents, cx),
+            self.render_nav_item("Usage", Some(IconName::Gauge), None, Section::Usage, cx),
             self.render_nav_item(
                 "Machines",
                 Some(IconName::Server),
@@ -775,6 +779,7 @@ impl SettingsPage {
             Section::Appearance => "settings-nav-appearance".into(),
             Section::Notifications => "settings-nav-notifications".into(),
             Section::Agents => "settings-nav-agents".into(),
+            Section::Usage => "settings-nav-usage".into(),
             Section::Machines => "settings-nav-machines".into(),
             Section::Project(key) => format!(
                 "settings-nav-project-{}-{}",
@@ -4692,6 +4697,240 @@ impl SettingsPage {
         }));
     }
 
+    /// The Usage page's title, and the machine whose agents it shows, as on the Agents page.
+    fn render_usage_header(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .h(px(28.))
+            .gap_4()
+            .justify_between()
+            .child(Headline::new("Usage").size(HeadlineSize::Small))
+            .when(self.machines.read(cx).has_remotes(), |header| {
+                header.child(self.render_agents_machine_picker(window, cx))
+            })
+            .into_any_element()
+    }
+
+    /// t3code's Usage page: each agent whose accounts' limits are read, with a card per window
+    /// for what's left across its accounts.
+    fn render_usage(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let client = self.agents_client(cx);
+        let mut agents: Vec<AgentListing> = self
+            .registry(cx)
+            .read(cx)
+            .agents()
+            .iter()
+            .filter(|agent| {
+                counts_as_installed(&agent.install_state)
+                    && agent
+                        .accounts
+                        .as_ref()
+                        .is_some_and(|support| support.reads_usage)
+            })
+            .cloned()
+            .collect();
+        agents.sort_by_key(|agent| agent.name().to_lowercase());
+        let now = SystemTime::now();
+        let sections: Vec<AnyElement> = agents
+            .iter()
+            .filter_map(|agent| {
+                let pools = usage_pools(&account_entries(&client.read(cx).accounts(agent.id())));
+                (!pools.is_empty()).then(|| self.render_usage_agent(agent, &pools, now, cx))
+            })
+            .collect();
+        if sections.is_empty() {
+            return vec![
+                Label::new("No agent on this machine reports its accounts' limits.")
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ];
+        }
+        sections
+    }
+
+    fn render_usage_agent(
+        &self,
+        agent: &AgentListing,
+        pools: &[UsagePool],
+        now: SystemTime,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let icon = match agent_icon(agent.id(), cx) {
+            Some(markup) => Icon::from_svg_markup(markup),
+            None => Icon::new(IconName::Sparkle),
+        };
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(icon.size(IconSize::Small).color(Color::Muted))
+                    .child(Label::new(agent.name().clone()).weight(gpui::FontWeight::MEDIUM)),
+            )
+            .children(
+                pools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pool)| self.render_usage_pool(agent.id(), index, pool, now, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// One window: what's left across the accounts, and a segment per account.
+    fn render_usage_pool(
+        &self,
+        agent_id: &AgentId,
+        index: usize,
+        pool: &UsagePool,
+        now: SystemTime,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let count = pool.members.len();
+        let selector = format!("usage-{}-{index}", agent_id.0);
+        h_flex()
+            .debug_selector(move || selector)
+            .px_4()
+            .py_3p5()
+            .gap_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border)
+            .child(
+                v_flex()
+                    .w(px(150.))
+                    .flex_none()
+                    .gap_0p5()
+                    .child(Label::new(pool.label.clone()).size(LabelSize::Small))
+                    .child(
+                        h_flex()
+                            .items_baseline()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(rems_from_px(24_f32))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(colors.text)
+                                    .child(format!("{}%", pool.left_percent())),
+                            )
+                            .child(
+                                Label::new("left")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .when(count > 1, |column| {
+                        column.child(
+                            Label::new(format!("across {count} accounts"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .children(pool.members.iter().map(|(entry, window)| {
+                        self.render_usage_segment(agent_id, index, entry, window, now, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// An account's share of a window, filled by what's left of it. Clicking it opens the
+    /// account on its agent's page.
+    fn render_usage_segment(
+        &self,
+        agent_id: &AgentId,
+        pool_index: usize,
+        entry: &AccountEntry,
+        window: &LimitWindow,
+        now: SystemTime,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let left = window.left_percent();
+        let selector = format!(
+            "usage-{}-{pool_index}-{}",
+            agent_id.0,
+            account_selector(entry.account)
+        );
+        let mut details = format!("{left}% left");
+        if let Some(resets_at) = window.resets_at {
+            details.push_str(&format!(" · resets {}", reset_phrase(resets_at, now)));
+        }
+        let name = entry.name.clone();
+        let machine = self.agents_machine;
+        let agent_id = agent_id.clone();
+        div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector)
+            .flex_1()
+            .min_w_0()
+            .h(px(30.))
+            .relative()
+            .rounded_md()
+            .overflow_hidden()
+            .cursor_pointer()
+            .bg(colors.element_background)
+            .hover(|segment| segment.bg(colors.element_hover))
+            .when(left > 0, |segment| {
+                // Translucent, as t3code's, so the label reads over it.
+                segment.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(gpui::relative(f32::from(left) / 100.))
+                        .rounded_md()
+                        .bg(limit_color(left, cx).opacity(0.35)),
+                )
+            })
+            .child(
+                // The name gives way first when the segment is narrow.
+                h_flex()
+                    .size_full()
+                    .px_2()
+                    .gap_1()
+                    .child(render_entry_avatar(entry, MENU_AVATAR_SIZE, cx))
+                    .child(
+                        div().min_w_0().child(
+                            Label::new(entry.name.clone())
+                                .size(LabelSize::XSmall)
+                                .weight(gpui::FontWeight::MEDIUM)
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        div().flex_none().child(
+                            Label::new(format!("{left}%"))
+                                .size(LabelSize::XSmall)
+                                .weight(gpui::FontWeight::SEMIBOLD)
+                                .color(if left == 0 {
+                                    Color::Error
+                                } else {
+                                    Color::Default
+                                }),
+                        ),
+                    )
+                    .child(div().flex_1())
+                    .children(format_short_resets_in(window, now).map(|resets| {
+                        div().flex_none().pl_1().child(
+                            Label::new(resets)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })),
+            )
+            .tooltip(move |_, cx| Tooltip::with_meta(name.clone(), None, details.clone(), cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.show_agent_accounts(machine, &agent_id, false, window, cx)
+            }))
+            .into_any_element()
+    }
+
     /// Which machine's agents the Agents page shows, once there's more than this Mac.
     fn render_agents_machine_picker(
         &self,
@@ -5743,6 +5982,45 @@ pub(crate) fn account_entry(accounts: &AgentAccounts, account: Option<AccountId>
     }
 }
 
+/// One of an agent's limit windows across its accounts, as t3code pools them: each account
+/// with a window of that name, in the order they're listed.
+struct UsagePool {
+    label: String,
+    members: Vec<(AccountEntry, LimitWindow)>,
+}
+
+impl UsagePool {
+    /// What's left across the accounts. Each counts the same whatever its plan, as in t3code.
+    fn left_percent(&self) -> u8 {
+        let used = self
+            .members
+            .iter()
+            .map(|(_, window)| window.used_percent.clamp(0., 100.))
+            .sum::<f64>()
+            / self.members.len().max(1) as f64;
+        (100. - used).round() as u8
+    }
+}
+
+/// The windows of the accounts not found logged out, whose last reads are out of date, in the
+/// order they first appear.
+fn usage_pools(entries: &[AccountEntry]) -> Vec<UsagePool> {
+    let mut pools: Vec<UsagePool> = Vec::new();
+    for entry in entries.iter().filter(|entry| !entry.is_logged_out) {
+        for window in &entry.windows {
+            let member = (entry.clone(), window.clone());
+            match pools.iter_mut().find(|pool| pool.label == window.label) {
+                Some(pool) => pool.members.push(member),
+                None => pools.push(UsagePool {
+                    label: window.label.clone(),
+                    members: vec![member],
+                }),
+            }
+        }
+    }
+    pools
+}
+
 /// How an account's elements are named in tests: by its id, or "external".
 pub(crate) fn account_selector(account: Option<AccountId>) -> String {
     account.map_or_else(|| "external".to_string(), |id| id.to_string())
@@ -6352,6 +6630,7 @@ impl Render for SettingsPage {
                 self.render_agents_header(window, cx),
                 self.render_agents(window, cx),
             ),
+            Section::Usage => (self.render_usage_header(window, cx), self.render_usage(cx)),
             Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
@@ -7304,6 +7583,146 @@ mod tests {
             agent_id: mock,
             account: AccountId(1),
         }));
+    }
+
+    /// Settings › Usage pools each window across an agent's accounts, without the agents that
+    /// read no usage or the accounts found logged out, and a segment opens its account on the
+    /// agent's page.
+    #[gpui::test]
+    fn the_usage_page_pools_each_window_across_the_accounts(cx: &mut TestAppContext) {
+        let hour = Duration::from_secs(3600);
+        let mock = AgentId::new("mock");
+        let other = AgentId::new("other");
+        let installed = InstallState::Installed {
+            version: "2.0.0".into(),
+            update_available: false,
+        };
+        let mut mock_listing = listing("mock", "Mock", installed.clone());
+        mock_listing.accounts = Some(AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            reads_usage: true,
+            ..AccountSupport::default()
+        });
+        let mut other_listing = listing("other", "Other", installed);
+        other_listing.accounts = Some(AccountSupport::default());
+        let status = |windows: Vec<LimitWindow>| AccountStatus {
+            windows,
+            ..AccountStatus::default()
+        };
+        let five_hour = |used_percent: f64| limit("5-hour", used_percent, 2 * hour, 5 * hour);
+        let mut logged_out = account(3, Some("Old"), Some(status(vec![five_hour(0.)])));
+        logged_out.logged_in = Some(false);
+        let accounts = AgentAccounts {
+            accounts: vec![
+                account(
+                    1,
+                    Some("Work"),
+                    Some(status(vec![
+                        five_hour(100.),
+                        limit("Weekly", 56., 72 * hour, 168 * hour),
+                    ])),
+                ),
+                account(2, Some("Side"), Some(status(vec![five_hour(0.)]))),
+                logged_out,
+            ],
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: status(vec![five_hour(38.)]),
+                read_at: SystemTime::now(),
+            }),
+            last_id: 3,
+            ..AgentAccounts::default()
+        };
+        let other_accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: status(vec![five_hour(10.)]),
+                read_at: SystemTime::now(),
+            }),
+            ..AgentAccounts::default()
+        };
+
+        // Each account counts the same: 62, 0 and 100 left are 54 across them.
+        let pools = usage_pools(&account_entries(&accounts));
+        let shape: Vec<(&str, usize, u8)> = pools
+            .iter()
+            .map(|pool| (pool.label.as_str(), pool.members.len(), pool.left_percent()))
+            .collect();
+        assert_eq!(shape, vec![("5-hour", 3, 54), ("Weekly", 1, 44)]);
+
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing, other_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| match request {
+                    Request::OpenLoginSession { account, .. } => {
+                        Some(Response::LoginSessionOpened(account.map_or(100, |id| id.0)))
+                    }
+                    Request::SubscribeThread(ConnectionId::LoginSession(_)) => {
+                        Some(Response::Thread(login_session(true)))
+                    }
+                    _ => None,
+                });
+                client.set_accounts_for_test(
+                    [(mock.clone(), accounts), (other, other_accounts)].into(),
+                    cx,
+                );
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::project_info::init(cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Usage, window, cx)
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("usage-mock-0").is_some());
+        assert!(cx.debug_bounds("usage-mock-1").is_some());
+        assert!(cx.debug_bounds("usage-other-0").is_none());
+        let external = cx
+            .debug_bounds("usage-mock-0-external")
+            .expect("the External account");
+        let work = cx
+            .debug_bounds("usage-mock-0-1")
+            .expect("an agentZ account");
+        let side = cx
+            .debug_bounds("usage-mock-0-2")
+            .expect("another agentZ account");
+        assert!(external.left() < work.left() && work.left() < side.left());
+        assert!(cx.debug_bounds("usage-mock-0-3").is_none());
+        assert!(cx.debug_bounds("usage-mock-1-external").is_none());
+
+        let weekly = cx
+            .debug_bounds("usage-mock-1-1")
+            .expect("Work's weekly window");
+        cx.simulate_click(weekly.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(agent_page_id(&page, cx).as_deref(), Some("mock"));
+        page.read_with(cx, |page, _| {
+            assert!(page.section == Section::Agents);
+            assert!(
+                page.agent_panel()
+                    .is_some_and(|panel| panel.tab == AgentTab::Account)
+            );
+        });
     }
 
     #[gpui::test]

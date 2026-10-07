@@ -29,6 +29,14 @@ Notes for whoever continues:
   be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
   importing sessions. Since item 8, the Account tab opens a login session per account.
+- Item 14: Settings › Usage lists the installed agents that read their accounts' limits
+  (`reads_usage`), an agent with one account included, as the mock's Codex is; "across N
+  accounts" shows only with more than one. Accounts found logged out are left out, as their
+  reads are out of date. Pools are by window name, what's left being 100 less the mean used
+  (t3code's). A segment's click opens the account's Account tab. The gauge is only in a
+  started thread's composer (a new thread's account picker already has the limits), and
+  isn't shown while the account is found logged out. Its popover has the account's windows
+  and Usage ↗; Use Reset comes with limit resets (20).
 - Item 13: the notice shows when a turn ends with an error while the last read of the
   thread's account has a window used up that hasn't reset; agentZ doesn't parse the agents'
   error texts. A failed turn is read again, so the notice can follow the error by a few
@@ -127,7 +135,7 @@ Notes for whoever continues:
 | 11 | 13 | The account's color on its threads' agent icon | done |
 | 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | done |
 | 13 | 14 | The limit notice over the composer (Continue on another account first) | done |
-| 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | |
+| 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | done |
 | 15 | | Wave 1: Claude | |
 | 16 | | Wave 1: Codex | |
 | 17 | | Wave 1: Devin | |

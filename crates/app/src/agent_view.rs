@@ -66,7 +66,9 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
-use crate::usage_limits::{left_label, reset_phrase, tightest_window, used_up_window};
+use crate::usage_limits::{
+    LOW_PERCENT, UsagePopover, left_label, reset_phrase, tightest_window, used_up_window,
+};
 use crate::{ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
@@ -4792,6 +4794,84 @@ impl AgentView {
         )
     }
 
+    /// The thread's account's window closest to running out, which the composer's gauge shows.
+    fn gauged_window(&self, cx: &App) -> Option<LimitWindow> {
+        let agent_id = self.agent_id.as_ref()?;
+        let account = self.store.read(cx).thread(self.thread_id)?.account;
+        let accounts = self.client.read(cx).accounts(agent_id);
+        // Its last read is from before it logged out.
+        if accounts.logged_in(account) == Some(false) {
+            return None;
+        }
+        tightest_window(&accounts.status(account)?.status.windows).cloned()
+    }
+
+    /// Beside the agent, what's left of the thread's account's window closest to running out,
+    /// opening that account's windows.
+    fn render_usage_gauge(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let window = self.gauged_window(cx)?;
+        let agent_id = self.agent_id.clone()?;
+        let account = self.store.read(cx).thread(self.thread_id)?.account;
+        let left = window.left_percent();
+        let color = if left == 0 {
+            Color::Error
+        } else if left <= LOW_PERCENT {
+            Color::Warning
+        } else {
+            Color::Muted
+        };
+        let tooltip = format!("{}: {left}% left", window.label);
+        let usage_page = self
+            .registry
+            .read(cx)
+            .agent(&agent_id)
+            .and_then(|agent| agent.accounts.as_ref())
+            .and_then(|support| support.usage_page.clone());
+        let client = self.client.clone();
+        Some(
+            div()
+                .debug_selector(|| "usage-gauge".into())
+                .child(
+                    PopoverMenu::new("usage-gauge-menu")
+                        .trigger_with_tooltip(
+                            ButtonLike::new("usage-gauge")
+                                .style(ButtonStyle::Filled)
+                                .size(ButtonSize::Compact)
+                                .child(
+                                    h_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            Icon::new(IconName::Gauge)
+                                                .size(IconSize::XSmall)
+                                                .color(color),
+                                        )
+                                        .child(
+                                            Label::new(format!("{left}%"))
+                                                .size(LabelSize::Small)
+                                                .color(color),
+                                        ),
+                                ),
+                            Tooltip::text(tooltip),
+                        )
+                        .menu(move |window, cx| {
+                            Some(cx.new(|cx| {
+                                UsagePopover::new(
+                                    client.clone(),
+                                    agent_id.clone(),
+                                    account,
+                                    usage_page.clone(),
+                                    window,
+                                    cx,
+                                )
+                            }))
+                        })
+                        .anchor(Anchor::BottomLeft)
+                        .offset(gpui::point(px(0.), px(-4.))),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The thread this one continues, with its agent's name and icon, while it's kept.
     fn continued_from(&self, cx: &App) -> Option<(ThreadId, SharedString, SharedString, Icon)> {
         let store = self.store.read(cx);
@@ -5220,6 +5300,7 @@ impl AgentView {
                                                     .size(LabelSize::Small)
                                                     .color(Color::Muted),
                                             )
+                                            .children(self.render_usage_gauge(cx))
                                             .into_any_element(),
                                         ComposerStyle::Card => self.render_agent_picker(cx),
                                     }),
@@ -7853,6 +7934,95 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("limit-notice").is_none());
         assert!(!at_limit(&view, cx));
+    }
+
+    /// The composer gauges the thread's account by its window closest to running out, and opens
+    /// that account's windows. A logged-out account's last read isn't gauged.
+    #[gpui::test]
+    fn the_composer_gauges_the_threads_account(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, StatusRead};
+
+        let (view, cx) = open(2, false, cx);
+        let mock = AgentId::new("mock");
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+        let window = |label: &str, used_percent: f64, length: Duration| LimitWindow {
+            label: label.into(),
+            used_percent,
+            resets_at: Some(now + 2 * hour),
+            length: Some(length),
+        };
+        let read = |windows: Vec<LimitWindow>| StatusRead {
+            status: AccountStatus {
+                plan: Some("Team".into()),
+                windows,
+                ..AccountStatus::default()
+            },
+            read_at: now,
+        };
+        let mut accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(read(vec![window("5-hour", 10., 5 * hour)])),
+            ..AgentAccounts::default()
+        };
+        let work = accounts.add();
+        if let Some(account) = accounts.account_mut(work) {
+            account.choices.label = Some("Work".into());
+            account.logged_in = Some(true);
+            account.status = Some(read(vec![
+                window("5-hour", 38., 5 * hour),
+                window("Weekly", 91., 168 * hour),
+            ]));
+        }
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        let mut on_work = snapshot(None);
+        on_work.threads[1].account = Some(work);
+        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx)
+        });
+        cx.run_until_parked();
+
+        let gauged = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                view.gauged_window(cx)
+                    .map(|window| (window.label.clone(), window.left_percent()))
+            })
+        };
+        assert_eq!(gauged(cx), Some(("Weekly".into(), 9)));
+        let gauge = cx
+            .debug_bounds("usage-gauge")
+            .expect("the composer has the gauge");
+        cx.simulate_click(gauge.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("usage-gauge-popover").is_some());
+        assert!(cx.debug_bounds("limit-gauge-window-0").is_some());
+        assert!(cx.debug_bounds("limit-gauge-window-1").is_some());
+        // Escape closes it without stopping the thread. The popover takes focus once drawn.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| thread.set_working_for_test(true, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("usage-gauge-popover").is_none());
+        assert!(thread.read_with(cx, |thread, _| thread.is_working()));
+        thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
+
+        if let Some(account) = accounts.account_mut(work) {
+            account.logged_in = Some(false);
+        }
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock, accounts)].into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(gauged(cx), None);
+        assert!(cx.debug_bounds("usage-gauge").is_none());
     }
 
     #[test]

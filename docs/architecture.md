@@ -242,7 +242,7 @@ Each entry: what it does, where it lives, and where it comes from.
   threads in faint text.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
   combining repositories), Appearance (Zed's theme modes), Notifications (sounds and macOS
-  notifications, see Attention states), Agents, Machines, and a page per project (with
+  notifications, see Attention states), Agents, Usage, Machines, and a page per project (with
   Checkouts).
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
   installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
@@ -269,6 +269,16 @@ Each entry: what it does, where it lives, and where it comes from.
   page every frame, and laying out every card held it to about 6 fps. A sub-page has Zed's back button and breadcrumb. With more than one machine, a machine
   picker sits in the header. Registry icons are single-color (`currentColor`), so they are
   drawn in the text color on a neutral tile.
+- **Settings › Usage** (`SettingsPage::render_usage`, t3code's `UsageLimitsPooled`, accounts
+  topic 16): each installed agent whose accounts' limits are read (its listing's
+  `accounts.reads_usage`), with a card per window (`UsagePool`, by the window's name): what's
+  left across its accounts (100 less the mean used, each account counting the same, as in
+  t3code), "across N accounts" with more than one, and a bar with a segment per account, in
+  the order they're listed, filled by what's left of it (as its limit bar, `limit_color`), with
+  its avatar, name, % and reset (`format_short_resets_in`). Accounts found logged out are left out, their
+  last reads being out of date. A segment's tooltip has the account and when it resets, and a
+  click opens the account's Account tab (`show_agent_accounts`). With more than one machine,
+  the Agents page's machine picker sits in the header.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
   Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
 
@@ -426,6 +436,14 @@ Each entry: what it does, where it lives, and where it comes from.
   the most left of its tightest window (then those not read yet, then used up, then logged
   out); with more than one other account, it's a split button whose arrow lists the rest.
   Usage ↗ opens the agent's usage page. Closed, it stays closed until the next turn.
+- **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
+  t3code's `ComposerUsageLimits`, accounts topic 16): beside the agent in a started thread's
+  composer, what's left of its account's window closest to running out ("62%"), yellow at 15%
+  or less and red when used up, with the window's name in its tooltip. It shows once the
+  account has a read, and not while it's found logged out. A click opens that account's
+  windows (avatar, name, plan, `render_limit_windows`) with Usage ↗ for the agent's usage
+  page; Escape or a click outside closes it without stopping the turn. A new thread shows the
+  accounts' limits in its account picker instead.
 - **New Thread** (`Shell::new_thread`, `Shell::start_draft`, `new_thread_modal.rs`; t3code's
   `useHandleNewThread`, the user's choice): opens a draft right away in the shown project, or
   asks which project first when several are shown (the modal is only that picker). It reuses

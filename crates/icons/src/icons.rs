@@ -160,6 +160,7 @@ pub enum IconName {
     Forgejo,
     ForwardArrow,
     ForwardArrowUp,
+    Gauge,
     GenericClose,
     GenericMaximize,
     GenericMinimize,
