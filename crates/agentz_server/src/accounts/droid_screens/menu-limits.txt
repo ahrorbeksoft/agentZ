@@ -1,0 +1,31 @@
+
+
+
+                                 █████████    █████████     ████████    ███   █████████
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   █████████    ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 █████████    ███    ███    ████████    ███   █████████
+
+                                                        v0.234.0
+
+                                       TIP: Use @ to mention files in your prompt
+
+                                   shift+tab to cycle modes · ctrl+N to cycle models
+                                        ctrl+L for autonomy · tab for reasoning
+
+                                         Skills (22) ✓  MCPs (0) ✗  AGENTS.md ✗
+
+
+ Auto (Off) · all actions require approval                                                           GPT-6.1 Sol (High)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ > /limits                                                                                                            │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+   /limits                          Manage credit usage limits and overage preferences                              info
+   /btw                             Ask a side question without polluting the main transcript                    session
+   /compress                        Compress the current session in place. Add instructions to custom...
+   /migrate                         Take substantial work from an agreed plan to a verified outcome, ...   factory skill
+   /incident                        RCA runbook for alerts. Given an alert link (or prompted to provi...
+   /detect-overlapping-workstreams  Check whether a Software Factory workstream duplicates one that a...

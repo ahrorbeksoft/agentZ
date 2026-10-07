@@ -1,9 +1,10 @@
 //! What agentZ knows about each agent it can run on several accounts.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use agentz_protocol::agents::AgentCommand;
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use super::{LoginCheck, Reader};
@@ -19,6 +20,9 @@ pub struct AgentDescription {
     /// Switches that keep the login in a file in the home, where it would otherwise go to a
     /// keychain entry every home shares.
     pub file_storage: BTreeMap<String, String>,
+    /// Files a new account's home starts with, by their path in it, such as settings that differ
+    /// from the agent's defaults.
+    pub home_files: BTreeMap<String, String>,
     /// Variables the agent takes as a login, which would override the account's own.
     pub login_variables: Vec<String>,
     pub login_check: LoginCheck,
@@ -50,6 +54,28 @@ pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
 }
 
 impl AgentDescription {
+    /// Writes the files a new account's `home` starts with.
+    pub fn start_home(&self, home: &Path) -> Result<()> {
+        for (path, contents) in &self.home_files {
+            // A custom agent names these, so one must not reach outside the home.
+            anyhow::ensure!(
+                !path.is_empty()
+                    && Path::new(path)
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                "{path} isn't a path inside an account's home"
+            );
+            let path = home.join(path);
+            if let Some(folder) = path.parent() {
+                std::fs::create_dir_all(folder)
+                    .with_context(|| format!("creating {}", folder.display()))?;
+            }
+            std::fs::write(&path, contents)
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        Ok(())
+    }
+
     /// Makes `command` run on an agentZ account whose folder is `home`: the server's
     /// environment without the agent's login variables, then the account's Environment
     /// (`account_env`), then the home variables and file storage switches, then the key it logs
@@ -106,6 +132,7 @@ mod tests {
                 ("AGENT_HOME".into(), String::new()),
             ]),
             file_storage: BTreeMap::from([("AGENT_KEYRING".into(), "file".into())]),
+            home_files: BTreeMap::new(),
             login_variables: vec!["AGENT_API_KEY".into(), "GITHUB_TOKEN".into()],
             login_check: LoginCheck::Session,
             reader: None,
@@ -171,5 +198,32 @@ mod tests {
         assert_eq!(description.login_check, LoginCheck::Session);
         assert!(built_in("factory-droid").is_some());
         assert!(built_in("mock").is_none());
+    }
+
+    #[test]
+    fn new_homes_start_with_their_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dir.path().join("1");
+        let description = AgentDescription {
+            home_files: BTreeMap::from([(
+                ".agent/settings.json".into(),
+                r#"{"sync": false}"#.into(),
+            )]),
+            ..AgentDescription::default()
+        };
+        description.start_home(&home).expect("start");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".agent/settings.json")).expect("read"),
+            r#"{"sync": false}"#
+        );
+
+        for outside in ["../escape.json", "/etc/escape.json", ""] {
+            let description = AgentDescription {
+                home_files: BTreeMap::from([(outside.into(), "{}".into())]),
+                ..AgentDescription::default()
+            };
+            assert!(description.start_home(&home).is_err(), "{outside}");
+        }
+        assert!(!dir.path().join("escape.json").exists());
     }
 }

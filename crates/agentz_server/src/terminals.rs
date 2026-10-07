@@ -62,6 +62,25 @@ pub(crate) struct TerminalSpawn {
     pub env: HashMap<String, String>,
 }
 
+/// `program` with `args`, run without the variables `removed`: a terminal only adds to the
+/// server's environment, so `env` leaves these out.
+pub(crate) fn without_variables(
+    program: String,
+    args: Vec<String>,
+    removed: Vec<String>,
+) -> (String, Vec<String>) {
+    if removed.is_empty() {
+        return (program, args);
+    }
+    let mut env_args = Vec::new();
+    for variable in removed {
+        env_args.extend(["-u".to_string(), variable]);
+    }
+    env_args.push(program);
+    env_args.extend(args);
+    ("/usr/bin/env".to_string(), env_args)
+}
+
 /// The terminal's size in cells, and the cell size in pixels for programs that ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TerminalSize {
@@ -354,6 +373,11 @@ impl Terminal {
 
     pub(crate) fn spawn(&self) -> &TerminalSpawn {
         &self.spawn
+    }
+
+    /// The process the terminal started.
+    pub(crate) fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     pub(crate) fn size(&self) -> TerminalSize {
@@ -1438,7 +1462,7 @@ impl Drop for AdoptedPty {
 /// Whether the process is there, even if it isn't this user's to signal (on macOS a terminal
 /// runs `login`, as root).
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     // SAFETY: signal 0 only checks.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)

@@ -1,0 +1,52 @@
+
+
+
+                                 █████████    █████████     ████████    ███   █████████
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   █████████    ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 █████████    ███    ███    ████████    ███   █████████
+
+                                                        v0.234.0
+
+                                    TIP: Press Alt/Option+X to disable auto-compress
+
+                                   shift+tab to cycle modes · ctrl+N to cycle models
+                                        ctrl+L for autonomy · tab for reasoning
+
+                                          Skills (…)  MCPs (0) ✗  AGENTS.md ✗
+
+
+●  Credit limit choice cancelled.
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ⓘ  How Factory's usage works                                                                                         │
+│ Your plan's Standard Usage gives you access to all models and is consumed first. When Standard Usage limit is        │
+│ reached, enable Droid Core to continue working with Droid Core labeled models, or enable Extra Usage to continue     │
+│ working with any model.                                                                                              │
+│                                                                                                                      │
+│ ● You are using Standard Usage, but weekly usage is at 80%.                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Usage & Limits                                                                                                       │
+│                                                                                                                      │
+│ ◉ Standard | ○ Droid Core | ○ Extra Usage                                                                            │
+│ 5-hour   48%                                                                                                 ↻ 39min │
+│ ████████████████████████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ Weekly   80%                                                                                                ↻ 2 days │
+│ █████████████████████████████████████████████████████████████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░ │
+│                                                                                                                      │
+│ Monthly  40%                                                                                               ↻ 25 days │
+│ ██████████████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                                                                                                                      │
+│ When limit is reached                                                                                                │
+│                                                                                                                      │
+│  >Switch to Droid Core                                                                                               │
+│     Continue with Droid Core models at no extra cost                                                                 │
+│                                                                                                                      │
+│   Enable Extra Usage in settings (opens browser)                                                                     │
+╰─ ───Configure Extra Usage on the billing page ($0.00 remaining)──────────────────────────────────────────────────────╯
+  ↑↓ navigate   Enter select   Tab switch tab   Esc close

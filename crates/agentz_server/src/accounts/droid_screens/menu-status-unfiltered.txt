@@ -1,0 +1,31 @@
+
+
+
+                                 █████████    █████████     ████████    ███   █████████
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   █████████    ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 █████████    ███    ███    ████████    ███   █████████
+
+                                                        v0.234.0
+
+                                       TIP: Use @ to mention files in your prompt
+
+                                   shift+tab to cycle modes · ctrl+N to cycle models
+                                        ctrl+L for autonomy · tab for reasoning
+
+                                         Skills (22) ✓  MCPs (0) ✗  AGENTS.md ✗
+
+
+ Auto (Off) · all actions require approval                                                           GPT-6.1 Sol (High)
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ > /status                                                                                                            │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+   /account                         Open Factory account in your browser                                         configs
+   /billing                         Open Factory billing in your browser
+   /cd                              Change the current session working directory
+   /cwd                             Change the current session working directory
+   /droids                          Manage custom Droids (subagents)
+   /fast                            Enable fast mode for the current model (/fast off to disable)

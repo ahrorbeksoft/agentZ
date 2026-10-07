@@ -269,8 +269,8 @@ that is still used.
 - Some readers leave files behind, which the server deletes after each read:
   - Droid's terminal UI writes an empty session file (~250 bytes) under
     `<home>/.factory/sessions/<folder>/` each time it starts, and it must start in a trusted
-    folder. The reader runs it in a fixed folder inside the account's home and deletes the
-    session file the run created.
+    folder. The reader runs it in a fixed folder of agentZ's (`accounts/<agent id>/reader/`,
+    trusted once in each home) and deletes the sessions opened there.
   - `claude -p "/usage"` writes a transcript under `<config dir>/projects/<folder>/`. It gets
     the same cleanup, unless Claude has a flag that skips saving the session.
   - Codex's `app-server` and Devin's status command leave nothing.

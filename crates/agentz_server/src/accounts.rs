@@ -3,6 +3,7 @@
 
 mod descriptions;
 mod droid;
+mod hidden_terminal;
 mod login_checks;
 mod readers;
 
@@ -98,6 +99,12 @@ pub fn agent_folder(data_dir: &Path, agent_id: &AgentId) -> Result<PathBuf> {
         "{agent_id} can't name a folder"
     );
     Ok(data_dir.join("accounts").join(name))
+}
+
+/// The folder the agent's reader runs in, for any of its accounts: one the user never works
+/// in, so what the reader leaves there (Droid's sessions) is its own.
+pub fn reader_folder(data_dir: &Path, agent_id: &AgentId) -> Result<PathBuf> {
+    Ok(agent_folder(data_dir, agent_id)?.join("reader"))
 }
 
 /// The API key the account in `home` logs in with, if it has one.

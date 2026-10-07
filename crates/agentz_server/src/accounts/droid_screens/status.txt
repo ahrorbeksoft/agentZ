@@ -1,0 +1,52 @@
+
+
+
+                                 █████████    █████████     ████████    ███   █████████
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   █████████    ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 █████████    ███    ███    ████████    ███   █████████
+
+                                                        v0.234.0
+
+                                    TIP: Press Alt/Option+X to disable auto-compress
+
+                                   shift+tab to cycle modes · ctrl+N to cycle models
+                                        ctrl+L for autonomy · tab for reasoning
+
+                                          Skills (…)  MCPs (0) ✗  AGENTS.md ✗
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ DROID STATUS                                                                                                         │
+│ 🤖 Droid Version:     v0.234.0                                                                                       │
+│    • Mode:            ⚡ Auto Mode (High Impact)                                                                     │
+│                                                                                                                      │
+│ 📁 Session:                                                                                                          │
+│    • ID:              00000000-0000-4000-8000-000000000001                                                           │
+│    • Working Dir:     /private/tmp/reader                                                                            │
+│                                                                                                                      │
+│ 🔌 IDE Integration:                                                                                                  │
+│    • Status:          Not connected                                                                                  │
+│                                                                                                                      │
+│ 🔐 Authentication:                                                                                                   │
+│    • Status:          Authenticated                                                                                  │
+│    • Email:           work@example.com                                                                               │
+│    • User ID:         user_00000000000000000000000000                                                                │
+│    • Org ID:          org00000000000000000                                                                           │
+│                                                                                                                      │
+│ 🧠 Model:                                                                                                            │
+│    • Selected:        Opus 5.5                                                                                       │
+│                                                                                                                      │
+│ 🌐 Backend:                                                                                                          │
+│    • Region:            global                                                                                       │
+│    • Global Host:       https://api.factory.ai                                                                       │
+│    • Prem Host:         https://prem.factory.ai                                                                      │
+│    • Client IP:         203.0.113.7                                                                                  │
+│    • Deploy SHA:        —                                                                                            │
+│                                                                                                                      │
+│ 💾 Data Persistence:                                                                                                 │
+│    • Sessions Dir:    /Users/me/.factory/sessions                                                                    │
+│ Esc close                                                                                                            │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

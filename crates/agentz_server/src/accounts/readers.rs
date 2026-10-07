@@ -1,6 +1,7 @@
 //! How agentZ reads an account's identity and limits (plan.md › Agent descriptions, the
 //! readers' kinds). Each kind comes with the first agent that needs it.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -11,6 +12,7 @@ use futures::AsyncReadExt as _;
 use http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 
+use super::droid::WINDOW_LABELS;
 use super::login_checks::run_with_account_env;
 
 /// How long an HTTP reader waits for its answer.
@@ -25,6 +27,9 @@ pub enum Reader {
     /// Factory's billing API, called with the account's `FACTORY_API_KEY` (plan.md, reader
     /// kind 6), as Droid's `/limits` calls it.
     FactoryApi { base_url: String },
+    /// Droid's `/status` and `/limits`, in its terminal UI run where nobody sees it (plan.md,
+    /// reader kind 5).
+    DroidTerminal,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -47,9 +52,16 @@ pub struct Read {
 }
 
 impl Reader {
-    /// Reads the account whose agent command is `agent`.
-    pub async fn read(&self, agent: AgentCommand, http: Arc<dyn HttpClient>) -> Result<Read> {
+    /// Reads the account whose agent command is `agent`. A reader that runs the agent's own UI
+    /// runs it in `folder` (the agent's [`super::reader_folder`]).
+    pub async fn read(
+        &self,
+        agent: AgentCommand,
+        http: Arc<dyn HttpClient>,
+        folder: &Path,
+    ) -> Result<Read> {
         match self {
+            Reader::DroidTerminal => super::droid::read(agent, folder).await,
             Reader::Command(command) => {
                 let output =
                     run_with_account_env(command.program.as_deref(), &command.args, agent).await?;
@@ -152,32 +164,29 @@ fn factory_limits(body: &[u8], now: SystemTime) -> Result<AccountStatus> {
         .limits
         .and_then(|pools| pools.standard)
         .context("Factory's answer has no Standard Usage limits")?;
-    let windows = [
-        ("5-hour", standard.five_hour),
-        ("Weekly", standard.weekly),
-        ("Monthly", standard.monthly),
-    ]
-    .into_iter()
-    .filter_map(|(label, window)| {
-        let window = window?;
-        let ends_at = window
-            .window_end
-            .as_deref()
-            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-            .map(SystemTime::from);
-        // A window that ended hasn't started again: Droid shows "Use Droid to start".
-        let active = ends_at.filter(|ends_at| *ends_at > now);
-        Some(LimitWindow {
-            label: label.to_string(),
-            used_percent: if active.is_some() {
-                window.used_percent
-            } else {
-                0.0
-            },
-            resets_at: active,
+    let windows = WINDOW_LABELS
+        .into_iter()
+        .zip([standard.five_hour, standard.weekly, standard.monthly])
+        .filter_map(|(label, window)| {
+            let window = window?;
+            let ends_at = window
+                .window_end
+                .as_deref()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(SystemTime::from);
+            // A window that ended hasn't started again: Droid shows "Use Droid to start".
+            let active = ends_at.filter(|ends_at| *ends_at > now);
+            Some(LimitWindow {
+                label: label.to_string(),
+                used_percent: if active.is_some() {
+                    window.used_percent
+                } else {
+                    0.0
+                },
+                resets_at: active,
+            })
         })
-    })
-    .collect();
+        .collect();
     let credits = limits
         .extra_usage_balance_cents
         .filter(|cents| *cents > 0.0)
@@ -197,6 +206,11 @@ mod tests {
 
     fn no_http() -> Arc<dyn HttpClient> {
         Arc::new(BlockedHttpClient)
+    }
+
+    /// Commands and HTTP readers run nothing in the reader's folder.
+    fn unused_folder() -> &'static Path {
+        Path::new("/nonexistent")
     }
 
     fn shell(script: &str) -> Reader {
@@ -219,7 +233,7 @@ mod tests {
                 \"windows\": [{\"label\": \"5-hour\", \"used_percent\": 40,
                 \"resets_at\": {\"secs_since_epoch\": 60, \"nanos_since_epoch\": 0}}]}""#,
         )
-        .read(agent.clone(), no_http())
+        .read(agent.clone(), no_http(), unused_folder())
         .await
         .expect("read");
         assert_eq!(read.logged_in, Some(true));
@@ -236,7 +250,7 @@ mod tests {
         );
 
         let logged_out = shell(r#"echo '{"logged_in": false}'"#)
-            .read(agent.clone(), no_http())
+            .read(agent.clone(), no_http(), unused_folder())
             .await
             .expect("read");
         assert_eq!(logged_out.logged_in, Some(false));
@@ -244,13 +258,13 @@ mod tests {
 
         assert!(
             shell("echo '{}'; exit 1")
-                .read(agent.clone(), no_http())
+                .read(agent.clone(), no_http(), unused_folder())
                 .await
                 .is_err()
         );
         assert!(
             shell("echo 5-hour: 40%")
-                .read(agent, no_http())
+                .read(agent, no_http(), unused_folder())
                 .await
                 .is_err()
         );
@@ -348,18 +362,23 @@ mod tests {
         };
 
         let read = reader
-            .read(with_key("fk-good"), http.clone())
+            .read(with_key("fk-good"), http.clone(), unused_folder())
             .await
             .expect("read");
         assert_eq!(read.logged_in, Some(true));
         assert_eq!(read.status.windows.len(), 3);
 
         let refused = reader
-            .read(with_key("fk-revoked"), http.clone())
+            .read(with_key("fk-revoked"), http.clone(), unused_folder())
             .await
             .expect("read");
         assert_eq!(refused.logged_in, Some(false));
 
-        assert!(reader.read(AgentCommand::default(), http).await.is_err());
+        assert!(
+            reader
+                .read(AgentCommand::default(), http, unused_folder())
+                .await
+                .is_err()
+        );
     }
 }

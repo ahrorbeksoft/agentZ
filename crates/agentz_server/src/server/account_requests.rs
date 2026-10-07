@@ -17,15 +17,24 @@ impl Server {
     pub(super) fn account_request(&mut self, request: Request) -> Result<Response> {
         match request {
             Request::AddAccount(agent_id) => {
-                if self.account_description(&agent_id).is_none() {
+                let Some(description) = self.account_description(&agent_id) else {
                     bail!(
                         "{} can't have more than one account",
                         self.agent_name(&agent_id)
                     );
-                }
+                };
                 // Every account gets a folder, named after its agent.
                 accounts::agent_folder(&self.data_dir, &agent_id)?;
                 let id = self.accounts.update(&agent_id, AgentAccounts::add);
+                let started = accounts::home(&self.data_dir, &agent_id, id)
+                    .and_then(|home| description.start_home(&home));
+                if let Err(error) = started {
+                    accounts::remove_home(&self.data_dir, &agent_id, id).log_err();
+                    self.accounts
+                        .update(&agent_id, |accounts| accounts.remove(id))
+                        .log_err();
+                    return Err(error);
+                }
                 Ok(Response::AccountAdded(id))
             }
             Request::RemoveAccount { agent_id, account } => {

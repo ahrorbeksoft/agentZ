@@ -1,0 +1,38 @@
+
+
+
+                                 █████████    █████████     ████████    ███   █████████
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   █████████    ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                 █████████    ███    ███    ████████    ███   █████████
+
+                                                        v0.234.0
+
+                                    TIP: Press Alt/Option+X to disable auto-compress
+
+                                   shift+tab to cycle modes · ctrl+N to cycle models
+                                        ctrl+L for autonomy · tab for reasoning
+
+                                          Skills (…)  MCPs (0) ✗  AGENTS.md ✗
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                      │
+│ Trust this folder?                                                                                                   │
+│                                                                                                                      │
+│ /private/tmp/reader                                                                                                  │
+│                                                                                                                      │
+│ Droid will read, edit, and run files in this folder, and load any project configuration it defines, including hooks  │
+│ and MCP servers that can execute commands on your machine.                                                           │
+│                                                                                                                      │
+│ If you just cloned this folder or don't recognize its contents, review the files and any .factory configuration      │
+│ (hooks, MCP servers) before trusting it.                                                                             │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+> 1. Trust this folder
+  2. Exit without trusting
+
+Enter to confirm · Esc to exit

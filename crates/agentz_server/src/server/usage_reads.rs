@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use util::ResultExt as _;
 
 use super::{Input, Server};
-use crate::accounts::Reader;
+use crate::accounts::{self, Reader};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A refresh reads the accounts not read for this long. Less than the interval, so an account
@@ -104,7 +104,8 @@ impl Server {
         }
         let command = self.agent_command(agent_id, account, true);
         let http = self.http_client.clone();
-        let read = async move { reader.read(command.await?, http).await };
+        let folder = accounts::reader_folder(&self.data_dir, agent_id);
+        let read = async move { reader.read(command.await?, http, &folder?).await };
         let agent_id = agent_id.clone();
         self.spawn_then(read, move |server, read| {
             server.reading_accounts.remove(&(agent_id.clone(), account));

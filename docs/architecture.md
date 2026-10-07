@@ -131,6 +131,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `agents/registry/` | server | Registry cache, icons, installed agents |
 | `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests), with how each keeps accounts, if it can |
 | `accounts/<agent id>/<account id>/` | server | An agentZ account's home: the agent's login, sessions and own settings files |
+| `accounts/<agent id>/reader/` | server | Where the agent's reader runs its terminal UI (Droid's), with the settings it runs with |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
@@ -523,14 +524,25 @@ Each entry: what it does, where it lives, and where it comes from.
   kept with when it was read): when an app opens and every 5 minutes while one is, for the
   accounts not read lately, a few seconds apart (`server/usage_reads.rs`); after each turn on
   the account; and on demand (`Request::RefreshUsage`). A read that fails, or finds the
-  account logged out, keeps the last numbers. An agentZ account's agent runs in the account's
-  folder, `accounts/<agent id>/<account id>/`, so every account is a process of its own with
-  its own login and sessions: its threads, login sessions (`OpenLoginSession`) and session
-  listing and import (`ListAgentSessions`, `ImportAgentSessions`) all take the account. Only
+  account logged out, keeps the last numbers. Droid's reader (`Reader::DroidTerminal`,
+  `accounts/droid.rs`) runs its terminal UI in a terminal nobody sees
+  (`accounts/hidden_terminal.rs`), in `accounts/<agent id>/reader/`, and runs `/status` and
+  `/limits` there. Droid is translated, so only its symbols, numbers, emails and ids are read
+  (`🔐`, `%`, `↻`, the bars); the screens it's tested on are in `accounts/droid_screens/`, and
+  a fake Droid in its tests shows them in turn. It answers the folder trust question for that
+  folder only, sends Esc and never Enter in `/limits` (Enter there changes the limit choice),
+  runs with `--settings` turning cloud session sync off, and then deletes the sessions it
+  opened, which are all those opened in that folder. An agentZ account's agent runs in the
+  account's folder, `accounts/<agent id>/<account id>/`, so every account is a process of its
+  own with its own login and sessions: its threads, login sessions (`OpenLoginSession`) and
+  session listing and import (`ListAgentSessions`, `ImportAgentSessions`) all take the
+  account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
   `accounts/droid.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the switches that keep
-  its login in a file rather than a shared keychain entry, the variables that log it in, its
+  its login in a file rather than a shared keychain entry, the files a new account's folder
+  starts with (`AgentDescription::start_home`, at `AddAccount`: Droid's
+  `.factory/settings.json` with cloud session sync off), the variables that log it in, its
   login check and its reader, and its key login: a method that reads a key from a variable
   (Droid's "Factory API Key"). On an agentZ account that method asks for the key
   (`AgentThread::set_key_method` marks it `LoginInput::ApiKey`), and logging in with it, or

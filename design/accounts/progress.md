@@ -29,11 +29,21 @@ Notes for whoever continues:
   settings tabs edit the External account's settings, until items 8 and 9 add the menus.
 - Only agents with a description can have more accounts (`AddAccount` refuses the rest).
   Droid's is `accounts/droid.rs`; wave 1 and later agents each add one beside it.
-- Readers (item 6): the reads, their storage and refreshes are built, with the one kind the
-  mock needs (`Reader::Command`, printing agentZ's own JSON). Each other kind comes with the
-  first agent that needs it. Droid's (the hidden terminal, kind 5) waits for captured
-  `/status` and `/limits` screens to parse and test against: driving Droid's terminal UI on
-  the user's real login needs their go-ahead, since `/limits` holds a billing choice.
+- Readers (item 6): the mock's kind is `Reader::Command` (printing agentZ's own JSON); each
+  other kind comes with the first agent that needs it. Droid's (`Reader::DroidTerminal`, the
+  hidden terminal, kind 5) reads `/status` and `/limits` by symbols and numbers only, as the
+  user asked, since Droid is translated. Droid's own code makes that hold: it writes reset
+  times in English in every language ("2 days", "1h 5min", "39min"), `/limits` always opens
+  on Standard Usage, and its windows are always drawn 5-hour, weekly, monthly, so they're
+  named by position. It runs in `accounts/factory-droid/reader/`, answering the trust
+  question once per home (for the External account, an entry in the user's own
+  `~/.factory/settings.json`), with cloud session sync off by `--settings`, and deletes its
+  sessions afterwards. Checked once against the real Droid (a new key home and the user's own
+  login): the same numbers as Factory's API, in 3 to 8 seconds; weekly and monthly resets are
+  only as exact as Droid's whole days. The limit choice stayed `droidCore`.
+- New Droid accounts start with `cloudSessionSync: false` in their `.factory/settings.json`
+  (the user's request; Droid's `/settings` turns it back on). It's a description's
+  `home_files`, written at `AddAccount`.
 - API-key accounts (item 7): a description's key login is the method that reads a key from a
   variable. agentZ keeps the key in the account's folder and restarts the agent with it to log
   in. Droid takes any key (checked over ACP: a made-up one passes `authenticate` and opens
@@ -50,7 +60,7 @@ Notes for whoever continues:
 | 3 | | Settings per account: `AgentSettings` keyed by account, the External account keeping today's | done |
 | 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | done |
 | 5 | | Login checks from the description | done |
-| 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | in progress: all but Droid's reader |
+| 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | done |
 | 7 | | API-key accounts (Droid with a Factory API key) | done |
 | 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | |
 | 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | |

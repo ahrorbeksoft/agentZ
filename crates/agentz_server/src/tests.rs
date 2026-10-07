@@ -300,6 +300,7 @@ fn mock_accounts() -> crate::AgentDescription {
     crate::AgentDescription {
         home_variables: BTreeMap::from([("MOCK_HOME".into(), String::new())]),
         file_storage: BTreeMap::new(),
+        home_files: BTreeMap::from([(".mock/settings.json".into(), r#"{"sync": false}"#.into())]),
         login_variables: vec!["MOCK_API_KEY".into()],
         login_check: crate::LoginCheck::Session,
         reader: None,
@@ -1276,14 +1277,18 @@ async fn accounts_decide_where_new_threads_run() {
             .is_err()
     );
 
-    // Removing an account deletes its folder; its threads keep it.
+    // A new account's folder starts with its agent's files. Removing the account deletes the
+    // folder; its threads keep it.
     let home = server
         .data_dir
         .path()
         .join("accounts")
         .join("mock")
         .join(side.to_string());
-    std::fs::create_dir_all(&home).expect("create the account's folder");
+    assert_eq!(
+        std::fs::read_to_string(home.join(".mock/settings.json")).expect("the starting file"),
+        r#"{"sync": false}"#
+    );
     client
         .ok(Request::RemoveAccount {
             agent_id: mock.clone(),

@@ -38,9 +38,10 @@ impl Server {
         method_id: acp::AuthMethodId,
         meta: Option<acp::Meta>,
     ) {
-        let key_login = self
-            .connection_account(connection)
-            .and_then(|(agent_id, account)| self.key_login(&agent_id, account));
+        let on_account = self.connection_account(connection);
+        let key_login = on_account
+            .as_ref()
+            .and_then(|(agent_id, account)| self.key_login(agent_id, *account));
         let Some(key_login) = key_login else {
             let result =
                 self.update_thread(connection, |thread| thread.authenticate(method_id, meta));
@@ -56,10 +57,12 @@ impl Server {
         };
         let check = key.as_ref().and_then(|key| {
             let reader = key_login.reader.clone()?;
+            let (agent_id, _) = on_account.as_ref()?;
+            let folder = accounts::reader_folder(&self.data_dir, agent_id);
             let command = self.connection_thread(connection)?.state.command.clone()?;
             let command = with_key(command, &key_login.variable, Some(key.clone()));
             let http = self.http_client.clone();
-            Some(async move { reader.read(command, http).await })
+            Some(async move { reader.read(command, http, &folder?).await })
         });
         let Some(check) = check else {
             let result = self.log_in(connection, method_id, meta, &key_login, key);
