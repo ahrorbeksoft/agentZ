@@ -68,6 +68,9 @@ pub(super) fn description() -> AgentDescription {
         normal_home: String::new(),
         // A key in the environment overrides the stored login.
         login_variables: vec!["FACTORY_API_KEY".into()],
+        // Both in the home it's given.
+        skills_folders: vec![".factory/skills".into(), ".agents/skills".into()],
+        outside_skills_folders: Vec::new(),
         // Logged out, `session/new` fails and offers a pairing code.
         login_check: LoginCheck::Session,
         reader: Some(Reader::DroidTerminal),

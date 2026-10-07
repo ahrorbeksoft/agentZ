@@ -37,7 +37,8 @@ before changing it, and keep the document current when you add or change a featu
 Agents run from a fixed command go in `agents/custom.json` in the data directory and show as
 installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "args":
 ["…/mock_agent.py"], "env": {}}}}`. To give it accounts, add `"accounts": {"home_variables":
-{"MOCK_HOME": ""}, "login_variables": ["MOCK_API_KEY"]}`.
+{"MOCK_HOME": ""}, "login_variables": ["MOCK_API_KEY"]}`, and `"skills_folders":
+[".mock/skills"]` there for agentZ's skills to be linked into them.
 
 ## Build, run, test
 

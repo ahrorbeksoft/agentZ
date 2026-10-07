@@ -86,7 +86,7 @@ so an open tool call's output raced the conversation.
 |---|---|
 | `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
-| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
+| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
@@ -135,6 +135,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests), with how each keeps accounts, if it can |
 | `accounts/<agent id>/<account id>/` | server | An agentZ account's home: the agent's login, sessions and own settings files |
 | `accounts/<agent id>/reader/` | server | Where the agent's reader runs its terminal UI (Droid's), with the settings it runs with |
+| `skills/<name>/` | server | agentZ's skills (Settings › Skills), each linked into every account's skills folder |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
@@ -242,8 +243,8 @@ Each entry: what it does, where it lives, and where it comes from.
   threads in faint text.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
   combining repositories), Appearance (Zed's theme modes), Notifications (sounds and macOS
-  notifications, see Attention states), Agents, Usage, Machines, and a page per project (with
-  Checkouts).
+  notifications, see Attention states), Agents, Usage, Skills, Machines, and a page per project
+  (with Checkouts).
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
   installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
   a login status badge, the version and registry links, Update when there is one, and a "⋯"
@@ -292,6 +293,26 @@ Each entry: what it does, where it lives, and where it comes from.
   last reads being out of date. A segment's tooltip has the account and when it resets, and a
   click opens the account's Account tab (`show_agent_accounts`). With more than one machine,
   the Agents page's machine picker sits in the header.
+- **Settings › Skills** (`settings_page/skills.rs`, `agentz_server::skills`,
+  `server/skill_requests.rs`; Zed's Skills page and Create a Skill form, accounts topics 17
+  and 18): agentZ's own skills on the machine, folders with a `SKILL.md` in `skills/` in its
+  data directory, which every agent and account loads in agentZ threads. Each row has the
+  skill's name and description, Delete (asking first, `ConfirmRequest::delete_skill`) and
+  Open ↗ (its `SKILL.md`, on this Mac only), and a warning line for each agent that keeps a
+  skill of its own by that name, naming the accounts when only some do. Add Skill is Add from
+  Folder… (a folder on this Mac, sent in base64 up to 32 MB without `.git`, `.DS_Store` or
+  linked folders, `Request::AddSkill`) and Create a Skill (Zed's form and checks, Enter making
+  a new line in its content, `Request::CreateSkill`). The server writes a skill into a hidden
+  folder and moves it in place, then links each skill on its own into every account's skills
+  folder (`skills::sync`): the first of its agent's `AgentDescription::skills_folders` that
+  isn't `~/.agents/skills`, which many agents read whatever their home and agentZ never writes
+  into. The External account's is linked while it's listed, and the sync reruns as skills,
+  installs or accounts change. Where an account's agent has a skill of that name in any folder
+  it reads (`outside_skills_folders` too), agentZ's is skipped, and the skills are sent with
+  the accounts skipping them (`Event::Skills`). Devin reads Claude's `~/.claude/skills`, so
+  Claude's accounts are linked first and Devin skips a skill it finds linked there. Only links
+  into `skills/` are ever removed. With more than one machine, the Agents page's machine
+  picker sits in the header.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
   Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
 

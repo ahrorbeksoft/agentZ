@@ -20,7 +20,10 @@ use util::ResultExt as _;
 
 use crate::agent_settings::{read_json, write_json};
 
-pub use descriptions::{AgentDescription, KeyLogin, built_in as built_in_description};
+pub use descriptions::{
+    AgentDescription, BUILT_IN as BUILT_IN_DESCRIPTIONS, KeyLogin, SHARED_SKILLS_FOLDER,
+    built_in as built_in_description,
+};
 pub use login_checks::{LoggedIn, LoginCheck, StatusCommand};
 pub use readers::{LimitResetOutcome, LimitResetUse, Read, Reader, ReaderCommand};
 

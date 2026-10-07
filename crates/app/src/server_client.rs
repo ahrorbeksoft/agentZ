@@ -12,6 +12,7 @@ use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
 use agentz_protocol::accounts::{AccountId, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::layout::PaneId;
+use agentz_protocol::skills::Skill;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{
@@ -99,6 +100,8 @@ pub struct ServerClient {
     agent_settings: BTreeMap<AgentId, AgentSettings>,
     /// Each agent's accounts, for those that have any of agentZ's or a read of the External one.
     accounts: BTreeMap<AgentId, AgentAccounts>,
+    /// agentZ's skills on this machine.
+    skills: Vec<Skill>,
     /// The Workspaces view's spaces on this machine.
     spaces: SpacesSnapshot,
     /// Pane agents that finished working since this window last showed them (herdr's unseen
@@ -151,6 +154,7 @@ impl ServerClient {
                 registry,
                 agent_settings: BTreeMap::new(),
                 accounts: BTreeMap::new(),
+                skills: Vec::new(),
                 spaces: SpacesSnapshot::default(),
                 unseen_panes: BTreeSet::new(),
                 machine_icon: MachineIcon::default(),
@@ -433,6 +437,22 @@ impl ServerClient {
         }
     }
 
+    pub fn skills(&self) -> &[Skill] {
+        &self.skills
+    }
+
+    fn set_skills(&mut self, skills: Vec<Skill>, cx: &mut Context<Self>) {
+        if skills != self.skills {
+            self.skills = skills;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_skills_for_test(&mut self, skills: Vec<Skill>, cx: &mut Context<Self>) {
+        self.set_skills(skills, cx);
+    }
+
     #[cfg(test)]
     pub fn set_agent_settings_for_test(
         &mut self,
@@ -667,6 +687,7 @@ impl ServerClient {
         self.set_registry(session.registry, cx);
         self.set_agent_settings(session.agent_settings, cx);
         self.set_accounts(session.accounts, cx);
+        self.set_skills(session.skills, cx);
         self.set_spaces(session.spaces, cx);
         self.set_machine_icon_state(session.machine_icon, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
@@ -690,6 +711,7 @@ impl ServerClient {
                     | Event::Registry(_)
                     | Event::AgentSettings(_)
                     | Event::Accounts(_)
+                    | Event::Skills(_)
                     | Event::Spaces(_)
                     | Event::MachineIcon(_)
             )
@@ -704,6 +726,7 @@ impl ServerClient {
             Event::Registry(registry) => self.set_registry(registry, cx),
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
             Event::Accounts(accounts) => self.set_accounts(accounts, cx),
+            Event::Skills(skills) => self.set_skills(skills, cx),
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::Thread { connection, update } => {

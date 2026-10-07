@@ -17,6 +17,7 @@ pub mod agents;
 pub mod attachments;
 pub mod diff;
 pub mod layout;
+pub mod skills;
 pub mod spaces;
 pub mod terminal;
 pub mod terminal_keys;
@@ -43,6 +44,7 @@ use crate::agents::{
 };
 use crate::attachments::{AttachmentData, AttachmentId};
 use crate::diff::{DiffScope, ThreadDiff};
+use crate::skills::{Skill, SkillFile};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
 use crate::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalMatches,
@@ -243,9 +245,9 @@ pub struct ErrorResponse {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
-    /// Projects, threads, the registry, agent settings and accounts: a [`Response::Session`]
-    /// snapshot, then [`Event::Projects`], [`Event::Registry`], [`Event::AgentSettings`] and
-    /// [`Event::Accounts`].
+    /// Projects, threads, the registry, agent settings, accounts and skills: a
+    /// [`Response::Session`] snapshot, then [`Event::Projects`], [`Event::Registry`],
+    /// [`Event::AgentSettings`], [`Event::Accounts`] and [`Event::Skills`].
     SubscribeSession,
     /// One connection's conversation: a [`Response::Thread`] snapshot, then
     /// [`Event::Thread`]s. Subscribing to a thread starts its agent if it isn't running.
@@ -631,6 +633,18 @@ pub enum Request {
         agent_id: AgentId,
         account: Option<AccountId>,
     },
+    /// Add from Folder…: a copy of a skill's folder, its `SKILL.md` at the top, becomes one of
+    /// agentZ's skills, named as its `SKILL.md` says. Every account then loads it.
+    AddSkill(Vec<SkillFile>),
+    /// Create a Skill: one of agentZ's skills with a new `SKILL.md`, as Zed's form writes it.
+    CreateSkill {
+        name: String,
+        description: String,
+        body: String,
+    },
+    /// Deletes one of agentZ's skills, by its name, and its links from every account.
+    DeleteSkill(String),
+
     /// Adds a thread on the account for each of the agent's sessions from
     /// [`Request::ListAgentSessions`], in the project its folder belongs to. The agent loads
     /// the session when its thread opens. Sessions that have a thread already, or no project,
@@ -860,6 +874,9 @@ pub struct SessionSnapshot {
     pub agent_settings: BTreeMap<AgentId, AgentSettings>,
     #[serde(default)]
     pub accounts: BTreeMap<AgentId, AgentAccounts>,
+    /// agentZ's skills on the machine, by name.
+    #[serde(default)]
+    pub skills: Vec<Skill>,
     #[serde(default)]
     pub spaces: SpacesSnapshot,
     #[serde(default)]
@@ -872,6 +889,7 @@ pub enum Event {
     Registry(RegistrySnapshot),
     AgentSettings(BTreeMap<AgentId, AgentSettings>),
     Accounts(BTreeMap<AgentId, AgentAccounts>),
+    Skills(Vec<Skill>),
     Spaces(SpacesSnapshot),
     MachineIcon(MachineIcon),
     Thread {

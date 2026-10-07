@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{LoginCheck, Reader};
 
+/// The skills folder Codex, Devin, Grok, OpenCode and others read whatever their home, in the
+/// user's home.
+pub const SHARED_SKILLS_FOLDER: &str = ".agents/skills";
+
 /// How an agent keeps its login, sessions and settings in a folder agentZ chooses. A custom
 /// agent can have one in `agents/custom.json`, under `accounts`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -40,6 +44,12 @@ pub struct AgentDescription {
     pub normal_home: String,
     /// Variables the agent takes as a login, which would override the account's own.
     pub login_variables: Vec<String>,
+    /// The folders the agent loads skills from, by their path in a home. agentZ links its own
+    /// skills into the first but the shared one ([`crate::skills`]).
+    pub skills_folders: Vec<String>,
+    /// Folders outside the home it loads skills from whatever its home, by their path in the
+    /// user's home (`~/.agents/skills`). A skill there is the agent's own, as one in the others.
+    pub outside_skills_folders: Vec<String>,
     pub login_check: LoginCheck,
     /// How agentZ reads the account's identity and limits, if it can.
     pub reader: Option<Reader>,
@@ -63,6 +73,9 @@ pub struct KeyLogin {
     /// How agentZ reads an account that logs in with a key, in place of the agent's `reader`.
     pub reader: Option<Reader>,
 }
+
+/// The registry agents agentZ has a description of.
+pub const BUILT_IN: [&str; 4] = ["factory-droid", "claude-acp", "codex-acp", "devin"];
 
 /// The description of a registry agent, by its id.
 pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
@@ -108,6 +121,47 @@ impl AgentDescription {
             .find_map(|(variable, _)| std::env::var_os(variable))
             .map(PathBuf::from)
             .unwrap_or_else(|| util::paths::home_dir().join(&self.normal_home))
+    }
+
+    /// `path` in the External account's home, or in the folder a variable set in the server's
+    /// environment moves it to (Devin's `.config`, by `XDG_CONFIG_HOME`).
+    fn external_path(&self, path: &str) -> Result<PathBuf> {
+        for (variable, folder) in &self.home_variables {
+            if folder.is_empty() {
+                continue;
+            }
+            if let Ok(rest) = Path::new(path).strip_prefix(folder)
+                && let Some(moved) = std::env::var_os(variable)
+            {
+                return Ok(PathBuf::from(moved).join(rest));
+            }
+        }
+        inside(&self.external_home(), path)
+    }
+
+    /// Where an account loads skills from, `home` being its folder (`None` for the External
+    /// account): the folder agentZ links its skills into, and the others, where a skill is the
+    /// agent's own. `None` without any to link into.
+    pub fn skill_folders(&self, home: Option<&Path>) -> Result<Option<(PathBuf, Vec<PathBuf>)>> {
+        let user_home = util::paths::home_dir();
+        let mut folders = self
+            .skills_folders
+            .iter()
+            .map(|path| match home {
+                Some(home) => inside(home, path),
+                None => self.external_path(path),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // agentZ never writes into the folder many agents read whatever their home.
+        let shared = user_home.join(SHARED_SKILLS_FOLDER);
+        let Some(index) = folders.iter().position(|folder| *folder != shared) else {
+            return Ok(None);
+        };
+        let folder = folders.remove(index);
+        for path in &self.outside_skills_folders {
+            folders.push(inside(user_home, path)?);
+        }
+        Ok(Some((folder, folders)))
     }
 
     /// Copy settings from: the settings files of the home `from` (none for Nothing) in place
@@ -354,6 +408,8 @@ mod tests {
             login_settings: BTreeMap::new(),
             normal_home: String::new(),
             login_variables: vec!["AGENT_API_KEY".into(), "GITHUB_TOKEN".into()],
+            skills_folders: Vec::new(),
+            outside_skills_folders: Vec::new(),
             login_check: LoginCheck::Session,
             reader: None,
             key_login: Some(KeyLogin {
@@ -418,8 +474,68 @@ mod tests {
         assert_eq!(description.home_variables["MOCK_HOME"], "");
         assert!(description.file_storage.is_empty());
         assert_eq!(description.login_check, LoginCheck::Session);
-        assert!(built_in("factory-droid").is_some());
         assert!(built_in("mock").is_none());
+        for agent_id in BUILT_IN {
+            let description = built_in(agent_id).expect("described");
+            assert!(!description.skills_folders.is_empty(), "{agent_id}");
+        }
+    }
+
+    #[test]
+    fn skills_link_into_the_first_folder_but_the_shared_one() {
+        let description = AgentDescription {
+            normal_home: "/normal".into(),
+            skills_folders: vec![".agent/skills".into(), ".agents/skills".into()],
+            outside_skills_folders: vec![".claude/skills".into()],
+            ..AgentDescription::default()
+        };
+        let user_home = util::paths::home_dir();
+        let home = Path::new("/data/accounts/agent/1");
+        assert_eq!(
+            description.skill_folders(Some(home)).expect("folders"),
+            Some((
+                home.join(".agent/skills"),
+                vec![
+                    home.join(".agents/skills"),
+                    user_home.join(".claude/skills")
+                ]
+            ))
+        );
+        assert_eq!(
+            description.skill_folders(None).expect("folders"),
+            Some((
+                PathBuf::from("/normal/.agent/skills"),
+                vec![
+                    PathBuf::from("/normal/.agents/skills"),
+                    user_home.join(".claude/skills")
+                ]
+            ))
+        );
+
+        // Droid's External account has the user's home for its own.
+        let description = AgentDescription {
+            normal_home: user_home.to_string_lossy().into_owned(),
+            skills_folders: vec![".agents/skills".into(), ".factory/skills".into()],
+            ..AgentDescription::default()
+        };
+        assert_eq!(
+            description.skill_folders(None).expect("folders"),
+            Some((
+                user_home.join(".factory/skills"),
+                vec![user_home.join(".agents/skills")]
+            ))
+        );
+        let description = AgentDescription {
+            skills_folders: vec![".agents/skills".into()],
+            ..description
+        };
+        assert_eq!(description.skill_folders(None).expect("folders"), None);
+        assert_eq!(
+            AgentDescription::default()
+                .skill_folders(Some(home))
+                .expect("folders"),
+            None
+        );
     }
 
     #[test]

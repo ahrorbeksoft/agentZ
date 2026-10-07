@@ -19,6 +19,7 @@ pub mod handoff;
 mod machine_kind;
 mod repositories;
 mod server;
+mod skills;
 mod spaces;
 mod terminal_programs;
 mod terminals;

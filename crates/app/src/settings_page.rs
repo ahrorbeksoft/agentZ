@@ -1,6 +1,8 @@
 //! The settings page, laid out like t3code's: a list of sections on the left (General,
-//! Appearance, Notifications, Agents, Usage, Machines, then one entry per project) and the
-//! chosen section's rows on the right.
+//! Appearance, Notifications, Agents, Usage, Skills, Machines, then one entry per project) and
+//! the chosen section's rows on the right.
+
+mod skills;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -93,6 +95,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", CloseSettings, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
+        KeyBinding::new("enter", text_input::Newline, Some("SkillBody > TextInput")),
     ]);
 }
 
@@ -113,6 +116,7 @@ enum Section {
     Notifications,
     Agents,
     Usage,
+    Skills,
     Machines,
     Project(ProjectKey),
 }
@@ -152,6 +156,11 @@ pub struct SettingsPage {
     starts_at_login: bool,
     agents_page: AgentsPage,
     registry_filter: RegistryFilter,
+    skills_page: skills::SkillsPage,
+    /// Why adding or deleting a skill failed.
+    skill_error: Option<SharedString>,
+    /// Add from Folder…, from picking the folder until the server has the skill.
+    adding_skill: Option<Task<()>>,
     nav_scroll: ScrollHandle,
     content_scroll: ScrollHandle,
     registry_scroll: UniformListScrollHandle,
@@ -239,6 +248,9 @@ impl SettingsPage {
             starts_at_login: crate::login_item::is_enabled(),
             agents_page: AgentsPage::Installed,
             registry_filter: RegistryFilter::All,
+            skills_page: skills::SkillsPage::List,
+            skill_error: None,
+            adding_skill: None,
             nav_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
             registry_scroll: UniformListScrollHandle::new(),
@@ -374,6 +386,8 @@ impl SettingsPage {
         if !matches!(self.agents_page, AgentsPage::Installed) {
             self.show_agents_page(AgentsPage::Installed, window, cx);
         }
+        self.skills_page = skills::SkillsPage::List;
+        self.skill_error = None;
         if section == Section::Agents {
             self.registry(cx)
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
@@ -661,6 +675,7 @@ impl SettingsPage {
             ),
             self.render_nav_item("Agents", Some(IconName::Sparkle), None, Section::Agents, cx),
             self.render_nav_item("Usage", Some(IconName::Gauge), None, Section::Usage, cx),
+            self.render_nav_item("Skills", Some(IconName::Book), None, Section::Skills, cx),
             self.render_nav_item(
                 "Machines",
                 Some(IconName::Server),
@@ -781,6 +796,7 @@ impl SettingsPage {
             Section::Notifications => "settings-nav-notifications".into(),
             Section::Agents => "settings-nav-agents".into(),
             Section::Usage => "settings-nav-usage".into(),
+            Section::Skills => "settings-nav-skills".into(),
             Section::Machines => "settings-nav-machines".into(),
             Section::Project(key) => format!(
                 "settings-nav-project-{}-{}",
@@ -1378,18 +1394,7 @@ impl SettingsPage {
             None
         } else if let AgentsPage::Agent(_) | AgentsPage::CustomAgent(_) = self.agents_page {
             // An agent's page, or its form, belongs to the machine it was opened on.
-            let machines = self.machines.read(cx);
-            Some(
-                h_flex()
-                    .gap_1p5()
-                    .child(
-                        Icon::new(machines.machine_icon(self.agents_machine, cx))
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(machines.label(self.agents_machine, cx)).color(Color::Muted))
-                    .into_any_element(),
-            )
+            Some(self.render_machine_label(cx))
         } else {
             Some(self.render_agents_machine_picker(window, cx))
         };
@@ -1402,29 +1407,62 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    /// Zed's sub-page heading: a back button and "Agents / `title`".
+    /// The machine a page belongs to, where a picker would let it change.
+    fn render_machine_label(&self, cx: &mut Context<Self>) -> AnyElement {
+        let machines = self.machines.read(cx);
+        h_flex()
+            .gap_1p5()
+            .child(
+                Icon::new(machines.machine_icon(self.agents_machine, cx))
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(machines.label(self.agents_machine, cx)).color(Color::Muted))
+            .into_any_element()
+    }
+
     fn render_breadcrumb(&self, title: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        self.render_sub_page_heading(
+            "agents-back",
+            "Agents",
+            title,
+            |this, window, cx| {
+                if let AgentsPage::CustomAgent(_) = this.agents_page {
+                    this.close_custom_agent_form(window, cx)
+                } else {
+                    this.show_agents_page(AgentsPage::Installed, window, cx)
+                }
+            },
+            cx,
+        )
+    }
+
+    /// Zed's sub-page heading: a back button and "`parent` / `title`".
+    fn render_sub_page_heading(
+        &self,
+        back_id: &'static str,
+        parent: &'static str,
+        title: &'static str,
+        on_back: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         h_flex()
             .min_w_0()
             .ml_neg_1p5()
             .gap_1()
             .child(
-                div().debug_selector(|| "agents-back".into()).child(
-                    IconButton::new("agents-back", IconName::ArrowLeft)
+                div().debug_selector(move || back_id.into()).child(
+                    IconButton::new(back_id, IconName::ArrowLeft)
                         .icon_size(IconSize::Small)
                         .shape(IconButtonShape::Square)
                         .tooltip(Tooltip::text("Back"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let AgentsPage::CustomAgent(_) = this.agents_page {
-                                this.close_custom_agent_form(window, cx)
-                            } else {
-                                this.show_agents_page(AgentsPage::Installed, window, cx)
-                            }
-                        })),
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| on_back(this, window, cx)),
+                        ),
                 ),
             )
             .child(
-                Headline::new("Agents")
+                Headline::new(parent)
                     .size(HeadlineSize::Small)
                     .color(Color::Muted),
             )
@@ -5381,6 +5419,7 @@ impl SettingsPage {
         if let AgentsPage::Agent(_) = self.agents_page {
             self.agents_page = AgentsPage::Installed;
         }
+        self.skill_error = None;
         self.registry(cx)
             .update(cx, |registry, cx| registry.refresh_if_stale(cx));
         cx.notify();
@@ -7069,6 +7108,10 @@ impl Render for SettingsPage {
                 self.render_agents(window, cx),
             ),
             Section::Usage => (self.render_usage_header(window, cx), self.render_usage(cx)),
+            Section::Skills => (
+                self.render_skills_header(window, cx),
+                self.render_skills(window, cx),
+            ),
             Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
@@ -7137,7 +7180,7 @@ mod tests {
     use super::*;
     use crate::server_client::ServerClient;
 
-    fn listing(id: &str, name: &str, install_state: InstallState) -> AgentListing {
+    pub(super) fn listing(id: &str, name: &str, install_state: InstallState) -> AgentListing {
         AgentListing {
             metadata: RegistryAgentMetadata {
                 id: AgentId::new(id.to_string()),
@@ -7728,7 +7771,7 @@ mod tests {
         }
     }
 
-    fn account(id: u64, label: Option<&str>, status: Option<AccountStatus>) -> Account {
+    pub(super) fn account(id: u64, label: Option<&str>, status: Option<AccountStatus>) -> Account {
         Account {
             id: AccountId(id),
             choices: AccountChoices {

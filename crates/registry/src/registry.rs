@@ -149,6 +149,8 @@ pub struct AgentRegistryStore {
     node_runtime: NodeRuntime,
     agents: Vec<RegistryAgent>,
     installed_versions: HashMap<AgentId, SharedString>,
+    /// Set once the installed agents have been scanned, which may come before the agent list.
+    knows_installed: bool,
     installing: HashSet<AgentId>,
     install_errors: HashMap<AgentId, SharedString>,
     is_fetching: bool,
@@ -183,6 +185,7 @@ impl AgentRegistryStore {
             node_runtime,
             agents: Vec::new(),
             installed_versions: HashMap::default(),
+            knows_installed: false,
             installing: HashSet::default(),
             install_errors: HashMap::default(),
             is_fetching: false,
@@ -218,6 +221,12 @@ impl AgentRegistryStore {
 
     pub fn fetch_error(&self) -> Option<SharedString> {
         self.fetch_error.clone()
+    }
+
+    /// Whether [`Self::install_state`] knows which agents are installed yet: until then, every
+    /// agent reads as not installed.
+    pub fn knows_installed(&self) -> bool {
+        self.knows_installed
     }
 
     pub fn install_state(&self, id: &AgentId) -> InstallState {
@@ -476,6 +485,7 @@ impl AgentRegistryStore {
             self.install_errors.remove(id);
         }
         self.installed_versions = installed_versions;
+        self.knows_installed = true;
     }
 
     fn load_cached_registry(&mut self) {

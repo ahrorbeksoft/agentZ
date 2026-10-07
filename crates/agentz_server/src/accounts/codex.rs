@@ -15,7 +15,7 @@ use util::ResultExt as _;
 
 use super::login_checks::account_command;
 use super::readers::{LimitResetOutcome, LimitResetUse, Read};
-use super::{AgentDescription, LoginCheck, Reader};
+use super::{AgentDescription, LoginCheck, Reader, SHARED_SKILLS_FOLDER};
 
 /// The adapter runs Codex itself with the arguments after this one.
 const CLI: &str = "cli";
@@ -50,6 +50,8 @@ pub(super) fn description() -> AgentDescription {
         normal_home: ".codex".into(),
         // The adapter's API Key login reads them.
         login_variables: vec!["CODEX_API_KEY".into(), "OPENAI_API_KEY".into()],
+        skills_folders: vec!["skills".into()],
+        outside_skills_folders: vec![SHARED_SKILLS_FOLDER.into()],
         // The adapter asks Codex for the account before it opens a session.
         login_check: LoginCheck::Session,
         reader: Some(Reader::CodexAppServer),

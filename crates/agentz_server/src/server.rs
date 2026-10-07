@@ -11,6 +11,7 @@ mod login_checks;
 mod prompt_requests;
 mod queue_requests;
 mod session_requests;
+mod skill_requests;
 mod space_requests;
 mod terminal_requests;
 mod tools;
@@ -31,6 +32,7 @@ use agentz_protocol::agents::{
     AgentId, AgentListing, AgentSettings, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
+use agentz_protocol::skills::Skill;
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::{
     AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, Request,
@@ -54,6 +56,7 @@ use crate::checkpoints::Checkpoints;
 use crate::continuations;
 use crate::machine_kind;
 use crate::repositories::{self, RepositoryChecks};
+use crate::skills;
 use crate::spaces::SpaceStore;
 use crate::transcripts;
 use crate::{AgentControl, CustomAgent, ServerConfig};
@@ -193,6 +196,13 @@ pub(crate) struct Server {
     failed_turns: HashMap<ThreadId, Instant>,
     /// For readers that call a vendor's API.
     http_client: Arc<dyn http_client::HttpClient>,
+    /// agentZ's skills, with the accounts that skip them as of the last sync.
+    skills: Vec<Skill>,
+    /// Whether `skills` was synced since the folder was last read.
+    skills_synced: bool,
+    /// Where the last sync linked them, and the accounts' revision then.
+    skill_targets_synced: Vec<skills::SkillTarget>,
+    skill_accounts_revision: u64,
     threads: HashMap<ThreadId, AgentThread>,
     login_sessions: HashMap<u64, LoginSession>,
     next_login_session_id: u64,
@@ -207,6 +217,7 @@ pub(crate) struct Server {
     registry_sent: RegistrySnapshot,
     agent_settings_revision_sent: u64,
     accounts_revision_sent: u64,
+    skills_sent: Vec<Skill>,
     machine_icon_sent: MachineIcon,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
@@ -313,6 +324,7 @@ impl Server {
             registry_sent: RegistrySnapshot::default(),
             agent_settings_revision_sent: agent_settings.revision(),
             accounts_revision_sent: accounts.revision(),
+            skills_sent: Vec::new(),
             projects,
             repository_checks: RepositoryChecks::default(),
             git_head_folders: BTreeSet::new(),
@@ -325,6 +337,10 @@ impl Server {
             limit_reset_attempts: HashMap::default(),
             failed_turns: HashMap::default(),
             http_client,
+            skills: Vec::new(),
+            skills_synced: false,
+            skill_targets_synced: Vec::new(),
+            skill_accounts_revision: 0,
             threads: HashMap::default(),
             login_sessions: HashMap::default(),
             next_login_session_id: 1,
@@ -347,6 +363,8 @@ impl Server {
         };
         server.forward(registry_inbox, Input::Registry);
         server.registry_sent = server.registry_snapshot();
+        server.list_skills();
+        server.skills_sent = server.skills.clone();
         server.refresh_repositories();
         #[cfg(unix)]
         if let Some(handed_over) = config.handed_over {
@@ -709,6 +727,7 @@ impl Server {
                     registry: self.registry_snapshot(),
                     agent_settings: self.agent_settings.all().clone(),
                     accounts: self.accounts.all().clone(),
+                    skills: self.skills.clone(),
                     spaces: self.spaces.snapshot(),
                     machine_icon: self.machine_icon.clone(),
                 }))
@@ -1044,6 +1063,9 @@ impl Server {
             | Request::RemoveAccount { .. }
             | Request::UpdateAccount { .. }
             | Request::RefreshUsage { .. }) => self.account_request(request),
+            request @ (Request::AddSkill(_)
+            | Request::CreateSkill { .. }
+            | Request::DeleteSkill(_)) => self.skill_request(request),
             Request::ContinueAtReset { thread_id, on } => {
                 self.continue_at_reset(thread_id, on)?;
                 Ok(Response::Ok)
@@ -2073,12 +2095,18 @@ impl Server {
             self.spaces_revision_sent = self.spaces.revision();
             self.broadcast(Event::Spaces(self.spaces.snapshot()));
         }
-        if std::mem::take(&mut self.registry_changed) {
+        let registry_changed = std::mem::take(&mut self.registry_changed);
+        if registry_changed {
             let registry = self.registry_snapshot();
             if registry != self.registry_sent {
                 self.registry_sent = registry.clone();
                 self.broadcast(Event::Registry(registry));
             }
+        }
+        self.sync_skills(registry_changed);
+        if self.skills != self.skills_sent {
+            self.skills_sent = self.skills.clone();
+            self.broadcast(Event::Skills(self.skills.clone()));
         }
         if self.agent_settings.revision() != self.agent_settings_revision_sent {
             self.agent_settings_revision_sent = self.agent_settings.revision();

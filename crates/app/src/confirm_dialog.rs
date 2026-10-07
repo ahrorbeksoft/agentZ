@@ -138,6 +138,26 @@ impl ConfirmRequest {
             on_confirm: Rc::new(on_confirm),
         }
     }
+
+    /// Deleting one of agentZ's skills, in Zed's words. There's no trash to move it to on the
+    /// server's machine, so it's deleted for good.
+    pub fn delete_skill(
+        skill_name: &str,
+        folder: &str,
+        on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            icon: IconName::Trash,
+            title: format!("Delete the skill \"{skill_name}\"?").into(),
+            message: format!(
+                "This will delete {folder} for good. Every agent and account loads this skill, \
+                 so it will no longer be available to them either."
+            )
+            .into(),
+            confirm_label: "Delete".into(),
+            on_confirm: Rc::new(on_confirm),
+        }
+    }
 }
 
 pub struct ConfirmDialog {

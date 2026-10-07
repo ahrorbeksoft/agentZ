@@ -310,6 +310,9 @@ fn mock_accounts() -> crate::AgentDescription {
         login_settings: BTreeMap::new(),
         normal_home: String::new(),
         login_variables: vec!["MOCK_API_KEY".into()],
+        // Its External account's home is the user's: tests that link skills name their own.
+        skills_folders: Vec::new(),
+        outside_skills_folders: Vec::new(),
         login_check: crate::LoginCheck::Session,
         reader: None,
         key_login: Some(crate::KeyLogin {
@@ -1947,6 +1950,131 @@ async fn api_key_accounts_keep_their_key() {
         })
         .await;
     assert!(!key_file.exists());
+}
+
+/// agentZ's skills are linked into every account's skills folder, the External one's included,
+/// except where the agent has a skill of its own by that name, and the links follow as skills
+/// and accounts come and go.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn skills_are_linked_into_every_account() {
+    use agentz_protocol::skills::{Skill, SkillFile};
+    use base64::Engine as _;
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let normal_home = tempfile::tempdir().expect("temp dir");
+    let external_skills = normal_home.path().join(".mock/skills");
+    std::fs::create_dir_all(external_skills.join("review")).expect("create");
+    let description = crate::AgentDescription {
+        normal_home: normal_home.path().to_string_lossy().into_owned(),
+        skills_folders: vec![".mock/skills".into()],
+        ..mock_accounts()
+    };
+    let Some(server) = TestServer::start_with_description(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    assert!(session.skills.is_empty());
+    let skills_folder = server.data_dir.path().join("skills");
+    let linked = |folder: &Path, name: &str| {
+        std::fs::read_link(folder.join(name)).ok() == Some(skills_folder.join(name))
+    };
+    let skills = |client: &TestClient| -> Vec<Skill> {
+        client
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Skills(skills) => Some(skills.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+
+    client
+        .ok(Request::CreateSkill {
+            name: "review".into(),
+            description: "Review a diff.".into(),
+            body: "Read it.".into(),
+        })
+        .await;
+    let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+    client
+        .ok(Request::AddSkill(vec![
+            SkillFile {
+                path: "SKILL.md".into(),
+                data: encode("---\nname: release-notes\ndescription: Write them.\n---\nSteps.\n"),
+                executable: false,
+            },
+            SkillFile {
+                path: "template.md".into(),
+                data: encode("# Notes\n"),
+                executable: false,
+            },
+        ]))
+        .await;
+    client.wait_until(|client| skills(client).len() == 2).await;
+    let listed = skills(&client);
+    assert_eq!(listed[0].name, "release-notes");
+    assert!(listed[0].skipped.is_empty());
+    // The External account has its own review.
+    assert_eq!(listed[1].name, "review");
+    assert_eq!(listed[1].description, "Review a diff.");
+    assert_eq!(
+        listed[1].skipped,
+        [agentz_protocol::skills::SkippedSkill {
+            agent_id: mock.clone(),
+            account: None,
+            own: external_skills.join("review"),
+        }]
+    );
+    assert!(linked(&external_skills, "release-notes"));
+    assert!(external_skills.join("review").is_dir());
+    let error = client
+        .request(Request::CreateSkill {
+            name: "review".into(),
+            description: "Again.".into(),
+            body: "Read it.".into(),
+        })
+        .await
+        .expect_err("a second review");
+    assert!(
+        error.message.contains("already exists"),
+        "{}",
+        error.message
+    );
+
+    // A new account gets them all.
+    let Response::AccountAdded(work) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    let work_skills = server
+        .data_dir
+        .path()
+        .join("accounts/mock")
+        .join(work.to_string())
+        .join(".mock/skills");
+    assert!(linked(&work_skills, "review") && linked(&work_skills, "release-notes"));
+
+    client
+        .ok(Request::DeleteSkill("release-notes".into()))
+        .await;
+    client.wait_until(|client| skills(client).len() == 1).await;
+    assert!(!skills_folder.join("release-notes").exists());
+    assert!(std::fs::symlink_metadata(external_skills.join("release-notes")).is_err());
+    assert!(std::fs::symlink_metadata(work_skills.join("release-notes")).is_err());
+    assert!(linked(&work_skills, "review"));
 }
 
 /// Gives the mock agent an agentZ account before the server starts, so it checks the External

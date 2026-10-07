@@ -255,6 +255,13 @@ Notes for whoever continues:
   other numbers. A key account has no email (Factory's `whoami` gives only ids), and only
   Factory's US address is used, not its EU one. An agentZ account's login rows have the key
   field; a key account's card is titled by its login method, having no email.
+- Skills (item 22): agentZ never links into `~/.agents/skills`, which Codex, Devin and others
+  read whatever their home, so a skill there stays the user's own; each agent gets agentZ's in
+  its own folder instead (Droid's `.factory/skills`, Codex's `$CODEX_HOME/skills`). Devin
+  also reads `~/.claude/skills`, so it skips a skill agentZ linked there for Claude's External
+  account rather than load it twice. Choices of mine, not on the board: Add from Folder…
+  sends at most 32 MB and leaves out `.git` and `.DS_Store`; Open ↗ is off for another
+  machine's skills, whose `SKILL.md` isn't on this Mac.
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -279,7 +286,7 @@ Notes for whoever continues:
 | 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | done |
 | 20 | 9 | Limit resets (Codex) | done |
 | 21 | 10 | Extra usage switch | |
-| 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | |
+| 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | done |
 | 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | dropped |
 | 24 | 19 | Settings › MCP Servers, passed to every session | |
 | 25 | 20 | The accounts menu on each skill and server | |

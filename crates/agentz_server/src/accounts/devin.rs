@@ -13,7 +13,7 @@ use util::ResultExt as _;
 use super::hidden_terminal::HiddenTerminal;
 use super::login_checks::run_with_account_env;
 use super::readers::Read;
-use super::{AgentDescription, LoggedIn, LoginCheck, Reader, StatusCommand};
+use super::{AgentDescription, LoggedIn, LoginCheck, Reader, SHARED_SKILLS_FOLDER, StatusCommand};
 use crate::terminals::TerminalSize;
 
 /// The ACP server is Devin's program with `acp`; its terminal UI and other commands are the
@@ -68,6 +68,8 @@ pub(super) fn description() -> AgentDescription {
         normal_home: String::new(),
         // It overrides the stored login.
         login_variables: vec!["WINDSURF_API_KEY".into()],
+        skills_folders: vec![".config/devin/skills".into()],
+        outside_skills_folders: vec![SHARED_SKILLS_FOLDER.into(), ".claude/skills".into()],
         // Its sessions open while it's logged out, with no models.
         login_check: LoginCheck::Command(StatusCommand {
             program: None,
