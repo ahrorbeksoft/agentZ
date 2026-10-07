@@ -594,6 +594,13 @@ pub enum Request {
         account: Option<AccountId>,
         change: AccountChange,
     },
+    /// The limit notice's Continue at <reset>: the thread, stopped by a limit its account's
+    /// last read has used up, gets "Continue." when it resets ([`projects::Thread::continues_at`]).
+    /// `on: false` cancels it.
+    ContinueAtReset {
+        thread_id: ThreadId,
+        on: bool,
+    },
     /// Refresh Usage: reads the account's identity and limits now. The read arrives with
     /// [`Event::Accounts`].
     RefreshUsage {

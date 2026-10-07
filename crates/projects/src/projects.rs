@@ -217,6 +217,10 @@ pub struct Thread {
     /// displayed this completion.
     #[serde(default)]
     pub completed_at: Option<SystemTime>,
+    /// Set while a limit of the thread's account stopped it and agentZ sends "Continue." when
+    /// the limit resets, at this time. A turn that starts by then cancels it.
+    #[serde(default)]
+    pub continues_at: Option<SystemTime>,
     /// Who started the thread, when it wasn't the user.
     #[serde(default)]
     pub created_by: Option<ThreadCreator>,
@@ -822,6 +826,7 @@ impl ProjectStore {
             has_custom_title: false,
             model: None,
             completed_at: None,
+            continues_at: None,
             created_by: None,
             task: None,
             workspace: None,
@@ -1306,6 +1311,16 @@ impl ProjectStore {
         {
             thread.unsent_text = text;
             thread.unsent_mentions = mentions;
+            self.changed();
+        }
+    }
+
+    /// [`Thread::continues_at`].
+    pub fn set_continues_at(&mut self, id: ThreadId, at: Option<SystemTime>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.continues_at != at
+        {
+            thread.continues_at = at;
             self.changed();
         }
     }

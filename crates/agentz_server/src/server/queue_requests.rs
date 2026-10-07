@@ -186,7 +186,7 @@ impl Server {
     }
 
     /// The thread whose queue a request changes: one the user messages, not a subthread.
-    fn queue_thread(&self, connection: ConnectionId) -> Result<ThreadId> {
+    pub(super) fn queue_thread(&self, connection: ConnectionId) -> Result<ThreadId> {
         let ConnectionId::Thread(thread_id) = connection else {
             return Err(anyhow!("only threads have queues"));
         };

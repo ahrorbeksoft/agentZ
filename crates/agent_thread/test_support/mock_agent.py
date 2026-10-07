@@ -38,9 +38,11 @@ the file says, as FACTORY_API_KEY does, unless it's "refused". In a home, it als
 `--status`, it prints {"logged_in": …} and exits with 1 when logged out, as agents' own status
 commands do. With MOCK_OPENS_LOGGED_OUT set, sessions open while it's logged out, as Claude
 Agent's do. Run with `--usage`, it prints what agentZ reads of an account: the email, plan and
-a 5-hour window, of which each reply in the home uses 10% (kept in `usage` in MOCK_HOME). A
-`.mock/settings.json` in MOCK_HOME with a list of `models` offers only those, as an
-organization's plan offers fewer.
+a 5-hour window, of which each reply in the home uses 10% (kept in `usage` in MOCK_HOME). The
+window resets in an hour, or at the time in seconds since the epoch in `resets_at` there, and
+once that has passed, none of it is used. While all of it is, prompts fail with "Usage limit
+reached", as agents' turns end at their limits. A `.mock/settings.json` in MOCK_HOME with a
+list of `models` offers only those, as an organization's plan offers fewer.
 
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
@@ -90,6 +92,9 @@ SESSIONS_PER_PAGE = 2
 SCRIPTS = json.loads(os.environ.get("MOCK_SCRIPTS") or "{}")
 # How much of its 5-hour limit the home has used, in percent: each reply uses 10.
 USAGE_FILE = os.path.join(os.environ["MOCK_HOME"], "usage") if os.environ.get("MOCK_HOME") else None
+# When the 5-hour window resets, in seconds since the epoch.
+RESETS_AT_FILE = (os.path.join(os.environ["MOCK_HOME"], "resets_at")
+                  if os.environ.get("MOCK_HOME") else None)
 
 
 def stored_login():
@@ -99,7 +104,29 @@ def stored_login():
     return not LOGIN_FILE or os.path.exists(LOGIN_FILE)
 
 
+def set_reset():
+    """The time in `resets_at`, if it's still to come."""
+    try:
+        with open(RESETS_AT_FILE) as file:
+            resets_at = int(file.read())
+    except (TypeError, OSError, ValueError):
+        return None
+    return resets_at if resets_at > time.time() else None
+
+
+def resets_at():
+    return set_reset() or int(time.time()) + 3600
+
+
 def used_percent():
+    # Past the reset the file names, the window starts again.
+    if RESETS_AT_FILE and os.path.exists(RESETS_AT_FILE) and set_reset() is None:
+        for path in (RESETS_AT_FILE, USAGE_FILE):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        return 0
     try:
         with open(USAGE_FILE) as file:
             return int(file.read())
@@ -115,10 +142,11 @@ if sys.argv[-1] == "--usage":
     if not stored_login():
         print(json.dumps({"logged_in": False}), flush=True)
         sys.exit(0)
-    resets_at = {"secs_since_epoch": int(time.time()) + 3600, "nanos_since_epoch": 0}
+    used = used_percent()
     print(json.dumps({"logged_in": True, "email": "mock@example.com", "plan": "Pro",
-                      "windows": [{"label": "5-hour", "used_percent": used_percent(),
-                                   "resets_at": resets_at,
+                      "windows": [{"label": "5-hour", "used_percent": used,
+                                   "resets_at": {"secs_since_epoch": resets_at(),
+                                                 "nanos_since_epoch": 0},
                                    "length": {"secs": 5 * 3600, "nanos": 0}}]}), flush=True)
     sys.exit(0)
 
@@ -558,7 +586,10 @@ for line in sys.stdin:
                 prompt_resources.append(block["mimeType"])
         record(text_chunk("user_message_chunk", prompt_text))
         prompt_text = SCRIPTS.get(prompt_text, prompt_text)
-        if prompt_text == "permission":
+        if USAGE_FILE and used_percent() >= 100:
+            send({"jsonrpc": "2.0", "id": message["id"],
+                  "error": {"code": -32603, "message": "Usage limit reached"}})
+        elif prompt_text == "permission":
             next_request_id += 1
             pending[next_request_id] = (message["id"], params["sessionId"], prompt_text)
             send({"jsonrpc": "2.0", "id": next_request_id, "method": "session/request_permission",

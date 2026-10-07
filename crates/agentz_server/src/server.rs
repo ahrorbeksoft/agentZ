@@ -6,6 +6,7 @@ mod custom_agents;
 #[cfg(unix)]
 mod hand_off;
 mod key_logins;
+mod limit_waits;
 mod login_checks;
 mod prompt_requests;
 mod queue_requests;
@@ -181,6 +182,9 @@ pub(crate) struct Server {
     accounts: AccountStore,
     /// The accounts whose identity and limits are being read.
     reading_accounts: HashSet<(AgentId, Option<AccountId>)>,
+    /// When threads' turns ended with an error, until a read of their account since then says
+    /// whether a limit stopped them ([`limit_waits`]).
+    failed_turns: HashMap<ThreadId, Instant>,
     /// For readers that call a vendor's API.
     http_client: Arc<dyn http_client::HttpClient>,
     threads: HashMap<ThreadId, AgentThread>,
@@ -311,6 +315,7 @@ impl Server {
             agent_settings,
             accounts,
             reading_accounts: HashSet::default(),
+            failed_turns: HashMap::default(),
             http_client,
             threads: HashMap::default(),
             login_sessions: HashMap::default(),
@@ -407,6 +412,7 @@ impl Server {
         server.refresh_git_heads();
         server.check_external_logins();
         server.start_usage_refreshes();
+        server.resume_limit_waits();
         server
     }
 
@@ -1020,6 +1026,10 @@ impl Server {
             | Request::RemoveAccount { .. }
             | Request::UpdateAccount { .. }
             | Request::RefreshUsage { .. }) => self.account_request(request),
+            Request::ContinueAtReset { thread_id, on } => {
+                self.continue_at_reset(thread_id, on)?;
+                Ok(Response::Ok)
+            }
             Request::ImportAgentSessions {
                 agent_id,
                 account,
@@ -1846,6 +1856,7 @@ impl Server {
             thread.status(),
             agentz_protocol::thread::ConnectionStatus::Failed(_)
         );
+        let turn_failed = thread.turn_error().is_some();
         let mut logged_in_or_out = false;
         let mut logged_in_here = false;
         let mut reported_login = None;
@@ -1855,6 +1866,9 @@ impl Server {
             match (connection, event) {
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::WorkingChanged(working)) => {
                     self.projects.set_thread_working(thread_id, working);
+                    if working {
+                        self.turn_started(thread_id);
+                    }
                     turn_ended |= !working;
                 }
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::SessionStarted(session)) => {
@@ -1963,6 +1977,9 @@ impl Server {
             );
             // The turn moved its account's limits.
             if turn_ended {
+                if turn_failed && let ConnectionId::Thread(thread_id) = connection {
+                    self.turn_failed(thread_id, agent_id, account);
+                }
                 self.read_account_if_it_can(agent_id, account);
             }
         }

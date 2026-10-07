@@ -14,7 +14,7 @@ use crate::project_store::ProjectStore;
 use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
 use agentz_protocol::accounts::{
     AccountChange, AccountChoice, AccountChoices, AccountId, AccountStatus, AccountSupport,
-    AgentAccounts, LimitWindow, SettingsSource,
+    AgentAccounts, AtLimit, LimitWindow, SettingsSource,
 };
 use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
@@ -3664,6 +3664,10 @@ impl SettingsPage {
         let shows_login = account.is_some()
             && has_auth_methods
             && matches!(state, AccountState::LoggedOut | AccountState::LoggingIn);
+        // Continuing at the reset needs the reset, from the account's limits.
+        let at_limit = support
+            .reads_usage
+            .then(|| self.render_at_limit(account, choices.at_limit, window, cx));
 
         card.child(
             h_flex()
@@ -3705,8 +3709,91 @@ impl SettingsPage {
                     cx,
                 ))
         }))
+        .children(at_limit)
         .when(shows_login, |card| card.child(session.login.clone()))
         .into_any_element()
+    }
+
+    /// "When a limit is reached": what every thread on the account does, Stop or Continue at
+    /// reset, with what each means in the menu.
+    fn render_at_limit(
+        &self,
+        account: Option<AccountId>,
+        current: AtLimit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const CHOICES: [(AtLimit, &str, &str); 2] = [
+            (AtLimit::Stop, "Stop", "The thread waits for you."),
+            (
+                AtLimit::ContinueAtReset,
+                "Continue at reset",
+                "agentZ sends “Continue.” when the limit resets.",
+            ),
+        ];
+        let label = CHOICES
+            .iter()
+            .find(|(choice, ..)| *choice == current)
+            .map_or("Stop", |(_, name, _)| *name);
+        let selector = account_selector(account);
+        let page = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, {
+            let selector = selector.clone();
+            move |mut menu, _, _| {
+                for (choice, name, description) in CHOICES {
+                    let selector = format!("at-limit-{selector}-{choice:?}");
+                    menu = menu.custom_entry(
+                        move |_, _| {
+                            let selector = selector.clone();
+                            v_flex()
+                                .w(px(260.))
+                                .debug_selector(move || selector)
+                                .child(render_check_entry(name, choice == current))
+                                .child(
+                                    Label::new(description)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .into_any_element()
+                        },
+                        on_page(&page, move |page, _, cx| {
+                            page.update_account(account, AccountChange::SetAtLimit(choice), cx)
+                        }),
+                    );
+                }
+                menu
+            }
+        });
+        let id = format!("at-limit-{selector}");
+        // Under the name, past the avatar, as the limits are.
+        h_flex()
+            .pl(px(16.) + AVATAR_SIZE + px(12.))
+            .pr_4()
+            .pb_3()
+            .gap_6()
+            .justify_between()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(Label::new("When a limit is reached"))
+                    .child(
+                        Label::new("What threads on this account do.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector({
+                        let id = id.clone();
+                        move || id
+                    })
+                    .child(DropdownMenu::new(SharedString::from(id), label, menu)),
+            )
+            .into_any_element()
     }
 
     /// A new account's "Copy settings from": the other accounts, the default one first, then
@@ -7526,6 +7613,29 @@ mod tests {
             account: Some(AccountId(1)),
         }));
         assert!(cx.debug_bounds("account-menu-refresh").is_none());
+
+        // "When a limit is reached" offers Stop and Continue at reset, under the limits.
+        let at_limit = cx
+            .debug_bounds("at-limit-1")
+            .expect("the account has the choice");
+        let limits = cx
+            .debug_bounds("limit-1-window-1")
+            .expect("the account has its limits");
+        assert!(at_limit.top() > limits.bottom());
+        assert!(cx.debug_bounds("at-limit-external").is_some());
+        cx.simulate_click(at_limit.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("at-limit-1-Stop").is_some());
+        let continue_at_reset = cx
+            .debug_bounds("at-limit-1-ContinueAtReset")
+            .expect("Continue at reset is offered");
+        cx.simulate_click(continue_at_reset.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(sent(&Request::UpdateAccount {
+            agent_id: mock.clone(),
+            account: Some(AccountId(1)),
+            change: AccountChange::SetAtLimit(AtLimit::ContinueAtReset),
+        }));
 
         // Rename edits the name in place: Enter keeps it, Escape doesn't.
         let rename = |cx: &mut gpui::VisualTestContext| {

@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::accounts::{AccountChoice, AccountId, AgentAccounts, LimitWindow};
+use agentz_protocol::accounts::{
+    AccountChoice, AccountId, AgentAccounts, LimitWindow, used_up_window,
+};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::agents::InstallState;
 use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
@@ -66,9 +68,7 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
-use crate::usage_limits::{
-    LOW_PERCENT, UsagePopover, left_label, reset_phrase, tightest_window, used_up_window,
-};
+use crate::usage_limits::{LOW_PERCENT, UsagePopover, left_label, reset_phrase, tightest_window};
 use crate::{ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
@@ -320,7 +320,8 @@ pub struct AgentView {
     _rename_blur: Option<Subscription>,
     /// The composer's handoff chip shows what goes to the agent.
     handoff_expanded: bool,
-    /// Why "Continue with another agent" didn't start a thread.
+    /// Why "Continue with another agent", or the limit notice's Continue at the reset, didn't
+    /// work.
     continue_error: Option<SharedString>,
     _continuing: Task<()>,
     /// The limit notice was closed, until the next turn.
@@ -3654,7 +3655,8 @@ impl AgentView {
             return None;
         }
         let error = thread.turn_error()?.clone();
-        let account = self.store.read(cx).thread(self.thread_id)?.account;
+        let record = self.store.read(cx).thread(self.thread_id)?;
+        let (account, continues_at) = (record.account, record.continues_at);
         let accounts = self.client.read(cx).accounts(&agent_id);
         let window = used_up_window(&accounts.status(account)?.status.windows, now)?.clone();
         Some(LimitReached {
@@ -3663,12 +3665,40 @@ impl AgentView {
             account,
             window,
             error,
+            continues_at,
         })
+    }
+
+    /// The limit notice's Continue at <reset>, or its cancel.
+    fn continue_at_reset(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.continue_error = None;
+        let thread_id = self.thread_id;
+        let task = self
+            .store
+            .update(cx, |store, cx| store.continue_at_reset(thread_id, on, cx));
+        cx.spawn(async move |this, cx| {
+            let Err(error) = task.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.continue_error = Some(
+                    format!(
+                        "Couldn't {} at the reset: {error:#}",
+                        if on { "continue" } else { "cancel continuing" }
+                    )
+                    .into(),
+                );
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     /// t3code's banner for a thread stopped by a usage limit, as Zed's warning callout over the
     /// composer: whose limit ran out and when it resets, then Continue on the agent's account
-    /// with the most left, its arrow listing the others.
+    /// with the most left, its arrow listing the others, and Continue at the reset (or its
+    /// cancel, once agentZ waits for it).
     fn render_limit_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.limit_notice_dismissed {
             return None;
@@ -3678,8 +3708,13 @@ impl AgentView {
         let has_accounts = reached.accounts.listed().len() > 1;
         let own = account_entry(&reached.accounts, reached.account);
         let who = has_accounts.then(|| account_phrase(&own, true));
-        let (title, body) =
-            limit_notice_text(who.as_deref(), &self.agent_name(cx), &reached.window, now);
+        let (title, body) = limit_notice_text(
+            who.as_deref(),
+            &self.agent_name(cx),
+            &reached.window,
+            reached.continues_at,
+            now,
+        );
         let others = if has_accounts {
             accounts_to_continue_on(&reached.accounts, reached.account, now)
         } else {
@@ -3783,7 +3818,29 @@ impl AgentView {
                 )
                 .on_click(move |_, _, cx| cx.open_url(&url))
         });
-        let has_buttons = continue_button.is_some() || usage_button.is_some();
+        // A subthread takes only its task.
+        let reset_choice = match (reached.continues_at, reached.window.resets_at) {
+            _ if self.parent(cx).is_some() => None,
+            (Some(_), _) => Some(("Don't Continue".to_string(), false)),
+            (None, Some(resets_at)) => {
+                Some((format!("Continue {}", reset_phrase(resets_at, now)), true))
+            }
+            (None, None) => None,
+        };
+        let reset_button = reset_choice.map(|(label, on)| {
+            div()
+                .debug_selector(|| "limit-continue-at-reset".into())
+                .child(
+                    Button::new("limit-continue-at-reset", label)
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.continue_at_reset(on, cx)
+                        })),
+                )
+        });
+        let has_buttons =
+            continue_button.is_some() || reset_button.is_some() || usage_button.is_some();
         let error = reached.error;
         let callout = Callout::new()
             .severity(Severity::Warning)
@@ -3806,6 +3863,7 @@ impl AgentView {
                                 .flex_wrap()
                                 .gap_1()
                                 .children(continue_button)
+                                .children(reset_button)
                                 .children(usage_button),
                         )
                     }),
@@ -6430,14 +6488,18 @@ struct LimitReached {
     account: Option<AccountId>,
     window: LimitWindow,
     error: SharedString,
+    /// When agentZ sends "Continue.", if it does.
+    continues_at: Option<SystemTime>,
 }
 
 /// The limit notice's title and body. `who` names the account whose limit ran out, when the
-/// agent has more than one to tell apart.
+/// agent has more than one to tell apart, and `continues_at` is when agentZ continues the
+/// thread, if it does.
 fn limit_notice_text(
     who: Option<&str>,
     agent_name: &str,
     window: &LimitWindow,
+    continues_at: Option<SystemTime>,
     now: SystemTime,
 ) -> (String, String) {
     let title = format!(
@@ -6446,13 +6508,20 @@ fn limit_notice_text(
         label_in_sentence(&window.label)
     );
     let mut body = format!("{agent_name} stopped.");
-    if let Some(resets_at) = window.resets_at {
+    if let Some(resets_at) = continues_at.or(window.resets_at) {
         let remaining = resets_at.duration_since(now).unwrap_or_default();
-        body.push_str(&format!(
-            " The limit resets {}, in {}.",
+        let when = format!(
+            "{}, in {}",
             reset_phrase(resets_at, now),
             crate::usage_limits::format_duration(remaining)
-        ));
+        );
+        if continues_at.is_some() {
+            body.push_str(&format!(
+                " agentZ sends “Continue.” when the limit resets {when}."
+            ));
+        } else {
+            body.push_str(&format!(" The limit resets {when}."));
+        }
     }
     (title, body)
 }
@@ -7936,6 +8005,90 @@ mod tests {
         assert!(!at_limit(&view, cx));
     }
 
+    /// The limit notice offers to continue at the reset, and once the server waits for it, to
+    /// cancel that.
+    #[gpui::test]
+    fn the_limit_notice_continues_at_the_reset(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, StatusRead};
+        use std::cell::RefCell;
+
+        let (view, cx) = open(2, false, cx);
+        let mock = AgentId::new("mock");
+        let now = SystemTime::now();
+        let resets_at = now + Duration::from_secs(2 * 60 * 60);
+        let accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    windows: vec![LimitWindow {
+                        label: "5-hour".into(),
+                        used_percent: 100.,
+                        resets_at: Some(resets_at),
+                        length: None,
+                    }],
+                    ..AccountStatus::default()
+                },
+                read_at: now,
+            }),
+            ..AgentAccounts::default()
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                matches!(request, Request::ContinueAtReset { .. }).then_some(Response::Ok)
+            });
+            client.set_accounts_for_test([(mock, accounts)].into(), cx);
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx);
+            thread.set_turn_error_for_test("Usage limit reached", cx);
+        });
+        cx.run_until_parked();
+        let asked = |requests: &RefCell<Vec<Request>>| {
+            requests
+                .borrow()
+                .iter()
+                .filter_map(|request| match request {
+                    Request::ContinueAtReset { thread_id, on } => Some((*thread_id, *on)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let button = cx
+            .debug_bounds("limit-continue-at-reset")
+            .expect("Continue at the reset is offered");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(asked(&requests), [(ThreadId(2), true)]);
+
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        let mut waiting = snapshot(None);
+        waiting.threads[1].continues_at = Some(resets_at);
+        store.update(cx, |store, cx| store.set_snapshot(waiting, cx));
+        cx.run_until_parked();
+        let body = view.read_with(cx, |view, cx| {
+            let reached = view
+                .limit_reached(SystemTime::now(), cx)
+                .expect("at the limit");
+            limit_notice_text(None, "Mock", &reached.window, reached.continues_at, now).1
+        });
+        assert!(body.contains("agentZ sends “Continue.”"), "{body}");
+        let button = cx
+            .debug_bounds("limit-continue-at-reset")
+            .expect("the wait can be cancelled");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            asked(&requests),
+            [(ThreadId(2), true), (ThreadId(2), false)]
+        );
+    }
+
     /// The composer gauges the thread's account by its window closest to running out, and opens
     /// that account's windows. A logged-out account's last read isn't gauged.
     #[gpui::test]
@@ -8034,9 +8187,17 @@ mod tests {
             resets_at: Some(now + Duration::from_secs(112 * 60 + 30)),
             length: None,
         };
-        let (title, body) = limit_notice_text(Some("Work"), "Claude Agent", &window, now);
+        let (title, body) = limit_notice_text(Some("Work"), "Claude Agent", &window, None, now);
         assert_eq!(title, "Work reached its weekly limit");
         assert!(body.starts_with("Claude Agent stopped. The limit resets "));
+        assert!(body.ends_with(", in 1h 52m."));
+        let (_, body) =
+            limit_notice_text(Some("Work"), "Claude Agent", &window, window.resets_at, now);
+        assert!(
+            body.starts_with(
+                "Claude Agent stopped. agentZ sends “Continue.” when the limit resets "
+            )
+        );
         assert!(body.ends_with(", in 1h 52m."));
         let (title, body) = limit_notice_text(
             None,
@@ -8046,6 +8207,7 @@ mod tests {
                 resets_at: None,
                 ..window
             },
+            None,
             now,
         );
         assert_eq!(title, "Your account reached its GPT-5 5-hour limit");

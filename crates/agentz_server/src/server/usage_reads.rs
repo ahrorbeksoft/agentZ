@@ -2,7 +2,7 @@
 //! app is open (t3code's interval), after each turn on the account, and on demand (Refresh
 //! Usage).
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use agentz_protocol::accounts::{AccountId, StatusRead};
 use agentz_protocol::agents::{AgentId, InstallState};
@@ -102,6 +102,7 @@ impl Server {
         if !self.reading_accounts.insert((agent_id.clone(), account)) {
             return;
         }
+        let started = Instant::now();
         let command = self.agent_command(agent_id, account, true);
         let http = self.http_client.clone();
         let folder = accounts::reader_folder(&self.data_dir, agent_id);
@@ -109,26 +110,26 @@ impl Server {
         let agent_id = agent_id.clone();
         self.spawn_then(read, move |server, read| {
             server.reading_accounts.remove(&(agent_id.clone(), account));
-            let Some(read) = read
+            if let Some(read) = read
                 .with_context(|| format!("reading {agent_id}'s usage"))
                 .log_err()
-            else {
-                return;
-            };
-            server.accounts.update(&agent_id, |accounts| {
-                if let Some(logged_in) = read.logged_in {
-                    accounts.set_logged_in(account, logged_in);
-                }
-                if read.logged_in != Some(false) {
-                    accounts.set_status(
-                        account,
-                        StatusRead {
-                            status: read.status,
-                            read_at: SystemTime::now(),
-                        },
-                    );
-                }
-            });
+            {
+                server.accounts.update(&agent_id, |accounts| {
+                    if let Some(logged_in) = read.logged_in {
+                        accounts.set_logged_in(account, logged_in);
+                    }
+                    if read.logged_in != Some(false) {
+                        accounts.set_status(
+                            account,
+                            StatusRead {
+                                status: read.status,
+                                read_at: SystemTime::now(),
+                            },
+                        );
+                    }
+                });
+            }
+            server.wait_for_limits_found(&agent_id, account, started);
         });
     }
 

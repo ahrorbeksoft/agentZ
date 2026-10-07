@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::{
-    AccountChange, AccountChoice, AccountId, AgentAccounts, SettingsSource,
+    AccountChange, AccountChoice, AccountId, AgentAccounts, AtLimit, SettingsSource,
 };
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
@@ -2201,6 +2201,133 @@ async fn accounts_read_their_identity_and_limits() {
             .await
             .is_err()
     );
+}
+
+/// A thread stopped by its account's limit gets "Continue." from the server when the limit
+/// resets: every thread on an account set to Continue at reset, or one the limit notice asked
+/// for. On an account set to Stop, it waits for the user.
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_stopped_by_a_limit_continue_at_the_reset() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    let home = data_dir.path().join("accounts/mock").join(work.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's home");
+    std::fs::write(home.join("usage"), "100").expect("use the account up");
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let Response::ThreadCreated(thread_id) = client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: mock.clone(),
+            workspace: Default::default(),
+            account: AccountChoice::Account(work),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    let continues_at = |client: &TestClient| {
+        client
+            .project_thread(thread_id)
+            .and_then(|thread| thread.continues_at)
+    };
+    let used_up = |client: &TestClient| {
+        client
+            .accounts("mock")
+            .status(Some(work))
+            .is_some_and(|read| read.status.windows[0].used_percent == 100.)
+    };
+
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            thread.turn_error().is_some() && !thread.is_working() && used_up(client)
+        })
+        .await;
+    assert_eq!(continues_at(&client), None);
+
+    // The notice's button, then its cancel.
+    client
+        .ok(Request::ContinueAtReset {
+            thread_id,
+            on: true,
+        })
+        .await;
+    client
+        .wait_until(|client| continues_at(client).is_some())
+        .await;
+    client
+        .ok(Request::ContinueAtReset {
+            thread_id,
+            on: false,
+        })
+        .await;
+    client
+        .wait_until(|client| continues_at(client).is_none())
+        .await;
+
+    client
+        .ok(Request::UpdateAccount {
+            agent_id: mock,
+            account: Some(work),
+            change: AccountChange::SetAtLimit(AtLimit::ContinueAtReset),
+        })
+        .await;
+    let resets_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("time")
+        .as_secs()
+        + 3;
+    std::fs::write(home.join("resets_at"), resets_at.to_string()).expect("set the reset");
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("again"),
+        })
+        .await;
+    client
+        .wait_until(|client| continues_at(client).is_some())
+        .await;
+    assert_eq!(
+        continues_at(&client),
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(resets_at))
+    );
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            agent_text(thread).contains("Echo: Continue.") && !thread.is_working()
+        })
+        .await;
+    assert_eq!(
+        client.user_messages(thread_id),
+        ["hello", "again", "Continue."]
+    );
+    assert_eq!(continues_at(&client), None);
 }
 
 /// Codex's device-code login asks the client to open a URL (an elicitation) while

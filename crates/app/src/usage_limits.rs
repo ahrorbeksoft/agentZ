@@ -295,16 +295,6 @@ pub(crate) fn tightest_window(windows: &[LimitWindow]) -> Option<&LimitWindow> {
     windows.iter().min_by_key(|window| window.left_percent())
 }
 
-/// The window that stops the account until it resets: of those used up, the last to reset. One
-/// whose reset has passed is no longer spent, though the last read still says so.
-pub(crate) fn used_up_window(windows: &[LimitWindow], now: SystemTime) -> Option<&LimitWindow> {
-    windows
-        .iter()
-        .filter(|window| window.left_percent() == 0)
-        .filter(|window| window.resets_at.is_none_or(|resets_at| resets_at > now))
-        .max_by_key(|window| window.resets_at)
-}
-
 /// A picker's line for the window: `62% left`, or `Used up · 2h 10m` in red until it resets.
 pub(crate) fn left_label(window: &LimitWindow, now: SystemTime) -> Label {
     let left = window.left_percent();
@@ -417,40 +407,5 @@ mod tests {
             ..window
         };
         assert_eq!(format_resets_in(&without_reset, now), None);
-    }
-
-    #[test]
-    fn an_account_waits_for_the_last_of_its_used_up_windows() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let window = |label: &str, used_percent: f64, resets_in: Option<i64>| LimitWindow {
-            label: label.into(),
-            used_percent,
-            resets_at: resets_in.map(|minutes| {
-                if minutes < 0 {
-                    now - Duration::from_secs(minutes.unsigned_abs() * 60)
-                } else {
-                    now + Duration::from_secs(minutes.unsigned_abs() * 60)
-                }
-            }),
-            length: None,
-        };
-        let label = |windows: &[LimitWindow]| {
-            used_up_window(windows, now).map(|window| window.label.clone())
-        };
-        assert_eq!(label(&[window("5-hour", 62., Some(30))]), None);
-        assert_eq!(
-            label(&[
-                window("5-hour", 100., Some(30)),
-                window("Weekly", 99.8, Some(3000)),
-                window("Monthly", 40., Some(9000)),
-            ]),
-            Some("Weekly".into())
-        );
-        // Past its reset, the last read is out of date.
-        assert_eq!(label(&[window("5-hour", 100., Some(-5))]), None);
-        assert_eq!(
-            label(&[window("5-hour", 100., None)]),
-            Some("5-hour".into())
-        );
     }
 }

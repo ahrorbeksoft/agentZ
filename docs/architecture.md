@@ -425,7 +425,7 @@ Each entry: what it does, where it lives, and where it comes from.
   (`without_handoff`). Sent, it links the threads (`Thread::continued_from`): the new thread
   opens with a "Continued from" divider, and the old one ends with a "Continued in" card (also
   the user's choice).
-- **The limit notice** (`AgentView::render_limit_notice`, `usage_limits::used_up_window`;
+- **The limit notice** (`AgentView::render_limit_notice`, `accounts::used_up_window`;
   t3code's `ThreadErrorBanner` as Zed's warning `Callout`, accounts topic 14): agents word a
   used-up limit each their own way, so agentZ goes by its reads instead. When a turn ends with
   an error while the last read of the thread's account has a window used up that hasn't reset
@@ -435,7 +435,22 @@ Each entry: what it does, where it lives, and where it comes from.
   the thread there, as Continue with Another Agent does, on the agent's other account with
   the most left of its tightest window (then those not read yet, then used up, then logged
   out); with more than one other account, it's a split button whose arrow lists the rest.
-  Usage ↗ opens the agent's usage page. Closed, it stays closed until the next turn.
+  "Continue at 16:10" waits for the reset (below), and once the thread waits, the body says
+  so and Don't Continue cancels it. Usage ↗ opens the agent's usage page. Closed, it stays
+  closed until the next turn.
+- **Continue at reset** (`server/limit_waits.rs`, `Thread::continues_at`,
+  `Request::ContinueAtReset`, `AtLimit`, `SettingsPage::render_at_limit`; t3code's "Resume
+  at reset", accounts topic 11): each account's card has "When a limit is reached", Stop (the
+  thread waits for the user) or Continue at reset, shown when its agent reads usage. When a
+  turn ends with an error on an account set to Continue at reset, the read that follows it
+  decides, as the notice does: with a window used up, the thread waits until its reset
+  (`Thread::continues_at`, kept in `state.json`). A read already under way when the turn
+  ended is followed by another. The notice's button sets the same wait for one thread, from
+  the account's last read. At that time the server queues "Continue." in the thread, which
+  starts its agent if it had stopped, so it goes with the app closed; a server that starts
+  waits again for the threads waiting when it stopped. A turn that starts meanwhile cancels
+  the wait, as Don't Continue does; an archived thread doesn't continue, and a subthread
+  never waits. On Droid this only happens when Droid itself stops at its limit.
 - **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
   t3code's `ComposerUsageLimits`, accounts topic 16): beside the agent in a started thread's
   composer, what's left of its account's window closest to running out ("62%"), yellow at 15%

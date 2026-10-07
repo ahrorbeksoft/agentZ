@@ -248,6 +248,20 @@ impl ProjectStore {
         )
     }
 
+    /// The limit notice's Continue at <reset>, or with `on: false` its cancel.
+    pub fn continue_at_reset(
+        &mut self,
+        id: ThreadId,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.request(
+            Request::ContinueAtReset { thread_id: id, on },
+            |response| matches!(response, Response::Ok).then_some(()),
+            cx,
+        )
+    }
+
     pub fn set_thread_order(&mut self, order: ThreadOrder, cx: &mut Context<Self>) {
         self.send(Request::SetThreadOrder(order), cx)
     }

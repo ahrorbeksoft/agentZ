@@ -82,6 +82,22 @@ Notes for whoever continues:
   and the user's own login (Pro) read both windows in about 11 seconds with no lock left. The
   status line's "Pro · 100% remaining" isn't read. Logging a new account in wasn't tried: it
   needs the user's browser.
+- Item 18 (`server/limit_waits.rs`): "When a limit is reached" sits under the card's limits,
+  past the avatar, as in the mock, and only for agents that read usage, since waiting needs
+  the reset from a read; an agent with one account has it too, as it has the notice. The
+  notice also gets §14's "Continue at 16:10" (item 13 left it for this), for one thread; once
+  the thread waits, its body says agentZ sends "Continue." when the limit resets, and Don't
+  Continue cancels it (t3code's "Cancel auto-resume"; the name is my choice). A limit is a
+  failed turn with a window used up in the read after it, as for the notice. The server keeps
+  the time in `Thread::continues_at` and queues "Continue." then, which starts a stopped
+  agent; it looks at the clock at least every minute, since a sleeping Mac stops timers, and
+  waits again after a restart. Any turn that starts cancels the wait, an archived thread
+  doesn't continue, and a subthread never waits. The time is the read's reset: later reads
+  don't move it, and a continue that comes too early (Droid's whole-day resets) fails and,
+  on a Continue at reset account, waits again. Switching an account to Stop leaves threads
+  already waiting (each notice can cancel). The mock fails prompts once its window is full
+  and resets at `resets_at` in its home. Not tried at a real agent's limit, which would
+  spend usage.
 - Item 14: Settings › Usage lists the installed agents that read their accounts' limits
   (`reads_usage`), an agent with one account included, as the mock's Codex is; "across N
   accounts" shows only with more than one. Accounts found logged out are left out, as their
@@ -192,7 +208,7 @@ Notes for whoever continues:
 | 15 | | Wave 1: Claude | done |
 | 16 | | Wave 1: Codex | done |
 | 17 | | Wave 1: Devin | done |
-| 18 | 11 | Stop or Continue at reset, per account | |
+| 18 | 11 | Stop or Continue at reset, per account | done |
 | 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | |
 | 20 | 9 | Limit resets (Codex) | |
 | 21 | 10 | Extra usage switch | |
