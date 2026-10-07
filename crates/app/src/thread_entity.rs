@@ -4,6 +4,7 @@
 use std::ops::Deref;
 
 use agent_client_protocol::schema::v1 as acp;
+use agentz_protocol::accounts::AccountId;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::thread::{ConnectionStatus, ThreadState, ThreadUpdate, ThreadView};
 use agentz_protocol::{ConnectionId, Request, Response};
@@ -114,18 +115,18 @@ impl AgentThread {
         cx.new(|cx| Self::open(client, thread_id, agent_name, cx))
     }
 
-    /// Starts the agent only to log in or out. It stops when this is dropped.
+    /// Starts the agent only to log the account in or out, `None` being the External account.
+    /// It stops when this is dropped.
     pub fn open_login_session(
         client: Entity<ServerClient>,
         agent_id: AgentId,
+        account: Option<AccountId>,
         agent_name: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
-        // The External account's, until Settings picks an account.
-        let response = client.read(cx).request(Request::OpenLoginSession {
-            agent_id,
-            account: None,
-        });
+        let response = client
+            .read(cx)
+            .request(Request::OpenLoginSession { agent_id, account });
         let mut this = Self::new(client, agent_name);
         this._subscribe = cx.spawn(async move |this, cx| {
             let result = match response.await {

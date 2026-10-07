@@ -11,6 +11,7 @@ use gpui_shared_string::SharedString;
 use projects::{ProjectId, ThreadId};
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::AccountSupport;
 use crate::thread::{AuthStatus, LoginIdentity, SessionDefaults};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -91,6 +92,9 @@ pub struct AgentListing {
     /// How a custom agent starts, to edit it. `None` for the registry's agents.
     #[serde(default)]
     pub custom_command: Option<AgentCommand>,
+    /// What it offers for accounts, if it can have more than its own login.
+    #[serde(default)]
+    pub accounts: Option<AccountSupport>,
 }
 
 /// A custom agent as Settings › Agents adds or changes it ([`crate::Request::SaveCustomAgent`]).

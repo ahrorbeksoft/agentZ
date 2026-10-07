@@ -246,7 +246,15 @@ Each entry: what it does, where it lives, and where it comes from.
   menu with Uninstall. Below it are Account, Defaults (for new threads), Environment and Threads
   tabs (Threads is described under Agent threads).
   Account is a card: the login methods while logged out, or the account the agent reported
-  with Change Account and Log Out (both described under Agent threads). Add Agent is Zed's
+  with Change Account and Log Out (both described under Agent threads). For an agent that can
+  have more accounts (its listing's `accounts`), Account lists a card per account instead,
+  the External one first, tagged "Outside agentZ": the avatar in the account's color, its name
+  (Rename's, else its email), "Default" on the one new threads take, its plan, its limit bars
+  (`usage_limits.rs`, t3code's `LimitWindows`), and a ⋯ menu (Rename in place, Use for New
+  Threads, Color, Refresh Usage, Open Usage Page, Show in Finder, Log Out, Remove Account).
+  Each account has its own login session (`OpenLoginSession` with the account) while the page
+  is open, and its login rows while logged out. Add Account makes a "New account" card that
+  Cancel removes. Add Agent is Zed's
   menu: Install from Registry, Add Custom Agent, and the ACP docs. The ACP Registry
   page has search, an All / Installed / Not Installed filter, and a card for each registry agent.
   As in Zed, the cards are a `uniform_list` below a pinned search bar: scrolling re-renders the

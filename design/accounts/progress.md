@@ -23,10 +23,17 @@ Notes for whoever continues:
   the agents that need them: an empty model list with Devin (17), a key agentZ holds with GLM
   (wave 2). As the server starts, it checks only the External account, and only of
   agents that have agentZ accounts: without any, nothing depends on it, and every agent would
-  be started at each server start. The app ignores `Event::Accounts` until item 8 shows them.
+  be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
-  importing sessions, but the app still sends the External account (`None`) for both, and its
-  settings tabs edit the External account's settings, until items 8 and 9 add the menus.
+  importing sessions. Since item 8, the Account tab opens a login session per account; the
+  Threads tab still lists the External account's sessions, and the other tabs edit its
+  settings, until item 9 adds their account menu.
+- Item 8: the app keeps every machine's accounts from `Event::Accounts`
+  (`ServerClient::accounts`). Rename saves on Enter or a click elsewhere, Escape cancels, and
+  an empty name shows the email again. Cancel on a New account card removes it without asking,
+  since its folder has nothing yet; Remove Account asks. The menu's icons are muted, as the
+  sidebar's, Remove Account included (Zed has no red items). Changes that fail say so under
+  "Accounts".
 - Only agents with a description can have more accounts (`AddAccount` refuses the rest).
   Droid's is `accounts/droid.rs`; wave 1 and later agents each add one beside it.
 - Readers (item 6): the mock's kind is `Reader::Command` (printing agentZ's own JSON); each
@@ -54,8 +61,8 @@ Notes for whoever continues:
   sessions), so agentZ checks the key with its reader first. Droid's key reader
   (`Reader::FactoryApi`) parses `/api/billing/limits`; its test answer is a real one, with
   other numbers. A key account has no email (Factory's `whoami` gives only ids), and only
-  Factory's US address is used, not its EU one. The app shows the key field once item 8 has
-  the account menus.
+  Factory's US address is used, not its EU one. An agentZ account's login rows have the key
+  field; a key account's card is titled by its login method, having no email.
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -66,7 +73,7 @@ Notes for whoever continues:
 | 5 | | Login checks from the description | done |
 | 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | done |
 | 7 | | API-key accounts (Droid with a Factory API key) | done |
-| 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | |
+| 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | done |
 | 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | |
 | 10 | 12 | The account in the strip under the composer; the default account for new threads | |
 | 11 | 13 | The account's color on its threads' agent icon | |

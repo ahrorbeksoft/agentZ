@@ -12,7 +12,7 @@ use futures::AsyncReadExt as _;
 use http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use super::droid::WINDOW_LABELS;
+use super::droid::{WINDOW_LABELS, WINDOW_LENGTHS};
 use super::login_checks::run_with_account_env;
 
 /// How long an HTTP reader waits for its answer.
@@ -166,8 +166,9 @@ fn factory_limits(body: &[u8], now: SystemTime) -> Result<AccountStatus> {
         .context("Factory's answer has no Standard Usage limits")?;
     let windows = WINDOW_LABELS
         .into_iter()
+        .zip(WINDOW_LENGTHS)
         .zip([standard.five_hour, standard.weekly, standard.monthly])
-        .filter_map(|(label, window)| {
+        .filter_map(|((label, length), window)| {
             let window = window?;
             let ends_at = window
                 .window_end
@@ -184,6 +185,7 @@ fn factory_limits(body: &[u8], now: SystemTime) -> Result<AccountStatus> {
                     0.0
                 },
                 resets_at: active,
+                length: Some(length),
             })
         })
         .collect();

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use agentz_protocol::accounts::{AccountChoice, AccountId, AgentAccounts};
+use agentz_protocol::accounts::{AccountChoice, AccountId, AccountSupport, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSettings};
 use agentz_protocol::{ConnectionId, Request, Response};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -91,6 +91,13 @@ impl Server {
             Some(agent) => agent.accounts.clone(),
             None => accounts::built_in_description(&agent_id.0),
         }
+    }
+
+    /// What the agent's listing says it offers for accounts, if it can have them.
+    pub(super) fn account_support(&self, agent_id: &AgentId) -> Option<AccountSupport> {
+        let description = self.account_description(agent_id)?;
+        let folder = accounts::agent_folder(&self.data_dir, agent_id).log_err()?;
+        Some(description.support(folder))
     }
 
     /// An agentZ account's description and home, while the account is there.

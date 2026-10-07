@@ -2670,6 +2670,7 @@ mod modal_tests {
                             update_available: false,
                         },
                         custom_command: None,
+                        accounts: None,
                     }],
                     is_fetching: false,
                     fetch_error: None,

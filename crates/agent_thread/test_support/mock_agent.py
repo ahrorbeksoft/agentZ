@@ -116,7 +116,8 @@ if sys.argv[-1] == "--usage":
     resets_at = {"secs_since_epoch": int(time.time()) + 3600, "nanos_since_epoch": 0}
     print(json.dumps({"logged_in": True, "email": "mock@example.com", "plan": "Pro",
                       "windows": [{"label": "5-hour", "used_percent": used_percent(),
-                                   "resets_at": resets_at}]}), flush=True)
+                                   "resets_at": resets_at,
+                                   "length": {"secs": 5 * 3600, "nanos": 0}}]}), flush=True)
     sys.exit(0)
 
 if sys.argv[-1] == "--login":

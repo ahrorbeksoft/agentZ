@@ -37,6 +37,13 @@ const END_TIMEOUT: Duration = Duration::from_secs(5);
 /// Droid's windows in the order `/limits` always draws them, by their English names: the
 /// labels it draws are translated.
 pub(super) const WINDOW_LABELS: [&str; 3] = ["5-hour", "Weekly", "Monthly"];
+/// How long each of [`WINDOW_LABELS`] runs. Neither `/limits` nor Factory's API says; the
+/// monthly one follows the calendar, so 30 days is close enough to place its hairline.
+pub(super) const WINDOW_LENGTHS: [Duration; 3] = [
+    Duration::from_secs(5 * 60 * 60),
+    Duration::from_secs(7 * 24 * 60 * 60),
+    Duration::from_secs(30 * 24 * 60 * 60),
+];
 
 /// Droid keeps everything in `.factory` under `FACTORY_HOME_OVERRIDE`, or else the user's home.
 /// Its login there is encrypted with a key from the keychain that every home shares, so the
@@ -60,6 +67,7 @@ pub(super) fn description() -> AgentDescription {
                 base_url: "https://api.factory.ai".into(),
             }),
         }),
+        usage_page: Some("https://app.factory.ai/settings/billing".into()),
     }
 }
 
@@ -350,6 +358,7 @@ fn limits_screen(screen: &str, now: SystemTime) -> Option<AccountStatus> {
                 .map_or_else(|| label.to_string(), |label| label.to_string()),
             used_percent,
             resets_at,
+            length: WINDOW_LENGTHS.get(windows.len()).copied(),
         });
     }
     let credits = lines

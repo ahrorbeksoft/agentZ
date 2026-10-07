@@ -44,6 +44,49 @@ impl ConfirmRequest {
             on_confirm: Rc::new(on_confirm),
         }
     }
+
+    /// Logging out of one of an agent's accounts. The External account is the agent's own
+    /// login, which its CLI shares.
+    pub fn account_logout(
+        account_name: &str,
+        agent_name: &str,
+        is_external: bool,
+        on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        let message = if is_external {
+            format!(
+                "This is {agent_name}'s own login, so its CLI is logged out too. Running threads \
+                 on it stop. Thread history is kept."
+            )
+        } else {
+            "Running threads on it stop, and ask to log in again. Thread history is kept. The \
+             account stays, to log in again any time."
+                .to_string()
+        };
+        Self {
+            icon: IconName::Exit,
+            title: format!("Log out of {account_name}?").into(),
+            message: message.into(),
+            confirm_label: "Log Out".into(),
+            on_confirm: Rc::new(on_confirm),
+        }
+    }
+
+    /// Removing an agentZ account, which deletes its folder.
+    pub fn remove_account(
+        account_name: &str,
+        on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            icon: IconName::Trash,
+            title: format!("Remove {account_name}?").into(),
+            message: "This deletes the account's login, sessions and history. Its threads stay \
+                      in the sidebar, but can't continue."
+                .into(),
+            confirm_label: "Remove Account".into(),
+            on_confirm: Rc::new(on_confirm),
+        }
+    }
 }
 
 pub struct ConfirmDialog {

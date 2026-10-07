@@ -12,6 +12,9 @@ use crate::agent_icons::agent_icon;
 use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey, ThreadKey};
 use crate::project_store::ProjectStore;
 use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
+use agentz_protocol::accounts::{
+    AccountChange, AccountChoices, AccountId, AccountStatus, AccountSupport, AgentAccounts,
+};
 use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
     InstallState,
@@ -20,7 +23,7 @@ use agentz_protocol::workspace::WorkspaceRemoval;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Task, UniformListScrollHandle,
-    Window, actions, uniform_list,
+    WeakEntity, Window, actions, uniform_list,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
@@ -43,8 +46,8 @@ use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::app_settings::{AppSettingsStore, MachineProfile, PlaySound, ThemeMode};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{
-    ActionButton, ActionStyle, account_badge, avatar, icon_tile, spinner, status_badge, status_dot,
-    text_field,
+    ACCOUNT_COLORS, ActionButton, ActionStyle, account_badge, account_color, avatar, color_hex,
+    icon_tile, spinner, status_badge, status_dot, text_field,
 };
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machine_icon_picker::MachineIconPicker;
@@ -58,8 +61,12 @@ use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
 use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
 use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
+use crate::usage_limits::render_limit_windows;
 
 const KEY_CONTEXT: &str = "SettingsPage";
+const ACCOUNT_RENAME_KEY_CONTEXT: &str = "AccountRename";
+/// An account card's avatar, which its limits line up after.
+const AVATAR_SIZE: Pixels = px(32.);
 const CONTENT_WIDTH: Pixels = px(720.);
 /// An agent can keep hundreds of sessions in a project, so the Threads tab shows them a page at
 /// a time, as the sidebar shows archived threads.
@@ -75,7 +82,11 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", CloseSettings, Some(KEY_CONTEXT))]);
+    cx.bind_keys([
+        KeyBinding::new("escape", CloseSettings, Some(KEY_CONTEXT)),
+        KeyBinding::new("enter", menu::Confirm, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
+    ]);
 }
 
 pub enum SettingsPageEvent {
@@ -1861,8 +1872,14 @@ impl SettingsPage {
             return Vec::new();
         };
         let listing = self.registry(cx).read(cx).agent(&panel.agent_id).cloned();
+        let support = listing
+            .as_ref()
+            .and_then(|listing| listing.accounts.clone());
         let content = match panel.tab {
-            AgentTab::Account => self.render_account_tab(cx),
+            AgentTab::Account => match &support {
+                Some(support) => self.render_accounts_tab(support, cx),
+                None => self.render_account_tab(cx),
+            },
             AgentTab::Defaults => self.render_agent_defaults(window, cx),
             AgentTab::Environment => self.render_agent_env(cx),
             AgentTab::Threads => self.render_agent_threads(window, cx),
@@ -1889,12 +1906,12 @@ impl SettingsPage {
         };
         let colors = cx.theme().colors().clone();
         let status_colors = cx.theme().status().clone();
-        let connection = panel.connection.read(cx);
+        let connection = panel.external.connection.read(cx);
         let id = panel.agent_id.clone();
         let name = listing
             .map(|agent| agent.name().clone())
             .unwrap_or_else(|| connection.agent_name().clone());
-        let (badge_label, badge_color) = match AccountState::of(connection) {
+        let (badge_label, badge_color) = match panel.agent_state(cx) {
             AccountState::Connecting => ("Starting…", colors.text_muted),
             AccountState::Failed => ("Couldn't start", status_colors.error),
             AccountState::LoggingIn => ("Logging in…", colors.text_accent),
@@ -2124,52 +2141,139 @@ impl SettingsPage {
     ) {
         let client = self.agents_client(cx);
         let agent_settings = client.read(cx).agent_settings(&id.0);
-        let name = name.clone();
-        let login_agent_id = id.clone();
-        let connection =
-            cx.new(|cx| AgentThread::open_login_session(client.clone(), login_agent_id, name, cx));
-        let login = cx
-            .new(|cx| AgentLogin::new(connection.clone(), LoginLayout::Rows, Some(id.clone()), cx));
-        // The server remembers the options and modes the agent offers, and logins made in
-        // the panel.
-        let subscription = cx.observe(&connection, |this, connection, cx| {
-            if let Some(panel) = this.agent_panel_mut() {
-                sync_elicitation_cards(&mut panel.elicitation_cards, &connection, cx);
-                let thread = connection.read(cx);
-                let was_authenticating =
-                    std::mem::replace(&mut panel.was_authenticating, thread.is_authenticating());
-                // A finished login settles the account change.
-                if was_authenticating
-                    && !thread.is_authenticating()
-                    && thread.auth_error().is_none()
-                {
-                    panel.changing_account = false;
-                }
-            }
-            cx.notify()
-        });
+        let external = self.open_account_session(&client, id, None, name, cx);
         let env_rows = agent_settings
             .env
             .iter()
             .map(|(key, value)| self.new_env_row(key, value, cx))
             .collect();
+        // Accounts added or removed, here or in another window.
+        let accounts_changed = cx.observe(&client, |this, _, cx| this.sync_account_sessions(cx));
         let panel = AgentPanel {
             agent_id: id.clone(),
             tab: AgentTab::Account,
-            connection,
-            login,
-            elicitation_cards: Vec::new(),
-            changing_account: false,
-            was_authenticating: false,
+            external,
+            accounts: BTreeMap::new(),
+            renaming: None,
+            adding_account: None,
+            account_error: None,
             env_rows,
             sessions: None,
             sessions_project: None,
             sessions_shown: SESSIONS_INITIAL_COUNT,
             importing: HashSet::new(),
             import_error: None,
-            _subscriptions: [subscription],
+            _subscriptions: vec![accounts_changed],
         };
         self.show_agents_page(AgentsPage::Agent(panel), window, cx);
+        self.sync_account_sessions(cx);
+    }
+
+    /// Starts the agent in the account's home (`None` being the External account's), to show
+    /// whether it's logged in and to log it in or out.
+    fn open_account_session(
+        &self,
+        client: &Entity<ServerClient>,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        agent_name: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> AccountSession {
+        let connection = cx.new(|cx| {
+            AgentThread::open_login_session(
+                client.clone(),
+                agent_id.clone(),
+                account,
+                agent_name.clone(),
+                cx,
+            )
+        });
+        let login = cx.new(|cx| {
+            AgentLogin::new(
+                connection.clone(),
+                LoginLayout::Rows,
+                Some(agent_id.clone()),
+                cx,
+            )
+        });
+        // The server remembers the options and modes the agent offers, and logins made in
+        // the panel.
+        let subscription = cx.observe(&connection, move |this, connection, cx| {
+            if let Some(session) = this
+                .agent_panel_mut()
+                .and_then(|panel| panel.session_mut(account))
+            {
+                sync_elicitation_cards(&mut session.elicitation_cards, &connection, cx);
+                let thread = connection.read(cx);
+                let was_authenticating =
+                    std::mem::replace(&mut session.was_authenticating, thread.is_authenticating());
+                // A finished login settles the account change.
+                if was_authenticating
+                    && !thread.is_authenticating()
+                    && thread.auth_error().is_none()
+                {
+                    session.changing_account = false;
+                }
+            }
+            cx.notify()
+        });
+        AccountSession {
+            connection,
+            login,
+            elicitation_cards: Vec::new(),
+            changing_account: false,
+            was_authenticating: false,
+            _subscription: subscription,
+        }
+    }
+
+    /// Gives each of the agent's agentZ accounts a login session, and stops those of the
+    /// accounts that are gone.
+    fn sync_account_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let agent_id = panel.agent_id.clone();
+        let connection = panel.external.connection.read(cx);
+        let client = connection.client().clone();
+        let agent_name = connection.agent_name().clone();
+        let listed: Vec<AccountId> = client
+            .read(cx)
+            .accounts(&agent_id)
+            .accounts
+            .iter()
+            .map(|account| account.id)
+            .collect();
+        let missing: Vec<AccountId> = listed
+            .iter()
+            .copied()
+            .filter(|id| !panel.accounts.contains_key(id))
+            .collect();
+        let is_unchanged = missing.is_empty() && panel.accounts.len() == listed.len();
+        if is_unchanged {
+            return;
+        }
+        let opened: Vec<(AccountId, AccountSession)> = missing
+            .into_iter()
+            .map(|id| {
+                let session =
+                    self.open_account_session(&client, &agent_id, Some(id), &agent_name, cx);
+                (id, session)
+            })
+            .collect();
+        if let Some(panel) = self.agent_panel_mut() {
+            panel.accounts.retain(|id, _| listed.contains(id));
+            panel.accounts.extend(opened);
+            if panel
+                .renaming
+                .as_ref()
+                .and_then(|rename| rename.account)
+                .is_some_and(|id| !listed.contains(&id))
+            {
+                panel.renaming = None;
+            }
+        }
+        cx.notify();
     }
 
     /// A variable on the Environment tab, saved as it's typed.
@@ -2200,7 +2304,7 @@ impl SettingsPage {
             })
             .collect();
         let agent_id = panel.agent_id.0.clone();
-        let client = panel.connection.read(cx).client().clone();
+        let client = panel.external.connection.read(cx).client().clone();
         client.update(cx, |client, cx| {
             client.update_agent_settings(&agent_id, |agent| agent.env = env, cx)
         });
@@ -2505,8 +2609,8 @@ impl SettingsPage {
             return div().into_any_element();
         };
         let agent_id = panel.agent_id.0.to_string();
-        let agent_name = panel.connection.read(cx).agent_name().clone();
-        let client = panel.connection.read(cx).client().clone();
+        let agent_name = panel.external.connection.read(cx).agent_name().clone();
+        let client = panel.external.connection.read(cx).client().clone();
         let agent = client.read(cx).agent_settings(&agent_id);
         let mut rows: Vec<AnyElement> = Vec::new();
         for option in &agent.known_config_options {
@@ -2640,7 +2744,7 @@ impl SettingsPage {
             ));
         }
         if rows.is_empty() {
-            let connection = panel.connection.read(cx);
+            let connection = panel.external.connection.read(cx);
             let message = match (connection.status(), connection.logged_in()) {
                 (_, Some(false)) => format!("Log in to {agent_name} to see its settings here."),
                 (ConnectionStatus::Connecting, _) => format!("Loading {agent_name}'s settings…"),
@@ -2667,7 +2771,7 @@ impl SettingsPage {
             return div().into_any_element();
         };
         let colors = cx.theme().colors().clone();
-        let agent_name = panel.connection.read(cx).agent_name().clone();
+        let agent_name = panel.external.connection.read(cx).agent_name().clone();
         let input_box = |input: Entity<TextInput>| {
             div()
                 .h(px(28.))
@@ -2758,9 +2862,10 @@ impl SettingsPage {
     /// that it isn't, with a row for each way it offers to log in; or the login in progress.
     /// The page a login asks to open shows in the card, other requests for input under it.
     fn render_account_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(account) = self.agent_panel() else {
+        let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
+        let account = &panel.external;
         let colors = cx.theme().colors().clone();
         let status_colors = cx.theme().status().clone();
         let connection = account.connection.read(cx);
@@ -2781,7 +2886,7 @@ impl SettingsPage {
         let login_method = connection
             .client()
             .read(cx)
-            .agent_settings(&account.agent_id.0)
+            .agent_settings(&panel.agent_id.0)
             .login_method;
         let machine = self.machines.read(cx).label(self.agents_machine, cx);
         let check_again = IconButton::new("account-check", IconName::RotateCw)
@@ -2789,8 +2894,9 @@ impl SettingsPage {
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text("Check Again"))
             .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(account) = this.agent_panel_mut() {
-                    account
+                if let Some(panel) = this.agent_panel_mut() {
+                    panel
+                        .external
                         .connection
                         .update(cx, |connection, cx| connection.check_login(cx));
                 }
@@ -2887,7 +2993,7 @@ impl SettingsPage {
                         ActionButton::new("account-logout", "Log Out")
                             .style(ActionStyle::Ghost)
                             .on_click(
-                                cx.listener(|this, _, window, cx| this.confirm_logout(window, cx)),
+                                cx.listener(|this, _, _, cx| this.confirm_logout(None, None, cx)),
                             )
                             .into_any_element(),
                     );
@@ -2898,7 +3004,7 @@ impl SettingsPage {
                         .py_3()
                         .gap_3()
                         .child(match &email {
-                            Some(email) => avatar(email, cx),
+                            Some(email) => avatar(email, None, cx),
                             None => account_badge(cx),
                         })
                         .child(
@@ -2953,9 +3059,664 @@ impl SettingsPage {
             .into_any_element()
     }
 
+    /// The Account tab of an agent that can have more accounts: a card per account under
+    /// "Accounts" and Add Account, the External account first while it's listed.
+    fn render_accounts_tab(&self, support: &AccountSupport, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel) = self.agent_panel() else {
+            return div().into_any_element();
+        };
+        let colors = cx.theme().colors().clone();
+        let status_colors = cx.theme().status().clone();
+        let external = panel.external.connection.read(cx);
+        let agent_name = external.agent_name().clone();
+        let external_state = AccountState::of(external);
+        let external_failure = match external.status() {
+            ConnectionStatus::Failed(error) => Some(error.clone()),
+            _ => None,
+        };
+        let accounts = external.client().read(cx).accounts(&panel.agent_id);
+        let listed = accounts.listed();
+
+        let mut cards: Vec<AnyElement> = Vec::new();
+        for &account in &listed {
+            cards.push(self.render_account_card(account, &accounts, support, listed.len(), cx));
+            if let Some(session) = panel.session(account) {
+                cards.extend(
+                    session
+                        .elicitation_cards
+                        .iter()
+                        .map(|card| card.clone().into_any_element()),
+                );
+            }
+        }
+        if listed.is_empty() {
+            // The agent isn't logged in outside agentZ, and has no account of agentZ's yet.
+            let row = match external_failure.filter(|_| external_state == AccountState::Failed) {
+                Some(error) => render_status_row(
+                    status_dot(status_colors.error).into_any_element(),
+                    format!("Couldn't start {agent_name}").into(),
+                    Some((error, Color::Error)),
+                    vec![
+                        ActionButton::new("account-retry", "Try Again")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.reopen_agent(window, cx)),
+                            )
+                            .into_any_element(),
+                    ],
+                ),
+                None => render_status_row(
+                    status_dot(status_colors.warning).into_any_element(),
+                    "Not logged in".into(),
+                    Some((
+                        format!("Add an account to log {agent_name} in.").into(),
+                        Color::Muted,
+                    )),
+                    Vec::new(),
+                ),
+            };
+            cards.push(
+                div()
+                    .debug_selector(|| "account-card-none".into())
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel_background)
+                    .child(row)
+                    .into_any_element(),
+            );
+        }
+
+        let add = Button::new("account-add", "Add Account")
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .start_icon(
+                Icon::new(IconName::Plus)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .disabled(panel.adding_account.is_some())
+            .on_click(cx.listener(|this, _, _, cx| this.add_account(cx)));
+        v_flex()
+            .gap_2p5()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        Label::new("Accounts")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().debug_selector(|| "account-add".into()).child(add)),
+            )
+            .children(
+                panel
+                    .account_error
+                    .clone()
+                    .map(|error| Label::new(error).size(LabelSize::Small).color(Color::Error)),
+            )
+            .children(cards)
+            .into_any_element()
+    }
+
+    /// An account as today's Account card shows the agent's login: its avatar in its color,
+    /// its name with its tags, its plan, its limits, and its ⋯ menu. Logged out, its login
+    /// rows follow; before its first login, it's the "New account" card.
+    fn render_account_card(
+        &self,
+        account: Option<AccountId>,
+        accounts: &AgentAccounts,
+        support: &AccountSupport,
+        listed_count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(panel) = self.agent_panel() else {
+            return div().into_any_element();
+        };
+        // Its session opens as soon as the page learns of the account.
+        let Some(session) = panel.session(account) else {
+            return div().into_any_element();
+        };
+        let colors = cx.theme().colors().clone();
+        let selector = account.map_or_else(|| "external".to_string(), |id| id.to_string());
+        let connection = session.connection.read(cx);
+        let agent_name = connection.agent_name().clone();
+        let state = AccountState::of(connection);
+        let has_auth_methods = !connection.auth_methods().is_empty();
+        let auth_status = connection
+            .auth_status()
+            .filter(|status| status.is_logged_in())
+            .cloned();
+        let auth_error = connection.auth_error().cloned();
+        let failure = match connection.status() {
+            ConnectionStatus::Failed(error) => Some(error.clone()),
+            _ => None,
+        };
+        let can_log_out = connection.supports_logout() || accounts.logs_in_with_key(account);
+        let login_method = match account {
+            None => {
+                connection
+                    .client()
+                    .read(cx)
+                    .agent_settings(&panel.agent_id.0)
+                    .login_method
+            }
+            Some(id) => accounts
+                .account(id)
+                .and_then(|account| account.settings.login_method.clone()),
+        };
+        let read = accounts.status(account);
+        let choices = accounts.choices(account).cloned().unwrap_or_default();
+        let color = choices
+            .color
+            .as_deref()
+            .and_then(|hex| account_color(hex, cx));
+        let reported_email = auth_status
+            .as_ref()
+            .and_then(|status| status.account.as_ref())
+            .and_then(|account| account.email.clone());
+        let email = read
+            .and_then(|read| read.status.email.clone())
+            .or(reported_email);
+        let name = accounts.name(account).or_else(|| email.clone());
+        let card = v_flex()
+            .id(SharedString::from(format!("account-card-{selector}")))
+            .debug_selector({
+                let selector = selector.clone();
+                move || format!("account-card-{selector}")
+            })
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.panel_background)
+            .overflow_hidden();
+
+        let is_new = state != AccountState::LoggedIn
+            && name.is_none()
+            && read.is_none()
+            && login_method.is_none();
+        if let Some(id) = account.filter(|_| is_new) {
+            let subtitle = match (failure.clone(), auth_error) {
+                (Some(error), _) | (None, Some(error)) => (error, Color::Error),
+                (None, None) if state == AccountState::Connecting => {
+                    (format!("Starting {agent_name}…").into(), Color::Muted)
+                }
+                (None, None) => (
+                    format!(
+                        "Choose how {agent_name} logs in. The account takes its email once \
+                         it's logged in."
+                    )
+                    .into(),
+                    Color::Muted,
+                ),
+            };
+            let new_avatar = div()
+                .size(AVATAR_SIZE)
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_dashed()
+                .border_color(colors.border)
+                .child(
+                    Icon::new(IconName::Plus)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                );
+            let mut actions = Vec::new();
+            if failure.is_some() {
+                actions.push(
+                    ActionButton::new(
+                        SharedString::from(format!("account-retry-{id}")),
+                        "Try Again",
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.reopen_agent(window, cx)))
+                    .into_any_element(),
+                );
+            }
+            actions.push(
+                div()
+                    .debug_selector(move || format!("account-cancel-{id}"))
+                    .child(
+                        ActionButton::new(
+                            SharedString::from(format!("account-cancel-{id}")),
+                            "Cancel",
+                        )
+                        .style(ActionStyle::Ghost)
+                        // Nothing is in its folder yet, so it goes without asking.
+                        .on_click(cx.listener(move |this, _, _, cx| this.remove_account(id, cx))),
+                    )
+                    .into_any_element(),
+            );
+            return card
+                .child(
+                    h_flex()
+                        .px_4()
+                        .py_3()
+                        .gap_3()
+                        .child(new_avatar)
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(Label::new("New account"))
+                                .child(
+                                    Label::new(subtitle.0)
+                                        .size(LabelSize::Small)
+                                        .color(subtitle.1),
+                                ),
+                        )
+                        .children(actions),
+                )
+                .when(has_auth_methods && failure.is_none(), |card| {
+                    card.child(session.login.clone())
+                })
+                .into_any_element();
+        }
+
+        let title: SharedString = match &name {
+            Some(name) => name.clone().into(),
+            None if state == AccountState::LoggedOut => "Not logged in".into(),
+            None => logged_in_title(auth_status.as_ref(), login_method.as_deref()),
+        };
+        let detail: Option<(SharedString, Color)> = match state {
+            AccountState::Failed => Some((
+                failure.unwrap_or_else(|| format!("Couldn't start {agent_name}").into()),
+                Color::Error,
+            )),
+            AccountState::LoggedOut => match auth_error {
+                Some(error) => Some((error, Color::Error)),
+                None => name
+                    .is_some()
+                    .then(|| ("Not logged in".into(), Color::Warning)),
+            },
+            AccountState::Connecting if read.is_none() && auth_status.is_none() => Some((
+                format!("Checking whether {agent_name} is logged in…").into(),
+                Color::Muted,
+            )),
+            _ => {
+                let details = account_card_details(
+                    &choices,
+                    email.as_deref(),
+                    read.map(|read| &read.status),
+                    auth_status.as_ref(),
+                );
+                (!details.is_empty()).then(|| (details.join(" · ").into(), Color::Muted))
+            }
+        };
+
+        let mut tags: Vec<AnyElement> = Vec::new();
+        if account.is_none() {
+            let machine = self.machines.read(cx).label(self.agents_machine, cx);
+            let explanation = format!(
+                "{agent_name}'s own login on {machine}, from its CLI. Threads on it go into the \
+                 CLI's history{}",
+                if can_log_out {
+                    ", and logging out here logs out the CLI too."
+                } else {
+                    "."
+                }
+            );
+            tags.push(
+                account_tag("Outside agentZ", Color::Muted, cx)
+                    .id("account-tag-outside")
+                    .debug_selector(|| "account-tag-outside".into())
+                    .tooltip(Tooltip::element(move |_, _| {
+                        div()
+                            .w(px(320.))
+                            .child(Label::new(explanation.clone()).size(LabelSize::Small))
+                            .into_any_element()
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let is_default = listed_count > 1 && accounts.new_thread_account() == account;
+        if is_default {
+            let selector = selector.clone();
+            tags.push(
+                account_tag("Default", Color::Accent, cx)
+                    .debug_selector(move || format!("account-tag-default-{selector}"))
+                    .into_any_element(),
+            );
+        }
+
+        let is_renaming = panel
+            .renaming
+            .as_ref()
+            .filter(|rename| rename.account == account);
+        let title_element = match is_renaming {
+            Some(rename) => div()
+                .w(px(240.))
+                .key_context(ACCOUNT_RENAME_KEY_CONTEXT)
+                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                    this.finish_account_rename(true, cx);
+                    window.focus(&this.focus_handle, cx);
+                }))
+                .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                    this.finish_account_rename(false, cx);
+                    window.focus(&this.focus_handle, cx);
+                }))
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border_focused)
+                .child(rename.input.clone())
+                .into_any_element(),
+            None => div()
+                .min_w_0()
+                .child(Label::new(title.clone()).truncate())
+                .into_any_element(),
+        };
+        let avatar = match &name {
+            Some(name) => avatar(name, color, cx),
+            None => account_badge(cx),
+        };
+
+        let mut actions: Vec<AnyElement> = Vec::new();
+        if state == AccountState::Failed {
+            actions.push(
+                ActionButton::new(
+                    SharedString::from(format!("account-retry-{selector}")),
+                    "Try Again",
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.reopen_agent(window, cx)))
+                .into_any_element(),
+            );
+        }
+        let is_local = self.agents_machine == MachineId::Local;
+        let menu = AccountMenu {
+            account,
+            name: name.map_or_else(|| title.clone(), Into::into),
+            can_make_default: listed_count > 1 && accounts.new_thread_account() != account,
+            color: choices.color,
+            can_refresh: support.reads_usage && state == AccountState::LoggedIn,
+            read_at: read.map(|read| read.read_at),
+            usage_page: support.usage_page.clone(),
+            folder: account
+                .filter(|_| is_local)
+                .map(|account| support.home(account)),
+            can_log_out: can_log_out && state == AccountState::LoggedIn,
+        };
+        actions.push(render_account_menu(&selector, menu, cx));
+
+        let windows = read
+            .map(|read| read.status.windows.clone())
+            .filter(|windows| !windows.is_empty())
+            .filter(|_| matches!(state, AccountState::LoggedIn | AccountState::Connecting));
+        let shows_login = account.is_some()
+            && has_auth_methods
+            && matches!(state, AccountState::LoggedOut | AccountState::LoggingIn);
+
+        card.child(
+            h_flex()
+                .px_4()
+                .py_3()
+                .gap_3()
+                .child(avatar)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_2()
+                                .child(title_element)
+                                .children(tags),
+                        )
+                        .children(detail.map(|(detail, color)| {
+                            Label::new(detail)
+                                .size(LabelSize::Small)
+                                .color(color)
+                                .truncate()
+                        })),
+                )
+                .children(actions),
+        )
+        .children(windows.map(|windows| {
+            // Under the name, past the avatar.
+            div()
+                .pl(px(16.) + AVATAR_SIZE + px(12.))
+                .pr_4()
+                .pb(px(14.))
+                .child(render_limit_windows(
+                    &selector,
+                    &windows,
+                    SystemTime::now(),
+                    cx,
+                ))
+        }))
+        .when(shows_login, |card| card.child(session.login.clone()))
+        .into_any_element()
+    }
+
+    /// Add Account: the server makes the account's folder, and the account arrives with the
+    /// agent's accounts, which opens its login session.
+    fn add_account(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        if panel.adding_account.is_some() {
+            return;
+        }
+        let agent_id = panel.agent_id.clone();
+        let client = panel.external.connection.read(cx).client().clone();
+        let request = client
+            .read(cx)
+            .request(Request::AddAccount(agent_id.clone()));
+        let task = cx.spawn(async move |this, cx| {
+            let added = request.await;
+            this.update(cx, |this, cx| {
+                let Some(panel) = this
+                    .agent_panel_mut()
+                    .filter(|panel| panel.agent_id == agent_id)
+                else {
+                    return;
+                };
+                panel.adding_account = None;
+                if let Err(error) = added {
+                    panel.account_error =
+                        Some(format!("Couldn't add an account: {error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+        if let Some(panel) = self.agent_panel_mut() {
+            panel.adding_account = Some(task);
+            panel.account_error = None;
+        }
+        cx.notify();
+    }
+
+    /// Sends a request about the agent's accounts, to say why if it fails.
+    fn send_account_request(
+        &mut self,
+        request: Request,
+        failure: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        panel.account_error = None;
+        let agent_id = panel.agent_id.clone();
+        let response = panel
+            .external
+            .connection
+            .read(cx)
+            .client()
+            .read(cx)
+            .request(request);
+        cx.spawn(async move |this, cx| {
+            let Err(error) = response.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some(panel) = this
+                    .agent_panel_mut()
+                    .filter(|panel| panel.agent_id == agent_id)
+                {
+                    panel.account_error = Some(format!("{failure}: {error:#}").into());
+                    cx.notify();
+                }
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn update_account(
+        &mut self,
+        account: Option<AccountId>,
+        change: AccountChange,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let request = Request::UpdateAccount {
+            agent_id: panel.agent_id.clone(),
+            account,
+            change,
+        };
+        self.send_account_request(request, "Couldn't change the account", cx);
+    }
+
+    fn refresh_usage(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let request = Request::RefreshUsage {
+            agent_id: panel.agent_id.clone(),
+            account,
+        };
+        self.send_account_request(request, "Couldn't read the usage", cx);
+    }
+
+    fn remove_account(&mut self, account: AccountId, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let request = Request::RemoveAccount {
+            agent_id: panel.agent_id.clone(),
+            account,
+        };
+        self.send_account_request(request, "Couldn't remove the account", cx);
+    }
+
+    fn confirm_remove_account(
+        &mut self,
+        account: AccountId,
+        name: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let page = cx.weak_entity();
+        let request = ConfirmRequest::remove_account(&name, move |_, cx| {
+            page.update(cx, |page, cx| page.remove_account(account, cx))
+                .log_err();
+        });
+        cx.emit(SettingsPageEvent::Confirm(request));
+    }
+
+    /// Rename…: the card's name becomes a field, with the name it shows.
+    fn start_account_rename(
+        &mut self,
+        account: Option<AccountId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let accounts = panel
+            .external
+            .connection
+            .read(cx)
+            .client()
+            .read(cx)
+            .accounts(&panel.agent_id);
+        let name = accounts.name(account).unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("Name", cx);
+            input.set_text(name, cx);
+            input.select_all_text(cx);
+            input
+        });
+        if let Some(panel) = self.agent_panel_mut() {
+            panel.renaming = Some(AccountRename {
+                account,
+                input,
+                _blur: None,
+            });
+        }
+        cx.notify();
+        // The menu takes focus two frames after it opens, and gives it back as it closes: the
+        // field takes it after both.
+        let page = cx.weak_entity();
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| {
+                    page.update(cx, |page, cx| page.focus_account_rename(window, cx))
+                        .log_err();
+                });
+            });
+        });
+    }
+
+    fn focus_account_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self
+            .agent_panel_mut()
+            .and_then(|panel| panel.renaming.as_mut())
+        else {
+            return;
+        };
+        let focus_handle = rename.input.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        rename._blur = Some(cx.on_blur(&focus_handle, window, |this, _, cx| {
+            this.finish_account_rename(true, cx)
+        }));
+    }
+
+    /// Enter or clicking elsewhere keeps the name; Escape doesn't. An empty name shows the
+    /// email again.
+    fn finish_account_rename(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(rename) = self
+            .agent_panel_mut()
+            .and_then(|panel| panel.renaming.take())
+        else {
+            return;
+        };
+        cx.notify();
+        if !keep {
+            return;
+        }
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let accounts = panel
+            .external
+            .connection
+            .read(cx)
+            .client()
+            .read(cx)
+            .accounts(&panel.agent_id);
+        let name = rename.input.read(cx).text().trim().to_string();
+        if accounts.name(rename.account).unwrap_or_default() == name {
+            return;
+        }
+        let label = Some(name).filter(|name| !name.is_empty());
+        self.update_account(rename.account, AccountChange::Rename(label), cx);
+    }
+
     fn set_changing_account(&mut self, changing_account: bool, cx: &mut Context<Self>) {
-        if let Some(account) = self.agent_panel_mut() {
-            account.changing_account = changing_account;
+        if let Some(panel) = self.agent_panel_mut() {
+            panel.external.changing_account = changing_account;
         }
         cx.notify();
     }
@@ -2967,7 +3728,7 @@ impl SettingsPage {
         };
         let id = account.agent_id.clone();
         let tab = account.tab;
-        let name = account.connection.read(cx).agent_name().clone();
+        let name = account.external.connection.read(cx).agent_name().clone();
         self.open_agent(&id, &name, window, cx);
         self.select_agent_tab(tab, cx);
     }
@@ -2995,7 +3756,7 @@ impl SettingsPage {
             return;
         };
         let agent_id = panel.agent_id.clone();
-        let client = panel.connection.read(cx).client().clone();
+        let client = panel.external.connection.read(cx).client().clone();
         // While disconnected, the request fails and says so.
         let is_outdated = client.read(cx).connection().is_some()
             && !client.read(cx).has_capability(CAPABILITY_IMPORT_SESSIONS);
@@ -3052,6 +3813,7 @@ impl SettingsPage {
         panel.importing.extend(session_ids.iter().cloned());
         panel.import_error = None;
         let import = panel
+            .external
             .connection
             .read(cx)
             .client()
@@ -3089,7 +3851,7 @@ impl SettingsPage {
             return div().into_any_element();
         };
         let status_colors = cx.theme().status().clone();
-        let connection = panel.connection.read(cx);
+        let connection = panel.external.connection.read(cx);
         let agent_name = connection.agent_name().clone();
         let client = connection.client().clone();
         let machine = self.machines.read(cx).label(self.agents_machine, cx);
@@ -3489,27 +4251,40 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    /// Asks first, as t3code does: logging out affects every thread with the agent.
-    fn confirm_logout(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(account) = self.agent_panel() else {
+    /// Asks first, as t3code does: logging out affects every thread on the account. An agent
+    /// that can have more than one names the account (`account_name`).
+    fn confirm_logout(
+        &mut self,
+        account: Option<AccountId>,
+        account_name: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.agent_panel() else {
             return;
         };
-        let agent_name = account.connection.read(cx).agent_name().clone();
+        let agent_name = panel.external.connection.read(cx).agent_name().clone();
         let page = cx.weak_entity();
-        cx.emit(SettingsPageEvent::Confirm(ConfirmRequest::logout(
-            &agent_name,
-            move |_, cx| {
-                page.update(cx, |page, cx| {
-                    if let Some(account) = page.agent_panel_mut() {
-                        account.changing_account = false;
-                        account
-                            .connection
-                            .update(cx, |connection, cx| connection.logout(cx));
-                    }
-                })
-                .log_err();
-            },
-        )));
+        let log_out = move |_: &mut Window, cx: &mut App| {
+            page.update(cx, |page, cx| {
+                if let Some(session) = page
+                    .agent_panel_mut()
+                    .and_then(|panel| panel.session_mut(account))
+                {
+                    session.changing_account = false;
+                    session
+                        .connection
+                        .update(cx, |connection, cx| connection.logout(cx));
+                }
+            })
+            .log_err();
+        };
+        let request = match account_name {
+            Some(name) => {
+                ConfirmRequest::account_logout(&name, &agent_name, account.is_none(), log_out)
+            }
+            None => ConfirmRequest::logout(&agent_name, log_out),
+        };
+        cx.emit(SettingsPageEvent::Confirm(request));
     }
 
     fn confirm_uninstall(
@@ -4237,14 +5012,16 @@ impl AccountState {
 struct AgentPanel {
     agent_id: AgentId,
     tab: AgentTab,
-    /// A session-less connection to the agent, alive only while the panel is open.
-    connection: Entity<AgentThread>,
-    login: Entity<AgentLogin>,
-    elicitation_cards: Vec<Entity<ElicitationCard>>,
-    /// The user asked to log in to another account while logged in.
-    changing_account: bool,
-    /// Whether the connection was logging in when last seen, to notice when it's done.
-    was_authenticating: bool,
+    /// The External account's: the agent in its own home. The other tabs use it.
+    external: AccountSession,
+    /// agentZ's accounts', opened as they're listed.
+    accounts: BTreeMap<AccountId, AccountSession>,
+    /// The account whose name is being edited on its card.
+    renaming: Option<AccountRename>,
+    /// Add Account's request, while it's on its way.
+    adding_account: Option<Task<()>>,
+    /// Why the last change to the accounts failed.
+    account_error: Option<SharedString>,
     env_rows: Vec<EnvRow>,
     /// Listed when the Threads tab first opens; `None` before.
     sessions: Option<SessionList>,
@@ -4254,7 +5031,92 @@ struct AgentPanel {
     /// Sessions whose import hasn't been answered yet.
     importing: HashSet<String>,
     import_error: Option<SharedString>,
-    _subscriptions: [Subscription; 1],
+    _subscriptions: Vec<Subscription>,
+}
+
+impl AgentPanel {
+    /// The account's login session, `None` being the External account.
+    fn session(&self, account: Option<AccountId>) -> Option<&AccountSession> {
+        match account {
+            None => Some(&self.external),
+            Some(id) => self.accounts.get(&id),
+        }
+    }
+
+    fn session_mut(&mut self, account: Option<AccountId>) -> Option<&mut AccountSession> {
+        match account {
+            None => Some(&mut self.external),
+            Some(id) => self.accounts.get_mut(&id),
+        }
+    }
+
+    /// For the badge beside the agent's name: logged in while any account it lists is, else
+    /// the furthest along of them. Without agentZ accounts, the External account's.
+    fn agent_state(&self, cx: &App) -> AccountState {
+        let external = AccountState::of(self.external.connection.read(cx));
+        if self.accounts.is_empty() {
+            return external;
+        }
+        let accounts = self
+            .external
+            .connection
+            .read(cx)
+            .client()
+            .read(cx)
+            .accounts(&self.agent_id);
+        let states: Vec<AccountState> = accounts
+            .listed()
+            .into_iter()
+            .filter_map(|account| self.session(account))
+            .map(|session| AccountState::of(session.connection.read(cx)))
+            .collect();
+        [
+            AccountState::LoggedIn,
+            AccountState::LoggingIn,
+            AccountState::Connecting,
+            AccountState::Failed,
+        ]
+        .into_iter()
+        .find(|state| states.contains(state))
+        .unwrap_or(AccountState::LoggedOut)
+    }
+}
+
+/// An account's connection to the agent, without a session, in the account's home: whether
+/// it's logged in, and its login rows. Alive only while the agent's page is open.
+struct AccountSession {
+    connection: Entity<AgentThread>,
+    login: Entity<AgentLogin>,
+    elicitation_cards: Vec<Entity<ElicitationCard>>,
+    /// The user asked to log in to another account while logged in (Change Account, for an
+    /// agent that can't have more accounts).
+    changing_account: bool,
+    /// Whether the connection was logging in when last seen, to notice when it's done.
+    was_authenticating: bool,
+    _subscription: Subscription,
+}
+
+/// Rename, edited in place on the account's card.
+struct AccountRename {
+    account: Option<AccountId>,
+    input: Entity<TextInput>,
+    /// Clicking elsewhere keeps the name, once the field has focus.
+    _blur: Option<Subscription>,
+}
+
+/// What an account's ⋯ menu offers.
+struct AccountMenu {
+    account: Option<AccountId>,
+    /// For the confirms.
+    name: SharedString,
+    can_make_default: bool,
+    color: Option<String>,
+    can_refresh: bool,
+    read_at: Option<SystemTime>,
+    usage_page: Option<String>,
+    /// Show in Finder's, on this Mac.
+    folder: Option<PathBuf>,
+    can_log_out: bool,
 }
 
 struct EnvRow {
@@ -4419,6 +5281,255 @@ fn account_details(status: &AuthStatus) -> Vec<String> {
     .flatten()
     .filter(|detail| !detail.trim().is_empty())
     .collect()
+}
+
+/// An account card's line under its name: the email when Rename gave it another name, and the
+/// plan, from the last read or else from what the agent reported.
+fn account_card_details(
+    choices: &AccountChoices,
+    email: Option<&str>,
+    status: Option<&AccountStatus>,
+    auth_status: Option<&AuthStatus>,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    if choices.label.is_some() {
+        details.extend(email.map(str::to_string));
+    }
+    match status {
+        Some(status) => details.extend(status.plan.clone()),
+        None => details.extend(auth_status.map(account_details).unwrap_or_default()),
+    }
+    details.retain(|detail| !detail.trim().is_empty());
+    details
+}
+
+/// A small tag beside an account's name: "Outside agentZ", "Default".
+fn account_tag(label: &'static str, color: Color, cx: &App) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_1p5()
+        .rounded(px(4.))
+        .bg(cx.theme().colors().element_hover)
+        .child(Label::new(label).size(LabelSize::XSmall).color(color))
+}
+
+/// A menu item's handler that acts on the settings page.
+fn on_page(
+    page: &WeakEntity<SettingsPage>,
+    action: impl Fn(&mut SettingsPage, &mut Window, &mut Context<SettingsPage>) + 'static,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    let page = page.clone();
+    move |window, cx| {
+        page.update(cx, |page, cx| action(page, window, cx))
+            .log_err();
+    }
+}
+
+/// An account's ⋯ menu, with the sidebar's muted icons.
+fn render_account_menu(
+    selector: &str,
+    menu: AccountMenu,
+    cx: &mut Context<SettingsPage>,
+) -> AnyElement {
+    let page = cx.weak_entity();
+    let menu = Rc::new(menu);
+    let debug_selector = format!("account-menu-{selector}");
+    div()
+        .debug_selector(move || debug_selector)
+        .child(
+            PopoverMenu::new(SharedString::from(format!("account-menu-{selector}")))
+                .menu(move |window, cx| {
+                    let page = page.clone();
+                    let menu = menu.clone();
+                    Some(ContextMenu::build(
+                        window,
+                        cx,
+                        move |context_menu, _, cx| {
+                            build_account_menu(context_menu, &menu, &page, cx)
+                        },
+                    ))
+                })
+                .trigger_with_tooltip(
+                    IconButton::new(
+                        SharedString::from(format!("account-menu-trigger-{selector}")),
+                        IconName::Ellipsis,
+                    )
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted),
+                    Tooltip::text("More"),
+                )
+                .anchor(gpui::Anchor::TopRight)
+                .offset(gpui::point(px(0.), px(4.))),
+        )
+        .into_any_element()
+}
+
+fn build_account_menu(
+    mut context_menu: ContextMenu,
+    menu: &AccountMenu,
+    page: &WeakEntity<SettingsPage>,
+    cx: &App,
+) -> ContextMenu {
+    let account = menu.account;
+    context_menu = context_menu.item(
+        ContextMenuEntry::new("Rename…")
+            .icon(IconName::Pencil)
+            .icon_color(Color::Muted)
+            .handler(on_page(page, move |page, window, cx| {
+                page.start_account_rename(account, window, cx)
+            })),
+    );
+    if menu.can_make_default {
+        context_menu = context_menu.item(
+            ContextMenuEntry::new("Use for New Threads")
+                .icon(IconName::Star)
+                .icon_color(Color::Muted)
+                .handler(on_page(page, move |page, _, cx| {
+                    page.update_account(account, AccountChange::MakeDefault, cx)
+                })),
+        );
+    }
+    let swatch = menu
+        .color
+        .as_deref()
+        .and_then(|hex| account_color(hex, cx))
+        .map_or(Color::Muted, Color::Custom);
+    let color = menu.color.clone();
+    let color_page = page.clone();
+    context_menu = context_menu.submenu_with_colored_icon(
+        "Color",
+        IconName::Circle,
+        swatch,
+        move |submenu, _, _| {
+            build_account_color_menu(submenu, account, color.as_deref(), &color_page)
+        },
+    );
+    if menu.can_refresh {
+        let read = menu.read_at.map(|read_at| {
+            match format_relative_time(read_at, SystemTime::now()).as_str() {
+                "now" => "read just now".to_string(),
+                ago => format!("read {ago} ago"),
+            }
+        });
+        context_menu =
+            context_menu.custom_entry(
+                move |_, _| {
+                    h_flex()
+                        .debug_selector(|| "account-menu-refresh".into())
+                        .w_full()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::RotateCw)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new("Refresh Usage"))
+                        .child(div().flex_1().min_w(px(16.)))
+                        .children(read.clone().map(|read| {
+                            Label::new(read).size(LabelSize::Small).color(Color::Muted)
+                        }))
+                        .into_any_element()
+                },
+                on_page(page, move |page, _, cx| page.refresh_usage(account, cx)),
+            );
+    }
+    if let Some(url) = menu.usage_page.clone() {
+        context_menu = context_menu.item(
+            ContextMenuEntry::new("Open Usage Page")
+                .icon(IconName::ArrowUpRight)
+                .icon_color(Color::Muted)
+                .handler(move |_, cx| cx.open_url(&url)),
+        );
+    }
+    if let Some(folder) = menu.folder.clone() {
+        context_menu = context_menu.item(
+            ContextMenuEntry::new("Show in Finder")
+                .icon(IconName::Folder)
+                .icon_color(Color::Muted)
+                .handler(move |_, cx| cx.reveal_path(&folder)),
+        );
+    }
+    if menu.can_log_out || account.is_some() {
+        context_menu = context_menu.separator();
+    }
+    if menu.can_log_out {
+        let name = menu.name.clone();
+        context_menu = context_menu.item(
+            ContextMenuEntry::new("Log Out")
+                .icon(IconName::Exit)
+                .icon_color(Color::Muted)
+                .handler(on_page(page, move |page, _, cx| {
+                    page.confirm_logout(account, Some(name.clone()), cx)
+                })),
+        );
+    }
+    // The External account is the agent's own login, which agentZ never removes.
+    if let Some(id) = account {
+        let name = menu.name.clone();
+        context_menu = context_menu.item(
+            ContextMenuEntry::new("Remove Account…")
+                .icon(IconName::Trash)
+                .icon_color(Color::Muted)
+                .handler(on_page(page, move |page, _, cx| {
+                    page.confirm_remove_account(id, name.clone(), cx)
+                })),
+        );
+    }
+    context_menu
+}
+
+/// The account's color (§13), as t3code's accent colors: a swatch each, then No Color.
+fn build_account_color_menu(
+    mut submenu: ContextMenu,
+    account: Option<AccountId>,
+    current: Option<&str>,
+    page: &WeakEntity<SettingsPage>,
+) -> ContextMenu {
+    for (name, shade, _) in ACCOUNT_COLORS {
+        let hex = color_hex(shade);
+        let is_current = current.is_some_and(|current| current.eq_ignore_ascii_case(&hex));
+        let swatch = hex.clone();
+        submenu = submenu.custom_entry(
+            move |_, cx| render_color_entry(name, account_color(&swatch, cx), is_current, cx),
+            on_page(page, move |page, _, cx| {
+                page.update_account(account, AccountChange::SetColor(Some(hex.clone())), cx)
+            }),
+        );
+    }
+    let has_none = current.is_none();
+    submenu.separator().custom_entry(
+        move |_, cx| render_color_entry("No Color", None, has_none, cx),
+        on_page(page, move |page, _, cx| {
+            page.update_account(account, AccountChange::SetColor(None), cx)
+        }),
+    )
+}
+
+fn render_color_entry(
+    name: &'static str,
+    swatch: Option<gpui::Hsla>,
+    is_current: bool,
+    cx: &App,
+) -> AnyElement {
+    let dot = div().size(px(10.)).m(px(2.)).flex_none().rounded_full();
+    let dot = match swatch {
+        Some(color) => dot.bg(color),
+        None => dot.border_1().border_color(cx.theme().colors().border),
+    };
+    h_flex()
+        .w_full()
+        .gap_1p5()
+        .child(dot)
+        .child(Label::new(name))
+        .child(div().flex_1().min_w(px(16.)))
+        .when(is_current, |row| {
+            row.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        })
+        .into_any_element()
 }
 
 /// A version as t3code shows it: a bare number gets a "v", anything else (a custom agent's
@@ -4804,10 +5915,14 @@ impl Render for SettingsPage {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::time::Duration;
 
-    use agentz_protocol::agents::{RegistryAgentMetadata, RegistrySnapshot};
+    use agentz_protocol::accounts::{Account, LimitWindow, StatusRead};
+    use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::spaces::SpacesSnapshot;
+    use agentz_protocol::thread::{ThreadState, ThreadView};
+    use agentz_protocol::{ConnectionId, Response};
     use gpui::TestAppContext;
     use projects::ImportedSession;
 
@@ -4829,6 +5944,7 @@ mod tests {
             supports_current_platform: true,
             install_state,
             custom_command: None,
+            accounts: None,
         }
     }
 
@@ -5393,6 +6509,308 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("agent-session-s-00").is_none());
+    }
+
+    fn limit(label: &str, used_percent: f64, resets_in: Duration, length: Duration) -> LimitWindow {
+        LimitWindow {
+            label: label.into(),
+            used_percent,
+            resets_at: Some(SystemTime::now() + resets_in),
+            length: Some(length),
+        }
+    }
+
+    fn account(id: u64, label: Option<&str>, status: Option<AccountStatus>) -> Account {
+        Account {
+            id: AccountId(id),
+            choices: AccountChoices {
+                label: label.map(str::to_string),
+                ..AccountChoices::default()
+            },
+            settings: AgentSettings::default(),
+            logged_in: Some(status.is_some()),
+            logs_in_with_key: false,
+            status: status.map(|status| StatusRead {
+                status,
+                read_at: SystemTime::now() - Duration::from_secs(180),
+            }),
+        }
+    }
+
+    /// A login session as the server sends it: logged in, or offering its login.
+    fn login_session(logged_in: bool) -> ThreadView {
+        ThreadView {
+            state: ThreadState {
+                status: if logged_in {
+                    ConnectionStatus::Ready
+                } else {
+                    ConnectionStatus::AuthRequired
+                },
+                logged_in: Some(logged_in),
+                auth_methods: if logged_in {
+                    Vec::new()
+                } else {
+                    vec![acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
+                        "login", "Log In",
+                    ))]
+                },
+                ..ThreadState::default()
+            },
+            entries: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn an_agents_accounts_are_cards_with_their_limits(cx: &mut TestAppContext) {
+        let hour = Duration::from_secs(3600);
+        let mock = AgentId::new("mock");
+        let mut mock_listing = listing(
+            "mock",
+            "Mock",
+            InstallState::Installed {
+                version: "2.0.0".into(),
+                update_available: false,
+            },
+        );
+        mock_listing.accounts = Some(AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            reads_usage: true,
+            usage_page: Some("https://example.com/usage".into()),
+        });
+        let work = AccountStatus {
+            email: Some("alex@acme.co".into()),
+            plan: Some("Team".into()),
+            windows: vec![
+                limit("5-hour", 100., 2 * hour, 5 * hour),
+                limit("Weekly", 56., 72 * hour, 168 * hour),
+            ],
+            ..AccountStatus::default()
+        };
+        let mut accounts = AgentAccounts {
+            accounts: vec![account(1, Some("Work"), Some(work)), account(2, None, None)],
+            default_account: Some(AccountId(1)),
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    email: Some("alex@hey.com".into()),
+                    plan: Some("Max 5x".into()),
+                    windows: vec![limit("5-hour", 38., 2 * hour, 5 * hour)],
+                    ..AccountStatus::default()
+                },
+                read_at: SystemTime::now(),
+            }),
+            last_id: 2,
+            ..AgentAccounts::default()
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            let requests = requests.clone();
+            let accounts = accounts.clone();
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    match request {
+                        // The External account's session is 100, the others' their account's.
+                        Request::OpenLoginSession { account, .. } => {
+                            Some(Response::LoginSessionOpened(account.map_or(100, |id| id.0)))
+                        }
+                        Request::SubscribeThread(ConnectionId::LoginSession(id)) => {
+                            Some(Response::Thread(login_session(*id == 100 || *id == 1)))
+                        }
+                        Request::AddAccount(_) => Some(Response::AccountAdded(AccountId(3))),
+                        Request::RemoveAccount { .. }
+                        | Request::UpdateAccount { .. }
+                        | Request::RefreshUsage { .. } => Some(Response::Ok),
+                        _ => None,
+                    }
+                });
+                client.set_accounts_for_test([(AgentId::new("mock"), accounts)].into(), cx);
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
+        cx.update(|_, cx| {
+            let confirms = confirms.clone();
+            cx.subscribe(&page, move |_, event: &SettingsPageEvent, _| {
+                if let SettingsPageEvent::Confirm(request) = event {
+                    confirms.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+        });
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("agent-row-mock")
+            .expect("the agent is listed");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let sent = |request: &Request| requests.borrow().contains(request);
+
+        // The External account first, then agentZ's in the order they were added; the one new
+        // threads take is tagged.
+        let external = cx
+            .debug_bounds("account-card-external")
+            .expect("the External account is listed");
+        let work = cx
+            .debug_bounds("account-card-1")
+            .expect("an agentZ account is listed");
+        let new = cx
+            .debug_bounds("account-card-2")
+            .expect("a new account is listed");
+        assert!(external.top() < work.top() && work.top() < new.top());
+        assert!(cx.debug_bounds("account-card").is_none());
+        assert!(cx.debug_bounds("account-tag-outside").is_some());
+        assert!(cx.debug_bounds("account-tag-default-1").is_some());
+        assert!(cx.debug_bounds("account-tag-default-external").is_none());
+
+        // A row per window, with a line where even spending would be: 2 hours of 5 are left.
+        assert!(cx.debug_bounds("limit-1-window-0").is_some());
+        assert!(cx.debug_bounds("limit-1-window-1").is_some());
+        assert!(cx.debug_bounds("limit-external-window-1").is_none());
+        let bar = cx
+            .debug_bounds("limit-external-bar-0")
+            .expect("the window has a bar");
+        let hairline = cx
+            .debug_bounds("limit-external-hairline-0")
+            .expect("the bar has its line");
+        let share = f32::from(hairline.left() - bar.left()) / f32::from(bar.size.width);
+        assert!((share - 0.4).abs() < 0.02, "the line is at {share}");
+
+        // An account that hasn't logged in yet is the New account card, which Cancel removes
+        // without asking.
+        assert!(cx.debug_bounds("account-menu-1").is_some());
+        assert!(cx.debug_bounds("account-menu-2").is_none());
+        assert!(cx.debug_bounds("limit-2-window-0").is_none());
+        let cancel = cx
+            .debug_bounds("account-cancel-2")
+            .expect("a new account can be cancelled");
+        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(sent(&Request::RemoveAccount {
+            agent_id: mock.clone(),
+            account: AccountId(2),
+        }));
+        assert!(confirms.borrow().is_empty());
+
+        // Add Account asks the server, and the account it adds gets a login session and a card.
+        let add = cx
+            .debug_bounds("account-add")
+            .expect("accounts can be added");
+        cx.simulate_click(add.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(sent(&Request::AddAccount(mock.clone())));
+        accounts
+            .accounts
+            .retain(|account| account.id != AccountId(2));
+        accounts.accounts.push(account(3, None, None));
+        accounts.last_id = 3;
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("account-card-2").is_none());
+        assert!(cx.debug_bounds("account-cancel-3").is_some());
+        assert!(sent(&Request::OpenLoginSession {
+            agent_id: mock.clone(),
+            account: Some(AccountId(3)),
+        }));
+
+        // The ⋯ menu refreshes the usage.
+        let menu = cx
+            .debug_bounds("account-menu-1")
+            .expect("the account has a menu");
+        cx.simulate_click(menu.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let refresh = cx
+            .debug_bounds("account-menu-refresh")
+            .expect("the menu has Refresh Usage");
+        cx.simulate_click(refresh.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(sent(&Request::RefreshUsage {
+            agent_id: mock.clone(),
+            account: Some(AccountId(1)),
+        }));
+        assert!(cx.debug_bounds("account-menu-refresh").is_none());
+
+        // Rename edits the name in place: Enter keeps it, Escape doesn't.
+        let rename = |cx: &mut gpui::VisualTestContext| {
+            page.update_in(cx, |page, window, cx| {
+                page.start_account_rename(Some(AccountId(1)), window, cx);
+                page.focus_account_rename(window, cx);
+            });
+            cx.run_until_parked();
+        };
+        rename(cx);
+        page.read_with(cx, |page, cx| {
+            let rename = page
+                .agent_panel()
+                .and_then(|panel| panel.renaming.as_ref())
+                .expect("the name is being edited");
+            assert_eq!(rename.input.read(cx).text().as_ref(), "Work");
+        });
+        cx.simulate_input("Job");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(sent(&Request::UpdateAccount {
+            agent_id: mock.clone(),
+            account: Some(AccountId(1)),
+            change: AccountChange::Rename(Some("Job".into())),
+        }));
+        assert!(page.read_with(cx, |page, _| {
+            page.agent_panel()
+                .is_some_and(|panel| panel.renaming.is_none())
+        }));
+        requests.borrow_mut().clear();
+        rename(cx);
+        cx.simulate_input("Side");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            !requests
+                .borrow()
+                .iter()
+                .any(|request| matches!(request, Request::UpdateAccount { .. }))
+        );
+        assert!(page.read_with(cx, |page, _| {
+            page.agent_panel()
+                .is_some_and(|panel| panel.renaming.is_none())
+        }));
+
+        // Removing an account asks first.
+        page.update(cx, |page, cx| {
+            page.confirm_remove_account(AccountId(1), "Work".into(), cx)
+        });
+        let confirm = confirms.borrow_mut().pop().expect("removing asks first");
+        assert_eq!(confirm.title.as_ref(), "Remove Work?");
+        cx.update(|window, cx| (confirm.on_confirm)(window, cx));
+        cx.run_until_parked();
+        assert!(sent(&Request::RemoveAccount {
+            agent_id: mock,
+            account: AccountId(1),
+        }));
     }
 
     #[test]

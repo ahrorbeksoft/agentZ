@@ -309,6 +309,7 @@ fn mock_accounts() -> crate::AgentDescription {
             variable: "MOCK_API_KEY".into(),
             reader: None,
         }),
+        usage_page: None,
     }
 }
 

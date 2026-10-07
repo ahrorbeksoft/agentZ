@@ -266,9 +266,10 @@ pub(crate) fn icon_tile(icon: Icon, size: Pixels, cx: &App) -> gpui::Div {
         ))))
 }
 
-/// A round avatar with the account's initial, as t3code shows an account.
-pub(crate) fn avatar(name: &str, cx: &App) -> AnyElement {
-    let accent = cx.theme().colors().text_accent;
+/// A round avatar with the account's initial, as t3code shows an account, in the account's
+/// color or else the theme's accent.
+pub(crate) fn avatar(name: &str, color: Option<Hsla>, cx: &App) -> AnyElement {
+    let accent = color.unwrap_or(cx.theme().colors().text_accent);
     let initial: SharedString = name
         .chars()
         .find(|character| character.is_alphanumeric())
@@ -292,6 +293,37 @@ pub(crate) fn avatar(name: &str, cx: &App) -> AnyElement {
         .text_color(on_fill_color(cx))
         .child(initial)
         .into_any_element()
+}
+
+/// The colors an account can be given, from t3code's project colors: Tailwind's 600 shade,
+/// which an account keeps as `#rrggbb`, and the 400 shade dark themes show it in.
+pub(crate) const ACCOUNT_COLORS: [(&str, u32, u32); 8] = [
+    ("Red", 0xdc2626, 0xf87171),
+    ("Orange", 0xea580c, 0xfb923c),
+    ("Yellow", 0xca8a04, 0xfacc15),
+    ("Green", 0x16a34a, 0x4ade80),
+    ("Teal", 0x0d9488, 0x2dd4bf),
+    ("Blue", 0x2563eb, 0x60a5fa),
+    ("Purple", 0x9333ea, 0xc084fc),
+    ("Pink", 0xdb2777, 0xf472b6),
+];
+
+/// How an account's color is kept.
+pub(crate) fn color_hex(color: u32) -> String {
+    format!("#{color:06x}")
+}
+
+/// An account's color in the current theme: one of [`ACCOUNT_COLORS`] in the theme's shade,
+/// any other `#rrggbb` as it is.
+pub(crate) fn account_color(hex: &str, cx: &App) -> Option<Hsla> {
+    let is_light = cx.theme().appearance().is_light();
+    if let Some((_, light, dark)) = ACCOUNT_COLORS
+        .iter()
+        .find(|(_, light, _)| color_hex(*light).eq_ignore_ascii_case(hex))
+    {
+        return Some(gpui::rgb(if is_light { *light } else { *dark }).into());
+    }
+    gpui::Rgba::try_from(hex).ok().map(Hsla::from)
 }
 
 /// A round badge for an account the agent didn't name: a person with a check.

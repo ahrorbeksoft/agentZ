@@ -1,7 +1,8 @@
 //! An agent's accounts: its own login (the External account) and the logins made in agentZ,
 //! each in its own home folder, with its own sessions, history and settings.
 
-use std::time::SystemTime;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 pub use projects::AccountId;
@@ -76,6 +77,49 @@ pub struct LimitWindow {
     pub used_percent: f64,
     #[serde(default)]
     pub resets_at: Option<SystemTime>,
+    /// How long the window runs, which with its reset says how much of it has gone.
+    #[serde(default)]
+    pub length: Option<Duration>,
+}
+
+impl LimitWindow {
+    /// What's left, in whole percent: bars and labels show what remains, as Codex and t3code
+    /// do.
+    pub fn left_percent(&self) -> u8 {
+        (100. - self.used_percent.clamp(0., 100.)).round() as u8
+    }
+
+    /// The share of the window still to come at `now`, 0 to 1: where even spending would
+    /// leave what's left. `None` without its length or reset.
+    pub fn time_left(&self, now: SystemTime) -> Option<f64> {
+        let length = self.length.filter(|length| !length.is_zero())?;
+        let remaining = self
+            .resets_at?
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO);
+        Some((remaining.as_secs_f64() / length.as_secs_f64()).clamp(0., 1.))
+    }
+}
+
+/// What an agent that can have accounts offers for them, in its listing
+/// ([`crate::agents::AgentListing::accounts`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountSupport {
+    /// Where its agentZ accounts have their folders, each named by its id, on the server's
+    /// machine.
+    pub folder: PathBuf,
+    /// Whether agentZ can read its accounts' identity and limits.
+    pub reads_usage: bool,
+    /// The vendor's page for an account's usage or billing.
+    pub usage_page: Option<String>,
+}
+
+impl AccountSupport {
+    /// The account's folder.
+    pub fn home(&self, account: AccountId) -> PathBuf {
+        self.folder.join(account.to_string())
+    }
 }
 
 /// What the user chooses for any account, the External one included.
@@ -135,6 +179,33 @@ impl AgentAccounts {
     /// agent's login was shown before it had accounts.
     pub fn lists_external(&self) -> bool {
         self.external_logged_in != Some(false)
+    }
+
+    /// The accounts in the order they're listed: the External one (`None`) first while it's
+    /// listed, then agentZ's in the order they were added.
+    pub fn listed(&self) -> Vec<Option<AccountId>> {
+        self.lists_external()
+            .then_some(None)
+            .into_iter()
+            .chain(self.accounts.iter().map(|account| Some(account.id)))
+            .collect()
+    }
+
+    /// What the user chose for `account`, `None` being the External one.
+    pub fn choices(&self, account: Option<AccountId>) -> Option<&AccountChoices> {
+        match account {
+            None => Some(&self.external),
+            Some(id) => self.account(id).map(|account| &account.choices),
+        }
+    }
+
+    /// Rename's name for the account, else the email or name its last read found.
+    pub fn name(&self, account: Option<AccountId>) -> Option<String> {
+        let label = self.choices(account)?.label.clone();
+        label.or_else(|| {
+            let status = &self.status(account)?.status;
+            status.email.clone().or_else(|| status.name.clone())
+        })
     }
 
     /// Use for New Threads' account, else the External account while it's listed, else the
@@ -342,6 +413,59 @@ mod tests {
                 .change(Some(AccountId(9)), AccountChange::MakeDefault)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn names_accounts_and_lists_the_external_one_first() {
+        let mut accounts = AgentAccounts::default();
+        let id = accounts.add();
+        assert_eq!(accounts.listed(), [None, Some(id)]);
+        assert_eq!(accounts.name(Some(id)), None);
+        let read = |email: &str| StatusRead {
+            status: AccountStatus {
+                email: Some(email.to_string()),
+                ..AccountStatus::default()
+            },
+            read_at: SystemTime::UNIX_EPOCH,
+        };
+        accounts.set_status(Some(id), read("work@example.com"));
+        assert_eq!(accounts.name(Some(id)).as_deref(), Some("work@example.com"));
+        accounts
+            .change(Some(id), AccountChange::Rename(Some("Work".into())))
+            .expect("rename");
+        assert_eq!(accounts.name(Some(id)).as_deref(), Some("Work"));
+        assert_eq!(accounts.name(Some(AccountId(9))), None);
+
+        accounts.set_logged_in(None, false);
+        assert_eq!(accounts.listed(), [Some(id)]);
+    }
+
+    #[test]
+    fn a_window_says_whats_left_of_it_and_of_its_time() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let window = LimitWindow {
+            label: "5-hour".into(),
+            used_percent: 37.6,
+            resets_at: Some(now + Duration::from_secs(2 * 3600)),
+            length: Some(Duration::from_secs(5 * 3600)),
+        };
+        assert_eq!(window.left_percent(), 62);
+        assert_eq!(window.time_left(now), Some(0.4));
+        // Past its reset, none of it is left.
+        assert_eq!(
+            window.time_left(now + Duration::from_secs(3 * 3600)),
+            Some(0.)
+        );
+        let without_length = LimitWindow {
+            length: None,
+            ..window.clone()
+        };
+        assert_eq!(without_length.time_left(now), None);
+        let overspent = LimitWindow {
+            used_percent: 112.,
+            ..window
+        };
+        assert_eq!(overspent.left_percent(), 0);
     }
 
     #[test]

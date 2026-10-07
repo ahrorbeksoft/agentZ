@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
+use agentz_protocol::accounts::AgentAccounts;
 use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
@@ -96,6 +97,8 @@ pub struct ServerClient {
     projects: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
     agent_settings: BTreeMap<AgentId, AgentSettings>,
+    /// Each agent's accounts, for those that have any of agentZ's or a read of the External one.
+    accounts: BTreeMap<AgentId, AgentAccounts>,
     /// The Workspaces view's spaces on this machine.
     spaces: SpacesSnapshot,
     /// Pane agents that finished working since this window last showed them (herdr's unseen
@@ -147,6 +150,7 @@ impl ServerClient {
                 projects,
                 registry,
                 agent_settings: BTreeMap::new(),
+                accounts: BTreeMap::new(),
                 spaces: SpacesSnapshot::default(),
                 unseen_panes: BTreeSet::new(),
                 machine_icon: MachineIcon::default(),
@@ -394,6 +398,27 @@ impl ServerClient {
         }
     }
 
+    /// The agent's accounts. An agent with none of agentZ's has only the External one.
+    pub fn accounts(&self, agent_id: &AgentId) -> AgentAccounts {
+        self.accounts.get(agent_id).cloned().unwrap_or_default()
+    }
+
+    fn set_accounts(&mut self, accounts: BTreeMap<AgentId, AgentAccounts>, cx: &mut Context<Self>) {
+        if accounts != self.accounts {
+            self.accounts = accounts;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_accounts_for_test(
+        &mut self,
+        accounts: BTreeMap<AgentId, AgentAccounts>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_accounts(accounts, cx);
+    }
+
     pub fn machine_icon(&self) -> &MachineIcon {
         &self.machine_icon
     }
@@ -609,6 +634,7 @@ impl ServerClient {
             .update(cx, |store, cx| store.set_snapshot(session.projects, cx));
         self.set_registry(session.registry, cx);
         self.set_agent_settings(session.agent_settings, cx);
+        self.set_accounts(session.accounts, cx);
         self.set_spaces(session.spaces, cx);
         self.set_machine_icon_state(session.machine_icon, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
@@ -631,6 +657,7 @@ impl ServerClient {
                 Event::Projects(_)
                     | Event::Registry(_)
                     | Event::AgentSettings(_)
+                    | Event::Accounts(_)
                     | Event::Spaces(_)
                     | Event::MachineIcon(_)
             )
@@ -644,8 +671,7 @@ impl ServerClient {
                 .update(cx, |store, cx| store.set_snapshot(projects, cx)),
             Event::Registry(registry) => self.set_registry(registry, cx),
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
-            // Nothing shows an agent's accounts yet.
-            Event::Accounts(_) => {}
+            Event::Accounts(accounts) => self.set_accounts(accounts, cx),
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::Thread { connection, update } => {

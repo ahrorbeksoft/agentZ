@@ -127,6 +127,7 @@ mod tests {
                     supports_current_platform: true,
                     install_state: InstallState::NotInstalled,
                     custom_command: None,
+                    accounts: None,
                 })
                 .collect(),
             ..Default::default()

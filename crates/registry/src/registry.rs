@@ -250,6 +250,7 @@ impl AgentRegistryStore {
                     supports_current_platform: agent.supports_current_platform(),
                     install_state: self.install_state(agent.id()),
                     custom_command: None,
+                    accounts: None,
                 })
                 .collect(),
             is_fetching: self.is_fetching,

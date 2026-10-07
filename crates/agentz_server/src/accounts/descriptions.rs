@@ -1,8 +1,9 @@
 //! What agentZ knows about each agent it can run on several accounts.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
+use agentz_protocol::accounts::AccountSupport;
 use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,8 @@ pub struct AgentDescription {
     pub reader: Option<Reader>,
     /// The agent's login method that takes a key from a variable, if it has one.
     pub key_login: Option<KeyLogin>,
+    /// The vendor's page for an account's usage or billing (Open Usage Page).
+    pub usage_page: Option<String>,
 }
 
 /// A login method that reads its key from the agent's environment rather than from
@@ -54,6 +57,19 @@ pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
 }
 
 impl AgentDescription {
+    /// What clients learn of it, with its accounts' folders in `folder`.
+    pub fn support(&self, folder: PathBuf) -> AccountSupport {
+        AccountSupport {
+            folder,
+            reads_usage: self.reader.is_some()
+                || self
+                    .key_login
+                    .as_ref()
+                    .is_some_and(|key_login| key_login.reader.is_some()),
+            usage_page: self.usage_page.clone(),
+        }
+    }
+
     /// Writes the files a new account's `home` starts with.
     pub fn start_home(&self, home: &Path) -> Result<()> {
         for (path, contents) in &self.home_files {
@@ -141,6 +157,7 @@ mod tests {
                 variable: "AGENT_API_KEY".into(),
                 reader: None,
             }),
+            usage_page: None,
         };
         let registry_command = AgentCommand {
             env: [

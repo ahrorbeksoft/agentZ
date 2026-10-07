@@ -162,8 +162,6 @@ impl Server {
                 account.logs_in_with_key = key.is_some();
             }
         });
-        // Its reader may be another now.
-        self.read_account_if_it_can(agent_id, account);
     }
 
     /// The agent and account a connection runs on.

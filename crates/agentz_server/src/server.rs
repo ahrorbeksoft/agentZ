@@ -1455,8 +1455,12 @@ impl Server {
                         update_available: false,
                     },
                     custom_command: Some(agent.command.clone()),
+                    accounts: None,
                 }
             }));
+        for listing in &mut snapshot.agents {
+            listing.accounts = self.account_support(&listing.metadata.id);
+        }
         snapshot
     }
 
@@ -1939,6 +1943,9 @@ impl Server {
         if let Some(agent_id) = &agent_id {
             if logged_in_here {
                 self.keep_key_of_login(connection, agent_id, account);
+                // The new login has its own identity and limits, and with a key, maybe its
+                // own reader.
+                self.read_account_if_it_can(agent_id, account);
             }
             self.thread_login_changed(
                 agent_id,
