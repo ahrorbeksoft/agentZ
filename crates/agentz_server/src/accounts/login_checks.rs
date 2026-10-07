@@ -34,9 +34,21 @@ pub struct StatusCommand {
     /// Whether `args` follow the agent's own arguments, as they must where the agent runs
     /// through Node, its script first (Claude's adapter, whose `--cli` runs Claude Code).
     pub after_agent_args: bool,
+    pub logged_in: LoggedIn,
+}
+
+/// How a status command's output says the agent is logged in.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoggedIn {
+    /// It exits with 0 only while logged in.
+    #[default]
+    ExitCode,
     /// A JSON pointer to where its output says `true` while it's logged in (`/loggedIn`).
-    /// Without one, it exits with 0 only while logged in.
-    pub logged_in: Option<String>,
+    Pointer(String),
+    /// Text its output starts with only while it's logged in, for a command that prints no
+    /// JSON and always exits with 0 (Devin's "Logged in").
+    Prefix(String),
 }
 
 impl StatusCommand {
@@ -52,14 +64,22 @@ impl StatusCommand {
     }
 
     fn logged_in(&self, output: &Output) -> Result<bool> {
-        let Some(pointer) = &self.logged_in else {
-            return Ok(output.status.success());
-        };
-        let json: serde_json::Value =
-            serde_json::from_slice(&output.stdout).context("its output isn't JSON")?;
-        match json.pointer(pointer) {
-            Some(serde_json::Value::Bool(logged_in)) => Ok(*logged_in),
-            found => bail!("its output has {found:?} at {pointer}"),
+        match &self.logged_in {
+            LoggedIn::ExitCode => Ok(output.status.success()),
+            LoggedIn::Pointer(pointer) => {
+                let json: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).context("its output isn't JSON")?;
+                match json.pointer(pointer) {
+                    Some(serde_json::Value::Bool(logged_in)) => Ok(*logged_in),
+                    found => bail!("its output has {found:?} at {pointer}"),
+                }
+            }
+            LoggedIn::Prefix(prefix) => {
+                anyhow::ensure!(output.status.success(), "it exited with {}", output.status);
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .trim_start()
+                    .starts_with(prefix.as_str()))
+            }
         }
     }
 }
@@ -111,7 +131,7 @@ mod tests {
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script.into()],
             after_agent_args: false,
-            logged_in: None,
+            logged_in: LoggedIn::ExitCode,
         }
     }
 
@@ -127,7 +147,7 @@ mod tests {
         assert!(!shell("exit 1").run(agent.clone()).await.expect("run"));
 
         let json = StatusCommand {
-            logged_in: Some("/account/loggedIn".into()),
+            logged_in: LoggedIn::Pointer("/account/loggedIn".into()),
             ..shell(
                 r#"echo "{\"account\": {\"loggedIn\": $([ "$ACCOUNT" = work ] && echo true || echo false)}}"; exit 1"#,
             )
@@ -140,15 +160,39 @@ mod tests {
         assert!(!json.run(elsewhere).await.expect("run"));
 
         let not_json = StatusCommand {
-            logged_in: Some("/loggedIn".into()),
+            logged_in: LoggedIn::Pointer("/loggedIn".into()),
             ..shell("echo Logged in")
         };
         assert!(not_json.run(agent.clone()).await.is_err());
         let missing = StatusCommand {
-            logged_in: Some("/loggedIn".into()),
+            logged_in: LoggedIn::Pointer("/loggedIn".into()),
             ..shell("echo '{}'")
         };
         assert!(missing.run(agent.clone()).await.is_err());
+
+        // Text, as Devin's `auth status` prints whether or not it's logged in.
+        let text = |script: &str| StatusCommand {
+            logged_in: LoggedIn::Prefix("Logged in".into()),
+            ..shell(script)
+        };
+        assert!(
+            text(r#"printf '\nLogged in (via Devin).\n\nUser\n'"#)
+                .run(agent.clone())
+                .await
+                .expect("run")
+        );
+        assert!(
+            !text("echo 'Not logged in.'")
+                .run(agent.clone())
+                .await
+                .expect("run")
+        );
+        assert!(
+            text("echo 'Logged in'; exit 2")
+                .run(agent.clone())
+                .await
+                .is_err()
+        );
 
         // After the agent's own arguments, as its script's.
         let script = AgentCommand {
@@ -164,7 +208,7 @@ mod tests {
             program: None,
             args: vec!["--cli".into(), "auth".into()],
             after_agent_args: true,
-            logged_in: None,
+            logged_in: LoggedIn::ExitCode,
         };
         assert!(after.run(script.clone()).await.expect("run"));
         let in_place = StatusCommand {
@@ -177,7 +221,7 @@ mod tests {
     #[test]
     fn descriptions_name_their_check() {
         let check: LoginCheck = serde_json::from_str(
-            r#"{"command": {"args": ["auth", "status", "--json"], "logged_in": "/loggedIn"}}"#,
+            r#"{"command": {"args": ["auth", "status", "--json"], "logged_in": {"pointer": "/loggedIn"}}}"#,
         )
         .expect("parse");
         let LoginCheck::Command(command) = check else {
@@ -185,6 +229,16 @@ mod tests {
         };
         assert_eq!(command.program, None);
         assert_eq!(command.args, ["auth", "status", "--json"]);
+        assert_eq!(command.logged_in, LoggedIn::Pointer("/loggedIn".into()));
+        let check: LoginCheck =
+            serde_json::from_str(r#"{"command": {"args": ["status"]}}"#).expect("parse");
+        assert_eq!(
+            check,
+            LoginCheck::Command(StatusCommand {
+                args: vec!["status".into()],
+                ..StatusCommand::default()
+            })
+        );
         let check: LoginCheck = serde_json::from_str(r#""session""#).expect("parse");
         assert_eq!(check, LoginCheck::Session);
     }

@@ -4,6 +4,7 @@
 mod claude;
 mod codex;
 mod descriptions;
+mod devin;
 mod droid;
 mod hidden_terminal;
 mod login_checks;
@@ -20,7 +21,7 @@ use util::ResultExt as _;
 use crate::agent_settings::{read_json, write_json};
 
 pub use descriptions::{AgentDescription, KeyLogin, built_in as built_in_description};
-pub use login_checks::{LoginCheck, StatusCommand};
+pub use login_checks::{LoggedIn, LoginCheck, StatusCommand};
 pub use readers::{Reader, ReaderCommand};
 
 /// Where an API-key account keeps its key, in its folder.

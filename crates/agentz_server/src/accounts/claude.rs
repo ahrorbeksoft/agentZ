@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use super::login_checks::{account_command, run_with_account_env};
 use super::readers::Read;
-use super::{AgentDescription, LoginCheck, Reader, StatusCommand};
+use super::{AgentDescription, LoggedIn, LoginCheck, Reader, StatusCommand};
 
 /// The adapter runs Claude Code itself with the arguments around this one, as its terminal
 /// logins do.
@@ -54,10 +54,12 @@ const WEEK_LENGTH: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub(super) fn description() -> AgentDescription {
     AgentDescription {
         home_variables: BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), String::new())]),
+        shared_folders: BTreeMap::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::new(),
         // The model, permissions, hooks and environment. The login is in the keychain.
         settings_files: vec!["settings.json".into()],
+        login_settings: BTreeMap::new(),
         normal_home: ".claude".into(),
         // Each overrides the stored login, as the adapter's own list of them says.
         login_variables: vec![
@@ -71,7 +73,7 @@ pub(super) fn description() -> AgentDescription {
             program: None,
             args: cli_args(&AUTH_STATUS),
             after_agent_args: true,
-            logged_in: Some("/loggedIn".into()),
+            logged_in: LoggedIn::Pointer("/loggedIn".into()),
         }),
         reader: Some(Reader::ClaudeCode),
         // Its logins are Claude's own: in a terminal, or a gateway.

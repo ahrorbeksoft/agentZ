@@ -301,10 +301,12 @@ fn agent_text(view: &ThreadView) -> String {
 fn mock_accounts() -> crate::AgentDescription {
     crate::AgentDescription {
         home_variables: BTreeMap::from([("MOCK_HOME".into(), String::new())]),
+        shared_folders: BTreeMap::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::from([(".mock/settings.json".into(), r#"{"sync": false}"#.into())]),
         // Tests that copy them name a normal home of their own, outside the user's.
         settings_files: Vec::new(),
+        login_settings: BTreeMap::new(),
         normal_home: String::new(),
         login_variables: vec!["MOCK_API_KEY".into()],
         login_check: crate::LoginCheck::Session,
@@ -2035,7 +2037,7 @@ async fn status_commands_check_logins_where_sessions_open_logged_out() {
             program: None,
             args: vec!["--status".into()],
             after_agent_args: true,
-            logged_in: Some("/logged_in".into()),
+            logged_in: crate::LoggedIn::Pointer("/logged_in".into()),
         }),
         ..mock_accounts()
     };

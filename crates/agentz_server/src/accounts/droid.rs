@@ -51,10 +51,12 @@ pub(super) const WINDOW_LENGTHS: [Duration; 3] = [
 pub(super) fn description() -> AgentDescription {
     AgentDescription {
         home_variables: BTreeMap::from([("FACTORY_HOME_OVERRIDE".into(), String::new())]),
+        shared_folders: BTreeMap::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::from([(".factory/settings.json".into(), HOME_SETTINGS.into())]),
         // Custom models and session defaults. The login is in other files.
         settings_files: vec![".factory/settings.json".into()],
+        login_settings: BTreeMap::new(),
         normal_home: String::new(),
         // A key in the environment overrides the stored login.
         login_variables: vec!["FACTORY_API_KEY".into()],

@@ -23,8 +23,8 @@ Notes for whoever continues:
   own, for every agent (items 22, 24, 25).
 - Login checks (item 5) are an empty session (`LoginCheck::Session`, Droid's) or the agent's
   status command (`LoginCheck::Command`). The other two in plan.md › Login checks come with
-  the agents that need them: an empty model list with Devin (17), a key agentZ holds with GLM
-  (wave 2). As the server starts, it checks only the External account, and only of
+  the agents that need them: an empty model list with Cortex Code (later; Devin's status
+  command was enough), a key agentZ holds with GLM (wave 2). As the server starts, it checks only the External account, and only of
   agents that have agentZ accounts: without any, nothing depends on it, and every agent would
   be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
@@ -59,6 +59,29 @@ Notes for whoever continues:
   20), other limits than `codex` (a model's own) and the `-c check_for_update_on_startup`
   switch plan.md names, which only the terminal UI needs. Logging a new account in wasn't
   tried: it needs the user's browser.
+- Item 17 (Devin, `accounts/devin.rs`): both home variables move, since `XDG_CONFIG_HOME`'s
+  `devin/config.json` holds the organization `/org` picked (`devin.org_id`), which belongs to
+  the login; "Copy settings from" leaves it out (`login_settings`). The tools Devin runs see
+  the same variables, so the account's `.config` and `.local/share` link every entry of the
+  user's own except `devin` (`shared_folders`, relinked each time the agent starts; links to
+  entries the user removed go). The login check is `auth status`, which always exits 0, so
+  it's read by how it starts ("Logged in", `LoggedIn::Prefix`); it reads only the stored
+  login, so a `WINDSURF_API_KEY` set on purpose in the Environment shows logged out. The
+  reader runs Devin's terminal UI (`devin` with `--respect-workspace-trust false`) in
+  `accounts/devin/reader/` with a config folder of its own there (first-run questions
+  answered, auto-update off), so it starts none of the user's MCP servers or hooks; its data
+  folder is the account's, for the login. It types `/usage`, presses Enter once the menu
+  offers it first, and quits with Ctrl+C twice. Until Devin has learned how the account is
+  billed (about 8 seconds after start in the real one), `/usage` answers "No credits or ACUs
+  consumed yet in this session." without the quota, so the reader asks again each second for
+  up to 30 seconds, then reads no windows (a login billed by credits or ACUs). Each run leaves
+  a session lock holding the ACP child's process id, which the reader removes once that
+  process is gone; nothing else is kept (no session, no prompt history), and Devin rotates
+  its own logs. Windows are Devin's: Daily and Weekly, with resets "in 16h 21m" or "Oct 11,
+  1:00 PM (UTC+5)". Checked against the real Devin 3000.11.3: logged out in empty folders,
+  and the user's own login (Pro) read both windows in about 11 seconds with no lock left. The
+  status line's "Pro · 100% remaining" isn't read. Logging a new account in wasn't tried: it
+  needs the user's browser.
 - Item 14: Settings › Usage lists the installed agents that read their accounts' limits
   (`reads_usage`), an agent with one account included, as the mock's Codex is; "across N
   accounts" shows only with more than one. Accounts found logged out are left out, as their
@@ -168,7 +191,7 @@ Notes for whoever continues:
 | 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | done |
 | 15 | | Wave 1: Claude | done |
 | 16 | | Wave 1: Codex | done |
-| 17 | | Wave 1: Devin | |
+| 17 | | Wave 1: Devin | done |
 | 18 | 11 | Stop or Continue at reset, per account | |
 | 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | |
 | 20 | 9 | Limit resets (Codex) | |

@@ -610,15 +610,28 @@ Each entry: what it does, where it lives, and where it comes from.
   the adapter's `cli` and asks it `account/read` (never refreshing the login) and
   `account/rateLimits/read`. Its windows are t3code's: the main limit's two, named Session,
   Weekly or Monthly by their length. An API key has none; the outputs it's tested on are in
-  `accounts/codex_reads/`. An
+  `accounts/codex_reads/`. Devin's description (`accounts/devin.rs`) moves its config with
+  `XDG_CONFIG_HOME` and its login and sessions with `XDG_DATA_HOME`. Other programs keep
+  their files in those folders too, and the tools Devin runs see the same variables, so the
+  account's `.config` and `.local/share` link every entry of the user's own except Devin's
+  (`AgentDescription::shared_folders`, relinked as the agent starts). Its login check is
+  `auth status`, by how its output starts (`LoggedIn::Prefix`), and its reader
+  (`Reader::DevinTerminal`) reads the name, email and plan from that, then runs `/usage` in
+  Devin's terminal UI in the hidden terminal, in `accounts/devin/reader/` with a config
+  folder of its own there (no MCP servers or hooks, the first-run questions answered). Until
+  Devin has learned how the account is billed, `/usage` answers without the quota, so the
+  reader asks again each second. Its windows are Devin's, Daily and Weekly, and it removes
+  the session lock Devin leaves; the screens it's tested on are in `accounts/devin_screens/`
+  and the outputs in `accounts/devin_reads/`. An
   agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
   so every account is a process of its own with its own login and sessions: its threads,
   login sessions (`OpenLoginSession`) and session listing and import (`ListAgentSessions`,
   `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
-  `accounts/droid.rs`, `accounts/claude.rs` and `accounts/codex.rs`; a custom agent's `accounts` in
-  `agents/custom.json`) can have more
-  accounts. It names the variables that move the agent's home there, the switches that keep
+  `accounts/droid.rs`, `accounts/claude.rs`, `accounts/codex.rs` and `accounts/devin.rs`; a
+  custom agent's `accounts` in `agents/custom.json`) can have more accounts. It names the
+  variables that move the agent's home there, the folders among those that hold other
+  programs' files too (linked from the user's), the switches that keep
   its login in a file rather than a shared keychain entry, the files a new account's folder
   starts with (`AgentDescription::start_home`, at `AddAccount`: Droid's
   `.factory/settings.json` with cloud session sync off), the variables that log it in, its
@@ -652,7 +665,8 @@ Each entry: what it does, where it lives, and where it comes from.
   `AddAccount`, the account for new threads'): its Environment without the login variables,
   its defaults, and the description's `settings_files` from its home (`normal_home` for the
   External account), with the keys of the files a home starts with kept
-  (`AgentDescription::copy_settings_files`), but never the login. Copied defaults wait for
+  (`AgentDescription::copy_settings_files`), but never the login, nor the settings that
+  belong to it (`login_settings`: Devin's organization). Copied defaults wait for
   the account's first session, which drops those it doesn't offer
   (`AgentSettings::{copy_settings, learn_offers}`).
 - **Logging out** (`confirm_dialog.rs`, t3code's dialogs): Log Out on the agent's page or in a

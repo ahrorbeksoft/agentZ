@@ -36,10 +36,12 @@ const MONTH_MINUTES: u64 = 30 * 24 * 60;
 pub(super) fn description() -> AgentDescription {
     AgentDescription {
         home_variables: BTreeMap::from([("CODEX_HOME".into(), String::new())]),
+        shared_folders: BTreeMap::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::new(),
         // The model, profiles, providers and MCP servers.
         settings_files: vec!["config.toml".into()],
+        login_settings: BTreeMap::new(),
         normal_home: ".codex".into(),
         // The adapter's API Key login reads them.
         login_variables: vec!["CODEX_API_KEY".into(), "OPENAI_API_KEY".into()],

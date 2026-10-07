@@ -1726,6 +1726,12 @@ impl Server {
                 Some((description, home)) => {
                     std::fs::create_dir_all(&home)
                         .with_context(|| format!("creating {}", home.display()))?;
+                    // Without them the agent still runs, but the tools it runs miss their
+                    // config.
+                    description
+                        .link_shared_folders(&home)
+                        .context("linking the user's folders into the account's home")
+                        .log_err();
                     let key = accounts::stored_key(&home)?;
                     description.apply(&mut command, env, &home, key);
                 }

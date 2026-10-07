@@ -1,0 +1,26 @@
+Logged in (via Devin).
+
+Credentials:
+  File:              /Users/me/.local/share/devin/credentials.toml
+  API server:        https://server.codeium.com
+  Devin webapp:      https://app.devin.ai
+  Devin API:         https://api.devin.ai
+
+User:
+  Name:              Example
+  Email:             work@example.com
+  User ID:           user-00000000000000000000000000000000
+
+Account:
+  Tier:              Devin Pro
+  Plan:              Pro
+  Team ID:           team-00000000000000000000000000000000
+  Team membership:   Approved
+  Enterprise:        no
+  Telemetry:         enabled
+
+Team settings:
+  Allowed models:    737 explicitly allowed
+  MCP servers:       allowed (no restrictions)
+  Sandbox:           optional
+  Fetched at:        2026-10-07 15:38:21 UTC
