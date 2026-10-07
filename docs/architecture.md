@@ -78,6 +78,9 @@ thread (`DrawableProvider`) and skips a present when none is ready, and `gpui_ma
 retries it on the next display tick (`present_skipped`). Zed waits in `nextDrawable` on the main
 thread; fullscreen, while a spinner or shimmer redraws every frame, that wait took most of each
 frame and made scrolling lag (zed-industries/zed#7940). Keep this when updating those crates.
+`gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
+on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,
+so an open tool call's output raced the conversation.
 
 | Crate | What it is |
 |---|---|

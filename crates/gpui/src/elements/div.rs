@@ -2431,6 +2431,34 @@ impl Interactivity {
             || window.is_inspector_picking(cx)
     }
 
+    fn scroll_max(&self, bounds: Bounds<Pixels>, style: &Style, window: &Window) -> Point<Pixels> {
+        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
+            const ROUNDING_FACTOR: f32 = 100.0;
+            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
+        }
+
+        let rem_size = window.rem_size();
+        // Taffy lays the box out with the padding snapped to the device pixel
+        // grid (`to_taffy`); recomputed unsnapped, e.g. py_1 at a fractional
+        // rem size, it exceeds `bounds` and leaves the box scrollable by the
+        // sub-pixel difference.
+        let padding = style
+            .padding
+            .to_pixels(bounds.size.into(), rem_size)
+            .map(|edge| window.pixel_snap(*edge));
+        let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+        // The floating point values produced by Taffy and ours often vary
+        // slightly after ~5 decimal places. This can lead to cases where after
+        // subtracting these, the container becomes scrollable for less than
+        // 0.00000x pixels. As we generally don't benefit from a precision that
+        // high for the maximum scroll, we round the scroll max to 2 decimal
+        // places here.
+        let padded_content_size = self.content_size + padding_size;
+        Point::from(padded_content_size - bounds.size)
+            .map(round_to_two_decimals)
+            .max(&Default::default())
+    }
+
     fn clamp_scroll_position(
         &self,
         bounds: Bounds<Pixels>,
@@ -2438,11 +2466,6 @@ impl Interactivity {
         window: &mut Window,
         _cx: &mut App,
     ) -> Point<Pixels> {
-        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
-            const ROUNDING_FACTOR: f32 = 100.0;
-            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
-        }
-
         if let Some(scroll_offset) = self.scroll_offset.as_ref() {
             let mut scroll_to_bottom = false;
             let mut tracked_scroll_handle = self
@@ -2454,26 +2477,7 @@ impl Interactivity {
                 scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
             }
 
-            let rem_size = window.rem_size();
-            // Taffy lays the box out with the padding snapped to the device pixel
-            // grid (`to_taffy`); recomputed unsnapped, e.g. py_1 at a fractional
-            // rem size, it exceeds `bounds` and leaves the box scrollable by the
-            // sub-pixel difference.
-            let padding = style
-                .padding
-                .to_pixels(bounds.size.into(), rem_size)
-                .map(|edge| window.pixel_snap(*edge));
-            let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
-            // The floating point values produced by Taffy and ours often vary
-            // slightly after ~5 decimal places. This can lead to cases where after
-            // subtracting these, the container becomes scrollable for less than
-            // 0.00000x pixels. As we generally don't benefit from a precision that
-            // high for the maximum scroll, we round the scroll max to 2 decimal
-            // places here.
-            let padded_content_size = self.content_size + padding_size;
-            let scroll_max = Point::from(padded_content_size - bounds.size)
-                .map(round_to_two_decimals)
-                .max(&Default::default());
+            let scroll_max = self.scroll_max(bounds, style, window);
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
@@ -2592,7 +2596,9 @@ impl Interactivity {
                                                 window,
                                                 cx,
                                             );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
+                                            self.paint_scroll_listener(
+                                                bounds, hitbox, &style, window, cx,
+                                            );
                                         }
 
                                         self.paint_keyboard_listeners(window, cx);
@@ -3323,6 +3329,7 @@ impl Interactivity {
 
     fn paint_scroll_listener(
         &self,
+        bounds: Bounds<Pixels>,
         hitbox: &Hitbox,
         style: &Style,
         window: &mut Window,
@@ -3336,6 +3343,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let scroll_max = self.scroll_max(bounds, style, window);
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3380,6 +3388,23 @@ impl Interactivity {
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
+                    }
+
+                    // Scrolling inside another scrolling element, this one takes the scroll
+                    // while it moves along the scroll's own axis, so both don't scroll at
+                    // once; at its end it passes the scroll on, as Zed's editor does. The
+                    // offset is clamped in prepaint, so it can be past the end here.
+                    let clamp = |offset: Point<Pixels>| {
+                        point(
+                            offset.x.clamp(-scroll_max.x, px(0.)),
+                            offset.y.clamp(-scroll_max.y, px(0.)),
+                        )
+                    };
+                    let (old, new) = (clamp(old_scroll_offset), clamp(*scroll_offset));
+                    let moved_along_y = !delta.y.is_zero() && delta_y == delta.y && new.y != old.y;
+                    let moved_along_x = !delta.x.is_zero() && delta_x == delta.x && new.x != old.x;
+                    if moved_along_y || moved_along_x {
+                        cx.stop_propagation();
                     }
                 }
             });
@@ -4443,7 +4468,8 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, Keystroke,
-        MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas, util::FluentBuilder as _,
+        MouseMoveEvent, ScrollDelta, TestAppContext, TouchEvent, TouchId, canvas,
+        util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -5597,6 +5623,84 @@ mod tests {
             .unwrap();
 
         assert_eq!(scroll_handle.max_offset().y, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_a_nested_scroller_takes_the_scroll_until_its_end(cx: &mut TestAppContext) {
+        struct Nested {
+            outer: ScrollHandle,
+            inner: ScrollHandle,
+        }
+
+        impl Render for Nested {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                // The inner box can scroll 30px, the outer one 170px.
+                div().size_full().child(
+                    div()
+                        .id("outer")
+                        .h(px(100.))
+                        .w(px(100.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.outer)
+                        .child(div().w_full().h(px(20.)))
+                        .child(
+                            div()
+                                .id("inner")
+                                .h(px(50.))
+                                .w_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.inner)
+                                .child(div().w_full().h(px(80.))),
+                        )
+                        .child(div().w_full().h(px(200.))),
+                )
+            }
+        }
+
+        let outer = ScrollHandle::new();
+        let inner = ScrollHandle::new();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (outer, inner) = (outer.clone(), inner.clone());
+                move |_, _| Nested { outer, inner }
+            })
+            .into();
+        let mut scroll = |position: Point<Pixels>, delta_y: f32| {
+            cx.update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(position, cx);
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(delta_y))),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+        let over_inner = point(px(50.), px(40.));
+
+        scroll(over_inner, -20.);
+        assert_eq!((outer.offset().y, inner.offset().y), (px(0.), px(-20.)));
+        // Only 10px are left in the inner box, and then it's at its end.
+        scroll(over_inner, -20.);
+        assert_eq!((outer.offset().y, inner.offset().y), (px(0.), px(-30.)));
+        scroll(over_inner, -20.);
+        assert_eq!((outer.offset().y, inner.offset().y), (px(-20.), px(-30.)));
+        // Back up, the inner box scrolls first again.
+        scroll(point(px(50.), px(30.)), 10.);
+        assert_eq!((outer.offset().y, inner.offset().y), (px(-20.), px(-20.)));
+        // Outside it, the outer box scrolls.
+        scroll(point(px(50.), px(90.)), -10.);
+        assert_eq!((outer.offset().y, inner.offset().y), (px(-30.), px(-20.)));
     }
 
     struct ContentSizedGrid;

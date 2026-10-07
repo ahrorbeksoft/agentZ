@@ -7459,6 +7459,65 @@ mod tests {
         assert!(top.item_ix > 0, "the scroll stopped at the top");
     }
 
+    /// An open tool call's output scrolls on its own: over it, the conversation stays put until
+    /// the output reaches its end.
+    #[gpui::test]
+    fn scrolling_over_a_tool_calls_output_scrolls_only_the_output(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let mut read = tool_call(acp::ToolCallStatus::Completed);
+        if let Entry::ToolCall(tool_call) = &mut read {
+            tool_call.kind = acp::ToolKind::Read;
+            tool_call.title = "Read /tmp/demo/total.ts".into();
+            tool_call.text = vec![
+                (1..=200)
+                    .map(|line| format!("const line{line} = {line};"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ];
+        }
+        let mut entries = vec![Entry::UserMessage("Read it".into())];
+        entries.extend((0..30).map(|index| Entry::AgentMessage(format!("Message {index}"))));
+        entries.push(read);
+        entries.push(Entry::AgentMessage("Done.".into()));
+        thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
+        cx.run_until_parked();
+        let row = cx.debug_bounds("tool-call-row-31").expect("the read's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let scroll = |name: &'static str, delta: f32, cx: &mut VisualTestContext| {
+            let bounds = cx.debug_bounds(name).expect(name);
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: bounds.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        };
+        let row_top = |cx: &mut VisualTestContext| {
+            f32::from(
+                cx.debug_bounds("tool-call-row-31")
+                    .expect("the read's row")
+                    .top(),
+            )
+        };
+        // Up from the end, so the conversation can scroll both ways.
+        scroll("conversation-row-33", 100., cx);
+        let top = row_top(cx);
+        scroll("tool-call-output-31", -40., cx);
+        assert_eq!(
+            row_top(cx),
+            top,
+            "the conversation scrolled with the output"
+        );
+        // Back at the output's top, the scroll goes on to the conversation.
+        scroll("tool-call-output-31", 40., cx);
+        assert_eq!(row_top(cx), top);
+        scroll("tool-call-output-31", 40., cx);
+        assert_eq!(row_top(cx), top + 40.);
+    }
+
     /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.
     #[gpui::test]
     fn thoughts_are_closed_unless_show_thinking_is_on(cx: &mut TestAppContext) {
