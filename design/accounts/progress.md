@@ -44,6 +44,21 @@ Notes for whoever continues:
   title-cased. Extra usage and the in-turn `_claude/rateLimit` updates aren't read. Logging
   a new account in (Claude's terminal login with `CLAUDE_CONFIG_DIR` set) wasn't tried: it
   needs the user's browser.
+- Item 16 (Codex, `accounts/codex.rs`): the adapter (codex-acp 2.1.1) runs Codex itself with
+  `cli`, so the reader is `cli app-server` after the adapter's script: `initialize`, then
+  `account/read` (`refreshToken: false`) and `account/rateLimits/read`, and it quits at the
+  end of its input (about 4.5 seconds through the adapter). The login check is a session:
+  the adapter fails `session/new` with "Authentication required" while Codex has no
+  account, as it did in a new home. Checked against the real Codex 0.160.0: a new home reads
+  logged out, and the user's own login (Free) read the captured fixture's one monthly
+  window. A new home's login is `auth.json` there; an API key login (tried with a fake key
+  in a temporary home) has no limits to read, and its read shows none. The API Key method
+  takes the key in `authenticate` and Codex keeps it, so Codex has no key login. Window
+  names and lengths are t3code's, as are the plans, without "ChatGPT … Subscription". Not
+  read: credits (none on the test account, and agentZ shows none yet), reset credits (item
+  20), other limits than `codex` (a model's own) and the `-c check_for_update_on_startup`
+  switch plan.md names, which only the terminal UI needs. Logging a new account in wasn't
+  tried: it needs the user's browser.
 - Item 14: Settings › Usage lists the installed agents that read their accounts' limits
   (`reads_usage`), an agent with one account included, as the mock's Codex is; "across N
   accounts" shows only with more than one. Accounts found logged out are left out, as their
@@ -152,7 +167,7 @@ Notes for whoever continues:
 | 13 | 14 | The limit notice over the composer (Continue on another account first) | done |
 | 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | done |
 | 15 | | Wave 1: Claude | done |
-| 16 | | Wave 1: Codex | |
+| 16 | | Wave 1: Codex | done |
 | 17 | | Wave 1: Devin | |
 | 18 | 11 | Stop or Continue at reset, per account | |
 | 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | |

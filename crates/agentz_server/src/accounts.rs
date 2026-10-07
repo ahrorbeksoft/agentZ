@@ -2,6 +2,7 @@
 //! in `accounts/<agent id>/<account id>/`.
 
 mod claude;
+mod codex;
 mod descriptions;
 mod droid;
 mod hidden_terminal;

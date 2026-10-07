@@ -1,0 +1,61 @@
+{
+  "ordinaryUsageAllowed": true,
+  "rateLimits": {
+    "limitId": "codex",
+    "limitName": null,
+    "normalModelSlug": null,
+    "primary": {
+      "usedPercent": 3,
+      "windowDurationMins": 43200,
+      "resetsAt": 1793476030
+    },
+    "secondary": null,
+    "credits": {
+      "hasCredits": false,
+      "unlimited": false,
+      "balance": null
+    },
+    "individualLimit": null,
+    "spendControlReached": false,
+    "planType": "free",
+    "rateLimitReachedType": null
+  },
+  "rateLimitsByLimitId": {
+    "codex": {
+      "limitId": "codex",
+      "limitName": null,
+      "normalModelSlug": null,
+      "primary": {
+        "usedPercent": 3,
+        "windowDurationMins": 43200,
+        "resetsAt": 1793476030
+      },
+      "secondary": null,
+      "credits": {
+        "hasCredits": false,
+        "unlimited": false,
+        "balance": null
+      },
+      "individualLimit": null,
+      "spendControlReached": false,
+      "planType": "free",
+      "rateLimitReachedType": null
+    }
+  },
+  "rateLimitResetCredits": {
+    "availableCount": 1,
+    "credits": [
+      {
+        "id": "RateLimitResetCredit_0",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1790701254,
+        "expiresAt": 1793293254,
+        "title": "Full reset (Monthly)",
+        "description": "Thanks for using Codex! You've been granted one free rate limit reset."
+      }
+    ]
+  },
+  "accountId": "00000000-0000-0000-0000-000000000000",
+  "rateLimitUpsell": null
+}

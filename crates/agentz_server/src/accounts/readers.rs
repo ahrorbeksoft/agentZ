@@ -33,6 +33,9 @@ pub enum Reader {
     /// Claude Code's `auth status` and its `get_usage` control request, through the adapter's
     /// `--cli` (plan.md, reader kinds 1 and 2).
     ClaudeCode,
+    /// Codex's `account/read` and `account/rateLimits/read`, from its app-server run through
+    /// the adapter's `cli` (plan.md, reader kind 2).
+    CodexAppServer,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -66,6 +69,7 @@ impl Reader {
         match self {
             Reader::DroidTerminal => super::droid::read(agent, folder).await,
             Reader::ClaudeCode => super::claude::read(agent, folder).await,
+            Reader::CodexAppServer => super::codex::read(agent, folder).await,
             Reader::Command(command) => {
                 let output =
                     run_with_account_env(command.program.as_deref(), &command.args, agent).await?;

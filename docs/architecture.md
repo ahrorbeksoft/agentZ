@@ -603,13 +603,20 @@ Each entry: what it does, where it lives, and where it comes from.
   capabilities probe) reads the email and plan from that, then sends Claude Code, started
   with no prompt, its `get_usage` control request, with no session kept, no MCP servers and
   the user's hooks off. Its windows are t3code's: Session, Weekly, and a week per model;
-  the outputs it's tested on are in `accounts/claude_reads/`. An
+  the outputs it's tested on are in `accounts/claude_reads/`. Codex's description
+  (`accounts/codex.rs`) moves its home, login (`auth.json`) included, with `CODEX_HOME`. Its
+  login check is a session, which the adapter opens only once Codex has an account, and its
+  reader (`Reader::CodexAppServer`, t3code's provider probe) runs Codex's app-server through
+  the adapter's `cli` and asks it `account/read` (never refreshing the login) and
+  `account/rateLimits/read`. Its windows are t3code's: the main limit's two, named Session,
+  Weekly or Monthly by their length. An API key has none; the outputs it's tested on are in
+  `accounts/codex_reads/`. An
   agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
   so every account is a process of its own with its own login and sessions: its threads,
   login sessions (`OpenLoginSession`) and session listing and import (`ListAgentSessions`,
   `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
-  `accounts/droid.rs` and `accounts/claude.rs`; a custom agent's `accounts` in
+  `accounts/droid.rs`, `accounts/claude.rs` and `accounts/codex.rs`; a custom agent's `accounts` in
   `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the switches that keep
   its login in a file rather than a shared keychain entry, the files a new account's folder
