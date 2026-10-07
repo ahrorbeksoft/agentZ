@@ -161,6 +161,10 @@ From Zed's guidelines, which this code follows:
 
 ## Pitfalls already hit
 
+- **A list keeps the heights it measured above the view.** It measures the rows above the view
+  ahead of time and keeps that height until a row is drawn, so a row whose height changes later
+  (its markdown parses in the background) must be remeasured (`ListState::remeasure_items`), or
+  the conversation jumps as it scrolls into view.
 - **Group hover:** an absolutely positioned child with `visible_on_hover` works, but test hover
   headlessly before blaming it.
 - **Scrollbars** (`vertical_scrollbar_for`) must be attached to a *non-scrolling* wrapper around

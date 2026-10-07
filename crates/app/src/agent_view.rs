@@ -233,6 +233,8 @@ pub struct AgentView {
     /// The entries' revisions the rows and markdowns were last synced with.
     synced_revisions: Vec<u64>,
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
+    /// Each markdown's row is measured again when it changes, as when it's parsed.
+    _markdown_subscriptions: Vec<Subscription>,
     /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
     /// Folded runs of work the user opened, by their first entry.
@@ -449,6 +451,7 @@ impl AgentView {
             },
             synced_revisions: Vec::new(),
             markdowns: HashMap::default(),
+            _markdown_subscriptions: Vec::new(),
             toggled_tool_calls: HashSet::default(),
             opened_runs: HashSet::default(),
             synced_working: false,
@@ -1155,6 +1158,14 @@ impl AgentView {
             }
             None => {
                 let markdown = cx.new(|cx| Markdown::new(text.to_string().into(), None, None, cx));
+                // Markdown parses in the background, so the list may measure the row before
+                // there's any text to show. A row measured above the view keeps that height
+                // until it's drawn, and the conversation jumps as it scrolls into view.
+                let row = key.0 + 1;
+                self._markdown_subscriptions
+                    .push(cx.observe(&markdown, move |this, _, _| {
+                        this.list_state.remeasure_items(row..row + 1);
+                    }));
                 self.markdowns.insert(key, markdown);
             }
         }
@@ -7392,6 +7403,60 @@ mod tests {
         assert!(cx.debug_bounds("tool-call-row-2").is_some());
         assert!(cx.debug_bounds("permission-buttons-2").is_some());
         assert!(cx.debug_bounds("thinking-row-3").is_none());
+    }
+
+    /// The rows above the view are measured before they're drawn, while their messages may
+    /// still be parsing; scrolling up to them must move the conversation by the scroll alone.
+    #[gpui::test]
+    fn scrolling_up_moves_the_rows_evenly(cx: &mut TestAppContext) {
+        const STEP: f32 = 12.;
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let messages = [
+            "Now the tests.",
+            "Now the requests that start an agent take the account, and the server keeps \
+             them apart across restarts and machines.",
+            "This failure is in a terminal test the change doesn't touch: the screen showed \
+             the echoed command before the pid was printed, so it's rerun to see whether it's \
+             flaky, and the rest of the suite runs once it passes.",
+        ];
+        let mut entries = vec![Entry::UserMessage("Go".into())];
+        let mut headers = Vec::new();
+        for run in 0..80 {
+            entries.push(Entry::AgentMessage(messages[run % messages.len()].into()));
+            headers.push(&*format!("work-run-{}", entries.len()).leak());
+            entries.push(work(&format!("run-{run}"), acp::ToolKind::Execute, None));
+            entries.push(work(&format!("read-{run}"), acp::ToolKind::Read, None));
+        }
+        entries.push(Entry::AgentMessage("Done.".into()));
+        thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
+        cx.run_until_parked();
+
+        let tops = |cx: &mut VisualTestContext| -> Vec<Option<f32>> {
+            headers
+                .iter()
+                .map(|name| cx.debug_bounds(name).map(|bounds| f32::from(bounds.top())))
+                .collect()
+        };
+        let mut before = tops(cx);
+        // Past the 2048 pixels above the first view, which were measured with it.
+        for step in 0..200 {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(px(400.), px(300.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(STEP))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+            let after = tops(cx);
+            for (header, (before, after)) in headers.iter().zip(before.iter().zip(&after)) {
+                if let (Some(before), Some(after)) = (before, after) {
+                    assert_eq!(after - before, STEP, "{header} at step {step}");
+                }
+            }
+            before = after;
+        }
+        let top = view.read_with(cx, |view, _| view.list_state.logical_scroll_top());
+        assert!(top.item_ix > 0, "the scroll stopped at the top");
     }
 
     /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.
