@@ -167,6 +167,16 @@ pub enum AccountChoice {
     Account(AccountId),
 }
 
+impl AccountChoice {
+    /// That very account, `None` being the External one.
+    pub fn of(account: Option<AccountId>) -> Self {
+        match account {
+            None => Self::External,
+            Some(id) => Self::Account(id),
+        }
+    }
+}
+
 /// [`crate::Request::UpdateAccount`]: a change to one account.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AccountChange {

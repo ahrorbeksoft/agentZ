@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey};
 use crate::project_store::ThreadStatus;
+use agentz_protocol::accounts::AccountChoice;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::layout::Node;
 use agentz_protocol::workspace::WorkspaceChoice;
@@ -217,6 +218,11 @@ impl Shell {
                         this.open_save_layout(root.clone(), panes.clone(), name.clone(), window, cx)
                     }
                     SpacesViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
+                    SpacesViewEvent::OpenAgentAccounts {
+                        machine,
+                        agent_id,
+                        add_account,
+                    } => this.open_agent_accounts(*machine, agent_id, *add_account, window, cx),
                 },
             ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
@@ -548,7 +554,13 @@ impl Shell {
         }
         let choice = workspace.map_or(WorkspaceChoice::Checkout, WorkspaceChoice::Existing);
         let created = store.update(cx, |store, cx| {
-            store.create_thread(project.project, agent_id, choice, cx)
+            store.create_thread(
+                project.project,
+                agent_id,
+                choice,
+                AccountChoice::Default,
+                cx,
+            )
         });
         self.show_draft_when_made(project.machine, created, None, window, cx);
     }
@@ -631,7 +643,13 @@ impl Shell {
             return;
         }
         let created = store.update(cx, |store, cx| {
-            store.create_workspaces_thread(folder, agent_id, WorkspaceChoice::Checkout, cx)
+            store.create_workspaces_thread(
+                folder,
+                agent_id,
+                WorkspaceChoice::Checkout,
+                AccountChoice::Default,
+                cx,
+            )
         });
         self.show_draft_when_made(pane.machine, created, Some(pane), window, cx);
     }
@@ -715,6 +733,23 @@ impl Shell {
         self.open_settings(&OpenSettings, window, cx);
         if let Some((page, _)) = &self.settings_page {
             page.update(cx, |page, cx| page.show_agents(window, cx));
+        }
+    }
+
+    /// Add Account… and Manage Accounts…, from a new thread's account picker.
+    fn open_agent_accounts(
+        &mut self,
+        machine: MachineId,
+        agent_id: &AgentId,
+        add_account: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(&OpenSettings, window, cx);
+        if let Some((page, _)) = &self.settings_page {
+            page.update(cx, |page, cx| {
+                page.show_agent_accounts(machine, agent_id, add_account, window, cx)
+            });
         }
     }
 
@@ -1103,6 +1138,10 @@ impl Shell {
                     cx,
                 ),
                 AgentViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
+                AgentViewEvent::OpenAgentAccounts {
+                    agent_id,
+                    add_account,
+                } => this.open_agent_accounts(key.machine, agent_id, *add_account, window, cx),
                 AgentViewEvent::Replaced { thread, text } => {
                     this.open_thread(*thread, window, cx);
                     if let Some(OpenThread {

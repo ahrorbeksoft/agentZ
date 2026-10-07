@@ -303,6 +303,7 @@ impl ProjectStore {
         project_id: ProjectId,
         agent_id: AgentId,
         workspace: WorkspaceChoice,
+        account: AccountChoice,
         cx: &mut Context<Self>,
     ) -> Task<Result<ThreadId>> {
         self.request(
@@ -310,7 +311,7 @@ impl ProjectStore {
                 project_id,
                 agent_id,
                 workspace,
-                account: AccountChoice::Default,
+                account,
             },
             |response| match response {
                 Response::ThreadCreated(thread_id) => Some(thread_id),
@@ -327,6 +328,7 @@ impl ProjectStore {
         folder: PathBuf,
         agent_id: AgentId,
         workspace: WorkspaceChoice,
+        account: AccountChoice,
         cx: &mut Context<Self>,
     ) -> Task<Result<ThreadId>> {
         self.request(
@@ -334,7 +336,7 @@ impl ProjectStore {
                 folder,
                 agent_id,
                 workspace,
-                account: AccountChoice::Default,
+                account,
             },
             |response| match response {
                 Response::ThreadCreated(thread_id) => Some(thread_id),
@@ -344,18 +346,20 @@ impl ProjectStore {
         )
     }
 
-    /// "Continue with another agent": a thread with `agent_id` in the thread's workspace, whose
-    /// first message brings the thread's conversation.
+    /// "Continue with another agent": a thread with `agent_id` on `account` in the thread's
+    /// workspace, whose first message brings the thread's conversation.
     pub fn continue_thread(
         &mut self,
         thread_id: ThreadId,
         agent_id: AgentId,
+        account: AccountChoice,
         cx: &mut Context<Self>,
     ) -> Task<Result<ThreadId>> {
         self.request(
             Request::ContinueThread {
                 thread_id,
                 agent_id,
+                account,
             },
             |response| match response {
                 Response::ThreadCreated(thread_id) => Some(thread_id),

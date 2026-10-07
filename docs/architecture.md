@@ -416,8 +416,16 @@ Each entry: what it does, where it lives, and where it comes from.
   user's choice of designs) is "What should we work on?" over the composer, with the agent
   picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
   Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
-  existing one), the machine picker and the branch. Changing any of them replaces the draft
-  with a new one.
+  existing one), the machine picker, the account picker and the branch. Changing any of them
+  replaces the draft with a new one. The account picker (`AgentView::render_account_picker`,
+  §12 of the accounts round) shows only while the agent lists more than one account: the
+  draft's account with its avatar, and a menu of the accounts with their plan (or "Logged
+  out") and the window closest to running out (`usage_limits::tightest_window`), then Add
+  Account… and Manage Accounts…, which open the agent's Account tab on the thread's machine
+  (`AgentViewEvent::OpenAgentAccounts`, `SettingsPage::show_agent_accounts`), adding an account
+  there for the first. Another checkout keeps the draft's account; another agent or machine
+  takes its account for new threads (`AccountChoice::Default`), and so does a continuation
+  unless one is picked (`ContinueThread`'s `account`).
 - **Drafts** (`Thread::is_draft`, `Thread::unsent_text`, `Server::sweep_drafts`,
   `Shell::open_thread`; t3code's draft threads and composer drafts): every new agent thread is
   a draft until its first message, so its agent starts at once, but it isn't in the thread
@@ -529,7 +537,8 @@ Each entry: what it does, where it lives, and where it comes from.
   (`Request::AddAccount`, `RemoveAccount`, `UpdateAccount`), kept in `agents/accounts.json`.
   Each thread keeps the account it started on (`Thread::account`, `None` for External), since
   accounts share no sessions. New threads take the account marked Use for New Threads, else the
-  External one while the agent's normal home is logged in, else the first agentZ account.
+  External one while the agent's normal home is logged in, else the first agentZ account
+  (`AccountChoice::Default`), unless the new thread screen's account picker names one.
   Whether each account is logged in is its last login check (`server/login_checks.rs`): what
   its threads and login sessions found, or, where the agent's sessions open logged out too,
   its own status command (`accounts/login_checks.rs`), run as the agent's settings open and

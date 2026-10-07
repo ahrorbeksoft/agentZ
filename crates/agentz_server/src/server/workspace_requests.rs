@@ -344,13 +344,15 @@ impl Server {
         Ok(thread_id)
     }
 
-    /// "Continue with another agent": a thread with `agent_id` in `thread_id`'s workspace,
-    /// whose first message brings `thread_id`'s conversation ([`handoff`]), t3code's context
-    /// handoff. The conversation is the one the running agent replayed, so the thread is open.
+    /// "Continue with another agent": a thread with `agent_id` on `account` in `thread_id`'s
+    /// workspace, whose first message brings `thread_id`'s conversation ([`handoff`]), t3code's
+    /// context handoff. The conversation is the one the running agent replayed, so the thread
+    /// is open.
     pub(super) fn continue_thread(
         &mut self,
         thread_id: ThreadId,
         agent_id: AgentId,
+        account: AccountChoice,
     ) -> Result<ThreadId> {
         let thread = self
             .projects
@@ -387,7 +389,7 @@ impl Server {
         else {
             return Err(anyhow!("the thread's workspace isn't ready"));
         };
-        let account = self.choose_account(&agent_id, AccountChoice::Default)?;
+        let account = self.choose_account(&agent_id, account)?;
         let new_thread = self.create_thread_in(
             thread.project_id,
             NewThread::Agent(agent_id, account),

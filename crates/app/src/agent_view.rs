@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
+use agentz_protocol::accounts::{AccountChoice, AccountId};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::agents::InstallState;
 use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
@@ -56,11 +57,15 @@ use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
+use crate::settings_page::{
+    AccountEntry, account_entries, account_entry, account_selector, render_entry_avatar,
+};
 use crate::terminal_drawer::{TerminalDrawer, TerminalDrawerEvent};
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
+use crate::usage_limits::{left_label, tightest_window};
 use crate::{ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
@@ -145,15 +150,21 @@ pub enum AgentViewEvent {
     Confirm(ConfirmRequest),
     /// The header's project was clicked: a new thread in it, as in t3code.
     NewThreadInProject(ProjectId),
-    /// The new thread was made again with another agent, checkout or machine, or as a
-    /// terminal: show `thread` in its place, with `text` in its composer. This one is deleted
-    /// right after.
+    /// The new thread was made again with another agent, account, checkout or machine, or as
+    /// a terminal: show `thread` in its place, with `text` in its composer. This one is
+    /// deleted right after.
     Replaced {
         thread: ThreadKey,
         text: SharedString,
     },
     /// Manage Agents, from the new thread's agent picker: Settings › Agents.
     OpenAgentSettings,
+    /// Manage Accounts…, from the new thread's account picker: the agent's Account tab on the
+    /// thread's machine, adding an account there with Add Account….
+    OpenAgentAccounts {
+        agent_id: AgentId,
+        add_account: bool,
+    },
 }
 
 /// What a new thread is made again to run, from its agent picker.
@@ -2530,7 +2541,7 @@ impl AgentView {
             .unwrap_or_else(|| agent_id.0.clone());
         let thread_id = self.thread_id;
         let task = self.store.update(cx, |store, cx| {
-            store.continue_thread(thread_id, agent_id, cx)
+            store.continue_thread(thread_id, agent_id, AccountChoice::Default, cx)
         });
         self._continuing = cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -5100,7 +5111,7 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// Under the new thread's composer: its checkout and machine, and its branch.
+    /// Under the new thread's composer: its checkout, machine and account, and its branch.
     fn render_new_thread_strip(&self, cx: &mut Context<Self>) -> AnyElement {
         let left = match &self.replacing {
             Some(status) => h_flex()
@@ -5119,11 +5130,16 @@ impl AgentView {
                         ),
                 )
                 .into_any_element(),
-            None if self.in_workspaces(cx) => self.render_folder_picker(cx),
+            None if self.in_workspaces(cx) => h_flex()
+                .gap_1()
+                .child(self.render_folder_picker(cx))
+                .children(self.render_account_picker(cx))
+                .into_any_element(),
             None => h_flex()
                 .gap_1()
                 .child(self.render_checkout_picker(cx))
                 .children(self.render_machine_picker(cx))
+                .children(self.render_account_picker(cx))
                 .into_any_element(),
         };
         let branch = self.thread_branch(cx).map(|(branch, _, folder)| {
@@ -5454,6 +5470,101 @@ impl AgentView {
         )
     }
 
+    /// The account the new thread runs on, shown only when its agent has more than one: its
+    /// avatar and name, with a menu of the accounts, their plans and the windows closest to
+    /// running out, then Add Account… and Manage Accounts….
+    fn render_account_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let agent_id = self.agent_id.clone()?;
+        let accounts = self.client.read(cx).accounts(&agent_id);
+        let entries = account_entries(&accounts);
+        if entries.len() < 2 {
+            return None;
+        }
+        // A draft made before its account was found logged out still shows it.
+        let current = self.store.read(cx).thread(self.thread_id)?.account;
+        let shown = account_entry(&accounts, current);
+        let chip = ButtonLike::new("new-thread-account-trigger")
+            .style(ButtonStyle::Subtle)
+            .size(ButtonSize::Compact)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(render_entry_avatar(&shown, px(14.), cx))
+                    .child(
+                        Label::new(shown.name.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+        let view = cx.weak_entity();
+        let now = SystemTime::now();
+        let menu = PopoverMenu::new("new-thread-account")
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let entries = entries.clone();
+                let agent_id = agent_id.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for entry in &entries {
+                        let account = entry.account;
+                        let is_current = account == current;
+                        let entry = entry.clone();
+                        let view = view.clone();
+                        menu = menu.custom_entry(
+                            move |_, cx| render_account_row(&entry, is_current, now, cx),
+                            move |_, cx| {
+                                view.update(cx, |view, cx| {
+                                    view.change_new_thread_account(account, cx)
+                                })
+                                .log_err();
+                            },
+                        );
+                    }
+                    let open_accounts = |add_account: bool| {
+                        let view = view.clone();
+                        let agent_id = agent_id.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            view.update(cx, |_, cx| {
+                                cx.emit(AgentViewEvent::OpenAgentAccounts {
+                                    agent_id: agent_id.clone(),
+                                    add_account,
+                                })
+                            })
+                            .log_err();
+                        }
+                    };
+                    menu.separator()
+                        .item(
+                            ContextMenuEntry::new("Add Account…")
+                                .icon(IconName::Plus)
+                                .icon_color(Color::Muted)
+                                .handler(open_accounts(true)),
+                        )
+                        .item(
+                            ContextMenuEntry::new("Manage Accounts…")
+                                .icon(IconName::Settings)
+                                .icon_color(Color::Muted)
+                                .handler(open_accounts(false)),
+                        )
+                }))
+            })
+            .trigger_with_tooltip(chip, Tooltip::text("Account"))
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)));
+        Some(
+            div()
+                .debug_selector(|| "new-thread-account".into())
+                .child(menu)
+                .into_any_element(),
+        )
+    }
+
     /// Asks for the project's repository once, for the checkout picker.
     fn load_new_thread_git(&mut self, cx: &mut Context<Self>) {
         if self._draft_git_load.is_some() {
@@ -5525,7 +5636,8 @@ impl AgentView {
             return;
         };
         let workspace = self.current_workspace_choice(cx);
-        self.replace_new_thread(project, starter, workspace, cx);
+        // Another agent's accounts are its own, so it starts on its account for new threads.
+        self.replace_new_thread(project, starter, workspace, AccountChoice::Default, cx);
     }
 
     fn change_new_thread_checkout(&mut self, workspace: WorkspaceChoice, cx: &mut Context<Self>) {
@@ -5536,10 +5648,12 @@ impl AgentView {
         else {
             return;
         };
-        self.replace_new_thread(project, Starter::Agent(agent_id), workspace, cx);
+        let account = self.current_account_choice(cx);
+        self.replace_new_thread(project, Starter::Agent(agent_id), workspace, account, cx);
     }
 
-    /// The thread moves to the project's checkout on another machine, in its own folder there.
+    /// The thread moves to the project's checkout on another machine, in its own folder there,
+    /// on that machine's account for new threads: each machine has its own accounts.
     fn change_new_thread_machine(&mut self, project: ProjectKey, cx: &mut Context<Self>) {
         if Some(project) == self.current_project(cx) {
             return;
@@ -5551,18 +5665,61 @@ impl AgentView {
             project,
             Starter::Agent(agent_id),
             WorkspaceChoice::Checkout,
+            AccountChoice::Default,
             cx,
         );
     }
 
-    /// ACP can't change a session's agent or folder, so the new thread is made again with
-    /// what was picked, shown in its place, and this one is deleted. A continuation stays one,
-    /// in the workspace of the thread it continues.
+    /// `account` being `None` for the External one.
+    fn change_new_thread_account(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+        let current = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .map(|thread| thread.account);
+        if current == Some(account) {
+            return;
+        }
+        let (Some(project), Some(agent_id)) = (self.current_project(cx), self.agent_id.clone())
+        else {
+            return;
+        };
+        let workspace = self.current_workspace_choice(cx);
+        self.replace_new_thread(
+            project,
+            Starter::Agent(agent_id),
+            workspace,
+            AccountChoice::of(account),
+            cx,
+        );
+    }
+
+    /// The thread's account, for a thread made in its place on this machine; the account for
+    /// new threads once it's no longer listed.
+    fn current_account_choice(&self, cx: &App) -> AccountChoice {
+        let (Some(agent_id), Some(thread)) = (
+            self.agent_id.as_ref(),
+            self.store.read(cx).thread(self.thread_id),
+        ) else {
+            return AccountChoice::Default;
+        };
+        let accounts = self.client.read(cx).accounts(agent_id);
+        if accounts.listed().contains(&thread.account) {
+            AccountChoice::of(thread.account)
+        } else {
+            AccountChoice::Default
+        }
+    }
+
+    /// ACP can't change a session's agent, account or folder, so the new thread is made again
+    /// with what was picked, shown in its place, and this one is deleted. A continuation stays
+    /// one, in the workspace of the thread it continues.
     fn replace_new_thread(
         &mut self,
         project: ProjectKey,
         starter: Starter,
         workspace: WorkspaceChoice,
+        account: AccountChoice,
         cx: &mut Context<Self>,
     ) {
         if self.replacing.is_some() {
@@ -5592,10 +5749,14 @@ impl AgentView {
         self.replace_error = None;
         cx.notify();
         let created = store.update(cx, |store, cx| match (starter, continued_from) {
-            (Starter::Agent(agent_id), Some(from)) => store.continue_thread(from, agent_id, cx),
+            (Starter::Agent(agent_id), Some(from)) => {
+                store.continue_thread(from, agent_id, account, cx)
+            }
             (Starter::Agent(agent_id), None) => match starting_folder {
-                Some(folder) => store.create_workspaces_thread(folder, agent_id, workspace, cx),
-                None => store.create_thread(project.project, agent_id, workspace, cx),
+                Some(folder) => {
+                    store.create_workspaces_thread(folder, agent_id, workspace, account, cx)
+                }
+                None => store.create_thread(project.project, agent_id, workspace, account, cx),
             },
             (Starter::Terminal, _) => store.create_terminal_thread(
                 project.project,
@@ -5809,6 +5970,62 @@ fn render_folder_crumb(folder: PathBuf) -> AnyElement {
                 .tooltip(Tooltip::text(folder.display().to_string())),
         )
         .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+        .into_any_element()
+}
+
+/// An account in the new thread's account picker: its avatar, its name over its plan, the
+/// window closest to running out, and a check when the thread runs on it.
+fn render_account_row(
+    entry: &AccountEntry,
+    is_current: bool,
+    now: SystemTime,
+    cx: &App,
+) -> AnyElement {
+    let selector = account_selector(entry.account);
+    let note = if entry.is_logged_out {
+        Some("Logged out".to_string())
+    } else {
+        entry.plan.clone()
+    };
+    // Unnamed, the External account is already called "Outside agentZ".
+    let is_outside = entry.account.is_none() && entry.is_named;
+    h_flex()
+        .debug_selector(move || format!("new-thread-account-{selector}"))
+        .w_full()
+        .gap_2()
+        .child(render_entry_avatar(entry, px(18.), cx))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(Label::new(entry.name.clone()).truncate())
+                        .when(is_outside, |name| {
+                            name.child(
+                                Label::new("· outside agentZ")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Placeholder),
+                            )
+                        }),
+                )
+                .children(
+                    note.map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                ),
+        )
+        .children(tightest_window(&entry.windows).map(|window| {
+            div()
+                .pl(px(14.))
+                .child(left_label(window, now).size(LabelSize::XSmall))
+        }))
+        .child(div().flex_none().w(px(14.)).when(is_current, |slot| {
+            slot.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        }))
         .into_any_element()
 }
 
@@ -6864,6 +7081,138 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("new-thread-folder").is_none());
         assert!(cx.debug_bounds("new-thread-folder-menu").is_some());
+    }
+
+    /// With two accounts, the strip under the composer shows the draft's account, and picking
+    /// another makes the draft again on it. Another checkout keeps the account; another agent
+    /// takes its own account for new threads.
+    #[gpui::test]
+    fn the_strip_picks_the_new_threads_account(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, AgentAccounts, LimitWindow, StatusRead};
+        use std::cell::RefCell;
+
+        let (view, cx) = open(1, false, cx);
+        assert!(cx.debug_bounds("new-thread-account").is_none());
+
+        let mock = AgentId::new("mock");
+        let mut accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    email: Some("alex@hey.com".into()),
+                    plan: Some("Max 5x".into()),
+                    windows: vec![LimitWindow {
+                        label: "5-hour".into(),
+                        used_percent: 38.,
+                        resets_at: None,
+                        length: None,
+                    }],
+                    ..AccountStatus::default()
+                },
+                read_at: SystemTime::now(),
+            }),
+            ..AgentAccounts::default()
+        };
+        let work = accounts.add();
+        if let Some(account) = accounts.account_mut(work) {
+            account.choices.label = Some("Work".into());
+            account.logged_in = Some(true);
+        }
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let events: Rc<RefCell<Vec<(AgentId, bool)>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::CreateThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
+                    _ => None,
+                }
+            });
+            client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
+        });
+        cx.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
+                if let AgentViewEvent::OpenAgentAccounts {
+                    agent_id,
+                    add_account,
+                } = event
+                {
+                    events.borrow_mut().push((agent_id.clone(), *add_account));
+                }
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let created = |account: AccountChoice, workspace: WorkspaceChoice| Request::CreateThread {
+            project_id: ProjectId(1),
+            agent_id: AgentId::new("mock"),
+            workspace,
+            account,
+        };
+
+        // The External account first, then agentZ's.
+        click("new-thread-account", cx);
+        let external = cx
+            .debug_bounds("new-thread-account-external")
+            .expect("the External account is offered");
+        let on_work = cx
+            .debug_bounds("new-thread-account-1")
+            .expect("Work is offered");
+        assert!(external.top() < on_work.top());
+        click("new-thread-account-1", cx);
+        assert!(requests.borrow().contains(&created(
+            AccountChoice::Account(work),
+            WorkspaceChoice::Checkout
+        )));
+
+        // A draft on Work keeps it in a new worktree.
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        let mut on_work = snapshot(Some("Fix the login"));
+        on_work.threads[0].account = Some(work);
+        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
+        cx.run_until_parked();
+        requests.borrow_mut().clear();
+        let worktree = WorkspaceChoice::New {
+            kind: WorkspaceKind::Worktree,
+            base: None,
+            branch: None,
+        };
+        view.update(cx, |view, cx| {
+            view.change_new_thread_checkout(worktree.clone(), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            requests
+                .borrow()
+                .contains(&created(AccountChoice::Account(work), worktree.clone()))
+        );
+        requests.borrow_mut().clear();
+        view.update(cx, |view, cx| {
+            view.change_new_thread_starter(Starter::Agent(AgentId::new("other")), cx)
+        });
+        cx.run_until_parked();
+        assert!(requests.borrow().iter().any(|request| matches!(
+            request,
+            Request::CreateThread {
+                account: AccountChoice::Default,
+                ..
+            }
+        )));
+
+        // Add Account… opens the agent's accounts to add one there.
+        click("new-thread-account", cx);
+        click("MENU_ITEM-Add Account…", cx);
+        assert_eq!(*events.borrow(), vec![(mock, true)]);
     }
 
     /// An archived thread takes no messages, so there's nothing to start.

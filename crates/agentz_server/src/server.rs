@@ -813,8 +813,9 @@ impl Server {
             Request::ContinueThread {
                 thread_id,
                 agent_id,
+                account,
             } => Ok(Response::ThreadCreated(
-                self.continue_thread(thread_id, agent_id)?,
+                self.continue_thread(thread_id, agent_id, account)?,
             )),
             Request::DropHandoff(connection) => {
                 self.update_thread(connection, AgentThread::drop_handoff)?;

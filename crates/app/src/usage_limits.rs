@@ -176,6 +176,28 @@ fn render_bar(
         .into_any_element()
 }
 
+/// The window closest to running out, which pickers show.
+pub(crate) fn tightest_window(windows: &[LimitWindow]) -> Option<&LimitWindow> {
+    windows.iter().min_by_key(|window| window.left_percent())
+}
+
+/// A picker's line for the window: `62% left`, or `Used up · 2h 10m` in red until it resets.
+pub(crate) fn left_label(window: &LimitWindow, now: SystemTime) -> Label {
+    let left = window.left_percent();
+    if left > 0 {
+        return Label::new(format!("{left}% left"));
+    }
+    let remaining = window
+        .resets_at
+        .and_then(|resets_at| resets_at.duration_since(now).ok())
+        .filter(|remaining| !remaining.is_zero());
+    let text = match remaining {
+        Some(remaining) => format!("Used up · {}", format_duration(remaining)),
+        None => "Used up".to_string(),
+    };
+    Label::new(text).color(Color::Error)
+}
+
 /// t3code's durations: `2d 3h`, `2h 13m`, `12m`.
 pub(crate) fn format_duration(duration: Duration) -> String {
     const MINUTE: u64 = 60;

@@ -459,6 +459,7 @@ async fn continues_threads_with_another_agent() {
         .ok(Request::ContinueThread {
             thread_id,
             agent_id: AgentId::new("mock"),
+            account: AccountChoice::Default,
         })
         .await
     else {
@@ -517,6 +518,32 @@ async fn continues_threads_with_another_agent() {
     // Only the user's words are their message.
     assert!(matches!(thread.entries().first(), Some(Entry::UserMessage(text)) if text == "next"));
     assert!(!saved.exists());
+
+    // A continuation can run on another of the agent's accounts.
+    let Response::AccountAdded(work) = client.ok(Request::AddAccount(AgentId::new("mock"))).await
+    else {
+        panic!("expected an account");
+    };
+    let Response::ThreadCreated(on_work) = client
+        .ok(Request::ContinueThread {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+            account: AccountChoice::Account(work),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    client
+        .wait_until(|client| {
+            client.projects.as_ref().is_some_and(|projects| {
+                projects
+                    .threads
+                    .iter()
+                    .any(|thread| thread.id == on_work && thread.account == Some(work))
+            })
+        })
+        .await;
 }
 
 /// An archived thread's agent stops once nothing needs it and no client has the thread open,
@@ -669,6 +696,7 @@ async fn removes_drafts_left_empty() {
         .ok(Request::ContinueThread {
             thread_id,
             agent_id: AgentId::new("mock"),
+            account: AccountChoice::Default,
         })
         .await
     else {

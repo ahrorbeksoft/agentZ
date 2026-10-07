@@ -520,6 +520,8 @@ pub enum Request {
     ContinueThread {
         thread_id: ThreadId,
         agent_id: AgentId,
+        #[serde(default)]
+        account: AccountChoice,
     },
     /// Starts the continued thread without the conversation it would have brought.
     DropHandoff(ConnectionId),

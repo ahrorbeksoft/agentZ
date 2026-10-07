@@ -26,6 +26,17 @@ Notes for whoever continues:
   be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
   importing sessions. Since item 8, the Account tab opens a login session per account.
+- Item 10: the account chip sits after Local and the machine (after the folder in a
+  Workspaces draft), only while the agent lists more than one account. Its menu is §12 A's
+  with §16 C's limits already in it (the window closest to running out, red "Used up · 1h 9m"
+  when spent), so item 14 has only the Usage page and the gauge left. An account found logged
+  out shows "Logged out" instead of its plan; it's still offered, as on the Defaults tabs, and
+  its thread asks to log in. Picking an account makes the draft again (ACP can't move a
+  session); another checkout keeps the account, another agent or machine takes its account
+  for new threads. `ContinueThread` takes an `account` now (the draft of a continuation keeps
+  its account picker; item 12 adds the accounts to Continue with Another Agent). Add Account…
+  and Manage Accounts… open the agent's Account tab (Add Account… also adds a card there);
+  a page already open on that agent keeps its login sessions.
 - Item 9: the Defaults, Environment and Threads tabs share one account menu
   (`AgentPanel::picked_account`). It opens on the account for new threads and follows it
   until one is picked; a picked account that's no longer listed gives way to it again. With
@@ -85,11 +96,11 @@ Notes for whoever continues:
 | 7 | | API-key accounts (Droid with a Factory API key) | done |
 | 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | done |
 | 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | done |
-| 10 | 12 | The account in the strip under the composer; the default account for new threads | |
+| 10 | 12 | The account in the strip under the composer; the default account for new threads | done |
 | 11 | 13 | The account's color on its threads' agent icon | |
 | 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | |
 | 13 | 14 | The limit notice over the composer (Continue on another account first) | |
-| 14 | 16 | Settings › Usage, the composer gauge, limits in the account picker | |
+| 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | |
 | 15 | | Wave 1: Claude | |
 | 16 | | Wave 1: Codex | |
 | 17 | | Wave 1: Devin | |

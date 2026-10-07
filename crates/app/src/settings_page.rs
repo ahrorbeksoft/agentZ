@@ -14,7 +14,7 @@ use crate::project_store::ProjectStore;
 use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
 use agentz_protocol::accounts::{
     AccountChange, AccountChoice, AccountChoices, AccountId, AccountStatus, AccountSupport,
-    AgentAccounts, SettingsSource,
+    AgentAccounts, LimitWindow, SettingsSource,
 };
 use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
@@ -69,6 +69,8 @@ const KEY_CONTEXT: &str = "SettingsPage";
 const ACCOUNT_RENAME_KEY_CONTEXT: &str = "AccountRename";
 /// An account card's avatar, which its limits line up after.
 const AVATAR_SIZE: Pixels = px(32.);
+/// An account's avatar in a menu and on its trigger.
+const MENU_AVATAR_SIZE: Pixels = px(16.);
 const CONTENT_WIDTH: Pixels = px(720.);
 /// An agent can keep hundreds of sessions in a project, so the Threads tab shows them a page at
 /// a time, as the sidebar shows archived threads.
@@ -251,6 +253,38 @@ impl SettingsPage {
 
     pub fn show_project(&mut self, key: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
         self.select(Section::Project(key), window, cx);
+    }
+
+    /// The agent's Account tab on `machine`, adding an account there with `add_account`, as
+    /// its Add Account does. An agent page already open stays, with its login sessions.
+    pub fn show_agent_accounts(
+        &mut self,
+        machine: MachineId,
+        agent_id: &AgentId,
+        add_account: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_open = self.section == Section::Agents
+            && self.agents_machine == machine
+            && self
+                .agent_panel()
+                .is_some_and(|panel| panel.agent_id == *agent_id);
+        if !is_open {
+            self.select(Section::Agents, window, cx);
+            self.set_agents_machine(machine, cx);
+            let name = self
+                .registry(cx)
+                .read(cx)
+                .agent(agent_id)
+                .map(|agent| agent.name().clone())
+                .unwrap_or_else(|| agent_id.0.to_string().into());
+            self.open_agent(agent_id, &name, window, cx);
+        }
+        self.select_agent_tab(AgentTab::Account, cx);
+        if add_account {
+            self.add_account(cx);
+        }
     }
 
     fn project(&self, key: ProjectKey, cx: &App) -> Option<Project> {
@@ -2129,7 +2163,7 @@ impl SettingsPage {
         let shown = entries.iter().find(|entry| entry.account == current)?;
         let label = h_flex()
             .gap_1p5()
-            .child(render_entry_avatar(shown, cx))
+            .child(render_entry_avatar(shown, MENU_AVATAR_SIZE, cx))
             .child(Label::new(shown.name.clone()).size(LabelSize::Small))
             .into_any_element();
         let page = cx.weak_entity();
@@ -2425,10 +2459,7 @@ impl SettingsPage {
         let Some(panel) = self.agent_panel_mut() else {
             return;
         };
-        panel.picked_account = match account {
-            None => AccountChoice::External,
-            Some(id) => AccountChoice::Account(id),
-        };
+        panel.picked_account = AccountChoice::of(account);
         self.sync_settings_account(cx);
         cx.notify();
     }
@@ -3704,7 +3735,7 @@ impl SettingsPage {
         let label = match entries.iter().find(|entry| source(entry) == current) {
             Some(entry) => h_flex()
                 .gap_1p5()
-                .child(render_entry_avatar(entry, cx))
+                .child(render_entry_avatar(entry, MENU_AVATAR_SIZE, cx))
                 .child(Label::new(entry.name.clone()))
                 .into_any_element(),
             None => Label::new("Nothing").into_any_element(),
@@ -5657,57 +5688,75 @@ fn account_card_details(
 }
 
 /// An account as the account menus show it.
-struct AccountEntry {
-    account: Option<AccountId>,
-    name: SharedString,
+#[derive(Clone)]
+pub(crate) struct AccountEntry {
+    pub(crate) account: Option<AccountId>,
+    pub(crate) name: SharedString,
     /// Whether `name` is the account's own (an email, or Rename's), for its avatar's initial.
-    is_named: bool,
-    color: Option<String>,
+    pub(crate) is_named: bool,
+    pub(crate) color: Option<String>,
+    /// From its last read.
+    pub(crate) plan: Option<String>,
+    pub(crate) windows: Vec<LimitWindow>,
+    /// Found logged out when last checked.
+    pub(crate) is_logged_out: bool,
 }
 
 /// The listed accounts, for the menus that pick one.
-fn account_entries(accounts: &AgentAccounts) -> Vec<AccountEntry> {
+pub(crate) fn account_entries(accounts: &AgentAccounts) -> Vec<AccountEntry> {
     accounts
         .listed()
         .into_iter()
-        .map(|account| {
-            let name = accounts.name(account);
-            let fallback = match account {
-                None => "Outside agentZ".to_string(),
-                // An API key's account has no email, and goes by its login method.
-                Some(id) => accounts
-                    .account(id)
-                    .and_then(|account| account.settings.login_method.as_deref())
-                    .and_then(login_method_subject)
-                    .unwrap_or_else(|| "New account".to_string()),
-            };
-            AccountEntry {
-                account,
-                is_named: name.is_some(),
-                name: name.unwrap_or(fallback).into(),
-                color: accounts
-                    .choices(account)
-                    .and_then(|choices| choices.color.clone()),
-            }
-        })
+        .map(|account| account_entry(accounts, account))
         .collect()
 }
 
+/// Any of the agent's accounts, listed or not, `None` being the External one.
+pub(crate) fn account_entry(accounts: &AgentAccounts, account: Option<AccountId>) -> AccountEntry {
+    let name = accounts.name(account);
+    let fallback = match account {
+        None => "Outside agentZ".to_string(),
+        // An API key's account has no email, and goes by its login method.
+        Some(id) => accounts
+            .account(id)
+            .and_then(|account| account.settings.login_method.as_deref())
+            .and_then(login_method_subject)
+            .unwrap_or_else(|| "New account".to_string()),
+    };
+    let status = accounts.status(account).map(|read| &read.status);
+    let logged_in = match account {
+        None => accounts.external_logged_in,
+        Some(id) => accounts.account(id).and_then(|account| account.logged_in),
+    };
+    AccountEntry {
+        account,
+        is_named: name.is_some(),
+        name: name.unwrap_or(fallback).into(),
+        color: accounts
+            .choices(account)
+            .and_then(|choices| choices.color.clone()),
+        plan: status.and_then(|status| status.plan.clone()),
+        windows: status
+            .map(|status| status.windows.clone())
+            .unwrap_or_default(),
+        is_logged_out: logged_in == Some(false),
+    }
+}
+
 /// How an account's elements are named in tests: by its id, or "external".
-fn account_selector(account: Option<AccountId>) -> String {
+pub(crate) fn account_selector(account: Option<AccountId>) -> String {
     account.map_or_else(|| "external".to_string(), |id| id.to_string())
 }
 
-fn render_entry_avatar(entry: &AccountEntry, cx: &App) -> AnyElement {
-    const SIZE: Pixels = px(16.);
+pub(crate) fn render_entry_avatar(entry: &AccountEntry, size: Pixels, cx: &App) -> AnyElement {
     if entry.is_named {
         let color = entry
             .color
             .as_deref()
             .and_then(|hex| account_color(hex, cx));
-        avatar(&entry.name, color, SIZE, cx)
+        avatar(&entry.name, color, size, cx)
     } else {
-        account_badge(SIZE, cx)
+        account_badge(size, cx)
     }
 }
 
@@ -5716,7 +5765,7 @@ fn render_account_entry(entry: &AccountEntry, is_current: bool, cx: &App) -> Any
     h_flex()
         .w_full()
         .gap_1p5()
-        .child(render_entry_avatar(entry, cx))
+        .child(render_entry_avatar(entry, MENU_AVATAR_SIZE, cx))
         .child(Label::new(entry.name.clone()))
         .child(div().flex_1().min_w(px(16.)))
         .when(is_current, |row| {
@@ -6360,7 +6409,7 @@ mod tests {
     use std::cell::RefCell;
     use std::time::Duration;
 
-    use agentz_protocol::accounts::{Account, LimitWindow, StatusRead};
+    use agentz_protocol::accounts::{Account, StatusRead};
     use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
@@ -7480,6 +7529,24 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("account-picker").is_none());
+
+        // A new thread's Add Account… goes to the Account tab of the page already open, and
+        // adds an account there.
+        let external_session = Request::OpenLoginSession {
+            agent_id: mock.clone(),
+            account: None,
+        };
+        let external_sessions = count(&external_session);
+        page.update_in(cx, |page, window, cx| {
+            page.show_agent_accounts(MachineId::Local, &mock, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(page.read_with(cx, |page, _| {
+            page.agent_panel()
+                .is_some_and(|panel| panel.tab == AgentTab::Account)
+        }));
+        assert!(sent(&Request::AddAccount(mock.clone())));
+        assert_eq!(count(&external_session), external_sessions);
     }
 
     #[test]
