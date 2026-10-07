@@ -276,6 +276,12 @@ impl AgentThread {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_turn_error_for_test(&mut self, error: &str, cx: &mut Context<Self>) {
+        self.view.state.turn_error = Some(error.to_string().into());
+        cx.notify();
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_status_for_test(&mut self, status: ConnectionStatus, cx: &mut Context<Self>) {
         self.view.state.status = status;
         cx.notify();

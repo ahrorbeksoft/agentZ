@@ -415,6 +415,17 @@ Each entry: what it does, where it lives, and where it comes from.
   (`without_handoff`). Sent, it links the threads (`Thread::continued_from`): the new thread
   opens with a "Continued from" divider, and the old one ends with a "Continued in" card (also
   the user's choice).
+- **The limit notice** (`AgentView::render_limit_notice`, `usage_limits::used_up_window`;
+  t3code's `ThreadErrorBanner` as Zed's warning `Callout`, accounts topic 14): agents word a
+  used-up limit each their own way, so agentZ goes by its reads instead. When a turn ends with
+  an error while the last read of the thread's account has a window used up that hasn't reset
+  (of several, the last to reset), a notice over the composer takes the error's place: whose
+  limit ran out ("Your account" with one account listed, else its name), and when it resets,
+  with the agent's error in the body's tooltip. "Continue on <account> · 97% left" continues
+  the thread there, as Continue with Another Agent does, on the agent's other account with
+  the most left of its tightest window (then those not read yet, then used up, then logged
+  out); with more than one other account, it's a split button whose arrow lists the rest.
+  Usage ↗ opens the agent's usage page. Closed, it stays closed until the next turn.
 - **New Thread** (`Shell::new_thread`, `Shell::start_draft`, `new_thread_modal.rs`; t3code's
   `useHandleNewThread`, the user's choice): opens a draft right away in the shown project, or
   asks which project first when several are shown (the modal is only that picker). It reuses

@@ -29,6 +29,15 @@ Notes for whoever continues:
   be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
   importing sessions. Since item 8, the Account tab opens a login session per account.
+- Item 13: the notice shows when a turn ends with an error while the last read of the
+  thread's account has a window used up that hasn't reset; agentZ doesn't parse the agents'
+  error texts. A failed turn is read again, so the notice can follow the error by a few
+  seconds. It's Zed's warning `Callout` (so its icon is the warning triangle, not the mock's
+  hourglass), the body's tooltip has the agent's error, and its × closes it until the next
+  turn. With one account listed it says "Your account" and offers no Continue; the Continue
+  button is a split button only when there's more than one other account. The Usage link is
+  the description's `usage_page`. Continue at the reset (18), Droid's choices (19) and limit
+  resets (20) add their buttons to it later.
 - Item 12: the thread's agent heads the submenu as a row that isn't picked itself (its
   accounts beneath it are), and its accounts are drawn as in the new thread's account picker.
   With one account listed, the submenu is as before. Agent control lists `accounts` (key: the
@@ -117,7 +126,7 @@ Notes for whoever continues:
 | 10 | 12 | The account in the strip under the composer; the default account for new threads | done |
 | 11 | 13 | The account's color on its threads' agent icon | done |
 | 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | done |
-| 13 | 14 | The limit notice over the composer (Continue on another account first) | |
+| 13 | 14 | The limit notice over the composer (Continue on another account first) | done |
 | 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | |
 | 15 | | Wave 1: Claude | |
 | 16 | | Wave 1: Codex | |

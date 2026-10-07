@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::accounts::{AccountChoice, AccountId};
+use agentz_protocol::accounts::{AccountChoice, AccountId, AgentAccounts, LimitWindow};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::agents::InstallState;
 use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
@@ -34,8 +34,8 @@ use projects::{ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKin
 use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
-    IconPosition, PopoverMenu, PopoverMenuHandle, Severity, SpinnerLabel, Switch, ToggleState,
-    Tooltip, prelude::*,
+    IconPosition, PopoverMenu, PopoverMenuHandle, Severity, SpinnerLabel, SplitButton,
+    SplitButtonStyle, Switch, ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -66,7 +66,7 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
-use crate::usage_limits::{left_label, tightest_window};
+use crate::usage_limits::{left_label, reset_phrase, tightest_window, used_up_window};
 use crate::{ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
@@ -321,6 +321,8 @@ pub struct AgentView {
     /// Why "Continue with another agent" didn't start a thread.
     continue_error: Option<SharedString>,
     _continuing: Task<()>,
+    /// The limit notice was closed, until the next turn.
+    limit_notice_dismissed: bool,
     /// The project's repository, for the new thread screen's checkout picker. Asked for the
     /// first time that screen shows.
     draft_git: Option<ProjectGit>,
@@ -363,6 +365,9 @@ impl AgentView {
                 this.apply_rename(cx)
             }),
             cx.observe(&thread, |this, thread, cx| {
+                if thread.read(cx).is_working() {
+                    this.limit_notice_dismissed = false;
+                }
                 this.sync_entries(cx);
                 sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
                 this.sync_composer_placeholder(cx);
@@ -510,6 +515,7 @@ impl AgentView {
             handoff_expanded: false,
             continue_error: None,
             _continuing: Task::ready(()),
+            limit_notice_dismissed: false,
             draft_git: None,
             _draft_git_load: None,
             replacing: None,
@@ -3634,7 +3640,200 @@ impl AgentView {
             .collect()
     }
 
+    /// The thread stopped with an error while its account's last read has a window used up:
+    /// agentZ takes that as the limit, however the agent worded it.
+    fn limit_reached(&self, now: SystemTime, cx: &App) -> Option<LimitReached> {
+        if self.is_archived {
+            return None;
+        }
+        let agent_id = self.agent_id.clone()?;
+        let thread = self.thread.read(cx);
+        if thread.is_working() {
+            return None;
+        }
+        let error = thread.turn_error()?.clone();
+        let account = self.store.read(cx).thread(self.thread_id)?.account;
+        let accounts = self.client.read(cx).accounts(&agent_id);
+        let window = used_up_window(&accounts.status(account)?.status.windows, now)?.clone();
+        Some(LimitReached {
+            agent_id,
+            accounts,
+            account,
+            window,
+            error,
+        })
+    }
+
+    /// t3code's banner for a thread stopped by a usage limit, as Zed's warning callout over the
+    /// composer: whose limit ran out and when it resets, then Continue on the agent's account
+    /// with the most left, its arrow listing the others.
+    fn render_limit_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.limit_notice_dismissed {
+            return None;
+        }
+        let now = SystemTime::now();
+        let reached = self.limit_reached(now, cx)?;
+        let has_accounts = reached.accounts.listed().len() > 1;
+        let own = account_entry(&reached.accounts, reached.account);
+        let who = has_accounts.then(|| account_phrase(&own, true));
+        let (title, body) =
+            limit_notice_text(who.as_deref(), &self.agent_name(cx), &reached.window, now);
+        let others = if has_accounts {
+            accounts_to_continue_on(&reached.accounts, reached.account, now)
+        } else {
+            Vec::new()
+        };
+        let usage_page = self
+            .registry
+            .read(cx)
+            .agent(&reached.agent_id)
+            .and_then(|agent| agent.accounts.as_ref())
+            .and_then(|support| support.usage_page.clone());
+
+        let continue_button = others.split_first().map(|(first, rest)| {
+            let label = format!(
+                "Continue on {}{}",
+                account_phrase(first, false),
+                room_note(first, now)
+            );
+            let agent_id = reached.agent_id.clone();
+            let account = first.account;
+            let on_click = cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.continue_with(agent_id.clone(), AccountChoice::of(account), cx)
+            });
+            if rest.is_empty() {
+                return div()
+                    .debug_selector(|| "limit-continue".into())
+                    .child(
+                        Button::new("limit-continue", label)
+                            .style(ButtonStyle::Outlined)
+                            .label_size(LabelSize::Small)
+                            .on_click(on_click),
+                    )
+                    .into_any_element();
+            }
+            let view = cx.weak_entity();
+            let agent_id = reached.agent_id.clone();
+            let rest = rest.to_vec();
+            let menu = PopoverMenu::new("limit-continue-menu")
+                .trigger_with_tooltip(
+                    IconButton::new("limit-continue-others", IconName::ChevronDown)
+                        .icon_size(IconSize::XSmall),
+                    Tooltip::text("Continue on Another Account"),
+                )
+                .menu(move |window, cx| {
+                    let view = view.clone();
+                    let agent_id = agent_id.clone();
+                    let rest = rest.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for entry in &rest {
+                            let account = entry.account;
+                            let entry = entry.clone();
+                            let view = view.clone();
+                            let agent_id = agent_id.clone();
+                            menu = menu.custom_entry(
+                                move |_, cx| {
+                                    let selector = account_selector(entry.account);
+                                    account_row(&entry, None, false, now, cx)
+                                        .debug_selector(move || {
+                                            format!("limit-continue-on-{selector}")
+                                        })
+                                        .into_any_element()
+                                },
+                                move |_, cx| {
+                                    let agent_id = agent_id.clone();
+                                    view.update(cx, |view, cx| {
+                                        view.continue_with(agent_id, AccountChoice::of(account), cx)
+                                    })
+                                    .log_err();
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .anchor(Anchor::TopRight)
+                .offset(gpui::point(px(0.), px(2.)));
+            div()
+                .debug_selector(|| "limit-continue".into())
+                .child(
+                    SplitButton::new(
+                        ButtonLike::new("limit-continue")
+                            .child(Label::new(label).size(LabelSize::Small))
+                            .on_click(on_click),
+                        div()
+                            .debug_selector(|| "limit-continue-others".into())
+                            .child(menu)
+                            .into_any_element(),
+                    )
+                    .style(SplitButtonStyle::Outlined),
+                )
+                .into_any_element()
+        });
+        let usage_button = usage_page.map(|url| {
+            Button::new("limit-usage-page", "Usage")
+                .label_size(LabelSize::Small)
+                .color(Color::Muted)
+                .end_icon(
+                    Icon::new(IconName::ArrowUpRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(move |_, _, cx| cx.open_url(&url))
+        });
+        let has_buttons = continue_button.is_some() || usage_button.is_some();
+        let error = reached.error;
+        let callout = Callout::new()
+            .severity(Severity::Warning)
+            .icon(IconName::Warning)
+            .title(title)
+            .description_slot(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("limit-notice-body")
+                            .text_color(cx.theme().colors().text_muted)
+                            .child(body)
+                            // In the agent's own words.
+                            .tooltip(Tooltip::text(error)),
+                    )
+                    .when(has_buttons, |this| {
+                        this.child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .children(continue_button)
+                                .children(usage_button),
+                        )
+                    }),
+            )
+            .dismiss_action(
+                div()
+                    .debug_selector(|| "limit-notice-dismiss".into())
+                    .child(
+                        IconButton::new("limit-notice-dismiss", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Dismiss"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.limit_notice_dismissed = true;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        Some(
+            div()
+                .debug_selector(|| "limit-notice".into())
+                .px_2()
+                .pb_2()
+                .child(callout)
+                .into_any_element(),
+        )
+    }
+
     fn render_errors(&self, cx: &App) -> Option<AnyElement> {
+        // The limit notice says it instead, even once closed.
+        let at_limit = self.limit_reached(SystemTime::now(), cx).is_some();
         let thread = self.thread.read(cx);
         let callout = if let ConnectionStatus::Failed(error) = thread.status() {
             Callout::new()
@@ -3642,7 +3841,7 @@ impl AgentView {
                 .icon(IconName::XCircle)
                 .title(format!("{} couldn't start", self.agent_name(cx)))
                 .description(error.clone())
-        } else if let Some(error) = thread.turn_error() {
+        } else if let Some(error) = thread.turn_error().filter(|_| !at_limit) {
             Callout::new()
                 .severity(Severity::Error)
                 .icon(IconName::XCircle)
@@ -6141,6 +6340,111 @@ fn account_row(
         }))
 }
 
+/// What the limit notice shows: the thread's account, the window it ran out of, and the
+/// agent's error.
+struct LimitReached {
+    agent_id: AgentId,
+    accounts: AgentAccounts,
+    /// `None` being the External one.
+    account: Option<AccountId>,
+    window: LimitWindow,
+    error: SharedString,
+}
+
+/// The limit notice's title and body. `who` names the account whose limit ran out, when the
+/// agent has more than one to tell apart.
+fn limit_notice_text(
+    who: Option<&str>,
+    agent_name: &str,
+    window: &LimitWindow,
+    now: SystemTime,
+) -> (String, String) {
+    let title = format!(
+        "{} reached its {} limit",
+        who.unwrap_or("Your account"),
+        label_in_sentence(&window.label)
+    );
+    let mut body = format!("{agent_name} stopped.");
+    if let Some(resets_at) = window.resets_at {
+        let remaining = resets_at.duration_since(now).unwrap_or_default();
+        body.push_str(&format!(
+            " The limit resets {}, in {}.",
+            reset_phrase(resets_at, now),
+            crate::usage_limits::format_duration(remaining)
+        ));
+    }
+    (title, body)
+}
+
+/// A window's label inside a sentence: "Weekly" as "weekly", but "GPT-5" as it is.
+fn label_in_sentence(label: &str) -> String {
+    let first_word = label.split_whitespace().next().unwrap_or_default();
+    let mut characters = first_word.chars();
+    let is_capitalized = characters.next().is_some_and(char::is_uppercase)
+        && characters.all(|character| !character.is_uppercase());
+    if !is_capitalized {
+        return label.to_string();
+    }
+    let mut characters = label.chars();
+    characters
+        .next()
+        .map(|first| first.to_lowercase().chain(characters).collect())
+        .unwrap_or_default()
+}
+
+/// How the limit notice names an account in a sentence.
+fn account_phrase(entry: &AccountEntry, starts_sentence: bool) -> String {
+    // Unnamed, the External account goes by "Outside agentZ", which isn't a name.
+    if entry.account.is_none() && !entry.is_named {
+        if starts_sentence {
+            "The account outside agentZ".to_string()
+        } else {
+            "the account outside agentZ".to_string()
+        }
+    } else {
+        entry.name.to_string()
+    }
+}
+
+/// The agent's other listed accounts, the one with the most room first.
+fn accounts_to_continue_on(
+    accounts: &AgentAccounts,
+    own: Option<AccountId>,
+    now: SystemTime,
+) -> Vec<AccountEntry> {
+    let mut entries: Vec<AccountEntry> = account_entries(accounts)
+        .into_iter()
+        .filter(|entry| entry.account != own)
+        .collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(room(entry, now)));
+    entries
+}
+
+/// How much room an account has to go on, for ordering: what's left of its tightest window,
+/// then not read yet, then used up, then logged out.
+fn room(entry: &AccountEntry, now: SystemTime) -> i16 {
+    if entry.is_logged_out {
+        return -2;
+    }
+    if used_up_window(&entry.windows, now).is_some() {
+        return -1;
+    }
+    tightest_window(&entry.windows).map_or(0, |window| i16::from(window.left_percent()))
+}
+
+/// What the Continue button says of the account it continues on.
+fn room_note(entry: &AccountEntry, now: SystemTime) -> String {
+    if entry.is_logged_out {
+        return " · Logged out".to_string();
+    }
+    if used_up_window(&entry.windows, now).is_some() {
+        return " · Used up".to_string();
+    }
+    tightest_window(&entry.windows)
+        .map(|window| format!(" · {}% left", window.left_percent()))
+        .unwrap_or_default()
+}
+
 /// A borderless button that opens one of the new thread's pickers.
 fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike {
     ButtonLike::new(id)
@@ -6431,6 +6735,7 @@ impl Render for AgentView {
                             }),
                     )
                     .children(self.render_request_elicitations(cx))
+                    .children(self.render_limit_notice(cx))
                     .children(self.render_errors(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
@@ -7411,6 +7716,170 @@ mod tests {
             continued(&requests),
             vec![(ThreadId(2), mock, AccountChoice::External)]
         );
+    }
+
+    /// A thread that stopped while its account's last read has a window used up shows the limit
+    /// notice in place of the agent's error. It continues on the account with the most left,
+    /// its arrow lists the others, and once closed it stays closed until the next turn.
+    #[gpui::test]
+    fn a_thread_stopped_at_its_accounts_limit_offers_another_account(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, StatusRead};
+        use std::cell::RefCell;
+
+        let (view, cx) = open(2, false, cx);
+        let mock = AgentId::new("mock");
+        let now = SystemTime::now();
+        let read = |used_percent: f64| StatusRead {
+            status: AccountStatus {
+                windows: vec![LimitWindow {
+                    label: "5-hour".into(),
+                    used_percent,
+                    resets_at: Some(now + Duration::from_secs(2 * 60 * 60)),
+                    length: None,
+                }],
+                ..AccountStatus::default()
+            },
+            read_at: now,
+        };
+        let mut accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(read(60.)),
+            ..AgentAccounts::default()
+        };
+        let work = accounts.add();
+        let side = accounts.add();
+        for (id, label, used_percent) in [(work, "Work", 100.), (side, "Side", 3.)] {
+            if let Some(account) = accounts.account_mut(id) {
+                account.choices.label = Some(label.into());
+                account.logged_in = Some(true);
+                account.status = Some(read(used_percent));
+            }
+        }
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        let mut on_work = snapshot(None);
+        on_work.threads[1].account = Some(work);
+        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::ContinueThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
+                    _ => None,
+                }
+            });
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx);
+        });
+        cx.run_until_parked();
+        let continued = |requests: &RefCell<Vec<Request>>| {
+            requests
+                .borrow()
+                .iter()
+                .filter_map(|request| match request {
+                    Request::ContinueThread { account, .. } => Some(*account),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let at_limit = |view: &Entity<AgentView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                view.limit_reached(SystemTime::now(), cx).is_some()
+            })
+        };
+
+        // A used-up account alone isn't a stop.
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-notice").is_none());
+        thread.update(cx, |thread, cx| {
+            thread.set_turn_error_for_test("Usage limit reached", cx)
+        });
+        cx.run_until_parked();
+        assert!(at_limit(&view, cx));
+        assert!(cx.debug_bounds("limit-notice").is_some());
+
+        let primary = cx
+            .debug_bounds("limit-continue")
+            .expect("Continue on Side is offered");
+        cx.simulate_click(
+            primary.origin + gpui::point(px(12.), primary.size.height / 2.),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert_eq!(continued(&requests), vec![AccountChoice::Account(side)]);
+
+        let others = cx
+            .debug_bounds("limit-continue-others")
+            .expect("the other accounts have an arrow");
+        cx.simulate_click(others.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-continue-on-2").is_none());
+        assert!(cx.debug_bounds("limit-continue-on-1").is_none());
+        let external = cx
+            .debug_bounds("limit-continue-on-external")
+            .expect("the External account is listed");
+        cx.simulate_click(external.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            continued(&requests),
+            vec![AccountChoice::Account(side), AccountChoice::External]
+        );
+
+        // Closed, it comes back with the next turn's stop.
+        let dismiss = cx
+            .debug_bounds("limit-notice-dismiss")
+            .expect("the notice can be closed");
+        cx.simulate_click(dismiss.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-notice").is_none());
+        for working in [true, false] {
+            thread.update(cx, |thread, cx| thread.set_working_for_test(working, cx));
+            cx.run_until_parked();
+        }
+        assert!(cx.debug_bounds("limit-notice").is_some());
+
+        // Once a read finds room again, the error is the agent's own.
+        if let Some(account) = accounts.account_mut(work) {
+            account.status = Some(read(40.));
+        }
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock, accounts)].into(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-notice").is_none());
+        assert!(!at_limit(&view, cx));
+    }
+
+    #[test]
+    fn the_limit_notice_names_the_window_and_its_reset() {
+        let now = SystemTime::now();
+        let window = LimitWindow {
+            label: "Weekly".into(),
+            used_percent: 100.,
+            resets_at: Some(now + Duration::from_secs(112 * 60 + 30)),
+            length: None,
+        };
+        let (title, body) = limit_notice_text(Some("Work"), "Claude Agent", &window, now);
+        assert_eq!(title, "Work reached its weekly limit");
+        assert!(body.starts_with("Claude Agent stopped. The limit resets "));
+        assert!(body.ends_with(", in 1h 52m."));
+        let (title, body) = limit_notice_text(
+            None,
+            "Claude Agent",
+            &LimitWindow {
+                label: "GPT-5 5-hour".into(),
+                resets_at: None,
+                ..window
+            },
+            now,
+        );
+        assert_eq!(title, "Your account reached its GPT-5 5-hour limit");
+        assert_eq!(body, "Claude Agent stopped.");
     }
 
     /// An archived thread takes no messages, so there's nothing to start.
