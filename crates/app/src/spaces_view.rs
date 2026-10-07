@@ -1690,6 +1690,7 @@ impl SpacesView {
                         pane: id,
                     },
                     pane,
+                    Color::Muted,
                     cx,
                 );
                 Some(LayoutPane {
@@ -1826,7 +1827,7 @@ impl SpacesView {
                 }),
                 icon: match project {
                     Some(project) => PlaceIcon::Project(ProjectKey { machine, project }),
-                    None => PlaceIcon::Icon(Icon::new(IconName::Folder)),
+                    None => PlaceIcon::Icon(Icon::new(IconName::Folder).color(Color::Muted)),
                 },
                 label: name.clone().into(),
                 detail: detail.into(),
@@ -1839,7 +1840,7 @@ impl SpacesView {
                         machine,
                         tab: tab.id,
                     }),
-                    icon: PlaceIcon::Icon(Icon::new(IconName::Tab)),
+                    icon: PlaceIcon::Icon(Icon::new(IconName::Tab).color(Color::Muted)),
                     label: tab_name.clone().into(),
                     detail: name.clone().into(),
                     section: "Tabs".into(),
@@ -1849,7 +1850,7 @@ impl SpacesView {
                         machine,
                         pane: pane.id,
                     };
-                    let (icon, title, _) = self.pane_title(key, pane, cx);
+                    let (icon, title, _) = self.pane_title(key, pane, Color::Muted, cx);
                     panes.push(PlaceEntry {
                         place: Place::Pane(key),
                         icon: PlaceIcon::Icon(icon),
@@ -2201,7 +2202,8 @@ impl SpacesView {
             .into();
         let (terminals, agents) = self.space_contents(machine, space, cx);
         let contents = contents_label(terminals, agents);
-        let agent_icons = self.space_agent_icons(machine, space, cx);
+        let faint_icon = Color::Custom(cx.theme().colors().text_muted.opacity(0.4));
+        let agent_icons = self.space_agent_icons(machine, space, faint_icon, cx);
         let has_remotes = self.machines.read(cx).has_remotes();
         // The project the workspace is in now, if any: its icon stands for the workspace.
         let project = self
@@ -2391,9 +2393,13 @@ impl SpacesView {
                                 }))
                         })
                         // The agents by their own icons, a few at most; shells by count.
-                        .children(agent_icons.iter().take(MAX_ROW_AGENT_ICONS).cloned().map(
-                            |icon| icon.size(IconSize::XSmall).color(Color::Custom(faint_text)),
-                        ))
+                        .children(
+                            agent_icons
+                                .iter()
+                                .take(MAX_ROW_AGENT_ICONS)
+                                .cloned()
+                                .map(|icon| icon.size(IconSize::XSmall)),
+                        )
                         .when(agent_icons.len() > MAX_ROW_AGENT_ICONS, |this| {
                             this.child(
                                 Label::new(format!("+{}", agent_icons.len() - MAX_ROW_AGENT_ICONS))
@@ -3037,8 +3043,15 @@ impl SpacesView {
         (terminals, agents)
     }
 
-    /// The icons of the agents in a workspace's panes, each thread once.
-    fn space_agent_icons(&self, machine: MachineId, space: &Space, cx: &App) -> Vec<Icon> {
+    /// The icons of the agents in a workspace's panes, each thread once, in `color` (a thread's
+    /// maybe in its account's).
+    fn space_agent_icons(
+        &self,
+        machine: MachineId,
+        space: &Space,
+        color: Color,
+        cx: &App,
+    ) -> Vec<Icon> {
         let store = self.machines.read(cx).projects(machine, cx);
         let store = store.as_ref().map(|store| store.read(cx));
         let mut threads = HashSet::default();
@@ -3046,7 +3059,7 @@ impl SpacesView {
         for pane in space.tabs.iter().flat_map(|tab| &tab.panes) {
             match &pane.content {
                 PaneContent::Terminal(_) if pane.agent.is_some() => {
-                    icons.push(pane_agent_icon(pane, cx))
+                    icons.push(pane_agent_icon(pane, cx).color(color))
                 }
                 PaneContent::Thread(thread_id) if threads.insert(*thread_id) => {
                     let Some(thread) = store.and_then(|store| store.thread(*thread_id)) else {
@@ -3055,9 +3068,9 @@ impl SpacesView {
                     let has_agent_cli =
                         store.is_some_and(|store| store.terminal_agent(*thread_id).is_some());
                     if thread.terminal.is_none() {
-                        icons.push(thread_agent_icon(thread, cx));
+                        icons.push(thread_agent_icon(machine, thread, color, cx));
                     } else if has_agent_cli {
-                        icons.push(Icon::new(IconName::ZedAgent));
+                        icons.push(Icon::new(IconName::ZedAgent).color(color));
                     }
                 }
                 PaneContent::Terminal(_) | PaneContent::Thread(_) | PaneContent::Unknown(_) => {}
@@ -3099,7 +3112,7 @@ impl SpacesView {
                         machine,
                         pane: pane.id,
                     };
-                    let (icon, title, _) = self.pane_title(key, pane, cx);
+                    let (icon, title, _) = self.pane_title(key, pane, Color::Muted, cx);
                     entries.push(AgentEntry {
                         pane: key,
                         icon,
@@ -3243,7 +3256,7 @@ impl SpacesView {
                     // Under the location, past the state's slot.
                     .pl(AGENT_ROW_INDENT)
                     .gap_2()
-                    .child(entry.icon.size(IconSize::Small).color(Color::Muted))
+                    .child(entry.icon.size(IconSize::Small))
                     .child(
                         div().flex_1().min_w_0().child(
                             Label::new(entry.title)
@@ -3279,11 +3292,13 @@ impl SpacesView {
         }
     }
 
-    /// A pane's icon, title, and a detail: where a terminal is, or a thread's agent.
+    /// A pane's icon in `color` (a thread's maybe in its account's), title, and a detail: where
+    /// a terminal is, or a thread's agent.
     fn pane_title(
         &self,
         key: PaneKey,
         pane: &Pane,
+        color: Color,
         cx: &App,
     ) -> (Icon, SharedString, Option<SharedString>) {
         match &pane.content {
@@ -3301,7 +3316,7 @@ impl SpacesView {
                     let (space, _, _) = self.find_pane(key, cx)?;
                     Some(pane_folder_label(&space, folder).into())
                 });
-                (pane_agent_icon(pane, cx), title.into(), folder)
+                (pane_agent_icon(pane, cx).color(color), title.into(), folder)
             }
             PaneContent::Thread(thread_id) => {
                 let machines = self.machines.read(cx);
@@ -3311,17 +3326,25 @@ impl SpacesView {
                 match thread {
                     // Like the thread's toolbar in the Agents view: its title, then its agent.
                     Some(thread) => (
-                        thread_agent_icon(&thread, cx),
+                        thread_agent_icon(key.machine, &thread, color, cx),
                         thread.title.clone().into(),
                         self.panes.get(&key).and_then(|open| match &open.view {
                             PaneView::Agent(view) => Some(view.read(cx).agent_name(cx)),
                             PaneView::Terminal(_) => None,
                         }),
                     ),
-                    None => (Icon::new(IconName::Chat), "Thread".into(), None),
+                    None => (
+                        Icon::new(IconName::Chat).color(color),
+                        "Thread".into(),
+                        None,
+                    ),
                 }
             }
-            PaneContent::Unknown(_) => (Icon::new(IconName::Screen), "Unknown".into(), None),
+            PaneContent::Unknown(_) => (
+                Icon::new(IconName::Screen).color(color),
+                "Unknown".into(),
+                None,
+            ),
         }
     }
 
@@ -3545,7 +3568,7 @@ impl SpacesView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let (icon, title, _) = self.pane_title(key, pane, cx);
+        let (icon, title, _) = self.pane_title(key, pane, Color::Default, cx);
         let body = match pane.content {
             PaneContent::Terminal(_) => colors.terminal_background,
             PaneContent::Thread(_) | PaneContent::Unknown(_) => colors.editor_background,
@@ -4410,7 +4433,12 @@ impl SpacesView {
             pane: pane.id,
         };
         let colors = cx.theme().colors().clone();
-        let (icon, title, detail) = self.pane_title(key, pane, cx);
+        let icon_color = if is_focused {
+            Color::Default
+        } else {
+            Color::Muted
+        };
+        let (icon, title, detail) = self.pane_title(key, pane, icon_color, cx);
         let status = self.pane_status(key.machine, pane, cx);
         let is_dragged = self
             .pane_drag
@@ -4501,11 +4529,7 @@ impl SpacesView {
             } else {
                 colors.tab_inactive_background
             })
-            .child(icon.size(IconSize::Small).color(if is_focused {
-                Color::Default
-            } else {
-                Color::Muted
-            }))
+            .child(icon.size(IconSize::Small))
             // The title fits first; the detail gives way.
             .child(
                 div().flex_none().max_w(relative(0.6)).child(

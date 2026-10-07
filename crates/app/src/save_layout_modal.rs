@@ -27,6 +27,7 @@ pub fn init(cx: &mut App) {
 #[derive(Clone)]
 pub struct LayoutPane {
     pub id: PaneId,
+    /// Colored already, as a thread's agent icon can be in its account's color.
     pub icon: Icon,
     pub title: SharedString,
     /// What it runs, to run again when the layout opens. Without one it opens a shell.
@@ -137,7 +138,7 @@ impl SaveLayoutModal {
                     this.set_kept(id, *state == ToggleState::Selected, cx)
                 })),
             )
-            .child(pane.icon.clone().size(IconSize::Small).color(Color::Muted))
+            .child(pane.icon.clone().size(IconSize::Small))
             .child(
                 div().flex_1().min_w_0().child(
                     Label::new(pane.title.clone())
@@ -260,7 +261,7 @@ mod tests {
         };
         let pane = |id: u64, command: Option<&str>| LayoutPane {
             id: PaneId(id),
-            icon: Icon::new(IconName::Terminal),
+            icon: Icon::new(IconName::Terminal).color(Color::Muted),
             title: command.unwrap_or("Shell").to_string().into(),
             command: command.map(str::to_string),
         };

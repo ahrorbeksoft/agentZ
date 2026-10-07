@@ -41,6 +41,7 @@ pub enum Place {
 
 #[derive(Clone)]
 pub enum PlaceIcon {
+    /// Colored already: a thread's agent icon can be in its account's color.
     Icon(Icon),
     /// The project's own icon, as its rows show it.
     Project(ProjectKey),
@@ -83,7 +84,7 @@ pub fn thread_places(cx: &App) -> Vec<PlaceEntry> {
                     machine,
                     thread: thread.id,
                 }),
-                icon: PlaceIcon::Icon(thread_agent_icon(&thread, cx)),
+                icon: PlaceIcon::Icon(thread_agent_icon(machine, &thread, Color::Muted, cx)),
                 label: thread.title.into(),
                 detail,
                 section: "Threads".into(),
@@ -217,11 +218,7 @@ impl GoToPicker {
 
     fn render_icon(icon: &PlaceIcon, cx: &App) -> AnyElement {
         match icon {
-            PlaceIcon::Icon(icon) => icon
-                .clone()
-                .size(IconSize::Small)
-                .color(Color::Muted)
-                .into_any_element(),
+            PlaceIcon::Icon(icon) => icon.clone().size(IconSize::Small).into_any_element(),
             PlaceIcon::Project(key) => {
                 let project = Machines::global(cx)
                     .read(cx)

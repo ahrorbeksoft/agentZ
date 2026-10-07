@@ -224,6 +224,16 @@ impl AgentAccounts {
         }
     }
 
+    /// The color the agent's icon takes on the account's threads: the account's own, while the
+    /// agent lists more than one account. With one, there's nothing to tell apart.
+    pub fn thread_color(&self, account: Option<AccountId>) -> Option<&str> {
+        let listed = usize::from(self.lists_external()) + self.accounts.len();
+        if listed < 2 {
+            return None;
+        }
+        self.choices(account)?.color.as_deref()
+    }
+
     /// Rename's name for the account, else the email or name its last read found.
     pub fn name(&self, account: Option<AccountId>) -> Option<String> {
         let label = self.choices(account)?.label.clone();
@@ -496,6 +506,35 @@ mod tests {
 
         accounts.set_logged_in(None, false);
         assert_eq!(accounts.listed(), [Some(id)]);
+    }
+
+    #[test]
+    fn colors_threads_only_while_there_are_accounts_to_tell_apart() {
+        let mut accounts = AgentAccounts::default();
+        let blue = Some("#2563eb".to_string());
+        accounts
+            .change(None, AccountChange::SetColor(blue.clone()))
+            .expect("color");
+        assert_eq!(accounts.thread_color(None), None);
+
+        let first = accounts.add();
+        assert_eq!(accounts.thread_color(None), blue.as_deref());
+        // Without a color of its own, its icon stays as it was.
+        assert_eq!(accounts.thread_color(Some(first)), None);
+        assert_eq!(accounts.thread_color(Some(AccountId(9))), None);
+
+        accounts.set_logged_in(None, false);
+        assert_eq!(accounts.thread_color(None), None);
+        let second = accounts.add();
+        accounts
+            .change(
+                Some(second),
+                AccountChange::SetColor(Some("#16a34a".into())),
+            )
+            .expect("color");
+        assert_eq!(accounts.thread_color(Some(second)), Some("#16a34a"));
+        // An External thread keeps its color while the normal home is logged out.
+        assert_eq!(accounts.thread_color(None), blue.as_deref());
     }
 
     #[test]

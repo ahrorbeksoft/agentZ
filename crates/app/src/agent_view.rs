@@ -50,6 +50,7 @@ use crate::attachment_image::{
     AttachmentImage, ImagePreviewTooltip, ImageViewer, render_hover_preview,
 };
 use crate::confirm_dialog::ConfirmRequest;
+use crate::controls::account_color;
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
@@ -838,11 +839,7 @@ impl AgentView {
             .bg(colors.editor_background)
             .border_t_1()
             .border_color(colors.border)
-            .child(
-                self.agent_icon(cx)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(self.thread_agent_icon(cx).size(IconSize::Small))
             .child(
                 div().flex_1().min_w_0().child(
                     Label::new(format!(
@@ -2094,6 +2091,17 @@ impl AgentView {
             Some(markup) => Icon::from_svg_markup(markup),
             None => Icon::new(IconName::Terminal),
         }
+    }
+
+    /// The agent's icon along a conversation: muted, or in the thread's account's color. The
+    /// new thread screen shows the account in the strip under its composer instead.
+    fn thread_agent_icon(&self, cx: &App) -> Icon {
+        let account_color = self.agent_id.as_ref().and_then(|agent_id| {
+            let account = self.store.read(cx).thread(self.thread_id)?.account;
+            self.account_icon_color(agent_id, account, cx)
+        });
+        self.agent_icon(cx)
+            .color(account_color.unwrap_or(Color::Muted))
     }
 
     pub(crate) fn agent_name(&self, cx: &App) -> SharedString {
@@ -4568,7 +4576,7 @@ impl AgentView {
         Some(handoff.from_title.clone().into())
     }
 
-    /// A thread's agent, by name, and its icon.
+    /// A thread's agent, by name, and its icon: muted, or in the thread's account's color.
     fn thread_agent(&self, thread: &projects::Thread, cx: &App) -> (SharedString, Icon) {
         let agent_id = thread.agent_id.clone().map(AgentId::new);
         let name = agent_id
@@ -4582,7 +4590,22 @@ impl AgentView {
             .and_then(|agent_id| agent_icon(agent_id, cx))
             .map(Icon::from_svg_markup)
             .unwrap_or_else(|| Icon::new(IconName::Sparkle));
-        (name, icon)
+        let account_color = agent_id
+            .as_ref()
+            .and_then(|agent_id| self.account_icon_color(agent_id, thread.account, cx));
+        (name, icon.color(account_color.unwrap_or(Color::Muted)))
+    }
+
+    /// The color the agent's icon takes on the account's threads
+    /// ([`agentz_protocol::accounts::AgentAccounts::thread_color`]).
+    fn account_icon_color(
+        &self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        cx: &App,
+    ) -> Option<Color> {
+        let hex = self.client.read(cx).thread_color(agent_id, account)?;
+        account_color(hex, cx).map(Color::Custom)
     }
 
     /// The divider that opens a continued thread: where it came from.
@@ -4608,7 +4631,7 @@ impl AgentView {
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         )
-                        .child(icon.size(IconSize::XSmall).color(Color::Muted))
+                        .child(icon.size(IconSize::XSmall))
                         .child(
                             Label::new(format!("{agent_name} ·"))
                                 .size(LabelSize::Small)
@@ -4668,7 +4691,7 @@ impl AgentView {
                             .rounded_lg()
                             .border_1()
                             .border_color(colors.border)
-                            .child(icon.size(IconSize::Small).color(Color::Muted))
+                            .child(icon.size(IconSize::Small))
                             .child(
                                 v_flex()
                                     .flex_1()
@@ -4704,7 +4727,7 @@ impl AgentView {
             store
                 .thread(handoff.from)
                 .map(|from| self.thread_agent(from, cx).1)
-                .unwrap_or_else(|| Icon::new(IconName::Sparkle))
+                .unwrap_or_else(|| Icon::new(IconName::Sparkle).color(Color::Muted))
         };
         let colors = cx.theme().colors().clone();
         let messages = match handoff.messages {
@@ -4734,7 +4757,7 @@ impl AgentView {
                     .size(IconSize::XSmall)
                     .color(Color::Muted),
             )
-            .child(icon.size(IconSize::XSmall).color(Color::Muted))
+            .child(icon.size(IconSize::XSmall))
             .child(
                 div()
                     .min_w_0()
@@ -4937,9 +4960,7 @@ impl AgentView {
                                             .gap_1()
                                             .px_1()
                                             .child(
-                                                self.agent_icon(cx)
-                                                    .size(IconSize::XSmall)
-                                                    .color(Color::Muted),
+                                                self.thread_agent_icon(cx).size(IconSize::XSmall),
                                             )
                                             .child(
                                                 Label::new(agent_name)

@@ -421,6 +421,11 @@ impl ServerClient {
         self.accounts.get(agent_id).cloned().unwrap_or_default()
     }
 
+    /// [`AgentAccounts::thread_color`], as `#rrggbb`.
+    pub fn thread_color(&self, agent_id: &AgentId, account: Option<AccountId>) -> Option<&str> {
+        self.accounts.get(agent_id)?.thread_color(account)
+    }
+
     fn set_accounts(&mut self, accounts: BTreeMap<AgentId, AgentAccounts>, cx: &mut Context<Self>) {
         if accounts != self.accounts {
             self.accounts = accounts;
