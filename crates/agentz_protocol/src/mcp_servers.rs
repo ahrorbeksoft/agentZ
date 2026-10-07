@@ -1,0 +1,172 @@
+//! agentZ's own MCP servers (design/accounts decisions.md §19): kept by the server in
+//! `mcp-servers.json` in its data directory and given to every agent's sessions, beside agentZ's
+//! own `agentz` server, as Zed gives its context servers.
+
+use serde::{Deserialize, Serialize};
+
+/// The name of the server agentZ gives every thread for its own tools.
+pub const AGENTZ_SERVER_NAME: &str = "agentz";
+
+/// Agents that ignore the MCP servers ACP gives them (design/accounts plan.md): their
+/// sessions get none of agentZ's.
+pub const IGNORES_MCP_SERVERS: [&str; 4] = ["autohand", "cline", "cortex-code", "pi-acp"];
+
+/// One of agentZ's MCP servers, as Settings › MCP Servers lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServer {
+    /// What agents know it by.
+    pub name: String,
+    /// Turned off with its switch, it stays listed but goes to no session.
+    pub enabled: bool,
+    pub transport: McpTransport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpTransport {
+    /// A program each agent starts for its session (ACP's stdio server).
+    Local {
+        /// A path, or a program found on the `PATH` of the machine the agent runs on.
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    /// A server agents reach over HTTP (ACP's streamable HTTP server). Only agents that
+    /// announce `mcpCapabilities.http` take it.
+    Remote {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+impl McpServer {
+    pub fn is_remote(&self) -> bool {
+        matches!(self.transport, McpTransport::Remote { .. })
+    }
+
+    /// The command line or the URL, as its row shows it.
+    pub fn detail(&self) -> String {
+        match &self.transport {
+            McpTransport::Local { command, args, .. } => std::iter::once(command)
+                .chain(args)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+            McpTransport::Remote { url, .. } => url.clone(),
+        }
+    }
+
+    /// Zed's checks of its form, in its words. `others` are the names of the other servers.
+    pub fn validate<'a>(&self, others: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("Server name is required.".into());
+        }
+        if name == AGENTZ_SERVER_NAME || others.into_iter().any(|other| other == name) {
+            return Err(format!("A server named \"{name}\" already exists."));
+        }
+        match &self.transport {
+            McpTransport::Local { command, env, .. } => {
+                if command.trim().is_empty() {
+                    return Err("Command is required.".into());
+                }
+                no_duplicates(env, "environment variable")
+            }
+            McpTransport::Remote { url, headers } => {
+                if url.trim().is_empty() {
+                    return Err("URL is required.".into());
+                }
+                if let Err(error) = url::Url::parse(url) {
+                    return Err(format!("Invalid URL: {error}"));
+                }
+                no_duplicates(headers, "header")
+            }
+        }
+    }
+}
+
+fn no_duplicates(pairs: &[(String, String)], label: &str) -> Result<(), String> {
+    for (index, (key, _)) in pairs.iter().enumerate() {
+        if pairs[..index].iter().any(|(other, _)| other == key) {
+            return Err(format!("Duplicate {label} \"{key}\"."));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local(name: &str, command: &str, env: &[(&str, &str)]) -> McpServer {
+        McpServer {
+            name: name.into(),
+            enabled: true,
+            transport: McpTransport::Local {
+                command: command.into(),
+                args: vec!["-y".into(), "server-github".into()],
+                env: env
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            },
+        }
+    }
+
+    fn remote(url: &str, headers: &[(&str, &str)]) -> McpServer {
+        McpServer {
+            name: "docs".into(),
+            enabled: true,
+            transport: McpTransport::Remote {
+                url: url.into(),
+                headers: headers
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn checks_the_form_as_zed_does() {
+        assert_eq!(local("github", "npx", &[]).validate([]), Ok(()));
+        assert_eq!(local("github", "npx", &[]).detail(), "npx -y server-github");
+        assert_eq!(
+            local(" ", "npx", &[]).validate([]),
+            Err("Server name is required.".into())
+        );
+        assert_eq!(
+            local("github", "  ", &[]).validate([]),
+            Err("Command is required.".into())
+        );
+        assert_eq!(
+            local("github", "npx", &[]).validate(["linear", "github"]),
+            Err("A server named \"github\" already exists.".into())
+        );
+        assert_eq!(
+            local("agentz", "npx", &[]).validate([]),
+            Err("A server named \"agentz\" already exists.".into())
+        );
+        assert_eq!(
+            local("github", "npx", &[("FOO", "1"), ("FOO", "2")]).validate([]),
+            Err("Duplicate environment variable \"FOO\".".into())
+        );
+        assert_eq!(
+            remote("https://mcp.linear.app/mcp", &[]).validate([]),
+            Ok(())
+        );
+        assert_eq!(remote("", &[]).validate([]), Err("URL is required.".into()));
+        assert!(
+            remote("mcp.linear.app", &[])
+                .validate([])
+                .is_err_and(|error| error.starts_with("Invalid URL"))
+        );
+        assert_eq!(
+            remote(
+                "https://mcp.linear.app/mcp",
+                &[("Authorization", "a"), ("Authorization", "b")]
+            )
+            .validate([]),
+            Err("Duplicate header \"Authorization\".".into())
+        );
+    }
+}

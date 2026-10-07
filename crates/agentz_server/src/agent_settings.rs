@@ -100,7 +100,10 @@ pub(crate) fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(value)?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+    // Renamed into place, so a reader never sees it half written.
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, json).with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]

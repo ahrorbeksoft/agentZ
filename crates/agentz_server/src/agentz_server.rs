@@ -17,6 +17,7 @@ mod git;
 #[cfg(unix)]
 pub mod handoff;
 mod machine_kind;
+mod mcp_servers;
 mod repositories;
 mod server;
 mod skills;

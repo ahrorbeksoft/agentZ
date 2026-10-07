@@ -12,6 +12,7 @@ use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
 use agentz_protocol::accounts::{AccountId, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::layout::PaneId;
+use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
 use agentz_protocol::terminal::TerminalKey;
@@ -102,6 +103,8 @@ pub struct ServerClient {
     accounts: BTreeMap<AgentId, AgentAccounts>,
     /// agentZ's skills on this machine.
     skills: Vec<Skill>,
+    /// agentZ's MCP servers on this machine.
+    mcp_servers: Vec<McpServer>,
     /// The Workspaces view's spaces on this machine.
     spaces: SpacesSnapshot,
     /// Pane agents that finished working since this window last showed them (herdr's unseen
@@ -155,6 +158,7 @@ impl ServerClient {
                 agent_settings: BTreeMap::new(),
                 accounts: BTreeMap::new(),
                 skills: Vec::new(),
+                mcp_servers: Vec::new(),
                 spaces: SpacesSnapshot::default(),
                 unseen_panes: BTreeSet::new(),
                 machine_icon: MachineIcon::default(),
@@ -453,6 +457,26 @@ impl ServerClient {
         self.set_skills(skills, cx);
     }
 
+    pub fn mcp_servers(&self) -> &[McpServer] {
+        &self.mcp_servers
+    }
+
+    fn set_mcp_servers(&mut self, mcp_servers: Vec<McpServer>, cx: &mut Context<Self>) {
+        if mcp_servers != self.mcp_servers {
+            self.mcp_servers = mcp_servers;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_mcp_servers_for_test(
+        &mut self,
+        mcp_servers: Vec<McpServer>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_mcp_servers(mcp_servers, cx);
+    }
+
     #[cfg(test)]
     pub fn set_agent_settings_for_test(
         &mut self,
@@ -688,6 +712,7 @@ impl ServerClient {
         self.set_agent_settings(session.agent_settings, cx);
         self.set_accounts(session.accounts, cx);
         self.set_skills(session.skills, cx);
+        self.set_mcp_servers(session.mcp_servers, cx);
         self.set_spaces(session.spaces, cx);
         self.set_machine_icon_state(session.machine_icon, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
@@ -712,6 +737,7 @@ impl ServerClient {
                     | Event::AgentSettings(_)
                     | Event::Accounts(_)
                     | Event::Skills(_)
+                    | Event::McpServers(_)
                     | Event::Spaces(_)
                     | Event::MachineIcon(_)
             )
@@ -727,6 +753,7 @@ impl ServerClient {
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
             Event::Accounts(accounts) => self.set_accounts(accounts, cx),
             Event::Skills(skills) => self.set_skills(skills, cx),
+            Event::McpServers(mcp_servers) => self.set_mcp_servers(mcp_servers, cx),
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::Thread { connection, update } => {

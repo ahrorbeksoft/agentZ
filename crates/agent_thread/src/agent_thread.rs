@@ -3010,6 +3010,7 @@ async fn open_session(
     previous_session: Option<acp::SessionId>,
     mcp_servers: Vec<acp::McpServer>,
 ) -> std::result::Result<SessionSetup, agent_client_protocol::Error> {
+    let mcp_servers = servers_the_agent_takes(&capabilities.mcp_capabilities, mcp_servers);
     if mcp_servers.is_empty() {
         return open_session_with(connection, capabilities, cwd, previous_session, mcp_servers)
             .await;
@@ -3032,6 +3033,22 @@ async fn open_session(
         }
         result => result,
     }
+}
+
+/// Every agent takes stdio servers; HTTP and SSE ones only go to agents that announce them, as
+/// ACP asks.
+fn servers_the_agent_takes(
+    capabilities: &acp::McpCapabilities,
+    mcp_servers: Vec<acp::McpServer>,
+) -> Vec<acp::McpServer> {
+    mcp_servers
+        .into_iter()
+        .filter(|server| match server {
+            acp::McpServer::Http(_) => capabilities.http,
+            acp::McpServer::Sse(_) => capabilities.sse,
+            _ => true,
+        })
+        .collect()
 }
 
 async fn open_session_with(

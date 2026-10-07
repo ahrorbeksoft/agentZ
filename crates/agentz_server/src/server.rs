@@ -8,6 +8,7 @@ mod hand_off;
 mod key_logins;
 mod limit_waits;
 mod login_checks;
+mod mcp_server_requests;
 mod prompt_requests;
 mod queue_requests;
 mod session_requests;
@@ -32,6 +33,7 @@ use agentz_protocol::agents::{
     AgentId, AgentListing, AgentSettings, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
+use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, McpServer};
 use agentz_protocol::skills::Skill;
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::{
@@ -55,6 +57,7 @@ use crate::browser;
 use crate::checkpoints::Checkpoints;
 use crate::continuations;
 use crate::machine_kind;
+use crate::mcp_servers;
 use crate::repositories::{self, RepositoryChecks};
 use crate::skills;
 use crate::spaces::SpaceStore;
@@ -203,6 +206,8 @@ pub(crate) struct Server {
     /// Where the last sync linked them, and the accounts' revision then.
     skill_targets_synced: Vec<skills::SkillTarget>,
     skill_accounts_revision: u64,
+    /// agentZ's MCP servers, given to every session opened.
+    mcp_servers: Vec<McpServer>,
     threads: HashMap<ThreadId, AgentThread>,
     login_sessions: HashMap<u64, LoginSession>,
     next_login_session_id: u64,
@@ -218,6 +223,7 @@ pub(crate) struct Server {
     agent_settings_revision_sent: u64,
     accounts_revision_sent: u64,
     skills_sent: Vec<Skill>,
+    mcp_servers_sent: Vec<McpServer>,
     machine_icon_sent: MachineIcon,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
@@ -269,6 +275,7 @@ impl Server {
             Some(&data_dir.join("settings.json")),
         );
         let accounts = AccountStore::load(Some(data_dir.join("agents").join("accounts.json")));
+        let mcp_servers = mcp_servers::load(&data_dir).log_err().unwrap_or_default();
         let http_client = config.http_client;
         let (mut registry, registry_inbox) = AgentRegistryStore::new(
             runtime.clone(),
@@ -325,6 +332,7 @@ impl Server {
             agent_settings_revision_sent: agent_settings.revision(),
             accounts_revision_sent: accounts.revision(),
             skills_sent: Vec::new(),
+            mcp_servers_sent: mcp_servers.clone(),
             projects,
             repository_checks: RepositoryChecks::default(),
             git_head_folders: BTreeSet::new(),
@@ -341,6 +349,7 @@ impl Server {
             skills_synced: false,
             skill_targets_synced: Vec::new(),
             skill_accounts_revision: 0,
+            mcp_servers,
             threads: HashMap::default(),
             login_sessions: HashMap::default(),
             next_login_session_id: 1,
@@ -728,6 +737,7 @@ impl Server {
                     agent_settings: self.agent_settings.all().clone(),
                     accounts: self.accounts.all().clone(),
                     skills: self.skills.clone(),
+                    mcp_servers: self.mcp_servers.clone(),
                     spaces: self.spaces.snapshot(),
                     machine_icon: self.machine_icon.clone(),
                 }))
@@ -1066,6 +1076,9 @@ impl Server {
             request @ (Request::AddSkill(_)
             | Request::CreateSkill { .. }
             | Request::DeleteSkill(_)) => self.skill_request(request),
+            request @ (Request::SaveMcpServer { .. }
+            | Request::DeleteMcpServer(_)
+            | Request::SetMcpServerEnabled { .. }) => self.mcp_server_request(request),
             Request::ContinueAtReset { thread_id, on } => {
                 self.continue_at_reset(thread_id, on)?;
                 Ok(Response::Ok)
@@ -1402,7 +1415,7 @@ impl Server {
             let token = uuid::Uuid::new_v4().to_string();
             self.tool_sessions.insert(token.clone(), thread_id);
             mcp_servers.push(acp::McpServer::Stdio(
-                acp::McpServerStdio::new("agentz", &control.executable)
+                acp::McpServerStdio::new(AGENTZ_SERVER_NAME, &control.executable)
                     .args(vec!["mcp-bridge".into()])
                     .env(vec![
                         acp::EnvVariable::new(
@@ -1456,6 +1469,7 @@ impl Server {
         if let Some(revision) = agent_thread.conversation_revision() {
             self.saved_transcripts.insert(thread_id, revision);
         }
+        mcp_servers.extend(mcp_servers::for_session(&self.mcp_servers, &agent_id));
         agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_turn_hook(self.turn_hook(cwd, thread_id));
         agent_thread.set_attachments(Attachments::for_thread(&self.data_dir, thread_id));
@@ -1897,6 +1911,12 @@ impl Server {
         let model = thread.model_name();
         let config_options = thread.config_options().to_vec();
         let modes = thread.modes().cloned();
+        // Known once it has started.
+        let mcp_capabilities = thread
+            .state
+            .command
+            .is_some()
+            .then(|| thread.state.capabilities.mcp_capabilities.clone());
         let logged_in = thread.state.logged_in;
         let failed = matches!(
             thread.status(),
@@ -1998,6 +2018,12 @@ impl Server {
         // Remembered so clients can name the model of threads that aren't open.
         if let (ConnectionId::Thread(thread_id), Some(model)) = (connection, model) {
             self.projects.set_thread_model(thread_id, model);
+        }
+        // The same for every account, so it's kept in the agent's own settings.
+        if let (Some(agent_id), Some(capabilities)) = (&agent_id, mcp_capabilities) {
+            self.agent_settings.update(agent_id, |settings| {
+                settings.mcp_capabilities = Some(capabilities)
+            });
         }
         // And so the account's settings can list its options without starting it.
         if let Some(agent_id) = &agent_id
@@ -2107,6 +2133,10 @@ impl Server {
         if self.skills != self.skills_sent {
             self.skills_sent = self.skills.clone();
             self.broadcast(Event::Skills(self.skills.clone()));
+        }
+        if self.mcp_servers != self.mcp_servers_sent {
+            self.mcp_servers_sent = self.mcp_servers.clone();
+            self.broadcast(Event::McpServers(self.mcp_servers.clone()));
         }
         if self.agent_settings.revision() != self.agent_settings_revision_sent {
             self.agent_settings_revision_sent = self.agent_settings.revision();

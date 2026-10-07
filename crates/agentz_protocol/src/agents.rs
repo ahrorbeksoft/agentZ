@@ -193,6 +193,10 @@ pub struct AgentSettings {
     /// The defaults were copied from another account, which may offer what this one doesn't:
     /// those are dropped once a session lists what this one offers.
     pub copied_defaults: bool,
+    /// The MCP servers the agent said it takes when it last started, kept in the agent's own
+    /// settings for all its accounts, so Settings › MCP Servers can name agents that can't
+    /// take remote ones. `None` until it has started.
+    pub mcp_capabilities: Option<acp::McpCapabilities>,
 }
 
 /// [`crate::Request::ListAgentSessions`]'s answer: the conversations an agent keeps on the

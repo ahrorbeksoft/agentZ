@@ -1955,6 +1955,127 @@ async fn api_key_accounts_keep_their_key() {
 /// agentZ's skills are linked into every account's skills folder, the External one's included,
 /// except where the agent has a skill of its own by that name, and the links follow as skills
 /// and accounts come and go.
+/// agentZ's MCP servers go to every session that's opened, but those turned off, and remote
+/// ones only to agents that take them. Each agent's settings keep what it takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_servers_go_to_every_session() {
+    use agentz_protocol::mcp_servers::{McpServer, McpTransport};
+
+    for takes_http in [false, true] {
+        let Some(mut command) = mock_agent() else {
+            return;
+        };
+        if takes_http {
+            command.env.insert("MOCK_MCP_HTTP".into(), "1".into());
+        }
+        let Some(server) = TestServer::start_with_agent(
+            tempfile::tempdir().expect("temp dir"),
+            tempfile::tempdir().expect("temp dir"),
+            command,
+        ) else {
+            return;
+        };
+        let mut client = server.connect().await;
+        client.ok(Request::SubscribeSession).await;
+        let local = || McpTransport::Local {
+            command: "true".into(),
+            args: vec!["--stdio".into()],
+            env: vec![("TOKEN".into(), "secret".into())],
+        };
+        for (name, transport) in [
+            ("github", local()),
+            (
+                "linear",
+                McpTransport::Remote {
+                    url: "https://mcp.linear.app/mcp".into(),
+                    headers: vec![("Authorization".into(), "Bearer key".into())],
+                },
+            ),
+            ("postgres", local()),
+        ] {
+            client
+                .ok(Request::SaveMcpServer {
+                    replacing: None,
+                    server: McpServer {
+                        name: name.into(),
+                        enabled: true,
+                        transport,
+                    },
+                })
+                .await;
+        }
+        client
+            .ok(Request::SetMcpServerEnabled {
+                name: "postgres".into(),
+                enabled: false,
+            })
+            .await;
+        client
+            .wait_until(|client| {
+                client.events.iter().rev().find_map(|event| match event {
+                    Event::McpServers(servers) => Some(
+                        servers
+                            .iter()
+                            .map(|server| (server.name.as_str(), server.enabled))
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                }) == Some(vec![
+                    ("github", true),
+                    ("linear", true),
+                    ("postgres", false),
+                ])
+            })
+            .await;
+        let error = client
+            .request(Request::SaveMcpServer {
+                replacing: None,
+                server: McpServer {
+                    name: "github".into(),
+                    enabled: true,
+                    transport: local(),
+                },
+            })
+            .await
+            .expect_err("a second github");
+        assert_eq!(error.message, "A server named \"github\" already exists.");
+
+        let thread_id = client.create_thread(&server).await;
+        let connection = ConnectionId::Thread(thread_id);
+        client.subscribe_thread(connection).await;
+        client
+            .ok(Request::Prompt {
+                connection,
+                prompt: PromptPart::text("mcp-servers"),
+            })
+            .await;
+        let expected = if takes_http {
+            "MCP servers: github, linear (http)"
+        } else {
+            "MCP servers: github"
+        };
+        client
+            .wait_until(|client| {
+                let thread = client.thread(connection);
+                !thread.is_working() && agent_text(thread) == expected
+            })
+            .await;
+        client
+            .wait_until(|client| {
+                client.events.iter().rev().find_map(|event| match event {
+                    Event::AgentSettings(settings) => Some(
+                        settings
+                            .get(&AgentId::new("mock"))
+                            .and_then(|settings| settings.mcp_capabilities.as_ref())
+                            .is_some_and(|capabilities| capabilities.http == takes_http),
+                    ),
+                    _ => None,
+                }) == Some(true)
+            })
+            .await;
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn skills_are_linked_into_every_account() {

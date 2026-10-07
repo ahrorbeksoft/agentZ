@@ -276,6 +276,13 @@ Notes for whoever continues:
   account rather than load it twice. Choices of mine, not on the board: Add from Folder…
   sends at most 32 MB and leaves out `.git` and `.DS_Store`; Open ↗ is off for another
   machine's skills, whose `SKILL.md` isn't on this Mac.
+- MCP servers (item 24): Zed's form is a sub-page of its settings, not a dialog, so agentZ's
+  is too, and Uninstall removes a server at once, as Zed's does. Zed's Timeout and OAuth
+  Client ID fields are left out: ACP passes neither to the agent. A command without a slash
+  is looked up on the server's `PATH`, since ACP wants an absolute path. Cline, Cortex Code
+  and the pi and Autohand adapters ignore ACP's servers, so they get none and the page says
+  so; agents that take local servers only are named under each remote server once a thread
+  or login session has started them.
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -302,7 +309,7 @@ Notes for whoever continues:
 | 21 | 10 | Extra usage: the balance, with Manage | done |
 | 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | done |
 | 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | dropped |
-| 24 | 19 | Settings › MCP Servers, passed to every session | |
+| 24 | 19 | Settings › MCP Servers, passed to every session | done |
 | 25 | 20 | The accounts menu on each skill and server | |
 | 26 | | Importing skills and servers from another machine (board topic first) | |
 | 27 | | Wave 2, one agent per commit | |

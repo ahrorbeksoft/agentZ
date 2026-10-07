@@ -87,7 +87,7 @@ so an open tool call's output raced the conversation.
 |---|---|
 | `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
-| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
+| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
@@ -137,6 +137,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `accounts/<agent id>/<account id>/` | server | An agentZ account's home: the agent's login, sessions and own settings files |
 | `accounts/<agent id>/reader/` | server | Where the agent's reader runs its terminal UI (Droid's), with the settings it runs with |
 | `skills/<name>/` | server | agentZ's skills (Settings › Skills), each linked into every account's skills folder |
+| `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
@@ -244,7 +245,8 @@ Each entry: what it does, where it lives, and where it comes from.
   threads in faint text.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
   combining repositories), Appearance (Zed's theme modes), Notifications (sounds and macOS
-  notifications, see Attention states), Agents, Usage, Skills, Machines, and a page per project
+  notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, and a page
+  per project
   (with Checkouts).
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
   installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
@@ -318,6 +320,24 @@ Each entry: what it does, where it lives, and where it comes from.
   Claude's accounts are linked first and Devin skips a skill it finds linked there. Only links
   into `skills/` are ever removed. With more than one machine, the Agents page's machine
   picker sits in the header.
+- **Settings › MCP Servers** (`settings_page/mcp_servers.rs`, `agentz_server::mcp_servers`,
+  `server/mcp_server_requests.rs`; Zed's MCP Servers page and form, accounts topic 19):
+  agentZ's own MCP servers on the machine, kept in `mcp-servers.json`, which every agent and
+  account gets in agentZ threads (not the agents' CLIs in a terminal). Each row has the name, a
+  Local or Remote tag, the command line or URL, a line naming the installed agents that don't
+  get it, then Configure, Uninstall (at once, as in Zed) and a switch that turns it off
+  (`Request::SetMcpServerEnabled`). Add Server is Add Local Server (Server Name, Command,
+  Arguments, Environment Variables) and Add Remote Server (Server Name, URL, Headers), Zed's
+  form as a sub-page with its checks and words; Zed's timeout and OAuth client ID are left out,
+  ACP having neither (`Request::SaveMcpServer`). `start_thread` adds the enabled ones to the
+  session's servers after `agentz` (`mcp_servers::for_session`; a bare command is looked up on
+  the server's `PATH`, as ACP wants an absolute path), and `agent_thread`'s `open_session`
+  leaves out HTTP and SSE servers its agent doesn't announce in `mcpCapabilities`. Agents that
+  ignore ACP's servers (`IGNORES_MCP_SERVERS`: Cline, Cortex Code, the pi and Autohand
+  adapters) get none. What each agent announced is kept in its own settings
+  (`AgentSettings::mcp_capabilities`) when a thread or login session starts it, so the page
+  can say "Not given to Factory Droid, which takes local servers only." for remote servers.
+  With more than one machine, the Agents page's machine picker sits in the header.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
   Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
 

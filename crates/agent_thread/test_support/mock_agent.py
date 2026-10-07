@@ -67,7 +67,9 @@ A prompt of "form" asks the client to fill in a form (a session elicitation) and
 It supports `session/close`, and with MOCK_CLOSED_FILE set, notes each closed session there.
 
 With MOCK_REJECT_MCP set, `session/new` and `session/load` fail when given any MCP server, as
-Factory Droid 0.233.0's do.
+Factory Droid 0.233.0's do. With MOCK_MCP_HTTP set, it announces that it takes HTTP MCP
+servers. A prompt of "mcp-servers" replies "MCP servers: <names>", with "(http)" after the
+HTTP ones, or "MCP servers: none".
 
 With MOCK_STEERING set, it takes messages into a running turn (`_session/steering`), as Claude
 Agent and Codex do: one sent while a "permission" turn waits for its answer joins that turn,
@@ -599,6 +601,7 @@ for line in sys.stdin:
                              "sessionCapabilities": session_capabilities,
                              "promptCapabilities": {"embeddedContext": True,
                                                     "image": bool(os.environ.get("MOCK_IMAGES"))},
+                             "mcpCapabilities": {"http": bool(os.environ.get("MOCK_MCP_HTTP"))},
                              "auth": {"logout": {}}},
                          "authMethods": auth_methods}})
         send_auth_status()
@@ -689,6 +692,12 @@ for line in sys.stdin:
                              "options": [
                                  {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
                                  {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}})
+        elif prompt_text == "mcp-servers":
+            names = [server["name"] + (" (http)" if server.get("type") == "http" else "")
+                     for server in mcp_servers]
+            update(params["sessionId"], text_chunk("agent_message_chunk",
+                                                   "MCP servers: " + (", ".join(names) or "none")))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "mcp" or prompt_text.startswith("mcp "):
             parts = prompt_text.split(" ", 2)
             name = parts[1] if len(parts) > 1 else None

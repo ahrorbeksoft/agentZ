@@ -1,7 +1,9 @@
 //! The settings page, laid out like t3code's: a list of sections on the left (General,
-//! Appearance, Notifications, Agents, Usage, Skills, Machines, then one entry per project) and
+//! Appearance, Notifications, Agents, Usage, Skills, MCP Servers, Machines, then one entry per
+//! project) and
 //! the chosen section's rows on the right.
 
+mod mcp_servers;
 mod skills;
 
 use std::collections::{HashMap, HashSet};
@@ -117,6 +119,7 @@ enum Section {
     Agents,
     Usage,
     Skills,
+    McpServers,
     Machines,
     Project(ProjectKey),
 }
@@ -161,6 +164,9 @@ pub struct SettingsPage {
     skill_error: Option<SharedString>,
     /// Add from Folder…, from picking the folder until the server has the skill.
     adding_skill: Option<Task<()>>,
+    mcp_servers_page: mcp_servers::McpServersPage,
+    /// Why deleting or switching an MCP server failed.
+    mcp_server_error: Option<SharedString>,
     nav_scroll: ScrollHandle,
     content_scroll: ScrollHandle,
     registry_scroll: UniformListScrollHandle,
@@ -251,6 +257,8 @@ impl SettingsPage {
             skills_page: skills::SkillsPage::List,
             skill_error: None,
             adding_skill: None,
+            mcp_servers_page: mcp_servers::McpServersPage::List,
+            mcp_server_error: None,
             nav_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
             registry_scroll: UniformListScrollHandle::new(),
@@ -388,6 +396,8 @@ impl SettingsPage {
         }
         self.skills_page = skills::SkillsPage::List;
         self.skill_error = None;
+        self.mcp_servers_page = mcp_servers::McpServersPage::List;
+        self.mcp_server_error = None;
         if section == Section::Agents {
             self.registry(cx)
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
@@ -677,6 +687,13 @@ impl SettingsPage {
             self.render_nav_item("Usage", Some(IconName::Gauge), None, Section::Usage, cx),
             self.render_nav_item("Skills", Some(IconName::Book), None, Section::Skills, cx),
             self.render_nav_item(
+                "MCP Servers",
+                Some(IconName::ToolHammer),
+                None,
+                Section::McpServers,
+                cx,
+            ),
+            self.render_nav_item(
                 "Machines",
                 Some(IconName::Server),
                 None,
@@ -797,6 +814,7 @@ impl SettingsPage {
             Section::Agents => "settings-nav-agents".into(),
             Section::Usage => "settings-nav-usage".into(),
             Section::Skills => "settings-nav-skills".into(),
+            Section::McpServers => "settings-nav-mcp-servers".into(),
             Section::Machines => "settings-nav-machines".into(),
             Section::Project(key) => format!(
                 "settings-nav-project-{}-{}",
@@ -5431,6 +5449,7 @@ impl SettingsPage {
             self.agents_page = AgentsPage::Installed;
         }
         self.skill_error = None;
+        self.mcp_server_error = None;
         self.registry(cx)
             .update(cx, |registry, cx| registry.refresh_if_stale(cx));
         cx.notify();
@@ -7122,6 +7141,10 @@ impl Render for SettingsPage {
             Section::Skills => (
                 self.render_skills_header(window, cx),
                 self.render_skills(window, cx),
+            ),
+            Section::McpServers => (
+                self.render_mcp_servers_header(window, cx),
+                self.render_mcp_servers(window, cx),
             ),
             Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
             Section::Project(key) => match self.project(key, cx) {

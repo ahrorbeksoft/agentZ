@@ -634,7 +634,7 @@ fn skip_reason(
     format!("{who} has its own skill named {skill_name}, so it keeps that one.")
 }
 
-fn join_with_and(mut names: Vec<String>) -> String {
+pub(super) fn join_with_and(mut names: Vec<String>) -> String {
     match names.pop() {
         None => String::new(),
         Some(last) if names.is_empty() => last,
@@ -642,7 +642,7 @@ fn join_with_and(mut names: Vec<String>) -> String {
     }
 }
 
-fn render_error(error: SharedString, selector: &'static str) -> AnyElement {
+pub(super) fn render_error(error: SharedString, selector: &'static str) -> AnyElement {
     h_flex()
         .debug_selector(move || selector.into())
         .gap_2()

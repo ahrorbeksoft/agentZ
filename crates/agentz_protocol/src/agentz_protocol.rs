@@ -17,6 +17,7 @@ pub mod agents;
 pub mod attachments;
 pub mod diff;
 pub mod layout;
+pub mod mcp_servers;
 pub mod skills;
 pub mod spaces;
 pub mod terminal;
@@ -44,6 +45,7 @@ use crate::agents::{
 };
 use crate::attachments::{AttachmentData, AttachmentId};
 use crate::diff::{DiffScope, ThreadDiff};
+use crate::mcp_servers::McpServer;
 use crate::skills::{Skill, SkillFile};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
 use crate::terminal::{
@@ -245,9 +247,10 @@ pub struct ErrorResponse {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
-    /// Projects, threads, the registry, agent settings, accounts and skills: a
+    /// Projects, threads, the registry, agent settings, accounts, skills and MCP servers: a
     /// [`Response::Session`] snapshot, then [`Event::Projects`], [`Event::Registry`],
-    /// [`Event::AgentSettings`], [`Event::Accounts`] and [`Event::Skills`].
+    /// [`Event::AgentSettings`], [`Event::Accounts`], [`Event::Skills`] and
+    /// [`Event::McpServers`].
     SubscribeSession,
     /// One connection's conversation: a [`Response::Thread`] snapshot, then
     /// [`Event::Thread`]s. Subscribing to a thread starts its agent if it isn't running.
@@ -644,6 +647,19 @@ pub enum Request {
     },
     /// Deletes one of agentZ's skills, by its name, and its links from every account.
     DeleteSkill(String),
+    /// Adds one of agentZ's MCP servers, or with `replacing`, changes the one of that name.
+    /// Sessions opened from then on get it.
+    SaveMcpServer {
+        replacing: Option<String>,
+        server: McpServer,
+    },
+    /// Deletes one of agentZ's MCP servers, by its name.
+    DeleteMcpServer(String),
+    /// Its switch: an MCP server that's off stays listed, and goes to no session.
+    SetMcpServerEnabled {
+        name: String,
+        enabled: bool,
+    },
 
     /// Adds a thread on the account for each of the agent's sessions from
     /// [`Request::ListAgentSessions`], in the project its folder belongs to. The agent loads
@@ -877,6 +893,9 @@ pub struct SessionSnapshot {
     /// agentZ's skills on the machine, by name.
     #[serde(default)]
     pub skills: Vec<Skill>,
+    /// agentZ's MCP servers on the machine, in the order they were added.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
     #[serde(default)]
     pub spaces: SpacesSnapshot,
     #[serde(default)]
@@ -890,6 +909,7 @@ pub enum Event {
     AgentSettings(BTreeMap<AgentId, AgentSettings>),
     Accounts(BTreeMap<AgentId, AgentAccounts>),
     Skills(Vec<Skill>),
+    McpServers(Vec<McpServer>),
     Spaces(SpacesSnapshot),
     MachineIcon(MachineIcon),
     Thread {
