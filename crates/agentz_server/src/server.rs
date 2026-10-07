@@ -556,6 +556,16 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request:
+                    Request::Authenticate {
+                        connection,
+                        method_id,
+                        meta,
+                    },
+            } => self.authenticate(client, id, connection, method_id, meta),
+            Input::Request {
+                client,
+                id,
                 request: Request::ListFiles(thread_id),
             } => self.list_files(client, id, thread_id),
             Input::Request {
@@ -855,14 +865,7 @@ impl Server {
                 self.update_thread(connection, |thread| thread.clear_plan())?;
                 Ok(Response::Ok)
             }
-            Request::Authenticate {
-                connection,
-                method_id,
-                meta,
-            } => {
-                self.authenticate(connection, method_id, meta)?;
-                Ok(Response::Ok)
-            }
+            Request::Authenticate { .. } => Err(anyhow!("logging in is handled separately")),
             Request::CancelAuthentication(connection) => {
                 self.update_thread(connection, |thread| thread.cancel_authentication())?;
                 Ok(Response::Ok)

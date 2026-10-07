@@ -5,13 +5,13 @@
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::AgentThread;
-use agentz_protocol::ConnectionId;
 use agentz_protocol::accounts::AccountId;
 use agentz_protocol::agents::{AgentCommand, AgentId};
-use anyhow::{Context as _, Result};
+use agentz_protocol::{ConnectionId, Response};
+use anyhow::{Context as _, Result, anyhow};
 use util::ResultExt as _;
 
-use super::Server;
+use super::{ClientId, Server};
 use crate::accounts::{self, KeyLogin};
 
 impl Server {
@@ -25,29 +25,66 @@ impl Server {
         self.account_description(agent_id)?.key_login
     }
 
-    /// Logs the connection's agent in with one of its methods. On an account that can log in
-    /// with a key, an agent started with another key than the login needs (the one entered, or
-    /// none for the agent's other methods) restarts with it first.
+    /// Logs the connection's agent in with one of its methods, then answers the request. On an
+    /// account that can log in with a key, an agent started with another key than the login
+    /// needs (the one entered, or none for the agent's other methods) restarts with it first.
+    /// An entered key is checked with its login's reader before that: Droid takes any key, and
+    /// opens sessions with it.
     pub(super) fn authenticate(
         &mut self,
+        client: ClientId,
+        id: u64,
         connection: ConnectionId,
         method_id: acp::AuthMethodId,
         meta: Option<acp::Meta>,
-    ) -> Result<()> {
+    ) {
         let key_login = self
             .connection_account(connection)
             .and_then(|(agent_id, account)| self.key_login(&agent_id, account));
         let Some(key_login) = key_login else {
-            self.update_thread(connection, |thread| thread.authenticate(method_id, meta))?;
-            return Ok(());
+            let result =
+                self.update_thread(connection, |thread| thread.authenticate(method_id, meta));
+            return self.respond(client, id, result.map(|()| Response::Ok));
         };
         let key = if *method_id.0 == *key_login.method {
-            Some(entered_key(meta.as_ref())?)
+            match entered_key(meta.as_ref()) {
+                Ok(key) => Some(key),
+                Err(error) => return self.respond(client, id, Err(error)),
+            }
         } else {
             None
         };
+        let check = key.as_ref().and_then(|key| {
+            let reader = key_login.reader.clone()?;
+            let command = self.connection_thread(connection)?.state.command.clone()?;
+            let command = with_key(command, &key_login.variable, Some(key.clone()));
+            let http = self.http_client.clone();
+            Some(async move { reader.read(command, http).await })
+        });
+        let Some(check) = check else {
+            let result = self.log_in(connection, method_id, meta, &key_login, key);
+            return self.respond(client, id, result.map(|()| Response::Ok));
+        };
+        self.spawn_then(check, move |server, read| {
+            let result = match read {
+                Ok(read) if read.logged_in == Some(false) => Err(anyhow!("The key was refused.")),
+                Ok(_) => server.log_in(connection, method_id, meta, &key_login, key),
+                Err(error) => Err(error.context("checking the key")),
+            };
+            server.respond(client, id, result.map(|()| Response::Ok));
+        });
+    }
+
+    fn log_in(
+        &mut self,
+        connection: ConnectionId,
+        method_id: acp::AuthMethodId,
+        meta: Option<acp::Meta>,
+        key_login: &KeyLogin,
+        key: Option<String>,
+    ) -> Result<()> {
         self.update_thread(connection, |thread| {
-            let started_with = started_key(thread, &key_login);
+            let started_with = started_key(thread, key_login);
             match thread.state.command.clone() {
                 Some(command) if started_with != key => thread
                     .restart_with(with_key(command, &key_login.variable, key), Some(method_id)),
@@ -55,8 +92,7 @@ impl Server {
                 _ if key.is_some() => thread.authenticate(method_id, None),
                 _ => thread.authenticate(method_id, meta),
             }
-        })?;
-        Ok(())
+        })
     }
 
     /// Logs the connection's agent out. An account that logs in with a key forgets it, and its

@@ -311,6 +311,16 @@ fn mock_accounts() -> crate::AgentDescription {
     }
 }
 
+/// The mock agent's `--usage`, which also says whether `MOCK_API_KEY` is a key that works.
+fn mock_usage_reader(command: &AgentCommand) -> crate::Reader {
+    let mut args = command.args.clone();
+    args.push("--usage".into());
+    crate::Reader::Command(crate::ReaderCommand {
+        program: Some(command.path.to_string_lossy().into_owned()),
+        args,
+    })
+}
+
 fn mock_agent() -> Option<AgentCommand> {
     let path = std::env::var_os("PATH")?;
     let Some(python) = std::env::split_paths(&path)
@@ -1588,8 +1598,8 @@ async fn accounts_run_in_homes_of_their_own() {
 
 /// An account can log in with a key its agent reads from its environment, as with Droid's
 /// "Factory API Key": agentZ asks for the key, keeps it in the account's folder for the user
-/// only, and starts the account's agents with it. A refused key isn't kept, and Log Out
-/// forgets it.
+/// only, and starts the account's agents with it. A key its reader refuses isn't tried, as
+/// Droid would take any key, and Log Out forgets it.
 #[tokio::test(flavor = "multi_thread")]
 async fn api_key_accounts_keep_their_key() {
     let Some(mut command) = mock_agent() else {
@@ -1604,9 +1614,20 @@ async fn api_key_accounts_keep_their_key() {
             .to_string_lossy()
             .into_owned(),
     );
-    let Some(server) =
-        TestServer::start_with_agent(data_dir, tempfile::tempdir().expect("temp dir"), command)
-    else {
+    let description = crate::AgentDescription {
+        key_login: Some(crate::KeyLogin {
+            method: "mock-env-key".into(),
+            variable: "MOCK_API_KEY".into(),
+            reader: Some(mock_usage_reader(&command)),
+        }),
+        ..mock_accounts()
+    };
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
         return;
     };
     let mock = AgentId::new("mock");
@@ -1649,15 +1670,13 @@ async fn api_key_accounts_keep_their_key() {
     };
     assert!(client.request(log_in(None)).await.is_err());
 
-    client.ok(log_in(Some("refused"))).await;
-    client
-        .wait_until(|client| {
-            client
-                .thread(login)
-                .auth_error()
-                .is_some_and(|error| error.contains("refused"))
-        })
-        .await;
+    let refused = client.request(log_in(Some("refused"))).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.message.contains("refused")),
+        "{refused:?}"
+    );
     assert!(!key_file.exists());
 
     client.ok(log_in(Some(" mk-good "))).await;
@@ -1867,13 +1886,8 @@ async fn accounts_read_their_identity_and_limits() {
         "MOCK_LOGIN_FILE".into(),
         external_login.to_string_lossy().into_owned(),
     );
-    let mut usage_args = command.args.clone();
-    usage_args.push("--usage".into());
     let description = crate::AgentDescription {
-        reader: Some(crate::Reader::Command(crate::ReaderCommand {
-            program: Some(command.path.to_string_lossy().into_owned()),
-            args: usage_args,
-        })),
+        reader: Some(mock_usage_reader(&command)),
         ..mock_accounts()
     };
     let work = add_an_account_before_start(data_dir.path());

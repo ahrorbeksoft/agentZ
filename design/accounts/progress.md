@@ -36,10 +36,12 @@ Notes for whoever continues:
   the user's real login needs their go-ahead, since `/limits` holds a billing choice.
 - API-key accounts (item 7): a description's key login is the method that reads a key from a
   variable. agentZ keeps the key in the account's folder and restarts the agent with it to log
-  in. Droid's key reader (`Reader::FactoryApi`) parses `/api/billing/limits` as Droid's own
-  code reads it; no real response has been seen yet, so check it against one. A key account
-  has no email (Factory's `whoami` gives none), and only Factory's US address is used, not
-  its EU one. The app shows the key field once item 8 has the account menus.
+  in. Droid takes any key (checked over ACP: a made-up one passes `authenticate` and opens
+  sessions), so agentZ checks the key with its reader first. Droid's key reader
+  (`Reader::FactoryApi`) parses `/api/billing/limits`; its test answer is a real one, with
+  other numbers. A key account has no email (Factory's `whoami` gives only ids), and only
+  Factory's US address is used, not its EU one. The app shows the key field once item 8 has
+  the account menus.
 
 | Order | § | Item | Status |
 |---|---|---|---|

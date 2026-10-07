@@ -114,7 +114,8 @@ async fn get_with_key(
 }
 
 /// `GET /api/billing/limits`, as Droid 0.234.0's `/limits` reads it: windows for its Standard
-/// Usage (and Droid Core, its other pool) and the Extra Usage balance.
+/// Usage (and Droid Core, its other pool) and the Extra Usage balance. It also says which
+/// pool takes over at a limit (`overagePreference`), for decisions.md §8.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FactoryLimits {
@@ -139,29 +140,7 @@ struct FactoryWindows {
 #[serde(rename_all = "camelCase")]
 struct FactoryWindow {
     used_percent: f64,
-    window_end: Option<FactoryTime>,
-}
-
-/// Droid reads it with `new Date(…)`, which takes either.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum FactoryTime {
-    Text(String),
-    Milliseconds(f64),
-}
-
-impl FactoryTime {
-    fn time(&self) -> Option<SystemTime> {
-        match self {
-            FactoryTime::Text(text) => chrono::DateTime::parse_from_rfc3339(text)
-                .ok()
-                .map(SystemTime::from),
-            FactoryTime::Milliseconds(milliseconds) if *milliseconds >= 0.0 => {
-                Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(milliseconds / 1000.0))
-            }
-            FactoryTime::Milliseconds(_) => None,
-        }
-    }
+    window_end: Option<String>,
 }
 
 /// The Standard Usage windows, by Droid's names for them. Droid Core's pool waits for its tabs
@@ -181,7 +160,11 @@ fn factory_limits(body: &[u8], now: SystemTime) -> Result<AccountStatus> {
     .into_iter()
     .filter_map(|(label, window)| {
         let window = window?;
-        let ends_at = window.window_end.as_ref().and_then(FactoryTime::time);
+        let ends_at = window
+            .window_end
+            .as_deref()
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+            .map(SystemTime::from);
         // A window that ended hasn't started again: Droid shows "Use Droid to start".
         let active = ends_at.filter(|ends_at| *ends_at > now);
         Some(LimitWindow {
@@ -273,20 +256,32 @@ mod tests {
         );
     }
 
-    /// Shaped as Droid 0.234.0's code reads `GET /api/billing/limits`: no real answer was seen
-    /// yet. The weekly window ended, and the monthly one counts in milliseconds.
+    /// A real answer of `GET /api/billing/limits` (October 2026), with other numbers: the
+    /// weekly window ended.
     const FACTORY_LIMITS: &str = r#"{
+        "usesTokenRateLimitsBilling": true,
         "limits": {
             "standard": {
-                "fiveHour": {"usedPercent": 42, "windowEnd": "2026-10-07T12:30:00Z"},
-                "weekly": {"usedPercent": 100, "windowEnd": "2026-10-01T00:00:00Z"},
-                "monthly": {"usedPercent": 12.5, "windowEnd": 1793491200000}
+                "fiveHour": {"usedPercent": 42, "windowEnd": "2026-10-07T12:30:00.000Z",
+                    "secondsRemaining": 9000},
+                "weekly": {"usedPercent": 100, "windowEnd": "2026-10-01T00:00:00.000Z",
+                    "secondsRemaining": 0},
+                "monthly": {"usedPercent": 12.5, "windowEnd": "2026-11-01T19:56:38.307Z",
+                    "secondsRemaining": 2195798}
             },
             "core": {
-                "fiveHour": {"usedPercent": 3, "windowEnd": "2026-10-07T12:30:00Z"}
+                "fiveHour": {"usedPercent": 3, "windowEnd": "2026-10-07T12:30:00.000Z",
+                    "secondsRemaining": 9000},
+                "weekly": {"usedPercent": 4, "windowEnd": "2026-10-13T20:21:42.847Z",
+                    "secondsRemaining": 555702},
+                "monthly": {"usedPercent": 3, "windowEnd": "2026-11-05T20:21:42.847Z",
+                    "secondsRemaining": 2542902}
             }
         },
-        "extraUsageBalanceCents": 1240
+        "overagePreference": "droidCore",
+        "canManageOverage": true,
+        "extraUsageBalanceCents": 1240,
+        "extraUsageAllowed": true
     }"#;
 
     #[test]

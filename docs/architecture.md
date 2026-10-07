@@ -535,10 +535,12 @@ Each entry: what it does, where it lives, and where it comes from.
   (Droid's "Factory API Key"). On an agentZ account that method asks for the key
   (`AgentThread::set_key_method` marks it `LoginInput::ApiKey`), and logging in with it, or
   with another method that the key would override, restarts the agent with the key (or
-  without it), then logs in (`server/key_logins.rs`, `AgentThread::restart_with`). The key
-  is kept in `agentz-api-key` in the account's folder (mode 0600) once that login works, and
-  Log Out forgets it. Such an account (`Account::logs_in_with_key`) has its key login's
-  reader: Droid's calls Factory's billing API with the key.
+  without it), then logs in (`server/key_logins.rs`, `AgentThread::restart_with`). Droid
+  takes any key and opens sessions with it, so an entered key is first checked with the key
+  login's reader, and a refused one fails the login request. The key is kept in
+  `agentz-api-key` in the account's folder (mode 0600) once that login works, and Log Out
+  forgets it. Such an account (`Account::logs_in_with_key`) has its key login's reader:
+  Droid's calls Factory's billing API with the key.
   `Server::agent_command` builds the account's environment from the server's without those
   login variables (`AgentCommand::env_remove`; a terminal login runs through `env -u`), then
   the account's Environment, where a login variable set on purpose stays, then the home
