@@ -254,6 +254,11 @@ pub struct AgentThread {
     /// False for a connection made only to log in or out (from settings), which never opens a
     /// session.
     opens_session: bool,
+    /// The login method that reads a key from the agent's environment, which clients are asked
+    /// for ([`Self::set_key_method`]).
+    key_method: Option<acp::AuthMethodId>,
+    /// The login to start once the restarted agent is up ([`Self::restart_with`]).
+    authenticate_once_connected: Option<acp::AuthMethodId>,
     defaults: SessionDefaults,
     events: Vec<AgentThreadEvent>,
     /// `None` for a thread that never starts.
@@ -479,6 +484,8 @@ impl AgentThread {
             turn_cancelled: None,
             stderr_lines: VecDeque::new(),
             opens_session: true,
+            key_method: None,
+            authenticate_once_connected: None,
             defaults: SessionDefaults::default(),
             events: Vec::new(),
             runtime,
@@ -648,7 +655,13 @@ impl AgentThread {
                 self.view.state.capabilities = connected.capabilities;
                 self.view.state.supports_steering = connected.supports_steering;
                 self.view.state.auth_methods = connected.auth_methods;
+                self.mark_key_method();
                 self.view.state.agent_info = connected.agent_info;
+                if let Some(method_id) = self.authenticate_once_connected.take() {
+                    self.view.state.status = ConnectionStatus::AuthRequired;
+                    self.authenticate(method_id, None);
+                    return;
+                }
                 // A login session opens an empty session too: it is how the login
                 // status (and the agent's settings) can be learned over ACP.
                 self.open_session();
@@ -832,6 +845,13 @@ impl AgentThread {
         let Some(command) = self.view.state.command.clone() else {
             return;
         };
+        self.restart_with(command, None);
+    }
+
+    /// Restarts the agent with `command` in place of the one it runs, as [`Self::reload`] does,
+    /// then logs in with `log_in_with` if given: for a login the agent reads from its
+    /// environment, which only a new process takes.
+    pub fn restart_with(&mut self, command: AgentCommand, log_in_with: Option<acp::AuthMethodId>) {
         // The new agent waits for the old one to close the session it will load.
         let stopping = self.stop_agent();
         self.generation += 1;
@@ -855,6 +875,7 @@ impl AgentThread {
         self.view.state.login_page = None;
         self.view.state.turn_error = None;
         self.view.state.status = ConnectionStatus::Connecting;
+        self.authenticate_once_connected = log_in_with;
         self.set_working(false);
         self.connect_agent(
             async move {
@@ -863,6 +884,32 @@ impl AgentThread {
             }
             .boxed(),
         );
+    }
+
+    /// Marks `method_id`, a login the agent reads from a variable in its environment (Droid's
+    /// "Factory API Key"), as taking an API key, so clients ask for one
+    /// ([`agentz_protocol::thread::LoginInput::ApiKey`]).
+    /// Whoever starts the agent passes the key in that variable.
+    pub fn set_key_method(&mut self, method_id: acp::AuthMethodId) {
+        self.key_method = Some(method_id);
+        self.mark_key_method();
+    }
+
+    fn mark_key_method(&mut self) {
+        let Some(method_id) = &self.key_method else {
+            return;
+        };
+        for method in &mut self.view.state.auth_methods {
+            if let acp::AuthMethod::Agent(method) = method
+                && method.id == *method_id
+            {
+                method
+                    .meta
+                    .get_or_insert_default()
+                    .entry("api-key")
+                    .or_insert_with(|| serde_json::json!({}));
+            }
+        }
     }
 
     /// Takes the agent out of the thread. The future it returns closes the agent's session

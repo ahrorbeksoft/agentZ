@@ -24,6 +24,21 @@ pub struct AgentDescription {
     pub login_check: LoginCheck,
     /// How agentZ reads the account's identity and limits, if it can.
     pub reader: Option<Reader>,
+    /// The agent's login method that takes a key from a variable, if it has one.
+    pub key_login: Option<KeyLogin>,
+}
+
+/// A login method that reads its key from the agent's environment rather than from
+/// `authenticate` (Droid's "Factory API Key"). agentZ keeps an account's key in its folder and
+/// starts the account's agent with the key in `variable`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyLogin {
+    /// The method's id among the agent's login methods.
+    pub method: String,
+    pub variable: String,
+    /// How agentZ reads an account that logs in with a key, in place of the agent's `reader`.
+    pub reader: Option<Reader>,
 }
 
 /// The description of a registry agent, by its id.
@@ -37,13 +52,15 @@ pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
 impl AgentDescription {
     /// Makes `command` run on an agentZ account whose folder is `home`: the server's
     /// environment without the agent's login variables, then the account's Environment
-    /// (`account_env`), then the home variables and file storage switches. A login variable set
-    /// in the account's Environment stays, since the user set it on purpose.
+    /// (`account_env`), then the home variables and file storage switches, then the key it logs
+    /// in with, if any. A login variable set in the account's Environment stays, since the user
+    /// set it on purpose.
     pub fn apply(
         &self,
         command: &mut AgentCommand,
         account_env: BTreeMap<String, String>,
         home: &Path,
+        key: Option<String>,
     ) {
         for variable in &self.login_variables {
             command.env.remove(variable);
@@ -64,6 +81,9 @@ impl AgentDescription {
                 .iter()
                 .map(|(variable, value)| (variable.clone(), value.clone())),
         );
+        if let (Some(key_login), Some(key)) = (&self.key_login, key) {
+            command.env.insert(key_login.variable.clone(), key);
+        }
         let env = &command.env;
         command.env_remove.extend(
             self.login_variables
@@ -89,8 +109,13 @@ mod tests {
             login_variables: vec!["AGENT_API_KEY".into(), "GITHUB_TOKEN".into()],
             login_check: LoginCheck::Session,
             reader: None,
+            key_login: Some(KeyLogin {
+                method: "agent-api-key".into(),
+                variable: "AGENT_API_KEY".into(),
+                reader: None,
+            }),
         };
-        let mut command = AgentCommand {
+        let registry_command = AgentCommand {
             env: [
                 ("AGENT_API_KEY".to_string(), "from-the-registry".to_string()),
                 ("NODE_OPTIONS".to_string(), "--no-warnings".to_string()),
@@ -103,10 +128,12 @@ mod tests {
             ("GITHUB_TOKEN".to_string(), "set-on-purpose".to_string()),
             ("AGENT_HOME".to_string(), "/elsewhere".to_string()),
         ]);
+        let mut command = registry_command.clone();
         description.apply(
             &mut command,
-            account_env,
+            account_env.clone(),
             Path::new("/data/accounts/agent/1"),
+            None,
         );
 
         let env = |variable: &str| command.env.get(variable).map(String::as_str);
@@ -117,6 +144,20 @@ mod tests {
         assert_eq!(env("XDG_DATA_HOME"), Some("/data/accounts/agent/1/data"));
         assert_eq!(env("AGENT_KEYRING"), Some("file"));
         assert_eq!(command.env_remove, ["AGENT_API_KEY"]);
+
+        // An API-key account's own key goes in its place.
+        let mut command = registry_command;
+        description.apply(
+            &mut command,
+            account_env,
+            Path::new("/data/accounts/agent/2"),
+            Some("sk-account".into()),
+        );
+        assert_eq!(
+            command.env.get("AGENT_API_KEY").map(String::as_str),
+            Some("sk-account")
+        );
+        assert!(command.env_remove.is_empty());
     }
 
     #[test]

@@ -531,12 +531,20 @@ Each entry: what it does, where it lives, and where it comes from.
   `accounts/droid.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the switches that keep
   its login in a file rather than a shared keychain entry, the variables that log it in, its
-  login check and its reader.
+  login check and its reader, and its key login: a method that reads a key from a variable
+  (Droid's "Factory API Key"). On an agentZ account that method asks for the key
+  (`AgentThread::set_key_method` marks it `LoginInput::ApiKey`), and logging in with it, or
+  with another method that the key would override, restarts the agent with the key (or
+  without it), then logs in (`server/key_logins.rs`, `AgentThread::restart_with`). The key
+  is kept in `agentz-api-key` in the account's folder (mode 0600) once that login works, and
+  Log Out forgets it. Such an account (`Account::logs_in_with_key`) has its key login's
+  reader: Droid's calls Factory's billing API with the key.
   `Server::agent_command` builds the account's environment from the server's without those
   login variables (`AgentCommand::env_remove`; a terminal login runs through `env -u`), then
   the account's Environment, where a login variable set on purpose stays, then the home
-  variables and switches. The External account runs as before, in the normal home. Removing
-  an account stops its agents, then deletes its folder; its threads stay but fail to start.
+  variables and switches, then its key. The External account runs as before, in the normal
+  home. Removing an account stops its agents, then deletes its folder; its threads stay but
+  fail to start.
   Each account has its own `AgentSettings` (environment, defaults, the options it last
   offered, its login), since accounts of one agent don't get the same models; the External
   account's are the agent's settings from before

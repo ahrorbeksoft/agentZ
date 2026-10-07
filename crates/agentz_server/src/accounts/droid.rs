@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{AgentDescription, LoginCheck};
+use super::{AgentDescription, KeyLogin, LoginCheck, Reader};
 
 /// Droid keeps everything in `.factory` under `FACTORY_HOME_OVERRIDE`, or else the user's home.
 /// Its login there is encrypted with a key from the keychain that every home shares, so the
@@ -17,5 +17,14 @@ pub(super) fn description() -> AgentDescription {
         login_check: LoginCheck::Session,
         // `/status` and `/limits` in its terminal UI come with captured screens to test on.
         reader: None,
+        // "Authenticate using a Factory API key set in the FACTORY_API_KEY environment
+        // variable."
+        key_login: Some(KeyLogin {
+            method: "factory-api-key".into(),
+            variable: "FACTORY_API_KEY".into(),
+            reader: Some(Reader::FactoryApi {
+                base_url: "https://api.factory.ai".into(),
+            }),
+        }),
     }
 }

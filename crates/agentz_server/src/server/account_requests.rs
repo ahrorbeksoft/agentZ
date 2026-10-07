@@ -65,12 +65,9 @@ impl Server {
                         .account(id)
                         .context("there's no such account")?;
                 }
-                let reader = self
-                    .account_description(&agent_id)
-                    .and_then(|description| description.reader)
-                    .with_context(|| {
-                        format!("agentZ can't read {}'s usage", self.agent_name(&agent_id))
-                    })?;
+                let reader = self.usage_reader(&agent_id, account).with_context(|| {
+                    format!("agentZ can't read {}'s usage", self.agent_name(&agent_id))
+                })?;
                 self.read_account(&agent_id, account, reader);
                 Ok(Response::Ok)
             }

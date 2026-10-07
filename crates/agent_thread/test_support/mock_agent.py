@@ -33,11 +33,12 @@ Every login and logout is reported with `_auth/status_update`, as Claude Agent a
 
 MOCK_HOME is its home, as FACTORY_HOME_OVERRIDE is Factory Droid's: with it set, the login
 MOCK_LOGIN_FILE asks for is the file `login` there instead. MOCK_API_KEY logs it in whatever
-the file says, as FACTORY_API_KEY does. Run with `--status`, it prints {"logged_in": …} and
-exits with 1 when logged out, as agents' own status commands do. With MOCK_OPENS_LOGGED_OUT
-set, sessions open while it's logged out, as Claude Agent's do. Run with `--usage`, it prints
-what agentZ reads of an account: the email, plan and a 5-hour window, of which each reply in
-the home uses 10% (kept in `usage` in MOCK_HOME).
+the file says, as FACTORY_API_KEY does, unless it's "refused". In a home, it also offers
+"mock-env-key", which logs in with that variable, as Droid's "Factory API Key" does. Run with
+`--status`, it prints {"logged_in": …} and exits with 1 when logged out, as agents' own status
+commands do. With MOCK_OPENS_LOGGED_OUT set, sessions open while it's logged out, as Claude
+Agent's do. Run with `--usage`, it prints what agentZ reads of an account: the email, plan and
+a 5-hour window, of which each reply in the home uses 10% (kept in `usage` in MOCK_HOME).
 
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
@@ -90,7 +91,10 @@ USAGE_FILE = os.path.join(os.environ["MOCK_HOME"], "usage") if os.environ.get("M
 
 
 def stored_login():
-    return bool(os.environ.get("MOCK_API_KEY")) or not LOGIN_FILE or os.path.exists(LOGIN_FILE)
+    # A key overrides the stored login, as FACTORY_API_KEY does, refused or not.
+    if os.environ.get("MOCK_API_KEY"):
+        return os.environ["MOCK_API_KEY"] != "refused"
+    return not LOGIN_FILE or os.path.exists(LOGIN_FILE)
 
 
 def used_percent():
@@ -322,6 +326,7 @@ def browser_open_login():
 
 
 def authenticate(request_id, params):
+    global logged_out
     method_id = params.get("methodId")
     meta = params.get("_meta") or {}
     error = None
@@ -343,10 +348,18 @@ def authenticate(request_id, params):
     elif method_id == "mock-gateway":
         if not (meta.get("gateway") or {}).get("baseUrl"):
             error = "No gateway given"
+    elif method_id == "mock-env-key":
+        if not os.environ.get("MOCK_API_KEY"):
+            error = "Set MOCK_API_KEY"
+        elif not stored_login():
+            error = "The key was refused"
     if error:
         send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": error}})
         return
-    log_in()
+    if method_id == "mock-env-key":
+        logged_out = False
+    else:
+        log_in()
     send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     send_auth_status()
 
@@ -430,6 +443,9 @@ for line in sys.stdin:
             auth_methods.append({"id": "mock-browser-open-login", "name": "Log in with your browser"})
         auth_methods.append({"id": "mock-api-key", "name": "Use an API key",
                              "_meta": {"api-key": {"provider": "mock"}}})
+        if os.environ.get("MOCK_HOME"):
+            auth_methods.append({"id": "mock-env-key", "name": "Mock API Key",
+                                 "description": "Authenticate using a key set in MOCK_API_KEY."})
         if ((capabilities.get("auth") or {}).get("_meta") or {}).get("gateway"):
             auth_methods.append({"id": "mock-gateway", "name": "Use a gateway",
                                  "_meta": {"gateway": {"protocol": "anthropic"}}})

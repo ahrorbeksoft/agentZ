@@ -5,6 +5,7 @@ mod attachment_requests;
 mod custom_agents;
 #[cfg(unix)]
 mod hand_off;
+mod key_logins;
 mod login_checks;
 mod prompt_requests;
 mod queue_requests;
@@ -45,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use util::ResultExt as _;
 
-use crate::accounts::AccountStore;
+use crate::accounts::{self, AccountStore};
 use crate::agent_settings::AgentSettingsStore;
 use crate::browser;
 use crate::checkpoints::Checkpoints;
@@ -180,6 +181,8 @@ pub(crate) struct Server {
     accounts: AccountStore,
     /// The accounts whose identity and limits are being read.
     reading_accounts: HashSet<(AgentId, Option<AccountId>)>,
+    /// For readers that call a vendor's API.
+    http_client: Arc<dyn http_client::HttpClient>,
     threads: HashMap<ThreadId, AgentThread>,
     login_sessions: HashMap<u64, LoginSession>,
     next_login_session_id: u64,
@@ -245,9 +248,10 @@ impl Server {
             Some(&data_dir.join("settings.json")),
         );
         let accounts = AccountStore::load(Some(data_dir.join("agents").join("accounts.json")));
+        let http_client = config.http_client;
         let (mut registry, registry_inbox) = AgentRegistryStore::new(
             runtime.clone(),
-            config.http_client,
+            http_client.clone(),
             config.shell_environment_ready,
             registry_dir(&data_dir),
             data_dir.join("node"),
@@ -307,6 +311,7 @@ impl Server {
             agent_settings,
             accounts,
             reading_accounts: HashSet::default(),
+            http_client,
             threads: HashMap::default(),
             login_sessions: HashMap::default(),
             next_login_session_id: 1,
@@ -855,7 +860,7 @@ impl Server {
                 method_id,
                 meta,
             } => {
-                self.update_thread(connection, |thread| thread.authenticate(method_id, meta))?;
+                self.authenticate(connection, method_id, meta)?;
                 Ok(Response::Ok)
             }
             Request::CancelAuthentication(connection) => {
@@ -910,7 +915,7 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::Logout(connection) => {
-                self.update_thread(connection, |thread| thread.logout())?;
+                self.logout(connection)?;
                 Ok(Response::Ok)
             }
             Request::RetrySession(connection) => {
@@ -1396,6 +1401,9 @@ impl Server {
         let (queued_messages, steering) = self.queues.state(thread_id);
         agent_thread.set_queued_messages(queued_messages, steering);
         agent_thread.set_defaults(self.account_settings(&agent_id, account).session_defaults());
+        if let Some(key_login) = self.key_login(&agent_id, account) {
+            agent_thread.set_key_method(acp::AuthMethodId::new(key_login.method));
+        }
         let connection = ConnectionId::Thread(thread_id);
         self.forward(inbox, move |message| Input::Thread(connection, message));
         Ok(agent_thread)
@@ -1709,7 +1717,8 @@ impl Server {
                 Some((description, home)) => {
                     std::fs::create_dir_all(&home)
                         .with_context(|| format!("creating {}", home.display()))?;
-                    description.apply(&mut command, env, &home);
+                    let key = accounts::stored_key(&home)?;
+                    description.apply(&mut command, env, &home, key);
                 }
             }
             Ok(command)
@@ -1731,11 +1740,14 @@ impl Server {
         let command = self.agent_command(&agent_id, account, owner.is_none());
         let command =
             self.with_browser_programs(command, ConnectionId::LoginSession(login_session_id));
-        let (thread, inbox) = AgentThread::start_for_login_session(
+        let (mut thread, inbox) = AgentThread::start_for_login_session(
             self.runtime.clone(),
             self.agent_name(&agent_id),
             command,
         );
+        if let Some(key_login) = self.key_login(&agent_id, account) {
+            thread.set_key_method(acp::AuthMethodId::new(key_login.method));
+        }
         self.login_sessions.insert(
             login_session_id,
             LoginSession {
@@ -1820,6 +1832,7 @@ impl Server {
             agentz_protocol::thread::ConnectionStatus::Failed(_)
         );
         let mut logged_in_or_out = false;
+        let mut logged_in_here = false;
         let mut reported_login = None;
         let mut turn_ended = false;
 
@@ -1866,6 +1879,7 @@ impl Server {
                 // What agentZ logged in, until the agent is logged out or in again elsewhere.
                 (_, AgentThreadEvent::LoggedIn(method)) => {
                     logged_in_or_out = true;
+                    logged_in_here = true;
                     if let Some(agent_id) = &agent_id {
                         self.update_account_settings(agent_id, account, |settings| {
                             settings.logged_in(method.to_string())
@@ -1920,6 +1934,9 @@ impl Server {
             });
         }
         if let Some(agent_id) = &agent_id {
+            if logged_in_here {
+                self.keep_key_of_login(connection, agent_id, account);
+            }
             self.thread_login_changed(
                 agent_id,
                 account,

@@ -54,13 +54,17 @@ impl Server {
         let mut due = Vec::new();
         for agent_id in self.agents_with_readers() {
             let accounts = self.accounts.get(&agent_id);
-            if !accounts.lists_external() {
-                self.check_login(&agent_id, None);
-            } else if is_stale(accounts.status(None)) {
-                due.push((agent_id.clone(), None));
+            if self.usage_reader(&agent_id, None).is_some() {
+                if !accounts.lists_external() {
+                    self.check_login(&agent_id, None);
+                } else if is_stale(accounts.status(None)) {
+                    due.push((agent_id.clone(), None));
+                }
             }
             for account in &accounts.accounts {
-                if is_stale(account.status.as_ref()) {
+                if is_stale(account.status.as_ref())
+                    && self.usage_reader(&agent_id, Some(account.id)).is_some()
+                {
                     due.push((agent_id.clone(), Some(account.id)));
                 }
             }
@@ -80,7 +84,7 @@ impl Server {
         account: Option<AccountId>,
     ) {
         let is_there = account.is_none_or(|id| self.accounts.get(agent_id).account(id).is_some());
-        if let Some(reader) = self.usage_reader(agent_id)
+        if let Some(reader) = self.usage_reader(agent_id, account)
             && is_there
         {
             self.read_account(agent_id, account, reader);
@@ -99,7 +103,8 @@ impl Server {
             return;
         }
         let command = self.agent_command(agent_id, account, true);
-        let read = async move { reader.read(command.await?).await };
+        let http = self.http_client.clone();
+        let read = async move { reader.read(command.await?, http).await };
         let agent_id = agent_id.clone();
         self.spawn_then(read, move |server, read| {
             server.reading_accounts.remove(&(agent_id.clone(), account));
@@ -126,12 +131,23 @@ impl Server {
         });
     }
 
-    fn usage_reader(&self, agent_id: &AgentId) -> Option<Reader> {
-        self.account_description(agent_id)
-            .and_then(|description| description.reader)
+    /// The account's reader, `None` being the External account: an account that logs in with a
+    /// key has its key login's, if that has one.
+    pub(super) fn usage_reader(
+        &self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+    ) -> Option<Reader> {
+        let description = self.account_description(agent_id)?;
+        let key_reader = description
+            .key_login
+            .and_then(|key_login| key_login.reader)
+            .filter(|_| self.accounts.get(agent_id).logs_in_with_key(account));
+        key_reader.or(description.reader)
     }
 
-    /// The custom agents and installed registry agents whose usage agentZ can read.
+    /// The custom agents and installed registry agents whose usage agentZ can read, on any of
+    /// their accounts.
     fn agents_with_readers(&self) -> Vec<AgentId> {
         let custom = self.custom_agents.keys().cloned();
         let installed = self
@@ -148,7 +164,15 @@ impl Server {
             });
         custom
             .chain(installed)
-            .filter(|agent_id| self.usage_reader(agent_id).is_some())
+            .filter(|agent_id| {
+                self.account_description(agent_id)
+                    .is_some_and(|description| {
+                        description.reader.is_some()
+                            || description
+                                .key_login
+                                .is_some_and(|key_login| key_login.reader.is_some())
+                    })
+            })
             .collect()
     }
 }

@@ -34,6 +34,12 @@ Notes for whoever continues:
   first agent that needs it. Droid's (the hidden terminal, kind 5) waits for captured
   `/status` and `/limits` screens to parse and test against: driving Droid's terminal UI on
   the user's real login needs their go-ahead, since `/limits` holds a billing choice.
+- API-key accounts (item 7): a description's key login is the method that reads a key from a
+  variable. agentZ keeps the key in the account's folder and restarts the agent with it to log
+  in. Droid's key reader (`Reader::FactoryApi`) parses `/api/billing/limits` as Droid's own
+  code reads it; no real response has been seen yet, so check it against one. A key account
+  has no email (Factory's `whoami` gives none), and only Factory's US address is used, not
+  its EU one. The app shows the key field once item 8 has the account menus.
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -43,7 +49,7 @@ Notes for whoever continues:
 | 4 | | Agent descriptions and each account's environment; an agent process per (agent, account); the mock agent's `MOCK_HOME`; Droid's description | done |
 | 5 | | Login checks from the description | done |
 | 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | in progress: all but Droid's reader |
-| 7 | | API-key accounts (Droid with a Factory API key) | |
+| 7 | | API-key accounts (Droid with a Factory API key) | done |
 | 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | |
 | 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | |
 | 10 | 12 | The account in the strip under the composer; the default account for new threads | |

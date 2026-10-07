@@ -18,7 +18,9 @@ use agentz_protocol::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalPoint,
     TerminalSelectionKind, TerminalSelectionUpdate,
 };
-use agentz_protocol::thread::{ConnectionStatus, Entry, ThreadView};
+use agentz_protocol::thread::{
+    ConnectionStatus, Entry, LoginInput, ThreadView, api_key_meta, login_input,
+};
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
     AgentSettingsChange, ClientHello, ClientKind, ClientMessage, ConnectionId, ErrorResponse,
@@ -292,7 +294,8 @@ fn agent_text(view: &ThreadView) -> String {
         .collect()
 }
 
-/// The mock agent keeps an account's login in `MOCK_HOME`, and takes `MOCK_API_KEY` as one.
+/// The mock agent keeps an account's login in `MOCK_HOME`, and takes `MOCK_API_KEY` as one, as
+/// its "mock-env-key" login does.
 fn mock_accounts() -> crate::AgentDescription {
     crate::AgentDescription {
         home_variables: BTreeMap::from([("MOCK_HOME".into(), String::new())]),
@@ -300,6 +303,11 @@ fn mock_accounts() -> crate::AgentDescription {
         login_variables: vec!["MOCK_API_KEY".into()],
         login_check: crate::LoginCheck::Session,
         reader: None,
+        key_login: Some(crate::KeyLogin {
+            method: "mock-env-key".into(),
+            variable: "MOCK_API_KEY".into(),
+            reader: None,
+        }),
     }
 }
 
@@ -1576,6 +1584,130 @@ async fn accounts_run_in_homes_of_their_own() {
             .await
             .is_err()
     );
+}
+
+/// An account can log in with a key its agent reads from its environment, as with Droid's
+/// "Factory API Key": agentZ asks for the key, keeps it in the account's folder for the user
+/// only, and starts the account's agents with it. A refused key isn't kept, and Log Out
+/// forgets it.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_key_accounts_keep_their_key() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        data_dir
+            .path()
+            .join("external-login")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let Some(server) =
+        TestServer::start_with_agent(data_dir, tempfile::tempdir().expect("temp dir"), command)
+    else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let Response::AccountAdded(account) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    let key_file = server
+        .data_dir
+        .path()
+        .join("accounts/mock")
+        .join(account.to_string())
+        .join("agentz-api-key");
+    let Response::LoginSessionOpened(login_session_id) = client
+        .ok(Request::OpenLoginSession {
+            agent_id: mock.clone(),
+            account: Some(account),
+        })
+        .await
+    else {
+        panic!("expected a login session");
+    };
+    let login = ConnectionId::LoginSession(login_session_id);
+    client.subscribe_thread(login).await;
+    let key_method = acp::AuthMethodId::new("mock-env-key");
+    client
+        .wait_until(|client| {
+            let thread = client.thread(login);
+            thread.logged_in() == Some(false)
+                && thread.auth_methods().iter().any(|method| {
+                    *method.id() == key_method && login_input(method) == LoginInput::ApiKey
+                })
+        })
+        .await;
+    let log_in = |key: Option<&str>| Request::Authenticate {
+        connection: login,
+        method_id: key_method.clone(),
+        meta: key.map(api_key_meta),
+    };
+    assert!(client.request(log_in(None)).await.is_err());
+
+    client.ok(log_in(Some("refused"))).await;
+    client
+        .wait_until(|client| {
+            client
+                .thread(login)
+                .auth_error()
+                .is_some_and(|error| error.contains("refused"))
+        })
+        .await;
+    assert!(!key_file.exists());
+
+    client.ok(log_in(Some(" mk-good "))).await;
+    client
+        .wait_until(|client| {
+            client.account_logged_in(Some(account)) == Some(true)
+                && client.accounts("mock").logs_in_with_key(Some(account))
+        })
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(&key_file).expect("the key"),
+        "mk-good"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&key_file)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // The account's threads start with it.
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let Response::ThreadCreated(thread_id) = client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: mock.clone(),
+            workspace: Default::default(),
+            account: AccountChoice::Account(account),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let thread = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(thread).await;
+    client
+        .wait_until(|client| *client.thread(thread).status() == ConnectionStatus::Ready)
+        .await;
+
+    client.ok(Request::Logout(login)).await;
+    client
+        .wait_until(|client| {
+            client.account_logged_in(Some(account)) == Some(false)
+                && !client.accounts("mock").logs_in_with_key(Some(account))
+        })
+        .await;
+    assert!(!key_file.exists());
 }
 
 /// Gives the mock agent an agentZ account before the server starts, so it checks the External

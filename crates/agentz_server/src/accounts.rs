@@ -16,9 +16,12 @@ use util::ResultExt as _;
 
 use crate::agent_settings::{read_json, write_json};
 
-pub use descriptions::{AgentDescription, built_in as built_in_description};
+pub use descriptions::{AgentDescription, KeyLogin, built_in as built_in_description};
 pub use login_checks::{LoginCheck, StatusCommand};
 pub use readers::{Reader, ReaderCommand};
+
+/// Where an API-key account keeps its key, in its folder.
+const KEY_FILE: &str = "agentz-api-key";
 
 pub struct AccountStore {
     accounts: BTreeMap<AgentId, AgentAccounts>,
@@ -97,6 +100,40 @@ pub fn agent_folder(data_dir: &Path, agent_id: &AgentId) -> Result<PathBuf> {
     Ok(data_dir.join("accounts").join(name))
 }
 
+/// The API key the account in `home` logs in with, if it has one.
+pub fn stored_key(home: &Path) -> Result<Option<String>> {
+    let path = home.join(KEY_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(key) => Ok(Some(key.trim().to_string()).filter(|key| !key.is_empty())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Keeps the key the account in `home` logs in with, or forgets it (`None`). Only the user can
+/// read it, as agents keep their own logins.
+pub fn store_key(home: &Path, key: Option<&str>) -> Result<()> {
+    let path = home.join(KEY_FILE);
+    let Some(key) = key else {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        };
+    };
+    std::fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    std::io::Write::write_all(&mut file, key.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 /// Deletes an account's folder, if it has one yet.
 pub fn remove_home(data_dir: &Path, agent_id: &AgentId, account: AccountId) -> Result<()> {
     let home = home(data_dir, agent_id, account)?;
@@ -132,6 +169,31 @@ mod tests {
 
         let store = AccountStore::load(Some(path));
         assert!(store.get(&mock).account(id).is_some());
+    }
+
+    #[test]
+    fn keys_are_kept_for_the_user_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dir.path().join("accounts").join("mock").join("1");
+        assert_eq!(stored_key(&home).expect("read"), None);
+        store_key(&home, Some("sk-first")).expect("store");
+        store_key(&home, Some("sk-second")).expect("store");
+        assert_eq!(
+            stored_key(&home).expect("read").as_deref(),
+            Some("sk-second")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(home.join(KEY_FILE))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        store_key(&home, None).expect("forget");
+        store_key(&home, None).expect("forget again");
+        assert_eq!(stored_key(&home).expect("read"), None);
     }
 
     #[test]

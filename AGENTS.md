@@ -121,11 +121,12 @@ From Zed's guidelines, which this code follows:
   `MOCK_SESSIONS_FILE` (a JSON array of ACP session infos, each with an optional `history` to
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
   For accounts, `MOCK_HOME` is its home (the login is then `login` there) and `MOCK_API_KEY`
-  logs it in; the server tests' mock is described with both, so it can have accounts. Run with
-  `--status`, it prints `{"logged_in": …}` as agents' status commands do, and with
-  `MOCK_OPENS_LOGGED_OUT` its sessions open while it's logged out, as Claude Agent's do. Run
-  with `--usage`, it prints a read of its account (email, plan, a 5-hour window that each
-  reply in the home fills by 10%).
+  logs it in (unless it's `refused`), as does its `mock-env-key` login in a home, which reads
+  that variable as Droid's "Factory API Key" does; the server tests' mock is described with
+  all three, so it can have accounts. Run with `--status`, it prints `{"logged_in": …}` as
+  agents' status commands do, and with `MOCK_OPENS_LOGGED_OUT` its sessions open while it's
+  logged out, as Claude Agent's do. Run with `--usage`, it prints a read of its account
+  (email, plan, a 5-hour window that each reply in the home fills by 10%).
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.

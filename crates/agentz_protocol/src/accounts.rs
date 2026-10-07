@@ -40,6 +40,9 @@ pub struct Account {
     /// Whether its home was logged in when last checked.
     #[serde(default)]
     pub logged_in: Option<bool>,
+    /// Whether it logs in with an API key agentZ keeps in its folder, which Log Out forgets.
+    #[serde(default)]
+    pub logs_in_with_key: bool,
     #[serde(default)]
     pub status: Option<StatusRead>,
 }
@@ -169,9 +172,17 @@ impl AgentAccounts {
             choices: AccountChoices::default(),
             settings: AgentSettings::default(),
             logged_in: None,
+            logs_in_with_key: false,
             status: None,
         });
         id
+    }
+
+    /// Whether the account logs in with a key agentZ keeps. The External account never does.
+    pub fn logs_in_with_key(&self, account: Option<AccountId>) -> bool {
+        account
+            .and_then(|id| self.account(id))
+            .is_some_and(|account| account.logs_in_with_key)
     }
 
     /// The account's last read, `None` being the External account.
