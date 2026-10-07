@@ -215,10 +215,10 @@ impl Server {
                     LimitResetOutcome::Reset | LimitResetOutcome::AlreadyRedeemed => {
                         Ok(Response::Ok)
                     }
-                    LimitResetOutcome::NothingToReset => {
-                        Err(anyhow!("no limit is used enough to reset yet"))
-                    }
-                    LimitResetOutcome::NoCredit => Err(anyhow!("the account has no resets left")),
+                    // t3code's wording. Codex says it while no limit is reached, as Claude's
+                    // `not_limited` that t3code reads the same way.
+                    LimitResetOutcome::NothingToReset => Err(anyhow!("nothing to reset right now")),
+                    LimitResetOutcome::NoCredit => Err(anyhow!("no reset credit left")),
                 }
             });
             server.respond(client, id, answer);

@@ -145,7 +145,8 @@ Notes for whoever continues:
   again in the same app-server. The server keeps one attempt per account until Codex
   answers it (t3code's `ResetCreditCoordinator`), so a try that timed out and is tried again
   can't spend a second reset; `alreadyRedeemed` counts as done, and `nothingToReset` and
-  `noCredit` are errors. A reset and a read of one account hold the same lock. The card's
+  `noCredit` are errors in t3code's words ("nothing to reset right now", "no reset credit
+  left"). A reset and a read of one account hold the same lock. The card's
   line sits under its limits ("1 limit reset available · expires in 27d 23h", t3code's
   duration), with `RotateCcw` for the mock's ticket, which agentZ's icons don't have. Use
   Reset asks in agentZ's confirm dialog with the mock's text ("This clears Work's 5-hour and
@@ -153,10 +154,14 @@ Notes for whoever continues:
   The notice offers Use Reset whenever the account has resets, and then sends the thread's
   last message again, as Switch to Droid Core does. The gauge's popover has the card's line;
   it closes for the question, and nothing goes again unless the thread is at its limit. The
-  mock's `limit_resets` file gives it resets. Not verified: no real reset was used (the
-  user's Codex has one, and using it can't be undone), so the request and its outcomes come
-  from t3code's copy of Codex's app-server schema and are tested against a fake app-server;
-  and the look of the line and dialog, checked in headless tests only (no screenshots).
+  mock's `limit_resets` file gives it resets, and it has nothing to reset until its window
+  is full. Checked against the real Codex 0.160.0 (the user's Free login, which the user let
+  this use): the read found its one reset (expiring Oct 29) beside the Monthly window at 3%,
+  and consume answered `{"outcome":"nothingToReset"}` twice with one key, leaving the reset
+  there: Codex resets only an account at a limit (as Claude's `not_limited` in t3code).
+  Not verified: an actual reset, which needs the account at its limit (that spends usage),
+  and so `reset` and `alreadyRedeemed` from the real Codex; and the look of the line and
+  dialog, checked in headless tests only (no screenshots).
 - `tests/browser.rs`'s `remote_agents_hand_their_login_pages_to_the_clients` failed once in
   a full run and passes alone: `agent_settings::write_json` writes `agents/settings.json` in
   place, and the test read it empty mid-write.

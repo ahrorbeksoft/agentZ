@@ -53,7 +53,7 @@ first saves that choice, as agentZ's Switch to Droid Core does through Droid.
 A `limit_resets` file in MOCK_HOME holds how many limit resets the home has, as Codex grants
 them: `--usage` reports them, the first expiring in 27 days. `--usage` with
 AGENTZ_LIMIT_RESET_ATTEMPT set uses one instead, clearing the window, and prints the outcome
-as Codex answers it: {"outcome": "reset"}, "nothingToReset" while none of the window is used,
+as Codex answers it: {"outcome": "reset"}, "nothingToReset" until the window is full,
 "noCredit" without any left, or "alreadyRedeemed" for the attempt that last used one.
 
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
@@ -169,7 +169,8 @@ def use_limit_reset(attempt):
     available = limit_resets() or 0
     if available <= 0:
         return "noCredit"
-    if used_percent() == 0:
+    # The real Codex had nothing to reset with 3% of its window used.
+    if used_percent() < 100:
         return "nothingToReset"
     with open(LIMIT_RESETS_FILE, "w") as file:
         file.write(str(available - 1))

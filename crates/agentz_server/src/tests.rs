@@ -2348,15 +2348,19 @@ async fn limit_resets_are_used_through_the_reader() {
     assert_eq!(used(&client, Some(work)), Some(0.0));
     assert_eq!(resets(&client).map(|resets| resets.available), Some(1));
 
-    // With nothing used, Codex has nothing to reset, and the reset stays.
+    // Short of a limit, Codex has nothing to reset, and the reset stays.
+    std::fs::write(home.join("usage"), "30").expect("use some of the account");
+    let error = client
+        .request(Request::UseLimitReset {
+            agent_id: mock.clone(),
+            account: Some(work),
+        })
+        .await
+        .expect_err("nothing to reset");
     assert!(
-        client
-            .request(Request::UseLimitReset {
-                agent_id: mock.clone(),
-                account: Some(work),
-            })
-            .await
-            .is_err()
+        error.message.contains("nothing to reset right now"),
+        "{}",
+        error.message
     );
     assert_eq!(
         std::fs::read_to_string(home.join("limit_resets")).expect("resets"),
