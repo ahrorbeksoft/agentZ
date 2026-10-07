@@ -98,6 +98,75 @@ Notes for whoever continues:
   already waiting (each notice can cancel). The mock fails prompts once its window is full
   and resets at `resets_at` in its home. Not tried at a real agent's limit, which would
   spend usage.
+- Item 19 (started, not built: pick it up here). What Droid 0.235.0 does, read in the
+  strings of `~/.local/bin/droid`:
+  - `/limits`'s "When limit is reached" rows are "Switch to Droid Core" (always) and "Enable
+    Extra Usage in settings (opens browser)" (only when the login `canManageOverage`;
+    disabled during a free trial). Enter on the first POSTs `set-overage-preference` with
+    `droidCore` (skipped when it can't manage) and moves that session to the recommended
+    Droid Core model. The second only opens `app.factory.ai/settings/usage`: nothing in
+    Droid posts `extraUsage`, which is turned on on Factory's site.
+  - A row is marked `●` when it's the preference (or Droid Core's when none is set and the
+    session's model is a Droid Core one), but the cursor (`>`, blinking between "> " and
+    " >") hides the mark of its row, and starts on the first row. Tab goes Standard → Droid
+    Core → Extra Usage (the last only when it can manage). The notes Droid prints are lines
+    starting `●  ` outside its boxes.
+  - Over ACP, at the limit Droid moves to a Droid Core model by itself when the preference is
+    `droidCore`, goes on billing when it's `extraUsage`, and otherwise the turn fails.
+  - New screens, from the user's own login with Tab, ↓ and Esc only:
+    `droid_screens/limits-droid-core.txt` (after Tab: Droid Core's windows, the cursor on the
+    first row) and `limits-moved.txt` (then ↓: `●` on Switch to Droid Core, the user's
+    choice).
+
+  The plan (my choices; tell the user that "Use extra usage" opens Factory's page instead of
+  saving it, since Droid itself never saves it):
+  - Protocol: `AccountStatus` gets `pool` (the windows' pool, "Standard"), `other_pools`
+    (`LimitPool { label, windows }`: Droid Core's) and `overage: Option<Overage {
+    preference: Option<OveragePreference::{DroidCore, ExtraUsage}>, can_change,
+    extra_usage_allowed }>`; `AccountSupport::extra_usage_page` from a description field
+    (Droid's is `https://app.factory.ai/settings/usage`); `Request::SwitchToDroidCore {
+    agent_id, account }`, answered once the read after it says `DroidCore`.
+  - Readers: `FactoryApi` reads `limits.core`, `overagePreference`, `canManageOverage` and
+    `extraUsageAllowed` (all in its test answer already), and switches by POSTing
+    `{"overagePreference": "droidCore"}` to
+    `/api/organization/subscription/set-overage-preference` with the key, then reading.
+    `DroidTerminal`: on Standard's tab, the second row's `●` is `ExtraUsage` and a second row
+    means `can_change`; Tab, wait for `◉` on the second tab, read Droid Core's windows; then
+    ↓ (`\x1b[B`) and wait about 5 seconds for the cursor on the second row (if it doesn't
+    move, that row is disabled: no extra usage), where the first row's `●` is `DroidCore`;
+    Esc. Rows are the box lines after the `─` separator whose two-character mark is followed
+    by text (the info box's "● You are using…" is above it). Its switch first runs
+    `/limits`, checks the cursor is on the first row, presses Enter, waits for a new `●  `
+    note and the prompt, then reads as usual, which checks it. Never Enter on the second row:
+    it opens a browser on the server's machine. The mock's `Command` reader is run with
+    `AGENTZ_OVERAGE_PREFERENCE=DroidCore`.
+  - Server: a `tokio::sync::Mutex` per account, held by reads and switches, so two Droid
+    terminal UIs never resume the reads' session at once. The switch is an `Input::Request`
+    arm (`spawn_then`, then `respond`) and keeps its read as `read_account` does.
+  - Mock: an `overage` file in `MOCK_HOME` (empty, `DroidCore` or `ExtraUsage`) makes
+    `--usage` report the pools, the preference and credits; the variable writes it.
+  - App: Zed's `ToggleButtonGroup` (as the registry filter uses it) over the card's windows:
+    Standard | Droid Core | Extra usage (the last when it can change: "Balance", "$12.40
+    remaining"), the tab kept per card in `AgentPanel`. Under them Droid's "When a limit is
+    reached": "Saved to your Factory account; the CLI does the same.", entries "Switch to
+    Droid Core" and "Use extra usage" with an ↗ (opens the page), "Not chosen" when none;
+    read-only with "Set by your organization." when it can't change. Item 18's row is then
+    titled "When <agent> stops at a limit". The notice: "… limit on standard models" when the
+    status names its pool, the body ending "<agent> can keep going:", and the buttons
+    "Switch to Droid Core" (unless chosen already, the login can't change it, or Droid Core's
+    pool is used up too; then it queues the thread's last message again, as Copy Message
+    copies it) and "Use Extra Usage · $18.20 left" (opens the page).
+  - Started, uncommitted in the worktree `/Users/ahrorbek/projects/agentZ-accounts` (branch
+    `accounts-build`), and kept as the local branch `accounts-19-wip` too (`git diff
+    origin/main accounts-19-wip -- crates` shows it): the protocol fields, `Overage`,
+    `LimitPool`, the request (`agentz_protocol.rs`, `accounts.rs`) and `extra_usage_page`
+    in every description (`accounts/{descriptions,droid,claude,codex,devin}.rs`, the mock's
+    in `tests.rs`). It doesn't build until the server handles `SwitchToDroidCore`. The
+    order left: readers and their tests (the two new screens), the server request and lock,
+    the mock's `overage`, the app, then docs, checks, one commit, push.
+- `tests/browser.rs`'s `remote_agents_hand_their_login_pages_to_the_clients` failed once in
+  a full run and passes alone: `agent_settings::write_json` writes `agents/settings.json` in
+  place, and the test read it empty mid-write.
 - Item 14: Settings › Usage lists the installed agents that read their accounts' limits
   (`reads_usage`), an agent with one account included, as the mock's Codex is; "across N
   accounts" shows only with more than one. Accounts found logged out are left out, as their
@@ -209,7 +278,7 @@ Notes for whoever continues:
 | 16 | | Wave 1: Codex | done |
 | 17 | | Wave 1: Devin | done |
 | 18 | 11 | Stop or Continue at reset, per account | done |
-| 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | |
+| 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | in progress |
 | 20 | 9 | Limit resets (Codex) | |
 | 21 | 10 | Extra usage switch | |
 | 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | |
