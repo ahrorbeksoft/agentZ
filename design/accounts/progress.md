@@ -102,6 +102,21 @@ Notes for whoever continues:
   in every home, as Devin reads Claude's, so they're its outside folders, and the External
   account, which agentZ runs as the user has it, reads them too. Logging a new account in
   wasn't tried: it needs the user's browser.
+- Wave 3 (item 28): Antigravity only, as the user asked; the rest wait. Antigravity
+  (`accounts/antigravity.rs`): `GEMINI_HOME` with `AGY_ACP_FORCE_FILE_STORAGE=1`, a session
+  as its login check, and "Gemini API key" (`GEMINI_API_KEY`) as its key login. It has no
+  reader, so its card shows no identity or quota. plan.md's kind 7 doesn't fit: its token
+  file holds only the refresh token, and the access token stays in the server's memory, so
+  reading Google's quota API would mean getting a new access token, which the rule against
+  refreshing logins forbids. Whether that grant, kept in memory and never written, may be
+  the exception is the user's call. A new account's folder starts empty: with `auth.type` in
+  `antigravity-acp/settings.json` and no login stored, `session/new` waits up to 5 minutes
+  on a browser login. Checked against the real server 1.3.0 in a new home with the switch:
+  `initialize` and `session/new` answer in about 4 seconds, "Authentication required", and
+  nothing is left in the home. Logged in, each session check leaves an empty conversation in
+  the home, as Droid's does; they aren't removed. Not verified: logging a new account in (it
+  needs the user's browser), and whether a wrong Gemini key fails at `authenticate` or only
+  at the first prompt.
 - Item 18 (`server/limit_waits.rs`): "When a limit is reached" sits under the card's limits,
   past the avatar, as in the mock, and only for agents that read usage, since waiting needs
   the reset from a read; an agent with one account has it too, as it has the notice. The
@@ -340,4 +355,4 @@ Notes for whoever continues:
 | 25 | 20 | The accounts menu on each skill and server | done |
 | 26 | | Importing skills and servers from another machine (board topic first) | |
 | 27 | | Wave 2, one agent per commit | Grok Build done; the rest wait |
-| 28 | | Wave 3, one agent per commit | |
+| 28 | | Wave 3, one agent per commit | Antigravity done; the rest wait |

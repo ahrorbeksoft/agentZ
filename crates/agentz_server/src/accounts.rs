@@ -1,6 +1,7 @@
 //! Each agent's accounts, kept by the server in `agents/accounts.json`, and their home folders
 //! in `accounts/<agent id>/<account id>/`.
 
+mod antigravity;
 mod claude;
 mod codex;
 mod descriptions;

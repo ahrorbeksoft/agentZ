@@ -1,0 +1,7 @@
+{
+  "code": -32000,
+  "message": "Authentication required",
+  "data": {
+    "message": "No authentication method selected. Either call the `authenticate` method (supports oauth-personal, gemini-api-key, agent-platform), or set `auth.type` in settings.json (<home>/antigravity-acp/settings.json) to one of: oauth-personal, gemini-api-key (requires GEMINI_API_KEY env var), oauth-business (Gemini Enterprise; requires gcp.project/location), agent-platform (formerly 'vertex-ai', still accepted; requires GOOGLE_API_KEY, or a project and location from GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION or gcp.project/gcp.location with Application Default Credentials), gateway (custom AI API Gateway; requires AGY_LLM_GATEWAY_URL or an enterprise admin_settings.json)."
+  }
+}

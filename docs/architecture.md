@@ -736,15 +736,23 @@ Each entry: what it does, where it lives, and where it comes from.
   (the email; logged out if not `authenticated`) and `_x.ai/billing` (the plan, the Weekly or
   Monthly window of its usage pool, and "Pay as you go", its on-demand cap in cents, or Off).
   A team's own login has no usage of its own, and a key login, with nothing to read, is left
-  to the session check. The outputs it's tested on are in `accounts/grok_reads/`. No
+  to the session check. The outputs it's tested on are in `accounts/grok_reads/`.
+  Antigravity's description (`accounts/antigravity.rs`) moves its home with `GEMINI_HOME`,
+  and `AGY_ACP_FORCE_FILE_STORAGE` keeps its login in that home
+  (`antigravity-acp/acp_token.json`) instead of the keychain entry every home would share.
+  A new account's folder starts empty: with a login method named in its `settings.json` and
+  no login stored, a session waits minutes on a browser login. Its login check is a session,
+  and it has no reader: nothing over ACP gives the identity or quota, and Google's quota API
+  needs an access token, which it keeps only in memory. Its key login is "Gemini API key"
+  (`GEMINI_API_KEY`). Its answers in a new home are in `accounts/antigravity_reads/`. No
   agent's terminal UI is read but Droid's (the user's rule). An
   agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
   so every account is a process of its own with its own login and sessions: its threads,
   login sessions (`OpenLoginSession`) and session listing and import (`ListAgentSessions`,
   `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
-  `accounts/droid.rs`, `accounts/claude.rs`, `accounts/codex.rs`, `accounts/devin.rs` and
-  `accounts/grok.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
+  `accounts/droid.rs`, `accounts/claude.rs`, `accounts/codex.rs`, `accounts/devin.rs`,
+  `accounts/grok.rs` and `accounts/antigravity.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the folders among those
   that hold other programs' files too (linked from the user's), the entries every account
   shares with the External account's home (linked to them), the switches that keep
