@@ -5,14 +5,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::{AccountStatus, LimitWindow};
+use agentz_protocol::accounts::{
+    AccountStatus, LimitPool, LimitWindow, Overage, OveragePreference,
+};
 use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::AsyncReadExt as _;
 use http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use super::droid::{WINDOW_LABELS, WINDOW_LENGTHS};
+use super::droid::{CORE_POOL, STANDARD_POOL, WINDOW_LABELS, WINDOW_LENGTHS};
 use super::login_checks::run_with_account_env;
 
 /// How long an HTTP reader waits for its answer.
@@ -83,12 +85,9 @@ impl Reader {
                 serde_json::from_slice(&output.stdout).context("its output isn't a read")
             }
             Reader::FactoryApi { base_url } => {
-                let key = agent
-                    .env
-                    .get("FACTORY_API_KEY")
-                    .context("the account has no Factory API key")?;
+                let key = factory_key(&agent)?;
                 let url = format!("{}/api/billing/limits", base_url.trim_end_matches('/'));
-                let (status, body) = get_with_key(http, &url, key).await?;
+                let (status, body) = send_with_key(http, Method::GET, &url, key, None).await?;
                 // As for Droid, a key that's refused (or revoked) logs nothing in.
                 if status == StatusCode::UNAUTHORIZED {
                     return Ok(Read {
@@ -106,19 +105,79 @@ impl Reader {
             }
         }
     }
+
+    /// Droid's "Switch to Droid Core" for the account (decisions.md §8), then a read, which
+    /// says whether it took.
+    pub async fn switch_to_droid_core(
+        &self,
+        agent: AgentCommand,
+        http: Arc<dyn HttpClient>,
+        folder: &Path,
+    ) -> Result<Read> {
+        match self {
+            Reader::DroidTerminal => super::droid::switch_to_droid_core(agent, folder).await,
+            // As Droid's `/limits` saves it.
+            Reader::FactoryApi { base_url } => {
+                let key = factory_key(&agent)?;
+                let url = format!(
+                    "{}/api/organization/subscription/set-overage-preference",
+                    base_url.trim_end_matches('/')
+                );
+                let body = serde_json::json!({ "overagePreference": "droidCore" }).to_string();
+                let (status, answer) =
+                    send_with_key(http.clone(), Method::POST, &url, key, Some(body)).await?;
+                if !status.is_success() {
+                    let message = serde_json::from_slice::<serde_json::Value>(&answer)
+                        .ok()
+                        .and_then(|answer| Some(answer.get("message")?.as_str()?.to_string()));
+                    bail!(
+                        "Factory answered {status}{}",
+                        message
+                            .map(|message| format!(": {message}"))
+                            .unwrap_or_default()
+                    );
+                }
+                self.read(agent, http, folder).await
+            }
+            // The mock agent's `--usage` saves the preference it's given.
+            Reader::Command(_) => {
+                let mut agent = agent;
+                agent
+                    .env
+                    .insert("AGENTZ_OVERAGE_PREFERENCE".into(), "DroidCore".into());
+                self.read(agent, http, folder).await
+            }
+            Reader::ClaudeCode | Reader::CodexAppServer | Reader::DevinTerminal => {
+                bail!("only Factory Droid has Droid Core")
+            }
+        }
+    }
 }
 
-async fn get_with_key(
+fn factory_key(agent: &AgentCommand) -> Result<&str> {
+    agent
+        .env
+        .get("FACTORY_API_KEY")
+        .map(String::as_str)
+        .context("the account has no Factory API key")
+}
+
+async fn send_with_key(
     http: Arc<dyn HttpClient>,
+    method: Method,
     url: &str,
     key: &str,
+    json: Option<String>,
 ) -> Result<(StatusCode, Vec<u8>)> {
-    let request = Request::builder()
-        .method(Method::GET)
+    let mut request = Request::builder()
+        .method(method)
         .uri(url)
         .header("Authorization", format!("Bearer {key}"))
-        .header("Accept", "application/json")
-        .body(AsyncBody::default())?;
+        .header("Accept", "application/json");
+    if json.is_some() {
+        request = request.header("Content-Type", "application/json");
+    }
+    let request = request.body(json.map(AsyncBody::from).unwrap_or_default())?;
     let read = async {
         let mut response = http
             .send(request)
@@ -137,19 +196,23 @@ async fn get_with_key(
         .map_err(|_| anyhow!("{url} didn't answer in {}s", HTTP_TIMEOUT.as_secs()))?
 }
 
-/// `GET /api/billing/limits`, as Droid 0.234.0's `/limits` reads it: windows for its Standard
-/// Usage (and Droid Core, its other pool) and the Extra Usage balance. It also says which
-/// pool takes over at a limit (`overagePreference`), for decisions.md §8.
+/// `GET /api/billing/limits`, as Droid 0.235.0's `/limits` reads it: windows for its Standard
+/// Usage and Droid Core, its other pool, the Extra Usage balance, and Droid's "When limit is
+/// reached" (decisions.md §8).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FactoryLimits {
     limits: Option<FactoryPools>,
     extra_usage_balance_cents: Option<f64>,
+    overage_preference: Option<String>,
+    can_manage_overage: Option<bool>,
+    extra_usage_allowed: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct FactoryPools {
     standard: Option<FactoryWindows>,
+    core: Option<FactoryWindows>,
 }
 
 #[derive(Deserialize)]
@@ -167,19 +230,48 @@ struct FactoryWindow {
     window_end: Option<String>,
 }
 
-/// The Standard Usage windows, by Droid's names for them. Droid Core's pool waits for its tabs
-/// (decisions.md §8).
+/// The Standard Usage windows, by Droid's names for them, with Droid Core's as another pool.
 fn factory_limits(body: &[u8], now: SystemTime) -> Result<AccountStatus> {
     let limits: FactoryLimits =
         serde_json::from_slice(body).context("Factory's limits aren't in the expected shape")?;
-    let standard = limits
-        .limits
-        .and_then(|pools| pools.standard)
-        .context("Factory's answer has no Standard Usage limits")?;
-    let windows = WINDOW_LABELS
+    let FactoryPools { standard, core } =
+        limits.limits.context("Factory's answer has no limits")?;
+    let standard = standard.context("Factory's answer has no Standard Usage limits")?;
+    let credits = limits
+        .extra_usage_balance_cents
+        .filter(|cents| *cents > 0.0)
+        .map(|cents| format!("${:.2}", cents / 100.0));
+    // As Droid reads it: anything else is no choice yet.
+    let preference = match limits.overage_preference.as_deref() {
+        Some("droidCore") => Some(OveragePreference::DroidCore),
+        Some("extraUsage") => Some(OveragePreference::ExtraUsage),
+        _ => None,
+    };
+    Ok(AccountStatus {
+        windows: factory_windows(standard, now),
+        pool: Some(STANDARD_POOL.into()),
+        other_pools: core
+            .map(|core| LimitPool {
+                label: CORE_POOL.into(),
+                windows: factory_windows(core, now),
+            })
+            .into_iter()
+            .collect(),
+        credits,
+        overage: Some(Overage {
+            preference,
+            can_change: limits.can_manage_overage == Some(true),
+            extra_usage_allowed: limits.extra_usage_allowed == Some(true),
+        }),
+        ..AccountStatus::default()
+    })
+}
+
+fn factory_windows(windows: FactoryWindows, now: SystemTime) -> Vec<LimitWindow> {
+    WINDOW_LABELS
         .into_iter()
         .zip(WINDOW_LENGTHS)
-        .zip([standard.five_hour, standard.weekly, standard.monthly])
+        .zip([windows.five_hour, windows.weekly, windows.monthly])
         .filter_map(|((label, length), window)| {
             let window = window?;
             let ends_at = window
@@ -200,16 +292,7 @@ fn factory_limits(body: &[u8], now: SystemTime) -> Result<AccountStatus> {
                 length: Some(length),
             })
         })
-        .collect();
-    let credits = limits
-        .extra_usage_balance_cents
-        .filter(|cents| *cents > 0.0)
-        .map(|cents| format!("${:.2}", cents / 100.0));
-    Ok(AccountStatus {
-        windows,
-        credits,
-        ..AccountStatus::default()
-    })
+        .collect()
 }
 
 #[cfg(test)]
@@ -343,6 +426,45 @@ mod tests {
         );
         assert_eq!(status.credits.as_deref(), Some("$12.40"));
         assert_eq!(status.email, None);
+        assert_eq!(status.pool.as_deref(), Some("Standard"));
+        let [core] = &status.other_pools[..] else {
+            panic!("expected Droid Core's pool");
+        };
+        assert_eq!(core.label, "Droid Core");
+        let used: Vec<f64> = core
+            .windows
+            .iter()
+            .map(|window| window.used_percent)
+            .collect();
+        assert_eq!(used, [3.0, 4.0, 3.0]);
+        assert_eq!(
+            status.overage,
+            Some(Overage {
+                preference: Some(OveragePreference::DroidCore),
+                can_change: true,
+                extra_usage_allowed: true,
+            })
+        );
+
+        // An organization's member, with nothing chosen.
+        let member = FACTORY_LIMITS
+            .replace(
+                r#""overagePreference": "droidCore""#,
+                r#""overagePreference": null"#,
+            )
+            .replace(
+                r#""canManageOverage": true"#,
+                r#""canManageOverage": false"#,
+            );
+        let status = factory_limits(member.as_bytes(), now).expect("parse");
+        assert_eq!(
+            status.overage,
+            Some(Overage {
+                preference: None,
+                can_change: false,
+                extra_usage_allowed: true,
+            })
+        );
 
         assert!(factory_limits(br#"{"limits": {}}"#, now).is_err());
         assert!(factory_limits(b"<html>", now).is_err());
@@ -350,20 +472,50 @@ mod tests {
 
     #[tokio::test]
     async fn the_factory_api_takes_the_accounts_key() {
-        let http = FakeHttpClient::create(|request| async move {
-            let authorization = request
-                .headers()
-                .get("Authorization")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let (status, body) = match authorization.as_deref() {
-                _ if request.uri().path() != "/api/billing/limits" => (404, String::new()),
-                Some("Bearer fk-good") => (200, FACTORY_LIMITS.to_string()),
-                _ => (401, r#"{"error": "unauthorized"}"#.to_string()),
-            };
-            Ok(Response::builder()
-                .status(status)
-                .body(AsyncBody::from(body))?)
+        // What the fake Factory keeps: the preference it was last sent.
+        let preference = Arc::new(std::sync::Mutex::new(None::<String>));
+        let http = FakeHttpClient::create({
+            let preference = preference.clone();
+            move |mut request| {
+                let preference = preference.clone();
+                async move {
+                    let authorization = request
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let mut sent = String::new();
+                    request.body_mut().read_to_string(&mut sent).await?;
+                    let (status, body) = match (request.uri().path(), authorization.as_deref()) {
+                        (_, Some(key)) if key != "Bearer fk-good" => {
+                            (401, r#"{"error": "unauthorized"}"#.to_string())
+                        }
+                        ("/api/billing/limits", _) => {
+                            let chosen = preference.lock().expect("lock").clone();
+                            let limits = match chosen {
+                                Some(chosen) => FACTORY_LIMITS.replace(
+                                    r#""overagePreference": "droidCore""#,
+                                    &format!(r#""overagePreference": "{chosen}""#),
+                                ),
+                                None => FACTORY_LIMITS.to_string(),
+                            };
+                            (200, limits)
+                        }
+                        ("/api/organization/subscription/set-overage-preference", _)
+                            if request.method() == Method::POST =>
+                        {
+                            let sent: serde_json::Value = serde_json::from_str(&sent)?;
+                            let chosen = sent["overagePreference"].as_str().map(str::to_string);
+                            *preference.lock().expect("lock") = chosen;
+                            (200, "{}".to_string())
+                        }
+                        _ => (404, String::new()),
+                    };
+                    Ok(Response::builder()
+                        .status(status)
+                        .body(AsyncBody::from(body))?)
+                }
+            }
         });
         let reader = Reader::FactoryApi {
             base_url: "https://api.factory.test/".into(),
@@ -387,6 +539,26 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(refused.logged_in, Some(false));
+
+        // Switching saves the preference as Droid does, and reads it back.
+        *preference.lock().expect("lock") = Some("extraUsage".into());
+        let switched = reader
+            .switch_to_droid_core(with_key("fk-good"), http.clone(), unused_folder())
+            .await
+            .expect("switch");
+        assert_eq!(
+            switched
+                .status
+                .overage
+                .and_then(|overage| overage.preference),
+            Some(OveragePreference::DroidCore)
+        );
+        assert!(
+            reader
+                .switch_to_droid_core(with_key("fk-revoked"), http.clone(), unused_folder())
+                .await
+                .is_err()
+        );
 
         assert!(
             reader

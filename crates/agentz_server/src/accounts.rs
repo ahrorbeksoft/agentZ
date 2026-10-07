@@ -22,7 +22,7 @@ use crate::agent_settings::{read_json, write_json};
 
 pub use descriptions::{AgentDescription, KeyLogin, built_in as built_in_description};
 pub use login_checks::{LoggedIn, LoginCheck, StatusCommand};
-pub use readers::{Reader, ReaderCommand};
+pub use readers::{Read, Reader, ReaderCommand};
 
 /// Where an API-key account keeps its key, in its folder.
 const KEY_FILE: &str = "agentz-api-key";

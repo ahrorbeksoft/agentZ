@@ -81,6 +81,28 @@ fn render_window(
         .into_any_element()
 }
 
+/// An account's extra usage balance, under its tab (Droid's Extra Usage).
+pub(crate) fn render_balance(key: &str, credits: Option<&str>) -> AnyElement {
+    let selector = format!("limit-{key}-balance");
+    h_flex()
+        .debug_selector(move || selector)
+        .gap(px(14.))
+        .child(
+            div().w(LABEL_WIDTH).flex_none().child(
+                Label::new("Balance")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
+        .child(
+            // Droid's readers leave out an empty balance, which Droid shows as $0.00.
+            Label::new(format!("{} remaining", credits.unwrap_or("$0.00")))
+                .size(LabelSize::Small)
+                .weight(FontWeight::MEDIUM),
+        )
+        .into_any_element()
+}
+
 /// The fill is what's left; the hairline is the share of the window still to come, where
 /// spending evenly would have left the fill. The tooltip has the exact figures and time.
 fn render_bar(

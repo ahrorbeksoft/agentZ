@@ -44,6 +44,12 @@ once that has passed, none of it is used. While all of it is, prompts fail with 
 reached", as agents' turns end at their limits. A `.mock/settings.json` in MOCK_HOME with a
 list of `models` offers only those, as an organization's plan offers fewer.
 
+An `overage` file in MOCK_HOME makes it Droid-like at its limit: `--usage` then reports its
+Standard and Droid Core pools, an extra usage balance, and Droid's "When limit is reached"
+choice, which is the file's text: empty for none, "DroidCore" or "ExtraUsage". With either
+one, prompts go on past the limit, as Droid's do. `--usage` with AGENTZ_OVERAGE_PREFERENCE set
+first saves that choice, as agentZ's Switch to Droid Core does through Droid.
+
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
 So are resource links (their URIs) and images (their MIME types). With MOCK_IMAGES set, it
@@ -95,6 +101,9 @@ USAGE_FILE = os.path.join(os.environ["MOCK_HOME"], "usage") if os.environ.get("M
 # When the 5-hour window resets, in seconds since the epoch.
 RESETS_AT_FILE = (os.path.join(os.environ["MOCK_HOME"], "resets_at")
                   if os.environ.get("MOCK_HOME") else None)
+# Droid's "When limit is reached", when the home has one.
+OVERAGE_FILE = (os.path.join(os.environ["MOCK_HOME"], "overage")
+                if os.environ.get("MOCK_HOME") else None)
 
 
 def stored_login():
@@ -116,6 +125,19 @@ def set_reset():
 
 def resets_at():
     return set_reset() or int(time.time()) + 3600
+
+
+def overage():
+    """The home's choice at its limit: None without one, "" when nothing is chosen."""
+    try:
+        with open(OVERAGE_FILE) as file:
+            return file.read().strip()
+    except (TypeError, OSError):
+        return None
+
+
+def stops_at_limit():
+    return USAGE_FILE and used_percent() >= 100 and overage() not in ("DroidCore", "ExtraUsage")
 
 
 def used_percent():
@@ -142,12 +164,24 @@ if sys.argv[-1] == "--usage":
     if not stored_login():
         print(json.dumps({"logged_in": False}), flush=True)
         sys.exit(0)
+    if os.environ.get("AGENTZ_OVERAGE_PREFERENCE") and OVERAGE_FILE:
+        with open(OVERAGE_FILE, "w") as file:
+            file.write(os.environ["AGENTZ_OVERAGE_PREFERENCE"])
     used = used_percent()
-    print(json.dumps({"logged_in": True, "email": "mock@example.com", "plan": "Pro",
-                      "windows": [{"label": "5-hour", "used_percent": used,
-                                   "resets_at": {"secs_since_epoch": resets_at(),
-                                                 "nanos_since_epoch": 0},
-                                   "length": {"secs": 5 * 3600, "nanos": 0}}]}), flush=True)
+    five_hours = {"secs": 5 * 3600, "nanos": 0}
+    read = {"logged_in": True, "email": "mock@example.com", "plan": "Pro",
+            "windows": [{"label": "5-hour", "used_percent": used,
+                         "resets_at": {"secs_since_epoch": resets_at(), "nanos_since_epoch": 0},
+                         "length": five_hours}]}
+    if overage() is not None:
+        read["pool"] = "Standard"
+        read["other_pools"] = [{"label": "Droid Core",
+                                "windows": [{"label": "5-hour", "used_percent": 0,
+                                             "length": five_hours}]}]
+        read["credits"] = "$18.20"
+        read["overage"] = {"preference": overage() or None, "can_change": True,
+                           "extra_usage_allowed": True}
+    print(json.dumps(read), flush=True)
     sys.exit(0)
 
 if sys.argv[-1] == "--login":
@@ -586,7 +620,7 @@ for line in sys.stdin:
                 prompt_resources.append(block["mimeType"])
         record(text_chunk("user_message_chunk", prompt_text))
         prompt_text = SCRIPTS.get(prompt_text, prompt_text)
-        if USAGE_FILE and used_percent() >= 100:
+        if stops_at_limit():
             send({"jsonrpc": "2.0", "id": message["id"],
                   "error": {"code": -32603, "message": "Usage limit reached"}})
         elif prompt_text == "permission":

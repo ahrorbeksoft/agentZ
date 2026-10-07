@@ -14,7 +14,7 @@ use crate::project_store::ProjectStore;
 use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
 use agentz_protocol::accounts::{
     AccountChange, AccountChoice, AccountChoices, AccountId, AccountStatus, AccountSupport,
-    AgentAccounts, AtLimit, LimitWindow, SettingsSource,
+    AgentAccounts, AtLimit, LimitWindow, Overage, OveragePreference, SettingsSource,
 };
 use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
@@ -64,7 +64,7 @@ use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
 use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
 use crate::usage_limits::{
-    format_short_resets_in, limit_color, render_limit_windows, reset_phrase,
+    format_short_resets_in, limit_color, render_balance, render_limit_windows, reset_phrase,
 };
 
 const KEY_CONTEXT: &str = "SettingsPage";
@@ -2277,6 +2277,8 @@ impl SettingsPage {
             sessions_shown: SESSIONS_INITIAL_COUNT,
             importing: HashSet::new(),
             import_error: None,
+            limit_tabs: HashMap::new(),
+            switching_to_core: HashSet::new(),
             _subscriptions: vec![accounts_changed],
         };
         self.show_agents_page(AgentsPage::Agent(panel), window, cx);
@@ -3657,17 +3659,41 @@ impl SettingsPage {
         };
         actions.push(render_account_menu(&selector, menu, cx));
 
-        let windows = read
-            .map(|read| read.status.windows.clone())
-            .filter(|windows| !windows.is_empty())
+        let status = read
+            .map(|read| read.status.clone())
             .filter(|_| matches!(state, AccountState::LoggedIn | AccountState::Connecting));
+        let limits = status
+            .as_ref()
+            .filter(|status| !status.windows.is_empty())
+            .map(|status| {
+                let tab = panel.limit_tabs.get(&account).copied().unwrap_or_default();
+                self.render_limits(&selector, account, status, tab, cx)
+            });
+        let overage = status.as_ref().and_then(|status| {
+            let overage = status.overage?;
+            Some(self.render_overage(
+                account,
+                overage,
+                status.credits.as_deref(),
+                support.extra_usage_page.clone(),
+                panel.switching_to_core.contains(&account),
+                window,
+                cx,
+            ))
+        });
         let shows_login = account.is_some()
             && has_auth_methods
             && matches!(state, AccountState::LoggedOut | AccountState::LoggingIn);
-        // Continuing at the reset needs the reset, from the account's limits.
+        // Continuing at the reset needs the reset, from the account's limits. Beside the
+        // agent's own choice, it's what agentZ does once the agent stops.
+        let at_limit_title = if overage.is_some() {
+            format!("When {agent_name} stops at a limit")
+        } else {
+            "When a limit is reached".to_string()
+        };
         let at_limit = support
             .reads_usage
-            .then(|| self.render_at_limit(account, choices.at_limit, window, cx));
+            .then(|| self.render_at_limit(account, choices.at_limit, at_limit_title, window, cx));
 
         card.child(
             h_flex()
@@ -3696,22 +3722,247 @@ impl SettingsPage {
                 )
                 .children(actions),
         )
-        .children(windows.map(|windows| {
+        .children(limits.map(|limits| {
             // Under the name, past the avatar.
             div()
                 .pl(px(16.) + AVATAR_SIZE + px(12.))
                 .pr_4()
                 .pb(px(14.))
-                .child(render_limit_windows(
-                    &selector,
-                    &windows,
-                    SystemTime::now(),
-                    cx,
-                ))
+                .child(limits)
         }))
+        .children(overage)
         .children(at_limit)
         .when(shows_login, |card| card.child(session.login.clone()))
         .into_any_element()
+    }
+
+    /// The account's windows. An account with pools of limits has a tab for each over them, as
+    /// Droid's `/limits` does, and one for its extra usage balance when it can turn it on.
+    fn render_limits(
+        &self,
+        selector: &str,
+        account: Option<AccountId>,
+        status: &AccountStatus,
+        tab: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let now = SystemTime::now();
+        let Some(pool) = &status.pool else {
+            return render_limit_windows(selector, &status.windows, now, cx);
+        };
+        let mut tabs: Vec<(SharedString, Option<&[LimitWindow]>)> =
+            vec![(pool.clone().into(), Some(&status.windows))];
+        tabs.extend(
+            status
+                .other_pools
+                .iter()
+                .map(|pool| (pool.label.clone().into(), Some(&pool.windows[..]))),
+        );
+        if status.overage.is_some_and(|overage| overage.can_change) {
+            tabs.push(("Extra usage".into(), None));
+        }
+        let tab = tab.min(tabs.len() - 1);
+        let shown = match tabs[tab].1 {
+            Some(windows) if tab == 0 => render_limit_windows(selector, windows, now, cx),
+            Some(windows) => render_limit_windows(&format!("{selector}-{tab}"), windows, now, cx),
+            None => render_balance(selector, status.credits.as_deref()),
+        };
+        let buttons: Vec<ToggleButtonSimple> = tabs
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _))| {
+                ToggleButtonSimple::new(
+                    label.clone(),
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(panel) = this.agent_panel_mut() {
+                            panel.limit_tabs.insert(account, index);
+                            cx.notify();
+                        }
+                    }),
+                )
+            })
+            .collect();
+        let id = format!("limit-tabs-{selector}");
+        v_flex()
+            .gap_3()
+            .children(render_limit_tabs(id, buttons, tab))
+            .child(shown)
+            .into_any_element()
+    }
+
+    /// Droid's "When limit is reached" (decisions.md §8), which it keeps on Factory's server.
+    /// "Use extra usage" opens Factory's page, as Droid's own does: Droid never saves it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_overage(
+        &self,
+        account: Option<AccountId>,
+        overage: Overage,
+        credits: Option<&str>,
+        extra_usage_page: Option<String>,
+        switching: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selector = account_selector(account);
+        let current = match overage.preference {
+            Some(OveragePreference::DroidCore) => "Switch to Droid Core",
+            Some(OveragePreference::ExtraUsage) => "Use extra usage",
+            None => "Not chosen",
+        };
+        let id = format!("overage-{selector}");
+        let control = if !overage.can_change {
+            Label::new(current)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else {
+            let page = cx.weak_entity();
+            let extra_usage_page = extra_usage_page.filter(|_| overage.extra_usage_allowed);
+            let balance = credits.map_or_else(String::new, |credits| format!(" ({credits})"));
+            let menu = ContextMenu::build(window, cx, {
+                move |menu, _, _| {
+                    let chosen = overage.preference;
+                    let core_selector = format!("overage-{selector}-droid-core");
+                    let menu = menu.custom_entry(
+                        move |_, _| {
+                            let selector = core_selector.clone();
+                            v_flex()
+                                .w(px(280.))
+                                .debug_selector(move || selector)
+                                .child(render_check_entry(
+                                    "Switch to Droid Core",
+                                    chosen == Some(OveragePreference::DroidCore),
+                                ))
+                                .child(
+                                    Label::new(
+                                        "Keep working on Droid Core models, at no extra cost.",
+                                    )
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                                .into_any_element()
+                        },
+                        on_page(&page, move |page, _, cx| {
+                            page.switch_to_droid_core(account, cx)
+                        }),
+                    );
+                    let Some(url) = extra_usage_page else {
+                        return menu;
+                    };
+                    let selector = format!("overage-{selector}-extra-usage");
+                    menu.custom_entry(
+                        move |_, _| {
+                            let selector = selector.clone();
+                            v_flex()
+                                .w(px(280.))
+                                .debug_selector(move || selector)
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(render_check_entry(
+                                            "Use extra usage",
+                                            chosen == Some(OveragePreference::ExtraUsage),
+                                        ))
+                                        .child(
+                                            Icon::new(IconName::ArrowUpRight)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    Label::new(format!(
+                                        "Keep working on the same models, billed from your \
+                                         extra usage balance{balance}. Turned on in Factory's \
+                                         settings."
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                                .into_any_element()
+                        },
+                        move |_, cx| cx.open_url(&url),
+                    )
+                }
+            });
+            let label = if switching {
+                "Switching to Droid Core…"
+            } else {
+                current
+            };
+            div()
+                .flex_none()
+                .debug_selector({
+                    let id = id.clone();
+                    move || id
+                })
+                .child(DropdownMenu::new(SharedString::from(id), label, menu).disabled(switching))
+                .into_any_element()
+        };
+        let description = if overage.can_change {
+            "Saved to your Factory account; the CLI does the same."
+        } else {
+            "Set by your organization."
+        };
+        // Under the name, past the avatar, as the limits are.
+        h_flex()
+            .pl(px(16.) + AVATAR_SIZE + px(12.))
+            .pr_4()
+            .pb_3()
+            .gap_6()
+            .justify_between()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(Label::new("When a limit is reached"))
+                    .child(
+                        Label::new(description)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(control)
+            .into_any_element()
+    }
+
+    /// The card's Switch to Droid Core, which takes a moment: Droid's terminal UI saves it.
+    fn switch_to_droid_core(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        if !panel.switching_to_core.insert(account) {
+            return;
+        }
+        panel.account_error = None;
+        let agent_id = panel.agent_id.clone();
+        let response = panel
+            .client(cx)
+            .read(cx)
+            .request(Request::SwitchToDroidCore {
+                agent_id: agent_id.clone(),
+                account,
+            });
+        cx.spawn(async move |this, cx| {
+            let result = response.await;
+            this.update(cx, |this, cx| {
+                let Some(panel) = this
+                    .agent_panel_mut()
+                    .filter(|panel| panel.agent_id == agent_id)
+                else {
+                    return;
+                };
+                panel.switching_to_core.remove(&account);
+                if let Err(error) = result {
+                    panel.account_error =
+                        Some(format!("Couldn't switch to Droid Core: {error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
     }
 
     /// "When a limit is reached": what every thread on the account does, Stop or Continue at
@@ -3720,6 +3971,7 @@ impl SettingsPage {
         &self,
         account: Option<AccountId>,
         current: AtLimit,
+        title: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3777,7 +4029,7 @@ impl SettingsPage {
                     .flex_1()
                     .min_w_0()
                     .gap_0p5()
-                    .child(Label::new("When a limit is reached"))
+                    .child(Label::new(title))
                     .child(
                         Label::new("What threads on this account do.")
                             .size(LabelSize::Small)
@@ -5726,6 +5978,11 @@ struct AgentPanel {
     /// Sessions whose import hasn't been answered yet.
     importing: HashSet<String>,
     import_error: Option<SharedString>,
+    /// The tab each card shows over its limits, for an account with pools: its own first, as
+    /// Droid's `/limits` opens on Standard.
+    limit_tabs: HashMap<Option<AccountId>, usize>,
+    /// Accounts whose Switch to Droid Core is on its way.
+    switching_to_core: HashSet<Option<AccountId>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -6372,6 +6629,39 @@ fn render_color_entry(
         .into_any_element()
 }
 
+/// A card's tabs over its limits: two or three, as `ToggleButtonGroup` takes a fixed number.
+fn render_limit_tabs(
+    id: String,
+    buttons: Vec<ToggleButtonSimple>,
+    selected: usize,
+) -> Option<AnyElement> {
+    fn group<const COUNT: usize>(
+        id: String,
+        buttons: [ToggleButtonSimple; COUNT],
+        selected: usize,
+    ) -> AnyElement {
+        let selector = id.clone();
+        // As wide as its tabs, rather than the card.
+        h_flex()
+            .child(
+                div().debug_selector(move || selector).child(
+                    ToggleButtonGroup::single_row(id, buttons)
+                        .style(ToggleButtonGroupStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .auto_width()
+                        .selected_index(selected),
+                ),
+            )
+            .into_any_element()
+    }
+    match buttons.len() {
+        2 => Some(group::<2>(id, buttons.try_into().ok()?, selected)),
+        3 => Some(group::<3>(id, buttons.try_into().ok()?, selected)),
+        4 => Some(group::<4>(id, buttons.try_into().ok()?, selected)),
+        _ => None,
+    }
+}
+
 fn render_check_entry(name: &'static str, is_current: bool) -> AnyElement {
     h_flex()
         .w_full()
@@ -6775,7 +7065,7 @@ mod tests {
     use std::cell::RefCell;
     use std::time::Duration;
 
-    use agentz_protocol::accounts::{Account, StatusRead};
+    use agentz_protocol::accounts::{Account, LimitPool, StatusRead};
     use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
@@ -7434,6 +7724,7 @@ mod tests {
             folder: "/tmp/agentz-test/accounts/mock".into(),
             reads_usage: true,
             usage_page: Some("https://example.com/usage".into()),
+            extra_usage_page: Some("https://example.com/extra-usage".into()),
             copies_settings_files: true,
         });
         let work = AccountStatus {
@@ -7450,10 +7741,25 @@ mod tests {
             default_account: Some(AccountId(1)),
             external_logged_in: Some(true),
             external_status: Some(StatusRead {
+                // Droid-like: pools, a balance and its choice at a limit.
                 status: AccountStatus {
                     email: Some("alex@hey.com".into()),
                     plan: Some("Max 5x".into()),
                     windows: vec![limit("5-hour", 38., 2 * hour, 5 * hour)],
+                    pool: Some("Standard".into()),
+                    other_pools: vec![LimitPool {
+                        label: "Droid Core".into(),
+                        windows: vec![
+                            limit("5-hour", 3., 2 * hour, 5 * hour),
+                            limit("Weekly", 4., 72 * hour, 168 * hour),
+                        ],
+                    }],
+                    credits: Some("$12.40".into()),
+                    overage: Some(Overage {
+                        preference: None,
+                        can_change: true,
+                        extra_usage_allowed: true,
+                    }),
                     ..AccountStatus::default()
                 },
                 read_at: SystemTime::now(),
@@ -7498,7 +7804,8 @@ mod tests {
                         Request::AddAccount(_) => Some(Response::AccountAdded(AccountId(3))),
                         Request::RemoveAccount { .. }
                         | Request::UpdateAccount { .. }
-                        | Request::RefreshUsage { .. } => Some(Response::Ok),
+                        | Request::RefreshUsage { .. }
+                        | Request::SwitchToDroidCore { .. } => Some(Response::Ok),
                         _ => None,
                     }
                 });
@@ -7557,6 +7864,43 @@ mod tests {
             .expect("the bar has its line");
         let share = f32::from(hairline.left() - bar.left()) / f32::from(bar.size.width);
         assert!((share - 0.4).abs() < 0.02, "the line is at {share}");
+
+        // An account with pools has a tab for each, and one for its extra usage balance.
+        let tabs = cx
+            .debug_bounds("limit-tabs-external")
+            .expect("the External account's pools are tabs");
+        assert!(tabs.bottom() <= bar.top());
+        assert!(cx.debug_bounds("limit-tabs-1").is_none());
+        assert!(cx.debug_bounds("limit-external-1-window-1").is_none());
+        cx.simulate_click(tabs.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-external-1-window-1").is_some());
+        assert!(cx.debug_bounds("limit-external-window-0").is_none());
+        cx.simulate_click(
+            gpui::point(tabs.right() - px(4.), tabs.center().y),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-external-balance").is_some());
+        assert!(cx.debug_bounds("limit-external-1-window-1").is_none());
+
+        // Droid's own "When a limit is reached" saves Switch to Droid Core.
+        assert!(cx.debug_bounds("overage-1").is_none());
+        let overage = cx
+            .debug_bounds("overage-external")
+            .expect("the External account has Droid's choice");
+        cx.simulate_click(overage.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("overage-external-extra-usage").is_some());
+        let droid_core = cx
+            .debug_bounds("overage-external-droid-core")
+            .expect("Switch to Droid Core is offered");
+        cx.simulate_click(droid_core.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(sent(&Request::SwitchToDroidCore {
+            agent_id: mock.clone(),
+            account: None,
+        }));
 
         // An account that hasn't logged in yet is the New account card, which Cancel removes
         // without asking.

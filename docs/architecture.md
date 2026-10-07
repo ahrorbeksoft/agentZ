@@ -256,6 +256,15 @@ Each entry: what it does, where it lives, and where it comes from.
   (Rename's, else its email), "Default" on the one new threads take, its plan, its limit bars
   (`usage_limits.rs`, t3code's `LimitWindows`), and a ⋯ menu (Rename in place, Use for New
   Threads, Color, Refresh Usage, Open Usage Page, Show in Finder, Log Out, Remove Account).
+  An account with pools of limits (`AccountStatus::pool`, `other_pools`: Droid's Standard and
+  Droid Core) has Zed's `ToggleButtonGroup` over its bars, a tab per pool as in Droid's
+  `/limits`, and Extra usage with its balance when the login can change Droid's choice; the
+  tab is kept per card (`AgentPanel::limit_tabs`). Under them, Droid's own "When a limit is
+  reached" (`SettingsPage::render_overage`, `Overage`, accounts topic 8), saved on Factory's
+  server: Switch to Droid Core (`Request::SwitchToDroidCore`) or Use extra usage, which opens
+  Factory's page (`AccountSupport::extra_usage_page`), as Droid's own does, since Droid never
+  saves it; read-only with "Set by your organization." when the login can't change it.
+  agentZ's own Stop or Continue at reset is then titled "When <agent> stops at a limit".
   Each account has its own login session (`OpenLoginSession` with the account) while the page
   is open, and its login rows while logged out. Add Account makes a "New account" card that
   Cancel removes, with "Copy settings from" (the other accounts, the default one first, or
@@ -437,7 +446,12 @@ Each entry: what it does, where it lives, and where it comes from.
   out); with more than one other account, it's a split button whose arrow lists the rest.
   "Continue at 16:10" waits for the reset (below), and once the thread waits, the body says
   so and Don't Continue cancels it. Usage ↗ opens the agent's usage page. Closed, it stays
-  closed until the next turn.
+  closed until the next turn. For an account with pools, the title names the pool ("… limit
+  on standard models"), and where the login can change Droid's choice, the body ends "<agent>
+  can keep going:" with Droid's ways on (accounts topic 8): Switch to Droid Core (unless it's
+  chosen already or Droid Core's pool is used up too), which saves it, then sends the
+  thread's last message again, as Copy Message copies it; and Use Extra Usage · <balance>
+  left, which opens Factory's page.
 - **Continue at reset** (`server/limit_waits.rs`, `Thread::continues_at`,
   `Request::ContinueAtReset`, `AtLimit`, `SettingsPage::render_at_limit`; t3code's "Resume
   at reset", accounts topic 11): each account's card has "When a limit is reached", Stop (the
@@ -607,6 +621,14 @@ Each entry: what it does, where it lives, and where it comes from.
   (`🔐`, `%`, `↻`, the bars); the screens it's tested on are in `accounts/droid_screens/`, and
   a fake Droid in its tests shows them in turn. It answers the folder trust question for that
   folder only, sends Esc and never Enter in `/limits` (Enter there changes the limit choice),
+  except for Switch to Droid Core (`droid::switch_to_droid_core`), which presses it on that
+  row only once the cursor is there, and waits for Droid's note about it. `/limits` is read
+  on two tabs: Standard's, then Tab for Droid Core's; then ↓ moves the cursor, which hides
+  the mark of its row, to the second row ("Enable Extra Usage", only for a login that can
+  change the choice; it stays put while extra usage can't be turned on), so the first row's
+  `●` shows whether Droid Core is chosen. Factory's API reader takes the same from
+  `/api/billing/limits` and switches by `set-overage-preference`, as Droid does. A read and a
+  switch of one account never run at once (`Server::account_locks`). It
   runs with `--settings` turning cloud session sync off, and resumes (`--resume`) the one
   session a past read opened in that folder: Droid opens a session each time it starts and
   keeps it in its own session indexes even once its files are deleted. A read removes any

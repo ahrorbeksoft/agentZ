@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::{
-    AccountChoice, AccountId, AgentAccounts, LimitWindow, used_up_window,
+    AccountChoice, AccountId, AccountStatus, AgentAccounts, LimitWindow, OveragePreference,
+    used_up_window,
 };
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::agents::InstallState;
@@ -320,10 +321,12 @@ pub struct AgentView {
     _rename_blur: Option<Subscription>,
     /// The composer's handoff chip shows what goes to the agent.
     handoff_expanded: bool,
-    /// Why "Continue with another agent", or the limit notice's Continue at the reset, didn't
-    /// work.
+    /// Why "Continue with another agent", or the limit notice's Continue at the reset or
+    /// Switch to Droid Core, didn't work.
     continue_error: Option<SharedString>,
     _continuing: Task<()>,
+    /// The limit notice's Switch to Droid Core, while it's on its way.
+    switching_to_core: Option<Task<()>>,
     /// The limit notice was closed, until the next turn.
     limit_notice_dismissed: bool,
     /// The project's repository, for the new thread screen's checkout picker. Asked for the
@@ -518,6 +521,7 @@ impl AgentView {
             handoff_expanded: false,
             continue_error: None,
             _continuing: Task::ready(()),
+            switching_to_core: None,
             limit_notice_dismissed: false,
             draft_git: None,
             _draft_git_load: None,
@@ -3658,15 +3662,68 @@ impl AgentView {
         let record = self.store.read(cx).thread(self.thread_id)?;
         let (account, continues_at) = (record.account, record.continues_at);
         let accounts = self.client.read(cx).accounts(&agent_id);
-        let window = used_up_window(&accounts.status(account)?.status.windows, now)?.clone();
+        let status = accounts.status(account)?.status.clone();
+        let window = used_up_window(&status.windows, now)?.clone();
         Some(LimitReached {
             agent_id,
             accounts,
             account,
             window,
+            status,
             error,
             continues_at,
         })
+    }
+
+    /// The limit notice's Switch to Droid Core: saved as Droid's `/limits` saves it, then the
+    /// thread's last message goes again, as Copy Message copies it.
+    fn switch_to_droid_core(
+        &mut self,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.continue_error = None;
+        let response = self
+            .client
+            .read(cx)
+            .request(Request::SwitchToDroidCore { agent_id, account });
+        self.switching_to_core = Some(cx.spawn(async move |this, cx| {
+            let result = response.await;
+            this.update(cx, |this, cx| {
+                this.switching_to_core = None;
+                match result {
+                    Ok(_) => this.send_last_message_again(cx),
+                    Err(error) => {
+                        this.continue_error =
+                            Some(format!("Couldn't switch to Droid Core: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn send_last_message_again(&mut self, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        let Some(text) = thread.entries().iter().rev().find_map(|entry| match entry {
+            Entry::UserMessage(text) => Some(without_handoff(text).to_string()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let prompt = PromptPart::text(text);
+        let waits = thread.is_working() || !thread.state.queued_messages.is_empty();
+        self.list_state.scroll_to_end();
+        self.thread.update(cx, |thread, cx| {
+            if waits {
+                thread.queue_message(prompt, cx)
+            } else {
+                thread.send(prompt, cx)
+            }
+        });
     }
 
     /// The limit notice's Continue at <reset>, or its cancel.
@@ -3708,10 +3765,12 @@ impl AgentView {
         let has_accounts = reached.accounts.listed().len() > 1;
         let own = account_entry(&reached.accounts, reached.account);
         let who = has_accounts.then(|| account_phrase(&own, true));
-        let (title, body) = limit_notice_text(
+        let agent_name = self.agent_name(cx);
+        let (title, mut body) = limit_notice_text(
             who.as_deref(),
-            &self.agent_name(cx),
+            &agent_name,
             &reached.window,
+            reached.status.pool.as_deref(),
             reached.continues_at,
             now,
         );
@@ -3720,12 +3779,70 @@ impl AgentView {
         } else {
             Vec::new()
         };
-        let usage_page = self
+        let support = self
             .registry
             .read(cx)
             .agent(&reached.agent_id)
-            .and_then(|agent| agent.accounts.as_ref())
+            .and_then(|agent| agent.accounts.clone());
+        let usage_page = support
+            .as_ref()
             .and_then(|support| support.usage_page.clone());
+        // Droid's own ways on (decisions.md §8), where the login can choose them.
+        let overage = reached.status.overage.filter(|overage| overage.can_change);
+        let can_switch = overage.is_some_and(|overage| {
+            overage.preference != Some(OveragePreference::DroidCore)
+                && reached
+                    .status
+                    .other_pools
+                    .iter()
+                    .all(|pool| used_up_window(&pool.windows, now).is_none())
+        });
+        let extra_usage_page = support
+            .and_then(|support| support.extra_usage_page)
+            .filter(|_| overage.is_some_and(|overage| overage.extra_usage_allowed));
+        if can_switch || extra_usage_page.is_some() {
+            body.push_str(&format!(" {agent_name} can keep going:"));
+        }
+        let switch_button = can_switch.then(|| {
+            let agent_id = reached.agent_id.clone();
+            let account = reached.account;
+            let switching = self.switching_to_core.is_some();
+            div()
+                .debug_selector(|| "limit-switch-to-droid-core".into())
+                .child(
+                    Button::new(
+                        "limit-switch-to-droid-core",
+                        if switching {
+                            "Switching to Droid Core…"
+                        } else {
+                            "Switch to Droid Core"
+                        },
+                    )
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .disabled(switching)
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.switch_to_droid_core(agent_id.clone(), account, cx)
+                        },
+                    )),
+                )
+        });
+        let extra_usage_button = extra_usage_page.map(|url| {
+            let label = match &reached.status.credits {
+                Some(credits) => format!("Use Extra Usage · {credits} left"),
+                None => "Use Extra Usage".to_string(),
+            };
+            Button::new("limit-extra-usage", label)
+                .style(ButtonStyle::Outlined)
+                .label_size(LabelSize::Small)
+                .end_icon(
+                    Icon::new(IconName::ArrowUpRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(move |_, _, cx| cx.open_url(&url))
+        });
 
         let continue_button = others.split_first().map(|(first, rest)| {
             let label = format!(
@@ -3839,8 +3956,11 @@ impl AgentView {
                         })),
                 )
         });
-        let has_buttons =
-            continue_button.is_some() || reset_button.is_some() || usage_button.is_some();
+        let has_buttons = continue_button.is_some()
+            || switch_button.is_some()
+            || extra_usage_button.is_some()
+            || reset_button.is_some()
+            || usage_button.is_some();
         let error = reached.error;
         let callout = Callout::new()
             .severity(Severity::Warning)
@@ -3863,6 +3983,8 @@ impl AgentView {
                                 .flex_wrap()
                                 .gap_1()
                                 .children(continue_button)
+                                .children(switch_button)
+                                .children(extra_usage_button)
                                 .children(reset_button)
                                 .children(usage_button),
                         )
@@ -6487,26 +6609,32 @@ struct LimitReached {
     /// `None` being the External one.
     account: Option<AccountId>,
     window: LimitWindow,
+    /// The read that found it.
+    status: AccountStatus,
     error: SharedString,
     /// When agentZ sends "Continue.", if it does.
     continues_at: Option<SystemTime>,
 }
 
 /// The limit notice's title and body. `who` names the account whose limit ran out, when the
-/// agent has more than one to tell apart, and `continues_at` is when agentZ continues the
-/// thread, if it does.
+/// agent has more than one to tell apart, `pool` the models the window is for, when the account
+/// has pools of limits, and `continues_at` is when agentZ continues the thread, if it does.
 fn limit_notice_text(
     who: Option<&str>,
     agent_name: &str,
     window: &LimitWindow,
+    pool: Option<&str>,
     continues_at: Option<SystemTime>,
     now: SystemTime,
 ) -> (String, String) {
-    let title = format!(
+    let mut title = format!(
         "{} reached its {} limit",
         who.unwrap_or("Your account"),
         label_in_sentence(&window.label)
     );
+    if let Some(pool) = pool {
+        title.push_str(&format!(" on {} models", pool.to_lowercase()));
+    }
     let mut body = format!("{agent_name} stopped.");
     if let Some(resets_at) = continues_at.or(window.resets_at) {
         let remaining = resets_at.duration_since(now).unwrap_or_default();
@@ -8075,7 +8203,15 @@ mod tests {
             let reached = view
                 .limit_reached(SystemTime::now(), cx)
                 .expect("at the limit");
-            limit_notice_text(None, "Mock", &reached.window, reached.continues_at, now).1
+            limit_notice_text(
+                None,
+                "Mock",
+                &reached.window,
+                None,
+                reached.continues_at,
+                now,
+            )
+            .1
         });
         assert!(body.contains("agentZ sends “Continue.”"), "{body}");
         let button = cx
@@ -8087,6 +8223,114 @@ mod tests {
             asked(&requests),
             [(ThreadId(2), true), (ThreadId(2), false)]
         );
+    }
+
+    /// Droid's ways on: the notice names the pool that ran out, and Switch to Droid Core saves
+    /// it, then sends the thread's last message again. It's gone once Droid Core is chosen.
+    #[gpui::test]
+    fn the_limit_notice_switches_to_droid_core(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, LimitPool, Overage, StatusRead};
+        use std::cell::RefCell;
+
+        let (view, cx) = open(2, false, cx);
+        let mock = AgentId::new("mock");
+        let now = SystemTime::now();
+        let window = |used_percent| LimitWindow {
+            label: "5-hour".into(),
+            used_percent,
+            resets_at: Some(now + Duration::from_secs(2 * 60 * 60)),
+            length: None,
+        };
+        let accounts = |preference| AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    windows: vec![window(100.)],
+                    pool: Some("Standard".into()),
+                    other_pools: vec![LimitPool {
+                        label: "Droid Core".into(),
+                        windows: vec![window(4.)],
+                    }],
+                    overage: Some(Overage {
+                        preference,
+                        can_change: true,
+                        extra_usage_allowed: true,
+                    }),
+                    ..AccountStatus::default()
+                },
+                read_at: now,
+            }),
+            ..AgentAccounts::default()
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                matches!(
+                    request,
+                    Request::SwitchToDroidCore { .. } | Request::Prompt { .. }
+                )
+                .then_some(Response::Ok)
+            });
+            client.set_accounts_for_test([(mock.clone(), accounts(None))].into(), cx);
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Fix the login".into()),
+                    Entry::UserMessage("Then the docs".into()),
+                ],
+                cx,
+            );
+            thread.set_turn_error_for_test("Usage limit reached", cx);
+        });
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("limit-switch-to-droid-core")
+            .expect("Switch to Droid Core is offered");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let sent: Vec<Request> = requests
+            .borrow()
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request,
+                    Request::SwitchToDroidCore { .. } | Request::Prompt { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        assert!(
+            matches!(&sent[..], [
+                Request::SwitchToDroidCore { agent_id, account: None },
+                Request::Prompt { prompt, .. },
+            ] if *agent_id == mock && *prompt == PromptPart::text("Then the docs")),
+            "{sent:?}"
+        );
+
+        // Chosen already, or Droid Core used up too: Droid can't go on that way.
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test(
+                [(mock.clone(), accounts(Some(OveragePreference::DroidCore)))].into(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-notice").is_some());
+        assert!(cx.debug_bounds("limit-switch-to-droid-core").is_none());
+        let mut used_up = accounts(None);
+        if let Some(read) = &mut used_up.external_status {
+            read.status.other_pools[0].windows = vec![window(100.)];
+        }
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock, used_up)].into(), cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("limit-switch-to-droid-core").is_none());
     }
 
     /// The composer gauges the thread's account by its window closest to running out, and opens
@@ -8187,12 +8431,19 @@ mod tests {
             resets_at: Some(now + Duration::from_secs(112 * 60 + 30)),
             length: None,
         };
-        let (title, body) = limit_notice_text(Some("Work"), "Claude Agent", &window, None, now);
+        let (title, body) =
+            limit_notice_text(Some("Work"), "Claude Agent", &window, None, None, now);
         assert_eq!(title, "Work reached its weekly limit");
         assert!(body.starts_with("Claude Agent stopped. The limit resets "));
         assert!(body.ends_with(", in 1h 52m."));
-        let (_, body) =
-            limit_notice_text(Some("Work"), "Claude Agent", &window, window.resets_at, now);
+        let (_, body) = limit_notice_text(
+            Some("Work"),
+            "Claude Agent",
+            &window,
+            None,
+            window.resets_at,
+            now,
+        );
         assert!(
             body.starts_with(
                 "Claude Agent stopped. agentZ sends “Continue.” when the limit resets "
@@ -8208,10 +8459,23 @@ mod tests {
                 ..window
             },
             None,
+            None,
             now,
         );
         assert_eq!(title, "Your account reached its GPT-5 5-hour limit");
         assert_eq!(body, "Claude Agent stopped.");
+        let (title, _) = limit_notice_text(
+            Some("Work"),
+            "Factory Droid",
+            &LimitWindow {
+                label: "5-hour".into(),
+                ..window
+            },
+            Some("Standard"),
+            None,
+            now,
+        );
+        assert_eq!(title, "Work reached its 5-hour limit on standard models");
     }
 
     /// An archived thread takes no messages, so there's nothing to start.

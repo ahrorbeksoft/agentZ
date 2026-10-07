@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::{AccountStatus, LimitWindow};
+use agentz_protocol::accounts::{
+    AccountStatus, LimitPool, LimitWindow, Overage, OveragePreference,
+};
 use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -34,6 +36,12 @@ const SCREEN: TerminalSize = TerminalSize {
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const END_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `/limits`' cursor gets to move down: it doesn't when the row below is disabled, as
+/// "Enable Extra Usage" is during a free trial.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Droid's pools of limits, by their English names, in the order `/limits` draws their tabs.
+pub(super) const STANDARD_POOL: &str = "Standard";
+pub(super) const CORE_POOL: &str = "Droid Core";
 /// Droid's windows in the order `/limits` always draws them, by their English names: the
 /// labels it draws are translated.
 pub(super) const WINDOW_LABELS: [&str; 3] = ["5-hour", "Weekly", "Monthly"];
@@ -73,18 +81,31 @@ pub(super) fn description() -> AgentDescription {
             }),
         }),
         usage_page: Some("https://app.factory.ai/settings/billing".into()),
+        // Droid's "Enable Extra Usage in settings (opens browser)" opens it.
+        extra_usage_page: Some("https://app.factory.ai/settings/usage".into()),
     }
 }
 
 /// Reads the account from `/status` and `/limits` in Droid's terminal UI, run in `folder`.
 /// Droid is translated, so only what it draws the same in every language is read: its symbols
-/// (`🔐`, `%`, `↻`, the bars), numbers, emails and ids. The only keys sent are the two commands,
-/// Enter to run them (and to trust `folder`), and Esc: Enter in `/limits` would change what
-/// Droid does at a limit.
+/// (`🔐`, `%`, `↻`, the bars, `/limits`' tabs and marks), numbers, emails and ids. The only keys
+/// sent are the two commands, Enter to run them (and to trust `folder`), Tab and ↓ in
+/// `/limits`, and Esc: Enter in `/limits` would change what Droid does at a limit.
 ///
 /// Droid opens a session each time it starts, and keeps it in its own indexes of sessions even
 /// once its files are deleted, so reads resume the one session a past read opened in the home.
 pub(super) async fn read(agent: AgentCommand, folder: &Path) -> Result<Read> {
+    run_reader(agent, folder, false).await
+}
+
+/// `/limits`' "Switch to Droid Core", which Droid saves on Factory's server, then a read, which
+/// says whether it took. Never "Enable Extra Usage": Enter there opens a browser on this
+/// machine.
+pub(super) async fn switch_to_droid_core(agent: AgentCommand, folder: &Path) -> Result<Read> {
+    run_reader(agent, folder, true).await
+}
+
+async fn run_reader(agent: AgentCommand, folder: &Path, switch: bool) -> Result<Read> {
     std::fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
     // Droid asks about the folder, and keeps its sessions, by its real path (`/private/tmp`
     // for `/tmp`).
@@ -115,7 +136,7 @@ pub(super) async fn read(agent: AgentCommand, folder: &Path) -> Result<Read> {
     }
     let mut terminal = HiddenTerminal::start(&agent, args, folder.clone(), SCREEN)?;
     let mut session = None;
-    let read = read_screens(&mut terminal, &folder, &mut session).await;
+    let read = read_screens(&mut terminal, &folder, &mut session, switch).await;
     terminal.end(END_TIMEOUT).await;
     match (&read, session, resumed) {
         (Ok(_), Some(session), _) => {
@@ -138,6 +159,7 @@ async fn read_screens(
     terminal: &mut HiddenTerminal,
     folder: &Path,
     session: &mut Option<String>,
+    switch: bool,
 ) -> Result<Read> {
     let mut trusted = false;
     loop {
@@ -162,6 +184,9 @@ async fn read_screens(
         }
     }
 
+    if switch {
+        choose_droid_core(terminal).await?;
+    }
     run(terminal, "/status").await?;
     let status = terminal
         .wait_for("/status", STEP_TIMEOUT, status_screen)
@@ -177,21 +202,103 @@ async fn read_screens(
         .await?;
 
     run(terminal, "/limits").await?;
-    let limits = terminal
+    let standard = terminal
         .wait_for("/limits", STEP_TIMEOUT, |screen| {
-            limits_screen(screen, SystemTime::now())
+            limits_screen(screen, SystemTime::now()).filter(|limits| limits.tab == 0)
         })
         .await?;
+    terminal.write("\t");
+    let core = terminal
+        .wait_for("Droid Core's limits", STEP_TIMEOUT, |screen| {
+            limits_screen(screen, SystemTime::now()).filter(|limits| limits.tab == 1)
+        })
+        .await?;
+    // The cursor hides the mark of the row it's on, the first: the mark is seen once it
+    // moves to the second, which only a login that can change the choice has.
+    let can_change = standard.rows.len() >= 2;
+    let moved = if can_change {
+        terminal.write("\x1b[B");
+        terminal
+            .wait_for("the cursor on the second row", MOVE_TIMEOUT, |screen| {
+                limits_screen(screen, SystemTime::now())
+                    .filter(|limits| limits.rows.get(1) == Some(&Mark::Cursor))
+            })
+            .await
+            .ok()
+    } else {
+        None
+    };
     terminal.write("\x1b");
+    let preference = if standard.rows.get(1) == Some(&Mark::Chosen) {
+        Some(OveragePreference::ExtraUsage)
+    } else if moved
+        .as_ref()
+        .is_some_and(|moved| moved.rows.first() == Some(&Mark::Chosen))
+    {
+        Some(OveragePreference::DroidCore)
+    } else {
+        None
+    };
     Ok(Read {
         // Droid shows its prompt only once it's logged in, and `/limits` only once it has
         // read them.
         logged_in: Some(true),
         status: AccountStatus {
             email: status.email,
-            ..limits
+            windows: standard.windows,
+            pool: Some(STANDARD_POOL.into()),
+            other_pools: vec![LimitPool {
+                label: CORE_POOL.into(),
+                windows: core.windows,
+            }],
+            credits: standard.credits,
+            // A login that can't change it sees only the first row, whose mark the cursor
+            // hides.
+            overage: can_change.then_some(Overage {
+                preference,
+                can_change,
+                // The second row is disabled while extra usage can't be turned on.
+                extra_usage_allowed: moved.is_some(),
+            }),
+            ..AccountStatus::default()
         },
     })
+}
+
+/// Picks "Switch to Droid Core" in `/limits`, once the cursor is on it, and waits for the note
+/// Droid prints about it and its prompt again.
+async fn choose_droid_core(terminal: &mut HiddenTerminal) -> Result<()> {
+    run(terminal, "/limits").await?;
+    let (limits, notes_before) = terminal
+        .wait_for("/limits", STEP_TIMEOUT, |screen| {
+            let limits = limits_screen(screen, SystemTime::now())?;
+            Some((limits, notes(screen)))
+        })
+        .await?;
+    anyhow::ensure!(
+        limits.rows.len() >= 2,
+        "this login can't change what Droid does at a limit"
+    );
+    anyhow::ensure!(
+        limits.rows.first() == Some(&Mark::Cursor),
+        "/limits' cursor isn't on Switch to Droid Core"
+    );
+    terminal.write("\r");
+    terminal
+        .wait_for("its note about Droid Core", STEP_TIMEOUT, |screen| {
+            prompt(screen).filter(|typed| !typed.starts_with('/'))?;
+            (notes(screen) != notes_before).then_some(())
+        })
+        .await
+}
+
+/// The notes Droid prints outside its boxes ("●  Credit limit choice cancelled.").
+fn notes(screen: &str) -> Vec<String> {
+    screen
+        .lines()
+        .filter(|line| line.starts_with("●  "))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Types `command`, and runs it once Droid's menu offers it first: the menu filters a moment
@@ -273,7 +380,11 @@ fn offers_first(screen: &str, command: &str) -> bool {
 
 /// The text inside a box's line, between its borders.
 fn box_text(line: &str) -> Option<&str> {
-    Some(line.strip_prefix('│')?.strip_suffix('│')?.trim())
+    Some(box_inside(line)?.trim())
+}
+
+fn box_inside(line: &str) -> Option<&str> {
+    line.strip_prefix('│')?.strip_suffix('│')
 }
 
 /// What `/status` says about the account and the session the read opened.
@@ -325,15 +436,43 @@ fn is_email(token: &str) -> bool {
     })
 }
 
-/// `/limits`, once its box is drawn whole. It opens on Standard Usage's tab (`◉`), whose
-/// windows are each a line with a percentage and when it resets (`↻`), above a bar of `█` and
+/// What `/limits` shows.
+#[derive(Debug, PartialEq)]
+struct Limits {
+    /// The tab shown: 0 for Standard, 1 for Droid Core.
+    tab: usize,
+    windows: Vec<LimitWindow>,
+    credits: Option<String>,
+    /// The marks of "When limit is reached"'s rows: "Switch to Droid Core", then "Enable Extra
+    /// Usage", which only a login that can change the choice has.
+    rows: Vec<Mark>,
+}
+
+/// A mark before one of `/limits`' rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mark {
+    None,
+    /// `●`: what Droid does at a limit.
+    Chosen,
+    /// `>`, blinking between "> " and " >", which hides the row's own mark.
+    Cursor,
+}
+
+/// `/limits`, once its box is drawn whole. Its tabs are a line of `◉` (the one shown) and `○`.
+/// Each window is a line with a percentage and when it resets (`↻`), above a bar of `█` and
 /// `░`. A window not started yet shows no reset. The Extra Usage balance is the dollar amount
-/// it offers to add to.
-fn limits_screen(screen: &str, now: SystemTime) -> Option<AccountStatus> {
+/// it offers to add to. Under a `─` line, "When limit is reached"'s rows each start with a
+/// two-character mark.
+fn limits_screen(screen: &str, now: SystemTime) -> Option<Limits> {
     let lines: Vec<&str> = screen.lines().collect();
     let tabs = lines
         .iter()
         .position(|line| line.contains('◉') && line.contains('○'))?;
+    let tab = lines[tabs]
+        .chars()
+        .take_while(|char| *char != '◉')
+        .filter(|char| *char == '○')
+        .count();
     let bottom = tabs
         + lines
             .iter()
@@ -372,11 +511,39 @@ fn limits_screen(screen: &str, now: SystemTime) -> Option<AccountStatus> {
         .find_map(|line| dollars(line))
         .filter(|dollars| *dollars > 0.0)
         .map(|dollars| format!("${dollars:.2}"));
-    Some(AccountStatus {
+    let rows = lines
+        .iter()
+        .take(bottom)
+        .skip(tabs + 1)
+        .skip_while(|line| !box_text(line).is_some_and(is_rule))
+        .skip(1)
+        .filter_map(|line| row_mark(line))
+        .collect();
+    Some(Limits {
+        tab,
         windows,
         credits,
-        ..AccountStatus::default()
+        rows,
     })
+}
+
+fn is_rule(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|char| char == '─')
+}
+
+/// The mark of one of `/limits`' rows: two characters after the box's border and its space,
+/// then the row's text. A row's description is indented further.
+fn row_mark(line: &str) -> Option<Mark> {
+    let text = box_inside(line)?.strip_prefix(' ')?;
+    let mut chars = text.chars();
+    let mark = [chars.next()?, chars.next()?];
+    chars.next().filter(|char| !char.is_whitespace())?;
+    match mark {
+        [' ', ' '] => Some(Mark::None),
+        ['●', ' '] => Some(Mark::Chosen),
+        ['>', ' '] | [' ', '>'] => Some(Mark::Cursor),
+        _ => None,
+    }
 }
 
 fn is_bar(text: &str) -> bool {
@@ -527,6 +694,10 @@ mod tests {
     const MENU_LIMITS: &str = include_str!("droid_screens/menu-limits.txt");
     const STATUS: &str = include_str!("droid_screens/status.txt");
     const LIMITS: &str = include_str!("droid_screens/limits.txt");
+    /// After Tab, from Droid 0.235.0.
+    const LIMITS_DROID_CORE: &str = include_str!("droid_screens/limits-droid-core.txt");
+    /// Then after ↓: the account's choice is Droid Core.
+    const LIMITS_MOVED: &str = include_str!("droid_screens/limits-moved.txt");
     /// The folder the screens were captured in.
     const FOLDER: &str = "/private/tmp/reader";
     const SESSION: &str = "00000000-0000-4000-8000-000000000001";
@@ -585,6 +756,7 @@ mod tests {
     fn limits_give_the_standard_windows() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let status = limits_screen(LIMITS, now).expect("limits");
+        assert_eq!(status.tab, 0);
         let windows: Vec<(&str, f64, Option<SystemTime>)> = status
             .windows
             .iter()
@@ -600,7 +772,6 @@ mod tests {
             ]
         );
         assert_eq!(status.credits, None);
-        assert_eq!(status.email, None);
 
         // In another language, with a label that runs into its number, a window not started
         // yet, and a balance.
@@ -637,6 +808,53 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(limits_screen(&half_drawn, now), None);
+    }
+
+    #[test]
+    fn limits_give_droid_cores_windows_and_the_choice() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let day = 24 * 60 * 60;
+        let core = limits_screen(LIMITS_DROID_CORE, now).expect("limits");
+        assert_eq!(core.tab, 1);
+        let windows: Vec<(&str, f64, Option<SystemTime>)> = core
+            .windows
+            .iter()
+            .map(|window| (window.label.as_str(), window.used_percent, window.resets_at))
+            .collect();
+        assert_eq!(
+            windows,
+            [
+                ("5-hour", 0.0, None),
+                ("Weekly", 4.0, Some(now + Duration::from_secs(6 * day))),
+                ("Monthly", 3.0, Some(now + Duration::from_secs(29 * day))),
+            ]
+        );
+
+        // The cursor starts on Switch to Droid Core, hiding its mark, and blinks.
+        assert_eq!(core.rows, [Mark::Cursor, Mark::None]);
+        assert_eq!(
+            limits_screen(LIMITS, now).expect("limits").rows,
+            [Mark::Cursor, Mark::None]
+        );
+        let moved = limits_screen(LIMITS_MOVED, now).expect("limits");
+        assert_eq!(moved.rows, [Mark::Chosen, Mark::Cursor]);
+        let blinked = LIMITS_MOVED.replace("│ > Enable", "│  >Enable");
+        assert_eq!(
+            limits_screen(&blinked, now).expect("limits").rows,
+            [Mark::Chosen, Mark::Cursor]
+        );
+
+        // A login that can't change it has only the first row, in any language.
+        let one_row: String = LIMITS
+            .lines()
+            .filter(|line| !line.contains("Enable Extra Usage in settings"))
+            .map(|line| line.replace("Switch to Droid Core", "Passa a Droid Core"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            limits_screen(&one_row, now).expect("limits").rows,
+            [Mark::Cursor]
+        );
     }
 
     #[test]
@@ -726,11 +944,17 @@ if os.environ.get("DROID_BROKEN"):
     print("It broke")
     sys.exit(1)
 
-def show(name, command=None):
-    with open(os.path.join(screens, name + ".txt")) as file:
+def show(name, command=None, note=None):
+    # Nothing chosen: the moved screen without its mark.
+    file_name = "limits-moved" if name == "limits-moved-none" else name
+    with open(os.path.join(screens, file_name + ".txt")) as file:
         text = file.read().replace("/private/tmp/reader", cwd)
+    if name == "limits-moved-none":
+        text = text.replace("│ ● Switch", "│   Switch")
     if command:
         text = text.replace("/limits", command)
+    if note:
+        text = text.replace(" Auto (Off)", "●  " + note + "\n Auto (Off)")
     sys.stdout.write("\x1b[2J\x1b[H" + text.replace("\n", "\r\n"))
     sys.stdout.flush()
 
@@ -759,7 +983,16 @@ if not resumes:
         file.write(json.dumps({"type": "session_start", "id": session, "cwd": cwd}) + "\n")
     with open(os.path.join(project, session + ".settings.json"), "w") as file:
         file.write("{}")
-show("ready")
+if os.environ.get("DROID_SWITCH"):
+    show("ready")
+    expect("/limits")
+    show("menu-limits")
+    expect("\r")
+    show("limits")
+    expect("\r")
+    with open("switched", "w") as file:
+        file.write("droidCore")
+show("ready", note="Switched to Droid Core." if os.path.exists("switched") else None)
 expect("/status")
 show("menu-status-unfiltered")
 time.sleep(0.3)
@@ -772,6 +1005,12 @@ expect("/limits")
 show("menu-limits")
 expect("\r")
 show("limits")
+expect("\t")
+show("limits-droid-core")
+expect("\x1b[B")
+# With extra usage not allowed, the second row is disabled: the cursor stays.
+if not os.environ.get("DROID_NO_EXTRA_USAGE"):
+    show("limits-moved" if os.path.exists("switched") else "limits-moved-none")
 expect("\x1b")
 show("ready")
 time.sleep(60)
@@ -850,6 +1089,51 @@ time.sleep(60)
         assert_eq!(
             reads_sessions(&sessions, &real_folder).expect("sessions"),
             [SESSION]
+        );
+
+        // Droid Core's windows, from Tab, and the choice, from ↓.
+        let status = &found.status;
+        assert_eq!(status.pool.as_deref(), Some(STANDARD_POOL));
+        let [core] = &status.other_pools[..] else {
+            panic!("expected Droid Core's pool");
+        };
+        assert_eq!(core.label, CORE_POOL);
+        assert_eq!(core.windows.len(), 3);
+        assert_eq!(core.windows[1].used_percent, 4.0);
+        assert_eq!(
+            status.overage,
+            Some(Overage {
+                preference: None,
+                can_change: true,
+                extra_usage_allowed: true,
+            })
+        );
+
+        // While extra usage can't be turned on, the cursor can't move to it.
+        let mut no_extra_usage = agent.clone();
+        no_extra_usage
+            .env
+            .insert("DROID_NO_EXTRA_USAGE".into(), "1".into());
+        let found = read(no_extra_usage, &folder).await.expect("read");
+        assert!(!folder.join("unexpected").exists());
+        assert_eq!(
+            found
+                .status
+                .overage
+                .map(|overage| overage.extra_usage_allowed),
+            Some(false)
+        );
+
+        // Switching picks the first row, and the read after it sees the choice.
+        let mut switching = agent.clone();
+        switching.env.insert("DROID_SWITCH".into(), "1".into());
+        let found = switch_to_droid_core(switching, &folder)
+            .await
+            .expect("switch");
+        assert!(!folder.join("unexpected").exists());
+        assert_eq!(
+            found.status.overage.and_then(|overage| overage.preference),
+            Some(OveragePreference::DroidCore)
         );
 
         // A read that fails doesn't resume that session again.

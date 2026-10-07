@@ -78,8 +78,44 @@ pub struct AccountStatus {
     pub plan: Option<String>,
     /// Empty for a login with no usage to read (an API key, say).
     pub windows: Vec<LimitWindow>,
+    /// The name of the pool `windows` belong to, when the account has others: Droid's
+    /// "Standard".
+    pub pool: Option<String>,
+    /// The account's other pools of limits, each for some of its models, as Droid's `/limits`
+    /// shows Droid Core's beside Standard's.
+    pub other_pools: Vec<LimitPool>,
     /// What's left to spend beyond the plan's limits, as the agent words it ("$12.40").
     pub credits: Option<String>,
+    /// What the vendor does once the limits run out, where the account chooses it: Droid's
+    /// "When limit is reached".
+    pub overage: Option<Overage>,
+}
+
+/// Limits that apply to some of an account's models.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitPool {
+    pub label: String,
+    pub windows: Vec<LimitWindow>,
+}
+
+/// Droid's "When limit is reached" (decisions.md §8), kept on Factory's server, so the CLI
+/// does the same.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Overage {
+    /// `None` until one is chosen: Droid then stops at the limit.
+    pub preference: Option<OveragePreference>,
+    /// Whether this login may change it: in an organization, only its managers may.
+    pub can_change: bool,
+    /// Whether extra usage can be turned on, which it can't during a free trial.
+    pub extra_usage_allowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OveragePreference {
+    /// Droid goes on with Droid Core models, at no extra cost.
+    DroidCore,
+    /// Droid goes on with any model, billed from the extra usage balance.
+    ExtraUsage,
 }
 
 /// One of an account's limits, such as the 5-hour or the weekly one.
@@ -136,6 +172,9 @@ pub struct AccountSupport {
     pub reads_usage: bool,
     /// The vendor's page for an account's usage or billing.
     pub usage_page: Option<String>,
+    /// Where the vendor turns extra usage on, which agentZ leaves to it: Factory's usage
+    /// settings, which Droid's own "Enable Extra Usage" opens.
+    pub extra_usage_page: Option<String>,
     /// Whether "Copy settings from" copies the agent's own settings files too.
     pub copies_settings_files: bool,
 }

@@ -47,6 +47,8 @@ pub struct AgentDescription {
     pub key_login: Option<KeyLogin>,
     /// The vendor's page for an account's usage or billing (Open Usage Page).
     pub usage_page: Option<String>,
+    /// Where the vendor turns extra usage on ([`AccountSupport::extra_usage_page`]).
+    pub extra_usage_page: Option<String>,
 }
 
 /// A login method that reads its key from the agent's environment rather than from
@@ -84,6 +86,7 @@ impl AgentDescription {
                     .as_ref()
                     .is_some_and(|key_login| key_login.reader.is_some()),
             usage_page: self.usage_page.clone(),
+            extra_usage_page: self.extra_usage_page.clone(),
             copies_settings_files: !self.settings_files.is_empty(),
         }
     }
@@ -359,6 +362,7 @@ mod tests {
                 reader: None,
             }),
             usage_page: None,
+            extra_usage_page: None,
         };
         let registry_command = AgentCommand {
             env: [

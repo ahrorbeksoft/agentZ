@@ -608,6 +608,14 @@ pub enum Request {
         /// `None` is the External account.
         account: Option<AccountId>,
     },
+    /// Droid's "Switch to Droid Core" for the account ([`accounts::Overage`]): once its limits
+    /// run out, Droid goes on with Droid Core models. Saved as Droid's own `/limits` saves it,
+    /// and answered once the account's read that follows says so.
+    SwitchToDroidCore {
+        agent_id: AgentId,
+        /// `None` is the External account.
+        account: Option<AccountId>,
+    },
     /// The conversations the agent keeps on this machine for one account (`None` being the
     /// External one), to import as threads, as Zed's thread import lists them:
     /// [`Response::AgentSessions`]. The agent starts only for this.

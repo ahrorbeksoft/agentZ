@@ -128,8 +128,10 @@ From Zed's guidelines, which this code follows:
   logged out, as Claude Agent's do. Run with `--usage`, it prints a read of its account
   (email, plan, a 5-hour window that each reply in the home fills by 10%); once it's full,
   prompts fail with "Usage limit reached" until it resets (`resets_at` in the home sets
-  when, in seconds since the epoch). A `models` list in `.mock/settings.json` in its home
-  limits the models it offers, as a plan can.
+  when, in seconds since the epoch). An `overage` file in the home (empty, `DroidCore` or
+  `ExtraUsage`) makes it Droid-like at its limit: the read has Droid's pools, a balance and
+  that choice, and with a choice, prompts go on past the limit. A `models` list in
+  `.mock/settings.json` in its home limits the models it offers, as a plan can.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.

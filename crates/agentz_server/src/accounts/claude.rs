@@ -79,6 +79,7 @@ pub(super) fn description() -> AgentDescription {
         // Its logins are Claude's own: in a terminal, or a gateway.
         key_login: None,
         usage_page: Some("https://claude.ai/settings/usage".into()),
+        extra_usage_page: None,
     }
 }
 

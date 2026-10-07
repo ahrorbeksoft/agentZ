@@ -182,6 +182,9 @@ pub(crate) struct Server {
     accounts: AccountStore,
     /// The accounts whose identity and limits are being read.
     reading_accounts: HashSet<(AgentId, Option<AccountId>)>,
+    /// Held by each read of an account and each change to it, so two never run its agent's
+    /// terminal UI at once: Droid's reads all resume one session.
+    account_locks: HashMap<(AgentId, Option<AccountId>), Arc<tokio::sync::Mutex<()>>>,
     /// When threads' turns ended with an error, until a read of their account since then says
     /// whether a limit stopped them ([`limit_waits`]).
     failed_turns: HashMap<ThreadId, Instant>,
@@ -315,6 +318,7 @@ impl Server {
             agent_settings,
             accounts,
             reading_accounts: HashSet::default(),
+            account_locks: HashMap::default(),
             failed_turns: HashMap::default(),
             http_client,
             threads: HashMap::default(),
@@ -559,6 +563,11 @@ impl Server {
                 id,
                 request: Request::ListAgentSessions { agent_id, account },
             } => self.list_agent_sessions(client, id, agent_id, account),
+            Input::Request {
+                client,
+                id,
+                request: Request::SwitchToDroidCore { agent_id, account },
+            } => self.switch_to_droid_core(client, id, agent_id, account),
             Input::Request {
                 client,
                 id,
@@ -1038,6 +1047,9 @@ impl Server {
             } => self.import_agent_sessions(agent_id, account, sessions, archived),
             Request::ListAgentSessions { .. } => {
                 Err(anyhow!("listing sessions is handled separately"))
+            }
+            Request::SwitchToDroidCore { .. } => {
+                Err(anyhow!("switching to Droid Core is handled separately"))
             }
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
 

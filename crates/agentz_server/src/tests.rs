@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::{
-    AccountChange, AccountChoice, AccountId, AgentAccounts, AtLimit, SettingsSource,
+    AccountChange, AccountChoice, AccountId, AgentAccounts, AtLimit, OveragePreference,
+    SettingsSource,
 };
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
@@ -317,6 +318,7 @@ fn mock_accounts() -> crate::AgentDescription {
             reader: None,
         }),
         usage_page: None,
+        extra_usage_page: None,
     }
 }
 
@@ -2201,6 +2203,91 @@ async fn accounts_read_their_identity_and_limits() {
             .await
             .is_err()
     );
+}
+
+/// Switch to Droid Core is saved through the account's reader, as Droid's `/limits` saves it,
+/// and answered once the read after it says it's chosen.
+#[tokio::test(flavor = "multi_thread")]
+async fn droid_core_is_chosen_through_the_reader() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    let home = data_dir.path().join("accounts/mock").join(work.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's home");
+    // Droid-like, with nothing chosen.
+    std::fs::write(home.join("overage"), "").expect("write the choice");
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    let overage = |client: &TestClient| {
+        client
+            .accounts("mock")
+            .status(Some(work))
+            .and_then(|read| read.status.overage)
+    };
+    client.ok(Request::SubscribeSession).await;
+    client.wait_until(|client| overage(client).is_some()).await;
+    let read = client
+        .accounts("mock")
+        .status(Some(work))
+        .cloned()
+        .expect("a read");
+    assert_eq!(read.status.pool.as_deref(), Some("Standard"));
+    assert_eq!(read.status.other_pools[0].label, "Droid Core");
+    assert_eq!(read.status.credits.as_deref(), Some("$18.20"));
+    assert_eq!(
+        overage(&client).and_then(|overage| overage.preference),
+        None
+    );
+
+    client
+        .ok(Request::SwitchToDroidCore {
+            agent_id: mock.clone(),
+            account: Some(work),
+        })
+        .await;
+    assert_eq!(
+        overage(&client).and_then(|overage| overage.preference),
+        Some(OveragePreference::DroidCore)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("overage")).expect("the choice"),
+        "DroidCore"
+    );
+
+    // An account without the choice, or none at all.
+    std::fs::remove_file(home.join("overage")).expect("no choice");
+    client
+        .ok(Request::RefreshUsage {
+            agent_id: mock.clone(),
+            account: Some(work),
+        })
+        .await;
+    client.wait_until(|client| overage(client).is_none()).await;
+    for account in [Some(work), Some(AccountId(9))] {
+        assert!(
+            client
+                .request(Request::SwitchToDroidCore {
+                    agent_id: mock.clone(),
+                    account,
+                })
+                .await
+                .is_err()
+        );
+    }
 }
 
 /// A thread stopped by its account's limit gets "Continue." from the server when the limit

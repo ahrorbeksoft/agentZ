@@ -2,15 +2,17 @@
 //! app is open (t3code's interval), after each turn on the account, and on demand (Refresh
 //! Usage).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use agentz_protocol::accounts::{AccountId, StatusRead};
+use agentz_protocol::Response;
+use agentz_protocol::accounts::{AccountId, OveragePreference, StatusRead};
 use agentz_protocol::agents::{AgentId, InstallState};
-use anyhow::Context as _;
+use anyhow::{Context as _, Result};
 use util::ResultExt as _;
 
-use super::{Input, Server};
-use crate::accounts::{self, Reader};
+use super::{ClientId, Input, Server};
+use crate::accounts::{self, Read, Reader};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A refresh reads the accounts not read for this long. Less than the interval, so an account
@@ -106,7 +108,11 @@ impl Server {
         let command = self.agent_command(agent_id, account, true);
         let http = self.http_client.clone();
         let folder = accounts::reader_folder(&self.data_dir, agent_id);
-        let read = async move { reader.read(command.await?, http, &folder?).await };
+        let lock = self.account_lock(agent_id, account);
+        let read = async move {
+            let _held = lock.lock().await;
+            reader.read(command.await?, http, &folder?).await
+        };
         let agent_id = agent_id.clone();
         self.spawn_then(read, move |server, read| {
             server.reading_accounts.remove(&(agent_id.clone(), account));
@@ -114,23 +120,95 @@ impl Server {
                 .with_context(|| format!("reading {agent_id}'s usage"))
                 .log_err()
             {
-                server.accounts.update(&agent_id, |accounts| {
-                    if let Some(logged_in) = read.logged_in {
-                        accounts.set_logged_in(account, logged_in);
-                    }
-                    if read.logged_in != Some(false) {
-                        accounts.set_status(
-                            account,
-                            StatusRead {
-                                status: read.status,
-                                read_at: SystemTime::now(),
-                            },
-                        );
-                    }
-                });
+                server.keep_read(&agent_id, account, read);
             }
             server.wait_for_limits_found(&agent_id, account, started);
         });
+    }
+
+    /// Droid's "Switch to Droid Core" on the account, through its reader, answered once the
+    /// read that follows says it's chosen.
+    pub(super) fn switch_to_droid_core(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+    ) {
+        let reader = self.overage_reader(&agent_id, account);
+        let reader = match reader {
+            Ok(reader) => reader,
+            Err(error) => return self.respond(client, id, Err(error)),
+        };
+        let command = self.agent_command(&agent_id, account, true);
+        let http = self.http_client.clone();
+        let folder = accounts::reader_folder(&self.data_dir, &agent_id);
+        let lock = self.account_lock(&agent_id, account);
+        let switch = async move {
+            let _held = lock.lock().await;
+            reader
+                .switch_to_droid_core(command.await?, http, &folder?)
+                .await
+        };
+        self.spawn_then(switch, move |server, read: Result<Read>| {
+            let switched = read.and_then(|read| {
+                let preference = read.status.overage.and_then(|overage| overage.preference);
+                server.keep_read(&agent_id, account, read);
+                anyhow::ensure!(
+                    preference == Some(OveragePreference::DroidCore),
+                    "Droid didn't save the choice."
+                );
+                Ok(Response::Ok)
+            });
+            server.respond(client, id, switched);
+        });
+    }
+
+    /// The reader of an account whose last read says it can change what Droid does at a limit.
+    fn overage_reader(&self, agent_id: &AgentId, account: Option<AccountId>) -> Result<Reader> {
+        let accounts = self.accounts.get(agent_id);
+        if let Some(id) = account {
+            accounts.account(id).context("there's no such account")?;
+        }
+        let overage = accounts
+            .status(account)
+            .and_then(|read| read.status.overage)
+            .with_context(|| format!("{} has no choice at a limit", self.agent_name(agent_id)))?;
+        anyhow::ensure!(
+            overage.can_change,
+            "This login can't change it: its organization sets it."
+        );
+        self.usage_reader(agent_id, account)
+            .with_context(|| format!("agentZ can't read {}'s usage", self.agent_name(agent_id)))
+    }
+
+    /// Keeps what a read found. A logged-out account keeps what it had.
+    fn keep_read(&mut self, agent_id: &AgentId, account: Option<AccountId>, read: Read) {
+        self.accounts.update(agent_id, |accounts| {
+            if let Some(logged_in) = read.logged_in {
+                accounts.set_logged_in(account, logged_in);
+            }
+            if read.logged_in != Some(false) {
+                accounts.set_status(
+                    account,
+                    StatusRead {
+                        status: read.status,
+                        read_at: SystemTime::now(),
+                    },
+                );
+            }
+        });
+    }
+
+    fn account_lock(
+        &mut self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.account_locks
+            .entry((agent_id.clone(), account))
+            .or_default()
+            .clone()
     }
 
     /// The account's reader, `None` being the External account: an account that logs in with a

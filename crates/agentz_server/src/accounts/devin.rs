@@ -79,6 +79,7 @@ pub(super) fn description() -> AgentDescription {
         // Its key login takes the key in `authenticate`.
         key_login: None,
         usage_page: Some("https://app.devin.ai/settings/usage".into()),
+        extra_usage_page: None,
     }
 }
 
