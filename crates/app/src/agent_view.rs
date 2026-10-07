@@ -2221,6 +2221,7 @@ impl AgentView {
         let view = cx.weak_entity();
         let thread_id = self.thread_id;
         let store = self.store.clone();
+        let client = self.client.clone();
         let registry = self.registry.clone();
         let current_agent = self.agent_id.clone();
         let is_archived = self.is_archived;
@@ -2262,6 +2263,24 @@ impl AgentView {
                         .map(|agent| (agent.id().clone(), agent.name().clone()))
                         .collect()
                 };
+                // Accounts share no sessions, so going on with another of the agent's accounts
+                // is continuing too.
+                let own_accounts = current_agent.as_ref().and_then(|agent_id| {
+                    let entries = account_entries(&client.read(cx).accounts(agent_id));
+                    if entries.len() < 2 {
+                        return None;
+                    }
+                    let name = registry
+                        .read(cx)
+                        .agent(agent_id)
+                        .map_or_else(|| agent_id.0.clone(), |agent| agent.name().clone());
+                    Some((agent_id.clone(), name, entries))
+                });
+                let thread_account = store
+                    .read(cx)
+                    .thread(thread_id)
+                    .map(|thread| thread.account);
+                let now = SystemTime::now();
                 let view = view.clone();
                 let store = store.clone();
                 let title = title.clone();
@@ -2294,11 +2313,58 @@ impl AgentView {
                     let continue_with = {
                         let view = view.clone();
                         let agents = agents.clone();
+                        let own_accounts = own_accounts.clone();
                         move |mut menu: ContextMenu,
                               _: &mut Window,
                               _: &mut Context<ContextMenu>| {
-                            if agents.is_empty() {
+                            if agents.is_empty() && own_accounts.is_none() {
                                 return menu.label("No other agents are installed");
+                            }
+                            // The thread's agent first, its accounts beneath it.
+                            if let Some((agent_id, name, entries)) = &own_accounts {
+                                let render_id = agent_id.clone();
+                                let name = name.clone();
+                                menu = menu.custom_row(move |_, cx| {
+                                    render_agent_item(&render_id, name.clone(), cx)
+                                });
+                                for entry in entries {
+                                    let account = entry.account;
+                                    let is_own = thread_account == Some(account);
+                                    let entry = entry.clone();
+                                    let render = move |_: &mut Window, cx: &mut App| {
+                                        let selector = account_selector(entry.account);
+                                        account_row(
+                                            &entry,
+                                            is_own.then(|| "This thread's account".into()),
+                                            is_own,
+                                            now,
+                                            cx,
+                                        )
+                                        .debug_selector(move || {
+                                            format!("continue-on-account-{selector}")
+                                        })
+                                        .pl(px(18.))
+                                        .child(div().flex_none().w(px(14.)))
+                                        .into_any_element()
+                                    };
+                                    if is_own {
+                                        menu = menu.custom_row(render);
+                                        continue;
+                                    }
+                                    let view = view.clone();
+                                    let agent_id = agent_id.clone();
+                                    menu = menu.custom_entry(render, move |_, cx| {
+                                        let agent_id = agent_id.clone();
+                                        view.update(cx, |view, cx| {
+                                            view.continue_with(
+                                                agent_id,
+                                                AccountChoice::of(account),
+                                                cx,
+                                            )
+                                        })
+                                        .log_err();
+                                    });
+                                }
                             }
                             for (agent_id, name) in &agents {
                                 let view = view.clone();
@@ -2306,23 +2372,11 @@ impl AgentView {
                                 let render_id = agent_id.clone();
                                 let name = name.clone();
                                 menu = menu.custom_entry(
-                                    move |_, cx| {
-                                        h_flex()
-                                            .gap_1p5()
-                                            .child(
-                                                agent_icon(&render_id, cx)
-                                                    .map(Icon::from_svg_markup)
-                                                    .unwrap_or_else(|| Icon::new(IconName::Sparkle))
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(Label::new(name.clone()))
-                                            .into_any_element()
-                                    },
+                                    move |_, cx| render_agent_item(&render_id, name.clone(), cx),
                                     move |_, cx| {
                                         let agent_id = agent_id.clone();
                                         view.update(cx, |view, cx| {
-                                            view.continue_with(agent_id, cx)
+                                            view.continue_with(agent_id, AccountChoice::Default, cx)
                                         })
                                         .log_err();
                                     },
@@ -2538,8 +2592,8 @@ impl AgentView {
         cx.notify();
     }
 
-    /// Starts a thread with `agent_id` that continues this one, and opens it.
-    fn continue_with(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+    /// Starts a thread with `agent_id` on `account` that continues this one, and opens it.
+    fn continue_with(&mut self, agent_id: AgentId, account: AccountChoice, cx: &mut Context<Self>) {
         self.continue_error = None;
         let agent_name = self
             .registry
@@ -2549,7 +2603,7 @@ impl AgentView {
             .unwrap_or_else(|| agent_id.0.clone());
         let thread_id = self.thread_id;
         let task = self.store.update(cx, |store, cx| {
-            store.continue_thread(thread_id, agent_id, AccountChoice::Default, cx)
+            store.continue_thread(thread_id, agent_id, account, cx)
         });
         self._continuing = cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -6003,15 +6057,57 @@ fn render_account_row(
     cx: &App,
 ) -> AnyElement {
     let selector = account_selector(entry.account);
-    let note = if entry.is_logged_out {
-        Some("Logged out".to_string())
+    account_row(entry, None, false, now, cx)
+        .debug_selector(move || format!("new-thread-account-{selector}"))
+        .child(div().flex_none().w(px(14.)).when(is_current, |slot| {
+            slot.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        }))
+        .into_any_element()
+}
+
+/// An agent in Continue with Another Agent: its icon and name.
+fn render_agent_item(agent_id: &AgentId, name: SharedString, cx: &App) -> AnyElement {
+    h_flex()
+        .gap_1p5()
+        .child(
+            agent_icon(agent_id, cx)
+                .map(Icon::from_svg_markup)
+                .unwrap_or_else(|| Icon::new(IconName::Sparkle))
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .child(Label::new(name))
+        .into_any_element()
+}
+
+/// An account as the menus that pick one show it: its avatar, its name over `note` (else its
+/// plan), and the window closest to running out. Greyed, it can't be picked.
+fn account_row(
+    entry: &AccountEntry,
+    note: Option<SharedString>,
+    is_greyed: bool,
+    now: SystemTime,
+    cx: &App,
+) -> Div {
+    let note = note.or_else(|| {
+        if entry.is_logged_out {
+            Some("Logged out".into())
+        } else {
+            entry.plan.clone().map(SharedString::from)
+        }
+    });
+    let (name_color, note_color) = if is_greyed {
+        (Color::Disabled, Color::Disabled)
     } else {
-        entry.plan.clone()
+        (Color::Default, Color::Muted)
     };
     // Unnamed, the External account is already called "Outside agentZ".
     let is_outside = entry.account.is_none() && entry.is_named;
     h_flex()
-        .debug_selector(move || format!("new-thread-account-{selector}"))
         .w_full()
         .gap_2()
         .child(render_entry_avatar(entry, px(18.), cx))
@@ -6022,7 +6118,7 @@ fn render_account_row(
                 .child(
                     h_flex()
                         .gap_1()
-                        .child(Label::new(entry.name.clone()).truncate())
+                        .child(Label::new(entry.name.clone()).color(name_color).truncate())
                         .when(is_outside, |name| {
                             name.child(
                                 Label::new("· outside agentZ")
@@ -6032,22 +6128,17 @@ fn render_account_row(
                         }),
                 )
                 .children(
-                    note.map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                    note.map(|note| Label::new(note).size(LabelSize::XSmall).color(note_color)),
                 ),
         )
         .children(tightest_window(&entry.windows).map(|window| {
-            div()
-                .pl(px(14.))
-                .child(left_label(window, now).size(LabelSize::XSmall))
+            let left = left_label(window, now).size(LabelSize::XSmall);
+            div().pl(px(14.)).child(if is_greyed {
+                left.color(Color::Disabled)
+            } else {
+                left
+            })
         }))
-        .child(div().flex_none().w(px(14.)).when(is_current, |slot| {
-            slot.child(
-                Icon::new(IconName::Check)
-                    .size(IconSize::Small)
-                    .color(Color::Accent),
-            )
-        }))
-        .into_any_element()
 }
 
 /// A borderless button that opens one of the new thread's pickers.
@@ -7234,6 +7325,92 @@ mod tests {
         click("new-thread-account", cx);
         click("MENU_ITEM-Add Account…", cx);
         assert_eq!(*events.borrow(), vec![(mock, true)]);
+    }
+
+    /// With two accounts, Continue with Another Agent lists the thread's agent first with its
+    /// accounts beneath it, and continues the thread on the one picked. The thread's own can't
+    /// be picked.
+    #[gpui::test]
+    fn a_thread_continues_on_another_of_its_agents_accounts(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::AgentAccounts;
+        use std::cell::RefCell;
+
+        let (view, cx) = open(2, false, cx);
+        let mock = AgentId::new("mock");
+        let mut accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            ..AgentAccounts::default()
+        };
+        let work = accounts.add();
+        if let Some(account) = accounts.account_mut(work) {
+            account.choices.label = Some("Work".into());
+            account.logged_in = Some(true);
+        }
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        let mut on_work = snapshot(None);
+        on_work.threads[1].account = Some(work);
+        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::ContinueThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
+                    _ => None,
+                }
+            });
+            client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
+        });
+        cx.run_until_parked();
+        let continued = |requests: &RefCell<Vec<Request>>| {
+            requests
+                .borrow()
+                .iter()
+                .filter_map(|request| match request {
+                    Request::ContinueThread {
+                        thread_id,
+                        agent_id,
+                        account,
+                    } => Some((*thread_id, agent_id.clone(), *account)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        view.update_in(cx, |view, window, cx| view.title_menu.show(window, cx));
+        cx.run_until_parked();
+        // The submenu opens on hovering the row under Rename. It's placed beside the row once a
+        // frame has measured the row, which the pointer moving on draws.
+        let rename = cx
+            .debug_bounds("MENU_ITEM-Rename")
+            .expect("the menu is open");
+        for nudge in [px(0.), px(4.)] {
+            cx.simulate_mouse_move(
+                rename.center() + gpui::point(nudge, rename.size.height),
+                None,
+                gpui::Modifiers::none(),
+            );
+            cx.run_until_parked();
+        }
+        let external = cx
+            .debug_bounds("continue-on-account-external")
+            .expect("the External account is offered");
+        let own = cx
+            .debug_bounds("continue-on-account-1")
+            .expect("the thread's own account is shown");
+        assert!(external.top() < own.top());
+
+        cx.simulate_click(own.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(continued(&requests).is_empty());
+        cx.simulate_click(external.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            continued(&requests),
+            vec![(ThreadId(2), mock, AccountChoice::External)]
+        );
     }
 
     /// An archived thread takes no messages, so there's nothing to start.

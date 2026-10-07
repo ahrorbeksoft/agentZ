@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::agents::{AgentId, AgentSettings, InstallState};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange};
 use agentz_protocol::thread::{ConnectionStatus, Entry};
 use agentz_protocol::{ConnectionId, ServerMessage, ToolCaller, ToolResult};
@@ -32,7 +32,7 @@ use collections::HashMap;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use projects::{
-    ProjectId, ProjectStore, Task, TaskEnd, TaskOutcome, Thread, ThreadCreator, ThreadId,
+    AccountId, ProjectId, ProjectStore, Task, TaskEnd, TaskOutcome, Thread, ThreadCreator, ThreadId,
 };
 use serde_json::{Map, Value, json};
 use util::ResultExt as _;
@@ -653,33 +653,34 @@ impl Server {
             .iter()
             .filter(|agent| matches!(agent.install_state, InstallState::Installed { .. }))
             .map(|agent| {
-                let settings = self.new_thread_settings(agent.id());
-                let models = model_choices(&settings.known_config_options)
-                    .map(|(_, choices, _)| {
-                        choices
-                            .into_iter()
-                            .map(|(id, name)| json!({"id": id, "name": name}))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let modes = settings
-                    .known_modes
-                    .as_ref()
-                    .map(|modes| {
-                        modes
-                            .available_modes
-                            .iter()
-                            .map(|mode| json!({"id": mode.id.0.as_ref(), "name": mode.name}))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                json!({
+                let accounts = self.accounts.get(agent.id());
+                let default_account = accounts.new_thread_account();
+                let settings = self.account_settings(agent.id(), default_account);
+                let mut entry = json!({
                     "agentId": agent.id().0.as_ref(),
                     "name": agent.name().as_ref(),
-                    "models": models,
-                    "modes": modes,
+                    "models": advertised_models(&settings),
+                    "modes": advertised_modes(&settings),
                     "canRunChildTask": true,
-                })
+                });
+                // With one account there's nothing to choose, so it's listed as before.
+                let listed = accounts.listed();
+                if listed.len() > 1 {
+                    entry["accounts"] = listed
+                        .into_iter()
+                        .map(|account| {
+                            let settings = self.account_settings(agent.id(), account);
+                            json!({
+                                "account": account_key(account),
+                                "name": accounts.name(account),
+                                "isDefault": account == default_account,
+                                "models": advertised_models(&settings),
+                                "modes": advertised_modes(&settings),
+                            })
+                        })
+                        .collect();
+                }
+                entry
             })
             .collect();
         Ok(Step::Done(json!({
@@ -944,6 +945,13 @@ impl Server {
             ));
         }
 
+        let account = self.launch_account(&agent_id, arguments)?;
+        // Named in errors only when the agent has accounts to tell apart.
+        let offered_by = match self.accounts.get(&agent_id).listed().len() {
+            0 | 1 => agent_id.0.to_string(),
+            _ => format!("{}'s account {}", agent_id.0, account_key(account)),
+        };
+
         let same_agent_as_caller = caller_thread
             .is_some_and(|thread| thread.agent_id.as_deref() == Some(agent_id.0.as_ref()));
         let caller_agent_thread = caller
@@ -959,10 +967,13 @@ impl Server {
         // Agents that put their permission mode in a setting rather than an ACP mode.
         let mode_option = select_choices(&caller_options, acp::SessionConfigOptionCategory::Mode)
             .map(|(config_id, _, current)| (config_id, current));
-        let known_options = if caller_options.is_empty() {
-            self.new_thread_settings(&agent_id).known_config_options
+        // Another account may offer other models (its plan's), so the caller's are its own.
+        let same_account_as_caller = caller_thread.is_some_and(|thread| thread.account == account);
+        let known_options = if caller_options.is_empty() || !same_account_as_caller {
+            self.account_settings(&agent_id, account)
+                .known_config_options
         } else {
-            caller_options
+            caller_options.clone()
         };
         let model = match arguments.string("model", 256)? {
             Some(requested) => {
@@ -970,8 +981,8 @@ impl Server {
                     return Err(failure(
                         "model_unavailable",
                         format!(
-                            "{} hasn't reported its models yet. Leave model out to use its default.",
-                            agent_id.0
+                            "{offered_by} hasn't reported its models yet. Leave model out to use \
+                             its default."
                         ),
                     ));
                 };
@@ -982,17 +993,24 @@ impl Server {
                     return Err(failure(
                         "model_unavailable",
                         format!(
-                            "{} has no model {requested}. Its models: {}.",
-                            agent_id.0,
+                            "{offered_by} has no model {requested}. Its models: {}.",
                             names.join(", ")
                         ),
                     ));
                 };
                 Some((config_id, value.clone()))
             }
-            // t3code's rule: the caller's model carries over to a thread of the same agent.
+            // t3code's rule: the caller's model carries over to a thread of the same agent, when
+            // its account offers it.
             None if same_agent_as_caller => {
-                model_choices(&known_options).map(|(config_id, _, current)| (config_id, current))
+                let caller_model = model_choices(&caller_options).map(|(_, _, current)| current);
+                model_choices(&known_options).and_then(|(config_id, choices, current)| {
+                    let model = caller_model.unwrap_or(current);
+                    choices
+                        .iter()
+                        .any(|(id, _)| *id == model)
+                        .then_some((config_id, model))
+                })
             }
             None => None,
         };
@@ -1000,11 +1018,51 @@ impl Server {
             prompt,
             title,
             agent_id,
+            account,
             model,
             mode,
             mode_option,
             placement: workspace_strategy(arguments)?,
         })
+    }
+
+    /// The account a launched thread runs on: the `account` argument (a listed account's id
+    /// or name, or "external"), else the agent's account for new threads.
+    fn launch_account(
+        &self,
+        agent_id: &AgentId,
+        arguments: &Arguments,
+    ) -> Result<Option<AccountId>, Failure> {
+        let accounts = self.accounts.get(agent_id);
+        let requested = match arguments.0.get("account") {
+            // Ids are numbers, though they're listed as strings.
+            Some(Value::Number(number)) => number.to_string(),
+            _ => match arguments.string("account", 256)? {
+                Some(requested) => requested.to_string(),
+                None => return Ok(accounts.new_thread_account()),
+            },
+        };
+        let listed = accounts.listed();
+        listed
+            .iter()
+            .copied()
+            .find(|account| {
+                account_key(*account).eq_ignore_ascii_case(&requested)
+                    || accounts
+                        .name(*account)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&requested))
+            })
+            .ok_or_else(|| {
+                let keys: Vec<String> = listed.iter().copied().map(account_key).collect();
+                failure(
+                    "account_unavailable",
+                    format!(
+                        "{} has no account {requested}. Its accounts: {}.",
+                        agent_id.0,
+                        keys.join(", ")
+                    ),
+                )
+            })
     }
 
     fn launch(&mut self, caller: Caller, spec: LaunchSpec, folder: Folder) -> Value {
@@ -1049,10 +1107,9 @@ impl Server {
         if let Some(title) = spec.title {
             self.projects.set_custom_title(thread_id, title);
         }
-        let account = self.accounts.get(&spec.agent_id).new_thread_account();
-        self.projects.set_thread_account(thread_id, account);
+        self.projects.set_thread_account(thread_id, spec.account);
         let mut defaults = self
-            .account_settings(&spec.agent_id, account)
+            .account_settings(&spec.agent_id, spec.account)
             .session_defaults();
         for (config_id, value) in spec.model.iter().chain(&spec.mode_option) {
             defaults.config_options.retain(|(id, _)| id != config_id);
@@ -1682,6 +1739,8 @@ struct LaunchSpec {
     prompt: Option<String>,
     title: Option<String>,
     agent_id: AgentId,
+    /// `None` is the External account.
+    account: Option<AccountId>,
     model: Option<(acp::SessionConfigId, String)>,
     /// The caller's mode, for a thread of the same agent: a delegated task never gets more
     /// room than its parent.
@@ -1809,6 +1868,37 @@ fn tool_result(result: Result<Value, Failure>) -> ToolResult {
     }
 }
 
+/// How agent control names an account: its id, or "external" for the agent's own login.
+fn account_key(account: Option<AccountId>) -> String {
+    account.map_or_else(|| "external".to_string(), |id| id.to_string())
+}
+
+/// The models a thread with these settings can pick, as `orchestrator_capabilities` lists them.
+fn advertised_models(settings: &AgentSettings) -> Vec<Value> {
+    model_choices(&settings.known_config_options)
+        .map(|(_, choices, _)| {
+            choices
+                .into_iter()
+                .map(|(id, name)| json!({"id": id, "name": name}))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn advertised_modes(settings: &AgentSettings) -> Vec<Value> {
+    settings
+        .known_modes
+        .as_ref()
+        .map(|modes| {
+            modes
+                .available_modes
+                .iter()
+                .map(|mode| json!({"id": mode.id.0.as_ref(), "name": mode.name}))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The model selector among the options: its id, its choices (value id and name), and the
 /// current value.
 fn model_choices(
@@ -1914,13 +2004,15 @@ pub(super) fn definitions() -> Value {
             "additionalProperties": false,
         })
     };
+    let account = json!({"type": "string", "maxLength": 256, "description": "For an agent with several accounts in orchestrator_capabilities: one of them, by its account key or name. Each account has its own models. Defaults to the agent's default account."});
     let launch = json!({
         "type": "object",
         "properties": {
             "prompt": {"type": "string", "maxLength": MAX_PROMPT_CHARS, "description": "The first message, a complete task for the new thread's agent. Without it the thread starts idle."},
             "title": {"type": "string", "maxLength": MAX_TITLE_CHARS, "description": "Optional concise title. Without it, the prompt names the thread."},
             "agentId": {"type": "string", "description": "An installed agent from orchestrator_capabilities. Defaults to this thread's agent."},
-            "model": {"type": "string", "description": "A model id or name the agent advertises in orchestrator_capabilities. Defaults to this thread's model for the same agent, or the agent's default."},
+            "account": account,
+            "model": {"type": "string", "description": "A model id or name the agent (or the chosen account) advertises in orchestrator_capabilities. Defaults to this thread's model for the same agent, or the agent's default."},
             "workspaceStrategy": workspace_strategy("Defaults to the project's own checkout, whatever this thread's workspace."),
         },
         "additionalProperties": false,
@@ -1931,7 +2023,7 @@ pub(super) fn definitions() -> Value {
         {
             "name": "orchestrator_capabilities",
             "title": "Get orchestration capabilities",
-            "description": "List the agents installed on this machine with the models and modes each advertises, this thread's agent and model, the machine, and the agentZ thread-management features available to this thread.",
+            "description": "List the agents installed on this machine with the models and modes each advertises (and, for an agent with several accounts, each account's), this thread's agent and model, the machine, and the agentZ thread-management features available to this thread.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
         },
@@ -2100,7 +2192,8 @@ pub(super) fn definitions() -> Value {
                     "title": {"type": "string", "maxLength": MAX_TITLE_CHARS},
                     "role": {"type": "string", "enum": TASK_ROLES},
                     "agentId": {"type": "string", "description": "An installed agent from orchestrator_capabilities. Defaults to this thread's agent."},
-                    "model": {"type": "string", "description": "A model id or name the agent advertises. Defaults to this thread's model for the same agent, or the agent's default."},
+                    "account": account,
+                    "model": {"type": "string", "description": "A model id or name the agent (or the chosen account) advertises. Defaults to this thread's model for the same agent, or the agent's default."},
                     "mode": {"type": "string", "enum": ["async", "wait"], "description": "Defaults to async. Use wait only when this turn needs the result before it can continue."},
                     "timeoutMs": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT.as_millis() as u64, "description": "How long mode=wait waits. It doesn't cancel the task."},
                     "workspaceStrategy": workspace_strategy("Defaults to this thread's own folder, so parallel tasks that edit files should each get a worktree or pasture."),

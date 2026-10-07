@@ -29,6 +29,13 @@ Notes for whoever continues:
   be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
   importing sessions. Since item 8, the Account tab opens a login session per account.
+- Item 12: the thread's agent heads the submenu as a row that isn't picked itself (its
+  accounts beneath it are), and its accounts are drawn as in the new thread's account picker.
+  With one account listed, the submenu is as before. Agent control lists `accounts` (key: the
+  id, or "external"; name; isDefault; models; modes) only for an agent with more than one, and
+  `account` takes a key or a name, failing with `account_unavailable` otherwise. A logged-out
+  account can be launched on, as in the picker; its thread asks to log in. The caller's model
+  carries over to a thread on another account only when that account offers it.
 - Item 11: the mock's tinted glyph is a tile, but the app's rows draw the agent's icon bare,
   so the icon itself takes the account's color (its theme shade, at full strength where it
   was muted and faint). That's on the sidebar card and its details popover, Go To, Workspaces'
@@ -109,7 +116,7 @@ Notes for whoever continues:
 | 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | done |
 | 10 | 12 | The account in the strip under the composer; the default account for new threads | done |
 | 11 | 13 | The account's color on its threads' agent icon | done |
-| 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | |
+| 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | done |
 | 13 | 14 | The limit notice over the composer (Continue on another account first) | |
 | 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | |
 | 15 | | Wave 1: Claude | |

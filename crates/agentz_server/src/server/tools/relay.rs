@@ -39,7 +39,8 @@ pub(super) const RELAYED_TOOLS: [&str; 14] = [
 ];
 
 /// Codes a relayed failure keeps; others become `orchestration_error`.
-const FAILURE_CODES: [&str; 18] = [
+const FAILURE_CODES: [&str; 19] = [
+    "account_unavailable",
     "invalid_request",
     "operation_failed",
     "orchestration_error",

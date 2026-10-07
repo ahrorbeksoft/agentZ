@@ -402,7 +402,11 @@ Each entry: what it does, where it lives, and where it comes from.
   `server/workspace_requests.rs`, `continuations.rs`; t3code's context handoff, Zed's New Thread
   from Summary): a thread keeps its agent, since each agent replays only its own sessions.
   Instead the menu starts a thread with another installed agent in the same workspace, and
-  agentZ writes the old conversation for it: the user's messages, the agent's replies with the
+  agentZ writes the old conversation for it. Accounts share no sessions either, so when the
+  thread's agent has more than one, the submenu lists it first with its accounts beneath it
+  (as the new thread's account picker shows them; the thread's own greyed, "This thread's
+  account"), then the other agents (accounts topic 15): picking one continues on that account.
+  The conversation it writes is the user's messages, the agent's replies with the
   tools it used, and the plan, in tags, keeping the first message and the latest ones within
   40,000 characters. It waits in `handoffs/<thread id>.json` and shows as a chip in the composer (the user's choice of two
   designs): a click previews exactly what goes, × drops it (`Request::DropHandoff`). It goes
@@ -593,8 +597,12 @@ Each entry: what it does, where it lives, and where it comes from.
   offered, its login), since accounts of one agent don't get the same models; the External
   account's are the agent's settings from before
   (`Server::{account_settings, update_account_settings}`). A thread starts with its account's
-  defaults, and a choice made in it becomes its account's default. Agent control lists and
-  checks the options of the account a launched thread will run on. A new account copies
+  defaults, and a choice made in it becomes its account's default. Agent control lists each
+  account with its models and modes when an agent has more than one
+  (`orchestrator_capabilities`' `accounts`, keyed by id or "external"), takes an `account` (key
+  or name) on `agentz_thread_launch`, `create_threads` and `delegate_task`, the account for new
+  threads otherwise, and checks a model against that account's options. The caller's model
+  carries over only where the account offers it. A new account copies
   another's settings (`Request::CopyAccountSettings`, `Account::settings_from`; at
   `AddAccount`, the account for new threads'): its Environment without the login variables,
   its defaults, and the description's `settings_files` from its home (`normal_home` for the

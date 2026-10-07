@@ -218,12 +218,6 @@ impl Server {
         }
     }
 
-    /// The settings of the account a new thread with `agent_id` runs on.
-    pub(super) fn new_thread_settings(&self, agent_id: &AgentId) -> AgentSettings {
-        let account = self.accounts.get(agent_id).new_thread_account();
-        self.account_settings(agent_id, account)
-    }
-
     /// Changes the account's settings, if it's still there.
     pub(super) fn update_account_settings(
         &mut self,

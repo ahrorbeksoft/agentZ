@@ -2778,6 +2778,177 @@ async fn agents_manage_the_threads_of_their_project() {
     assert_eq!(code, "invalid_request");
 }
 
+/// An agent with several accounts is listed with each one's models, and a launched thread or
+/// delegated task runs on the account asked for, its model checked against that account's.
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_launch_threads_on_an_account() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let orchestrator = client.create_thread_in(project_id).await;
+    client.wait_until_ready(orchestrator).await;
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| match event {
+                Event::AgentSettings(settings) => settings
+                    .get(&mock)
+                    .is_some_and(|settings| !settings.known_config_options.is_empty()),
+                _ => false,
+            })
+        })
+        .await;
+
+    // With only the agent's own login, there's no account to choose.
+    let capabilities = client
+        .tool(orchestrator, "orchestrator_capabilities", json!({}))
+        .await;
+    assert_eq!(capabilities["agents"][0]["accounts"], Value::Null);
+
+    // The mock offers fewer models in a home whose settings name them, as a plan can.
+    let Response::AccountAdded(side) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    client
+        .ok(Request::UpdateAccount {
+            agent_id: mock.clone(),
+            account: Some(side),
+            change: AccountChange::Rename(Some("Side".into())),
+        })
+        .await;
+    let home = server
+        .data_dir
+        .path()
+        .join("accounts/mock")
+        .join(side.to_string());
+    std::fs::write(home.join(".mock/settings.json"), r#"{"models": ["haiku"]}"#).expect("write");
+    let Response::ThreadCreated(first) = client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: mock.clone(),
+            workspace: Default::default(),
+            account: AccountChoice::Account(side),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    client.wait_until_ready(first).await;
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| match event {
+                Event::Accounts(accounts) => accounts
+                    .get(&mock)
+                    .and_then(|accounts| accounts.account(side))
+                    .is_some_and(|account| !account.settings.known_config_options.is_empty()),
+                _ => false,
+            })
+        })
+        .await;
+
+    let capabilities = client
+        .tool(orchestrator, "orchestrator_capabilities", json!({}))
+        .await;
+    let accounts = capabilities["agents"][0]["accounts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let listed: Vec<(Value, Value, Value, Vec<Value>)> = accounts
+        .iter()
+        .map(|account| {
+            let models = account["models"]
+                .as_array()
+                .map(|models| models.iter().map(|model| model["id"].clone()).collect())
+                .unwrap_or_default();
+            (
+                account["account"].clone(),
+                account["name"].clone(),
+                account["isDefault"].clone(),
+                models,
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (
+                json!("external"),
+                Value::Null,
+                json!(true),
+                vec![json!("opus"), json!("sonnet"), json!("haiku")]
+            ),
+            (
+                json!(side.to_string()),
+                json!("Side"),
+                json!(false),
+                vec![json!("haiku")]
+            ),
+        ]
+    );
+
+    // The model is checked against the account's own.
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(orchestrator),
+            "agentz_thread_launch",
+            json!({"account": "side", "model": "opus"}),
+        )
+        .await;
+    assert_eq!(code, "model_unavailable");
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(orchestrator),
+            "agentz_thread_launch",
+            json!({"account": "nobody"}),
+        )
+        .await;
+    assert_eq!(code, "account_unavailable");
+
+    let launched = client
+        .tool(
+            orchestrator,
+            "agentz_thread_launch",
+            json!({"account": side.to_string(), "model": "Haiku"}),
+        )
+        .await;
+    let on_side = ThreadId(launched["threadId"].as_u64().expect("a thread id"));
+    assert_eq!(launched["model"], json!("haiku"));
+    let launched = client
+        .tool(orchestrator, "agentz_thread_launch", json!({}))
+        .await;
+    let on_default = ThreadId(launched["threadId"].as_u64().expect("a thread id"));
+
+    // A task on another account doesn't take its parent's model when the account lacks it.
+    let delegated = client
+        .tool(
+            orchestrator,
+            "delegate_task",
+            json!({"task": "hello", "account": side.0}),
+        )
+        .await;
+    let task = task_id(&delegated);
+    client.wait_until_ready(task).await;
+    assert_eq!(
+        config_value(client.thread(ConnectionId::Thread(task)), "model").as_deref(),
+        Some("haiku")
+    );
+    client
+        .wait_until(|client| {
+            [on_side, on_default, task].map(|thread_id| {
+                client
+                    .project_thread(thread_id)
+                    .map(|thread| thread.account)
+            }) == [Some(Some(side)), Some(None), Some(Some(side))]
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_queue_restart_and_interrupt_turns() {
     let Some(server) = TestServer::start() else {
