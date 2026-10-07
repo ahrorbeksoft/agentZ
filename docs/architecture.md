@@ -10,6 +10,7 @@ source there first and keep agentZ's behavior and wording the same.
 | t3code (`references/t3code`) | MIT | Sidebar, thread cards, settings, agent control (orchestrator MCP), subthreads, checkpoints and diffs, worktrees, terminal drawer, machines and merged projects |
 | herdr (`references/herdr`) | Apache-2.0 | Background server, attention states, terminal agent detection, SSH machines, the Workspaces view (spaces, tabs, split panes) |
 | cow (`references/cow`) | MIT | Pastures: copy-on-write project copies, their sync and bring-back |
+| OpenUsage (`references/openusage`, github.com/robinebers/openusage) | MIT | The vendors' usage APIs that account readers call with an agent's stored login (Devin's `GetUserStatus`) |
 
 Code or data ported from herdr keeps its Apache-2.0 notice (`crates/agentz_server/src/detect/`).
 The sounds in `assets/sounds/` are Zed's `agent_done.wav` and t3code's
@@ -689,13 +690,13 @@ Each entry: what it does, where it lives, and where it comes from.
   account's `.config` and `.local/share` link every entry of the user's own except Devin's
   (`AgentDescription::shared_folders`, relinked as the agent starts). Its login check is
   `auth status`, by how its output starts (`LoggedIn::Prefix`), and its reader
-  (`Reader::DevinTerminal`) reads the name, email and plan from that, then runs `/usage` in
-  Devin's terminal UI in the hidden terminal, in `accounts/devin/reader/` with a config
-  folder of its own there (no MCP servers or hooks, the first-run questions answered). Until
-  Devin has learned how the account is billed, `/usage` answers without the quota, so the
-  reader asks again each second. Its windows are Devin's, Daily and Weekly, and it removes
-  the session lock Devin leaves; the screens it's tested on are in `accounts/devin_screens/`
-  and the outputs in `accounts/devin_reads/`. An
+  (`Reader::DevinApi`, OpenUsage's Devin provider) reads the name, email and plan from that,
+  then sends `GetUserStatus` to Devin's API server with the key in Devin's
+  `credentials.toml` (or `WINDSURF_API_KEY`), only read, never redirected. Its windows are
+  Devin's, Daily and Weekly, from the percentage left, and its extra usage is Devin's "Extra
+  usage balance", once above zero; a refused key reads logged out. The outputs it's tested
+  on are in `accounts/devin_reads/`. No agent's terminal UI is read but Droid's (the user's
+  rule). An
   agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
   so every account is a process of its own with its own login and sessions: its threads,
   login sessions (`OpenLoginSession`) and session listing and import (`ListAgentSessions`,

@@ -1,5 +1,5 @@
 //! A terminal nobody sees, for readers that type a command into an agent's terminal UI and read
-//! the screen (plan.md, reader kind 5). It ends its program when dropped.
+//! the screen (plan.md, reader kind 5): only Droid's. It ends its program when dropped.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,20 +96,6 @@ impl HiddenTerminal {
 
     pub(super) fn write(&self, text: &str) {
         self.terminal.write(text.as_bytes().to_vec());
-    }
-
-    /// Waits up to `timeout` for the program to exit by itself, and says whether it did.
-    pub(super) async fn wait_for_exit(&mut self, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while self.terminal.exit().is_none() {
-            match tokio::time::timeout_at(deadline, self.events.next()).await {
-                Ok(Some(event)) => {
-                    self.terminal.handle_event(event);
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
-        self.terminal.exit().is_some()
     }
 
     /// Ends the program, and waits up to `timeout` for it to be gone, so it's done writing its

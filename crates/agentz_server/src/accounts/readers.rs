@@ -38,9 +38,9 @@ pub enum Reader {
     /// Codex's `account/read` and `account/rateLimits/read`, from its app-server run through
     /// the adapter's `cli` (plan.md, reader kind 2).
     CodexAppServer,
-    /// Devin's `auth status`, then `/usage` in its terminal UI run where nobody sees it
-    /// (plan.md, reader kinds 1 and 5).
-    DevinTerminal,
+    /// Devin's `auth status`, then the `GetUserStatus` Devin asks its API server for, sent the
+    /// key Devin keeps, as OpenUsage reads it (plan.md, reader kinds 1 and 7).
+    DevinApi,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -75,7 +75,7 @@ impl Reader {
             Reader::DroidTerminal => super::droid::read(agent, folder).await,
             Reader::ClaudeCode => super::claude::read(agent, folder).await,
             Reader::CodexAppServer => super::codex::read(agent, folder).await,
-            Reader::DevinTerminal => super::devin::read(agent, folder).await,
+            Reader::DevinApi => super::devin::read(agent, http).await,
             Reader::Command(command) => {
                 let output =
                     run_with_account_env(command.program.as_deref(), &command.args, agent).await?;
@@ -147,7 +147,7 @@ impl Reader {
                     .insert("AGENTZ_OVERAGE_PREFERENCE".into(), "DroidCore".into());
                 self.read(agent, http, folder).await
             }
-            Reader::ClaudeCode | Reader::CodexAppServer | Reader::DevinTerminal => {
+            Reader::ClaudeCode | Reader::CodexAppServer | Reader::DevinApi => {
                 bail!("only Factory Droid has Droid Core")
             }
         }
@@ -185,7 +185,7 @@ impl Reader {
             Reader::FactoryApi { .. }
             | Reader::DroidTerminal
             | Reader::ClaudeCode
-            | Reader::DevinTerminal => bail!("only Codex has limit resets"),
+            | Reader::DevinApi => bail!("only Codex has limit resets"),
         }
     }
 }
@@ -240,6 +240,15 @@ async fn send_with_key(
         request = request.header("Content-Type", "application/json");
     }
     let request = request.body(json.map(AsyncBody::from).unwrap_or_default())?;
+    send(http, request).await
+}
+
+/// Sends `request` and reads the whole answer.
+pub(super) async fn send(
+    http: Arc<dyn HttpClient>,
+    request: Request<AsyncBody>,
+) -> Result<(StatusCode, Vec<u8>)> {
+    let url = request.uri().to_string();
     let read = async {
         let mut response = http
             .send(request)

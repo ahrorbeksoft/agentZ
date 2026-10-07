@@ -221,16 +221,25 @@ Readers come in seven kinds:
    `GET /kilocode/provider-usage`).
 5. **Hidden terminal script:** start the agent's terminal UI in a PTY nobody sees, wait for it
    to be ready, type a slash command, press Enter only once the command menu shows the
-   expected entry, read the screen, then close it with Esc and quit. This is for numbers that
-   only exist in the terminal UI (Droid `/status` and `/limits`, Devin `/usage`, Kimi
-   `/usage`, Cursor `/usage`, Qoder `/usage`). The server already runs
-   terminals (`alacritty_terminal`), so this reuses them.
+   expected entry, read the screen, then close it with Esc and quit. The server already runs
+   terminals (`alacritty_terminal`), so this reuses them. Only for Droid's `/status` and
+   `/limits`: the user allows no other agent's terminal UI to be read (Devin's `/usage` was
+   read this way at first). An agent whose quota is only in its terminal UI has no quota
+   reader, unless its vendor's API gives it (kind 7).
 6. **HTTP with a key agentZ holds** (API-key accounts, above).
 7. **HTTP with the agent's stored login:** read the token from where the agent keeps it in the
    account's home, and call the vendor's usage API with it. Only where nothing else gives the
-   quota: Antigravity (Google's APIs), Cline, OpenCode's provider logins, Kimi's API. agentZ
-   only reads the login; it never changes, refreshes or copies it. The user lifted the rule
-   against reading agents' credentials for this.
+   quota: Devin (`GetUserStatus`), Antigravity (Google's APIs), Cline, OpenCode's provider
+   logins, Kimi's API, Cursor's dashboard API. OpenUsage (`references/openusage`) reads most
+   of these vendors' APIs: take the requests from it, sent as it sends them, never redirected.
+   The user lifted the rule against reading agents' credentials for this.
+
+   agentZ only reads the login; it never changes, refreshes or copies it (the user's choice).
+   Many vendors' refresh tokens work once, so a refresh by agentZ would log the agent out,
+   and writing the new tokens back would race the agent. A login whose token has expired
+   keeps its last numbers until the agent renews it. ACP's `initialize` doesn't renew it; an
+   agent renews its token when it uses it, so an empty session (no prompt) may *(check per
+   agent)*. API keys (Devin's, Factory's, OpenCode Go's, Z.ai's) don't expire this way.
 
 Readers return one shape: `AccountStatus { logged_in, email, name, plan, windows, credits }`,
 with each window `{ label, used_percent, resets_at }`.
@@ -273,7 +282,7 @@ that is still used.
     trusted once in each home) and deletes the sessions opened there.
   - `claude -p "/usage"` writes a transcript under `<config dir>/projects/<folder>/`. It gets
     the same cleanup, unless Claude has a flag that skips saving the session.
-  - Codex's `app-server` and Devin's status command leave nothing.
+  - Codex's `app-server`, Devin's status command and its `GetUserStatus` leave nothing.
 - Hidden terminal readers have to handle first-run prompts: Droid's folder trust and Codex's
   update prompt (`-c check_for_update_on_startup=false`).
 
@@ -297,7 +306,7 @@ bill money.
   usage credits (reported as `extra_usage`), the hidden `/limit-reset` resets the limits once a
   week, and at the limit `/rate-limit-options` offers switching to usage credits or "Stop and
   wait for limit to reset", with an automatic resume at the reset. agentZ could only reach
-  these through a hidden terminal *(untested)*.
+  these through a hidden terminal, which the user doesn't allow for Claude.
 - **Devin:** overage billing, once the org allows it, set on Devin's site.
 - **Grok:** a prepaid balance and an on-demand cap, read from `_x.ai/billing`.
 - **Waiting for the reset** works for every agent without its help: the server queues a message
@@ -446,7 +455,7 @@ Decided in the design round; `decisions.md` is the spec. In short:
 | Login stored | `<home>/.factory/auth.v2.loginkeychain`, encrypted with one shared keychain key | Keychain entry named after the folder | `<home>/auth.json` | `<data>/devin/credentials.toml` |
 | Logged out | `session/new` fails | Session opens; `claude auth status --json` | `session/new` fails | Session opens with no models; `devin auth status` |
 | Identity | Terminal `/status` *(unverified, read in code)*; API key: `GET /api/cli/whoami` | `claude auth status --json`: email, org, plan, method | `account/read`: email, plan | `devin auth status`: name, email, plan |
-| Quota | Terminal `/limits`: 5-hour, weekly, monthly, extra usage; API key: `GET /api/billing/limits` | `claude -p "/usage"`: session and week, % used, resets | `account/rateLimits/read`: windows with `usedPercent`, `windowDurationMins`, `resetsAt`, credits | Terminal `/usage`: daily and weekly; also the status line |
+| Quota | Terminal `/limits`: 5-hour, weekly, monthly, extra usage; API key: `GET /api/billing/limits` | `claude -p "/usage"`: session and week, % used, resets | `account/rateLimits/read`: windows with `usedPercent`, `windowDurationMins`, `resetsAt`, credits | `GetUserStatus` with `windsurf_api_key` from `credentials.toml` (OpenUsage's): daily and weekly, extra usage balance |
 | Skills | `<home>/.factory/skills`, `<home>/.agents/skills` | `<home>/skills` | `<home>/skills`, plus real `~/.agents/skills` | `<config>/devin/skills`, plus real `~/.agents/skills` and `~/.claude/skills` |
 | MCP | Stdio only; accepted and started | Accepted | Accepted | Accepted |
 
@@ -522,7 +531,7 @@ Notes:
   - Logged out: `session/new` fails.
   - Identity: `qodercli status -o json` gives `logged_in`, plus the username, email, plan and
     org when logged in *(from source)*.
-  - Quota: terminal `/usage` *(unverified)*.
+  - Quota: only in its terminal `/usage` *(unverified)*, which isn't read: no quota reader.
   - Skills: `$QODER_CONFIG_DIR/skills`, plus the real `~/.agents/skills`.
   - MCP: http and sse; whether it's honored is unverified.
 
@@ -537,8 +546,10 @@ Notes:
     account.
   - Identity: `cursor-agent status --format json` gives the email and name;
     `about --format json` gives the tier.
-  - Quota: terminal `/usage`: the monthly allowance for Auto, API and total, plus on-demand
-    spend.
+  - Quota: its terminal `/usage` (the monthly allowance for Auto, API and total, plus
+    on-demand spend) isn't read. Cursor's dashboard API (`api2.cursor.sh`, `DashboardService`'s
+    `GetCurrentPeriodUsage` and `GetPlanInfo`, as OpenUsage reads it) with the stored access
+    token (kind 7), if `cursor-agent`'s file store keeps one *(unverified)*.
   - Skills: `$HOME/.cursor/skills`, `$HOME/.agents/skills`. MCP: http and sse.
 - **Google Antigravity** (`agy-acp-server`):
   - Home: `GEMINI_HOME` plus `AGY_ACP_FORCE_FILE_STORAGE=1`. Without the switch, the login
@@ -553,7 +564,7 @@ Notes:
   - Home: `KIMI_SHARE_DIR` plus HOME, because two paths ignore it. The login is a file.
   - Plans have 5-hour and weekly windows.
   - Logged out: `session/new` fails.
-  - Quota: terminal `/usage`. The API needs the stored OAuth token.
+  - Quota: the API with the stored OAuth token (kind 7); its terminal `/usage` isn't read.
   - Skills: the first of `~/.kimi/skills`, `~/.claude/skills`, `~/.codex/skills` that exists
     (under the moved HOME), plus `~/.agents/skills`. MCP: http.
 - **Auggie** (`auggie --acp`):
@@ -580,7 +591,7 @@ Notes:
   - MCP: passed to `amp` on each prompt.
 - **Junie** (JetBrains):
   - Home: `JUNIE_HOME`. Keychain use is unclear.
-  - Quota: terminal `/usage` (remaining balance).
+  - Quota: only its terminal `/usage` (remaining balance), which isn't read: no quota reader.
   - Everything is from docs only (the download is 334 MB). Test it first.
 - **OpenCode** (installed by the user):
   - Home: `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`; the login is
@@ -599,7 +610,7 @@ Notes:
 | Agent | Home | Why later |
 |---|---|---|
 | Cline | `CLINE_DIR`, `CLINE_DATA_DIR` | ACP ignores `mcpServers`; identity and quota need the stored token; one fixed hub port (25463) for every home |
-| Codebuddy Code | HOME + `CODEBUDDY_CONFIG_DIR` | China-focused logins; quota only in its terminal UI |
+| Codebuddy Code | HOME + `CODEBUDDY_CONFIG_DIR` | China-focused logins; quota only in its terminal UI, which isn't read |
 | Cortex Code | `SNOWFLAKE_HOME`, or named connections (`-c`) | Snowflake accounts; no quota source; ignores ACP MCP; session opens without a connection |
 | Mistral Vibe | `VIBE_HOME` + `VIBE_TEST_DISABLE_KEYRING=1` | Identity through its API with the key, but no quota |
 | Qwen Code | `QWEN_HOME` | Coding Plan keys have windows, but no quota API was found; the free login ended 2026-04-15 |
@@ -631,7 +642,9 @@ Decided by the user:
 - The agents' own skills and MCP servers aren't imported: their configs stay as they are, and
   may be agent-specific. agentZ only adds skills and servers of its own, for every agent.
 - Agents that need HOME moved get links to the user's `.gitconfig`, `.ssh` and `.config`.
-- agentZ may read an agent's stored login where that's the only quota source (reader kind 7).
+- agentZ may read an agent's stored login where that's the only quota source (reader kind 7),
+  and never refreshes it.
+- No agent's terminal UI is read but Droid's (reader kind 5).
 - Skills and MCP servers are per machine, and can be imported from another machine.
 - "Copy settings from" also copies the agent's own settings files.
 - On Droid, Stop or Continue at reset applies only when Droid itself stops, and there's no

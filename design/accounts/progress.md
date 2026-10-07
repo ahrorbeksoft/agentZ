@@ -15,7 +15,10 @@ Notes for whoever continues:
   and §10 has no Droid switch.
 - §7 also copies the agent's own settings files (never the login), as the user decided.
 - The user lifted the rule against reading agents' stored logins (reader kind 7). AGENTS.md's
-  pitfall now allows status commands and points at kind 7, which comes with wave 3.
+  pitfall now allows status commands and points at kind 7, which came with Devin's reader.
+  agentZ never refreshes a stored login (the user's choice), and reads no agent's terminal UI
+  but Droid's (the user's rule, after item 22): take a vendor's usage API from OpenUsage
+  (`references/openusage`) instead.
 - Importing skills and servers from another machine isn't on the design board yet: add a topic
   and let the user pick before building item 26.
 - The agents' own skills and MCP servers are never imported (the user's answer, which dropped
@@ -66,21 +69,19 @@ Notes for whoever continues:
   entries the user removed go). The login check is `auth status`, which always exits 0, so
   it's read by how it starts ("Logged in", `LoggedIn::Prefix`); it reads only the stored
   login, so a `WINDSURF_API_KEY` set on purpose in the Environment shows logged out. The
-  reader runs Devin's terminal UI (`devin` with `--respect-workspace-trust false`) in
-  `accounts/devin/reader/` with a config folder of its own there (first-run questions
-  answered, auto-update off), so it starts none of the user's MCP servers or hooks; its data
-  folder is the account's, for the login. It types `/usage`, presses Enter once the menu
-  offers it first, and quits with Ctrl+C twice. Until Devin has learned how the account is
-  billed (about 8 seconds after start in the real one), `/usage` answers "No credits or ACUs
-  consumed yet in this session." without the quota, so the reader asks again each second for
-  up to 30 seconds, then reads no windows (a login billed by credits or ACUs). Each run leaves
-  a session lock holding the ACP child's process id, which the reader removes once that
-  process is gone; nothing else is kept (no session, no prompt history), and Devin rotates
-  its own logs. Windows are Devin's: Daily and Weekly, with resets "in 16h 21m" or "Oct 11,
-  1:00 PM (UTC+5)". Checked against the real Devin 3000.11.3: logged out in empty folders,
-  and the user's own login (Pro) read both windows in about 11 seconds with no lock left. The
-  status line's "Pro · 100% remaining" isn't read. Logging a new account in wasn't tried: it
-  needs the user's browser.
+  reader (`Reader::DevinApi`) reads the name, email and plan from `auth status`, then sends
+  `GetUserStatus` (Connect JSON) to the API server `credentials.toml` names (only `https://`,
+  else `server.codeium.com`), never redirected, with the key there (`WINDSURF_API_KEY`
+  first), as OpenUsage does, client name and version included; Devin's own CLI asks the same
+  in protobuf. It first read `/usage` in Devin's terminal UI, which the user then ruled out
+  (only Droid's terminal is read). The quota comes as the percentage left, and proto3 leaves
+  zeros out, so a window with a reset and no percentage is used up; `hideDailyQuota` drops
+  Daily. "Extra usage balance" (Devin's name) is `overageBalanceMicros`, shown only above
+  zero: the user's login has a small negative one, and Devin's `/usage` showed no balance
+  then. A 401 or 403 reads logged out. Checked against the real Devin 3000.11.3: the user's
+  login (Pro) read Daily and Weekly at 0% with the resets `/usage` showed, in about 4
+  seconds, and nothing is left behind. Logging a new account in wasn't tried: it needs the
+  user's browser.
 - Item 18 (`server/limit_waits.rs`): "When a limit is reached" sits under the card's limits,
   past the avatar, as in the mock, and only for agents that read usage, since waiting needs
   the reset from a read; an agent with one account has it too, as it has the notice. The

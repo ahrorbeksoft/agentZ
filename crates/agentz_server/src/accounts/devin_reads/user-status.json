@@ -1,0 +1,46 @@
+{
+  "userStatus": {
+    "pro": true,
+    "name": "Example",
+    "email": "work@example.com",
+    "teamsTier": "TEAMS_TIER_DEVIN_PRO",
+    "planStatus": {
+      "planInfo": {
+        "teamsTier": "TEAMS_TIER_DEVIN_PRO",
+        "planName": "Pro",
+        "monthlyPromptCredits": -1,
+        "hasPaidFeatures": true,
+        "devinInfo": {
+          "canUseCascade": true,
+          "canUseCli": true,
+          "isAdmin": true,
+          "webappHost": "app.devin.ai",
+          "apiUrl": "https://api.devin.ai",
+          "accountDisplayName": "Example",
+          "requestUsageAction": {
+            "kind": "KIND_TEXT_ONLY",
+            "label": "Ask your account admin to raise it"
+          }
+        },
+        "isDevin": true,
+        "billingStrategy": "BILLING_STRATEGY_QUOTA"
+      },
+      "planStart": "2026-09-10T17:34:04Z",
+      "planEnd": "2026-10-10T17:34:04Z",
+      "availablePromptCredits": -1,
+      "dailyQuotaRemainingPercent": 88,
+      "weeklyQuotaRemainingPercent": 61,
+      "overageBalanceMicros": "12400000",
+      "dailyQuotaResetAtUnix": "1791446400",
+      "weeklyQuotaResetAtUnix": "1791705600"
+    }
+  },
+  "planInfo": {
+    "teamsTier": "TEAMS_TIER_DEVIN_PRO",
+    "planName": "Pro",
+    "monthlyPromptCredits": -1,
+    "hasPaidFeatures": true,
+    "isDevin": true,
+    "billingStrategy": "BILLING_STRATEGY_QUOTA"
+  }
+}

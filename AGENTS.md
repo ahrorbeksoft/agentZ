@@ -19,6 +19,9 @@ This file is for any agent continuing the work. Read it before changing anything
   background servers, attention states, terminal panes, SSH machines and the Workspaces view.
 - **cow** (`references/cow`, a read-only clone, gitignored, MIT) is the model for copy-on-write
   workspaces, which cow calls pastures (instant APFS copies of a project for each thread).
+- **OpenUsage** (`references/openusage`, a read-only clone of `robinebers/openusage`,
+  gitignored, MIT) is the model for reading an account's usage from the vendor's API with the
+  agent's stored login: which requests, sent as it sends them.
 - **Don't invent extras.** Build what was asked, the way Zed or t3code does it. If neither has
   it, keep it minimal and say what you chose.
 
@@ -200,7 +203,9 @@ From Zed's guidelines, which this code follows:
   they're logged out (Claude, Devin), so their description (`crates/agentz_server/src/accounts/`)
   names their own status command as the login check. Read a stored login only where nothing else
   gives the quota (`design/accounts/plan.md`, reader kind 7), and never change, refresh or copy
-  it: every agent stores its login differently.
+  it: every agent stores its login differently, and many vendors' refresh tokens work once, so
+  a refresh by agentZ logs the agent out. Don't read an agent's terminal UI for its quota: the
+  user allows only Droid's (`accounts/hidden_terminal.rs`).
 - **Threads from older builds may lack `session_id` or `model`.** They fill in the next time the
   thread is opened.
 - **`agentz-server proxy` must not wait for stdin when it exits.** Tokio reads stdin on a
