@@ -60,6 +60,7 @@ pub(super) fn description() -> AgentDescription {
     AgentDescription {
         home_variables: BTreeMap::from([("FACTORY_HOME_OVERRIDE".into(), String::new())]),
         shared_folders: BTreeMap::new(),
+        external_links: Vec::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::from([(".factory/settings.json".into(), HOME_SETTINGS.into())]),
         // Custom models and session defaults. The login is in other files.

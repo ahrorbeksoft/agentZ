@@ -1,0 +1,5 @@
+{
+  "code": -32000,
+  "message": "Authentication required",
+  "data": "Authentication required to fetch billing data"
+}

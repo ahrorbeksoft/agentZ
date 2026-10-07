@@ -303,6 +303,7 @@ fn mock_accounts() -> crate::AgentDescription {
     crate::AgentDescription {
         home_variables: BTreeMap::from([("MOCK_HOME".into(), String::new())]),
         shared_folders: BTreeMap::new(),
+        external_links: Vec::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::from([(".mock/settings.json".into(), r#"{"sync": false}"#.into())]),
         // Tests that copy them name a normal home of their own, outside the user's.

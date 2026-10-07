@@ -1,0 +1,33 @@
+{
+  "authMethods": [
+    {
+      "id": "cached_token",
+      "name": "cached_token",
+      "description": "Cached token from ~/.grok/auth.json"
+    },
+    {
+      "id": "grok.com",
+      "name": "Grok",
+      "description": "Sign in with Grok"
+    }
+  ],
+  "defaultAuthMethodId": "cached_token",
+  "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+      "image": false,
+      "audio": false,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "sessionCapabilities": {
+      "list": {},
+      "resume": {},
+      "close": {}
+    },
+    "auth": {}
+  }
+}

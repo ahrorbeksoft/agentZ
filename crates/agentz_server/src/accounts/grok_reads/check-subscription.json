@@ -1,0 +1,19 @@
+{
+  "authenticated": true,
+  "meta": {
+    "email": "user@example.com",
+    "auth_mode": "Oidc",
+    "team_id": "00000000-0000-4000-8000-000000000001",
+    "is_team_principal": false,
+    "team_name": null,
+    "is_zdr": false,
+    "team_role": null,
+    "coding_data_retention_opt_out": true,
+    "can_administer_team": null,
+    "show_resolved_model": null,
+    "gate": null,
+    "subscription_tier": null,
+    "feedback_trace_offer": false,
+    "backend_billed": false
+  }
+}

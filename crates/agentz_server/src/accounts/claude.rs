@@ -55,6 +55,7 @@ pub(super) fn description() -> AgentDescription {
     AgentDescription {
         home_variables: BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), String::new())]),
         shared_folders: BTreeMap::new(),
+        external_links: Vec::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::new(),
         // The model, permissions, hooks and environment. The login is in the keychain.

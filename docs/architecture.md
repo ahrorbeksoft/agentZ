@@ -727,17 +727,27 @@ Each entry: what it does, where it lives, and where it comes from.
   `credentials.toml` (or `WINDSURF_API_KEY`), only read, never redirected. Its windows are
   Devin's, Daily and Weekly, from the percentage left, and its extra usage is Devin's "Extra
   usage balance", once above zero; a refused key reads logged out. The outputs it's tested
-  on are in `accounts/devin_reads/`. No agent's terminal UI is read but Droid's (the user's
-  rule). An
+  on are in `accounts/devin_reads/`. Grok Build's description (`accounts/grok.rs`) moves its
+  home, login (`auth.json`) included, with `GROK_HOME`. Its npm launcher runs the binary in
+  `$GROK_HOME/bin`, which npm's install updates in the user's `~/.grok` only, so each
+  account's `bin` links to that one (`AgentDescription::external_links`). Its login check is
+  a session, and its reader (`Reader::GrokExtensions`) starts the agent itself and asks its
+  own ACP extensions right after `initialize`, with no session: `_x.ai/auth/check_subscription`
+  (the email; logged out if not `authenticated`) and `_x.ai/billing` (the plan, the Weekly or
+  Monthly window of its usage pool, and "Pay as you go", its on-demand cap in cents, or Off).
+  A team's own login has no usage of its own, and a key login, with nothing to read, is left
+  to the session check. The outputs it's tested on are in `accounts/grok_reads/`. No
+  agent's terminal UI is read but Droid's (the user's rule). An
   agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
   so every account is a process of its own with its own login and sessions: its threads,
   login sessions (`OpenLoginSession`) and session listing and import (`ListAgentSessions`,
   `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
-  `accounts/droid.rs`, `accounts/claude.rs`, `accounts/codex.rs` and `accounts/devin.rs`; a
-  custom agent's `accounts` in `agents/custom.json`) can have more accounts. It names the
-  variables that move the agent's home there, the folders among those that hold other
-  programs' files too (linked from the user's), the switches that keep
+  `accounts/droid.rs`, `accounts/claude.rs`, `accounts/codex.rs`, `accounts/devin.rs` and
+  `accounts/grok.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
+  accounts. It names the variables that move the agent's home there, the folders among those
+  that hold other programs' files too (linked from the user's), the entries every account
+  shares with the External account's home (linked to them), the switches that keep
   its login in a file rather than a shared keychain entry, the files a new account's folder
   starts with (`AgentDescription::start_home`, at `AddAccount`: Droid's
   `.factory/settings.json` with cloud session sync off), the variables that log it in, its

@@ -1,0 +1,33 @@
+{
+  "authMethods": [
+    {
+      "id": "xai.api_key",
+      "name": "xai.api_key",
+      "description": "XAI_API_KEY or api_key/env_key in config.toml"
+    },
+    {
+      "id": "grok.com",
+      "name": "Grok",
+      "description": "Sign in with Grok"
+    }
+  ],
+  "defaultAuthMethodId": "xai.api_key",
+  "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+      "image": false,
+      "audio": false,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "sessionCapabilities": {
+      "list": {},
+      "resume": {},
+      "close": {}
+    },
+    "auth": {}
+  }
+}

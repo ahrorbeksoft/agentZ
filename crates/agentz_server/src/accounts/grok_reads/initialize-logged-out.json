@@ -1,0 +1,28 @@
+{
+  "authMethods": [
+    {
+      "id": "grok.com",
+      "name": "Grok",
+      "description": "Sign in with Grok"
+    }
+  ],
+  "defaultAuthMethodId": null,
+  "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {
+      "image": false,
+      "audio": false,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "sessionCapabilities": {
+      "list": {},
+      "resume": {},
+      "close": {}
+    },
+    "auth": {}
+  }
+}

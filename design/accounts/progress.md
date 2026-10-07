@@ -82,6 +82,26 @@ Notes for whoever continues:
   login (Pro) read Daily and Weekly at 0% with the resets `/usage` showed, in about 4
   seconds, and nothing is left behind. Logging a new account in wasn't tried: it needs the
   user's browser.
+- Wave 2 (item 27): the user asked for Grok Build only, with the easiest of the others; the
+  rest wait. Grok (`accounts/grok.rs`): `GROK_HOME` moves the whole home. Its npm launcher
+  runs `$GROK_HOME/bin/grok`, copying the 150 MB binary there the first time, and npm's
+  install of a new version updates only `~/.grok/bin`, so an account's own `bin` would stay
+  at the version it first ran: every account's `bin` links to the user's
+  (`external_links`, linked once it's there). The reader is plan.md's kind 3, without a
+  session: `initialize`, then `_x.ai/auth/check_subscription` and `_x.ai/billing`, and Grok
+  quits at the end of its input (about 5 seconds). Checked against the real Grok 1.0.49: a
+  new home reads logged out, and the user's login (Free) reads Weekly at 0% with its reset,
+  and "Pay as you go: Off", leaving no session and `auth.json` untouched. Not verified:
+  billing's amounts, all 0 on that login; they're taken as cents, as xAI's billing APIs
+  write money (`{"val": …}`), so a cap of 2500 is "$25.00". The plan is billing's
+  `subscription_tier`. Prepaid credits aren't shown (agentZ shows a balance only beside
+  Droid's limit choice). A key login (`XAI_API_KEY` in the Environment) has no
+  subscription, so it's left to the session check; Grok offers its key method only once the
+  key is set, so there's no key login to enter one into. Unlike plan.md, Claude's and
+  Cursor's skills aren't switched off: Grok reads `~/.claude/skills` and `~/.cursor/skills`
+  in every home, as Devin reads Claude's, so they're its outside folders, and the External
+  account, which agentZ runs as the user has it, reads them too. Logging a new account in
+  wasn't tried: it needs the user's browser.
 - Item 18 (`server/limit_waits.rs`): "When a limit is reached" sits under the card's limits,
   past the avatar, as in the mock, and only for agents that read usage, since waiting needs
   the reset from a read; an agent with one account has it too, as it has the notice. The
@@ -319,5 +339,5 @@ Notes for whoever continues:
 | 24 | 19 | Settings › MCP Servers, passed to every session | done |
 | 25 | 20 | The accounts menu on each skill and server | done |
 | 26 | | Importing skills and servers from another machine (board topic first) | |
-| 27 | | Wave 2, one agent per commit | |
+| 27 | | Wave 2, one agent per commit | Grok Build done; the rest wait |
 | 28 | | Wave 3, one agent per commit | |

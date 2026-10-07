@@ -6,6 +6,7 @@ mod codex;
 mod descriptions;
 mod devin;
 mod droid;
+mod grok;
 mod hidden_terminal;
 mod login_checks;
 mod readers;

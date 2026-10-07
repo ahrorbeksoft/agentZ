@@ -41,6 +41,9 @@ pub enum Reader {
     /// Devin's `auth status`, then the `GetUserStatus` Devin asks its API server for, sent the
     /// key Devin keeps, as OpenUsage reads it (plan.md, reader kinds 1 and 7).
     DevinApi,
+    /// Grok's own ACP extensions `_x.ai/auth/check_subscription` and `_x.ai/billing`, asked
+    /// right after `initialize`, with no session (plan.md, reader kind 3).
+    GrokExtensions,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -76,6 +79,7 @@ impl Reader {
             Reader::ClaudeCode => super::claude::read(agent, folder).await,
             Reader::CodexAppServer => super::codex::read(agent, folder).await,
             Reader::DevinApi => super::devin::read(agent, http).await,
+            Reader::GrokExtensions => super::grok::read(agent, folder).await,
             Reader::Command(command) => {
                 let output =
                     run_with_account_env(command.program.as_deref(), &command.args, agent).await?;
@@ -147,7 +151,10 @@ impl Reader {
                     .insert("AGENTZ_OVERAGE_PREFERENCE".into(), "DroidCore".into());
                 self.read(agent, http, folder).await
             }
-            Reader::ClaudeCode | Reader::CodexAppServer | Reader::DevinApi => {
+            Reader::ClaudeCode
+            | Reader::CodexAppServer
+            | Reader::DevinApi
+            | Reader::GrokExtensions => {
                 bail!("only Factory Droid has Droid Core")
             }
         }
@@ -185,7 +192,8 @@ impl Reader {
             Reader::FactoryApi { .. }
             | Reader::DroidTerminal
             | Reader::ClaudeCode
-            | Reader::DevinApi => bail!("only Codex has limit resets"),
+            | Reader::DevinApi
+            | Reader::GrokExtensions => bail!("only Codex has limit resets"),
         }
     }
 }
@@ -241,6 +249,35 @@ async fn send_with_key(
     }
     let request = request.body(json.map(AsyncBody::from).unwrap_or_default())?;
     send(http, request).await
+}
+
+/// One answer in a JSON-RPC server's output: its id, and its result or the message of its
+/// error. `None` for a notification or a request.
+pub(super) fn json_rpc_answer(line: &str) -> Option<(u64, Result<serde_json::Value, String>)> {
+    let mut message = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if message.get("method").is_some() {
+        return None;
+    }
+    let id = message["id"].as_u64()?;
+    let answer = match message.get_mut("error") {
+        Some(error) => Err(error["message"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string())),
+        None => Ok(message["result"].take()),
+    };
+    Some((id, answer))
+}
+
+/// A variable as the agent's run of the account sees it.
+pub(super) fn account_variable(agent: &AgentCommand, name: &str) -> Option<String> {
+    if let Some(value) = agent.env.get(name) {
+        return Some(value.clone());
+    }
+    if agent.env_remove.iter().any(|removed| removed == name) {
+        return None;
+    }
+    std::env::var(name).ok()
 }
 
 /// Sends `request` and reads the whole answer.

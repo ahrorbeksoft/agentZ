@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use util::ResultExt as _;
 
 use super::login_checks::account_command;
-use super::readers::{LimitResetOutcome, LimitResetUse, Read, format_number};
+use super::readers::{LimitResetOutcome, LimitResetUse, Read, format_number, json_rpc_answer};
 use super::{AgentDescription, LoginCheck, Reader, SHARED_SKILLS_FOLDER};
 
 /// The adapter runs Codex itself with the arguments after this one.
@@ -42,6 +42,7 @@ pub(super) fn description() -> AgentDescription {
     AgentDescription {
         home_variables: BTreeMap::from([("CODEX_HOME".into(), String::new())]),
         shared_folders: BTreeMap::new(),
+        external_links: Vec::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::new(),
         // The model, profiles, providers and MCP servers.
@@ -218,21 +219,6 @@ struct Answers {
     rate_limits: Result<serde_json::Value, String>,
 }
 
-/// One answer from Codex's output: its id, and its result or the message of its error. `None`
-/// for a notification.
-fn parse_answer(line: &str) -> Option<(u64, Result<serde_json::Value, String>)> {
-    let mut message = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    let id = message["id"].as_u64()?;
-    let answer = match message.get_mut("error") {
-        Some(error) => Err(error["message"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| error.to_string())),
-        None => Ok(message["result"].take()),
-    };
-    Some((id, answer))
-}
-
 /// Reads Codex's output up to its answers, among the notifications it sends.
 async fn collect_answers(output: &mut Lines<impl AsyncBufRead + Unpin>) -> Result<Answers> {
     let mut account = None;
@@ -242,7 +228,7 @@ async fn collect_answers(output: &mut Lines<impl AsyncBufRead + Unpin>) -> Resul
         .await
         .context("reading Codex's answers")?
     {
-        match parse_answer(&line) {
+        match json_rpc_answer(&line) {
             Some((INITIALIZE_REQUEST, Err(error))) => bail!("Codex didn't start: {error}"),
             Some((ACCOUNT_REQUEST, answer)) => account = Some(answer),
             Some((RATE_LIMITS_REQUEST, answer)) => rate_limits = Some(answer),
@@ -271,7 +257,7 @@ async fn answer_to(
         .await
         .context("reading Codex's answers")?
     {
-        match parse_answer(&line) {
+        match json_rpc_answer(&line) {
             Some((INITIALIZE_REQUEST, Err(error))) => bail!("Codex didn't start: {error}"),
             Some((answered, answer)) if answered == id => return Ok(answer),
             _ => {}

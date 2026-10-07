@@ -1,0 +1,23 @@
+{
+  "config": {
+    "creditUsagePercent": 42.5,
+    "currentPeriod": {
+      "type": "USAGE_PERIOD_TYPE_WEEKLY",
+      "start": "2026-10-06T00:00:00+00:00",
+      "end": "2026-10-13T00:00:00+00:00"
+    },
+    "onDemandCap": {
+      "val": 2500
+    },
+    "onDemandUsed": {
+      "val": 300
+    },
+    "prepaidBalance": {
+      "val": 1000
+    },
+    "isUnifiedBillingUser": true,
+    "billingPeriodStart": "2026-10-06T00:00:00+00:00",
+    "billingPeriodEnd": "2026-10-13T00:00:00+00:00"
+  },
+  "subscription_tier": "SuperGrok"
+}

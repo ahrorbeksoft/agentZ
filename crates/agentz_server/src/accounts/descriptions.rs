@@ -27,6 +27,10 @@ pub struct AgentDescription {
     /// the user's folder is linked into the home's, so the programs the agent runs still find
     /// theirs (`gh`'s login, `git`'s config).
     pub shared_folders: BTreeMap<String, Vec<String>>,
+    /// Entries of the External account's home that every account's home links to instead of
+    /// keeping its own, by their path in a home: Grok's `bin`, where its npm launcher keeps
+    /// the binary it runs, and its updates put the new one.
+    pub external_links: Vec<String>,
     /// Switches that keep the login in a file in the home, where it would otherwise go to a
     /// keychain entry every home shares.
     pub file_storage: BTreeMap<String, String>,
@@ -75,7 +79,13 @@ pub struct KeyLogin {
 }
 
 /// The registry agents agentZ has a description of.
-pub const BUILT_IN: [&str; 4] = ["factory-droid", "claude-acp", "codex-acp", "devin"];
+pub const BUILT_IN: [&str; 5] = [
+    "factory-droid",
+    "claude-acp",
+    "codex-acp",
+    "devin",
+    "grok-build",
+];
 
 /// The description of a registry agent, by its id.
 pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
@@ -84,6 +94,7 @@ pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
         "claude-acp" => Some(super::claude::description()),
         "codex-acp" => Some(super::codex::description()),
         "devin" => Some(super::devin::description()),
+        "grok-build" => Some(super::grok::description()),
         _ => None,
     }
 }
@@ -209,9 +220,26 @@ impl AgentDescription {
     }
 
     /// Links the user's entries into the account `home`'s shared folders, and removes links
-    /// to entries that are gone. Run before each start of the account's agent, so it finds
-    /// what the user added since.
+    /// to entries that are gone; then links the External account's entries in
+    /// `external_links`, once they're there. Run before each start of the account's agent, so
+    /// it finds what the user added since.
     pub fn link_shared_folders(&self, home: &Path) -> Result<()> {
+        for path in &self.external_links {
+            let link = inside(home, path)?;
+            let target = self.external_path(path)?;
+            if std::fs::symlink_metadata(&link).is_ok() || !target.exists() {
+                continue;
+            }
+            if let Some(folder) = link.parent() {
+                std::fs::create_dir_all(folder)
+                    .with_context(|| format!("creating {}", folder.display()))?;
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &link)
+                .with_context(|| format!("linking {} to {}", link.display(), target.display()))?;
+            #[cfg(not(unix))]
+            anyhow::bail!("can't link {} to {}", link.display(), target.display());
+        }
         for (path, own) in &self.shared_folders {
             let folder = inside(home, path)?;
             let user_folder = self
@@ -403,6 +431,7 @@ mod tests {
                 ("AGENT_HOME".into(), String::new()),
             ]),
             shared_folders: BTreeMap::new(),
+            external_links: Vec::new(),
             file_storage: BTreeMap::from([("AGENT_KEYRING".into(), "file".into())]),
             home_files: BTreeMap::new(),
             settings_files: Vec::new(),

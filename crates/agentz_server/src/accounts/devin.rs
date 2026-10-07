@@ -14,7 +14,7 @@ use http_client::{
 use serde::Deserialize;
 
 use super::login_checks::run_with_account_env;
-use super::readers::{Read, format_number, send};
+use super::readers::{Read, account_variable, format_number, send};
 use super::{AgentDescription, LoggedIn, LoginCheck, Reader, SHARED_SKILLS_FOLDER, StatusCommand};
 
 /// The ACP server is Devin's program with `acp`; its other commands are the program alone.
@@ -49,6 +49,7 @@ pub(super) fn description() -> AgentDescription {
             (".config".into(), vec!["devin".into()]),
             (".local/share".into(), vec!["devin".into()]),
         ]),
+        external_links: Vec::new(),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::new(),
         // The model, permissions, hooks and keymap. The login is in the data folder.
@@ -184,7 +185,7 @@ struct Credentials {
 /// Devin's login as it would use it: the key in `WINDSURF_API_KEY`, or else in its
 /// `credentials.toml`, which is only read.
 fn stored_login(agent: &AgentCommand) -> Result<Option<DevinLogin>> {
-    let data = variable(agent, "XDG_DATA_HOME")
+    let data = account_variable(agent, "XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| util::paths::home_dir().join(".local/share"));
     let path = data.join(CREDENTIALS);
@@ -200,22 +201,11 @@ fn stored_login(agent: &AgentCommand) -> Result<Option<DevinLogin>> {
         .filter(|url| url.starts_with("https://"))
         .unwrap_or(API_SERVER)
         .to_string();
-    let key = variable(agent, KEY_VARIABLE)
+    let key = account_variable(agent, KEY_VARIABLE)
         .or(credentials.windsurf_api_key)
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty());
     Ok(key.map(|key| DevinLogin { key, api_server }))
-}
-
-/// A variable as the agent's run of the account sees it.
-fn variable(agent: &AgentCommand, name: &str) -> Option<String> {
-    if let Some(value) = agent.env.get(name) {
-        return Some(value.clone());
-    }
-    if agent.env_remove.iter().any(|removed| removed == name) {
-        return None;
-    }
-    std::env::var(name).ok()
 }
 
 /// `GetUserStatus`'s answer, as proto3 JSON writes it: zeros and falses are left out, and
