@@ -5,7 +5,7 @@
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::{AccountId, LimitResets, LimitWindow};
+use agentz_protocol::accounts::{AccountId, ExtraUsage, LimitResets, LimitWindow};
 use agentz_protocol::agents::AgentId;
 use gpui::{
     AnyElement, App, ClickEvent, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -146,6 +146,57 @@ pub(crate) fn render_limit_resets(
                     .on_click(on_use),
                 ),
         )
+        .into_any_element()
+}
+
+/// decisions.md §10's line under an account's limits: what's left of its extra usage, and
+/// Manage, which opens the vendor's page for it. agentZ never turns paid usage on itself.
+pub(crate) fn render_extra_usage(
+    key: &str,
+    extra_usage: &ExtraUsage,
+    manage_page: Option<String>,
+) -> AnyElement {
+    let selector = format!("extra-usage-{key}");
+    let button_selector = format!("extra-usage-manage-{key}");
+    h_flex()
+        .debug_selector(move || selector)
+        .gap_2()
+        .child(
+            Icon::new(IconName::Coins)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(extra_usage.label.clone())
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            div().flex_1().min_w_0().child(
+                Label::new(extra_usage.summary.clone())
+                    .size(LabelSize::Small)
+                    .truncate(),
+            ),
+        )
+        .children(manage_page.map(|url| {
+            div()
+                .flex_none()
+                .debug_selector(move || button_selector)
+                .child(
+                    Button::new(
+                        SharedString::from(format!("extra-usage-manage-{key}")),
+                        "Manage",
+                    )
+                    .label_size(LabelSize::Small)
+                    .color(Color::Accent)
+                    .end_icon(
+                        Icon::new(IconName::ArrowUpRight)
+                            .size(IconSize::XSmall)
+                            .color(Color::Accent),
+                    )
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+        }))
         .into_any_element()
 }
 

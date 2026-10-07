@@ -313,10 +313,10 @@ Any action that spends a reset or can bill money asks first. What the design rou
   message again.
 - **Limit resets** (§9): a line under the limits says how many resets the account has and when
   the next expires, with Use Reset, which always asks first. The thread's notice offers it too.
-- **Extra usage** (§10): a switch per account, "Use extra usage when limits run out", which asks
-  first because it bills the card on file. agentZ changes it through the agent: Claude's only
-  through its terminal app *(untested)*. Droid gets no separate switch: its "When limit is
-  reached" choice (§8) is already its extra usage setting.
+- **Extra usage** (§10): for accounts that report one, a line under the limits says what's left
+  of the extra usage or credits, with Manage opening the vendor's page. agentZ never turns paid
+  usage on itself. Droid gets no separate line: its balance is on its Extra usage tab, and its
+  "When limit is reached" choice (§8) is already its extra usage setting.
 - **Waiting** (§11): a setting per account, Stop (today) or Continue at reset, for every thread
   on it. agentZ never moves a thread to another account by itself. On Droid it applies only
   when Droid itself stops, since its own choice at the limit comes first.
@@ -635,7 +635,8 @@ Decided by the user:
 - Skills and MCP servers are per machine, and can be imported from another machine.
 - "Copy settings from" also copies the agent's own settings files.
 - On Droid, Stop or Continue at reset applies only when Droid itself stops, and there's no
-  separate extra usage switch.
+  separate extra usage line.
+- Extra usage is shown, never turned on by agentZ (§10 A, after B was first picked).
 - The waves are in the right order. Gemini CLI is deprecated, so it's skipped.
 
 Nothing is open.

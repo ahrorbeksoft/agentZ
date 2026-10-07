@@ -77,6 +77,7 @@ pub enum IconName {
     CloudDownload,
     Code,
     Codeberg,
+    Coins,
     Command,
     Compact,
     Control,

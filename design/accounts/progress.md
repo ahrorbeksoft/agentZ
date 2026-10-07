@@ -41,7 +41,7 @@ Notes for whoever continues:
   takes about 6 seconds with `auth status`. Checked against the real Claude: a new home is
   logged out, and the user's own login read the same windows as the captured fixture. Window
   names are t3code's (Session, Weekly, "Weekly · <model>"); the plan is `subscriptionType`
-  title-cased. Extra usage and the in-turn `_claude/rateLimit` updates aren't read. Logging
+  title-cased. The in-turn `_claude/rateLimit` updates aren't read. Logging
   a new account in (Claude's terminal login with `CLAUDE_CONFIG_DIR` set) wasn't tried: it
   needs the user's browser.
 - Item 16 (Codex, `accounts/codex.rs`): the adapter (codex-acp 2.1.1) runs Codex itself with
@@ -255,6 +255,19 @@ Notes for whoever continues:
   other numbers. A key account has no email (Factory's `whoami` gives only ids), and only
   Factory's US address is used, not its EU one. An agentZ account's login rows have the key
   field; a key account's card is titled by its login method, having no email.
+- Item 21 (`AccountStatus::extra_usage`, `usage_limits::render_extra_usage`): §10 is A now,
+  the user's pick when B came to be built. Claude's line is Claude Code's "Usage credits" in
+  `/usage`, read from `extra_usage` in the same `get_usage` answer: amounts in cents, the
+  currency written as Claude Code writes it (`$`, `€`, `CA$`, …, else the code; yen, won and
+  dong in whole units). As there, a Pro or Max login always has the line ("Off" while
+  they're off, "Unlimited" without a limit), a team or enterprise one only once they're on
+  ("$12.00 spent" without a limit), and other logins none. Codex's is "Credits", from the
+  main limit's `credits` (`hasCredits`, `unlimited`, `balance` as text), shown only while
+  there are some, as a number ("1,240 left"), since credits aren't money. Droid gets no line:
+  its balance is already on its Extra usage tab. Manage ↗ opens the description's usage
+  page. Not verified: an account with credits on (the user's Claude Pro login has them off,
+  as in the captured fixture, and the Codex Free login has none), and the line's look,
+  checked in a headless test only (no screenshots).
 - Skills (item 22): agentZ never links into `~/.agents/skills`, which Codex, Devin and others
   read whatever their home, so a skill there stays the user's own; each agent gets agentZ's in
   its own folder instead (Droid's `.factory/skills`, Codex's `$CODEX_HOME/skills`). Devin
@@ -285,7 +298,7 @@ Notes for whoever continues:
 | 18 | 11 | Stop or Continue at reset, per account | done |
 | 19 | 8 | Droid: pools as tabs, When limit is reached, its buttons in the notice | done |
 | 20 | 9 | Limit resets (Codex) | done |
-| 21 | 10 | Extra usage switch | |
+| 21 | 10 | Extra usage: the balance, with Manage | done |
 | 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | done |
 | 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | dropped |
 | 24 | 19 | Settings › MCP Servers, passed to every session | |

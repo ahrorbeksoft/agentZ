@@ -66,8 +66,8 @@ use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
 use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
 use crate::usage_limits::{
-    format_short_resets_in, limit_color, render_balance, render_limit_resets, render_limit_windows,
-    reset_phrase,
+    format_short_resets_in, limit_color, render_balance, render_extra_usage, render_limit_resets,
+    render_limit_windows, reset_phrase,
 };
 
 const KEY_CONTEXT: &str = "SettingsPage";
@@ -3722,6 +3722,13 @@ impl SettingsPage {
                 }),
             ))
         });
+        let extra_usage = status.as_ref().and_then(|status| {
+            Some(render_extra_usage(
+                &selector,
+                status.extra_usage.as_ref()?,
+                support.usage_page.clone(),
+            ))
+        });
         let overage = status.as_ref().and_then(|status| {
             let overage = status.overage?;
             Some(self.render_overage(
@@ -3775,18 +3782,22 @@ impl SettingsPage {
                 )
                 .children(actions),
         )
-        .when(limits.is_some() || limit_resets.is_some(), |card| {
-            // Under the name, past the avatar.
-            card.child(
-                v_flex()
-                    .pl(px(16.) + AVATAR_SIZE + px(12.))
-                    .pr_4()
-                    .pb(px(14.))
-                    .gap_3()
-                    .children(limits)
-                    .children(limit_resets),
-            )
-        })
+        .when(
+            limits.is_some() || limit_resets.is_some() || extra_usage.is_some(),
+            |card| {
+                // Under the name, past the avatar.
+                card.child(
+                    v_flex()
+                        .pl(px(16.) + AVATAR_SIZE + px(12.))
+                        .pr_4()
+                        .pb(px(14.))
+                        .gap_3()
+                        .children(limits)
+                        .children(limit_resets)
+                        .children(extra_usage),
+                )
+            },
+        )
         .children(overage)
         .children(at_limit)
         .when(shows_login, |card| card.child(session.login.clone()))
@@ -7169,7 +7180,7 @@ mod tests {
     use std::cell::RefCell;
     use std::time::Duration;
 
-    use agentz_protocol::accounts::{Account, LimitPool, StatusRead};
+    use agentz_protocol::accounts::{Account, ExtraUsage, LimitPool, StatusRead};
     use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
@@ -7844,6 +7855,10 @@ mod tests {
                 available: 1,
                 next_expires_at: Some(SystemTime::now() + 27 * 24 * hour),
             }),
+            extra_usage: Some(ExtraUsage {
+                label: "Credits".into(),
+                summary: "1,240 left".into(),
+            }),
             ..AccountStatus::default()
         };
         let mut accounts = AgentAccounts {
@@ -8023,6 +8038,13 @@ mod tests {
             .debug_bounds("limit-1-window-1")
             .expect("Work has a weekly window");
         assert!(resets.top() >= weekly.bottom());
+        // Its credits are under them, with the vendor's page to manage them.
+        let extra_usage = cx
+            .debug_bounds("extra-usage-1")
+            .expect("Work's credits are under its limits");
+        assert!(extra_usage.top() >= resets.bottom());
+        assert!(cx.debug_bounds("extra-usage-manage-1").is_some());
+        assert!(cx.debug_bounds("extra-usage-external").is_none());
         let use_reset = cx
             .debug_bounds("use-limit-reset-1")
             .expect("a reset can be used");

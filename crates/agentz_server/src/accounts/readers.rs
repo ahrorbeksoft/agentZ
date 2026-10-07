@@ -357,6 +357,31 @@ fn factory_windows(windows: FactoryWindows, now: SystemTime) -> Vec<LimitWindow>
         .collect()
 }
 
+/// A non-negative `amount` as JavaScript's `toLocaleString("en-US")` writes it with at most
+/// `decimals` places, as the agents' own screens do: "1,240", "12.4" with 1, "12.40" with
+/// `fixed`.
+pub(super) fn format_number(amount: f64, decimals: usize, fixed: bool) -> String {
+    let text = format!("{:.*}", decimals, amount.max(0.));
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
+    let fraction = if fixed {
+        fraction
+    } else {
+        fraction.trim_end_matches('0')
+    };
+    let mut grouped = String::new();
+    for (index, digit) in whole.chars().enumerate() {
+        if index > 0 && (whole.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    if fraction.is_empty() {
+        grouped
+    } else {
+        format!("{grouped}.{fraction}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use http_client::{BlockedHttpClient, FakeHttpClient, Response};
@@ -377,6 +402,17 @@ mod tests {
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script.into()],
         })
+    }
+
+    #[test]
+    fn numbers_are_written_as_the_agents_write_them() {
+        assert_eq!(format_number(0., 2, true), "0.00");
+        assert_eq!(format_number(228.6, 2, true), "228.60");
+        assert_eq!(format_number(1_234_567.891, 2, true), "1,234,567.89");
+        assert_eq!(format_number(1240., 2, false), "1,240");
+        assert_eq!(format_number(12.5, 2, false), "12.5");
+        assert_eq!(format_number(999.999, 2, false), "1,000");
+        assert_eq!(format_number(-3., 0, false), "0");
     }
 
     #[tokio::test]

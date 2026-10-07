@@ -270,6 +270,10 @@ Each entry: what it does, where it lives, and where it comes from.
   `ResetCredits`, accounts topic 9) has a line under its bars, "1 limit reset available ·
   expires in 27d 23h" (`usage_limits::render_limit_resets`), whose Use Reset asks first
   (`ConfirmRequest::use_limit_reset`), then sends `Request::UseLimitReset`.
+  An account that may spend past its limits (`AccountStatus::extra_usage`: Claude's usage
+  credits, Codex's credits; accounts topic 10) has a line there too, "Usage credits · $228.60
+  of $500.00 left this month" (`usage_limits::render_extra_usage`), whose Manage ↗ opens the
+  description's usage page. agentZ never turns paid usage on itself.
   Each account has its own login session (`OpenLoginSession` with the account) while the page
   is open, and its login rows while logged out. Add Account makes a "New account" card that
   Cancel removes, with "Copy settings from" (the other accounts, the default one first, or

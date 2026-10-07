@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::{AccountStatus, LimitResets, LimitWindow};
+use agentz_protocol::accounts::{AccountStatus, ExtraUsage, LimitResets, LimitWindow};
 use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Deserialize;
@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use util::ResultExt as _;
 
 use super::login_checks::account_command;
-use super::readers::{LimitResetOutcome, LimitResetUse, Read};
+use super::readers::{LimitResetOutcome, LimitResetUse, Read, format_number};
 use super::{AgentDescription, LoginCheck, Reader, SHARED_SKILLS_FOLDER};
 
 /// The adapter runs Codex itself with the arguments after this one.
@@ -360,6 +360,20 @@ struct RateLimitSnapshot {
     plan_type: Option<String>,
     primary: Option<RateLimitWindow>,
     secondary: Option<RateLimitWindow>,
+    #[serde(default)]
+    credits: Option<Credits>,
+}
+
+/// Credits bought for ChatGPT, which Codex spends once the plan's limits run out.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Credits {
+    #[serde(default)]
+    has_credits: bool,
+    #[serde(default)]
+    unlimited: bool,
+    /// A number of credits, as text.
+    balance: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -396,26 +410,51 @@ fn account_read(answers: Answers) -> Result<Read> {
     let mut rate_limits: RateLimitsResponse = serde_json::from_value(rate_limits)
         .context("Codex's limits aren't in the expected shape")?;
     let limit_resets = limit_resets(rate_limits.rate_limit_reset_credits.take());
+    let snapshot = main_snapshot(rate_limits);
     Ok(Read {
         logged_in: Some(true),
         status: AccountStatus {
             email: account.email,
             plan: account.plan_type.as_deref().and_then(plan_label),
-            windows: windows(rate_limits),
+            extra_usage: snapshot.credits.as_ref().and_then(credits),
+            windows: windows(snapshot),
             limit_resets,
             ..AccountStatus::default()
         },
     })
 }
 
+fn main_snapshot(response: RateLimitsResponse) -> RateLimitSnapshot {
+    response
+        .rate_limits_by_limit_id
+        .and_then(|mut by_limit| by_limit.remove(MAIN_LIMIT))
+        .unwrap_or(response.rate_limits)
+}
+
+/// What's left of the account's credits, while it has any.
+fn credits(credits: &Credits) -> Option<ExtraUsage> {
+    let summary = if credits.unlimited {
+        "Unlimited".to_string()
+    } else {
+        let balance = credits
+            .balance
+            .as_deref()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|balance| credits.has_credits && *balance > 0.)?;
+        format!("{} left", format_number(balance, 2, false))
+    };
+    Some(ExtraUsage {
+        label: "Credits".into(),
+        summary,
+    })
+}
+
 /// t3code's windows for Codex: the main limit's two, named by their length. `primary` and
 /// `secondary` are places, not lengths; without a length, a paid plan's are the 5-hour and
 /// weekly ones, and Free and Go have one monthly allowance.
-fn windows(response: RateLimitsResponse) -> Vec<LimitWindow> {
-    let snapshot = response
-        .rate_limits_by_limit_id
-        .and_then(|mut by_limit| by_limit.remove(MAIN_LIMIT))
-        .unwrap_or(response.rate_limits);
+fn windows(snapshot: RateLimitSnapshot) -> Vec<LimitWindow> {
     if snapshot
         .limit_id
         .as_deref()
@@ -582,6 +621,47 @@ mod tests {
             rate_limits["rateLimits"]["limitId"] = "codex_bengalfox".into();
         });
         assert_eq!(windows, []);
+    }
+
+    #[test]
+    fn credits_are_shown_while_there_are_some() {
+        let summary = |credits: serde_json::Value| {
+            let mut rate_limits = fixture(RATE_LIMITS);
+            rate_limits["rateLimitsByLimitId"]["codex"]["credits"] = credits;
+            read_answers(fixture(ACCOUNT), Ok(rate_limits))
+                .expect("read")
+                .status
+                .extra_usage
+                .map(|credits| {
+                    assert_eq!(credits.label, "Credits");
+                    credits.summary
+                })
+        };
+        // The captured Free account has none.
+        let read = read_answers(fixture(ACCOUNT), Ok(fixture(RATE_LIMITS))).expect("read");
+        assert_eq!(read.status.extra_usage, None);
+        assert_eq!(
+            summary(serde_json::json!({"hasCredits": true, "unlimited": false, "balance": "1240"}))
+                .as_deref(),
+            Some("1,240 left")
+        );
+        assert_eq!(
+            summary(serde_json::json!({"hasCredits": true, "unlimited": false, "balance": "5.25"}))
+                .as_deref(),
+            Some("5.25 left")
+        );
+        assert_eq!(
+            summary(serde_json::json!({"hasCredits": true, "unlimited": true, "balance": null}))
+                .as_deref(),
+            Some("Unlimited")
+        );
+        for none in [
+            serde_json::json!({"hasCredits": false, "unlimited": false, "balance": "0"}),
+            serde_json::json!({"hasCredits": true, "unlimited": false, "balance": "0"}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(summary(none), None);
+        }
     }
 
     #[test]

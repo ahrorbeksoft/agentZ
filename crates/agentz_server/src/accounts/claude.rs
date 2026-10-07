@@ -5,14 +5,14 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
-use agentz_protocol::accounts::{AccountStatus, LimitWindow};
+use agentz_protocol::accounts::{AccountStatus, ExtraUsage, LimitWindow};
 use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt as _;
 
 use super::login_checks::{account_command, run_with_account_env};
-use super::readers::Read;
+use super::readers::{Read, format_number};
 use super::{AgentDescription, LoggedIn, LoginCheck, Reader, StatusCommand};
 
 /// The adapter runs Claude Code itself with the arguments around this one, as its terminal
@@ -172,6 +172,19 @@ struct RateLimits {
     /// Weekly limits of single models, beside the one for all of them.
     #[serde(default)]
     model_scoped: Vec<ModelWindow>,
+    #[serde(default)]
+    extra_usage: Option<UsageCredits>,
+}
+
+/// Usage credits, which go on past the plan's limits. Amounts are in cents, and
+/// `monthly_limit` is named so whatever the period.
+#[derive(Deserialize)]
+struct UsageCredits {
+    #[serde(default)]
+    is_enabled: bool,
+    monthly_limit: Option<f64>,
+    used_credits: Option<f64>,
+    currency: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -210,11 +223,12 @@ fn usage_response(stdout: &[u8]) -> Result<Usage> {
 /// t3code's windows for Claude: the session and the week for all models, then each model's
 /// week. A login with no limits (an API key) has none.
 fn account_status(status: AuthStatus, usage: Usage) -> AccountStatus {
-    let plan = status
-        .subscription_type
-        .or(usage.subscription_type)
-        .map(|plan| plan_label(&plan));
-    let windows = match usage.rate_limits.filter(|_| usage.rate_limits_available) {
+    let subscription = status.subscription_type.or(usage.subscription_type);
+    let limits = usage.rate_limits.filter(|_| usage.rate_limits_available);
+    let extra_usage = limits
+        .as_ref()
+        .and_then(|limits| usage_credits(subscription.as_deref()?, limits.extra_usage.as_ref()?));
+    let windows = match limits {
         Some(limits) => {
             let windows = [
                 ("Session".to_string(), SESSION_LENGTH, limits.five_hour),
@@ -251,10 +265,64 @@ fn account_status(status: AuthStatus, usage: Usage) -> AccountStatus {
     };
     AccountStatus {
         email: status.email,
-        plan,
+        plan: subscription.map(|plan| plan_label(&plan)),
         windows,
+        extra_usage,
         ..AccountStatus::default()
     }
+}
+
+/// Claude Code's "Usage credits" in `/usage`: a Pro or Max login's whether they're on or not,
+/// a team's only once they are.
+fn usage_credits(subscription: &str, credits: &UsageCredits) -> Option<ExtraUsage> {
+    let personal = matches!(subscription, "pro" | "max");
+    if !personal && !matches!(subscription, "team" | "enterprise") {
+        return None;
+    }
+    let currency = credits.currency.as_deref().unwrap_or("USD");
+    let summary = match (
+        credits.is_enabled,
+        credits.monthly_limit,
+        credits.used_credits,
+    ) {
+        (false, _, _) if personal => "Off".to_string(),
+        (false, _, _) => return None,
+        (true, None, _) if personal => "Unlimited".to_string(),
+        (true, None, Some(used)) => format!("{} spent", format_money(used, currency)),
+        // Claude Code's `/usage` has the limit reset at the start of each month.
+        (true, Some(limit), Some(used)) => format!(
+            "{} of {} left this month",
+            format_money(limit - used, currency),
+            format_money(limit, currency)
+        ),
+        (true, _, None) => return None,
+    };
+    Some(ExtraUsage {
+        label: "Usage credits".into(),
+        summary,
+    })
+}
+
+/// Claude Code's way of writing an amount of cents: "$228.60", "€5.00", "CHF 5.00", "¥500".
+fn format_money(cents: f64, currency: &str) -> String {
+    let currency = currency.to_uppercase();
+    let symbol = match currency.as_str() {
+        "USD" => "$".to_string(),
+        "EUR" => "€".to_string(),
+        "GBP" => "£".to_string(),
+        "JPY" => "¥".to_string(),
+        "BRL" => "R$".to_string(),
+        "CAD" => "CA$".to_string(),
+        "AUD" => "A$".to_string(),
+        "NZD" => "NZ$".to_string(),
+        "SGD" => "S$".to_string(),
+        _ => format!("{currency} "),
+    };
+    // These have no smaller unit, so the amount is whole ones.
+    if matches!(currency.as_str(), "JPY" | "KRW" | "VND") {
+        return format!("{symbol}{}", format_number(cents, 0, false));
+    }
+    format!("{symbol}{}", format_number(cents / 100., 2, true))
 }
 
 /// "pro" as "Pro", "max" as "Max".
@@ -367,6 +435,68 @@ mod tests {
         let failed = r#"{"type":"control_response","response":{"subtype":"error","request_id":"usage","error":"offline"}}"#;
         assert!(usage_response(failed.as_bytes()).is_err());
         assert!(usage_response(b"").is_err());
+    }
+
+    #[test]
+    fn usage_credits_are_read_as_claude_code_shows_them() {
+        let status = || serde_json::from_str::<AuthStatus>(AUTH_STATUS_FIXTURE).expect("status");
+        let summary = |subscription: &str, credits: serde_json::Value| {
+            let usage = fixture_usage(|usage| {
+                usage["subscription_type"] = subscription.into();
+                usage["rate_limits"]["extra_usage"] = credits;
+            });
+            let mut status = status();
+            status.subscription_type = None;
+            account_status(status, usage_response(usage.as_bytes()).expect("usage"))
+                .extra_usage
+                .map(|credits| {
+                    assert_eq!(credits.label, "Usage credits");
+                    credits.summary
+                })
+        };
+        // The captured Pro account has them off.
+        let usage = usage_response(USAGE_FIXTURE.as_bytes()).expect("usage");
+        assert_eq!(
+            account_status(status(), usage).extra_usage,
+            Some(ExtraUsage {
+                label: "Usage credits".into(),
+                summary: "Off".into(),
+            })
+        );
+        let on = |limit: serde_json::Value, used: serde_json::Value, currency: &str| {
+            serde_json::json!({"is_enabled": true, "monthly_limit": limit, "used_credits": used,
+                "utilization": null, "currency": currency})
+        };
+        assert_eq!(
+            summary("max", on(50000.into(), 27140.into(), "USD")).as_deref(),
+            Some("$228.60 of $500.00 left this month")
+        );
+        assert_eq!(
+            summary("pro", on(1000.into(), 1250.into(), "eur")).as_deref(),
+            Some("€0.00 of €10.00 left this month")
+        );
+        assert_eq!(
+            summary("team", on(500000.into(), 1200.into(), "JPY")).as_deref(),
+            Some("¥498,800 of ¥500,000 left this month")
+        );
+        assert_eq!(
+            summary("pro", on(serde_json::Value::Null, 1200.into(), "USD")).as_deref(),
+            Some("Unlimited")
+        );
+        assert_eq!(
+            summary(
+                "enterprise",
+                on(serde_json::Value::Null, 1200.into(), "CHF")
+            )
+            .as_deref(),
+            Some("CHF 12.00 spent")
+        );
+        // A team's are shown only once they're on; other logins have none.
+        let off = serde_json::json!({"is_enabled": false, "monthly_limit": null,
+            "used_credits": null, "utilization": null});
+        assert_eq!(summary("team", off.clone()), None);
+        assert_eq!(summary("free", off), None);
+        assert_eq!(summary("max", serde_json::Value::Null), None);
     }
 
     #[test]

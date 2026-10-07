@@ -92,6 +92,19 @@ pub struct AccountStatus {
     /// Resets the vendor granted the account, each clearing its limits at once: Codex's.
     /// `None` without any.
     pub limit_resets: Option<LimitResets>,
+    /// What the account may spend past its plan's limits, where the agent shows it beside
+    /// them: Claude's usage credits, Codex's credits. Droid's balance is `credits`.
+    pub extra_usage: Option<ExtraUsage>,
+}
+
+/// An account's extra usage (decisions.md §10), as its agent words it. agentZ only shows it,
+/// with the vendor's page to manage it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExtraUsage {
+    /// The agent's name for it: "Usage credits", "Credits".
+    pub label: String,
+    /// What's left of it, or that it's off: "$228.60 of $500.00 left this month", "Off".
+    pub summary: String,
 }
 
 /// An account's limit resets (decisions.md §9), as Codex's `rateLimitResetCredits` counts them.

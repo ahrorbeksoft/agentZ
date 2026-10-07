@@ -88,13 +88,15 @@ Picked on the design board (`design/accounts/`, see `design/README.md`). Each se
 
 **A. A line under the limits, with a confirm** (from t3code ResetCredits): When the account has resets, a line under its limits says how many and when the next expires, with Use Reset. It always asks first, since a reset can’t be given back. The thread’s limit notice offers the same button (see “When a thread’s account runs out”).
 
-## 10. Extra usage and credits: B. A switch to turn it on
+## 10. Extra usage and credits: A. The balance, with a link to manage it
 
 *When limits run out*
 
 **Today:** Not shown. Every subscription agent can bill past its plan: Claude’s usage credits (`extra_usage` in its usage data, turned on in `/usage-credits`), Codex’s purchased credits (`credits.balance`), Droid’s extra usage balance, Devin’s overage, Grok’s prepaid balance. Turning paid usage on happens on the vendor’s site or in its terminal app.
 
-**B. A switch to turn it on** (from Claude’s /usage-credits, Droid’s preference): A switch per account: “Use extra usage when limits run out”, asking first because it bills the card on file. agentZ changes it through the agent (Droid’s preference; Claude’s only through its terminal app, untested).
+**A. The balance, with a link to manage it** (from t3code’s Manage usage): For accounts that report one, a line under the limits: what’s left of the extra usage or credits, and “Manage” opening the vendor’s billing page. agentZ never turns paid usage on itself.
+
+The user first picked B (a switch to turn it on), then took A at building it: Claude Code turns usage credits on only in its interactive `/usage-credits`, which agentZ would have to drive in a hidden terminal, Codex has no way to, and Droid gets no switch here (its “When limit is reached” is one, §8).
 
 ## 11. Waiting for the reset: B. A setting per account
 
