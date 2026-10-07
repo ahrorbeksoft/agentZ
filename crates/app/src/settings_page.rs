@@ -13,7 +13,8 @@ use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, Projec
 use crate::project_store::ProjectStore;
 use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
 use agentz_protocol::accounts::{
-    AccountChange, AccountChoices, AccountId, AccountStatus, AccountSupport, AgentAccounts,
+    AccountChange, AccountChoice, AccountChoices, AccountId, AccountStatus, AccountSupport,
+    AgentAccounts, SettingsSource,
 };
 use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
@@ -29,9 +30,10 @@ use projects::{Project, ProjectIcon, ProjectId, ThreadId, ThreadOrder, Workspace
 use text_input::{TextInput, TextInputEvent};
 use theme::{Appearance, ThemeRegistry};
 use ui::{
-    ContextMenu, ContextMenuEntry, DropdownMenu, IconButtonShape, IconPosition, PopoverMenu,
-    ScrollableHandle as _, Switch, TintColor, ToggleButtonGroup, ToggleButtonGroupSize,
-    ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip, WithScrollbar as _, prelude::*,
+    ContextMenu, ContextMenuEntry, DropdownMenu, DropdownStyle, IconButtonShape, IconPosition,
+    PopoverMenu, ScrollableHandle as _, Switch, TintColor, ToggleButtonGroup,
+    ToggleButtonGroupSize, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip, WithScrollbar as _,
+    prelude::*,
 };
 use util::ResultExt as _;
 
@@ -1877,12 +1879,24 @@ impl SettingsPage {
             .and_then(|listing| listing.accounts.clone());
         let content = match panel.tab {
             AgentTab::Account => match &support {
-                Some(support) => self.render_accounts_tab(support, cx),
+                Some(support) => self.render_accounts_tab(support, window, cx),
                 None => self.render_account_tab(cx),
             },
             AgentTab::Defaults => self.render_agent_defaults(window, cx),
             AgentTab::Environment => self.render_agent_env(cx),
             AgentTab::Threads => self.render_agent_threads(window, cx),
+        };
+        let picker = match panel.tab {
+            AgentTab::Account => None,
+            _ => self.render_account_picker(window, cx),
+        };
+        let content = match picker {
+            Some(picker) => v_flex()
+                .gap(px(18.))
+                .child(picker)
+                .child(content)
+                .into_any_element(),
+            None => content,
         };
         vec![
             v_flex()
@@ -2098,6 +2112,64 @@ impl SettingsPage {
             .into_any_element()
     }
 
+    /// "Account" and a menu of the accounts over the Defaults, Environment and Threads tabs,
+    /// which picks whose settings or sessions they show. An agent with one account has none.
+    fn render_account_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.agent_panel()?;
+        let accounts = panel.client(cx).read(cx).accounts(&panel.agent_id);
+        let entries = account_entries(&accounts);
+        if entries.len() < 2 {
+            return None;
+        }
+        let current = panel.settings_account(&accounts);
+        let shown = entries.iter().find(|entry| entry.account == current)?;
+        let label = h_flex()
+            .gap_1p5()
+            .child(render_entry_avatar(shown, cx))
+            .child(Label::new(shown.name.clone()).size(LabelSize::Small))
+            .into_any_element();
+        let page = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for entry in entries {
+                let account = entry.account;
+                let selector = account_selector(account);
+                menu = menu.custom_entry(
+                    move |_, cx| {
+                        let selector = selector.clone();
+                        div()
+                            .w_full()
+                            .debug_selector(move || format!("account-picker-{selector}"))
+                            .child(render_account_entry(&entry, entry.account == current, cx))
+                            .into_any_element()
+                    },
+                    on_page(&page, move |page, _, cx| page.pick_account(account, cx)),
+                );
+            }
+            menu
+        });
+        Some(
+            h_flex()
+                .gap_2()
+                .child(
+                    Label::new("Account")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div().debug_selector(|| "account-picker".into()).child(
+                        DropdownMenu::new_with_element("account-picker", label, menu)
+                            .style(DropdownStyle::Outlined)
+                            .trigger_size(ButtonSize::Compact),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The agent whose page is open.
     fn agent_panel(&self) -> Option<&AgentPanel> {
         match &self.agents_page {
@@ -2140,15 +2212,15 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) {
         let client = self.agents_client(cx);
-        let agent_settings = client.read(cx).agent_settings(&id.0);
+        // The tabs open on the account for new threads.
+        let account = client.read(cx).accounts(id).new_thread_account();
+        let env_rows = self.account_env_rows(&client, id, account, cx);
         let external = self.open_account_session(&client, id, None, name, cx);
-        let env_rows = agent_settings
-            .env
-            .iter()
-            .map(|(key, value)| self.new_env_row(key, value, cx))
-            .collect();
         // Accounts added or removed, here or in another window.
-        let accounts_changed = cx.observe(&client, |this, _, cx| this.sync_account_sessions(cx));
+        let accounts_changed = cx.observe(&client, |this, _, cx| {
+            this.sync_account_sessions(cx);
+            this.sync_settings_account(cx);
+        });
         let panel = AgentPanel {
             agent_id: id.clone(),
             tab: AgentTab::Account,
@@ -2157,7 +2229,10 @@ impl SettingsPage {
             renaming: None,
             adding_account: None,
             account_error: None,
+            picked_account: AccountChoice::Default,
+            env_account: account,
             env_rows,
+            sessions_account: account,
             sessions: None,
             sessions_project: None,
             sessions_shown: SESSIONS_INITIAL_COUNT,
@@ -2290,7 +2365,76 @@ impl SettingsPage {
         row
     }
 
-    /// Writes the panel's variables to the agent's settings; rows without a name are skipped.
+    /// The Environment tab's rows for the account's variables.
+    fn account_env_rows(
+        &self,
+        client: &Entity<ServerClient>,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        cx: &mut Context<Self>,
+    ) -> Vec<EnvRow> {
+        client
+            .read(cx)
+            .account_settings(agent_id, account)
+            .env
+            .iter()
+            .map(|(key, value)| self.new_env_row(key, value, cx))
+            .collect()
+    }
+
+    /// Shows the account's variables on the Environment tab, read again from its settings.
+    fn show_account_env(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let client = panel.client(cx);
+        let agent_id = panel.agent_id.clone();
+        let rows = self.account_env_rows(&client, &agent_id, account, cx);
+        if let Some(panel) = self.agent_panel_mut() {
+            panel.env_account = account;
+            panel.env_rows = rows;
+        }
+        cx.notify();
+    }
+
+    /// Follows the account the tabs show when it changes: picked, made the default, or gone.
+    fn sync_settings_account(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel() else {
+            return;
+        };
+        let accounts = panel.client(cx).read(cx).accounts(&panel.agent_id);
+        let account = panel.settings_account(&accounts);
+        if panel.env_account != account {
+            self.show_account_env(account, cx);
+        }
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        if panel.sessions_account != account && panel.sessions.is_some() {
+            panel.sessions = None;
+            panel.importing.clear();
+            panel.import_error = None;
+            if panel.tab == AgentTab::Threads {
+                self.list_agent_sessions(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn pick_account(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        panel.picked_account = match account {
+            None => AccountChoice::External,
+            Some(id) => AccountChoice::Account(id),
+        };
+        self.sync_settings_account(cx);
+        cx.notify();
+    }
+
+    /// Writes the panel's variables to their account's settings; rows without a name are
+    /// skipped.
     fn save_env(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.agent_panel() else {
             return;
@@ -2303,10 +2447,10 @@ impl SettingsPage {
                 (!key.is_empty()).then(|| (key, row.value.read(cx).text().to_string()))
             })
             .collect();
-        let agent_id = panel.agent_id.0.clone();
-        let client = panel.external.connection.read(cx).client().clone();
-        client.update(cx, |client, cx| {
-            client.update_agent_settings(&agent_id, |agent| agent.env = env, cx)
+        let agent_id = panel.agent_id.clone();
+        let account = panel.env_account;
+        panel.client(cx).update(cx, |client, cx| {
+            client.update_account_settings(&agent_id, account, |settings| settings.env = env, cx)
         });
     }
 
@@ -2601,17 +2745,19 @@ impl SettingsPage {
             .collect()
     }
 
-    /// Zed's per-agent defaults: what a new session starts with. Choosing a setting in a thread
-    /// changes these too.
+    /// Zed's per-agent defaults, here the account's: what a new session starts with. Choosing a
+    /// setting in a thread changes these too.
     fn render_agent_defaults(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         const TITLE: &str = "Defaults for New Threads";
         let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
-        let agent_id = panel.agent_id.0.to_string();
+        let agent_id = panel.agent_id.clone();
         let agent_name = panel.external.connection.read(cx).agent_name().clone();
-        let client = panel.external.connection.read(cx).client().clone();
-        let agent = client.read(cx).agent_settings(&agent_id);
+        let client = panel.client(cx);
+        let accounts = client.read(cx).accounts(&agent_id);
+        let account = panel.settings_account(&accounts);
+        let agent = client.read(cx).account_settings(&agent_id, account);
         let mut rows: Vec<AnyElement> = Vec::new();
         for option in &agent.known_config_options {
             let config_id = option.id.0.to_string();
@@ -2655,8 +2801,9 @@ impl SettingsPage {
                             let value = value.clone();
                             let config_id = config_id.clone();
                             client.update(cx, |client, cx| {
-                                client.update_agent_settings(
+                                client.update_account_settings(
                                     &agent_id,
+                                    account,
                                     |agent| match value {
                                         Some(value) => {
                                             agent.default_config_options.insert(config_id, value);
@@ -2673,15 +2820,17 @@ impl SettingsPage {
                 }
                 menu
             });
+            let selector = format!("agent-default-{}", option.id.0);
             rows.push(render_row(
                 option.name.clone(),
                 option.description.clone().unwrap_or_default(),
-                DropdownMenu::new(
-                    SharedString::from(format!("agent-default-{}", option.id.0)),
-                    label,
-                    menu,
-                )
-                .into_any_element(),
+                div()
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || selector
+                    })
+                    .child(DropdownMenu::new(SharedString::from(selector), label, menu))
+                    .into_any_element(),
                 cx,
             ));
         }
@@ -2725,8 +2874,9 @@ impl SettingsPage {
                         move |_, cx| {
                             let mode = mode.clone();
                             client.update(cx, |client, cx| {
-                                client.update_agent_settings(
+                                client.update_account_settings(
                                     &agent_id,
+                                    account,
                                     |agent| agent.default_mode = mode,
                                     cx,
                                 )
@@ -2744,7 +2894,8 @@ impl SettingsPage {
             ));
         }
         if rows.is_empty() {
-            let connection = panel.external.connection.read(cx);
+            let session = panel.session(account).unwrap_or(&panel.external);
+            let connection = session.connection.read(cx);
             let message = match (connection.status(), connection.logged_in()) {
                 (_, Some(false)) => format!("Log in to {agent_name} to see its settings here."),
                 (ConnectionStatus::Connecting, _) => format!("Loading {agent_name}'s settings…"),
@@ -2757,12 +2908,12 @@ impl SettingsPage {
                 .into_any_element();
             return render_section(TITLE, vec![message], cx);
         }
-        render_section_with_note(
-            TITLE,
-            rows,
-            "Choosing one in a thread also makes it the default.",
-            cx,
-        )
+        let note = if accounts.listed().len() > 1 {
+            "Choosing one in a thread on this account also makes it the default."
+        } else {
+            "Choosing one in a thread also makes it the default."
+        };
+        render_section_with_note(TITLE, rows, note, cx)
     }
 
     /// The variables the agent starts with, one row each.
@@ -2839,6 +2990,18 @@ impl SettingsPage {
                 }
                 cx.notify();
             }));
+        let has_accounts = panel
+            .client(cx)
+            .read(cx)
+            .accounts(&panel.agent_id)
+            .listed()
+            .len()
+            > 1;
+        let starts = if has_accounts {
+            "when it starts on this account"
+        } else {
+            "when it starts"
+        };
         v_flex()
             .gap_2()
             .child(render_section_with_actions(
@@ -2849,8 +3012,8 @@ impl SettingsPage {
             ))
             .child(
                 Label::new(format!(
-                    "Passed to {agent_name} when it starts. Running threads pick them up after \
-                     Reload Agent."
+                    "Passed to {agent_name} {starts}. Running threads pick them up after Reload \
+                     Agent."
                 ))
                 .size(LabelSize::Small)
                 .color(Color::Muted),
@@ -3004,8 +3167,8 @@ impl SettingsPage {
                         .py_3()
                         .gap_3()
                         .child(match &email {
-                            Some(email) => avatar(email, None, cx),
-                            None => account_badge(cx),
+                            Some(email) => avatar(email, None, AVATAR_SIZE, cx),
+                            None => account_badge(AVATAR_SIZE, cx),
                         })
                         .child(
                             v_flex()
@@ -3061,7 +3224,12 @@ impl SettingsPage {
 
     /// The Account tab of an agent that can have more accounts: a card per account under
     /// "Accounts" and Add Account, the External account first while it's listed.
-    fn render_accounts_tab(&self, support: &AccountSupport, cx: &mut Context<Self>) -> AnyElement {
+    fn render_accounts_tab(
+        &self,
+        support: &AccountSupport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
@@ -3079,7 +3247,14 @@ impl SettingsPage {
 
         let mut cards: Vec<AnyElement> = Vec::new();
         for &account in &listed {
-            cards.push(self.render_account_card(account, &accounts, support, listed.len(), cx));
+            cards.push(self.render_account_card(
+                account,
+                &accounts,
+                support,
+                listed.len(),
+                window,
+                cx,
+            ));
             if let Some(session) = panel.session(account) {
                 cards.extend(
                     session
@@ -3168,6 +3343,7 @@ impl SettingsPage {
         accounts: &AgentAccounts,
         support: &AccountSupport,
         listed_count: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(panel) = self.agent_panel() else {
@@ -3311,6 +3487,9 @@ impl SettingsPage {
                         )
                         .children(actions),
                 )
+                .when(listed_count > 1, |card| {
+                    card.child(self.render_copy_settings(id, accounts, support, window, cx))
+                })
                 .when(has_auth_methods && failure.is_none(), |card| {
                     card.child(session.login.clone())
                 })
@@ -3411,8 +3590,8 @@ impl SettingsPage {
                 .into_any_element(),
         };
         let avatar = match &name {
-            Some(name) => avatar(name, color, cx),
-            None => account_badge(cx),
+            Some(name) => avatar(name, color, AVATAR_SIZE, cx),
+            None => account_badge(AVATAR_SIZE, cx),
         };
 
         let mut actions: Vec<AnyElement> = Vec::new();
@@ -3492,6 +3671,152 @@ impl SettingsPage {
         }))
         .when(shows_login, |card| card.child(session.login.clone()))
         .into_any_element()
+    }
+
+    /// A new account's "Copy settings from": the other accounts, the default one first, then
+    /// Nothing.
+    fn render_copy_settings(
+        &self,
+        account: AccountId,
+        accounts: &AgentAccounts,
+        support: &AccountSupport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let agent_name = self
+            .agent_panel()
+            .map(|panel| panel.external.connection.read(cx).agent_name().clone())
+            .unwrap_or_default();
+        let current = accounts
+            .account(account)
+            .map(|account| account.settings_from)
+            .unwrap_or_default();
+        let default = accounts.new_thread_account();
+        let mut entries: Vec<AccountEntry> = account_entries(accounts)
+            .into_iter()
+            .filter(|entry| entry.account != Some(account))
+            .collect();
+        entries.sort_by_key(|entry| entry.account != default);
+        let source = |entry: &AccountEntry| match entry.account {
+            None => SettingsSource::External,
+            Some(id) => SettingsSource::Account(id),
+        };
+        let label = match entries.iter().find(|entry| source(entry) == current) {
+            Some(entry) => h_flex()
+                .gap_1p5()
+                .child(render_entry_avatar(entry, cx))
+                .child(Label::new(entry.name.clone()))
+                .into_any_element(),
+            None => Label::new("Nothing").into_any_element(),
+        };
+        let page = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for entry in entries {
+                let from = source(&entry);
+                let selector = account_selector(entry.account);
+                menu = menu.custom_entry(
+                    move |_, cx| {
+                        let selector = selector.clone();
+                        div()
+                            .w_full()
+                            .debug_selector(move || format!("copy-settings-from-{selector}"))
+                            .child(render_account_entry(&entry, from == current, cx))
+                            .into_any_element()
+                    },
+                    on_page(&page, move |page, _, cx| {
+                        page.copy_account_settings(account, from, cx)
+                    }),
+                );
+            }
+            menu.separator().custom_entry(
+                move |_, _| {
+                    div()
+                        .w_full()
+                        .debug_selector(|| "copy-settings-from-nothing".into())
+                        .child(render_check_entry(
+                            "Nothing",
+                            current == SettingsSource::Nothing,
+                        ))
+                        .into_any_element()
+                },
+                on_page(&page, move |page, _, cx| {
+                    page.copy_account_settings(account, SettingsSource::Nothing, cx)
+                }),
+            )
+        });
+        let what = if support.copies_settings_files {
+            format!(
+                "Its defaults, environment variables and {agent_name}'s own settings, but not \
+                 its login."
+            )
+        } else {
+            "Its defaults and environment variables.".to_string()
+        };
+        div()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(render_row(
+                "Copy settings from",
+                format!("{what} Defaults this account doesn't offer are dropped."),
+                div()
+                    .debug_selector(move || format!("copy-settings-{account}"))
+                    .child(DropdownMenu::new_with_element(
+                        SharedString::from(format!("copy-settings-{account}")),
+                        label,
+                        menu,
+                    ))
+                    .into_any_element(),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// Copy settings from, then the account's agent starts again with them, to log in with its
+    /// variables.
+    fn copy_account_settings(
+        &mut self,
+        account: AccountId,
+        from: SettingsSource,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        panel.account_error = None;
+        let agent_id = panel.agent_id.clone();
+        let response = panel
+            .client(cx)
+            .read(cx)
+            .request(Request::CopyAccountSettings {
+                agent_id: agent_id.clone(),
+                account,
+                from,
+            });
+        cx.spawn(async move |this, cx| {
+            let copied = response.await;
+            this.update(cx, |this, cx| {
+                let Some(panel) = this
+                    .agent_panel_mut()
+                    .filter(|panel| panel.agent_id == agent_id)
+                else {
+                    return;
+                };
+                match copied {
+                    Ok(_) => {
+                        panel.accounts.remove(&account);
+                        this.sync_account_sessions(cx);
+                    }
+                    Err(error) => {
+                        panel.account_error =
+                            Some(format!("Couldn't copy the settings: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Add Account: the server makes the account's folder, and the account arrives with the
@@ -3733,8 +4058,9 @@ impl SettingsPage {
         self.select_agent_tab(tab, cx);
     }
 
-    /// Shows one of the agent page's tabs. Threads lists the agent's sessions the first time,
-    /// and again after the agent couldn't list them.
+    /// Shows one of the agent page's tabs. Threads lists the account's sessions the first time,
+    /// and again after the agent couldn't list them. Environment reads the account's variables
+    /// again, which Copy settings from may have changed.
     fn select_agent_tab(&mut self, tab: AgentTab, cx: &mut Context<Self>) {
         let Some(panel) = self.agent_panel_mut() else {
             return;
@@ -3745,9 +4071,14 @@ impl SettingsPage {
             Some(SessionList::Listed(sessions)) => !matches!(sessions, AgentSessions::Listed(_)),
             Some(SessionList::Listing { .. }) => false,
         };
+        let env_account = panel.env_account;
         if tab == AgentTab::Threads && needs_listing {
             self.list_agent_sessions(cx);
         }
+        if tab == AgentTab::Environment {
+            self.show_account_env(env_account, cx);
+        }
+        self.sync_settings_account(cx);
         cx.notify();
     }
 
@@ -3756,12 +4087,14 @@ impl SettingsPage {
             return;
         };
         let agent_id = panel.agent_id.clone();
-        let client = panel.external.connection.read(cx).client().clone();
+        let client = panel.client(cx);
+        let account = panel.settings_account(&client.read(cx).accounts(&agent_id));
         // While disconnected, the request fails and says so.
         let is_outdated = client.read(cx).connection().is_some()
             && !client.read(cx).has_capability(CAPABILITY_IMPORT_SESSIONS);
         if is_outdated {
             if let Some(panel) = self.agent_panel_mut() {
+                panel.sessions_account = account;
                 panel.sessions = Some(SessionList::Failed(
                     "This machine's agentz-server can't list threads. Update it to import them."
                         .into(),
@@ -3770,18 +4103,18 @@ impl SettingsPage {
             cx.notify();
             return;
         }
-        let listing = client
-            .read(cx)
-            .projects()
-            .read(cx)
-            .list_agent_sessions(agent_id.clone(), cx);
+        let listing =
+            client
+                .read(cx)
+                .projects()
+                .read(cx)
+                .list_agent_sessions(agent_id.clone(), account, cx);
         let task = cx.spawn(async move |this, cx| {
             let listing = listing.await;
             this.update(cx, |this, cx| {
-                let Some(panel) = this
-                    .agent_panel_mut()
-                    .filter(|panel| panel.agent_id == agent_id)
-                else {
+                let Some(panel) = this.agent_panel_mut().filter(|panel| {
+                    panel.agent_id == agent_id && panel.sessions_account == account
+                }) else {
                     return;
                 };
                 panel.sessions = Some(match listing {
@@ -3794,6 +4127,7 @@ impl SettingsPage {
             .log_err();
         });
         if let Some(panel) = self.agent_panel_mut() {
+            panel.sessions_account = account;
             panel.sessions = Some(SessionList::Listing { _task: task });
             panel.import_error = None;
         }
@@ -3806,6 +4140,7 @@ impl SettingsPage {
             return;
         };
         let agent_id = panel.agent_id.clone();
+        let account = panel.sessions_account;
         let session_ids: Vec<String> = sessions
             .iter()
             .map(|session| session.session_id.clone())
@@ -3813,14 +4148,11 @@ impl SettingsPage {
         panel.importing.extend(session_ids.iter().cloned());
         panel.import_error = None;
         let import = panel
-            .external
-            .connection
-            .read(cx)
-            .client()
+            .client(cx)
             .read(cx)
             .projects()
             .read(cx)
-            .import_agent_sessions(agent_id.clone(), sessions, cx);
+            .import_agent_sessions(agent_id.clone(), account, sessions, cx);
         cx.spawn(async move |this, cx| {
             let imported = import.await;
             this.update(cx, |this, cx| {
@@ -3899,7 +4231,7 @@ impl SettingsPage {
                     .filter_map(|session| {
                         let thread = store.thread_for_session(
                             &panel.agent_id.0,
-                            None,
+                            panel.sessions_account,
                             &session.session_id,
                         )?;
                         Some((session.session_id.as_str(), thread))
@@ -5022,7 +5354,13 @@ struct AgentPanel {
     adding_account: Option<Task<()>>,
     /// Why the last change to the accounts failed.
     account_error: Option<SharedString>,
+    /// The account picked over the Defaults, Environment and Threads tabs.
+    picked_account: AccountChoice,
+    /// Whose variables `env_rows` are.
+    env_account: Option<AccountId>,
     env_rows: Vec<EnvRow>,
+    /// Whose sessions `sessions` are.
+    sessions_account: Option<AccountId>,
     /// Listed when the Threads tab first opens; `None` before.
     sessions: Option<SessionList>,
     /// The project whose sessions the Threads tab shows, once the user picks one.
@@ -5035,6 +5373,21 @@ struct AgentPanel {
 }
 
 impl AgentPanel {
+    fn client(&self, cx: &App) -> Entity<ServerClient> {
+        self.external.connection.read(cx).client().clone()
+    }
+
+    /// The account the Defaults, Environment and Threads tabs show: the one picked while it's
+    /// listed, else the account for new threads.
+    fn settings_account(&self, accounts: &AgentAccounts) -> Option<AccountId> {
+        let listed = accounts.listed();
+        match self.picked_account {
+            AccountChoice::External if listed.contains(&None) => None,
+            AccountChoice::Account(id) if listed.contains(&Some(id)) => Some(id),
+            _ => accounts.new_thread_account(),
+        }
+    }
+
     /// The account's login session, `None` being the External account.
     fn session(&self, account: Option<AccountId>) -> Option<&AccountSession> {
         match account {
@@ -5303,6 +5656,79 @@ fn account_card_details(
     details
 }
 
+/// An account as the account menus show it.
+struct AccountEntry {
+    account: Option<AccountId>,
+    name: SharedString,
+    /// Whether `name` is the account's own (an email, or Rename's), for its avatar's initial.
+    is_named: bool,
+    color: Option<String>,
+}
+
+/// The listed accounts, for the menus that pick one.
+fn account_entries(accounts: &AgentAccounts) -> Vec<AccountEntry> {
+    accounts
+        .listed()
+        .into_iter()
+        .map(|account| {
+            let name = accounts.name(account);
+            let fallback = match account {
+                None => "Outside agentZ".to_string(),
+                // An API key's account has no email, and goes by its login method.
+                Some(id) => accounts
+                    .account(id)
+                    .and_then(|account| account.settings.login_method.as_deref())
+                    .and_then(login_method_subject)
+                    .unwrap_or_else(|| "New account".to_string()),
+            };
+            AccountEntry {
+                account,
+                is_named: name.is_some(),
+                name: name.unwrap_or(fallback).into(),
+                color: accounts
+                    .choices(account)
+                    .and_then(|choices| choices.color.clone()),
+            }
+        })
+        .collect()
+}
+
+/// How an account's elements are named in tests: by its id, or "external".
+fn account_selector(account: Option<AccountId>) -> String {
+    account.map_or_else(|| "external".to_string(), |id| id.to_string())
+}
+
+fn render_entry_avatar(entry: &AccountEntry, cx: &App) -> AnyElement {
+    const SIZE: Pixels = px(16.);
+    if entry.is_named {
+        let color = entry
+            .color
+            .as_deref()
+            .and_then(|hex| account_color(hex, cx));
+        avatar(&entry.name, color, SIZE, cx)
+    } else {
+        account_badge(SIZE, cx)
+    }
+}
+
+/// An account in a menu: its avatar and name, and a check when it's the one chosen.
+fn render_account_entry(entry: &AccountEntry, is_current: bool, cx: &App) -> AnyElement {
+    h_flex()
+        .w_full()
+        .gap_1p5()
+        .child(render_entry_avatar(entry, cx))
+        .child(Label::new(entry.name.clone()))
+        .child(div().flex_1().min_w(px(16.)))
+        .when(is_current, |row| {
+            row.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        })
+        .into_any_element()
+}
+
 /// A small tag beside an account's name: "Outside agentZ", "Default".
 fn account_tag(label: &'static str, color: Color, cx: &App) -> gpui::Div {
     div()
@@ -5520,6 +5946,22 @@ fn render_color_entry(
         .w_full()
         .gap_1p5()
         .child(dot)
+        .child(Label::new(name))
+        .child(div().flex_1().min_w(px(16.)))
+        .when(is_current, |row| {
+            row.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_check_entry(name: &'static str, is_current: bool) -> AnyElement {
+    h_flex()
+        .w_full()
+        .gap_1p5()
         .child(Label::new(name))
         .child(div().flex_1().min_w(px(16.)))
         .when(is_current, |row| {
@@ -5922,7 +6364,7 @@ mod tests {
     use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
-    use agentz_protocol::{ConnectionId, Response};
+    use agentz_protocol::{AgentSettingsChange, ConnectionId, Response};
     use gpui::TestAppContext;
     use projects::ImportedSession;
 
@@ -6528,6 +6970,7 @@ mod tests {
                 ..AccountChoices::default()
             },
             settings: AgentSettings::default(),
+            settings_from: SettingsSource::default(),
             logged_in: Some(status.is_some()),
             logs_in_with_key: false,
             status: status.map(|status| StatusRead {
@@ -6576,6 +7019,7 @@ mod tests {
             folder: "/tmp/agentz-test/accounts/mock".into(),
             reads_usage: true,
             usage_page: Some("https://example.com/usage".into()),
+            copies_settings_files: true,
         });
         let work = AccountStatus {
             email: Some("alex@acme.co".into()),
@@ -6811,6 +7255,231 @@ mod tests {
             agent_id: mock,
             account: AccountId(1),
         }));
+    }
+
+    #[gpui::test]
+    fn the_tabs_show_the_picked_accounts_settings(cx: &mut TestAppContext) {
+        let mock = AgentId::new("mock");
+        let mut mock_listing = listing(
+            "mock",
+            "Mock",
+            InstallState::Installed {
+                version: "2.0.0".into(),
+                update_available: false,
+            },
+        );
+        mock_listing.accounts = Some(AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            copies_settings_files: true,
+            ..AccountSupport::default()
+        });
+        let options: Vec<acp::SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select", "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}, {"value": "haiku", "name": "Haiku"}]},
+        ]))
+        .expect("options");
+        let settings = |variable: &str, model: Option<&str>| AgentSettings {
+            env: BTreeMap::from([(variable.to_string(), "1".to_string())]),
+            known_config_options: options.clone(),
+            default_config_options: model
+                .map(|model| {
+                    (
+                        "model".to_string(),
+                        acp::SessionConfigOptionValue::value_id(model.to_string()),
+                    )
+                })
+                .into_iter()
+                .collect(),
+            ..AgentSettings::default()
+        };
+        let mut work = account(1, Some("Work"), Some(AccountStatus::default()));
+        work.settings = settings("WORK_TOKEN", Some("haiku"));
+        let mut accounts = AgentAccounts {
+            accounts: vec![work, account(2, None, None)],
+            default_account: Some(AccountId(1)),
+            external_logged_in: Some(true),
+            last_id: 2,
+            ..AgentAccounts::default()
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            let requests = requests.clone();
+            let accounts = accounts.clone();
+            let external = settings("EXTERNAL_TOKEN", None);
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    match request {
+                        Request::OpenLoginSession { account, .. } => {
+                            Some(Response::LoginSessionOpened(account.map_or(100, |id| id.0)))
+                        }
+                        Request::SubscribeThread(ConnectionId::LoginSession(id)) => {
+                            Some(Response::Thread(login_session(*id != 2)))
+                        }
+                        Request::ListAgentSessions { .. } => {
+                            Some(Response::AgentSessions(AgentSessions::Listed(Vec::new())))
+                        }
+                        Request::CopyAccountSettings { .. }
+                        | Request::UpdateAgentSettings { .. } => Some(Response::Ok),
+                        _ => None,
+                    }
+                });
+                client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
+                client.set_agent_settings_for_test([(mock.clone(), external)].into(), cx);
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let sent = |request: &Request| requests.borrow().contains(request);
+        let count = |request: &Request| {
+            requests
+                .borrow()
+                .iter()
+                .filter(|sent| *sent == request)
+                .count()
+        };
+        let set_model = |account: Option<AccountId>, model: &str| Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account,
+            change: AgentSettingsChange::SetDefaultConfigOption {
+                config_id: "model".into(),
+                value: Some(acp::SessionConfigOptionValue::value_id(model.to_string())),
+            },
+        };
+        let list_sessions = |account: Option<AccountId>| Request::ListAgentSessions {
+            agent_id: mock.clone(),
+            account,
+        };
+        click("agent-row-mock", cx);
+
+        // Only the account the agent hasn't logged in yet offers Copy settings from: the
+        // default account first, then the others, then Nothing.
+        assert!(cx.debug_bounds("account-picker").is_none());
+        assert!(cx.debug_bounds("copy-settings-1").is_none());
+        click("copy-settings-2", cx);
+        let from_work = cx
+            .debug_bounds("copy-settings-from-1")
+            .expect("Work is offered");
+        let from_external = cx
+            .debug_bounds("copy-settings-from-external")
+            .expect("the External account is offered");
+        let from_nothing = cx
+            .debug_bounds("copy-settings-from-nothing")
+            .expect("Nothing is offered");
+        assert!(from_work.top() < from_external.top() && from_external.top() < from_nothing.top());
+        assert!(cx.debug_bounds("copy-settings-from-2").is_none());
+        let opened = Request::OpenLoginSession {
+            agent_id: mock.clone(),
+            account: Some(AccountId(2)),
+        };
+        assert_eq!(count(&opened), 1);
+        click("copy-settings-from-external", cx);
+        assert!(sent(&Request::CopyAccountSettings {
+            agent_id: mock.clone(),
+            account: AccountId(2),
+            from: SettingsSource::External,
+        }));
+        // It starts again with the variables copied.
+        assert_eq!(count(&opened), 2);
+
+        // Defaults are the account for new threads' at first, then the picked one's.
+        click("agent-tab-defaults", cx);
+        click("agent-default-model", cx);
+        click("MENU_ITEM-Sonnet", cx);
+        assert!(sent(&set_model(Some(AccountId(1)), "sonnet")));
+        click("account-picker", cx);
+        click("account-picker-external", cx);
+        click("agent-default-model", cx);
+        click("MENU_ITEM-Haiku", cx);
+        assert!(sent(&set_model(None, "haiku")));
+
+        // The Environment tab shows and saves the picked account's variables.
+        click("agent-tab-environment", cx);
+        let env = |cx: &mut gpui::VisualTestContext| {
+            page.read_with(cx, |page, cx| {
+                let panel = page.agent_panel().expect("the agent is open");
+                let keys: Vec<String> = panel
+                    .env_rows
+                    .iter()
+                    .map(|row| row.key.read(cx).text().to_string())
+                    .collect();
+                (panel.env_account, keys)
+            })
+        };
+        assert_eq!(env(cx), (None, vec!["EXTERNAL_TOKEN".to_string()]));
+        click("account-picker", cx);
+        click("account-picker-1", cx);
+        assert_eq!(
+            env(cx),
+            (Some(AccountId(1)), vec!["WORK_TOKEN".to_string()])
+        );
+        page.update(cx, |page, cx| {
+            if let Some(panel) = page.agent_panel_mut() {
+                panel.env_rows.clear();
+            }
+            page.save_env(cx);
+        });
+        assert!(sent(&Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account: Some(AccountId(1)),
+            change: AgentSettingsChange::SetEnv(BTreeMap::new()),
+        }));
+
+        // The Threads tab lists the picked account's sessions, and lists again for another.
+        click("agent-tab-threads", cx);
+        assert!(sent(&list_sessions(Some(AccountId(1)))));
+        assert!(!sent(&list_sessions(None)));
+        click("account-picker", cx);
+        click("account-picker-external", cx);
+        assert!(sent(&list_sessions(None)));
+
+        // An account that's no longer listed gives way to the account for new threads.
+        accounts.external_logged_in = Some(false);
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(count(&list_sessions(Some(AccountId(1)))), 2);
+
+        // With one account, there's nothing to pick.
+        accounts
+            .accounts
+            .retain(|account| account.id == AccountId(1));
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("account-picker").is_none());
     }
 
     #[test]

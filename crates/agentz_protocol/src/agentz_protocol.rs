@@ -36,7 +36,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::accounts::{AccountChange, AccountChoice, AccountId, AgentAccounts};
+use crate::accounts::{AccountChange, AccountChoice, AccountId, AgentAccounts, SettingsSource};
 use crate::agents::{
     AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, CustomAgentChange, IconId,
     RegistrySnapshot,
@@ -568,8 +568,18 @@ pub enum Request {
         change: AgentSettingsChange,
     },
     /// A new agentZ account for the agent, logged out until it logs in:
-    /// [`Response::AccountAdded`].
+    /// [`Response::AccountAdded`]. Its settings are copied from the account for new threads
+    /// ([`accounts::AgentAccounts::default_settings_source`]).
     AddAccount(AgentId),
+    /// Copy settings from: puts another account's Environment, defaults and the agent's own
+    /// settings files in place of the account's (none with [`SettingsSource::Nothing`]), but
+    /// never its login. Defaults it doesn't offer are dropped once a session lists what it
+    /// does.
+    CopyAccountSettings {
+        agent_id: AgentId,
+        account: AccountId,
+        from: SettingsSource,
+    },
     /// Deletes an agentZ account and its folder: its login, sessions and history. Its threads
     /// stay, but can't continue.
     RemoveAccount {

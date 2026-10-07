@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use agentz_protocol::accounts::{AccountChoice, AccountId, AccountSupport, AgentAccounts};
+use agentz_protocol::accounts::{
+    AccountChoice, AccountId, AccountSupport, AgentAccounts, SettingsSource,
+};
 use agentz_protocol::agents::{AgentId, AgentSettings};
 use agentz_protocol::{ConnectionId, Request, Response};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -25,6 +27,7 @@ impl Server {
                 };
                 // Every account gets a folder, named after its agent.
                 accounts::agent_folder(&self.data_dir, &agent_id)?;
+                let source = self.accounts.get(&agent_id).default_settings_source();
                 let id = self.accounts.update(&agent_id, AgentAccounts::add);
                 let started = accounts::home(&self.data_dir, &agent_id, id)
                     .and_then(|home| description.start_home(&home));
@@ -35,7 +38,17 @@ impl Server {
                         .log_err();
                     return Err(error);
                 }
+                // A copy that fails leaves the account with nothing copied, to pick again.
+                self.copy_account_settings(&agent_id, id, source).log_err();
                 Ok(Response::AccountAdded(id))
+            }
+            Request::CopyAccountSettings {
+                agent_id,
+                account,
+                from,
+            } => {
+                self.copy_account_settings(&agent_id, account, from)?;
+                Ok(Response::Ok)
             }
             Request::RemoveAccount { agent_id, account } => {
                 self.accounts
@@ -120,6 +133,41 @@ impl Server {
             description,
             accounts::home(&self.data_dir, agent_id, account)?,
         ))
+    }
+
+    /// Copy settings from: `from`'s Environment, defaults and settings files in place of the
+    /// account's.
+    fn copy_account_settings(
+        &mut self,
+        agent_id: &AgentId,
+        account: AccountId,
+        from: SettingsSource,
+    ) -> Result<()> {
+        let (description, home) = self.account_home(agent_id, account)?;
+        let (source_home, mut settings) = match from {
+            SettingsSource::Nothing => (None, AgentSettings::default()),
+            SettingsSource::External => (
+                Some(description.external_home()),
+                self.account_settings(agent_id, None),
+            ),
+            SettingsSource::Account(id) => {
+                anyhow::ensure!(id != account, "An account can't copy its own settings.");
+                let (_, source_home) = self.account_home(agent_id, id)?;
+                (Some(source_home), self.account_settings(agent_id, Some(id)))
+            }
+        };
+        // A login variable in the Environment is a login, which is never copied.
+        settings
+            .env
+            .retain(|variable, _| !description.login_variables.contains(variable));
+        description.copy_settings_files(source_home.as_deref(), &home)?;
+        self.accounts.update(agent_id, |accounts| {
+            if let Some(account) = accounts.account_mut(account) {
+                account.settings.copy_settings(&settings);
+                account.settings_from = from;
+            }
+        });
+        Ok(())
     }
 
     /// Stops the agents running on the account: its threads' and its login sessions'. Returns

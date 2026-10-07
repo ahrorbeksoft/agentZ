@@ -38,7 +38,9 @@ the file says, as FACTORY_API_KEY does, unless it's "refused". In a home, it als
 `--status`, it prints {"logged_in": …} and exits with 1 when logged out, as agents' own status
 commands do. With MOCK_OPENS_LOGGED_OUT set, sessions open while it's logged out, as Claude
 Agent's do. Run with `--usage`, it prints what agentZ reads of an account: the email, plan and
-a 5-hour window, of which each reply in the home uses 10% (kept in `usage` in MOCK_HOME).
+a 5-hour window, of which each reply in the home uses 10% (kept in `usage` in MOCK_HOME). A
+`.mock/settings.json` in MOCK_HOME with a list of `models` offers only those, as an
+organization's plan offers fewer.
 
 Context embedded in a prompt (an ACP resource, such as the handoff agentZ sends with a continued
 thread's first message) is named at the end of the echo: "Echo: next [with agentz://handoff]".
@@ -157,7 +159,22 @@ logged_out = False
 prompt_resources = []
 
 
+def offered_models():
+    # An account's settings can offer fewer models, as an organization's plan does.
+    models = [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"},
+              {"value": "haiku", "name": "Haiku"}]
+    try:
+        with open(os.path.join(os.environ["MOCK_HOME"], ".mock", "settings.json")) as file:
+            offered = json.load(file)["models"]
+    except (KeyError, OSError, TypeError, ValueError):
+        return models
+    return [model for model in models if model["value"] in offered] or models
+
+
 def config_options():
+    models = offered_models()
+    if settings["model"] not in [model["value"] for model in models]:
+        settings["model"] = models[0]["value"]
     return [
         {"id": "mode", "name": "Mode", "category": "mode", "type": "select",
          "currentValue": settings["mode"],
@@ -165,8 +182,7 @@ def config_options():
                      {"value": "plan", "name": "Plan", "description": "Plan before editing"}]},
         {"id": "model", "name": "Model", "category": "model", "type": "select",
          "currentValue": settings["model"],
-         "options": [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"},
-                     {"value": "haiku", "name": "Haiku"}]},
+         "options": models},
         {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
          "currentValue": settings["effort"],
          "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"},

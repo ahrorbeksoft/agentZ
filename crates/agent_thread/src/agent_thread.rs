@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
+use agentz_protocol::agents::select_offers;
 use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
@@ -2977,19 +2978,6 @@ fn prompt_answer(
 fn lock_slot(slot: &Mutex<PauseSlot>) -> std::sync::MutexGuard<'_, PauseSlot> {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn select_offers(select: &acp::SessionConfigSelect, value: &acp::SessionConfigValueId) -> bool {
-    match &select.options {
-        acp::SessionConfigSelectOptions::Ungrouped(options) => {
-            options.iter().any(|option| option.value == *value)
-        }
-        acp::SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|group| &group.options)
-            .any(|option| option.value == *value),
-        _ => false,
-    }
 }
 
 struct Connected {

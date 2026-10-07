@@ -25,9 +25,19 @@ Notes for whoever continues:
   agents that have agentZ accounts: without any, nothing depends on it, and every agent would
   be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
-  importing sessions. Since item 8, the Account tab opens a login session per account; the
-  Threads tab still lists the External account's sessions, and the other tabs edit its
-  settings, until item 9 adds their account menu.
+  importing sessions. Since item 8, the Account tab opens a login session per account.
+- Item 9: the Defaults, Environment and Threads tabs share one account menu
+  (`AgentPanel::picked_account`). It opens on the account for new threads and follows it
+  until one is picked; a picked account that's no longer listed gives way to it again. With
+  one account listed there's no menu. "Copy settings from" is `CopyAccountSettings`;
+  `AddAccount` copies from the account for new threads first (`default_settings_source`). It
+  copies the Environment (without the description's login variables, which are a login),
+  the defaults, and the description's `settings_files` from that account's home (the normal
+  home for the External account), with the keys `home_files` starts a home with written over
+  them (Droid's `cloudSessionSync: false`). Copied defaults wait for the account's first
+  session (`AgentSettings::copied_defaults`), which drops those it doesn't offer. The row
+  shows only on a New account card while more than one account is listed, and copying starts
+  its login session again, with the copied variables.
 - Item 8: the app keeps every machine's accounts from `Event::Accounts`
   (`ServerClient::accounts`). Rename saves on Enter or a click elsewhere, Escape cancels, and
   an empty name shows the email again. Cancel on a New account card removes it without asking,
@@ -74,7 +84,7 @@ Notes for whoever continues:
 | 6 | | Identity and quota readers, refresh (5 minutes, after each turn, on demand), failed reads keeping the last numbers; Droid's `/status` and `/limits` reader | done |
 | 7 | | API-key accounts (Droid with a Factory API key) | done |
 | 8 | 1–5, 13 | Account tab: a card per account with limit bars, Add Account, the External account tagged, the ⋯ menu, the account's color | done |
-| 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | |
+| 9 | 6, 7 | Account menu on the Defaults, Environment and Threads tabs; Copy settings from | done |
 | 10 | 12 | The account in the strip under the composer; the default account for new threads | |
 | 11 | 13 | The account's color on its threads' agent icon | |
 | 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | |

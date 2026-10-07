@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
-use agentz_protocol::accounts::AgentAccounts;
+use agentz_protocol::accounts::{AccountId, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
@@ -363,23 +363,41 @@ impl ServerClient {
             .unwrap_or_default()
     }
 
-    /// Asks the server to make the change. The copy here follows when the server says so. The
-    /// options and modes an agent offers are the server's to remember, so changes to them are
-    /// ignored.
-    pub fn update_agent_settings(
+    /// The account's settings, `None` being the External account, whose are the agent's.
+    pub fn account_settings(
+        &self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+    ) -> AgentSettings {
+        match account {
+            None => self.agent_settings(&agent_id.0),
+            Some(id) => self
+                .accounts
+                .get(agent_id)
+                .and_then(|accounts| accounts.account(id))
+                .map(|account| account.settings.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Asks the server to change the account's settings (`None` being the External account's).
+    /// The copy here follows when the server says so. The options and modes an agent offers
+    /// are the server's to remember, so changes to them are ignored.
+    pub fn update_account_settings(
         &mut self,
-        agent_id: &str,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
         change: impl FnOnce(&mut AgentSettings),
         cx: &mut Context<Self>,
     ) {
-        let previous = self.agent_settings(agent_id);
+        let previous = self.account_settings(agent_id, account);
         let mut settings = previous.clone();
         change(&mut settings);
         for change in agent_settings_changes(&previous, &settings) {
             self.send(
                 Request::UpdateAgentSettings {
-                    agent_id: AgentId::new(agent_id.to_string()),
-                    account: None,
+                    agent_id: agent_id.clone(),
+                    account,
                     change,
                 },
                 cx,
@@ -408,6 +426,15 @@ impl ServerClient {
             self.accounts = accounts;
             cx.notify();
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_agent_settings_for_test(
+        &mut self,
+        agents: BTreeMap<AgentId, AgentSettings>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_agent_settings(agents, cx);
     }
 
     #[cfg(test)]

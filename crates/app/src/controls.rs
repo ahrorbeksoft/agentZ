@@ -268,7 +268,7 @@ pub(crate) fn icon_tile(icon: Icon, size: Pixels, cx: &App) -> gpui::Div {
 
 /// A round avatar with the account's initial, as t3code shows an account, in the account's
 /// color or else the theme's accent.
-pub(crate) fn avatar(name: &str, color: Option<Hsla>, cx: &App) -> AnyElement {
+pub(crate) fn avatar(name: &str, color: Option<Hsla>, size: Pixels, cx: &App) -> AnyElement {
     let accent = color.unwrap_or(cx.theme().colors().text_accent);
     let initial: SharedString = name
         .chars()
@@ -277,7 +277,7 @@ pub(crate) fn avatar(name: &str, color: Option<Hsla>, cx: &App) -> AnyElement {
         .unwrap_or_default()
         .into();
     div()
-        .size(px(32.))
+        .size(size)
         .flex_none()
         .flex()
         .items_center()
@@ -288,7 +288,7 @@ pub(crate) fn avatar(name: &str, color: Option<Hsla>, cx: &App) -> AnyElement {
             linear_color_stop(accent.blend(gpui::white().opacity(0.3)), 0.),
             linear_color_stop(accent.blend(gpui::black().opacity(0.15)), 1.),
         ))
-        .text_size(rems_from_px(13_f32))
+        .text_size(rems_from_px((f32::from(size) * 13. / 32.).round().max(9.)))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(on_fill_color(cx))
         .child(initial)
@@ -327,10 +327,10 @@ pub(crate) fn account_color(hex: &str, cx: &App) -> Option<Hsla> {
 }
 
 /// A round badge for an account the agent didn't name: a person with a check.
-pub(crate) fn account_badge(cx: &App) -> AnyElement {
+pub(crate) fn account_badge(size: Pixels, cx: &App) -> AnyElement {
     let status = cx.theme().status();
     div()
-        .size(px(32.))
+        .size(size)
         .flex_none()
         .flex()
         .items_center()
@@ -339,7 +339,9 @@ pub(crate) fn account_badge(cx: &App) -> AnyElement {
         .bg(status.success_background)
         .child(
             Icon::new(IconName::UserCheck)
-                .size(IconSize::Small)
+                .size(IconSize::Custom(rems_from_px(
+                    (f32::from(size) * 0.45).round().max(10.),
+                )))
                 .color(Color::Success),
         )
         .into_any_element()

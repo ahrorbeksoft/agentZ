@@ -254,7 +254,11 @@ Each entry: what it does, where it lives, and where it comes from.
   Threads, Color, Refresh Usage, Open Usage Page, Show in Finder, Log Out, Remove Account).
   Each account has its own login session (`OpenLoginSession` with the account) while the page
   is open, and its login rows while logged out. Add Account makes a "New account" card that
-  Cancel removes. Add Agent is Zed's
+  Cancel removes, with "Copy settings from" (the other accounts, the default one first, or
+  Nothing) while more than one is listed. With more than one account, the Defaults,
+  Environment and Threads tabs share an "Account" menu over them that picks whose settings
+  or sessions they show (`AgentPanel::picked_account`), opening on the account for new
+  threads. Add Agent is Zed's
   menu: Install from Registry, Add Custom Agent, and the ACP docs. The ACP Registry
   page has search, an All / Installed / Not Installed filter, and a card for each registry agent.
   As in Zed, the cards are a `uniform_list` below a pinned search bar: scrolling re-renders the
@@ -577,7 +581,14 @@ Each entry: what it does, where it lives, and where it comes from.
   account's are the agent's settings from before
   (`Server::{account_settings, update_account_settings}`). A thread starts with its account's
   defaults, and a choice made in it becomes its account's default. Agent control lists and
-  checks the options of the account a launched thread will run on.
+  checks the options of the account a launched thread will run on. A new account copies
+  another's settings (`Request::CopyAccountSettings`, `Account::settings_from`; at
+  `AddAccount`, the account for new threads'): its Environment without the login variables,
+  its defaults, and the description's `settings_files` from its home (`normal_home` for the
+  External account), with the keys of the files a home starts with kept
+  (`AgentDescription::copy_settings_files`), but never the login. Copied defaults wait for
+  the account's first session, which drops those it doesn't offer
+  (`AgentSettings::{copy_settings, learn_offers}`).
 - **Logging out** (`confirm_dialog.rs`, t3code's dialogs): Log Out on the agent's page or in a
   thread's "…" menu first asks in a dialog in the shell's modal layer, since it stops every
   thread that shares the login. Uninstall asks in the same dialog.

@@ -1015,6 +1015,7 @@ impl Server {
                 Ok(Response::Ok)
             }
             request @ (Request::AddAccount(_)
+            | Request::CopyAccountSettings { .. }
             | Request::RemoveAccount { .. }
             | Request::UpdateAccount { .. }
             | Request::RefreshUsage { .. }) => self.account_request(request),
@@ -1936,8 +1937,7 @@ impl Server {
             && (!config_options.is_empty() || modes.is_some())
         {
             self.update_account_settings(agent_id, account, |settings| {
-                settings.known_config_options = config_options;
-                settings.known_modes = modes;
+                settings.learn_offers(config_options, modes)
             });
         }
         if let Some(agent_id) = &agent_id {

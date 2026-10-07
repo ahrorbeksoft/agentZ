@@ -46,6 +46,19 @@ pub struct Account {
     pub logs_in_with_key: bool,
     #[serde(default)]
     pub status: Option<StatusRead>,
+    /// The account "Copy settings from" last copied, which its card shows until it logs in.
+    #[serde(default)]
+    pub settings_from: SettingsSource,
+}
+
+/// Whose settings a new account copies: its Environment, defaults, and the agent's own settings
+/// files, never the login ([`crate::Request::CopyAccountSettings`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettingsSource {
+    #[default]
+    Nothing,
+    External,
+    Account(AccountId),
 }
 
 /// An account's last identity and quota read. A read that fails leaves it, so the account
@@ -113,6 +126,8 @@ pub struct AccountSupport {
     pub reads_usage: bool,
     /// The vendor's page for an account's usage or billing.
     pub usage_page: Option<String>,
+    /// Whether "Copy settings from" copies the agent's own settings files too.
+    pub copies_settings_files: bool,
 }
 
 impl AccountSupport {
@@ -222,6 +237,16 @@ impl AgentAccounts {
         self.accounts.first().map(|account| account.id)
     }
 
+    /// What a new account copies its settings from at first: the account for new threads,
+    /// while it's listed.
+    pub fn default_settings_source(&self) -> SettingsSource {
+        match self.new_thread_account() {
+            Some(id) => SettingsSource::Account(id),
+            None if self.lists_external() => SettingsSource::External,
+            None => SettingsSource::Nothing,
+        }
+    }
+
     /// The account a new thread runs on, `None` being the External one.
     pub fn choose(&self, choice: AccountChoice) -> Result<Option<AccountId>> {
         match choice {
@@ -245,6 +270,7 @@ impl AgentAccounts {
             logged_in: None,
             logs_in_with_key: false,
             status: None,
+            settings_from: SettingsSource::Nothing,
         });
         id
     }
@@ -385,6 +411,28 @@ mod tests {
 
         // Ids aren't given twice.
         assert_eq!(accounts.add(), AccountId(3));
+    }
+
+    #[test]
+    fn new_accounts_copy_the_default_one() {
+        let mut accounts = AgentAccounts::default();
+        assert_eq!(accounts.default_settings_source(), SettingsSource::External);
+        accounts.set_logged_in(None, false);
+        assert_eq!(accounts.default_settings_source(), SettingsSource::Nothing);
+        let first = accounts.add();
+        assert_eq!(
+            accounts.default_settings_source(),
+            SettingsSource::Account(first)
+        );
+        accounts.set_logged_in(None, true);
+        let second = accounts.add();
+        accounts
+            .change(Some(second), AccountChange::MakeDefault)
+            .expect("change");
+        assert_eq!(
+            accounts.default_settings_source(),
+            SettingsSource::Account(second)
+        );
     }
 
     #[test]

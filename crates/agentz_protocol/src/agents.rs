@@ -190,6 +190,9 @@ pub struct AgentSettings {
     /// The account the agent reported after agentZ logged it in. Another one later means it was
     /// logged in again outside agentZ.
     pub login_identity: Option<LoginIdentity>,
+    /// The defaults were copied from another account, which may offer what this one doesn't:
+    /// those are dropped once a session lists what this one offers.
+    pub copied_defaults: bool,
 }
 
 /// [`crate::Request::ListAgentSessions`]'s answer: the conversations an agent keeps on the
@@ -262,6 +265,57 @@ impl AgentSettings {
         }
     }
 
+    /// What a session of the account offers. Copied defaults it doesn't offer go now.
+    pub fn learn_offers(
+        &mut self,
+        config_options: Vec<acp::SessionConfigOption>,
+        modes: Option<acp::SessionModeState>,
+    ) {
+        self.known_config_options = config_options;
+        self.known_modes = modes;
+        if std::mem::take(&mut self.copied_defaults) {
+            self.drop_unoffered_defaults();
+        }
+    }
+
+    /// "Copy settings from": another account's Environment and defaults in place of these. The
+    /// defaults are checked against what this account offers as soon as it's known.
+    pub fn copy_settings(&mut self, from: &AgentSettings) {
+        self.env = from.env.clone();
+        self.default_mode = from.default_mode.clone();
+        self.default_config_options = from.default_config_options.clone();
+        if self.known_config_options.is_empty() && self.known_modes.is_none() {
+            self.copied_defaults = true;
+        } else {
+            self.drop_unoffered_defaults();
+        }
+    }
+
+    fn drop_unoffered_defaults(&mut self) {
+        let options = &self.known_config_options;
+        self.default_config_options.retain(|config_id, value| {
+            options
+                .iter()
+                .find(|option| *option.id.0 == **config_id)
+                .is_some_and(|option| offers(option, value))
+        });
+        let mode_offered = |mode: &acp::SessionModeId| {
+            self.known_modes.as_ref().is_some_and(|modes| {
+                modes
+                    .available_modes
+                    .iter()
+                    .any(|available| available.id == *mode)
+            })
+        };
+        if self
+            .default_mode
+            .as_ref()
+            .is_some_and(|mode| !mode_offered(mode))
+        {
+            self.default_mode = None;
+        }
+    }
+
     pub fn session_defaults(&self) -> SessionDefaults {
         SessionDefaults {
             mode: self.default_mode.clone(),
@@ -271,6 +325,31 @@ impl AgentSettings {
                 .map(|(id, value)| (acp::SessionConfigId::new(id.clone()), value.clone()))
                 .collect(),
         }
+    }
+}
+
+/// Whether `value` is one of the option's choices.
+pub fn offers(option: &acp::SessionConfigOption, value: &acp::SessionConfigOptionValue) -> bool {
+    match (&option.kind, value) {
+        (
+            acp::SessionConfigKind::Select(select),
+            acp::SessionConfigOptionValue::ValueId { value },
+        ) => select_offers(select, value),
+        (acp::SessionConfigKind::Boolean(_), acp::SessionConfigOptionValue::Boolean { .. }) => true,
+        _ => false,
+    }
+}
+
+pub fn select_offers(select: &acp::SessionConfigSelect, value: &acp::SessionConfigValueId) -> bool {
+    match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(options) => {
+            options.iter().any(|option| option.value == *value)
+        }
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| &group.options)
+            .any(|option| option.value == *value),
+        _ => false,
     }
 }
 
@@ -289,6 +368,67 @@ mod tests {
             }),
             detail: None,
         }
+    }
+
+    #[test]
+    fn copied_defaults_this_account_doesnt_offer_are_dropped() {
+        let options: Vec<acp::SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select", "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}, {"value": "haiku", "name": "Haiku"}]},
+            {"id": "fast", "name": "Fast", "type": "boolean", "currentValue": false},
+        ]))
+        .expect("options");
+        let modes: acp::SessionModeState = serde_json::from_value(serde_json::json!({
+            "currentModeId": "default",
+            "availableModes": [{"id": "default", "name": "Default"}],
+        }))
+        .expect("modes");
+        let from = AgentSettings {
+            env: BTreeMap::from([("HTTPS_PROXY".into(), "http://proxy:3128".into())]),
+            default_mode: Some(acp::SessionModeId::new("plan")),
+            default_config_options: BTreeMap::from([
+                (
+                    "model".into(),
+                    acp::SessionConfigOptionValue::value_id("opus"),
+                ),
+                ("fast".into(), acp::SessionConfigOptionValue::boolean(true)),
+                (
+                    "effort".into(),
+                    acp::SessionConfigOptionValue::value_id("high"),
+                ),
+            ]),
+            ..AgentSettings::default()
+        };
+
+        // Copied before the account's first session, they wait for it.
+        let mut settings = AgentSettings::default();
+        settings.copy_settings(&from);
+        assert_eq!(settings.env, from.env);
+        assert_eq!(settings.default_config_options.len(), 3);
+        settings.learn_offers(options.clone(), Some(modes.clone()));
+        assert_eq!(
+            settings.default_config_options.keys().collect::<Vec<_>>(),
+            ["fast"]
+        );
+        assert_eq!(settings.default_mode, None);
+        assert!(!settings.copied_defaults);
+
+        // Chosen later, they stay, whatever a later session offers.
+        settings.default_config_options.insert(
+            "model".into(),
+            acp::SessionConfigOptionValue::value_id("haiku"),
+        );
+        settings.learn_offers(Vec::new(), None);
+        assert!(settings.default_config_options.contains_key("model"));
+
+        // Copied once it knows what it offers, they're checked at once.
+        settings.learn_offers(options, Some(modes));
+        settings.copy_settings(&from);
+        assert_eq!(
+            settings.default_config_options.keys().collect::<Vec<_>>(),
+            ["fast"]
+        );
+        assert!(!settings.copied_defaults);
     }
 
     #[test]

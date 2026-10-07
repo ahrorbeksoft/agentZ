@@ -126,7 +126,8 @@ From Zed's guidelines, which this code follows:
   all three, so it can have accounts. Run with `--status`, it prints `{"logged_in": …}` as
   agents' status commands do, and with `MOCK_OPENS_LOGGED_OUT` its sessions open while it's
   logged out, as Claude Agent's do. Run with `--usage`, it prints a read of its account
-  (email, plan, a 5-hour window that each reply in the home fills by 10%).
+  (email, plan, a 5-hour window that each reply in the home fills by 10%). A `models` list
+  in `.mock/settings.json` in its home limits the models it offers, as a plan can.
 - **Server:** `agentz_server` tests run the server in-process over in-memory streams with the
   mock agent as a custom agent; `tests/binary.rs` runs the real binary against a temporary data
   directory. `agentz_client` tests reattach to a turn in progress.

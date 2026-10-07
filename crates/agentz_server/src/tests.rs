@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::accounts::{AccountChange, AccountChoice, AccountId, AgentAccounts};
+use agentz_protocol::accounts::{
+    AccountChange, AccountChoice, AccountId, AgentAccounts, SettingsSource,
+};
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::layout::{Direction, Node};
@@ -301,6 +303,9 @@ fn mock_accounts() -> crate::AgentDescription {
         home_variables: BTreeMap::from([("MOCK_HOME".into(), String::new())]),
         file_storage: BTreeMap::new(),
         home_files: BTreeMap::from([(".mock/settings.json".into(), r#"{"sync": false}"#.into())]),
+        // Tests that copy them name a normal home of their own, outside the user's.
+        settings_files: Vec::new(),
+        normal_home: String::new(),
         login_variables: vec!["MOCK_API_KEY".into()],
         login_check: crate::LoginCheck::Session,
         reader: None,
@@ -1409,6 +1414,183 @@ async fn each_account_keeps_its_own_defaults() {
             .default_config_options
             .contains_key("model")
     );
+}
+
+/// A new account starts with the default account's Environment, defaults and settings files,
+/// but not its login, and drops the defaults its first session doesn't offer. Copy settings
+/// from puts another account's in their place, or nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_accounts_copy_another_accounts_settings() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let normal_home = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir_all(normal_home.path().join(".mock")).expect("create");
+    // The mock reads it only in an account's home, where it then offers two models.
+    std::fs::write(
+        normal_home.path().join(".mock/settings.json"),
+        r#"{"models": ["sonnet", "haiku"], "sync": true}"#,
+    )
+    .expect("write");
+    std::fs::write(normal_home.path().join("login"), "").expect("write");
+    let description = crate::AgentDescription {
+        settings_files: vec![".mock/settings.json".into()],
+        normal_home: normal_home.path().to_string_lossy().into_owned(),
+        ..mock_accounts()
+    };
+    let Some(server) = TestServer::start_with_description(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let proxy = BTreeMap::from([("HTTPS_PROXY".to_string(), "http://proxy:3128".to_string())]);
+    let mut external_env = proxy.clone();
+    external_env.insert("MOCK_API_KEY".into(), "external-key".into());
+    for change in [
+        AgentSettingsChange::SetEnv(external_env),
+        AgentSettingsChange::SetDefaultConfigOption {
+            config_id: "model".into(),
+            value: Some(acp::SessionConfigOptionValue::value_id("opus")),
+        },
+        AgentSettingsChange::SetDefaultConfigOption {
+            config_id: "effort".into(),
+            value: Some(acp::SessionConfigOptionValue::value_id("high")),
+        },
+    ] {
+        client
+            .ok(Request::UpdateAgentSettings {
+                agent_id: mock.clone(),
+                account: None,
+                change,
+            })
+            .await;
+    }
+    let add = async |client: &mut TestClient| match client
+        .ok(Request::AddAccount(AgentId::new("mock")))
+        .await
+    {
+        Response::AccountAdded(id) => id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let settings_of = |client: &TestClient, id| {
+        client
+            .accounts("mock")
+            .account(id)
+            .map(|account| (account.settings_from, account.settings.clone()))
+    };
+    let home = |id: AccountId| {
+        server
+            .data_dir
+            .path()
+            .join("accounts/mock")
+            .join(id.to_string())
+    };
+    let settings_file = |id: AccountId| -> Value {
+        let text = std::fs::read_to_string(home(id).join(".mock/settings.json")).expect("read");
+        serde_json::from_str(&text).expect("json")
+    };
+
+    let work = add(&mut client).await;
+    client
+        .wait_until(|client| settings_of(client, work).is_some())
+        .await;
+    let (from, settings) = settings_of(&client, work).expect("account");
+    assert_eq!(from, SettingsSource::External);
+    assert_eq!(settings.env, proxy);
+    assert_eq!(settings.default_config_options.len(), 2);
+    // The file the home starts with keeps sessions to itself.
+    assert_eq!(
+        settings_file(work),
+        json!({"models": ["sonnet", "haiku"], "sync": false})
+    );
+    assert!(!home(work).join("login").exists());
+
+    // Its first session offers no Opus, so that default goes.
+    let on_work = match client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: mock.clone(),
+            workspace: Default::default(),
+            account: AccountChoice::Account(work),
+        })
+        .await
+    {
+        Response::ThreadCreated(thread_id) => thread_id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    client.wait_until_ready(on_work).await;
+    client
+        .wait_until(|client| {
+            settings_of(client, work).is_some_and(|(_, settings)| !settings.copied_defaults)
+                && config_value(client.thread(ConnectionId::Thread(on_work)), "effort").as_deref()
+                    == Some("high")
+        })
+        .await;
+    let (_, settings) = settings_of(&client, work).expect("account");
+    assert_eq!(
+        settings.default_config_options.keys().collect::<Vec<_>>(),
+        ["effort"]
+    );
+    assert_eq!(
+        config_value(client.thread(ConnectionId::Thread(on_work)), "model").as_deref(),
+        Some("sonnet")
+    );
+
+    // The next one copies the account for new threads.
+    client
+        .ok(Request::UpdateAccount {
+            agent_id: mock.clone(),
+            account: Some(work),
+            change: AccountChange::MakeDefault,
+        })
+        .await;
+    let side = add(&mut client).await;
+    client
+        .wait_until(|client| settings_of(client, side).is_some())
+        .await;
+    let (from, settings) = settings_of(&client, side).expect("account");
+    assert_eq!(from, SettingsSource::Account(work));
+    assert_eq!(settings.env, proxy);
+    assert_eq!(settings_file(side), settings_file(work));
+
+    // Nothing empties them, but keeps the file a new home starts with.
+    client
+        .ok(Request::CopyAccountSettings {
+            agent_id: mock.clone(),
+            account: side,
+            from: SettingsSource::Nothing,
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            settings_of(client, side).is_some_and(|(from, _)| from == SettingsSource::Nothing)
+        })
+        .await;
+    let (_, settings) = settings_of(&client, side).expect("account");
+    assert!(settings.env.is_empty() && settings.default_config_options.is_empty());
+    assert_eq!(settings_file(side), json!({"sync": false}));
+    for from in [
+        SettingsSource::Account(side),
+        SettingsSource::Account(AccountId(99)),
+    ] {
+        assert!(
+            client
+                .request(Request::CopyAccountSettings {
+                    agent_id: mock.clone(),
+                    account: side,
+                    from,
+                })
+                .await
+                .is_err()
+        );
+    }
 }
 
 /// Each agentZ account runs the agent in a home of its own and logs in there, without the
