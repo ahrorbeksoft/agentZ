@@ -58,6 +58,7 @@ pub struct KeyLogin {
 pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
     match agent_id {
         "factory-droid" => Some(super::droid::description()),
+        "claude-acp" => Some(super::claude::description()),
         _ => None,
     }
 }

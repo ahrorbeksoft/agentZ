@@ -1,0 +1,8 @@
+{
+  "loggedIn": false,
+  "authMethod": "none",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "/Users/me/agentZ/accounts/claude-acp/2/projects",
+  "configDirectory": "/Users/me/agentZ/accounts/claude-acp/2"
+}

@@ -1,6 +1,6 @@
 //! How agentZ tells whether an account is logged in.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
@@ -28,9 +28,12 @@ pub enum LoginCheck {
 #[serde(default)]
 pub struct StatusCommand {
     /// A path, or a name looked up on `PATH`. Without one, the agent's own program runs, with
-    /// `args` in place of its arguments.
+    /// `args` in place of its arguments, or after them with `after_agent_args`.
     pub program: Option<String>,
     pub args: Vec<String>,
+    /// Whether `args` follow the agent's own arguments, as they must where the agent runs
+    /// through Node, its script first (Claude's adapter, whose `--cli` runs Claude Code).
+    pub after_agent_args: bool,
     /// A JSON pointer to where its output says `true` while it's logged in (`/loggedIn`).
     /// Without one, it exits with 0 only while logged in.
     pub logged_in: Option<String>,
@@ -39,7 +42,12 @@ pub struct StatusCommand {
 impl StatusCommand {
     /// Runs it with the environment `agent`, the account's agent command, has.
     pub async fn run(&self, agent: AgentCommand) -> Result<bool> {
-        let output = run_with_account_env(self.program.as_deref(), &self.args, agent).await?;
+        let args = if self.program.is_none() && self.after_agent_args {
+            agent.args.iter().chain(&self.args).cloned().collect()
+        } else {
+            self.args.clone()
+        };
+        let output = run_with_account_env(self.program.as_deref(), &args, agent).await?;
         self.logged_in(&output)
     }
 
@@ -63,23 +71,35 @@ pub(super) async fn run_with_account_env(
     args: &[String],
     agent: AgentCommand,
 ) -> Result<Output> {
-    let program = program.map(PathBuf::from).unwrap_or(agent.path);
-    let mut command = tokio::process::Command::new(&program);
+    let program = program.map(PathBuf::from).unwrap_or(agent.path.clone());
+    let mut command = account_command(&program, args, &agent);
+    command
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null());
+    tokio::time::timeout(COMMAND_TIMEOUT, command.output())
+        .await
+        .with_context(|| format!("{} didn't finish", program.display()))?
+        .with_context(|| format!("running {}", program.display()))
+}
+
+/// `program` with `args` and the environment `agent`, the account's agent command, has, its
+/// output read and its errors dropped. It's killed if it's dropped before it ends.
+pub(super) fn account_command(
+    program: &Path,
+    args: &[String],
+    agent: &AgentCommand,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
     command
         .args(args)
         .envs(&agent.env)
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
     for variable in &agent.env_remove {
         command.env_remove(variable);
     }
-    tokio::time::timeout(COMMAND_TIMEOUT, command.output())
-        .await
-        .with_context(|| format!("{} didn't finish", program.display()))?
-        .with_context(|| format!("running {}", program.display()))
+    command
 }
 
 #[cfg(test)]
@@ -90,6 +110,7 @@ mod tests {
         StatusCommand {
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script.into()],
+            after_agent_args: false,
             logged_in: None,
         }
     }
@@ -127,7 +148,30 @@ mod tests {
             logged_in: Some("/loggedIn".into()),
             ..shell("echo '{}'")
         };
-        assert!(missing.run(agent).await.is_err());
+        assert!(missing.run(agent.clone()).await.is_err());
+
+        // After the agent's own arguments, as its script's.
+        let script = AgentCommand {
+            path: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"[ "$1 $2" = "--cli auth" ] && [ "$ACCOUNT" = work ]"#.into(),
+                "sh".into(),
+            ],
+            ..agent
+        };
+        let after = StatusCommand {
+            program: None,
+            args: vec!["--cli".into(), "auth".into()],
+            after_agent_args: true,
+            logged_in: None,
+        };
+        assert!(after.run(script.clone()).await.expect("run"));
+        let in_place = StatusCommand {
+            after_agent_args: false,
+            ..after
+        };
+        assert!(!in_place.run(script).await.expect("run"));
     }
 
     #[test]

@@ -595,13 +595,22 @@ Each entry: what it does, where it lives, and where it comes from.
   runs with `--settings` turning cloud session sync off, and resumes (`--resume`) the one
   session a past read opened in that folder: Droid opens a session each time it starts and
   keeps it in its own session indexes even once its files are deleted. A read removes any
-  other session opened in that folder, and a read that fails removes the one it resumed. An
+  other session opened in that folder, and a read that fails removes the one it resumed.
+  Claude Agent's description (`accounts/claude.rs`) moves its home with `CLAUDE_CONFIG_DIR`
+  (its keychain entry is named after that folder), and runs Claude Code through the
+  adapter's `--cli`, after the adapter's own script (`StatusCommand::after_agent_args`): its
+  login check is `auth status --json`, and its reader (`Reader::ClaudeCode`, t3code's
+  capabilities probe) reads the email and plan from that, then sends Claude Code, started
+  with no prompt, its `get_usage` control request, with no session kept, no MCP servers and
+  the user's hooks off. Its windows are t3code's: Session, Weekly, and a week per model;
+  the outputs it's tested on are in `accounts/claude_reads/`. An
   agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
   so every account is a process of its own with its own login and sessions: its threads,
   login sessions (`OpenLoginSession`) and session listing and import (`ListAgentSessions`,
   `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
-  `accounts/droid.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
+  `accounts/droid.rs` and `accounts/claude.rs`; a custom agent's `accounts` in
+  `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the switches that keep
   its login in a file rather than a shared keychain entry, the files a new account's folder
   starts with (`AgentDescription::start_home`, at `AddAccount`: Droid's

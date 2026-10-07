@@ -2029,12 +2029,12 @@ async fn status_commands_check_logins_where_sessions_open_logged_out() {
     command
         .env
         .insert("MOCK_OPENS_LOGGED_OUT".into(), "1".into());
-    let mut status_args = command.args.clone();
-    status_args.push("--status".into());
+    // As Claude's adapter takes `--cli auth status --json` after its script.
     let description = crate::AgentDescription {
         login_check: crate::LoginCheck::Command(crate::StatusCommand {
-            program: Some(command.path.to_string_lossy().into_owned()),
-            args: status_args,
+            program: None,
+            args: vec!["--status".into()],
+            after_agent_args: true,
             logged_in: Some("/logged_in".into()),
         }),
         ..mock_accounts()

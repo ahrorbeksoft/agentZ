@@ -29,6 +29,21 @@ Notes for whoever continues:
   be started at each server start.
 - The server takes an account for login sessions (`OpenLoginSession`) and for listing and
   importing sessions. Since item 8, the Account tab opens a login session per account.
+- Item 15 (Claude, `accounts/claude.rs`): the adapter runs Claude Code itself with `--cli`
+  (as its terminal logins do), so the login check is `--cli auth status --json` after the
+  adapter's script, by `loggedIn` (true on an API key or Bedrock too, as checked on 2.1.287).
+  The reader isn't plan.md's `claude -p "/usage"`, which goes in as a prompt and prints text
+  to parse: it's `get_usage`, the control request the adapter's and t3code's `/usage` send
+  (numbers and ISO reset times), to Claude Code
+  started with no prompt (`--no-session-persistence`, `--strict-mcp-config`,
+  `disableAllHooks`: the user's SessionStart hooks report to herdr and Orca, and would take
+  each read for a session). It leaves nothing behind (no transcript, no project entry), and
+  takes about 6 seconds with `auth status`. Checked against the real Claude: a new home is
+  logged out, and the user's own login read the same windows as the captured fixture. Window
+  names are t3code's (Session, Weekly, "Weekly · <model>"); the plan is `subscriptionType`
+  title-cased. Extra usage and the in-turn `_claude/rateLimit` updates aren't read. Logging
+  a new account in (Claude's terminal login with `CLAUDE_CONFIG_DIR` set) wasn't tried: it
+  needs the user's browser.
 - Item 14: Settings › Usage lists the installed agents that read their accounts' limits
   (`reads_usage`), an agent with one account included, as the mock's Codex is; "across N
   accounts" shows only with more than one. Accounts found logged out are left out, as their
@@ -136,7 +151,7 @@ Notes for whoever continues:
 | 12 | 15 | Accounts in Continue with Another Agent; agent control's accounts (plan › Settings per account: each account's models in the agent listing, an `account` argument on launch and delegate) | done |
 | 13 | 14 | The limit notice over the composer (Continue on another account first) | done |
 | 14 | 16 | Settings › Usage, the composer gauge (the picker's limits came with item 10) | done |
-| 15 | | Wave 1: Claude | |
+| 15 | | Wave 1: Claude | done |
 | 16 | | Wave 1: Codex | |
 | 17 | | Wave 1: Devin | |
 | 18 | 11 | Stop or Continue at reset, per account | |
