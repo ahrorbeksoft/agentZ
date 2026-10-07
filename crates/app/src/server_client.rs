@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
-use agentz_protocol::accounts::{AccountId, AgentAccounts};
+use agentz_protocol::accounts::{AccountId, AgentAccount, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
@@ -464,6 +464,36 @@ impl ServerClient {
     fn set_mcp_servers(&mut self, mcp_servers: Vec<McpServer>, cx: &mut Context<Self>) {
         if mcp_servers != self.mcp_servers {
             self.mcp_servers = mcp_servers;
+            cx.notify();
+        }
+    }
+
+    /// An accounts menu's change, shown before the server confirms it, so the open menu checks
+    /// what was clicked.
+    pub fn show_skill_kept_off(
+        &mut self,
+        name: &str,
+        kept_off: Vec<AgentAccount>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(skill) = self.skills.iter_mut().find(|skill| skill.name == name) {
+            skill.kept_off = kept_off;
+            cx.notify();
+        }
+    }
+
+    pub fn show_mcp_server_kept_off(
+        &mut self,
+        name: &str,
+        kept_off: Vec<AgentAccount>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(server) = self
+            .mcp_servers
+            .iter_mut()
+            .find(|server| server.name == name)
+        {
+            server.kept_off = kept_off;
             cx.notify();
         }
     }

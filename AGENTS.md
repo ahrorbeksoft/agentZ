@@ -172,6 +172,12 @@ From Zed's guidelines, which this code follows:
     higher.
   - Capture with `screencapture -x -o -l <id>`, then restore every patched file.
   - A plain background window never draws, so its screenshot is blank or stale.
+  - Without the Screen Recording permission, `screencapture` fails. Render headlessly instead,
+    in a temporary ignored test in `crates/app`: `HeadlessAppContext::with_platform` with
+    `gpui_macos::MacTextSystem` (temporarily `pub use`d from `gpui_macos`), the app's
+    `Assets` and `gpui_platform::current_headless_renderer`, then save the frame with `image`
+    (temporary dev-dependencies: `gpui_platform` with `test-support`, `gpui_macos` with
+    `font-kit`, `image`). Revert all of it, `Cargo.lock` included.
 
 ## Pitfalls already hit
 

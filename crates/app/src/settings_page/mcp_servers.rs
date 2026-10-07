@@ -2,8 +2,11 @@
 //! (design/accounts decisions.md §19), which every agent and account gets in agentZ threads.
 //! Add Server offers Zed's Add Local Server and Add Remote Server, each a form like Zed's.
 
+use std::rc::Rc;
+
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::Request;
+use agentz_protocol::accounts::AgentAccount;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::mcp_servers::{IGNORES_MCP_SERVERS, McpServer, McpTransport};
 use gpui::{AnyElement, App, Context, Entity, Focusable, Task, Window};
@@ -11,6 +14,7 @@ use text_input::TextInput;
 use ui::{ContextMenu, ContextMenuEntry, PopoverMenu, Switch, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 
+use super::accounts_menu::{KeptOffItem, account_groups, render_accounts_menu};
 use super::skills::{join_with_and, render_error};
 use super::{
     EnvRow, SettingsPage, account_tag, new_text_input, new_variable_row, on_page, render_row,
@@ -30,8 +34,9 @@ pub(super) struct McpServerForm {
     remote: bool,
     /// The server being configured; `None` adds one.
     replacing: Option<String>,
-    /// Kept as it was when one is configured.
+    /// Kept as they were when one is configured.
     enabled: bool,
+    kept_off: Vec<AgentAccount>,
     name: Entity<TextInput>,
     command: Entity<TextInput>,
     /// Split on spaces, as Zed's form does.
@@ -91,6 +96,7 @@ impl McpServerForm {
             name: text(&self.name),
             enabled: self.enabled,
             transport,
+            kept_off: self.kept_off.clone(),
         }
     }
 }
@@ -141,12 +147,16 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         match &self.mcp_servers_page {
-            McpServersPage::List => self.render_mcp_server_list(cx),
+            McpServersPage::List => self.render_mcp_server_list(window, cx),
             McpServersPage::Form(form) => self.render_mcp_server_form(form, window, cx),
         }
     }
 
-    fn render_mcp_server_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_mcp_server_list(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let servers = self.agents_client(cx).read(cx).mcp_servers().to_vec();
         let rows = if servers.is_empty() {
             vec![
@@ -168,7 +178,9 @@ impl SettingsPage {
             servers
                 .iter()
                 .enumerate()
-                .map(|(index, server)| self.render_mcp_server_row(index, server, &agents, cx))
+                .map(|(index, server)| {
+                    self.render_mcp_server_row(index, server, &agents, window, cx)
+                })
                 .collect()
         };
         let list = render_section_with_actions(
@@ -210,8 +222,34 @@ impl SettingsPage {
         index: usize,
         server: &McpServer,
         agents: &[McpAgent],
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let client = self.agents_client(cx);
+        let groups = account_groups(
+            self.registry(cx).read(cx).agents(),
+            client.read(cx),
+            |agent| {
+                agents
+                    .iter()
+                    .find(|other| other.id == *agent.id())
+                    .is_some_and(|agent| agent.gets(server))
+            },
+        );
+        let page = cx.weak_entity();
+        let accounts_menu = render_accounts_menu(
+            KeptOffItem::McpServer(server.name.clone()),
+            groups,
+            client,
+            Rc::new(move |request, cx| {
+                page.update(cx, |page, cx| {
+                    page.send_mcp_server_request(request, "Couldn't change the server", cx)
+                })
+                .log_err();
+            }),
+            window,
+            cx,
+        );
         let selector = format!("mcp-server-{}", server.name);
         let name = server.name.clone();
         let configured = server.clone();
@@ -259,6 +297,7 @@ impl SettingsPage {
                 h_flex()
                     .flex_none()
                     .gap_1()
+                    .children(accounts_menu)
                     .child(
                         div()
                             .debug_selector(move || format!("mcp-server-configure-{index}"))
@@ -431,6 +470,9 @@ impl SettingsPage {
             remote,
             replacing: server.map(|server| server.name.clone()),
             enabled: server.is_none_or(|server| server.enabled),
+            kept_off: server
+                .map(|server| server.kept_off.clone())
+                .unwrap_or_default(),
             name,
             command: new_text_input("/path/to/server", &command, cx),
             args: new_text_input("--flag value", &args, cx),
@@ -696,6 +738,24 @@ struct McpAgent {
     capabilities: Option<acp::McpCapabilities>,
 }
 
+impl McpAgent {
+    fn ignores_servers(&self) -> bool {
+        IGNORES_MCP_SERVERS.contains(&self.id.0.as_ref())
+    }
+
+    /// Whether it's given the server: it doesn't ignore ACP's servers, and for a remote one,
+    /// didn't say it takes local ones only.
+    fn gets(&self, server: &McpServer) -> bool {
+        !self.ignores_servers() && !(server.is_remote() && self.takes_local_only())
+    }
+
+    fn takes_local_only(&self) -> bool {
+        self.capabilities
+            .as_ref()
+            .is_some_and(|capabilities| !capabilities.http)
+    }
+}
+
 /// Which agents don't get the server, and why: those that ignore ACP's MCP servers, and for a
 /// remote one, those that said they only take local ones. Agents that haven't started yet
 /// aren't named.
@@ -707,16 +767,9 @@ fn not_given_notes(server: &McpServer, agents: &[McpAgent]) -> Vec<String> {
             .map(|agent| agent.name.clone())
             .collect()
     };
-    let ignores = |agent: &McpAgent| IGNORES_MCP_SERVERS.contains(&agent.id.0.as_ref());
     let mut notes = Vec::new();
     if server.is_remote() {
-        let local_only = names(&|agent| {
-            !ignores(agent)
-                && agent
-                    .capabilities
-                    .as_ref()
-                    .is_some_and(|capabilities| !capabilities.http)
-        });
+        let local_only = names(&|agent| !agent.ignores_servers() && agent.takes_local_only());
         if !local_only.is_empty() {
             let verb = if local_only.len() == 1 {
                 "takes"
@@ -729,7 +782,7 @@ fn not_given_notes(server: &McpServer, agents: &[McpAgent]) -> Vec<String> {
             ));
         }
     }
-    let ignoring = names(&ignores);
+    let ignoring = names(&McpAgent::ignores_servers);
     if !ignoring.is_empty() {
         let verb = if ignoring.len() == 1 {
             "ignores"
@@ -789,6 +842,7 @@ mod tests {
                 args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
                 env: vec![("GITHUB_TOKEN".into(), "secret".into())],
             },
+            kept_off: Vec::new(),
         }
     }
 
@@ -800,6 +854,7 @@ mod tests {
                 url: "https://mcp.linear.app/mcp".into(),
                 headers: Vec::new(),
             },
+            kept_off: Vec::new(),
         }
     }
 
@@ -1006,5 +1061,120 @@ mod tests {
         }));
         click("mcp-server-delete-1", cx);
         assert!(sent(&Request::DeleteMcpServer("linear".into())));
+    }
+
+    #[gpui::test]
+    fn servers_are_kept_off_accounts_from_their_menu(cx: &mut TestAppContext) {
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let droid = AgentId::new("factory-droid");
+        let claude = AgentId::new("claude-acp");
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![
+                            installed("factory-droid", "Factory Droid"),
+                            installed("claude-acp", "Claude Agent"),
+                        ],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            let requests = requests.clone();
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    Some(Response::Ok)
+                });
+                // Droid takes local servers only, and has an agentZ account beside its own.
+                client.set_agent_settings_for_test(
+                    [(
+                        droid.clone(),
+                        AgentSettings {
+                            mcp_capabilities: Some(acp::McpCapabilities::default()),
+                            ..AgentSettings::default()
+                        },
+                    )]
+                    .into(),
+                    cx,
+                );
+                client.set_accounts_for_test(
+                    [(
+                        droid.clone(),
+                        agentz_protocol::accounts::AgentAccounts {
+                            accounts: vec![super::super::tests::account(1, Some("Work"), None)],
+                            last_id: 1,
+                            ..Default::default()
+                        },
+                    )]
+                    .into(),
+                    cx,
+                );
+                client.set_mcp_servers_for_test(vec![github(), linear()], cx);
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::project_info::init(cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::McpServers, window, cx)
+        });
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let kept_off = |accounts: &[(&AgentId, Option<u64>)]| -> Vec<AgentAccount> {
+            accounts
+                .iter()
+                .map(|(agent_id, account)| AgentAccount {
+                    agent_id: (*agent_id).clone(),
+                    account: account.map(agentz_protocol::accounts::AccountId),
+                })
+                .collect()
+        };
+        let sent = |kept_off: Vec<AgentAccount>| {
+            requests.borrow().contains(&Request::SetMcpServerKeptOff {
+                name: "github".into(),
+                kept_off,
+            })
+        };
+
+        // Linear reaches only Claude's one account, so there's nothing to choose.
+        assert!(cx.debug_bounds("mcp-server-accounts-linear").is_none());
+
+        // Github's menu has Droid's two accounts and Claude's, and stays open as they're
+        // unchecked and checked again.
+        click("mcp-server-accounts-github", cx);
+        let work = "mcp-server-accounts-github-factory-droid-1";
+        assert!(
+            cx.debug_bounds("mcp-server-accounts-github-claude-acp-external")
+                .is_some()
+        );
+        click(work, cx);
+        assert!(sent(kept_off(&[(&droid, Some(1))])));
+        assert_eq!(
+            client.read_with(cx, |client, _| client.mcp_servers()[0].kept_off.clone()),
+            kept_off(&[(&droid, Some(1))])
+        );
+        click("mcp-server-accounts-github-claude-acp-external", cx);
+        assert!(sent(kept_off(&[(&claude, None), (&droid, Some(1))])));
+        click(work, cx);
+        assert!(sent(kept_off(&[(&claude, None)])));
     }
 }

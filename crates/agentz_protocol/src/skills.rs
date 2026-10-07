@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::accounts::AccountId;
+use crate::accounts::{AccountId, AgentAccount};
 use crate::agents::AgentId;
 
 /// Zed's limits.
@@ -26,6 +26,9 @@ pub struct Skill {
     /// The accounts that keep a skill of their own by this name instead.
     #[serde(default)]
     pub skipped: Vec<SkippedSkill>,
+    /// The accounts its accounts menu keeps it off, so an account added later loads it.
+    #[serde(default)]
+    pub kept_off: Vec<AgentAccount>,
 }
 
 /// An account that doesn't load one of agentZ's skills, since its agent has its own skill of

@@ -38,7 +38,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::accounts::{AccountChange, AccountChoice, AccountId, AgentAccounts, SettingsSource};
+use crate::accounts::{
+    AccountChange, AccountChoice, AccountId, AgentAccount, AgentAccounts, SettingsSource,
+};
 use crate::agents::{
     AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, CustomAgentChange, IconId,
     RegistrySnapshot,
@@ -659,6 +661,16 @@ pub enum Request {
     SetMcpServerEnabled {
         name: String,
         enabled: bool,
+    },
+    /// Its accounts menu: the accounts whose sessions don't get an MCP server.
+    SetMcpServerKeptOff {
+        name: String,
+        kept_off: Vec<AgentAccount>,
+    },
+    /// Its accounts menu: the accounts a skill isn't linked into.
+    SetSkillKeptOff {
+        name: String,
+        kept_off: Vec<AgentAccount>,
     },
 
     /// Adds a thread on the account for each of the agent's sessions from

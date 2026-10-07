@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result};
 pub use projects::AccountId;
 use serde::{Deserialize, Serialize};
 
-use crate::agents::AgentSettings;
+use crate::agents::{AgentId, AgentSettings};
 
 /// An agent's accounts, as `agents/accounts.json` keeps them. The External account's settings
 /// are the agent's settings ([`AgentSettings`] in `agents/settings.json`).
@@ -202,6 +202,17 @@ pub struct AccountSupport {
     pub extra_usage_page: Option<String>,
     /// Whether "Copy settings from" copies the agent's own settings files too.
     pub copies_settings_files: bool,
+    /// Whether agentZ's skills are linked into its accounts.
+    pub loads_skills: bool,
+}
+
+/// One account of an agent, as the accounts menu on agentZ's skills and MCP servers keeps it
+/// (design/accounts decisions.md §20).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AgentAccount {
+    pub agent_id: AgentId,
+    /// `None` is the External account.
+    pub account: Option<AccountId>,
 }
 
 impl AccountSupport {

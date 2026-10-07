@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, Attachments, ThreadMessage, ThreadView};
-use agentz_protocol::accounts::AccountId;
+use agentz_protocol::accounts::{AccountId, AgentAccount};
 use agentz_protocol::agents::{
     AgentId, AgentListing, AgentSettings, InstallState, RegistryAgentMetadata, RegistrySnapshot,
 };
@@ -1075,10 +1075,12 @@ impl Server {
             | Request::RefreshUsage { .. }) => self.account_request(request),
             request @ (Request::AddSkill(_)
             | Request::CreateSkill { .. }
-            | Request::DeleteSkill(_)) => self.skill_request(request),
+            | Request::DeleteSkill(_)
+            | Request::SetSkillKeptOff { .. }) => self.skill_request(request),
             request @ (Request::SaveMcpServer { .. }
             | Request::DeleteMcpServer(_)
-            | Request::SetMcpServerEnabled { .. }) => self.mcp_server_request(request),
+            | Request::SetMcpServerEnabled { .. }
+            | Request::SetMcpServerKeptOff { .. }) => self.mcp_server_request(request),
             Request::ContinueAtReset { thread_id, on } => {
                 self.continue_at_reset(thread_id, on)?;
                 Ok(Response::Ok)
@@ -1469,7 +1471,13 @@ impl Server {
         if let Some(revision) = agent_thread.conversation_revision() {
             self.saved_transcripts.insert(thread_id, revision);
         }
-        mcp_servers.extend(mcp_servers::for_session(&self.mcp_servers, &agent_id));
+        mcp_servers.extend(mcp_servers::for_session(
+            &self.mcp_servers,
+            &AgentAccount {
+                agent_id: agent_id.clone(),
+                account,
+            },
+        ));
         agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_turn_hook(self.turn_hook(cwd, thread_id));
         agent_thread.set_attachments(Attachments::for_thread(&self.data_dir, thread_id));

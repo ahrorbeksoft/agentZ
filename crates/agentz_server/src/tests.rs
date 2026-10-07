@@ -2000,6 +2000,7 @@ async fn mcp_servers_go_to_every_session() {
                         name: name.into(),
                         enabled: true,
                         transport,
+                        kept_off: Vec::new(),
                     },
                 })
                 .await;
@@ -2034,6 +2035,7 @@ async fn mcp_servers_go_to_every_session() {
                     name: "github".into(),
                     enabled: true,
                     transport: local(),
+                    kept_off: Vec::new(),
                 },
             })
             .await
@@ -2071,6 +2073,35 @@ async fn mcp_servers_go_to_every_session() {
                     ),
                     _ => None,
                 }) == Some(true)
+            })
+            .await;
+        if takes_http {
+            continue;
+        }
+
+        // Kept off the thread's account, a server doesn't reach its new sessions.
+        client
+            .ok(Request::SetMcpServerKeptOff {
+                name: "github".into(),
+                kept_off: vec![agentz_protocol::accounts::AgentAccount {
+                    agent_id: AgentId::new("mock"),
+                    account: None,
+                }],
+            })
+            .await;
+        let thread_id = client.create_thread(&server).await;
+        let connection = ConnectionId::Thread(thread_id);
+        client.subscribe_thread(connection).await;
+        client
+            .ok(Request::Prompt {
+                connection,
+                prompt: PromptPart::text("mcp-servers"),
+            })
+            .await;
+        client
+            .wait_until(|client| {
+                let thread = client.thread(connection);
+                !thread.is_working() && agent_text(thread) == "MCP servers: none"
             })
             .await;
     }
@@ -2188,6 +2219,37 @@ async fn skills_are_linked_into_every_account() {
         .join(".mock/skills");
     assert!(linked(&work_skills, "review") && linked(&work_skills, "release-notes"));
 
+    // Kept off the work account, review leaves it, and an account added later still loads it.
+    let kept_off = vec![agentz_protocol::accounts::AgentAccount {
+        agent_id: mock.clone(),
+        account: Some(work),
+    }];
+    client
+        .ok(Request::SetSkillKeptOff {
+            name: "review".into(),
+            kept_off: kept_off.clone(),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            skills(client)
+                .iter()
+                .any(|skill| skill.name == "review" && skill.kept_off == kept_off)
+        })
+        .await;
+    assert!(std::fs::symlink_metadata(work_skills.join("review")).is_err());
+    assert!(linked(&work_skills, "release-notes"));
+    let Response::AccountAdded(side) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    let side_skills = server
+        .data_dir
+        .path()
+        .join("accounts/mock")
+        .join(side.to_string())
+        .join(".mock/skills");
+    assert!(linked(&side_skills, "review"));
+
     client
         .ok(Request::DeleteSkill("release-notes".into()))
         .await;
@@ -2195,7 +2257,7 @@ async fn skills_are_linked_into_every_account() {
     assert!(!skills_folder.join("release-notes").exists());
     assert!(std::fs::symlink_metadata(external_skills.join("release-notes")).is_err());
     assert!(std::fs::symlink_metadata(work_skills.join("release-notes")).is_err());
-    assert!(linked(&work_skills, "review"));
+    assert!(linked(&side_skills, "review"));
 }
 
 /// Gives the mock agent an agentZ account before the server starts, so it checks the External

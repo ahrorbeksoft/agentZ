@@ -3,6 +3,7 @@
 //! Folder… and Zed's Create a Skill.
 
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use agentz_protocol::Request;
 use agentz_protocol::accounts::{AccountId, AgentAccounts};
@@ -19,6 +20,7 @@ use text_input::{TextInput, TextInputEvent};
 use ui::{ContextMenu, ContextMenuEntry, Divider, PopoverMenu, Tooltip, prelude::*};
 use util::ResultExt as _;
 
+use super::accounts_menu::{KeptOffItem, account_groups, render_accounts_menu};
 use super::{
     SettingsPage, SettingsPageEvent, account_entry, new_text_input, on_page,
     render_section_with_actions,
@@ -127,12 +129,12 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         match &self.skills_page {
-            SkillsPage::List => self.render_skill_list(cx),
+            SkillsPage::List => self.render_skill_list(window, cx),
             SkillsPage::Create(form) => self.render_skill_form(form, window, cx),
         }
     }
 
-    fn render_skill_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_skill_list(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let skills = self.agents_client(cx).read(cx).skills().to_vec();
         let rows = if skills.is_empty() {
             vec![
@@ -162,7 +164,7 @@ impl SettingsPage {
             skills
                 .iter()
                 .enumerate()
-                .map(|(index, skill)| self.render_skill_row(index, skill, cx))
+                .map(|(index, skill)| self.render_skill_row(index, skill, window, cx))
                 .collect()
         };
         let list = render_section_with_actions(
@@ -180,8 +182,39 @@ impl SettingsPage {
 
     /// Zed's row: the name, with a warning when an agent skips the skill and why, the
     /// description, then delete and Open ↗.
-    fn render_skill_row(&self, index: usize, skill: &Skill, cx: &mut Context<Self>) -> AnyElement {
+    fn render_skill_row(
+        &self,
+        index: usize,
+        skill: &Skill,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let reasons = self.skip_reasons(skill, cx);
+        let client = self.agents_client(cx);
+        let groups = account_groups(
+            self.registry(cx).read(cx).agents(),
+            client.read(cx),
+            |agent| {
+                agent
+                    .accounts
+                    .as_ref()
+                    .is_some_and(|accounts| accounts.loads_skills)
+            },
+        );
+        let page = cx.weak_entity();
+        let accounts_menu = render_accounts_menu(
+            KeptOffItem::Skill(skill.name.clone()),
+            groups,
+            client.clone(),
+            Rc::new(move |request, cx| {
+                page.update(cx, |page, cx| {
+                    page.send_skill_request(&client, request, "Couldn't change the skill", cx)
+                })
+                .log_err();
+            }),
+            window,
+            cx,
+        );
         let is_local = self.agents_machine == MachineId::Local;
         let machine = self.machines.read(cx).label(self.agents_machine, cx);
         let skill_path = skill.path.clone();
@@ -224,6 +257,7 @@ impl SettingsPage {
                 h_flex()
                     .flex_none()
                     .gap_2()
+                    .children(accounts_menu)
                     .child(
                         div()
                             .debug_selector(move || format!("skill-delete-{index}"))
@@ -420,14 +454,30 @@ impl SettingsPage {
         name: String,
         cx: &mut Context<Self>,
     ) {
+        self.send_skill_request(
+            client,
+            Request::DeleteSkill(name),
+            "Couldn't delete the skill",
+            cx,
+        );
+    }
+
+    /// Sends a change to the machine the skill was listed on, to say why if it fails.
+    fn send_skill_request(
+        &mut self,
+        client: &Entity<ServerClient>,
+        request: Request,
+        failure: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         self.skill_error = None;
-        let response = client.read(cx).request(Request::DeleteSkill(name));
+        let response = client.read(cx).request(request);
         cx.spawn(async move |this, cx| {
             let Err(error) = response.await else {
                 return;
             };
             this.update(cx, |this, cx| {
-                this.skill_error = Some(format!("Couldn't delete the skill: {error:#}").into());
+                this.skill_error = Some(format!("{failure}: {error:#}").into());
                 cx.notify();
             })
             .log_err();
@@ -731,6 +781,7 @@ mod tests {
     use std::rc::Rc;
 
     use agentz_protocol::Response;
+    use agentz_protocol::accounts::{AccountSupport, AgentAccount};
     use agentz_protocol::agents::{InstallState, RegistrySnapshot};
     use agentz_protocol::skills::SkippedSkill;
     use agentz_protocol::spaces::SpacesSnapshot;
@@ -821,17 +872,22 @@ mod tests {
                 cx,
             );
             let registry = client.read(cx).registry().clone();
+            let mut mock_listing = listing(
+                "mock",
+                "Mock",
+                InstallState::Installed {
+                    version: "2.0.0".into(),
+                    update_available: false,
+                },
+            );
+            mock_listing.accounts = Some(AccountSupport {
+                loads_skills: true,
+                ..AccountSupport::default()
+            });
             registry.update(cx, |registry, cx| {
                 registry.set_snapshot(
                     RegistrySnapshot {
-                        agents: vec![listing(
-                            "mock",
-                            "Mock",
-                            InstallState::Installed {
-                                version: "2.0.0".into(),
-                                update_available: false,
-                            },
-                        )],
+                        agents: vec![mock_listing],
                         is_fetching: false,
                         fetch_error: None,
                     },
@@ -843,7 +899,9 @@ mod tests {
                 client.answer_for_test(move |request| {
                     requests.borrow_mut().push(request.clone());
                     match request {
-                        Request::CreateSkill { .. } | Request::DeleteSkill(_) => Some(Response::Ok),
+                        Request::CreateSkill { .. }
+                        | Request::DeleteSkill(_)
+                        | Request::SetSkillKeptOff { .. } => Some(Response::Ok),
                         _ => None,
                     }
                 });
@@ -957,16 +1015,18 @@ mod tests {
                 description: "Writes release notes.".into(),
                 path: "/tmp/agentz-test/skills/release-notes/SKILL.md".into(),
                 skipped: Vec::new(),
+                kept_off: Vec::new(),
             },
             Skill {
                 name: "review".into(),
                 description: "Reviews a change.".into(),
                 path: "/tmp/agentz-test/skills/review/SKILL.md".into(),
                 skipped: vec![SkippedSkill {
-                    agent_id: mock,
+                    agent_id: mock.clone(),
                     account: Some(AccountId(1)),
                     own: "/tmp/agentz-test/accounts/mock/1/.mock/skills/review".into(),
                 }],
+                kept_off: Vec::new(),
             },
         ];
         client.update(cx, |client, cx| {
@@ -1007,5 +1067,16 @@ mod tests {
         cx.update(|window, cx| (confirm.on_confirm)(window, cx));
         cx.run_until_parked();
         assert!(sent(&Request::DeleteSkill("review".into())));
+
+        // Its accounts menu keeps it off one of Mock's four accounts.
+        click("skill-accounts-review", cx);
+        click("skill-accounts-review-mock-2", cx);
+        assert!(sent(&Request::SetSkillKeptOff {
+            name: "review".into(),
+            kept_off: vec![AgentAccount {
+                agent_id: mock,
+                account: Some(AccountId(2)),
+            }],
+        }));
     }
 }

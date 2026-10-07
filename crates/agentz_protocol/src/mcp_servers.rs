@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::AgentAccount;
+
 /// The name of the server agentZ gives every thread for its own tools.
 pub const AGENTZ_SERVER_NAME: &str = "agentz";
 
@@ -19,6 +21,9 @@ pub struct McpServer {
     /// Turned off with its switch, it stays listed but goes to no session.
     pub enabled: bool,
     pub transport: McpTransport,
+    /// The accounts its accounts menu keeps it off, so an account added later gets it.
+    #[serde(default)]
+    pub kept_off: Vec<AgentAccount>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +44,13 @@ pub enum McpTransport {
 }
 
 impl McpServer {
+    /// Whether a session of the account gets it.
+    pub fn reaches(&self, account: &AgentAccount) -> bool {
+        self.enabled
+            && !IGNORES_MCP_SERVERS.contains(&account.agent_id.0.as_ref())
+            && !self.kept_off.contains(account)
+    }
+
     pub fn is_remote(&self) -> bool {
         matches!(self.transport, McpTransport::Remote { .. })
     }
@@ -109,6 +121,7 @@ mod tests {
                     .map(|(key, value)| (key.to_string(), value.to_string()))
                     .collect(),
             },
+            kept_off: Vec::new(),
         }
     }
 
@@ -123,6 +136,7 @@ mod tests {
                     .map(|(key, value)| (key.to_string(), value.to_string()))
                     .collect(),
             },
+            kept_off: Vec::new(),
         }
     }
 

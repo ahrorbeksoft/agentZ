@@ -283,6 +283,13 @@ Notes for whoever continues:
   and the pi and Autohand adapters ignore ACP's servers, so they get none and the page says
   so; agents that take local servers only are named under each remote server once a thread
   or login session has started them.
+- Accounts menu (item 25): what's kept is the accounts a skill or server is kept off, not
+  those it loads on, so a new account starts checked, as §20 says. The menu lists only
+  installed agents that could load the item (agents with a skills folder; for a server, those
+  that get it), and isn't shown while there's a single account to choose. Choices of mine:
+  the menu stays open as checks change, and a skill added again under the same name starts
+  on every account. Checked in a headless test and a headless render (no screenshots: the
+  screen recording permission is off).
 
 | Order | § | Item | Status |
 |---|---|---|---|
@@ -310,7 +317,7 @@ Notes for whoever continues:
 | 22 | 17, 18 | agentZ's skills folder, linking into accounts, Settings › Skills | done |
 | 23 | 17 | Importing the skills already in the agents' homes and `~/.agents/skills` | dropped |
 | 24 | 19 | Settings › MCP Servers, passed to every session | done |
-| 25 | 20 | The accounts menu on each skill and server | |
+| 25 | 20 | The accounts menu on each skill and server | done |
 | 26 | | Importing skills and servers from another machine (board topic first) | |
 | 27 | | Wave 2, one agent per commit | |
 | 28 | | Wave 3, one agent per commit | |

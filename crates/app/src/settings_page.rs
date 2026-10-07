@@ -3,6 +3,7 @@
 //! project) and
 //! the chosen section's rows on the right.
 
+mod accounts_menu;
 mod mcp_servers;
 mod skills;
 
@@ -6513,7 +6514,7 @@ pub(crate) fn render_entry_avatar(entry: &AccountEntry, size: Pixels, cx: &App) 
 }
 
 /// An account in a menu: its avatar and name, and a check when it's the one chosen.
-fn render_account_entry(entry: &AccountEntry, is_current: bool, cx: &App) -> AnyElement {
+pub(crate) fn render_account_entry(entry: &AccountEntry, is_current: bool, cx: &App) -> AnyElement {
     h_flex()
         .w_full()
         .gap_1p5()
@@ -7865,6 +7866,7 @@ mod tests {
             usage_page: Some("https://example.com/usage".into()),
             extra_usage_page: Some("https://example.com/extra-usage".into()),
             copies_settings_files: true,
+            loads_skills: false,
         });
         let work = AccountStatus {
             email: Some("alex@acme.co".into()),

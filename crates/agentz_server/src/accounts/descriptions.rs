@@ -101,6 +101,7 @@ impl AgentDescription {
             usage_page: self.usage_page.clone(),
             extra_usage_page: self.extra_usage_page.clone(),
             copies_settings_files: !self.settings_files.is_empty(),
+            loads_skills: self.skill_folders(None).ok().flatten().is_some(),
         }
     }
 

@@ -4,10 +4,11 @@
 //! them, and skipped where the agent has a skill of its own by that name. Only links into
 //! `skills/` are ever removed.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use agentz_protocol::accounts::AccountId;
+use agentz_protocol::accounts::{AccountId, AgentAccount};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::skills::{
     FOLDER_TOO_LARGE, MAX_FOLDER_SIZE, Skill, SkillFile, SkippedSkill, validate_description,
@@ -17,6 +18,8 @@ use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::agent_settings::{read_json, write_json};
+
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 /// Zed's limit.
 const MAX_SKILL_FILE_SIZE: usize = 100 * 1024;
@@ -24,6 +27,35 @@ const MAX_SKILL_FILE_SIZE: usize = 100 * 1024;
 /// Where agentZ keeps its skills.
 pub fn folder(data_dir: &Path) -> PathBuf {
     data_dir.join("skills")
+}
+
+/// What the accounts menu chose for one of the skills (design/accounts decisions.md §20), kept
+/// in `skills.json` in the data directory by the skill's name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillChoices {
+    pub kept_off: Vec<AgentAccount>,
+}
+
+fn choices_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("skills.json")
+}
+
+pub fn load_choices(data_dir: &Path) -> Result<BTreeMap<String, SkillChoices>> {
+    Ok(read_json(&choices_path(data_dir))?.unwrap_or_default())
+}
+
+/// Keeps the skill named `name` off `kept_off`, or with none, forgets what was chosen for it.
+pub fn set_kept_off(data_dir: &Path, name: &str, kept_off: Vec<AgentAccount>) -> Result<()> {
+    let mut choices = load_choices(data_dir)?;
+    if kept_off.is_empty() {
+        if choices.remove(name).is_none() {
+            return Ok(());
+        }
+    } else {
+        choices.insert(name.to_string(), SkillChoices { kept_off });
+    }
+    write_json(&choices_path(data_dir), &choices)
 }
 
 /// A `SKILL.md`'s frontmatter, as Zed reads and writes it.
@@ -58,6 +90,7 @@ pub fn list(folder: &Path) -> Result<Vec<Skill>> {
                 description: frontmatter.description,
                 path,
                 skipped: Vec::new(),
+                kept_off: Vec::new(),
             }),
             Err(error) => log::warn!("leaving out the skill in {}: {error:#}", path.display()),
         }
@@ -280,6 +313,16 @@ pub struct SkillTarget {
     pub loads: bool,
 }
 
+impl SkillTarget {
+    /// Whether the skill's accounts menu leaves it on this account.
+    fn takes(&self, skill: &Skill) -> bool {
+        !skill
+            .kept_off
+            .iter()
+            .any(|kept_off| kept_off.agent_id == self.agent_id && kept_off.account == self.account)
+    }
+}
+
 /// Links each of `skills` (in `folder`) into each target, except where the agent has a skill of
 /// its own by that name or already loads ours from another of its folders, and removes
 /// agentZ's links that aren't wanted any more. Returns the skills with the accounts that
@@ -334,9 +377,9 @@ fn sync_target(
                 };
                 let is_wanted = target.loads
                     && link.file_name() == to.file_name()
-                    && skills
-                        .iter()
-                        .any(|skill| to.file_name() == Some(OsStr::new(&skill.name)));
+                    && skills.iter().any(|skill| {
+                        to.file_name() == Some(OsStr::new(&skill.name)) && target.takes(skill)
+                    });
                 if !is_wanted {
                     remove_link(&link)?;
                 }
@@ -352,6 +395,10 @@ fn sync_target(
     }
     let mut skipped = Vec::new();
     for (index, skill) in skills.iter().enumerate() {
+        // Its link, if it had one, went above.
+        if !target.takes(skill) {
+            continue;
+        }
         let link = target.folder.join(&skill.name);
         // agentZ's links elsewhere (an External account's, which another agent reads too)
         // aren't the agent's own.
@@ -618,5 +665,49 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["frontend-design", "mine"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_a_skill_off_the_accounts_its_menu_unchecks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path().join("skills");
+        create(&folder, "review", "A skill.", "Do it.").expect("create");
+        let target = |account: Option<AccountId>| SkillTarget {
+            agent_id: AgentId::new("claude"),
+            account,
+            folder: dir
+                .path()
+                .join(account.map_or_else(|| "external".to_string(), |id| id.to_string()))
+                .join("skills"),
+            other_folders: Vec::new(),
+            loads: true,
+        };
+        let (external, work) = (target(None), target(Some(AccountId(1))));
+        let targets = [external.clone(), work.clone()];
+        let linked = |target: &SkillTarget| target.folder.join("review").exists();
+        sync(&folder, list(&folder).expect("list"), &targets);
+        assert!(linked(&external) && linked(&work));
+
+        set_kept_off(
+            dir.path(),
+            "review",
+            vec![AgentAccount {
+                agent_id: AgentId::new("claude"),
+                account: Some(AccountId(1)),
+            }],
+        )
+        .expect("keep it off");
+        let mut skills = list(&folder).expect("list");
+        skills[0].kept_off = load_choices(dir.path()).expect("load")["review"]
+            .kept_off
+            .clone();
+        let skills = sync(&folder, skills, &targets);
+        assert!(linked(&external) && !linked(&work));
+        assert!(skills[0].skipped.is_empty());
+
+        // Every account again forgets the choice.
+        set_kept_off(dir.path(), "review", Vec::new()).expect("put it back");
+        assert!(load_choices(dir.path()).expect("load").is_empty());
     }
 }

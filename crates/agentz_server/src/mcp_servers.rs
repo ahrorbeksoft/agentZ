@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::agents::AgentId;
-use agentz_protocol::mcp_servers::{IGNORES_MCP_SERVERS, McpServer, McpTransport};
+use agentz_protocol::accounts::AgentAccount;
+use agentz_protocol::mcp_servers::{McpServer, McpTransport};
 use anyhow::{Result, anyhow};
 
 use crate::agent_settings::{read_json, write_json};
@@ -63,28 +63,26 @@ pub fn delete_server(data_dir: &Path, servers: &mut Vec<McpServer>, name: &str) 
     save(data_dir, servers)
 }
 
-pub fn set_enabled(
+/// Changes the server named `name` (its switch, its accounts menu) and saves them.
+pub fn change(
     data_dir: &Path,
     servers: &mut [McpServer],
     name: &str,
-    enabled: bool,
+    change: impl FnOnce(&mut McpServer),
 ) -> Result<()> {
     let server = servers
         .iter_mut()
         .find(|server| server.name == name)
         .ok_or_else(|| anyhow!("There's no MCP server named \"{name}\"."))?;
-    server.enabled = enabled;
+    change(server);
     save(data_dir, servers)
 }
 
-/// What a session of `agent_id` is given of agentZ's servers.
-pub fn for_session(servers: &[McpServer], agent_id: &AgentId) -> Vec<acp::McpServer> {
-    if IGNORES_MCP_SERVERS.contains(&agent_id.0.as_ref()) {
-        return Vec::new();
-    }
+/// What a session on `account` is given of agentZ's servers.
+pub fn for_session(servers: &[McpServer], account: &AgentAccount) -> Vec<acp::McpServer> {
     servers
         .iter()
-        .filter(|server| server.enabled)
+        .filter(|server| server.reaches(account))
         .map(|server| match &server.transport {
             McpTransport::Local { command, args, env } => acp::McpServer::Stdio(
                 acp::McpServerStdio::new(server.name.clone(), find_program(command))
@@ -126,6 +124,9 @@ fn find_program(command: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use agentz_protocol::accounts::AccountId;
+    use agentz_protocol::agents::AgentId;
+
     use super::*;
 
     fn server(name: &str, transport: McpTransport) -> McpServer {
@@ -133,6 +134,7 @@ mod tests {
             name: name.into(),
             enabled: true,
             transport,
+            kept_off: Vec::new(),
         }
     }
 
@@ -182,7 +184,9 @@ mod tests {
             Some("github"),
             server("gh", local("/usr/bin/env")),
         )?;
-        set_enabled(data_dir.path(), &mut servers, "linear", false)?;
+        change(data_dir.path(), &mut servers, "linear", |server| {
+            server.enabled = false
+        })?;
         assert_eq!(load(data_dir.path())?, servers);
         assert_eq!(
             servers
@@ -192,7 +196,11 @@ mod tests {
             ["gh", "linear"]
         );
 
-        let given = for_session(&servers, &AgentId::new("claude"));
+        let account = |agent_id: &str, account: Option<u64>| AgentAccount {
+            agent_id: AgentId::new(agent_id.to_string()),
+            account: account.map(AccountId),
+        };
+        let given = for_session(&servers, &account("claude", None));
         assert_eq!(
             given,
             [acp::McpServer::Stdio(
@@ -201,7 +209,16 @@ mod tests {
                     .env(vec![acp::EnvVariable::new("GITHUB_TOKEN", "secret")])
             )]
         );
-        assert!(for_session(&servers, &AgentId::new("cline")).is_empty());
+        assert!(for_session(&servers, &account("cline", None)).is_empty());
+
+        // Kept off one account, the others still get it.
+        let kept_off = vec![account("claude", Some(2))];
+        change(data_dir.path(), &mut servers, "gh", |server| {
+            server.kept_off = kept_off.clone()
+        })?;
+        assert_eq!(load(data_dir.path())?[0].kept_off, kept_off);
+        assert!(for_session(&servers, &account("claude", Some(2))).is_empty());
+        assert_eq!(for_session(&servers, &account("claude", Some(3))), given);
 
         delete_server(data_dir.path(), &mut servers, "gh")?;
         assert_eq!(load(data_dir.path())?.len(), 1);

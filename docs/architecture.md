@@ -137,7 +137,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `accounts/<agent id>/<account id>/` | server | An agentZ account's home: the agent's login, sessions and own settings files |
 | `accounts/<agent id>/reader/` | server | Where the agent's reader runs its terminal UI (Droid's), with the settings it runs with |
 | `skills/<name>/` | server | agentZ's skills (Settings › Skills), each linked into every account's skills folder |
-| `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session |
+| `skills.json` | server | The accounts each of agentZ's skills is kept off (its accounts menu) |
+| `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
@@ -318,8 +319,8 @@ Each entry: what it does, where it lives, and where it comes from.
   it reads (`outside_skills_folders` too), agentZ's is skipped, and the skills are sent with
   the accounts skipping them (`Event::Skills`). Devin reads Claude's `~/.claude/skills`, so
   Claude's accounts are linked first and Devin skips a skill it finds linked there. Only links
-  into `skills/` are ever removed. With more than one machine, the Agents page's machine
-  picker sits in the header.
+  into `skills/` are ever removed. Each row's accounts menu keeps a skill off some accounts
+  (below). With more than one machine, the Agents page's machine picker sits in the header.
 - **Settings › MCP Servers** (`settings_page/mcp_servers.rs`, `agentz_server::mcp_servers`,
   `server/mcp_server_requests.rs`; Zed's MCP Servers page and form, accounts topic 19):
   agentZ's own MCP servers on the machine, kept in `mcp-servers.json`, which every agent and
@@ -338,6 +339,17 @@ Each entry: what it does, where it lives, and where it comes from.
   (`AgentSettings::mcp_capabilities`) when a thread or login session starts it, so the page
   can say "Not given to Factory Droid, which takes local servers only." for remote servers.
   With more than one machine, the Agents page's machine picker sits in the header.
+- **The accounts menu on skills and MCP servers** (`settings_page/accounts_menu.rs`; accounts
+  topic 20): a menu on each skill's and server's row, "Every account" or "2 of 5", listing
+  the accounts of the installed agents that could load it (for a server, those that get it),
+  grouped by agent, each with a check; it's left out while there's only one such account.
+  What's kept is the accounts it's kept off (`AgentAccount`s, the External account's with no
+  id): `Skill::kept_off` from `skills.json`, `McpServer::kept_off` in `mcp-servers.json`, so
+  an account added later loads it. A click shows the change at once and sends
+  `Request::SetSkillKeptOff` or `SetMcpServerKeptOff`; the menu stays open. `skills::sync`
+  removes a skill's link from the accounts it's kept off, and `start_thread` leaves the
+  server out of their sessions (`McpServer::reaches`). Adding, creating or deleting a skill
+  forgets its choices.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
   Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
 

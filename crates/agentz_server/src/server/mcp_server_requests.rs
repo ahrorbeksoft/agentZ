@@ -20,7 +20,14 @@ impl Server {
                 mcp_servers::delete_server(&data_dir, &mut self.mcp_servers, &name)?
             }
             Request::SetMcpServerEnabled { name, enabled } => {
-                mcp_servers::set_enabled(&data_dir, &mut self.mcp_servers, &name, enabled)?
+                mcp_servers::change(&data_dir, &mut self.mcp_servers, &name, |server| {
+                    server.enabled = enabled
+                })?
+            }
+            Request::SetMcpServerKeptOff { name, kept_off } => {
+                mcp_servers::change(&data_dir, &mut self.mcp_servers, &name, |server| {
+                    server.kept_off = kept_off
+                })?
             }
             request => return Err(anyhow!("not an MCP server request: {request:?}")),
         }

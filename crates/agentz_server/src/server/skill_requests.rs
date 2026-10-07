@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 
 use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::skills::Skill;
 use agentz_protocol::{Request, Response};
 use anyhow::{Result, anyhow};
 use util::ResultExt as _;
@@ -15,18 +16,33 @@ use crate::skills::{self, SkillTarget};
 impl Server {
     pub(super) fn skill_request(&mut self, request: Request) -> Result<Response> {
         let folder = skills::folder(&self.data_dir);
-        match request {
-            Request::AddSkill(files) => {
-                skills::add(&folder, &files)?;
-            }
+        // A new skill loads on every account, whatever was chosen for one of its name before.
+        let forgotten = match request {
+            Request::AddSkill(files) => skills::add(&folder, &files)?,
             Request::CreateSkill {
                 name,
                 description,
                 body,
-            } => skills::create(&folder, &name, &description, &body)?,
-            Request::DeleteSkill(name) => skills::delete(&folder, &name)?,
+            } => {
+                skills::create(&folder, &name, &description, &body)?;
+                name
+            }
+            Request::DeleteSkill(name) => {
+                skills::delete(&folder, &name)?;
+                name
+            }
+            Request::SetSkillKeptOff { name, kept_off } => {
+                anyhow::ensure!(
+                    self.skills.iter().any(|skill| skill.name == name),
+                    "There's no skill named \"{name}\"."
+                );
+                skills::set_kept_off(&self.data_dir, &name, kept_off)?;
+                self.list_skills();
+                return Ok(Response::Ok);
+            }
             request => return Err(anyhow!("not a skill request: {request:?}")),
-        }
+        };
+        skills::set_kept_off(&self.data_dir, &forgotten, Vec::new()).log_err();
         self.list_skills();
         Ok(Response::Ok)
     }
@@ -34,10 +50,24 @@ impl Server {
     /// Reads the skills folder again. Their links, and who skips each, follow with the next
     /// changes sent.
     pub(super) fn list_skills(&mut self) {
-        self.skills = skills::list(&skills::folder(&self.data_dir))
+        self.skills = self.listed_skills();
+        self.skills_synced = false;
+    }
+
+    /// The skills in the folder, with the accounts each is kept off.
+    fn listed_skills(&self) -> Vec<Skill> {
+        let mut listed = skills::list(&skills::folder(&self.data_dir))
             .log_err()
             .unwrap_or_default();
-        self.skills_synced = false;
+        let mut choices = skills::load_choices(&self.data_dir)
+            .log_err()
+            .unwrap_or_default();
+        for skill in &mut listed {
+            if let Some(choices) = choices.remove(&skill.name) {
+                skill.kept_off = choices.kept_off;
+            }
+        }
+        listed
     }
 
     /// Links the skills into every account, when they or the accounts that load them changed
@@ -56,9 +86,8 @@ impl Server {
         if self.skills_synced && targets == self.skill_targets_synced {
             return;
         }
-        let folder = skills::folder(&self.data_dir);
-        let listed = skills::list(&folder).log_err().unwrap_or_default();
-        self.skills = skills::sync(&folder, listed, &targets);
+        let listed = self.listed_skills();
+        self.skills = skills::sync(&skills::folder(&self.data_dir), listed, &targets);
         self.skill_targets_synced = targets;
         self.skills_synced = true;
     }
