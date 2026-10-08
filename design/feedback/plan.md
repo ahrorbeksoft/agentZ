@@ -352,3 +352,31 @@ Screenshots are in `evidence/`. The ones that show the user's account emails are
 - Find what opens it first: check the server log (`logs/server.log` in the data directory) for usage reads and `agy` runs around the time it happens, and ask the user when it last happened.
 - Don't log the user out of Antigravity, and don't refresh, change or copy its stored logins beyond what AGENTS.md allows.
 
+## 25. `agentz_thread_list` never answers when the project is on more than one machine
+
+**Reported:** handed off from a thread on Devbox 1. There, `agentz_thread_list` hung, both as the MCP tool and as `agentz-server call agentz_thread_list '{"limit":20}'`. The MCP call waited 30 minutes until Claude Code aborted it. The server was otherwise healthy, and other relayed calls worked (`agentz_thread_launch` with `machine: "This Mac"`).
+
+**Researched on This Mac on 2026-10-08, so unlike the other entries, the cause is known:**
+- The first page of a list runs `list_everywhere` (`crates/agentz_server/src/server/tools/relay.rs`) for every caller. That includes a call relayed from another machine, whose caller is a `ToolCaller::Directory`.
+- So the list bounces:
+  1. Devbox 1 relays it to This Mac through the app (`relay_tool_call` in `crates/app/src/machines.rs`).
+  2. This Mac's server runs `list_everywhere` again and relays it back to Devbox 1.
+  3. This repeats, and each server waits on its relay with no timeout, so nothing answers.
+- It's an endless ping-pong, not a one-time deadlock. Two scratch servers, each told about the other's checkout, with a script relaying as the app does: 32,451 hops in 3 s, still going after the caller gave up. Between real machines the SSH round trip paces it (about 7 hops a second to Devbox 1). That keeps it quiet on the network, but it grows both servers' memory while it runs.
+- A loop ends only when one of these happens, and then the whole chain unwinds:
+  - one side's peers stop listing the other's checkout;
+  - the app disconnects from either server;
+  - a server restarts.
+- The hang comes and goes. From 15:34:56 to 15:38:34 UTC, This Mac's server listed no Devbox 1 checkout of agentZ, and the list answered at once. Then the checkout was back, and the list hung again. Why the app's peers dropped the checkout for those minutes wasn't found.
+- Pages after the first (`cursor` above 0) never relay, so they always answer.
+- The tests miss it: `agents_work_on_other_machines_through_the_app` (`crates/agentz_server/src/tests.rs`) sends `SetPeers` to only one of its two servers.
+
+**Wanted:**
+- `agentz_thread_list` answers on every machine, with the first page listing every machine's threads, as it was meant to.
+
+**Notes for whoever picks this up:**
+- A possible fix: don't run `list_everywhere` for relayed calls (a `Directory` caller has no thread). Consider a timeout on relays too, so one machine that never answers can't hang the caller.
+- Only `agentz_thread_list` relays on its own. The other relayed tools go to another machine only when given `machine`, which the relay removes before passing the call on.
+- Find why the app's peers dropped a combined project's checkout for minutes at a time (`sync_peers` and `peer_checkouts` in `crates/app/src/machines.rs`). It hid this bug some of the time, and it would also make `machine` calls fail with "This project isn't on …" meanwhile.
+- Test it by giving both servers in that test `SetPeers` with each other's checkout, then checking that the list answers with both machines' threads.
+

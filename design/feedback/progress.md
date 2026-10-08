@@ -37,4 +37,5 @@ Notes for whoever continues:
 | 15 | 12, 13 | Tool calls and images in threads, ToolSearch, agentZ's own tools ("Started a subthread") | design round | picked (`design/tool-calls/decisions.md`): file icons for reads and edits, output first with the input behind "Input", wrapped lines, images shown at once, thumbnails in messages, t3code's viewer, agentZ's tools as what they did, ToolSearch as "Loaded 8 tools", other MCP tools in words with their server. Not built yet |
 | 16 | 10 | Simpler thread terminals | design round | picked (`design/thread-terminals/decisions.md`): shells as tabs, no split buttons, a strip above the shell, ask before closing a busy shell, under the composer as today, drag and Full Screen as today. Not built yet |
 | 17 | 1 | Thread cards with a draft | design round | picked (`design/draft-cards/decisions.md`): a gray "Draft" badge before the state, and the same on new-thread draft rows, without the tint. Not built yet |
-| 18 | 14 | Agents manage workspaces, terminals and projects on any machine, and delegate there | feature | not started |
+| 18 | 25 | `agentz_thread_list` answers when the project is on several machines, instead of bouncing between them | fix (cause known) | not started |
+| 19 | 14 | Agents manage workspaces, terminals and projects on any machine, and delegate there | feature | not started |
