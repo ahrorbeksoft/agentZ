@@ -28,9 +28,9 @@ use agentz_protocol::agents::select_offers;
 use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
-    AuthStatus, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry, FileDiff,
-    PendingHandoff, PermissionOption, PermissionRequest, PlanItem, QueuedMessage, SessionDefaults,
-    SessionRestore, ThreadState, ThreadView, ToolCall, TurnTime,
+    AuthStatus, BackgroundTask, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry,
+    FileDiff, PendingHandoff, PermissionOption, PermissionRequest, PlanItem, QueuedMessage,
+    SessionDefaults, SessionRestore, ThreadState, ThreadView, ToolCall, TurnTime,
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -56,6 +56,14 @@ const AUTH_STATUS_NOTIFICATION: &str = "_auth/status_update";
 /// How Claude Agent and Codex take a message into a running turn: an ACP extension request,
 /// until ACP has its own.
 const STEERING_REQUEST: &str = "_session/steering";
+
+/// How Claude Agent stops a background task: JetBrains AIR's async tasks extension.
+const STOP_BACKGROUND_TASK_REQUEST: &str = "_session/async_task/stop";
+
+/// How long an agent working without a prompt may send nothing, with no tool call running,
+/// before it counts as done. Only for agents that don't end that work with a cost, as Claude
+/// Agent does.
+const OWN_WORK_QUIET: Duration = Duration::from_secs(30);
 
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
@@ -177,6 +185,53 @@ enum MessageKind {
     ElicitationCancelled(u64),
     /// The agent reported its login (`_auth/status_update`).
     AuthStatus(AuthStatus),
+    /// The agent reported on work it left running ([`ThreadState::background_tasks`]).
+    BackgroundTask(BackgroundTaskUpdate),
+    /// The agent answered [`AgentThread::stop_background_task`].
+    BackgroundTaskStopped {
+        task_id: SharedString,
+        result: std::result::Result<Value, agent_client_protocol::Error>,
+    },
+    /// [`OWN_WORK_QUIET`] passed since the agent, working without a prompt, had sent this many
+    /// updates.
+    OwnWorkQuiet(u64),
+    /// The owner's work after the agent's work of its own is done.
+    OwnWorkEnded,
+}
+
+/// A `session/update` of JetBrains AIR's async tasks extension, by which Claude Agent reports
+/// the work it left running. ACP's own updates don't include them.
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "sessionUpdate",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum BackgroundTaskUpdate {
+    AsyncTaskSpawned {
+        async_task_id: String,
+        name: Option<String>,
+        description: Option<String>,
+        task_type: Option<String>,
+        #[serde(default)]
+        can_stop: bool,
+        output_file_path: Option<PathBuf>,
+        tool_call_id: Option<String>,
+    },
+    AsyncTaskProgress {
+        async_task_id: String,
+        description: Option<String>,
+        summary: Option<String>,
+        output_file_path: Option<PathBuf>,
+        tool_call_id: Option<String>,
+    },
+    AsyncTaskStateUpdate {
+        async_task_id: String,
+        /// "running", "paused", "completed", "failed" or "stopped".
+        state: String,
+        output_file_path: Option<PathBuf>,
+        tool_call_id: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -288,6 +343,21 @@ pub struct AgentThread {
     /// Counts changes to what [`Self::transcript`] gives, so the server saves it only when it
     /// changed.
     conversation_revision: u64,
+    /// The agent works without a prompt, as Claude Agent does once a background task it
+    /// started ends. ACP has no turn for that, so the thread works until the agent's result
+    /// (an update with its cost) or until it has been quiet for [`OWN_WORK_QUIET`].
+    working_on_its_own: bool,
+    /// The updates the agent sent while working on its own, to tell when it went quiet.
+    own_work_updates: u64,
+    /// The first entry of the agent's work of its own.
+    own_work_from: usize,
+    /// The agent's work of its own ended, and the owner's work after a turn is being done.
+    own_work_ending: bool,
+    /// Stops of background tasks the agent hasn't answered yet. What it says meanwhile is its
+    /// note of the stop, not work of its own.
+    stops_in_flight: usize,
+    /// The agent's next message starts an entry of its own rather than going on with the last.
+    new_message_due: bool,
 }
 
 /// The agent's process id, and whether stopping the thread stops it.
@@ -349,6 +419,9 @@ pub struct AgentSnapshot {
     pid: u32,
     /// The prompt the agent works on, by its JSON-RPC id.
     prompt_id: Option<Value>,
+    /// The agent works without a prompt ([`AgentThread::working_on_its_own`]).
+    #[serde(default)]
+    working_on_its_own: bool,
     /// Requests the agent waits on an answer to, as it sent them.
     unanswered: Vec<String>,
     stdout_rest: Vec<u8>,
@@ -501,6 +574,12 @@ impl AgentThread {
             has_conversation: false,
             dropping_replay: false,
             conversation_revision: 0,
+            working_on_its_own: false,
+            own_work_updates: 0,
+            own_work_from: 0,
+            own_work_ending: false,
+            stops_in_flight: 0,
+            new_message_due: false,
         };
         (this, inbox)
     }
@@ -837,6 +916,31 @@ impl AgentThread {
                 }
             }
             MessageKind::Steered { parts, result } => self.steered(parts, result),
+            MessageKind::BackgroundTask(update) => self.apply_background_task_update(update),
+            MessageKind::BackgroundTaskStopped { task_id, result } => {
+                self.background_task_stopped(task_id, result)
+            }
+            // Unless a turn took over meanwhile.
+            MessageKind::OwnWorkEnded if self.own_work_ending => self.own_work_ended(),
+            MessageKind::OwnWorkEnded => {}
+            MessageKind::OwnWorkQuiet(updates) => {
+                if !self.working_on_its_own {
+                    return;
+                }
+                let since = self.own_work_from.min(self.view.entries.len());
+                let is_waiting = self.view.entries[since..].iter().any(|entry| {
+                    matches!(entry, Entry::ToolCall(tool_call) if matches!(
+                        tool_call.status,
+                        acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
+                    ))
+                }) || !self.view.state.permission_requests.is_empty()
+                    || !self.view.state.elicitations.is_empty();
+                if updates == self.own_work_updates && !is_waiting {
+                    self.end_own_work();
+                } else {
+                    self.check_own_work_later();
+                }
+            }
         }
     }
 
@@ -868,6 +972,9 @@ impl AgentThread {
         self.cancel_elicitations(|_| true);
         self.queued_prompts.clear();
         self.after_turn.clear();
+        // They stop with the agent.
+        self.view.state.background_tasks.clear();
+        self.stops_in_flight = 0;
         self.view.state.auth_error = None;
         self.view.state.auth_description = None;
         self.view.state.authenticating = None;
@@ -942,6 +1049,8 @@ impl AgentThread {
             self.spawn_task(closing);
         }
         self.session = None;
+        // They belong to the session.
+        self.view.state.background_tasks.clear();
     }
 
     /// Whether the open session can be closed: the agent supports it and still runs here (it
@@ -1096,7 +1205,7 @@ impl AgentThread {
             .context("the agent isn't connected")?
             .hand_off()?;
         anyhow::ensure!(
-            wire.prompt_id.is_some() == self.is_working(),
+            wire.prompt_id.is_some() == (self.is_working() && !self.working_on_its_own),
             "the turn is starting or ending"
         );
         let mut view = self.view.clone();
@@ -1114,6 +1223,7 @@ impl AgentThread {
                 stderr_lines: self.stderr_lines.iter().cloned().collect(),
                 pid,
                 prompt_id: wire.prompt_id,
+                working_on_its_own: self.working_on_its_own,
                 unanswered: wire.unanswered,
                 stdout_rest: wire.stdout_rest,
                 stderr_rest: wire.stderr_rest,
@@ -1184,6 +1294,11 @@ impl AgentThread {
         this.terminal_host = terminal_host.clone();
         if is_working {
             this.emit(AgentThreadEvent::WorkingChanged(true));
+        }
+        if snapshot.working_on_its_own {
+            this.working_on_its_own = true;
+            this.own_work_from = this.view.entries.len();
+            this.check_own_work_later();
         }
 
         let sender = this.sender();
@@ -1807,6 +1922,9 @@ impl AgentThread {
         };
         let request = acp::PromptRequest::new(session.session_id.clone(), prompt);
         let connection = session.connection.clone();
+        // The prompt's turn ends the work, if the agent was working on its own.
+        self.working_on_its_own = false;
+        self.own_work_ending = false;
         self.set_working(true);
         let Some(hook) = self.turn_hook.clone() else {
             let response = connection.send_request(request).block_task();
@@ -1847,6 +1965,230 @@ impl AgentThread {
             self.set_working(false);
         }
         self.cancel_permission_requests();
+        // No prompt's answer will end it.
+        if self.working_on_its_own {
+            self.end_own_work();
+        }
+    }
+
+    /// Asks the agent to stop work it left running ([`ThreadState::background_tasks`]).
+    pub fn stop_background_task(&mut self, task_id: &str) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let Some(task) = self
+            .view
+            .state
+            .background_tasks
+            .iter_mut()
+            .find(|task| task.id.as_ref() == task_id && task.can_stop && !task.stopping)
+        else {
+            return;
+        };
+        task.stopping = true;
+        let request = agent_client_protocol::UntypedMessage::new(
+            STOP_BACKGROUND_TASK_REQUEST,
+            serde_json::json!({
+                "sessionId": session.session_id,
+                "asyncTaskId": task_id,
+            }),
+        );
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                log::error!("failed to ask the agent to stop a background task: {error:?}");
+                task.stopping = false;
+                return;
+            }
+        };
+        let response = session.connection.send_request(request).block_task();
+        let task_id = task.id.clone();
+        self.stops_in_flight += 1;
+        // Claude Agent notes the stop in the conversation.
+        self.new_message_due = true;
+        self.spawn(async move {
+            MessageKind::BackgroundTaskStopped {
+                task_id,
+                result: response.await,
+            }
+        });
+    }
+
+    fn background_task_stopped(
+        &mut self,
+        task_id: SharedString,
+        result: std::result::Result<Value, agent_client_protocol::Error>,
+    ) {
+        self.stops_in_flight = self.stops_in_flight.saturating_sub(1);
+        let stopped = match &result {
+            Ok(response) => response
+                .get("stopped")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            Err(error) => {
+                log::warn!(
+                    "the agent didn't stop a background task: {}",
+                    error_message(error)
+                );
+                false
+            }
+        };
+        let tasks = &mut self.view.state.background_tasks;
+        if stopped {
+            tasks.retain(|task| task.id != task_id);
+        } else if let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) {
+            task.stopping = false;
+        }
+    }
+
+    fn apply_background_task_update(&mut self, update: BackgroundTaskUpdate) {
+        // What a loading session replays is over. An adopted agent's session goes on.
+        if self.session.is_none() && self.pending_session.is_none() {
+            return;
+        }
+        let tasks = &mut self.view.state.background_tasks;
+        match update {
+            BackgroundTaskUpdate::AsyncTaskSpawned {
+                async_task_id,
+                name,
+                description,
+                task_type,
+                can_stop,
+                output_file_path,
+                tool_call_id,
+            } => {
+                let task = BackgroundTask {
+                    id: async_task_id.into(),
+                    name: name
+                        .or(description)
+                        .unwrap_or_else(|| "Background task".to_string())
+                        .into(),
+                    kind: task_type.unwrap_or_else(|| "task".to_string()).into(),
+                    tool_call_id: tool_call_id.map(acp::ToolCallId::new),
+                    output_file: output_file_path,
+                    progress: None,
+                    paused: false,
+                    can_stop,
+                    stopping: false,
+                    started_at: SystemTime::now(),
+                };
+                match tasks.iter_mut().find(|existing| existing.id == task.id) {
+                    Some(existing) => *existing = task,
+                    None => tasks.push(task),
+                }
+            }
+            BackgroundTaskUpdate::AsyncTaskProgress {
+                async_task_id,
+                description,
+                summary,
+                output_file_path,
+                tool_call_id,
+            } => {
+                let Some(task) = tasks
+                    .iter_mut()
+                    .find(|task| task.id.as_ref() == async_task_id)
+                else {
+                    return;
+                };
+                if let Some(description) = description {
+                    task.name = description.into();
+                }
+                if let Some(summary) = summary {
+                    task.progress = Some(summary.into());
+                }
+                if let Some(path) = output_file_path {
+                    task.output_file = Some(path);
+                }
+                if let Some(id) = tool_call_id {
+                    task.tool_call_id = Some(acp::ToolCallId::new(id));
+                }
+            }
+            BackgroundTaskUpdate::AsyncTaskStateUpdate {
+                async_task_id,
+                state,
+                output_file_path,
+                tool_call_id,
+            } => {
+                let Some(index) = tasks
+                    .iter()
+                    .position(|task| task.id.as_ref() == async_task_id)
+                else {
+                    return;
+                };
+                match state.as_str() {
+                    "running" | "paused" => {
+                        let task = &mut tasks[index];
+                        task.paused = state == "paused";
+                        if let Some(path) = output_file_path {
+                            task.output_file = Some(path);
+                        }
+                        if let Some(id) = tool_call_id {
+                            task.tool_call_id = Some(acp::ToolCallId::new(id));
+                        }
+                    }
+                    // Ended: the agent says how in the conversation, as it picks it up.
+                    _ => {
+                        tasks.remove(index);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the update shows the agent working although no prompt is: Claude Agent going
+    /// on once a background task it started ended. What follows a turn's end, or a session's
+    /// loading, or a stop of a background task (the agent's note of it), doesn't count.
+    fn starts_own_work(&self, update: &acp::SessionUpdate) -> bool {
+        !self.is_working()
+            && self.session.is_some()
+            && self.view.state.status == ConnectionStatus::Ready
+            && self.stops_in_flight == 0
+            && matches!(
+                update,
+                acp::SessionUpdate::AgentMessageChunk(_)
+                    | acp::SessionUpdate::AgentThoughtChunk(_)
+                    | acp::SessionUpdate::ToolCall(_)
+            )
+    }
+
+    fn start_own_work(&mut self) {
+        self.working_on_its_own = true;
+        self.own_work_from = self.view.entries.len();
+        // Its reply is its own, not more of the last turn's.
+        self.new_message_due = true;
+        self.set_working(true);
+        self.check_own_work_later();
+    }
+
+    fn check_own_work_later(&mut self) {
+        let updates = self.own_work_updates;
+        self.spawn(async move {
+            tokio::time::sleep(OWN_WORK_QUIET).await;
+            MessageKind::OwnWorkQuiet(updates)
+        });
+    }
+
+    /// The agent's work of its own ended. It's a turn, so the owner's work after a turn (a
+    /// checkpoint) is done for it too, and then what waited for it goes.
+    fn end_own_work(&mut self) {
+        self.working_on_its_own = false;
+        let Some(hook) = self.turn_hook.clone() else {
+            self.own_work_ended();
+            return;
+        };
+        self.own_work_ending = true;
+        self.spawn(async move {
+            hook(TurnPoint::Ended).await;
+            MessageKind::OwnWorkEnded
+        });
+    }
+
+    fn own_work_ended(&mut self) {
+        self.own_work_ending = false;
+        self.set_working(false);
+        if let Some(parts) = self.after_turn.pop_front() {
+            self.send_after_turn(parts);
+        }
     }
 
     pub fn respond_to_permission(
@@ -1932,6 +2274,10 @@ impl AgentThread {
     }
 
     fn set_working(&mut self, working: bool) {
+        if !working {
+            self.working_on_its_own = false;
+            self.own_work_ending = false;
+        }
         if working == self.is_working() {
             return;
         }
@@ -1962,6 +2308,8 @@ impl AgentThread {
         self.session = None;
         self.queued_prompts.clear();
         self.after_turn.clear();
+        self.view.state.background_tasks.clear();
+        self.stops_in_flight = 0;
         self.view.state.authenticating = None;
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
@@ -2003,9 +2351,24 @@ impl AgentThread {
                 if self.dropping_replay && is_conversation_update(&notification.update) {
                     return;
                 }
+                if self.starts_own_work(&notification.update) {
+                    self.start_own_work();
+                }
+                // Claude Agent reports its cost with each result, its own work's too.
+                let ends_own_work = self.working_on_its_own
+                    && matches!(
+                        &notification.update,
+                        acp::SessionUpdate::UsageUpdate(update) if update.cost.is_some()
+                    );
+                if self.working_on_its_own && is_conversation_update(&notification.update) {
+                    self.own_work_updates += 1;
+                }
                 self.apply_update(notification.update);
                 if let Some(title) = self.pending_title.take() {
                     self.emit(AgentThreadEvent::TitleChanged(title));
+                }
+                if ends_own_work {
+                    self.end_own_work();
                 }
             }
             Incoming::Permission(request, responder) => {
@@ -2145,7 +2508,14 @@ impl AgentThread {
         let Some(text) = self.content_markdown(content) else {
             return;
         };
-        if let Some(existing) = self.view.entries.last_mut().and_then(existing_text) {
+        let continues = !std::mem::take(&mut self.new_message_due);
+        if let Some(existing) = self
+            .view
+            .entries
+            .last_mut()
+            .filter(|_| continues)
+            .and_then(existing_text)
+        {
             existing.push_str(&text);
             self.entry_changed(self.view.entries.len() - 1);
         } else {
@@ -2571,6 +2941,25 @@ fn auth_status(params: &Value) -> Option<AuthStatus> {
     (!status.kind.is_empty()).then_some(status)
 }
 
+/// The notification's background task update, if it's one ([`BackgroundTaskUpdate`]).
+fn background_task_update(
+    notification: &agent_client_protocol::UntypedMessage,
+) -> Option<BackgroundTaskUpdate> {
+    if notification.method != "session/update" {
+        return None;
+    }
+    let update = notification.params.get("update")?;
+    let kind = update.get("sessionUpdate")?.as_str()?;
+    if !kind.starts_with("async_task_") {
+        return None;
+    }
+    serde_json::from_value(update.clone())
+        .inspect_err(|error| {
+            log::warn!("the agent sent a background task update that couldn't be read: {error}")
+        })
+        .ok()
+}
+
 /// Web links in a line the agent printed, except local callback addresses, which only the
 /// agent itself can use.
 fn login_links(line: &str) -> Vec<String> {
@@ -2732,10 +3121,17 @@ fn client_capabilities(supports_terminals: bool) -> acp::ClientCapabilities {
                 .form(acp::ElicitationFormCapabilities::new())
                 .url(acp::ElicitationUrlCapabilities::new()),
         )
-        .meta(acp::Meta::from_iter([(
-            "terminal-auth".to_string(),
-            true.into(),
-        )]))
+        // JetBrains AIR's async tasks, by which Claude Agent reports what it left running and
+        // stops it, are only for clients that call themselves AIR. That also changes a little
+        // of how it reports tool calls: a file read or search names the files without their
+        // text, and a subagent's text stays inside its tool call.
+        .meta(acp::Meta::from_iter([
+            ("terminal-auth".to_string(), true.into()),
+            (
+                "jetbrains".to_string(),
+                serde_json::json!({"air": {"version": 1, "capabilities": ["asyncTasks"]}}),
+            ),
+        ]))
 }
 
 type Transport = agent_client_protocol::Lines<
@@ -2772,6 +3168,7 @@ fn client_connection(
     let elicitation_sender = sender.clone();
     let completion_sender = sender.clone();
     let extension_sender = sender.clone();
+    let background_task_sender = sender.clone();
     let permission_sender = sender;
     let (create_host, output_host, wait_host, kill_host, release_host) = (
         host.clone(),
@@ -2783,6 +3180,24 @@ fn client_connection(
     let connection_future = Client
         .builder()
         .name("agentZ")
+        // Before the typed updates, which can't read these and would drop them.
+        .on_receive_notification(
+            async move |notification: agent_client_protocol::UntypedMessage, connection| {
+                match background_task_update(&notification) {
+                    Some(update) => {
+                        background_task_sender
+                            .send(MessageKind::BackgroundTask(update))
+                            .ok();
+                        Ok(agent_client_protocol::Handled::Yes)
+                    }
+                    None => Ok(agent_client_protocol::Handled::No {
+                        message: (notification, connection),
+                        retry: false,
+                    }),
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .on_receive_notification(
             async move |notification: acp::SessionNotification, _connection| {
                 let message = match &*notification.session_id.0 {
@@ -3625,6 +4040,90 @@ mod tests {
             })
             .await;
         assert_eq!(user_messages(&thread.thread), ["permission", "refuse"]);
+    }
+
+    fn agent_messages(thread: &AgentThread) -> Vec<String> {
+        thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::AgentMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A command the agent sends to the background shows until it ends, as Claude Agent reports
+    /// it (JetBrains AIR's async tasks). The agent then goes on with no prompt: the thread works
+    /// until its result, with a message of its own, and what was sent meanwhile goes after.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shows_background_tasks_and_the_work_after_them() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("background-task 1".into()));
+        thread
+            .wait_until(|thread| !thread.is_working() && !thread.state.background_tasks.is_empty())
+            .await;
+        let task = thread.thread.state.background_tasks[0].clone();
+        assert_eq!(task.name.as_ref(), "Sleep for 1 seconds");
+        assert_eq!(task.kind.as_ref(), "shell");
+        assert_eq!(task.tool_call_id, Some(acp::ToolCallId::new("bash-1")));
+        assert!(task.can_stop);
+
+        thread
+            .wait_until(|thread| thread.is_working() && thread.state.background_tasks.is_empty())
+            .await;
+        thread.update(|thread| thread.steer("next".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).is_some_and(|text| text.starts_with("Echo: next"))
+            })
+            .await;
+        assert_eq!(
+            agent_messages(&thread.thread)[..2],
+            ["Started in the background.", "The command finished."]
+        );
+        assert_eq!(user_messages(&thread.thread), ["background-task 1", "next"]);
+        // Each piece of work counts as a turn.
+        assert_eq!(thread.thread.state.finished_turns.len(), 3);
+    }
+
+    /// Stopping a background task stops it on the agent's side. The agent's note of the stop
+    /// is a message of its own, and not work: the thread stays idle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stops_a_background_task() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("background-task 30".into()));
+        thread
+            .wait_until(|thread| !thread.is_working() && !thread.state.background_tasks.is_empty())
+            .await;
+        thread.update(|thread| thread.stop_background_task("task-1"));
+        assert!(thread.thread.state.background_tasks[0].stopping);
+        thread
+            .wait_until(|thread| {
+                thread.state.background_tasks.is_empty() && thread.stops_in_flight == 0
+            })
+            .await;
+        assert!(!thread.thread.is_working());
+        assert_eq!(
+            agent_messages(&thread.thread),
+            [
+                "Started in the background.",
+                "**Task stopped by user:** Sleep for 30 seconds."
+            ]
+        );
     }
 
     /// A browser login that asks the client to open a URL, as Codex's device code login does,

@@ -299,6 +299,16 @@ impl AgentThread {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_background_tasks_for_test(
+        &mut self,
+        tasks: Vec<agentz_protocol::thread::BackgroundTask>,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.state.background_tasks = tasks;
+        cx.notify();
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_queued_messages_for_test(
         &mut self,
         messages: Vec<agentz_protocol::thread::QueuedMessage>,
@@ -501,6 +511,17 @@ impl AgentThread {
                 connection,
                 tool_call_id,
                 option_id,
+            },
+            cx,
+        )
+    }
+
+    pub fn stop_background_task(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let task_id = task_id.to_string();
+        self.request(
+            |connection| Request::StopBackgroundTask {
+                connection,
+                task_id,
             },
             cx,
         )

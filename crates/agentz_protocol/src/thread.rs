@@ -187,6 +187,29 @@ pub struct PlanItem {
     pub status: acp::PlanEntryStatus,
 }
 
+/// Work the agent left running after its turn, such as a command it sent to the background,
+/// as Claude Agent reports it through JetBrains AIR's async tasks. It's shown until it ends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BackgroundTask {
+    /// The agent's id for it.
+    pub id: SharedString,
+    /// What the agent calls it: a background command's description.
+    pub name: SharedString,
+    /// What kind of work it is: "shell", "workflow", "monitor" or "task".
+    pub kind: SharedString,
+    /// The tool call that started it.
+    pub tool_call_id: Option<acp::ToolCallId>,
+    /// Where its output goes, on the agent's machine.
+    pub output_file: Option<PathBuf>,
+    /// What it last said of its progress.
+    pub progress: Option<SharedString>,
+    pub paused: bool,
+    pub can_stop: bool,
+    /// Asked to stop, and not answered yet.
+    pub stopping: bool,
+    pub started_at: SystemTime,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PermissionOption {
     pub id: acp::PermissionOptionId,
@@ -382,6 +405,9 @@ pub struct ThreadState {
     /// and it goes then.
     #[serde(default)]
     pub steering_queued: bool,
+    /// What the agent left running in the background, oldest first.
+    #[serde(default)]
+    pub background_tasks: Vec<BackgroundTask>,
 }
 
 /// A thread's state and entries, with the read API both the server's thread and the clients'

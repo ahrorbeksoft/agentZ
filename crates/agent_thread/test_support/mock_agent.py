@@ -7,7 +7,14 @@ A prompt of "mcp" starts the first stdio MCP server given in session/new (or
 session/load), calls its first tool, and replies "MCP: <tool result>"; "mcp <tool>
 <json arguments>" calls that tool instead. A prompt of "background" ends its turn at
 once, then goes on streaming a "." every half second for six seconds, as Claude Agent's
-background tasks report after the turn. A prompt of "slow" streams
+background tasks report after the turn, and ends that with a usage update with its cost, as
+Claude Agent ends each result. "background-task [seconds]" runs a command in the background
+for a second (or the seconds given) and ends its turn; to a client that takes JetBrains AIR's
+async tasks (`_meta.jetbrains.air.capabilities` has "asyncTasks"), it reports the task as
+Claude Agent does, and stops it on `_session/async_task/stop`, noting the stop in the
+conversation. Once the command is done, it says so a word at a time with no prompt, as Claude
+Agent goes on when a background task ends, and ends with a usage update with its cost. A
+prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
 word at a time, 500 ms apart, then replies. "write <path> <text>"
 writes the text and a newline to the file, relative to the session's folder, and
@@ -276,6 +283,12 @@ session_cwd = os.getcwd()
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
 # Set by logout: sessions then need a login, until the process restarts.
 logged_out = False
+# Whether the client takes JetBrains AIR's async tasks, which Claude Agent reports its
+# background work with.
+async_tasks = False
+# Background commands still running, by task id: an event set to stop each, and its name.
+background_tasks = {}
+background_task_count = 0
 # The resources embedded in the prompt being answered.
 prompt_resources = []
 
@@ -327,6 +340,33 @@ def work_in_background(session_id):
         time.sleep(0.5)
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session_id, "update": text_chunk("agent_message_chunk", ".")}})
+    send_result_cost(session_id)
+
+
+def send_result_cost(session_id):
+    """What Claude Agent sends as each result ends, its work after a turn's too."""
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session_id, "update": {"sessionUpdate": "usage_update", "used": 1200,
+                                            "size": 200_000,
+                                            "cost": {"amount": 0.01, "currency": "USD"}}}})
+
+
+def send_task_update(session_id, payload):
+    send({"jsonrpc": "2.0", "method": "session/update",
+          "params": {"sessionId": session_id, "update": payload}})
+
+
+def run_background_task(session_id, task_id, seconds, stop):
+    if stop.wait(seconds):
+        return
+    background_tasks.pop(task_id, None)
+    if async_tasks:
+        send_task_update(session_id, {"sessionUpdate": "async_task_state_update",
+                                      "asyncTaskId": task_id, "state": "completed"})
+    for word in ["The", " command", " finished."]:
+        update(session_id, text_chunk("agent_message_chunk", word))
+        time.sleep(0.2)
+    send_result_cost(session_id)
 
 
 def listed_sessions():
@@ -572,6 +612,8 @@ for line in sys.stdin:
         auth_methods = [{"id": "mock-login", "name": "Log In",
                          "description": "Log in to the mock agent"}]
         capabilities = message["params"].get("clientCapabilities", {})
+        air = ((capabilities.get("_meta") or {}).get("jetbrains") or {}).get("air") or {}
+        async_tasks = "asyncTasks" in (air.get("capabilities") or [])
         if capabilities.get("auth", {}).get("terminal"):
             auth_methods.append({"id": "mock-terminal-login", "name": "Log in in a terminal",
                                  "type": "terminal", "args": ["--login"]})
@@ -661,6 +703,19 @@ for line in sys.stdin:
         else:
             send({"jsonrpc": "2.0", "id": message["id"],
                   "result": {"outcome": "promptRequired", "reason": "noRunningTurn"}})
+    elif method == "_session/async_task/stop":
+        params = message["params"]
+        task = background_tasks.pop(params["asyncTaskId"], None)
+        if task:
+            stop, name = task
+            stop.set()
+            send_task_update(params["sessionId"], {"sessionUpdate": "async_task_state_update",
+                                                   "asyncTaskId": params["asyncTaskId"],
+                                                   "state": "stopped"})
+            # As Claude Agent notes it for clients that don't take notices.
+            update(params["sessionId"], text_chunk("agent_message_chunk",
+                                                   f"**Task stopped by user:** {name}."))
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopped": task is not None}})
     elif method == "session/set_config_option":
         params = message["params"]
         settings[params["configId"]] = params["value"]
@@ -732,6 +787,33 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
             threading.Thread(target=work_in_background, args=(params["sessionId"],),
                              daemon=True).start()
+        elif prompt_text == "background-task" or prompt_text.startswith("background-task "):
+            session_id = params["sessionId"]
+            seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 1
+            background_task_count += 1
+            task_id = f"task-{background_task_count}"
+            tool_call_id = f"bash-{background_task_count}"
+            name = f"Sleep for {seconds:g} seconds"
+            update(session_id, {"sessionUpdate": "tool_call", "toolCallId": tool_call_id,
+                                "title": f"sleep {seconds:g}", "kind": "execute",
+                                "status": "completed",
+                                "rawInput": {"command": f"sleep {seconds:g}",
+                                             "description": name, "run_in_background": True},
+                                "content": [{"type": "content", "content": {
+                                    "type": "text",
+                                    "text": f"Command running in background with ID: {task_id}"}}]})
+            stop = threading.Event()
+            background_tasks[task_id] = (stop, name)
+            if async_tasks:
+                send_task_update(session_id, {
+                    "sessionUpdate": "async_task_spawned", "asyncTaskId": task_id, "name": name,
+                    "taskType": "shell", "description": name, "showInTranscript": True,
+                    "canStop": True, "toolCallId": tool_call_id,
+                    "outputFilePath": f"/tmp/mock-tasks/{task_id}.output"})
+            update(session_id, text_chunk("agent_message_chunk", "Started in the background."))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+            threading.Thread(target=run_background_task,
+                             args=(session_id, task_id, seconds, stop), daemon=True).start()
         elif prompt_text == "slow":
             for word in ["One", " two", " three", " four", " five"]:
                 update(params["sessionId"], text_chunk("agent_message_chunk", word))

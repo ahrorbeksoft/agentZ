@@ -610,8 +610,9 @@ async fn stops_the_agent_of_an_archived_thread_left_idle() {
         .await;
 }
 
-/// An agent that goes on sending after its turn, as Claude Agent's background tasks do, isn't
-/// idle: it stops once it has been quiet for as long as its thread allows.
+/// An agent that goes on sending after its turn, as Claude Agent does once a background task
+/// ends, works on its own: it stops once that ends with its result and it has been quiet for as
+/// long as its thread allows.
 #[tokio::test(flavor = "multi_thread")]
 async fn keeps_an_agent_that_works_after_its_turn() {
     let Some(mut command) = mock_agent() else {
@@ -644,7 +645,7 @@ async fn keeps_an_agent_that_works_after_its_turn() {
     client
         .wait_until(|client| {
             let thread = client.thread(connection);
-            !thread.is_working() && agent_text(thread).starts_with("Working in the background")
+            thread.is_working() && agent_text(thread).contains("Working in the background.")
         })
         .await;
     // Archived, so 3 seconds without work would stop it.
@@ -659,6 +660,68 @@ async fn keeps_an_agent_that_works_after_its_turn() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(closed.exists(), "the agent kept running once it went quiet");
+}
+
+/// An agent with a command running in the background isn't idle, however quiet it is. Once the
+/// command is stopped, it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_an_agent_with_a_background_task() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let closed = dir.path().join("closed");
+    command.env.insert(
+        "MOCK_CLOSED_FILE".into(),
+        closed.to_string_lossy().into_owned(),
+    );
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("background-task 60"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && !thread.state.background_tasks.is_empty()
+        })
+        .await;
+    // Archived, so 3 seconds without work would stop it.
+    client.ok(Request::ArchiveThread(thread_id)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!closed.exists(), "the agent stopped with a task running");
+
+    client
+        .ok(Request::StopBackgroundTask {
+            connection,
+            task_id: "task-1".into(),
+        })
+        .await;
+    client
+        .wait_until(|client| client.thread(connection).state.background_tasks.is_empty())
+        .await;
+    client.ok(Request::UnsubscribeThread(connection)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !closed.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        closed.exists(),
+        "the agent kept running once its task stopped"
+    );
 }
 
 /// A new thread is a draft until its first message, as in t3code: one left with nothing typed

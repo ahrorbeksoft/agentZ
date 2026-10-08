@@ -50,7 +50,7 @@ script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─►
 - **Agent lifetimes** (`Server::update_thread`, `Server::stop_idle_agents`): a thread's agent
   starts when a client opens the thread or something is sent to it. It stops when the thread is
   deleted, or once it has had nothing to do (no turn, question, login, queued message, unfinished
-  task or running command in its terminals), sent nothing, and no client has had the thread
+  task, running command in its terminals or background task), sent nothing, and no client has had the thread
   open for 30 minutes, 3 seconds for an archived thread (t3code's idle release). What it sends
   counts because agents work after their turns (Claude Agent's background tasks); ACP has no
   other sign of it, so work that stays silent that long is stopped. Opening the thread again
@@ -457,6 +457,22 @@ Each entry: what it does, where it lives, and where it comes from.
   the agent is on (`ThreadState::steering_queued`): once no tool call since the last message is
   running (or it asks for permission), the server cancels the turn and the queue sends the
   message. Editing or removing the front message disarms it.
+- **Background tasks** (`AgentThread::{apply_background_task_update, stop_background_task}`,
+  `AgentView::render_background_tasks_section`; t3code's pending background work, new UI in the
+  Agents section's style): Claude Agent reports what it leaves running after a turn (commands
+  it sent to the background) only to JetBrains AIR, so agentZ's `initialize` says it takes
+  AIR's `asyncTasks` (`_meta.jetbrains.air`). Its `async_task_*` session updates, which ACP's
+  types don't read, are caught raw (`background_task_update`) into
+  `ThreadState::background_tasks`, shown in the activity bar with how long each has run and
+  Stop (`Request::StopBackgroundTask`, the `_session/async_task/stop` request). Being AIR also
+  means read and search results come without the file's text, and a subagent's text stays in
+  its tool call.
+- **Work after a turn** (`AgentThread::{starts_own_work, end_own_work}`): when a background
+  task ends, Claude Agent goes on with no prompt. A message, thought or tool call while no turn
+  runs (and the session is open, and no stop is in flight, whose note doesn't count) makes the
+  thread work as for a turn, with its reply as a new message, until the agent's result (a
+  usage update with its cost) or 30 seconds without updates or running tool calls. Messages sent
+  meanwhile wait for it, as for a turn; Stop cancels it.
 - **Images** (`attachment_image.rs`, `server/attachment_requests.rs`; t3code's attachments and
   `ExpandedImageDialog`): every image in a thread is kept by its server, so every client sees
   it. Clients fetch one by id (`Request::Attachment`), as a 640-pixel PNG thumbnail (made once

@@ -898,6 +898,13 @@ impl Server {
                 })?;
                 Ok(Response::Ok)
             }
+            Request::StopBackgroundTask {
+                connection,
+                task_id,
+            } => {
+                self.update_thread(connection, |thread| thread.stop_background_task(&task_id))?;
+                Ok(Response::Ok)
+            }
             Request::SetConfigOption {
                 connection,
                 config_id,
@@ -1753,7 +1760,8 @@ impl Server {
     }
 
     /// Whether a thread's agent has something to do or to finish: a turn, a question or login
-    /// waiting on the user, messages to send, a task to report, a command in its terminal.
+    /// waiting on the user, messages to send, a task to report, a command in its terminal or
+    /// in the background.
     fn needs_agent(&self, thread_id: ThreadId) -> bool {
         let Some(thread) = self.threads.get(&thread_id) else {
             return false;
@@ -1772,6 +1780,7 @@ impl Server {
             || self.moving_threads.contains_key(&thread_id)
             || self.has_waiting_prompt(thread_id)
             || self.has_running_agent_terminal(thread_id)
+            || !thread.state.background_tasks.is_empty()
     }
 
     /// The command that starts the agent, with the environment from the account's settings

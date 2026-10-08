@@ -297,6 +297,7 @@ pub struct AgentView {
     /// The composer text for which the user dismissed the slash-command menu.
     command_menu_dismissed_for: Option<SharedString>,
     agents_expanded: bool,
+    background_tasks_expanded: bool,
     /// Subthreads at any depth waiting for a permission answer, which is given here (t3code).
     blocked_subthreads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
     /// The thread's terminals (t3code's drawer). Kept while hidden, so its layout stays.
@@ -439,12 +440,14 @@ impl AgentView {
                 }
             },
         ));
-        // Keeps the elapsed-time label ticking while the agent works.
+        // Keeps the elapsed-time labels ticking while the agent works, or its background tasks
+        // run.
         let elapsed_refresh = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let still_open = this.update(cx, |this, cx| {
-                    if this.thread.read(cx).is_working() {
+                    let thread = this.thread.read(cx);
+                    if thread.is_working() || !thread.state.background_tasks.is_empty() {
                         cx.notify();
                     }
                 });
@@ -509,6 +512,7 @@ impl AgentView {
             command_menu_index: 0,
             command_menu_dismissed_for: None,
             agents_expanded: true,
+            background_tasks_expanded: true,
             blocked_subthreads: HashMap::default(),
             drawer: None,
             is_drawer_open: false,
@@ -726,6 +730,146 @@ impl AgentView {
                     this.child(
                         v_flex()
                             .id("agent-rows")
+                            .max_h(rems_from_px(31. * MAX_AGENT_ROWS_SHOWN as f32))
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// What the agent left running after its turn, such as commands it sent to the background,
+    /// in the Agents section's style: each with how long it has run, and Stop.
+    fn render_background_tasks_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tasks = self.thread.read(cx).state.background_tasks.clone();
+        if tasks.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let count = tasks.len();
+        let expanded = self.background_tasks_expanded;
+        let title = if count == 1 {
+            "1 Background Task".to_string()
+        } else {
+            format!("{count} Background Tasks")
+        };
+        let summary = h_flex()
+            .id("background-tasks-summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .cursor_pointer()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(colors.border)
+            })
+            .child(Disclosure::new("background-tasks-disclosure", expanded))
+            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.background_tasks_expanded = !this.background_tasks_expanded;
+                cx.notify();
+            }));
+
+        let rows: Vec<AnyElement> = tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| {
+                let icon = if task.paused && !task.stopping {
+                    Icon::new(IconName::DebugPause)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .into_any_element()
+                } else {
+                    Icon::new(IconName::LoadCircle)
+                        .size(IconSize::Small)
+                        .color(if task.stopping {
+                            Color::Muted
+                        } else {
+                            Color::Accent
+                        })
+                        .with_rotate_animation(2)
+                        .into_any_element()
+                };
+                let state = if task.stopping {
+                    "Stopping…".to_string()
+                } else if task.paused {
+                    "Paused".to_string()
+                } else {
+                    format_elapsed(task.started_at.elapsed().unwrap_or_default())
+                };
+                let details = format!("{} · {state}", background_task_kind(&task.kind));
+                let name = task.name.clone();
+                let about = task
+                    .progress
+                    .clone()
+                    .map(|progress| progress.to_string())
+                    .or_else(|| {
+                        task.output_file
+                            .as_ref()
+                            .map(|path| format!("Output in {}", path.display()))
+                    });
+                let task_id = task.id.clone();
+                h_flex()
+                    .w_full()
+                    .p_1p5()
+                    .gap_1p5()
+                    .bg(colors.editor_background)
+                    .when(index + 1 < count, |this| {
+                        this.border_b_1().border_color(colors.border_variant)
+                    })
+                    .child(icon)
+                    .child(
+                        div()
+                            .id(("background-task-name", index))
+                            .debug_selector(move || format!("background-task-name-{index}"))
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
+                            .tooltip(move |_, cx| match &about {
+                                Some(about) => {
+                                    Tooltip::with_meta(name.clone(), None, about.clone(), cx)
+                                }
+                                None => Tooltip::simple(name.clone(), cx),
+                            }),
+                    )
+                    .child(
+                        Label::new(details)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .when(task.can_stop, |this| {
+                        this.child(
+                            div()
+                                .debug_selector(move || format!("stop-background-task-{index}"))
+                                .child(
+                                    IconButton::new(
+                                        ("stop-background-task", index),
+                                        IconName::Stop,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .disabled(task.stopping)
+                                    .tooltip(Tooltip::text("Stop Task"))
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.thread.update(cx, |thread, cx| {
+                                                thread.stop_background_task(&task_id, cx)
+                                            });
+                                        },
+                                    )),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            v_flex()
+                .child(summary)
+                .when(expanded, |this| {
+                    this.child(
+                        v_flex()
+                            .id("background-task-rows")
                             .max_h(rems_from_px(31. * MAX_AGENT_ROWS_SHOWN as f32))
                             .overflow_y_scroll()
                             .children(rows),
@@ -4723,6 +4867,7 @@ impl AgentView {
     fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let sections: Vec<AnyElement> = [
             self.render_agents_section(cx),
+            self.render_background_tasks_section(cx),
             self.render_plan_section(window, cx),
             self.render_queue_section(cx),
         ]
@@ -7461,6 +7606,15 @@ fn day_aware_time(time: SystemTime, now: SystemTime) -> String {
 }
 
 /// The running timer counts whole seconds, so it doesn't flicker through tenths.
+/// How a background task's kind reads: Claude Agent's "shell" as "Shell".
+fn background_task_kind(kind: &str) -> String {
+    let mut characters = kind.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => "Task".to_string(),
+    }
+}
+
 fn format_elapsed(duration: Duration) -> String {
     let seconds = duration.as_secs();
     if seconds < 60 {
@@ -9451,6 +9605,53 @@ mod tests {
 
     fn sent(client: &Entity<ServerClient>, cx: &mut VisualTestContext) -> Vec<Request> {
         client.read_with(cx, |client, _| client.sent_for_test())
+    }
+
+    /// What the agent left running shows above the composer, each with Stop, which asks the
+    /// server to stop it.
+    #[gpui::test]
+    fn shows_background_tasks_with_stop(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let task = |id: &str, name: &str| agentz_protocol::thread::BackgroundTask {
+            id: id.to_string().into(),
+            name: name.to_string().into(),
+            kind: "shell".into(),
+            tool_call_id: None,
+            output_file: Some("/tmp/tasks/task.output".into()),
+            progress: None,
+            paused: false,
+            can_stop: true,
+            stopping: false,
+            started_at: std::time::SystemTime::now(),
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Build it".into())], cx);
+            thread.set_background_tasks_for_test(
+                vec![
+                    task("task-1", "Build the release app"),
+                    task("task-2", "Run the dev server"),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("background-task-name-1").is_some());
+
+        let stop = cx
+            .debug_bounds("stop-background-task-1")
+            .expect("each task has Stop");
+        cx.simulate_click(stop.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(sent(&client, cx).iter().any(|request| matches!(request,
+            Request::StopBackgroundTask { task_id, .. } if task_id == "task-2")));
+
+        thread.update(cx, |thread, cx| {
+            thread.set_background_tasks_for_test(Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("background-task-name-0").is_none());
     }
 
     /// A message typed while the agent works goes to the queue the server keeps.

@@ -117,7 +117,9 @@ From Zed's guidelines, which this code follows:
   reload, defaults, history replay). Extend the mock when you need a protocol feature; it speaks
   JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp` (or
   `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>` and `delete <path>` script
-  different turns (see its docstring). With `MOCK_LOGIN_FILE` in its env it needs a login, and
+  different turns (see its docstring). `background-task [seconds]` leaves a command running
+  as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
+  once it ends. With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
   `MOCK_BROWSER_OPEN` too, a browser login that runs `xdg-open` and waits on a `127.0.0.1`
   callback, as Devin's and Codex's do (`tests/browser.rs` drives it as on an SSH machine). It

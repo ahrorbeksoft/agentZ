@@ -482,6 +482,11 @@ pub enum Request {
         tool_call_id: acp::ToolCallId,
         option_id: acp::PermissionOptionId,
     },
+    /// Stops work the agent left running ([`thread::ThreadState::background_tasks`]).
+    StopBackgroundTask {
+        connection: ConnectionId,
+        task_id: String,
+    },
     SetConfigOption {
         connection: ConnectionId,
         config_id: acp::SessionConfigId,
