@@ -1,13 +1,14 @@
-//! A thread's terminals: t3code's terminal drawer (`ThreadTerminalDrawer.tsx`, and its layout
-//! rules in `terminalUiStateStore.ts`). Terminals sit in groups, side by side or stacked, up to
-//! four to a group; the active group fills the drawer. With more than one terminal a list on
-//! the right shows the groups. The layout is this window's; the server keeps the terminals
-//! running, and lists them so a restarted app finds them again.
+//! A thread's terminals: t3code's terminal drawer (`ThreadTerminalDrawer.tsx`) with Zed's
+//! terminal panel's tabs in place of its groups and splits, as picked in
+//! `design/thread-terminals/`. A strip across the top has a tab for each shell, named by what
+//! runs in it, then New Terminal and Full Screen; one shell shows at a time. The tabs are this
+//! window's; the server keeps the terminals running, and lists them so a restarted app finds
+//! them again.
 
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::{CAPABILITY_DRAWER_TERMINALS, Request, Response};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, Subscription, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, Subscription, Window,
 };
 use projects::ThreadId;
 use ui::{Tooltip, prelude::*};
@@ -17,21 +18,15 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 
-/// t3code's `MAX_TERMINALS_PER_GROUP`.
-const MAX_TERMINALS_PER_GROUP: usize = 4;
-/// t3code's list width (`w-36`).
-const LIST_WIDTH: Pixels = px(144.);
+/// The strip's height, as in the design's mock.
+const STRIP_HEIGHT: Pixels = px(30.);
+/// Past this a tab's name is cut short: a long command line would push the others away.
+const MAX_TAB_NAME_WIDTH: Pixels = px(160.);
 
 pub enum TerminalDrawerEvent {
     ToggleFullScreen,
     /// Its last terminal closed.
     Empty,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Split {
-    SideBySide,
-    Stacked,
 }
 
 struct DrawerTerminal {
@@ -40,19 +35,15 @@ struct DrawerTerminal {
     _exit: Subscription,
 }
 
-struct Group {
-    numbers: Vec<u32>,
-    split: Split,
-}
-
 pub struct TerminalDrawer {
     client: Entity<ServerClient>,
     thread_id: ThreadId,
     terminals: Vec<DrawerTerminal>,
-    groups: Vec<Group>,
     active: u32,
     next_number: u32,
     is_full_screen: bool,
+    /// The tabs name what runs in each shell, which the server reports in the projects.
+    _programs: Subscription,
 }
 
 impl EventEmitter<TerminalDrawerEvent> for TerminalDrawer {}
@@ -67,19 +58,20 @@ impl Focusable for TerminalDrawer {
 }
 
 impl TerminalDrawer {
-    /// Opens with Terminal 1, then takes in the thread's other terminals still running on the
-    /// server, each in a group of its own.
+    /// Opens with the first shell, then takes in the thread's other terminals still running on
+    /// the server, each as a tab.
     pub fn new(client: Entity<ServerClient>, thread_id: ThreadId, cx: &mut Context<Self>) -> Self {
+        let projects = client.read(cx).projects().clone();
         let mut this = Self {
             client: client.clone(),
             thread_id,
             terminals: Vec::new(),
-            groups: Vec::new(),
             active: 1,
             next_number: 1,
             is_full_screen: false,
+            _programs: cx.observe(&projects, |_, _, cx| cx.notify()),
         };
-        this.add_terminal(None, cx);
+        this.add_terminal(cx);
         if this.has_several_terminals(cx) {
             let running = client.read(cx).request(Request::DrawerTerminals(thread_id));
             cx.spawn(async move |this, cx| {
@@ -91,7 +83,7 @@ impl TerminalDrawer {
                     for number in numbers {
                         if this.terminal(number).is_none() {
                             this.next_number = this.next_number.max(number);
-                            this.add_terminal(None, cx);
+                            this.add_terminal(cx);
                         }
                     }
                     this.active = active;
@@ -117,12 +109,6 @@ impl TerminalDrawer {
             .find(|terminal| terminal.number == number)
     }
 
-    fn group_of(&self, number: u32) -> Option<usize> {
-        self.groups
-            .iter()
-            .position(|group| group.numbers.contains(&number))
-    }
-
     pub fn set_full_screen(&mut self, is_full_screen: bool, cx: &mut Context<Self>) {
         if self.is_full_screen != is_full_screen {
             self.is_full_screen = is_full_screen;
@@ -130,14 +116,13 @@ impl TerminalDrawer {
         }
     }
 
-    /// Starts the next terminal: in the active group beside the active terminal when
-    /// splitting, else in a group of its own. Returns its number.
-    fn add_terminal(&mut self, split: Option<Split>, cx: &mut Context<Self>) -> u32 {
+    /// Starts the next shell as the last tab and shows it. Returns its number.
+    fn add_terminal(&mut self, cx: &mut Context<Self>) -> u32 {
         let number = self.next_number;
         self.next_number += 1;
         let key = TerminalKey::drawer(self.thread_id, number);
         let terminal = Terminal::shared(&self.client, key, cx);
-        // A shell that exits closes its terminal, as in t3code. One that had ended before the
+        // A shell that exits closes its tab, as in t3code. One that had ended before the
         // drawer opened starts again instead, so opening the drawer always shows a shell.
         let mut was_running = false;
         let exit = cx.observe(&terminal, move |this, terminal, cx| {
@@ -159,47 +144,51 @@ impl TerminalDrawer {
             view,
             _exit: exit,
         });
-        let active_group = self.group_of(self.active);
-        match (split, active_group) {
-            (Some(split), Some(index)) => {
-                let group = &mut self.groups[index];
-                let anchor = group
-                    .numbers
-                    .iter()
-                    .position(|candidate| *candidate == self.active)
-                    .map_or(group.numbers.len(), |position| position + 1);
-                group.numbers.insert(anchor, number);
-                group.split = split;
-            }
-            _ => self.groups.push(Group {
-                numbers: vec![number],
-                split: Split::SideBySide,
-            }),
-        }
         self.active = number;
         cx.notify();
         number
     }
 
-    fn split(&mut self, split: Split, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_active_group_full() {
-            return;
-        }
-        self.add_terminal(Some(split), cx);
-        self.focus_active(window, cx);
-    }
-
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_terminal(None, cx);
+        self.add_terminal(cx);
         self.focus_active(window, cx);
     }
 
-    fn is_active_group_full(&self) -> bool {
-        self.group_of(self.active)
-            .is_some_and(|index| self.groups[index].numbers.len() >= MAX_TERMINALS_PER_GROUP)
+    /// What runs in front of the shell, as the server reports it.
+    fn running_program(&self, number: u32, cx: &App) -> Option<String> {
+        self.client
+            .read(cx)
+            .projects()
+            .read(cx)
+            .drawer_commands(self.thread_id)
+            .find(|(candidate, _)| *candidate == number)
+            .map(|(_, command)| command.to_string())
     }
 
-    /// Ends the terminal on the server. The next one along becomes active, as in t3code.
+    /// A tab's × ends an idle shell at once, and asks first while a program runs in it, as
+    /// closing a Workspaces pane does.
+    fn request_close(&mut self, number: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(program) = self.running_program(number, cx) else {
+            self.close_terminal(number, cx);
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Close “{program}”?"),
+            Some("It's still running, and closing the terminal ends it."),
+            &["Close", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.close_terminal(number, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Ends the terminal on the server. The next tab along shows, as in t3code.
     fn close_terminal(&mut self, number: u32, cx: &mut Context<Self>) {
         let Some(position) = self
             .terminals
@@ -209,10 +198,6 @@ impl TerminalDrawer {
             return;
         };
         self.terminals.remove(position);
-        for group in &mut self.groups {
-            group.numbers.retain(|candidate| *candidate != number);
-        }
-        self.groups.retain(|group| !group.numbers.is_empty());
         self.client.read(cx).send(
             Request::CloseTerminal(TerminalKey::drawer(self.thread_id, number)),
             cx,
@@ -243,359 +228,231 @@ impl TerminalDrawer {
         }
     }
 
-    /// t3code's actions: split side by side, split stacked, new terminal, close the active one,
-    /// and full screen.
-    fn render_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_split = !self.is_active_group_full() && self.has_several_terminals(cx);
-        let can_add = self.has_several_terminals(cx);
-        let split_tooltip = |label: &'static str| {
-            if can_split {
-                label.to_string()
-            } else {
-                format!("{label} (max {MAX_TERMINALS_PER_GROUP} per group)")
-            }
+    /// A shell's tab: the terminal icon, what runs in it (as a Workspaces pane names it), and
+    /// its ×, which shows on the tab in front and under the mouse, as Zed's do.
+    fn render_tab(&self, number: u32, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let is_active = number == self.active;
+        let color = if is_active {
+            Color::Default
+        } else {
+            Color::Muted
         };
-        let active = self.active;
-        let side_by_side_tooltip = split_tooltip("Split Terminal Horizontally");
-        let stacked_tooltip = split_tooltip("Split Terminal Vertically");
+        let name = self
+            .running_program(number, cx)
+            .unwrap_or_else(|| "Shell".to_string());
+        let group = SharedString::from(format!("drawer-tab-{number}"));
         h_flex()
-            .child(
-                IconButton::new("drawer-split", IconName::SquareSplitHorizontal)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(!can_split)
-                    .tooltip(Tooltip::text(side_by_side_tooltip))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.split(Split::SideBySide, window, cx)
-                        }),
-                    ),
-            )
-            .child(
-                IconButton::new("drawer-split-stacked", IconName::SquareSplitVertical)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(!can_split)
-                    .tooltip(Tooltip::text(stacked_tooltip))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.split(Split::Stacked, window, cx)),
-                    ),
-            )
-            .child(
-                IconButton::new("drawer-new-terminal", IconName::Plus)
-                    .icon_size(IconSize::XSmall)
-                    .disabled(!can_add)
-                    .tooltip(Tooltip::text("New Terminal"))
-                    .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx))),
-            )
-            .child(
-                IconButton::new(
-                    "drawer-full-screen",
-                    if self.is_full_screen {
-                        IconName::Minimize
-                    } else {
-                        IconName::Maximize
-                    },
-                )
-                .icon_size(IconSize::XSmall)
-                .tooltip(Tooltip::text(if self.is_full_screen {
-                    "Exit Full Screen"
+            .id(("drawer-tab", number as usize))
+            .debug_selector(|| format!("drawer-tab-{number}"))
+            .group(group.clone())
+            .h_full()
+            .flex_none()
+            .pl_2p5()
+            .pr_1()
+            .gap_1p5()
+            .border_r_1()
+            .border_color(colors.border_variant)
+            .map(|tab| {
+                if is_active {
+                    tab.bg(colors.terminal_background)
                 } else {
-                    "Full Screen"
-                }))
-                .on_click(
-                    cx.listener(|_, _, _, cx| cx.emit(TerminalDrawerEvent::ToggleFullScreen)),
+                    tab.border_b_1()
+                        .cursor_pointer()
+                        .hover(|tab| tab.bg(colors.ghost_element_hover))
+                }
+            })
+            .child(
+                Icon::new(IconName::Terminal)
+                    .size(IconSize::XSmall)
+                    .color(color),
+            )
+            .child(
+                div().max_w(MAX_TAB_NAME_WIDTH).child(
+                    Label::new(name)
+                        .size(LabelSize::Small)
+                        .color(color)
+                        .truncate(),
                 ),
             )
             .child(
-                IconButton::new("drawer-close-terminal", IconName::Close)
-                    .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("Close Terminal"))
-                    .on_click(cx.listener(move |this, _, _, cx| this.close_terminal(active, cx))),
+                div()
+                    .when(!is_active, |close| close.visible_on_hover(group))
+                    .child(
+                        IconButton::new(("drawer-close-tab", number as usize), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Close Terminal"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.request_close(number, window, cx)
+                            })),
+                    ),
             )
+            .on_click(cx.listener(move |this, _, window, cx| this.activate(number, window, cx)))
     }
 
-    /// The active group's terminals, split evenly.
-    fn render_group(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let Some(group) = self.group_of(self.active).map(|index| &self.groups[index]) else {
-            return div().into_any_element();
-        };
-        let is_split = group.numbers.len() > 1;
-        let stacked = group.split == Split::Stacked;
-        let cells = group
-            .numbers
+    /// Zed's terminal panel's strip: the tabs, then New Terminal and Full Screen at its end.
+    fn render_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_add = self.has_several_terminals(cx);
+        let tabs = self
+            .terminals
             .iter()
-            .enumerate()
-            .filter_map(|(index, number)| {
-                let terminal = self.terminal(*number)?;
-                let number = *number;
-                let is_active = number == self.active;
-                Some(
-                    div()
-                        .id(("drawer-terminal", number as usize))
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        // A stretched cell's size isn't definite to its child, so it's set.
-                        .map(|cell| {
-                            if stacked {
-                                cell.w_full()
-                            } else {
-                                cell.h_full()
-                            }
-                        })
-                        .pt_1()
-                        .when(is_split && index > 0, |cell| {
-                            let border = if is_active {
-                                colors.border
-                            } else {
-                                colors.border_variant
-                            };
-                            if stacked {
-                                cell.border_t_1().border_color(border)
-                            } else {
-                                cell.border_l_1().border_color(border)
-                            }
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                if this.active != number {
-                                    this.active = number;
-                                    cx.notify();
-                                }
-                            }),
-                        )
-                        .child(terminal.view.clone()),
-                )
-            });
-        if stacked {
-            v_flex().size_full().children(cells).into_any_element()
-        } else {
-            h_flex().size_full().children(cells).into_any_element()
-        }
-    }
-
-    /// t3code's list: the actions, then each group (named when there's more than one, or a
-    /// split) and its terminals.
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
-        let shows_group_headers =
-            self.groups.len() > 1 || self.groups.iter().any(|group| group.numbers.len() > 1);
-        let groups = self
-            .groups
-            .iter()
-            .enumerate()
-            .map(|(group_index, group)| {
-                let is_group_active = group.numbers.contains(&self.active);
-                let first = group.numbers.first().copied().unwrap_or(self.active);
-                let (label, icon) = match (group.numbers.len() > 1, group.split) {
-                    (false, _) => ("Single", IconName::Square),
-                    (true, Split::SideBySide) => ("Side by side", IconName::SquareSplitHorizontal),
-                    (true, Split::Stacked) => ("Stacked", IconName::SquareSplitVertical),
-                };
-                let header =
-                    shows_group_headers.then(|| {
-                        h_flex()
-                            .id(("drawer-group", group_index))
-                            .h(px(22.))
-                            .px_1p5()
-                            .gap_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .when(is_group_active, |row| row.bg(colors.element_selected))
-                            .hover(|row| row.bg(colors.ghost_element_hover))
-                            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-                            .child(
-                                div().flex_1().min_w_0().child(
-                                    Label::new(label)
-                                        .size(LabelSize::XSmall)
-                                        .color(if is_group_active {
-                                            Color::Default
-                                        } else {
-                                            Color::Muted
-                                        })
-                                        .truncate(),
-                                ),
-                            )
-                            .child(
-                                Label::new(group.numbers.len().to_string())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.activate(first, window, cx)
-                            }))
-                    });
-                let rows =
-                    group.numbers.iter().map(|number| {
-                        let number = *number;
-                        let is_active = number == self.active;
-                        let row_group = SharedString::from(format!("drawer-row-{number}"));
-                        h_flex()
-                            .id(("drawer-row", number as usize))
-                            .group(row_group.clone())
-                            .h_6()
-                            .pl_1()
-                            .pr_2()
-                            .gap_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(is_active, |row| row.bg(colors.element_selected))
-                            .when(!is_active, |row| {
-                                row.hover(|row| row.bg(colors.ghost_element_hover))
-                            })
-                            // The icon turns into the close button under the mouse, as in t3code.
-                            .child(
-                                div()
-                                    .relative()
-                                    .size_4()
-                                    .flex_none()
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .inset_0()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .group_hover(row_group.clone(), |icon| icon.invisible())
-                                            .child(
-                                                Icon::new(IconName::Terminal)
-                                                    .size(IconSize::XSmall)
-                                                    .color(Color::Muted),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .inset_0()
-                                            .visible_on_hover(row_group)
-                                            .child(
-                                                IconButton::new(
-                                                    ("drawer-close-row", number as usize),
-                                                    IconName::Close,
-                                                )
-                                                .icon_size(IconSize::XSmall)
-                                                .tooltip(Tooltip::text(format!(
-                                                    "Close Terminal {number}"
-                                                )))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.close_terminal(number, cx)
-                                                })),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div().flex_1().min_w_0().child(
-                                    Label::new(format!("Terminal {number}"))
-                                        .size(LabelSize::Small)
-                                        .color(if is_active {
-                                            Color::Default
-                                        } else {
-                                            Color::Muted
-                                        })
-                                        .truncate(),
-                                ),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.activate(number, window, cx)
-                            }))
-                    });
-                v_flex()
-                    .pb_0p5()
-                    .children(header)
-                    .child(v_flex().gap_0p5().children(rows))
-            })
+            .map(|terminal| self.render_tab(terminal.number, cx).into_any_element())
             .collect::<Vec<_>>();
-        v_flex()
-            .w(LIST_WIDTH)
+        let colors = cx.theme().colors();
+        h_flex()
+            .h(STRIP_HEIGHT)
             .flex_none()
-            .h_full()
-            .border_l_1()
-            .border_color(colors.border_variant)
+            .w_full()
+            .bg(colors.panel_background)
             .child(
                 h_flex()
-                    .h(px(22.))
-                    .flex_none()
+                    .id("drawer-tabs")
+                    .h_full()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .children(tabs),
+            )
+            // The tab in front has no bottom border, so it runs into its shell.
+            .child(
+                h_flex()
+                    .flex_1()
+                    .h_full()
                     .justify_end()
+                    .gap_0p5()
+                    .px_1p5()
                     .border_b_1()
                     .border_color(colors.border_variant)
-                    .child(self.render_actions(cx)),
-            )
-            .child(
-                v_flex()
-                    .id("drawer-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_1()
-                    .children(groups),
+                    .child(
+                        IconButton::new("drawer-new-terminal", IconName::Plus)
+                            .icon_size(IconSize::XSmall)
+                            .disabled(!can_add)
+                            .tooltip(Tooltip::text("New Terminal"))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.new_terminal(window, cx)),
+                            ),
+                    )
+                    .child(
+                        IconButton::new(
+                            "drawer-full-screen",
+                            if self.is_full_screen {
+                                IconName::Minimize
+                            } else {
+                                IconName::Maximize
+                            },
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text(if self.is_full_screen {
+                            "Exit Full Screen"
+                        } else {
+                            "Full Screen"
+                        }))
+                        .on_click(
+                            cx.listener(|_, _, _, cx| {
+                                cx.emit(TerminalDrawerEvent::ToggleFullScreen)
+                            }),
+                        ),
+                    ),
             )
     }
 }
 
 impl Render for TerminalDrawer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_list = self.terminals.len() > 1;
-        h_flex()
-            .relative()
+        let active = self
+            .terminal(self.active)
+            .map(|terminal| (terminal.number, terminal.view.clone()));
+        v_flex()
             .size_full()
             .bg(cx.theme().colors().terminal_background)
-            .child(
+            .child(self.render_strip(cx))
+            .children(active.map(|(number, view)| {
                 div()
+                    .id(("drawer-terminal", number as usize))
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.render_group(cx)),
-            )
-            .when(has_list, |drawer| drawer.child(self.render_list(cx)))
-            // With one terminal, the actions float at its top right, as in t3code.
-            .when(!has_list, |drawer| {
-                drawer.child(
-                    div()
-                        .absolute()
-                        .top_1()
-                        .right_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(cx.theme().colors().border_variant)
-                        .bg(cx.theme().colors().editor_background)
-                        .child(self.render_actions(cx)),
-                )
-            })
+                    .min_h_0()
+                    .w_full()
+                    .pt_1()
+                    .child(view)
+            }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
+    use projects::ProjectsSnapshot;
 
     use super::*;
     use crate::machines::MachineId;
 
-    fn layout(drawer: &TerminalDrawer) -> Vec<(Vec<u32>, bool)> {
-        drawer
-            .groups
-            .iter()
-            .map(|group| (group.numbers.clone(), group.split == Split::Stacked))
-            .collect()
-    }
-
-    #[gpui::test]
-    fn terminals_split_and_close_as_t3code_s_do(cx: &mut TestAppContext) {
-        let drawer = cx.update(|cx| {
+    fn open(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ServerClient>,
+        Entity<TerminalDrawer>,
+        &mut VisualTestContext,
+    ) {
+        let client = cx.update(|cx| {
             crate::init_for_test(cx);
-            let client = ServerClient::new_for_test(
+            ServerClient::new_for_test(
                 MachineId::Local,
                 "This Mac".into(),
                 SpacesSnapshot::default(),
                 cx,
-            );
-            cx.new(|cx| TerminalDrawer::new(client, ThreadId(1), cx))
+            )
         });
+        let (drawer, cx) = cx.add_window_view({
+            let client = client.clone();
+            |_, cx| TerminalDrawer::new(client, ThreadId(1), cx)
+        });
+        (client, drawer, cx)
+    }
+
+    /// What the server says runs in front of each shell.
+    fn set_running(client: &Entity<ServerClient>, running: &[(u32, &str)], cx: &mut App) {
+        let projects = client.read(cx).projects().clone();
+        projects.update(cx, |store, cx| {
+            store.set_snapshot(
+                ProjectsSnapshot {
+                    drawer_commands: running
+                        .iter()
+                        .map(|(number, command)| (ThreadId(1), *number, command.to_string()))
+                        .collect(),
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+    }
+
+    fn numbers(drawer: &TerminalDrawer) -> Vec<u32> {
+        drawer
+            .terminals
+            .iter()
+            .map(|terminal| terminal.number)
+            .collect()
+    }
+
+    fn closes(client: &Entity<ServerClient>, cx: &mut VisualTestContext) -> usize {
+        client.read_with(cx, |client, _| {
+            client
+                .sent_for_test()
+                .into_iter()
+                .filter(|request| matches!(request, Request::CloseTerminal(_)))
+                .count()
+        })
+    }
+
+    /// A new shell is the last tab and shows; closing the one in front shows the next along,
+    /// and closing the last empties the drawer.
+    #[gpui::test]
+    fn shells_are_tabs(cx: &mut TestAppContext) {
+        let (_, drawer, cx) = open(cx);
         let emptied = std::rc::Rc::new(std::cell::Cell::new(false));
-        cx.update(|cx| {
+        cx.update(|_, cx| {
             let emptied = emptied.clone();
             cx.subscribe(&drawer, move |_, event, _| {
                 if matches!(event, TerminalDrawerEvent::Empty) {
@@ -604,32 +461,82 @@ mod tests {
             })
             .detach();
         });
-
         drawer.update(cx, |drawer, cx| {
-            assert_eq!(layout(drawer), vec![(vec![1], false)]);
-            // A split goes beside the active terminal, in its group.
-            drawer.add_terminal(Some(Split::SideBySide), cx);
-            assert_eq!(layout(drawer), vec![(vec![1, 2], false)]);
-            drawer.active = 1;
-            drawer.add_terminal(Some(Split::Stacked), cx);
-            assert_eq!(layout(drawer), vec![(vec![1, 3, 2], true)]);
+            assert_eq!(numbers(drawer), vec![1]);
+            drawer.add_terminal(cx);
+            drawer.add_terminal(cx);
+            assert_eq!(numbers(drawer), vec![1, 2, 3]);
             assert_eq!(drawer.active, 3);
-            drawer.add_terminal(Some(Split::Stacked), cx);
-            assert!(drawer.is_active_group_full());
-            // A new terminal has a group of its own.
-            drawer.add_terminal(None, cx);
-            assert_eq!(layout(drawer).len(), 2);
-            assert_eq!(drawer.active, 5);
-            // Closing the active one makes the next along active.
-            drawer.active = 3;
+            drawer.active = 2;
+            drawer.close_terminal(2, cx);
+            assert_eq!(numbers(drawer), vec![1, 3]);
+            assert_eq!(drawer.active, 3);
             drawer.close_terminal(3, cx);
-            assert_eq!(layout(drawer)[0].0, vec![1, 4, 2]);
-            assert_eq!(drawer.active, 4);
-            for number in [1, 2, 4, 5] {
-                drawer.close_terminal(number, cx);
-            }
-            assert!(drawer.groups.is_empty());
+            assert_eq!(drawer.active, 1);
         });
+        assert!(!emptied.get());
+        drawer.update(cx, |drawer, cx| drawer.close_terminal(1, cx));
         assert!(emptied.get());
+    }
+
+    /// Each tab names what runs in its shell, and a click on one shows it.
+    #[gpui::test]
+    fn tabs_name_what_runs_and_switch_shells(cx: &mut TestAppContext) {
+        let (client, drawer, cx) = open(cx);
+        drawer.update(cx, |drawer, cx| {
+            drawer.add_terminal(cx);
+        });
+        cx.update(|_, cx| set_running(&client, &[(2, "npm run dev")], cx));
+        cx.run_until_parked();
+        let tab = |cx: &mut VisualTestContext, number: u32| {
+            cx.debug_bounds(&*format!("drawer-tab-{number}").leak())
+                .expect("a tab")
+        };
+        assert!(tab(cx, 1).size.width < tab(cx, 2).size.width);
+        let names = drawer.read_with(cx, |drawer, cx| {
+            [1, 2].map(|number| drawer.running_program(number, cx))
+        });
+        assert_eq!(names, [None, Some("npm run dev".to_string())]);
+
+        let first = tab(cx, 1);
+        cx.simulate_click(first.center(), gpui::Modifiers::none());
+        assert_eq!(drawer.read_with(cx, |drawer, _| drawer.active), 1);
+    }
+
+    /// An idle shell's × ends it at once; while a program runs, it asks first.
+    #[gpui::test]
+    fn closing_a_busy_shell_asks_first(cx: &mut TestAppContext) {
+        let (client, drawer, cx) = open(cx);
+        drawer.update(cx, |drawer, cx| {
+            drawer.add_terminal(cx);
+            drawer.add_terminal(cx);
+        });
+        cx.update(|_, cx| set_running(&client, &[(2, "npm run dev")], cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| drawer.update(cx, |drawer, cx| drawer.request_close(3, window, cx)));
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(closes(&client, cx), 1);
+
+        cx.update(|window, cx| drawer.update(cx, |drawer, cx| drawer.request_close(2, window, cx)));
+        assert_eq!(
+            cx.pending_prompt(),
+            Some((
+                "Close “npm run dev”?".to_string(),
+                "It's still running, and closing the terminal ends it.".to_string()
+            ))
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            drawer.read_with(cx, |drawer, _| numbers(drawer)),
+            vec![1, 2]
+        );
+        cx.update(|window, cx| drawer.update(cx, |drawer, cx| drawer.request_close(2, window, cx)));
+        cx.simulate_prompt_answer("Close");
+        cx.run_until_parked();
+        assert_eq!(drawer.read_with(cx, |drawer, _| numbers(drawer)), vec![1]);
+        assert_eq!(closes(&client, cx), 2);
     }
 }
