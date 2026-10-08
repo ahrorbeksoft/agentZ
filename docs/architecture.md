@@ -292,13 +292,25 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
   combining repositories), Appearance (Zed's theme modes), Notifications (sounds and system
   notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, and a page
-  per project
-  (with Checkouts). As in Zed's settings, a page is a `list` of its header and sections
+  per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards are rows of
   their own: a frame lays out only the rows in view, each on its own. Laid out whole, a page of
   nested flex columns took taffy a measure of each label twice per column around it, and an
   agent with seven accounts scrolled at 20 to 30 fps. The rows out of view are measured again
   on each frame that isn't a scroll, since anything else may have changed their height.
+- **Project settings** (`SettingsPage::{render_project_header, render_project}`, the user's
+  picks in `design/settings-projects/`): the settings sidebar lists each project once, as
+  combined by Merged projects (`Machines::project_groups`), by its name; one only on another
+  machine adds " · Devbox 1". Its page shows one copy (`Section::Project` holds its
+  `ProjectKey`): the one a thread's Project Settings came from, else the group's first (This
+  Mac's). With more than one copy, the Usage page's machine dropdown sits beside the title,
+  listing each copy's machine with its icon and a check on the one shown, two copies on one
+  machine told apart by folder ("This Mac · ~/projects/agentZ-2", `copy_label`). Project
+  (Name, Icon, Monogram, from the group's first copy) and Repository apply to every copy;
+  then a section titled with the chosen copy's machine holds its Folder and Grouping, then its
+  Checkouts and Danger. A combined project's Danger is "Remove from <machine>", which removes
+  only that copy, after which the page shows the next one (`SettingsPage::project_copies`,
+  `next_copy`); a project with one copy keeps "Remove Project".
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
   installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
   a login status badge, the version and registry links, Update when there is one, and a "⋯"

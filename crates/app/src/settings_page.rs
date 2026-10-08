@@ -117,7 +117,7 @@ pub enum SettingsPageEvent {
     OpenThread(ThreadKey),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Section {
     General,
     Appearance,
@@ -127,6 +127,8 @@ enum Section {
     Skills,
     McpServers,
     Machines,
+    /// A project's page, showing the copy given: the project combines its checkouts on every
+    /// machine, and its page's machine picker moves between them.
     Project(ProjectKey),
 }
 
@@ -154,6 +156,8 @@ pub struct SettingsPage {
     machines: Entity<Machines>,
     app_settings: Entity<AppSettingsStore>,
     section: Section,
+    /// The open project's copies as last seen, so removing the one shown shows the next.
+    project_copies: Vec<ProjectKey>,
     name_input: Entity<TextInput>,
     monogram_input: Entity<TextInput>,
     /// The machine whose agents Settings › Agents shows.
@@ -201,11 +205,20 @@ impl SettingsPage {
         let monogram_input = cx.new(|cx| TextInput::new("", cx));
         let mut subscriptions = vec![
             cx.observe(&machines, |this, _, cx| {
-                // A removed project's page has nothing left to show.
-                if let Section::Project(key) = this.section
-                    && this.project(key, cx).is_none()
-                {
-                    this.section = Section::General;
+                if let Section::Project(key) = this.section {
+                    if this.project(key, cx).is_some() {
+                        this.project_copies = this.copy_keys(key, cx);
+                    } else {
+                        // A removed copy's page shows the project's next copy, and a removed
+                        // project's page has nothing left to show.
+                        let next = next_copy(&this.project_copies, key, |copy| {
+                            this.project(copy, cx).is_some()
+                        });
+                        match next {
+                            Some(copy) => this.show_copy(copy, cx),
+                            None => this.section = Section::General,
+                        }
+                    }
                 }
                 if this
                     .machines
@@ -254,6 +267,7 @@ impl SettingsPage {
             machines,
             app_settings,
             section: Section::General,
+            project_copies: Vec::new(),
             name_input,
             monogram_input,
             agents_machine: MachineId::Local,
@@ -356,6 +370,40 @@ impl SettingsPage {
         }
     }
 
+    /// The name the projects list shows for the project the copy is in.
+    fn project_name(&self, key: ProjectKey, cx: &App) -> SharedString {
+        self.machines
+            .read(cx)
+            .group_of(key.machine, key.project, cx)
+            .map(|group| group.name())
+            .or_else(|| self.project(key, cx).map(|project| project.name()))
+            .unwrap_or_default()
+    }
+
+    fn copy_keys(&self, key: ProjectKey, cx: &App) -> Vec<ProjectKey> {
+        self.group_members(key, cx)
+            .into_iter()
+            .map(|(copy, _)| copy)
+            .collect()
+    }
+
+    /// The copy whose name and icon stand for the whole project, as in the sidebar: This
+    /// Mac's first. The shared sections show it whichever copy is chosen.
+    fn shared_copy(&self, key: ProjectKey, cx: &App) -> Option<(ProjectKey, Project)> {
+        self.group_members(key, cx).into_iter().next()
+    }
+
+    /// Shows another copy of the open project. Its name and icon are the project's, so the
+    /// shared sections' inputs stay as they are.
+    fn show_copy(&mut self, key: ProjectKey, cx: &mut Context<Self>) {
+        if self.section != Section::Project(key) {
+            self.scroll_content_to_top();
+        }
+        self.section = Section::Project(key);
+        self.project_copies = self.copy_keys(key, cx);
+        cx.notify();
+    }
+
     /// Gives the project's group the icon. An image is a file on this Mac, so only this
     /// Mac's checkouts take it.
     fn set_group_icon(&self, key: ProjectKey, icon: Option<ProjectIcon>, cx: &mut App) {
@@ -415,24 +463,25 @@ impl SettingsPage {
             self.registry(cx)
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
         }
-        if let Section::Project(key) = section
-            && let Some(project) = self.project(key, cx)
-        {
-            // Set before the section's inputs fire their change events, which then write
-            // the same values back.
-            self.name_input.update(cx, |input, cx| {
-                input.set_placeholder(project.folder_name(), cx);
-                input.set_text(project.custom_name.clone().unwrap_or_default(), cx);
-            });
-            let text = match &project.icon {
-                Some(ProjectIcon::Monogram { text, .. }) => text.clone(),
-                _ => String::new(),
-            };
-            let (automatic_text, _) = automatic_monogram(&project.name());
-            self.monogram_input.update(cx, |input, cx| {
-                input.set_placeholder(automatic_text, cx);
-                input.set_text(text, cx);
-            });
+        if let Section::Project(key) = section {
+            self.project_copies = self.copy_keys(key, cx);
+            if let Some((_, project)) = self.shared_copy(key, cx) {
+                // Set before the section's inputs fire their change events, which then write
+                // the same values back.
+                self.name_input.update(cx, |input, cx| {
+                    input.set_placeholder(project.folder_name(), cx);
+                    input.set_text(project.custom_name.clone().unwrap_or_default(), cx);
+                });
+                let text = match &project.icon {
+                    Some(ProjectIcon::Monogram { text, .. }) => text.clone(),
+                    _ => String::new(),
+                };
+                let (automatic_text, _) = automatic_monogram(&project.name());
+                self.monogram_input.update(cx, |input, cx| {
+                    input.set_placeholder(automatic_text, cx);
+                    input.set_text(text, cx);
+                });
+            }
         }
         cx.notify();
     }
@@ -443,7 +492,7 @@ impl SettingsPage {
         let Section::Project(key) = self.section else {
             return;
         };
-        let Some(project) = self.project(key, cx) else {
+        let Some((_, project)) = self.shared_copy(key, cx) else {
             return;
         };
         let (automatic_text, automatic_color) = automatic_monogram(&project.name());
@@ -484,26 +533,42 @@ impl SettingsPage {
         .detach();
     }
 
+    /// Removes the copy, the project's only one or one of several: the other machines keep
+    /// theirs.
     fn confirm_remove_project(
         &mut self,
-        project: &Project,
+        key: ProjectKey,
+        name: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(store) = self.machines.read(cx).projects(key.machine, cx) else {
+            return;
+        };
+        let (title, detail) = if self.group_members(key, cx).len() > 1 {
+            (
+                format!(
+                    "Remove “{name}” from {}?",
+                    self.machines.read(cx).label(key.machine, cx)
+                ),
+                "Its threads there are removed too. Nothing on disk is touched.",
+            )
+        } else {
+            (
+                format!("Remove “{name}” from agentZ?"),
+                "Its threads are removed too. Nothing on disk is touched.",
+            )
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Remove “{}” from agentZ?", project.name()),
-            Some("Its threads are removed too. Nothing on disk is touched."),
+            &title,
+            Some(detail),
             &["Remove", "Cancel"],
             cx,
         );
-        let Some(store) = self.project_store(cx) else {
-            return;
-        };
-        let id = project.id;
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(0) {
-                store.update(cx, |store, cx| store.remove_project(id, cx));
+                store.update(cx, |store, cx| store.remove_project(key.project, cx));
             }
         })
         .detach();
@@ -668,12 +733,7 @@ impl SettingsPage {
 
     fn render_nav(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let machines = self.machines.read(cx);
-        let projects: Vec<(MachineId, Project)> = machines
-            .project_groups(cx)
-            .into_iter()
-            .flat_map(|group| group.members)
-            .collect();
+        let projects = self.machines.read(cx).project_groups(cx);
         let mut items = vec![
             self.render_nav_item(
                 "General",
@@ -716,25 +776,34 @@ impl SettingsPage {
         ];
         let fixed_count = items.len();
         let mut project_items = Vec::with_capacity(projects.len());
-        for (machine, project) in &projects {
-            let icon = render_project_icon(*machine, project, px(14.), cx);
-            let label: SharedString = match machine {
-                MachineId::Local => project.name(),
-                MachineId::Remote(_) => format!(
+        // One row per project, however many copies it combines: it opens on the copy shown,
+        // or else on the sidebar's first (This Mac's).
+        for group in &projects {
+            let Some((machine, project)) = group.primary() else {
+                continue;
+            };
+            let copy = match self.section {
+                Section::Project(open) if group.contains(open.machine, open.project) => open,
+                _ => ProjectKey {
+                    machine,
+                    project: project.id,
+                },
+            };
+            let icon = render_project_icon(machine, project, px(14.), cx);
+            let label: SharedString = match group.machines().as_slice() {
+                [MachineId::Remote(_)] => format!(
                     "{} · {}",
-                    project.name(),
-                    self.machines.read(cx).label(*machine, cx)
+                    group.name(),
+                    self.machines.read(cx).label(machine, cx)
                 )
                 .into(),
+                _ => group.name(),
             };
             project_items.push(self.render_nav_item(
                 label,
                 None,
                 Some(icon),
-                Section::Project(ProjectKey {
-                    machine: *machine,
-                    project: project.id,
-                }),
+                Section::Project(copy),
                 cx,
             ));
         }
@@ -832,7 +901,8 @@ impl SettingsPage {
             .into(),
         };
         h_flex()
-            .id(id)
+            .id(id.clone())
+            .debug_selector(move || id.to_string())
             .h(px(28.))
             .px_2()
             .gap_2()
@@ -5806,28 +5876,106 @@ impl SettingsPage {
         .detach();
     }
 
+    /// The project's name, and the machine picker while it has more than one copy (the
+    /// Agents and Usage pages' dropdown, with New Thread's labels).
+    fn render_project_header(
+        &self,
+        key: ProjectKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let copies = self.group_members(key, cx);
+        let name = self.project_name(key, cx);
+        let picker = (copies.len() > 1).then(|| {
+            let machines = self.machines.read(cx);
+            let rows: Vec<(ProjectKey, IconName, SharedString)> = copies
+                .iter()
+                .map(|(copy, _)| {
+                    (
+                        *copy,
+                        machines.machine_icon(copy.machine, cx),
+                        copy_label(*copy, &copies, cx),
+                    )
+                })
+                .collect();
+            let icon = machines.machine_icon(key.machine, cx);
+            let page = cx.weak_entity();
+            // Custom entries, since a toggleable entry's icon takes the check's place.
+            let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for (copy, icon, label) in rows {
+                    menu = menu.custom_entry(
+                        move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .gap_1p5()
+                                .debug_selector(move || {
+                                    format!(
+                                        "project-copy-option-{}-{}",
+                                        copy.machine.slug(),
+                                        copy.project.0
+                                    )
+                                })
+                                .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                                .child(Label::new(label.clone()))
+                                .child(div().flex_1().min_w(px(16.)))
+                                .when(copy == key, |row| {
+                                    row.child(
+                                        Icon::new(IconName::Check)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    )
+                                })
+                                .into_any_element()
+                        },
+                        on_page(&page, move |page, _, cx| page.show_copy(copy, cx)),
+                    );
+                }
+                menu
+            });
+            let trigger = h_flex()
+                .gap_1p5()
+                .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                .child(Label::new(copy_label(key, &copies, cx)))
+                .into_any_element();
+            div().debug_selector(|| "project-copy-picker".into()).child(
+                DropdownMenu::new_with_element("project-copy", trigger, menu),
+            )
+        });
+        h_flex()
+            .h(px(28.))
+            .gap_4()
+            .justify_between()
+            .child(Headline::new(name).size(HeadlineSize::Small))
+            .children(picker)
+            .into_any_element()
+    }
+
+    /// The project's own sections, from the copy that stands for it, then the chosen copy's:
+    /// its folder and grouping under its machine's name, its checkouts, and removing it.
     fn render_project(
         &self,
-        machine: MachineId,
+        key: ProjectKey,
         project: Project,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
-        let id = project.id;
-        let key = ProjectKey {
-            machine,
-            project: id,
-        };
-        let is_local = machine == MachineId::Local;
-        let icon_description: SharedString = match &project.icon {
+        let copies = self.group_members(key, cx);
+        let (shared_key, shared) = copies
+            .first()
+            .cloned()
+            .unwrap_or_else(|| (key, project.clone()));
+        let has_local_copy = copies
+            .iter()
+            .any(|(copy, _)| copy.machine == MachineId::Local);
+        let icon_description: SharedString = match &shared.icon {
             None => "Automatic: the project's favicon, or a monogram.".into(),
             Some(ProjectIcon::Monogram { text, color }) => {
                 format!("Monogram · {text} · {color}").into()
             }
             Some(ProjectIcon::Image { path }) => path.display().to_string().into(),
         };
-        let current_color = match &project.icon {
+        let current_color = match &shared.icon {
             Some(ProjectIcon::Monogram { color, .. }) => Some(color.clone()),
             _ => None,
         };
@@ -5867,111 +6015,142 @@ impl SettingsPage {
                         cx.listener(move |this, _, _, cx| this.set_monogram(None, Some(name), cx)),
                     )
             }));
-        let icon_controls = h_flex()
-            .gap_2()
-            .child(render_project_icon(machine, &project, px(24.), cx))
-            // The picker shows this Mac's files, which another machine can't read.
-            .when(is_local, |this| {
-                this.child(
-                    Button::new("choose-icon-file", "Choose File…")
-                        .style(ButtonStyle::Outlined)
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.choose_icon_file(key, cx)),
-                        ),
+        let icon_controls =
+            h_flex()
+                .gap_2()
+                .child(render_project_icon(
+                    shared_key.machine,
+                    &shared,
+                    px(24.),
+                    cx,
+                ))
+                // The picker shows this Mac's files, which only this Mac's copies can use.
+                .when(has_local_copy, |this| {
+                    this.child(
+                        Button::new("choose-icon-file", "Choose File…")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.choose_icon_file(shared_key, cx)
+                            })),
+                    )
+                })
+                .when(shared.icon.is_some(), |this| {
+                    this.child(
+                        Button::new("reset-icon", "Reset")
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.monogram_input
+                                    .update(cx, |input, cx| input.set_text("", cx));
+                                this.set_group_icon(shared_key, None, cx);
+                            })),
+                    )
+                });
+        let machine_label = self.machines.read(cx).label(key.machine, cx);
+        let mut copy_rows = vec![render_row(
+            "Folder",
+            project.path.display().to_string(),
+            div().into_any_element(),
+            cx,
+        )];
+        copy_rows.extend(self.render_grouping(key, &project, window, cx));
+        let is_combined = copies.len() > 1;
+        let name = self.project_name(key, cx);
+        let remove_button = div()
+            .debug_selector(|| "remove-project".into())
+            .child(
+                Button::new(
+                    "remove-project",
+                    if is_combined {
+                        "Remove…"
+                    } else {
+                        "Remove Project"
+                    },
                 )
-            })
-            .when(project.icon.is_some(), |this| {
-                this.child(
-                    Button::new("reset-icon", "Reset")
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.monogram_input
-                                .update(cx, |input, cx| input.set_text("", cx));
-                            this.set_group_icon(key, None, cx);
-                        })),
+                .style(ButtonStyle::Outlined)
+                .color(Color::Error)
+                .start_icon(
+                    Icon::new(IconName::Trash)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
                 )
-            });
-        vec![
-            render_section(
-                "Project",
-                vec![
-                    render_row(
-                        "Name",
-                        "Shown in the sidebar and thread lists. Leave it empty for the folder name.",
-                        input_box(self.name_input.clone(), px(256.)).into_any_element(),
-                        cx,
-                    ),
-                    render_row(
-                        "Icon",
-                        icon_description,
-                        icon_controls.into_any_element(),
-                        cx,
-                    ),
-                    render_row(
-                        "Monogram",
-                        "Letters and a color for a custom monogram icon.",
-                        v_flex()
-                            .items_end()
-                            .gap_2()
-                            .child(input_box(self.monogram_input.clone(), px(64.)))
-                            .child(div().w(px(256.)).child(swatches))
-                            .into_any_element(),
-                        cx,
-                    ),
-                    render_row(
-                        "Folder",
-                        match machine {
-                            MachineId::Local => project.path.display().to_string(),
-                            MachineId::Remote(_) => format!(
-                                "{}: {}",
-                                self.machines.read(cx).label(machine, cx),
-                                project.path.display()
-                            ),
-                        },
-                        div().into_any_element(),
-                        cx,
-                    ),
-                ],
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.confirm_remove_project(key, name.clone(), window, cx)
+                })),
+            )
+            .into_any_element();
+        let remove_row = if is_combined {
+            render_row(
+                format!("Remove from {machine_label}"),
+                format!(
+                    "Removes this copy and its threads from agentZ. {} Files on disk are not \
+                     touched.",
+                    kept_copies(key, &copies, cx)
+                ),
+                remove_button,
                 cx,
-            ),
-        ]
-        .into_iter()
-        .chain(self.render_repository(key, &project, window, cx))
-        .chain([
-            self.render_checkouts(machine, &project, cx),
-            render_section(
-                "Danger",
-                vec![render_row(
-                    "Remove project",
-                    "Removes the project and its threads from agentZ. Files on disk are not touched.",
-                    Button::new("remove-project", "Remove Project")
-                        .style(ButtonStyle::Outlined)
-                        .color(Color::Error)
-                        .start_icon(
-                            Icon::new(IconName::Trash)
-                                .size(IconSize::Small)
-                                .color(Color::Error),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.confirm_remove_project(&project, window, cx)
-                        }))
+            )
+        } else {
+            render_row(
+                "Remove project",
+                "Removes the project and its threads from agentZ. Files on disk are not touched.",
+                remove_button,
+                cx,
+            )
+        };
+        vec![render_section(
+            "Project",
+            vec![
+                render_row(
+                    "Name",
+                    "Shown in the sidebar and thread lists. Leave it empty for the folder name.",
+                    input_box(self.name_input.clone(), px(256.)).into_any_element(),
+                    cx,
+                ),
+                render_row(
+                    "Icon",
+                    icon_description,
+                    icon_controls.into_any_element(),
+                    cx,
+                ),
+                render_row(
+                    "Monogram",
+                    "Letters and a color for a custom monogram icon.",
+                    v_flex()
+                        .items_end()
+                        .gap_2()
+                        .child(input_box(self.monogram_input.clone(), px(64.)))
+                        .child(div().w(px(256.)).child(swatches))
                         .into_any_element(),
                     cx,
-                )],
-                cx,
-            )])
+                ),
+            ],
+            cx,
+        )]
+        .into_iter()
+        .chain(render_repository(&project, cx))
+        .chain([
+            div()
+                .debug_selector(move || {
+                    format!("project-copy-{}-{}", key.machine.slug(), key.project.0)
+                })
+                .child(render_section(machine_label, copy_rows, cx))
+                .into_any_element(),
+            self.render_checkouts(key.machine, &project, cx),
+            render_section("Danger", vec![remove_row], cx),
+        ])
         .collect()
     }
 
-    /// The repository the project's checkout belongs to, what it's combined with, and how.
-    fn render_repository(
+    /// Whether the copy combines with the repository's other checkouts, which is saved for
+    /// this copy only.
+    fn render_grouping(
         &self,
         key: ProjectKey,
         project: &Project,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let repository = project.repository.as_ref()?;
+        project.repository.as_ref()?;
         let settings = self.app_settings.read(cx).settings();
         let default = settings.project_grouping;
         let physical = GroupKey::of_project(key);
@@ -6018,55 +6197,100 @@ impl SettingsPage {
             Some(mode) => mode.label().into(),
             None => "Default".into(),
         };
-        let name = repository
-            .display_name
-            .clone()
-            .unwrap_or_else(|| repository.canonical_key.clone());
-        let mut rows = vec![
-            render_row(
-                "Repository",
-                format!(
-                    "{name} · {} {}",
-                    repository.remote_name, repository.remote_url
-                ),
-                div().into_any_element(),
-                cx,
-            ),
-            render_row(
-                "Grouping",
-                mode.description(),
-                DropdownMenu::new("project-grouping-override", dropdown_label, menu)
-                    .into_any_element(),
-                cx,
-            ),
-        ];
-        let machines = self.machines.read(cx);
-        let others: Vec<String> = self
-            .group_members(key, cx)
-            .into_iter()
-            .filter(|(member, _)| *member != key)
-            .map(|(member, project)| match member.machine {
-                MachineId::Local => compact_path(&project.path),
-                machine => format!(
-                    "{}: {}",
-                    machines.label(machine, cx),
-                    project.path.display()
-                ),
-            })
-            .collect();
-        if !others.is_empty() {
-            rows.push(render_row(
-                "Combined with",
-                format!(
-                    "{}. Name and icon changes apply to all of them.",
-                    others.join(", ")
-                ),
-                div().into_any_element(),
-                cx,
-            ));
-        }
-        Some(render_section("Repository", rows, cx))
+        Some(render_row(
+            "Grouping",
+            mode.description(),
+            DropdownMenu::new("project-grouping-override", dropdown_label, menu).into_any_element(),
+            cx,
+        ))
     }
+}
+
+/// The repository the project's checkouts belong to.
+fn render_repository(project: &Project, cx: &App) -> Option<AnyElement> {
+    let repository = project.repository.as_ref()?;
+    let name = repository
+        .display_name
+        .clone()
+        .unwrap_or_else(|| repository.canonical_key.clone());
+    Some(render_section(
+        "Repository",
+        vec![render_row(
+            "Repository",
+            format!(
+                "{name} · {} {}",
+                repository.remote_name, repository.remote_url
+            ),
+            div().into_any_element(),
+            cx,
+        )],
+        cx,
+    ))
+}
+
+/// The copy's machine in the project's machine picker, and its folder too while the project
+/// has another copy there, as New Thread's machine menu tells them apart.
+fn copy_label(copy: ProjectKey, copies: &[(ProjectKey, Project)], cx: &App) -> SharedString {
+    let label = Machines::global(cx).read(cx).label(copy.machine, cx);
+    let shares_machine = copies
+        .iter()
+        .any(|(other, _)| *other != copy && other.machine == copy.machine);
+    let path = copies
+        .iter()
+        .find(|(other, _)| *other == copy)
+        .map(|(_, project)| &project.path);
+    match path {
+        Some(path) if shares_machine => {
+            let folder = match copy.machine {
+                MachineId::Local => compact_path(path),
+                MachineId::Remote(_) => path.display().to_string(),
+            };
+            format!("{label} · {folder}").into()
+        }
+        _ => label,
+    }
+}
+
+/// Who keeps the project once the copy is removed, for Remove's description.
+fn kept_copies(copy: ProjectKey, copies: &[(ProjectKey, Project)], cx: &App) -> String {
+    let others: Vec<MachineId> = copies
+        .iter()
+        .map(|(other, _)| *other)
+        .filter(|other| *other != copy)
+        .map(|other| other.machine)
+        .collect();
+    if others == [copy.machine] {
+        return "The other copy stays.".to_string();
+    }
+    if others.contains(&copy.machine) {
+        return "The other copies stay.".to_string();
+    }
+    match others.as_slice() {
+        [machine] => format!(
+            "{} keeps its copy.",
+            Machines::global(cx).read(cx).label(*machine, cx)
+        ),
+        [machine, rest @ ..] if rest.iter().all(|other| other == machine) => format!(
+            "{} keeps its copies.",
+            Machines::global(cx).read(cx).label(*machine, cx)
+        ),
+        _ => "Other machines keep theirs.".to_string(),
+    }
+}
+
+/// The copy to show once `removed` is gone: the next of the project's copies still there, else
+/// the one before it.
+fn next_copy(
+    copies: &[ProjectKey],
+    removed: ProjectKey,
+    exists: impl Fn(ProjectKey) -> bool,
+) -> Option<ProjectKey> {
+    let index = copies.iter().position(|copy| *copy == removed)?;
+    copies[index + 1..]
+        .iter()
+        .chain(copies[..index].iter().rev())
+        .copied()
+        .find(|copy| exists(*copy))
 }
 
 pub(crate) async fn remove_workspace(
@@ -7045,13 +7269,13 @@ fn select_choices(
 }
 
 /// t3code's settings section: a small heading over a bordered group of rows.
-fn render_section(title: &'static str, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+fn render_section(title: impl Into<SharedString>, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
     render_section_with_actions(title, rows, gpui::Empty.into_any_element(), cx)
 }
 
 /// A section with buttons beside its title, as t3code's `headerAction`.
 fn render_section_with_actions(
-    title: &'static str,
+    title: impl Into<SharedString>,
     rows: Vec<AnyElement>,
     actions: AnyElement,
     cx: &App,
@@ -7253,8 +7477,8 @@ impl SettingsPage {
             Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
-                    headline(project.name()),
-                    self.render_project(key.machine, project, window, cx),
+                    self.render_project_header(key, window, cx),
+                    self.render_project(key, project, window, cx),
                 ),
                 None => (headline("General".into()), self.render_general(window, cx)),
             },
@@ -7359,7 +7583,7 @@ mod tests {
     use agentz_protocol::thread::{ThreadState, ThreadView};
     use agentz_protocol::{AgentSettingsChange, ConnectionId, Response};
     use gpui::TestAppContext;
-    use projects::ImportedSession;
+    use projects::{ImportedSession, ProjectsSnapshot};
 
     use super::*;
     use crate::server_client::ServerClient;
@@ -8916,6 +9140,256 @@ mod tests {
         }));
         assert!(sent(&Request::AddAccount(mock.clone())));
         assert_eq!(count(&external_session), external_sessions);
+    }
+
+    fn checkout(id: u64, path: &str) -> Project {
+        Project {
+            id: ProjectId(id),
+            path: path.into(),
+            custom_name: None,
+            icon: None,
+            workspaces: Vec::new(),
+            repository: Some(projects::RepositoryIdentity {
+                canonical_key: "github.com/agentz/agentz".into(),
+                root_path: path.into(),
+                remote_name: "origin".into(),
+                remote_url: "https://github.com/agentz/agentz.git".into(),
+                display_name: Some("agentz/agentz".into()),
+                owner: Some("agentz".into()),
+                name: Some("agentz".into()),
+            }),
+        }
+    }
+
+    fn folder(id: u64, path: &str) -> Project {
+        Project {
+            repository: None,
+            ..checkout(id, path)
+        }
+    }
+
+    /// This Mac with two checkouts of one repository and a folder, and Devbox 1 with a third
+    /// checkout and a folder of its own.
+    fn machines_with_copies(
+        cx: &mut TestAppContext,
+    ) -> (Entity<ServerClient>, Entity<ServerClient>) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let local = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let devbox = ServerClient::new_for_test(
+                MachineId::Remote(1),
+                "Devbox 1".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            for (client, projects) in [
+                (
+                    &local,
+                    vec![
+                        checkout(1, "/work/agentz"),
+                        checkout(2, "/work/agentz-2"),
+                        folder(3, "/work/notes"),
+                    ],
+                ),
+                (
+                    &devbox,
+                    vec![
+                        checkout(1, "/home/me/agentz"),
+                        folder(2, "/home/me/scratch"),
+                    ],
+                ),
+            ] {
+                client.read(cx).projects().clone().update(cx, |store, cx| {
+                    store.set_snapshot(
+                        ProjectsSnapshot {
+                            projects,
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                });
+            }
+            crate::machines::init_for_test(vec![local.clone(), devbox.clone()], cx);
+            (local, devbox)
+        })
+    }
+
+    fn shown_section(page: &Entity<SettingsPage>, cx: &mut gpui::VisualTestContext) -> Section {
+        page.read_with(cx, |page, _| page.section)
+    }
+
+    #[gpui::test]
+    fn a_combined_project_is_one_row_whose_page_picks_the_copy(cx: &mut TestAppContext) {
+        machines_with_copies(cx);
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.run_until_parked();
+        let this_mac = ProjectKey {
+            machine: MachineId::Local,
+            project: ProjectId(1),
+        };
+        let devbox = ProjectKey {
+            machine: MachineId::Remote(1),
+            project: ProjectId(1),
+        };
+
+        // The three checkouts are one row, which opens This Mac's first. The folders keep
+        // their own rows.
+        let row = cx
+            .debug_bounds("settings-nav-project-local-1")
+            .expect("the combined project is listed");
+        for copy in [
+            "settings-nav-project-local-2",
+            "settings-nav-project-remote-1-1",
+        ] {
+            assert!(cx.debug_bounds(copy).is_none(), "{copy} has no row");
+        }
+        assert!(cx.debug_bounds("settings-nav-project-local-3").is_some());
+        assert!(cx.debug_bounds("settings-nav-project-remote-1-2").is_some());
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(shown_section(&page, cx), Section::Project(this_mac));
+        assert!(cx.debug_bounds("project-copy-local-1").is_some());
+
+        // The machine picker's menu lists each copy, and tells the two on This Mac apart by
+        // folder.
+        let (labels, kept) = page.update(cx, |page, cx| {
+            let copies = page.group_members(this_mac, cx);
+            let labels: Vec<SharedString> = copies
+                .iter()
+                .map(|(copy, _)| copy_label(*copy, &copies, cx))
+                .collect();
+            let kept = [this_mac, devbox].map(|copy| kept_copies(copy, &copies, cx));
+            (labels, kept)
+        });
+        assert_eq!(
+            labels,
+            [
+                "This Mac · /work/agentz",
+                "This Mac · /work/agentz-2",
+                "Devbox 1"
+            ]
+        );
+        assert_eq!(
+            kept,
+            ["The other copies stay.", "This Mac keeps its copies."]
+        );
+        let picker = cx
+            .debug_bounds("project-copy-picker")
+            .expect("a combined project has a machine picker");
+        cx.simulate_click(picker.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        for option in ["project-copy-option-local-1", "project-copy-option-local-2"] {
+            assert!(cx.debug_bounds(option).is_some(), "{option} is listed");
+        }
+        let devbox_option = cx
+            .debug_bounds("project-copy-option-remote-1-1")
+            .expect("Devbox 1's copy is listed");
+        cx.simulate_click(devbox_option.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(shown_section(&page, cx), Section::Project(devbox));
+        assert!(cx.debug_bounds("project-copy-remote-1-1").is_some());
+        assert!(cx.debug_bounds("project-copy-local-1").is_none());
+        // Still one row, standing for the copy shown.
+        assert!(cx.debug_bounds("settings-nav-project-remote-1-1").is_some());
+        assert!(cx.debug_bounds("settings-nav-project-local-1").is_none());
+
+        // A thread's Project Settings opens on its copy.
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::General, window, cx);
+            page.show_project(devbox, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(shown_section(&page, cx), Section::Project(devbox));
+
+        // A project with one copy has nothing to pick.
+        let notes = cx
+            .debug_bounds("settings-nav-project-local-3")
+            .expect("the folder is listed");
+        cx.simulate_click(notes.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("project-copy-local-3").is_some());
+        assert!(cx.debug_bounds("project-copy-picker").is_none());
+    }
+
+    #[gpui::test]
+    fn removing_a_copy_leaves_the_others_and_shows_the_next(cx: &mut TestAppContext) {
+        let (local, devbox) = machines_with_copies(cx);
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let on_devbox = ProjectKey {
+            machine: MachineId::Remote(1),
+            project: ProjectId(1),
+        };
+        page.update_in(cx, |page, window, cx| {
+            page.show_project(on_devbox, window, cx)
+        });
+        cx.run_until_parked();
+
+        let remove = cx
+            .debug_bounds("remove-project")
+            .expect("the copy can be removed");
+        cx.simulate_click(remove.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Remove");
+        cx.run_until_parked();
+        let removes = |client: &Entity<ServerClient>, cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter(|request| matches!(request, Request::RemoveProject(_)))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            removes(&devbox, cx),
+            vec![Request::RemoveProject(ProjectId(1))]
+        );
+        assert!(removes(&local, cx).is_empty());
+
+        // Once Devbox 1's server has removed it, the page shows the next copy: the one before
+        // it, the last being gone.
+        devbox.update(cx, |client, cx| {
+            client.projects().clone().update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![folder(2, "/home/me/scratch")],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            shown_section(&page, cx),
+            Section::Project(ProjectKey {
+                machine: MachineId::Local,
+                project: ProjectId(2),
+            })
+        );
+        assert!(cx.debug_bounds("project-copy-local-2").is_some());
+    }
+
+    #[test]
+    fn the_next_copy_follows_the_removed_one() {
+        let this_mac = |id| ProjectKey {
+            machine: MachineId::Local,
+            project: ProjectId(id),
+        };
+        let copies = [this_mac(1), this_mac(2), this_mac(3)];
+        assert_eq!(next_copy(&copies, this_mac(2), |_| true), Some(this_mac(3)));
+        assert_eq!(next_copy(&copies, this_mac(3), |_| true), Some(this_mac(2)));
+        assert_eq!(
+            next_copy(&copies, this_mac(1), |copy| copy == this_mac(3)),
+            Some(this_mac(3))
+        );
+        assert_eq!(next_copy(&copies[..1], this_mac(1), |_| true), None);
     }
 
     #[test]
