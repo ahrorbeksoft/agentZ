@@ -237,6 +237,7 @@ fn clonefile(source: &Path, destination: &Path) -> Result<()> {
 
 /// A reflink copy on btrfs or xfs, or else a full copy (cow on Linux).
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::disallowed_methods, reason = "runs on a blocking thread")]
 fn clone_folder(source: &Path, destination: &Path) -> Result<()> {
     use std::process::Command;
 
@@ -705,6 +706,10 @@ fn file_system_name(path: &Path) -> Result<String> {
 
 /// Reflinks only work within one file system; elsewhere cow copies in full.
 #[cfg(not(target_os = "macos"))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the probe's copy runs on a blocking thread"
+)]
 async fn pasture_support(repo: &Path, data_dir: &Path) -> PastureSupport {
     use std::os::unix::fs::MetadataExt as _;
 
