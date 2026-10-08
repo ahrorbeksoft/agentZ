@@ -1,6 +1,7 @@
 //! agentZ's own controls for the login, account and input-request surfaces, where `ui`'s
 //! styles fall short: buttons with a solid accent or red fill, a field frame with a focus
-//! ring, an account avatar, an icon tile, and a one-time code in boxes.
+//! ring, an account avatar, an agent's icon on its account's color, an icon tile, and a
+//! one-time code in boxes.
 
 use gpui::{
     AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, Focusable as _, FontWeight, Hsla,
@@ -266,6 +267,62 @@ pub(crate) fn icon_tile(icon: Icon, size: Pixels, cx: &App) -> gpui::Div {
         ))))
 }
 
+/// An agent's icon for a thread: as it is, or white on a rounded square in the thread's
+/// account's color ([`account_fill_color`]) while its agent has more than one account, as the
+/// accounts round's pick D draws it.
+#[derive(Clone, IntoElement)]
+pub(crate) struct AgentIcon {
+    icon: Icon,
+    size: IconSize,
+    account_color: Option<Hsla>,
+}
+
+impl AgentIcon {
+    pub(crate) fn new(icon: Icon, account_color: Option<Hsla>) -> Self {
+        Self {
+            icon,
+            size: IconSize::default(),
+            account_color,
+        }
+    }
+
+    pub(crate) fn size(mut self, size: IconSize) -> Self {
+        self.size = size;
+        self
+    }
+}
+
+impl From<Icon> for AgentIcon {
+    fn from(icon: Icon) -> Self {
+        Self::new(icon, None)
+    }
+}
+
+impl RenderOnce for AgentIcon {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let Some(background) = self.account_color else {
+            return self.icon.size(self.size).into_any_element();
+        };
+        // The square takes the bare icon's place, so nothing around it moves, and the icon
+        // shrinks inside it, as in the design (a 10px icon on a 14px square).
+        let side = self.size.rems();
+        div()
+            .size(side)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(side / 3.5_f32)
+            .bg(background)
+            .child(
+                self.icon
+                    .size(IconSize::Custom(side - rems_from_px(4_f32)))
+                    .color(Color::Custom(gpui::white())),
+            )
+            .into_any_element()
+    }
+}
+
 /// A round avatar with the account's initial, as t3code shows an account, in the account's
 /// color or else the theme's accent.
 pub(crate) fn avatar(name: &str, color: Option<Hsla>, size: Pixels, cx: &App) -> AnyElement {
@@ -323,6 +380,12 @@ pub(crate) fn account_color(hex: &str, cx: &App) -> Option<Hsla> {
     {
         return Some(gpui::rgb(if is_light { *light } else { *dark }).into());
     }
+    gpui::Rgba::try_from(hex).ok().map(Hsla::from)
+}
+
+/// An account's color behind white, in every theme: as it's kept, which for
+/// [`ACCOUNT_COLORS`] is the darker shade.
+pub(crate) fn account_fill_color(hex: &str) -> Option<Hsla> {
     gpui::Rgba::try_from(hex).ok().map(Hsla::from)
 }
 

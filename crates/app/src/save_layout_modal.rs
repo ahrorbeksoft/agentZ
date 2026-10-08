@@ -13,6 +13,7 @@ use text_input::{TextInput, TextInputEvent};
 use ui::{Checkbox, ToggleState, prelude::*};
 
 use crate::app_settings::{AppSettingsStore, SavedLayout};
+use crate::controls::AgentIcon;
 
 const KEY_CONTEXT: &str = "SaveLayoutModal";
 
@@ -27,8 +28,8 @@ pub fn init(cx: &mut App) {
 #[derive(Clone)]
 pub struct LayoutPane {
     pub id: PaneId,
-    /// Colored already, as a thread's agent icon can be in its account's color.
-    pub icon: Icon,
+    /// Colored already, as a thread's agent icon can be on its account's color.
+    pub icon: AgentIcon,
     pub title: SharedString,
     /// What it runs, to run again when the layout opens. Without one it opens a shell.
     pub command: Option<String>,
@@ -261,7 +262,7 @@ mod tests {
         };
         let pane = |id: u64, command: Option<&str>| LayoutPane {
             id: PaneId(id),
-            icon: Icon::new(IconName::Terminal).color(Color::Muted),
+            icon: Icon::new(IconName::Terminal).color(Color::Muted).into(),
             title: command.unwrap_or("Shell").to_string().into(),
             command: command.map(str::to_string),
         };

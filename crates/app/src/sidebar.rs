@@ -6,11 +6,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::agent_icons::agent_icon;
 use crate::agent_view::TOOLBAR_HEIGHT;
-use crate::controls::account_color;
+use crate::controls::{AgentIcon, account_fill_color};
 use crate::machines::{
     MachineId, Machines, ProjectKey, Scope, ThreadKey, by_latest_activity, project_at,
 };
 use crate::project_store::{ProjectStore, ThreadStatus};
+use crate::settings_page::{AccountEntry, account_entry, render_entry_avatar};
 use crate::slide_drag::{
     DRAG_SCROLL_STEP, SlideDrag, drag_scroll_direction, render_raised_rows, scroll_while_held,
 };
@@ -1379,9 +1380,15 @@ impl Sidebar {
         let agent = agent.or_else(|| {
             let name = store?.terminal_agent(thread.id)?;
             Some((
-                Icon::new(IconName::Terminal).color(faint_icon),
+                Icon::new(IconName::Terminal).color(faint_icon).into(),
                 SharedString::from(name.to_string()),
             ))
+        });
+        // Only while the agent has others to tell it from, as its icon's color shows.
+        let account = thread.agent_id.as_ref().and_then(|agent_id| {
+            let client = machines.client(machine, cx)?;
+            let accounts = client.read(cx).accounts(&AgentId::new(agent_id.clone()));
+            (accounts.listed().len() > 1).then(|| account_entry(&accounts, thread.account))
         });
         let checkout = self.thread_checkout(machine, thread, cx);
         // A terminal is described by where it is now: that folder's project and branch, or its
@@ -1425,6 +1432,7 @@ impl Sidebar {
                 ))
             }),
             agent,
+            account,
             subthreads: store.and_then(|store| {
                 let (count, running) = subthread_counts(store, thread.id);
                 subthreads_label(count, running).map(SharedString::from)
@@ -2801,8 +2809,10 @@ pub(crate) struct ThreadDetails {
     pub(crate) path: Option<SharedString>,
     /// The worktree or pasture it works in, described.
     pub(crate) workspace: Option<(WorkspaceKind, SharedString)>,
-    /// The agent's icon, colored, and its label.
-    pub(crate) agent: Option<(Icon, SharedString)>,
+    /// The agent's icon, on its account's color, and its label.
+    pub(crate) agent: Option<(AgentIcon, SharedString)>,
+    /// The account the thread runs on, while its agent has more than one.
+    pub(crate) account: Option<AccountEntry>,
     /// How many subthreads the thread has, and how many of them run.
     pub(crate) subthreads: Option<SharedString>,
     /// What a Workspaces view workspace holds, such as "2 terminals · 1 agent".
@@ -2893,6 +2903,12 @@ impl ThreadDetails {
             rows.push(detail_row(
                 icon.size(IconSize::XSmall).into_any_element(),
                 Label::new(label).truncate(),
+            ));
+        }
+        if let Some(account) = &self.account {
+            rows.push(detail_row(
+                render_entry_avatar(account, px(12.), cx),
+                Label::new(account.name.clone()).truncate(),
             ));
         }
         if let Some(subthreads) = &self.subthreads {
@@ -3455,17 +3471,25 @@ mod view_tests {
         cx.run_until_parked();
     }
 
-    /// A thread's agent icon takes its account's color while the agent has another account,
-    /// and only once that account has a color.
+    /// A thread's agent icon sits on its account's color while the agent has another account,
+    /// and only once that account has a color. The details name the account meanwhile.
     #[gpui::test]
     fn colors_a_threads_agent_icon_by_its_account(cx: &mut TestAppContext) {
         use agentz_protocol::accounts::{AccountChange, AgentAccounts};
         use agentz_protocol::agents::AgentId;
 
         use super::thread_account_color;
-        use crate::controls::account_color;
+        use crate::controls::account_fill_color;
 
-        let (_, _, cx) = new_sidebar(cx);
+        let (sidebar, _, cx) = new_sidebar(cx);
+        let account_in_details = |thread: &Thread, cx: &mut VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, cx| {
+                sidebar
+                    .thread_details(MachineId::Local, thread, None, cx)
+                    .account
+                    .map(|account| account.name)
+            })
+        };
         let set_accounts = |accounts: &AgentAccounts, cx: &mut VisualTestContext| {
             cx.update(|_, cx| {
                 let client = Machines::global(cx)
@@ -3483,8 +3507,6 @@ mod view_tests {
         let color_of = |thread: &Thread, cx: &mut VisualTestContext| {
             cx.update(|_, cx| thread_account_color(MachineId::Local, thread, cx))
         };
-        let in_theme =
-            |hex: &str, cx: &mut VisualTestContext| cx.update(|_, cx| account_color(hex, cx));
         let blue = "#2563eb";
         let green = "#16a34a";
 
@@ -3498,26 +3520,41 @@ mod view_tests {
         let outside = thread(1, false, None);
         set_accounts(&accounts, cx);
         assert_eq!(color_of(&outside, cx), None);
+        assert_eq!(account_in_details(&outside, cx), None);
 
         let work = accounts.add();
         let side = accounts.add();
         accounts
             .change(Some(work), AccountChange::SetColor(Some(green.into())))
             .expect("color");
+        accounts
+            .change(Some(work), AccountChange::Rename(Some("Work".into())))
+            .expect("name");
         set_accounts(&accounts, cx);
         let mut on_work = thread(2, false, None);
         on_work.account = Some(work);
         let mut on_side = thread(3, false, None);
         on_side.account = Some(side);
-        assert!(in_theme(blue, cx).is_some());
-        assert_eq!(color_of(&outside, cx), in_theme(blue, cx));
-        assert_eq!(color_of(&on_work, cx), in_theme(green, cx));
+        assert!(account_fill_color(blue).is_some());
+        assert_eq!(color_of(&outside, cx), account_fill_color(blue));
+        assert_eq!(color_of(&on_work, cx), account_fill_color(green));
         assert_eq!(color_of(&on_side, cx), None);
+        assert_eq!(
+            account_in_details(&outside, cx).as_deref(),
+            Some("Outside agentZ")
+        );
+        assert_eq!(account_in_details(&on_work, cx).as_deref(), Some("Work"));
+        // Named even without a color.
+        assert_eq!(
+            account_in_details(&on_side, cx).as_deref(),
+            Some("New account")
+        );
 
         // A terminal thread has no agent, so no account.
         let mut terminal = thread(4, false, None);
         terminal.agent_id = None;
         assert_eq!(color_of(&terminal, cx), None);
+        assert_eq!(account_in_details(&terminal, cx), None);
     }
 
     #[gpui::test]
@@ -3912,33 +3949,32 @@ mod view_tests {
     }
 }
 
-/// The icon of the agent a thread runs, in `color`, or in its account's color
+/// The icon of the agent a thread runs, in `color`, on its account's color
 /// ([`thread_account_color`]). A terminal thread's is a terminal.
 pub(crate) fn thread_agent_icon(
     machine: MachineId,
     thread: &Thread,
     color: Color,
     cx: &App,
-) -> Icon {
+) -> AgentIcon {
     let icon = thread
         .agent_id
         .as_ref()
         .and_then(|agent_id| agent_icon(&AgentId::new(agent_id.clone()), cx))
         .map(Icon::from_svg_markup)
         .unwrap_or_else(|| Icon::new(IconName::Terminal));
-    let account_color = thread_account_color(machine, thread, cx);
-    icon.color(account_color.map_or(color, Color::Custom))
+    AgentIcon::new(icon.color(color), thread_account_color(machine, thread, cx))
 }
 
 /// The color of the account a thread runs on, while its agent has others
-/// ([`AgentAccounts::thread_color`]), in the current theme.
+/// ([`AgentAccounts::thread_color`]), behind its agent's icon.
 ///
 /// [`AgentAccounts::thread_color`]: agentz_protocol::accounts::AgentAccounts::thread_color
 pub(crate) fn thread_account_color(machine: MachineId, thread: &Thread, cx: &App) -> Option<Hsla> {
     let agent_id = AgentId::new(thread.agent_id.clone()?);
     let client = Machines::global(cx).read(cx).client(machine, cx)?;
     let hex = client.read(cx).thread_color(&agent_id, thread.account)?;
-    account_color(hex, cx)
+    account_fill_color(hex)
 }
 
 /// Purple, apart from the other statuses' colors. Every bundled theme's fourth player color is

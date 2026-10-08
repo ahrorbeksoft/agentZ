@@ -228,7 +228,8 @@ impl AccountSupport {
 pub struct AccountChoices {
     /// Rename's short name, shown instead of the email.
     pub label: Option<String>,
-    /// t3code's accent color, as `#rrggbb`: it tints the agent's icon on the account's threads.
+    /// t3code's accent color, as `#rrggbb`: it shows behind the agent's icon on the account's
+    /// threads.
     pub color: Option<String>,
     pub at_limit: AtLimit,
 }
@@ -311,8 +312,8 @@ impl AgentAccounts {
         }
     }
 
-    /// The color the agent's icon takes on the account's threads: the account's own, while the
-    /// agent lists more than one account. With one, there's nothing to tell apart.
+    /// The color behind the agent's icon on the account's threads: the account's own, while
+    /// the agent lists more than one account. With one, there's nothing to tell apart.
     pub fn thread_color(&self, account: Option<AccountId>) -> Option<&str> {
         let listed = usize::from(self.lists_external()) + self.accounts.len();
         if listed < 2 {

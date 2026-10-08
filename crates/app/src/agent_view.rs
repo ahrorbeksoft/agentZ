@@ -53,7 +53,7 @@ use crate::attachment_image::{
     AttachmentImage, ImagePreviewTooltip, ImageViewer, render_hover_preview,
 };
 use crate::confirm_dialog::ConfirmRequest;
-use crate::controls::account_color;
+use crate::controls::{AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
@@ -2255,15 +2255,14 @@ impl AgentView {
         }
     }
 
-    /// The agent's icon along a conversation: muted, or in the thread's account's color. The
-    /// new thread screen shows the account in the strip under its composer instead.
-    fn thread_agent_icon(&self, cx: &App) -> Icon {
+    /// The agent's icon along a conversation: muted, on the thread's account's color. The new
+    /// thread screen shows the account in the strip under its composer instead.
+    fn thread_agent_icon(&self, cx: &App) -> AgentIcon {
         let account_color = self.agent_id.as_ref().and_then(|agent_id| {
             let account = self.store.read(cx).thread(self.thread_id)?.account;
             self.account_icon_color(agent_id, account, cx)
         });
-        self.agent_icon(cx)
-            .color(account_color.unwrap_or(Color::Muted))
+        AgentIcon::new(self.agent_icon(cx).color(Color::Muted), account_color)
     }
 
     pub(crate) fn agent_name(&self, cx: &App) -> SharedString {
@@ -5301,7 +5300,10 @@ impl AgentView {
     }
 
     /// The thread this one continues, with its agent's name and icon, while it's kept.
-    fn continued_from(&self, cx: &App) -> Option<(ThreadId, SharedString, SharedString, Icon)> {
+    fn continued_from(
+        &self,
+        cx: &App,
+    ) -> Option<(ThreadId, SharedString, SharedString, AgentIcon)> {
         let store = self.store.read(cx);
         let from = store.thread(store.thread(self.thread_id)?.continued_from?)?;
         let (name, icon) = self.thread_agent(from, cx);
@@ -5337,8 +5339,8 @@ impl AgentView {
         Some(handoff.from_title.clone().into())
     }
 
-    /// A thread's agent, by name, and its icon: muted, or in the thread's account's color.
-    fn thread_agent(&self, thread: &projects::Thread, cx: &App) -> (SharedString, Icon) {
+    /// A thread's agent, by name, and its icon: muted, on the thread's account's color.
+    fn thread_agent(&self, thread: &projects::Thread, cx: &App) -> (SharedString, AgentIcon) {
         let agent_id = thread.agent_id.clone().map(AgentId::new);
         let name = agent_id
             .as_ref()
@@ -5354,19 +5356,22 @@ impl AgentView {
         let account_color = agent_id
             .as_ref()
             .and_then(|agent_id| self.account_icon_color(agent_id, thread.account, cx));
-        (name, icon.color(account_color.unwrap_or(Color::Muted)))
+        (
+            name,
+            AgentIcon::new(icon.color(Color::Muted), account_color),
+        )
     }
 
-    /// The color the agent's icon takes on the account's threads
+    /// The color behind the agent's icon on the account's threads
     /// ([`agentz_protocol::accounts::AgentAccounts::thread_color`]).
     fn account_icon_color(
         &self,
         agent_id: &AgentId,
         account: Option<AccountId>,
         cx: &App,
-    ) -> Option<Color> {
+    ) -> Option<Hsla> {
         let hex = self.client.read(cx).thread_color(agent_id, account)?;
-        account_color(hex, cx).map(Color::Custom)
+        account_fill_color(hex)
     }
 
     /// The divider that opens a continued thread: where it came from.
@@ -5422,7 +5427,7 @@ impl AgentView {
 
     /// A card for each thread that continues this one with another agent, after its end.
     fn render_continuations(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let continuations: Vec<(ThreadId, SharedString, SharedString, Icon)> = {
+        let continuations: Vec<(ThreadId, SharedString, SharedString, AgentIcon)> = {
             let store = self.store.read(cx);
             store
                 .continuations(self.thread_id)
@@ -5488,7 +5493,7 @@ impl AgentView {
             store
                 .thread(handoff.from)
                 .map(|from| self.thread_agent(from, cx).1)
-                .unwrap_or_else(|| Icon::new(IconName::Sparkle).color(Color::Muted))
+                .unwrap_or_else(|| Icon::new(IconName::Sparkle).color(Color::Muted).into())
         };
         let colors = cx.theme().colors().clone();
         let messages = match handoff.messages {

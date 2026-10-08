@@ -35,6 +35,7 @@ use crate::agent_icons::agent_icon;
 use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
 use crate::app_settings::AppSettingsStore;
 use crate::confirm_dialog::ConfirmRequest;
+use crate::controls::AgentIcon;
 use crate::go_to_picker::{Place, PlaceEntry, PlaceIcon};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
@@ -611,7 +612,7 @@ fn pane_drop_edge(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<Nav
 /// A row of the sidebar's agents list.
 struct AgentEntry {
     pane: PaneKey,
-    icon: Icon,
+    icon: AgentIcon,
     title: SharedString,
     status: Option<ThreadStatus>,
     space: SharedString,
@@ -1844,7 +1845,7 @@ impl SpacesView {
                 }),
                 icon: match project {
                     Some(project) => PlaceIcon::Project(ProjectKey { machine, project }),
-                    None => PlaceIcon::Icon(Icon::new(IconName::Folder).color(Color::Muted)),
+                    None => PlaceIcon::Icon(Icon::new(IconName::Folder).color(Color::Muted).into()),
                 },
                 label: name.clone().into(),
                 detail: detail.into(),
@@ -1857,7 +1858,7 @@ impl SpacesView {
                         machine,
                         tab: tab.id,
                     }),
-                    icon: PlaceIcon::Icon(Icon::new(IconName::Tab).color(Color::Muted)),
+                    icon: PlaceIcon::Icon(Icon::new(IconName::Tab).color(Color::Muted).into()),
                     label: tab_name.clone().into(),
                     detail: name.clone().into(),
                     section: "Tabs".into(),
@@ -2273,6 +2274,7 @@ impl SpacesView {
             path: Some(path.clone()),
             workspace: None,
             agent: None,
+            account: None,
             subthreads: None,
             contents: contents.clone().map(Into::into),
         };
@@ -3062,14 +3064,14 @@ impl SpacesView {
     }
 
     /// The icons of the agents in a workspace's panes, each thread once, in `color` (a thread's
-    /// maybe in its account's).
+    /// maybe on its account's).
     fn space_agent_icons(
         &self,
         machine: MachineId,
         space: &Space,
         color: Color,
         cx: &App,
-    ) -> Vec<Icon> {
+    ) -> Vec<AgentIcon> {
         let store = self.machines.read(cx).projects(machine, cx);
         let store = store.as_ref().map(|store| store.read(cx));
         let mut threads = HashSet::default();
@@ -3077,7 +3079,7 @@ impl SpacesView {
         for pane in space.tabs.iter().flat_map(|tab| &tab.panes) {
             match &pane.content {
                 PaneContent::Terminal(_) if pane.agent.is_some() => {
-                    icons.push(pane_agent_icon(pane, cx).color(color))
+                    icons.push(pane_agent_icon(pane, cx).color(color).into())
                 }
                 PaneContent::Thread(thread_id) if threads.insert(*thread_id) => {
                     let Some(thread) = store.and_then(|store| store.thread(*thread_id)) else {
@@ -3088,7 +3090,7 @@ impl SpacesView {
                     if thread.terminal.is_none() {
                         icons.push(thread_agent_icon(machine, thread, color, cx));
                     } else if has_agent_cli {
-                        icons.push(Icon::new(IconName::ZedAgent).color(color));
+                        icons.push(Icon::new(IconName::ZedAgent).color(color).into());
                     }
                 }
                 PaneContent::Terminal(_) | PaneContent::Thread(_) | PaneContent::Unknown(_) => {}
@@ -3310,7 +3312,7 @@ impl SpacesView {
         }
     }
 
-    /// A pane's icon in `color` (a thread's maybe in its account's), title, and a detail: where
+    /// A pane's icon in `color` (a thread's maybe on its account's), title, and a detail: where
     /// a terminal is, or a thread's agent.
     fn pane_title(
         &self,
@@ -3318,7 +3320,7 @@ impl SpacesView {
         pane: &Pane,
         color: Color,
         cx: &App,
-    ) -> (Icon, SharedString, Option<SharedString>) {
+    ) -> (AgentIcon, SharedString, Option<SharedString>) {
         match &pane.content {
             PaneContent::Terminal(terminal) => {
                 // What runs there: its agent, the command it was opened with, or what's in
@@ -3334,7 +3336,11 @@ impl SpacesView {
                     let (space, _, _) = self.find_pane(key, cx)?;
                     Some(pane_folder_label(&space, folder).into())
                 });
-                (pane_agent_icon(pane, cx).color(color), title.into(), folder)
+                (
+                    pane_agent_icon(pane, cx).color(color).into(),
+                    title.into(),
+                    folder,
+                )
             }
             PaneContent::Thread(thread_id) => {
                 let machines = self.machines.read(cx);
@@ -3352,14 +3358,14 @@ impl SpacesView {
                         }),
                     ),
                     None => (
-                        Icon::new(IconName::Chat).color(color),
+                        Icon::new(IconName::Chat).color(color).into(),
                         "Thread".into(),
                         None,
                     ),
                 }
             }
             PaneContent::Unknown(_) => (
-                Icon::new(IconName::Screen).color(color),
+                Icon::new(IconName::Screen).color(color).into(),
                 "Unknown".into(),
                 None,
             ),

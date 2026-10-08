@@ -233,11 +233,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   with an Archived shelf, title search, context menu. Automatic titles (the first prompt, the
   agent, a shell's folder, a terminal's agent CLI) keep updating under the user's own
   (`Thread::automatic_title`), which shows while set; clearing it shows the automatic one
-  again, as with workspaces. While
-  the thread's agent lists more than one account, the agent's icon is drawn in the color of
-  the thread's account, if it has one (`AgentAccounts::thread_color`,
-  `sidebar::thread_agent_icon`): on the card and its details, in Go To, in Workspaces' panes,
-  rows and agents list, and in the thread's composer.
+  again, as with workspaces. While the thread's agent lists more than one account, the
+  agent's icon sits on a rounded square in the color of the thread's account, if it has one
+  (`AgentAccounts::thread_color`, `sidebar::thread_agent_icon`, `controls::AgentIcon`, as the
+  accounts round's mock draws it): on the card and its details, in Go To, in Workspaces'
+  panes, rows and agents list, and in the thread's composer. Meanwhile the details popover
+  names the account too, with its avatar, after the agent.
 - **Pinned threads** (`sidebar.rs`, `Machines::active_threads`, `projects::order_key`; t3code's
   `pinnedAt`, order keys and `planSidebarThreadDrop`, the user's picks in `design/pins/`):
   pinned cards come first, with nothing between them and the rest, each with a muted pin

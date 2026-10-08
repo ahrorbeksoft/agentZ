@@ -113,11 +113,11 @@ Because agentZ holds the key, it can call the vendor's quota API itself.
 ### Data
 
 - `accounts.json` in the data directory: for each agent, its accounts in order. Each has an id,
-  a label (Rename, §5; the email until then), a color (§13: it tints the agent's icon wherever
-  the account's threads show), what happens when a limit is reached (Stop or Continue at reset,
-  §11), and the last identity and quota read, with when they were read. Each agent also names
-  its default account for new threads (Use for New Threads, §5), if any. New fields get
-  `#[serde(default)]`.
+  a label (Rename, §5; the email until then), a color (§13: it shows behind the agent's icon
+  wherever the account's threads show), what happens when a limit is reached (Stop or Continue
+  at reset, §11), and the last identity and quota read, with when they were read. Each agent
+  also names its default account for new threads (Use for New Threads, §5), if any. New fields
+  get `#[serde(default)]`.
 - Each thread records its account (`account: Option<AccountId>`, where `None` is External), so
   every existing thread stays on the External account.
 - The External account is listed whenever the normal home is logged in. Its color and limit

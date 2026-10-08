@@ -14,6 +14,7 @@ use ui::{
     prelude::*,
 };
 
+use crate::controls::AgentIcon;
 use crate::machines::{Machines, ProjectKey, ThreadKey};
 use crate::project_info::{ProjectInfoStore, render_project_icon};
 use crate::project_switcher::fuzzy_match;
@@ -41,8 +42,8 @@ pub enum Place {
 
 #[derive(Clone)]
 pub enum PlaceIcon {
-    /// Colored already: a thread's agent icon can be in its account's color.
-    Icon(Icon),
+    /// Colored already: a thread's agent icon can be on its account's color.
+    Icon(AgentIcon),
     /// The project's own icon, as its rows show it.
     Project(ProjectKey),
 }
