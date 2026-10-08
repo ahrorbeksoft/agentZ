@@ -2631,6 +2631,60 @@ async fn accounts_read_their_identity_and_limits() {
     );
 }
 
+/// An account is read again soon after the earliest reset its read names, so the app doesn't
+/// show what was used before the reset until the next 5-minute refresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn accounts_are_read_again_at_their_reset() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    let home = data_dir.path().join("accounts/mock").join(work.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's home");
+    std::fs::write(home.join("login"), "").expect("log in the account");
+    std::fs::write(home.join("usage"), "40").expect("use some of the window");
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let used = |client: &TestClient| {
+        client.accounts("mock").status(Some(work)).and_then(|read| {
+            read.status
+                .windows
+                .first()
+                .map(|window| window.used_percent)
+        })
+    };
+    // After the first read, which comes a few seconds on, behind the External account's.
+    let resets_at = SystemTime::now() + Duration::from_secs(6);
+    let seconds = resets_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    std::fs::write(home.join("resets_at"), seconds.to_string()).expect("set the reset");
+
+    client.ok(Request::SubscribeSession).await;
+    client.wait_until(|client| used(client) == Some(40.0)).await;
+    // Without another read, it would say 40% until the refresh 5 minutes on.
+    client.wait_until(|client| used(client) == Some(0.0)).await;
+    let read_at = client
+        .accounts("mock")
+        .status(Some(work))
+        .map(|read| read.read_at)
+        .expect("a read");
+    assert!(read_at >= resets_at);
+}
+
 /// Switch to Droid Core is saved through the account's reader, as Droid's `/limits` saves it,
 /// and answered once the read after it says it's chosen.
 #[tokio::test(flavor = "multi_thread")]

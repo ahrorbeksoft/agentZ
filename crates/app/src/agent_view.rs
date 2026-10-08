@@ -5209,7 +5209,7 @@ impl AgentView {
         if accounts.logged_in(account) == Some(false) {
             return None;
         }
-        tightest_window(&accounts.status(account)?.status.windows).cloned()
+        tightest_window(&accounts.status(account)?.status.windows, SystemTime::now()).cloned()
     }
 
     /// Beside the agent, what's left of the thread's account's window closest to running out,
@@ -6838,7 +6838,7 @@ fn account_row(
                     note.map(|note| Label::new(note).size(LabelSize::XSmall).color(note_color)),
                 ),
         )
-        .children(tightest_window(&entry.windows).map(|window| {
+        .children(tightest_window(&entry.windows, now).map(|window| {
             let left = left_label(window, now).size(LabelSize::XSmall);
             div().pl(px(14.)).child(if is_greyed {
                 left.color(Color::Disabled)
@@ -6954,7 +6954,7 @@ fn room(entry: &AccountEntry, now: SystemTime) -> i16 {
     if used_up_window(&entry.windows, now).is_some() {
         return -1;
     }
-    tightest_window(&entry.windows).map_or(0, |window| i16::from(window.left_percent()))
+    tightest_window(&entry.windows, now).map_or(0, |window| i16::from(window.left_percent()))
 }
 
 /// What the Continue button says of the account it continues on.
@@ -6965,7 +6965,7 @@ fn room_note(entry: &AccountEntry, now: SystemTime) -> String {
     if used_up_window(&entry.windows, now).is_some() {
         return " · Used up".to_string();
     }
-    tightest_window(&entry.windows)
+    tightest_window(&entry.windows, now)
         .map(|window| format!(" · {}% left", window.left_percent()))
         .unwrap_or_default()
 }

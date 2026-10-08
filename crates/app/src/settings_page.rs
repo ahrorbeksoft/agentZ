@@ -70,14 +70,18 @@ use crate::slider::Slider;
 use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
 use crate::usage_limits::{
-    format_short_resets_in, limit_color, render_balance, render_extra_usage, render_limit_resets,
-    render_limit_windows, reset_phrase,
+    is_resetting, render_balance, render_extra_usage, render_limit_cell, render_limit_resets,
+    render_limit_windows,
 };
 
 const KEY_CONTEXT: &str = "SettingsPage";
 const ACCOUNT_RENAME_KEY_CONTEXT: &str = "AccountRename";
 /// An account card's avatar, which its limits line up after.
 const AVATAR_SIZE: Pixels = px(32.);
+/// A window's column in a Usage page table, and the gap between columns. Narrower than the
+/// design's 128 and 18, whose page was 64 px wider, so three windows leave room for an email.
+const USAGE_COLUMN_WIDTH: Pixels = px(112.);
+const USAGE_COLUMN_GAP: Pixels = px(16.);
 /// An account's avatar in a menu and on its trigger.
 const MENU_AVATAR_SIZE: Pixels = px(16.);
 const CONTENT_WIDTH: Pixels = px(720.);
@@ -5294,8 +5298,8 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    /// t3code's Usage page: each agent whose accounts' limits are read, with a card per window
-    /// for what's left across its accounts.
+    /// The Usage page: each agent whose accounts' limits are read, as a table of its accounts
+    /// and their windows.
     fn render_usage(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let client = self.agents_client(cx);
         let mut agents: Vec<AgentListing> = self
@@ -5317,8 +5321,8 @@ impl SettingsPage {
         let sections: Vec<AnyElement> = agents
             .iter()
             .filter_map(|agent| {
-                let pools = usage_pools(&account_entries(&client.read(cx).accounts(agent.id())));
-                (!pools.is_empty()).then(|| self.render_usage_agent(agent, &pools, now, cx))
+                let table = UsageTable::new(account_entries(&client.read(cx).accounts(agent.id())));
+                (!table.rows.is_empty()).then(|| self.render_usage_agent(agent, &table, now, cx))
             })
             .collect();
         if sections.is_empty() {
@@ -5331,184 +5335,206 @@ impl SettingsPage {
         sections
     }
 
+    /// An agent's card: a column per window, an "All N accounts" row with what's left across
+    /// them (t3code's pooled number) when there's more than one, then a row per account.
     fn render_usage_agent(
         &self,
         agent: &AgentListing,
-        pools: &[UsagePool],
+        table: &UsageTable,
         now: SystemTime,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
         let icon = match agent_icon(agent.id(), cx) {
             Some(markup) => Icon::from_svg_markup(markup),
             None => Icon::new(IconName::Sparkle),
         };
+        let count = table.rows.len();
+        let agent_key = agent.id().0.to_string();
+        let column = |child: Option<AnyElement>| {
+            div()
+                .w(USAGE_COLUMN_WIDTH)
+                .flex_none()
+                .min_w_0()
+                .children(child)
+        };
+        let head = h_flex()
+            .px_4()
+            .py_2()
+            .gap(USAGE_COLUMN_GAP)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new("Account")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .children(table.columns.iter().map(|label| {
+                column(Some(
+                    Label::new(label.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate()
+                        .into_any_element(),
+                ))
+            }))
+            .child(div().w(px(16.)).flex_none());
+        let all = (count > 1).then(|| {
+            let selector = format!("usage-{agent_key}-all");
+            h_flex()
+                .debug_selector(move || selector)
+                .px_4()
+                .py(px(9.))
+                .gap(USAGE_COLUMN_GAP)
+                .bg(colors.text.opacity(0.02))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(format!("All {count} accounts"))
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::MEDIUM),
+                    ),
+                )
+                .children((0..table.columns.len()).map(|index| {
+                    column(table.pooled(index, now).map(|window| {
+                        render_limit_cell(
+                            &format!("usage-{agent_key}-all"),
+                            index,
+                            &window,
+                            now,
+                            cx,
+                        )
+                    }))
+                }))
+                .child(div().w(px(16.)).flex_none())
+        });
+        let rows: Vec<AnyElement> = table
+            .rows
+            .iter()
+            .map(|entry| self.render_usage_row(agent.id(), table, entry, now, cx))
+            .collect();
+        let card_selector = format!("usage-{agent_key}");
         v_flex()
-            .gap_3()
+            .gap_2p5()
             .child(
                 h_flex()
                     .gap_2()
                     .child(icon.size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new(agent.name().clone()).weight(gpui::FontWeight::MEDIUM)),
-            )
-            .children(
-                pools
-                    .iter()
-                    .enumerate()
-                    .map(|(index, pool)| self.render_usage_pool(agent.id(), index, pool, now, cx)),
-            )
-            .into_any_element()
-    }
-
-    /// One window: what's left across the accounts, and a segment per account.
-    fn render_usage_pool(
-        &self,
-        agent_id: &AgentId,
-        index: usize,
-        pool: &UsagePool,
-        now: SystemTime,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let count = pool.members.len();
-        let selector = format!("usage-{}-{index}", agent_id.0);
-        h_flex()
-            .debug_selector(move || selector)
-            .px_4()
-            .py_3p5()
-            .gap_4()
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .child(
-                v_flex()
-                    .w(px(150.))
-                    .flex_none()
-                    .gap_0p5()
-                    .child(Label::new(pool.label.clone()).size(LabelSize::Small))
-                    .child(
-                        h_flex()
-                            .items_baseline()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(rems_from_px(24_f32))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(colors.text)
-                                    .child(format!("{}%", pool.left_percent())),
-                            )
-                            .child(
-                                Label::new("left")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                    .when(count > 1, |column| {
-                        column.child(
-                            Label::new(format!("across {count} accounts"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                    .child(Label::new(agent.name().clone()).weight(gpui::FontWeight::MEDIUM))
+                    .when(count > 1, |title| {
+                        title.child(
+                            Label::new(format!("{count} accounts"))
+                                .size(LabelSize::Small)
+                                .color(Color::Placeholder),
                         )
                     }),
             )
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .children(pool.members.iter().map(|(entry, window)| {
-                        self.render_usage_segment(agent_id, index, entry, window, now, cx)
-                    })),
+                v_flex()
+                    .debug_selector(move || card_selector)
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(colors.border)
+                    .overflow_hidden()
+                    .child(head)
+                    .children(
+                        all.into_iter()
+                            .map(IntoElement::into_any_element)
+                            .chain(rows)
+                            .map(|row| {
+                                div()
+                                    .border_t_1()
+                                    .border_color(colors.border_variant)
+                                    .child(row)
+                            }),
+                    ),
             )
             .into_any_element()
     }
 
-    /// An account's share of a window, filled by what's left of it. Clicking it opens the
-    /// account on its agent's page.
-    fn render_usage_segment(
+    /// An account's row: its avatar, name and plan, then a cell per window. Clicking it opens
+    /// the account on its agent's page.
+    fn render_usage_row(
         &self,
         agent_id: &AgentId,
-        pool_index: usize,
+        table: &UsageTable,
         entry: &AccountEntry,
-        window: &LimitWindow,
         now: SystemTime,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let left = window.left_percent();
-        let selector = format!(
-            "usage-{}-{pool_index}-{}",
-            agent_id.0,
-            account_selector(entry.account)
-        );
-        let mut details = format!("{left}% left");
-        if let Some(resets_at) = window.resets_at {
-            details.push_str(&format!(" · resets {}", reset_phrase(resets_at, now)));
-        }
-        let name = entry.name.clone();
+        let key = format!("usage-{}-{}", agent_id.0, account_selector(entry.account));
+        let detail = entry
+            .plan
+            .iter()
+            .cloned()
+            .chain(
+                entry
+                    .email
+                    .clone()
+                    .filter(|email| entry.name.as_ref() != email),
+            )
+            .collect::<Vec<_>>()
+            .join(" · ");
         let machine = self.agents_machine;
         let agent_id = agent_id.clone();
-        div()
-            .id(SharedString::from(selector.clone()))
+        let selector = key.clone();
+        h_flex()
+            .id(SharedString::from(key.clone()))
             .debug_selector(move || selector)
-            .flex_1()
-            .min_w_0()
-            .h(px(30.))
-            .relative()
-            .rounded_md()
-            .overflow_hidden()
+            .px_4()
+            .py_2()
+            .gap(USAGE_COLUMN_GAP)
             .cursor_pointer()
-            .bg(colors.element_background)
-            .hover(|segment| segment.bg(colors.element_hover))
-            .when(left > 0, |segment| {
-                // Translucent, as t3code's, so the label reads over it.
-                segment.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(gpui::relative(f32::from(left) / 100.))
-                        .rounded_md()
-                        .bg(limit_color(left, cx).opacity(0.35)),
-                )
-            })
+            .hover(|row| row.bg(colors.element_hover))
             .child(
-                // The name gives way first when the segment is narrow.
                 h_flex()
-                    .size_full()
-                    .px_2()
-                    .gap_1()
-                    .child(render_entry_avatar(entry, MENU_AVATAR_SIZE, cx))
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .child(render_entry_avatar(entry, px(22.), cx))
                     .child(
-                        div().min_w_0().child(
-                            Label::new(entry.name.clone())
-                                .size(LabelSize::XSmall)
-                                .weight(gpui::FontWeight::MEDIUM)
-                                .truncate(),
-                        ),
-                    )
-                    .child(
-                        div().flex_none().child(
-                            Label::new(format!("{left}%"))
-                                .size(LabelSize::XSmall)
-                                .weight(gpui::FontWeight::SEMIBOLD)
-                                .color(if left == 0 {
-                                    Color::Error
-                                } else {
-                                    Color::Default
-                                }),
-                        ),
-                    )
-                    .child(div().flex_1())
-                    .children(format_short_resets_in(window, now).map(|resets| {
-                        div().flex_none().pl_1().child(
-                            Label::new(resets)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    })),
+                        v_flex()
+                            .min_w_0()
+                            .gap_px()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .child(Label::new(entry.name.clone()).truncate()),
+                                    )
+                                    .when(entry.account.is_none(), |name| {
+                                        name.child(account_tag("Outside", Color::Muted, cx))
+                                    }),
+                            )
+                            .when(!detail.is_empty(), |column| {
+                                column.child(
+                                    Label::new(detail)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                )
+                            }),
+                    ),
             )
-            .tooltip(move |_, cx| Tooltip::with_meta(name.clone(), None, details.clone(), cx))
+            .children(table.columns.iter().enumerate().map(|(index, label)| {
+                div().w(USAGE_COLUMN_WIDTH).flex_none().min_w_0().children(
+                    entry
+                        .windows
+                        .iter()
+                        .find(|window| window.label == *label)
+                        .map(|window| render_limit_cell(&key, index, window, now, cx)),
+                )
+            }))
+            .child(
+                div().w(px(16.)).flex_none().child(
+                    Icon::new(IconName::ChevronRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.show_agent_accounts(machine, &agent_id, false, window, cx)
             }))
@@ -6678,6 +6704,7 @@ pub(crate) struct AccountEntry {
     pub(crate) color: Option<String>,
     /// From its last read.
     pub(crate) plan: Option<String>,
+    pub(crate) email: Option<String>,
     pub(crate) windows: Vec<LimitWindow>,
     pub(crate) limit_resets: Option<LimitResets>,
     /// Found logged out when last checked.
@@ -6718,6 +6745,7 @@ pub(crate) fn account_entry(accounts: &AgentAccounts, account: Option<AccountId>
             .choices(account)
             .and_then(|choices| choices.color.clone()),
         plan: status.and_then(|status| status.plan.clone()),
+        email: status.and_then(|status| status.email.clone()),
         windows: status
             .map(|status| status.windows.clone())
             .unwrap_or_default(),
@@ -6726,43 +6754,48 @@ pub(crate) fn account_entry(accounts: &AgentAccounts, account: Option<AccountId>
     }
 }
 
-/// One of an agent's limit windows across its accounts, as t3code pools them: each account
-/// with a window of that name, in the order they're listed.
-struct UsagePool {
-    label: String,
-    members: Vec<(AccountEntry, LimitWindow)>,
+/// An agent's accounts on the Usage page: a column per window, in the order they first
+/// appear, and a row per account with a read, the External one first. Accounts found logged out
+/// are left out, their last reads being out of date.
+struct UsageTable {
+    columns: Vec<String>,
+    rows: Vec<AccountEntry>,
 }
 
-impl UsagePool {
-    /// What's left across the accounts. Each counts the same whatever its plan, as in t3code.
-    fn left_percent(&self) -> u8 {
-        let used = self
-            .members
-            .iter()
-            .map(|(_, window)| window.used_percent.clamp(0., 100.))
-            .sum::<f64>()
-            / self.members.len().max(1) as f64;
-        (100. - used).round() as u8
-    }
-}
-
-/// The windows of the accounts not found logged out, whose last reads are out of date, in the
-/// order they first appear.
-fn usage_pools(entries: &[AccountEntry]) -> Vec<UsagePool> {
-    let mut pools: Vec<UsagePool> = Vec::new();
-    for entry in entries.iter().filter(|entry| !entry.is_logged_out) {
-        for window in &entry.windows {
-            let member = (entry.clone(), window.clone());
-            match pools.iter_mut().find(|pool| pool.label == window.label) {
-                Some(pool) => pool.members.push(member),
-                None => pools.push(UsagePool {
-                    label: window.label.clone(),
-                    members: vec![member],
-                }),
+impl UsageTable {
+    fn new(entries: Vec<AccountEntry>) -> Self {
+        let rows: Vec<AccountEntry> = entries
+            .into_iter()
+            .filter(|entry| !entry.is_logged_out && !entry.windows.is_empty())
+            .collect();
+        let mut columns: Vec<String> = Vec::new();
+        for window in rows.iter().flat_map(|entry| &entry.windows) {
+            if !columns.contains(&window.label) {
+                columns.push(window.label.clone());
             }
         }
+        Self { columns, rows }
     }
-    pools
+
+    /// What's left of the column's window across the accounts that have it, each counting the
+    /// same whatever its plan, as in t3code. It has no reset or pace of its own. A window past
+    /// its reset is left out until it's read again, its percentage being out of date.
+    fn pooled(&self, column: usize, now: SystemTime) -> Option<LimitWindow> {
+        let label = self.columns.get(column)?;
+        let used: Vec<f64> = self
+            .rows
+            .iter()
+            .filter_map(|entry| entry.windows.iter().find(|window| window.label == *label))
+            .filter(|window| !is_resetting(window, now))
+            .map(|window| window.used_percent.clamp(0., 100.))
+            .collect();
+        (!used.is_empty()).then(|| LimitWindow {
+            label: label.clone(),
+            used_percent: used.iter().sum::<f64>() / used.len() as f64,
+            resets_at: None,
+            length: None,
+        })
+    }
 }
 
 /// How an account's elements are named in tests: by its id, or "external".
@@ -8761,11 +8794,12 @@ mod tests {
         assert!(cx.debug_bounds("account-card-1").is_none());
     }
 
-    /// Settings › Usage pools each window across an agent's accounts, without the agents that
-    /// read no usage or the accounts found logged out, and a segment opens its account on the
+    /// Settings › Usage has a table per agent: a column per window, "All N accounts" with what's
+    /// left across them, then a row per account, the External one first, without the agents
+    /// that read no usage or the accounts found logged out. A row opens its account on the
     /// agent's page.
     #[gpui::test]
-    fn the_usage_page_pools_each_window_across_the_accounts(cx: &mut TestAppContext) {
+    fn the_usage_page_has_a_table_per_agent(cx: &mut TestAppContext) {
         let hour = Duration::from_secs(3600);
         let mock = AgentId::new("mock");
         let other = AgentId::new("other");
@@ -8819,12 +8853,29 @@ mod tests {
         };
 
         // Each account counts the same: 62, 0 and 100 left are 54 across them.
-        let pools = usage_pools(&account_entries(&accounts));
-        let shape: Vec<(&str, usize, u8)> = pools
-            .iter()
-            .map(|pool| (pool.label.as_str(), pool.members.len(), pool.left_percent()))
+        let table = UsageTable::new(account_entries(&accounts));
+        assert_eq!(table.columns, vec!["5-hour", "Weekly"]);
+        let rows: Vec<Option<AccountId>> = table.rows.iter().map(|entry| entry.account).collect();
+        assert_eq!(rows, vec![None, Some(AccountId(1)), Some(AccountId(2))]);
+        let now = SystemTime::now();
+        let pooled: Vec<Option<u8>> = (0..3)
+            .map(|column| {
+                table
+                    .pooled(column, now)
+                    .map(|window| window.left_percent())
+            })
             .collect();
-        assert_eq!(shape, vec![("5-hour", 3, 54), ("Weekly", 1, 44)]);
+        assert_eq!(pooled, vec![Some(54), Some(44), None]);
+        // Past their resets, the 5-hour windows are left out until they're read again.
+        let later = now + 3 * hour;
+        let pooled: Vec<Option<u8>> = (0..2)
+            .map(|column| {
+                table
+                    .pooled(column, later)
+                    .map(|window| window.left_percent())
+            })
+            .collect();
+        assert_eq!(pooled, vec![None, Some(44)]);
 
         cx.update(|cx| {
             crate::init_for_test(cx);
@@ -8869,26 +8920,30 @@ mod tests {
         });
         cx.run_until_parked();
 
-        assert!(cx.debug_bounds("usage-mock-0").is_some());
-        assert!(cx.debug_bounds("usage-mock-1").is_some());
-        assert!(cx.debug_bounds("usage-other-0").is_none());
+        assert!(cx.debug_bounds("usage-mock").is_some());
+        assert!(cx.debug_bounds("usage-other").is_none());
+        let all = cx
+            .debug_bounds("usage-mock-all")
+            .expect("the accounts together");
         let external = cx
-            .debug_bounds("usage-mock-0-external")
+            .debug_bounds("usage-mock-external")
             .expect("the External account");
-        let work = cx
-            .debug_bounds("usage-mock-0-1")
-            .expect("an agentZ account");
+        let work = cx.debug_bounds("usage-mock-1").expect("an agentZ account");
         let side = cx
-            .debug_bounds("usage-mock-0-2")
+            .debug_bounds("usage-mock-2")
             .expect("another agentZ account");
-        assert!(external.left() < work.left() && work.left() < side.left());
-        assert!(cx.debug_bounds("usage-mock-0-3").is_none());
-        assert!(cx.debug_bounds("usage-mock-1-external").is_none());
+        assert!(all.top() < external.top() && external.top() < work.top());
+        assert!(work.top() < side.top());
+        assert!(cx.debug_bounds("usage-mock-3").is_none());
+        assert!(cx.debug_bounds("limit-usage-mock-all-bar-1").is_some());
+        assert!(cx.debug_bounds("limit-usage-mock-external-bar-0").is_some());
+        assert!(cx.debug_bounds("limit-usage-mock-external-bar-1").is_none());
 
         let weekly = cx
-            .debug_bounds("usage-mock-1-1")
+            .debug_bounds("limit-usage-mock-1-bar-1")
             .expect("Work's weekly window");
-        cx.simulate_click(weekly.center(), gpui::Modifiers::none());
+        assert!(weekly.left() > work.left() + work.size.width / 2.);
+        cx.simulate_click(work.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(agent_page_id(&page, cx).as_deref(), Some("mock"));
         page.read_with(cx, |page, _| {

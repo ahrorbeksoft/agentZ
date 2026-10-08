@@ -1,12 +1,12 @@
 //! Reading each account's identity and limits with its agent's reader: every 5 minutes while an
-//! app is open (t3code's interval), after each turn on the account, and on demand (Refresh
-//! Usage).
+//! app is open (t3code's interval), at the earliest reset its last read names, after each turn
+//! on the account, and on demand (Refresh Usage).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use agentz_protocol::Response;
-use agentz_protocol::accounts::{AccountId, OveragePreference, StatusRead};
+use agentz_protocol::accounts::{AccountId, AccountStatus, OveragePreference, StatusRead};
 use agentz_protocol::agents::{AgentId, InstallState};
 use anyhow::{Context as _, Result, anyhow};
 use util::ResultExt as _;
@@ -20,9 +20,26 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const STALE_AFTER: Duration = Duration::from_secs(150);
 /// Between the reads of one refresh, so the agents don't all start at once.
 const STAGGER: Duration = Duration::from_secs(3);
+/// How long after a reset the account is read, so the vendor has started the new window.
+const AFTER_RESET: Duration = Duration::from_secs(5);
+/// The longest a wait for a reset sleeps before it looks at the clock again: the reset is a
+/// time of day, and the clock a sleep runs on stops while the Mac sleeps.
+const CLOCK_CHECK: Duration = Duration::from_secs(60);
 
 impl Server {
-    pub(super) fn start_usage_refreshes(&self) {
+    pub(super) fn start_usage_refreshes(&mut self) {
+        for agent_id in self.agents_with_readers() {
+            let accounts: Vec<AccountId> = self
+                .accounts
+                .get(&agent_id)
+                .accounts
+                .iter()
+                .map(|account| account.id)
+                .collect();
+            for account in std::iter::once(None).chain(accounts.into_iter().map(Some)) {
+                self.read_at_next_reset(&agent_id, account);
+            }
+        }
         let inputs = self.inputs.clone();
         self.runtime.spawn(async move {
             loop {
@@ -47,10 +64,14 @@ impl Server {
             return;
         }
         let now = SystemTime::now();
+        // A window that reset since the read, while no app was open to read it then, is out
+        // of date however recent the read.
         let is_stale = |read: Option<&StatusRead>| {
             read.is_none_or(|read| {
                 now.duration_since(read.read_at)
                     .is_ok_and(|age| age >= STALE_AFTER)
+                    || resets(&read.status)
+                        .any(|resets_at| read.read_at < resets_at && resets_at <= now)
             })
         };
         let mut due = Vec::new();
@@ -273,6 +294,71 @@ impl Server {
                 );
             }
         });
+        self.read_at_next_reset(agent_id, account);
+    }
+
+    /// Reads the account again at the earliest reset its last read names, so no window shows
+    /// what was used before it reset for longer than the read takes. A later read that names
+    /// another reset moves the wait.
+    fn read_at_next_reset(&mut self, agent_id: &AgentId, account: Option<AccountId>) {
+        let now = SystemTime::now();
+        let next = self
+            .accounts
+            .get(agent_id)
+            .status(account)
+            .and_then(|read| resets(&read.status).filter(|at| *at > now).min());
+        let key = (agent_id.clone(), account);
+        if self.reset_reads.get(&key).map(|(at, _)| *at) == next {
+            return;
+        }
+        if let Some((_, wait)) = self.reset_reads.remove(&key) {
+            wait.abort();
+        }
+        let Some(at) = next else {
+            return;
+        };
+        let inputs = self.inputs.clone();
+        let wait = {
+            let agent_id = agent_id.clone();
+            self.runtime.spawn(async move {
+                let read_at = at + AFTER_RESET;
+                loop {
+                    let remaining = read_at
+                        .duration_since(SystemTime::now())
+                        .unwrap_or_default();
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(remaining.min(CLOCK_CHECK)).await;
+                }
+                let read = Input::Run(Box::new(move |server: &mut Server| {
+                    server.read_at_reset(&agent_id, account, at)
+                }));
+                inputs.unbounded_send(read).ok();
+            })
+        };
+        self.reset_reads.insert(key, (at, wait.abort_handle()));
+    }
+
+    /// The read [`Self::read_at_next_reset`] waited for. With no app open it waits for one:
+    /// [`Self::refresh_usage`] reads an account with a window reset since its last read.
+    fn read_at_reset(&mut self, agent_id: &AgentId, account: Option<AccountId>, at: SystemTime) {
+        let key = (agent_id.clone(), account);
+        if self
+            .reset_reads
+            .get(&key)
+            .is_none_or(|(next, _)| *next != at)
+        {
+            return;
+        }
+        self.reset_reads.remove(&key);
+        if self
+            .clients
+            .values()
+            .any(|client| client.subscribed_to_session)
+        {
+            self.read_account_if_it_can(agent_id, account);
+        }
     }
 
     fn account_lock(
@@ -330,4 +416,13 @@ impl Server {
             })
             .collect()
     }
+}
+
+/// When each of the read's windows resets, in every pool.
+fn resets(status: &AccountStatus) -> impl Iterator<Item = SystemTime> + '_ {
+    status
+        .windows
+        .iter()
+        .chain(status.other_pools.iter().flat_map(|pool| &pool.windows))
+        .filter_map(|window| window.resets_at)
 }

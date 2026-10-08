@@ -50,8 +50,10 @@ Agent's do. Run with `--usage`, it prints what agentZ reads of an account: the e
 a 5-hour window, of which each reply in the home uses 10% (kept in `usage` in MOCK_HOME). The
 window resets in an hour, or at the time in seconds since the epoch in `resets_at` there, and
 once that has passed, none of it is used. While all of it is, prompts fail with "Usage limit
-reached", as agents' turns end at their limits. A `.mock/settings.json` in MOCK_HOME with a
-list of `models` offers only those, as an organization's plan offers fewer.
+reached", as agents' turns end at their limits. A `windows` file in MOCK_HOME (a JSON array of
+{"label", "used_percent", "resets_in", "length"}, the last two in seconds) replaces that window
+in `--usage` with those, to show several windows at different paces. A `.mock/settings.json`
+in MOCK_HOME with a list of `models` offers only those, as an organization's plan offers fewer.
 
 An `overage` file in MOCK_HOME makes it Droid-like at its limit: `--usage` then reports its
 Standard and Droid Core pools, an extra usage balance, and Droid's "When limit is reached"
@@ -118,6 +120,9 @@ USAGE_FILE = os.path.join(os.environ["MOCK_HOME"], "usage") if os.environ.get("M
 # When the 5-hour window resets, in seconds since the epoch.
 RESETS_AT_FILE = (os.path.join(os.environ["MOCK_HOME"], "resets_at")
                   if os.environ.get("MOCK_HOME") else None)
+# The windows `--usage` reports instead of its 5-hour one.
+WINDOWS_FILE = (os.path.join(os.environ["MOCK_HOME"], "windows")
+                if os.environ.get("MOCK_HOME") else None)
 # Droid's "When limit is reached", when the home has one.
 OVERAGE_FILE = (os.path.join(os.environ["MOCK_HOME"], "overage")
                 if os.environ.get("MOCK_HOME") else None)
@@ -236,6 +241,14 @@ if sys.argv[-1] == "--usage":
             "windows": [{"label": "5-hour", "used_percent": used,
                          "resets_at": {"secs_since_epoch": resets_at(), "nanos_since_epoch": 0},
                          "length": five_hours}]}
+    windows = read_text(WINDOWS_FILE)
+    if windows:
+        now = int(time.time())
+        read["windows"] = [{"label": window["label"], "used_percent": window["used_percent"],
+                            "resets_at": {"secs_since_epoch": now + window["resets_in"],
+                                          "nanos_since_epoch": 0},
+                            "length": {"secs": window["length"], "nanos": 0}}
+                           for window in json.loads(windows)]
     if overage() is not None:
         read["pool"] = "Standard"
         read["other_pools"] = [{"label": "Droid Core",

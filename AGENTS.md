@@ -148,7 +148,9 @@ From Zed's guidelines, which this code follows:
   logged out, as Claude Agent's do. Run with `--usage`, it prints a read of its account
   (email, plan, a 5-hour window that each reply in the home fills by 10%); once it's full,
   prompts fail with "Usage limit reached" until it resets (`resets_at` in the home sets
-  when, in seconds since the epoch). An `overage` file in the home (empty, `DroidCore` or
+  when, in seconds since the epoch), and a `windows` file there (a JSON array of `label`,
+  `used_percent`, `resets_in` and `length`, in seconds) replaces that window with those, for
+  several windows at different paces. An `overage` file in the home (empty, `DroidCore` or
   `ExtraUsage`) makes it Droid-like at its limit: the read has Droid's pools, a balance and
   that choice, and with a choice, prompts go on past the limit. A `limit_resets` file (a
   count) gives it Codex's limit resets, which `--usage` with `AGENTZ_LIMIT_RESET_ATTEMPT`

@@ -320,9 +320,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   with Change Account and Log Out (both described under Agent threads). For an agent that can
   have more accounts (its listing's `accounts`), Account lists a card per account instead,
   the External one first, tagged "Outside agentZ": the avatar in the account's color, its name
-  (Rename's, else its email), "Default" on the one new threads take, its plan, its limit bars
-  (`usage_limits.rs`, t3code's `LimitWindows`), and a ⋯ menu (Rename in place, Use for New
-  Threads, Color, Refresh Usage, Open Usage Page, Show in Finder, Log Out, Remove Account).
+  (Rename's, else its email), "Default" on the one new threads take, its plan, its limit rows
+  (see Limit rows below), and a ⋯ menu (Rename in place, Use for New Threads, Color, Refresh
+  Usage, Open Usage Page, Show in Finder, Log Out, Remove Account).
   An account with pools of limits (`AccountStatus::pool`, `other_pools`: Droid's Standard and
   Droid Core) has Zed's `ToggleButtonGroup` over its bars, a tab per pool as in Droid's
   `/limits`, and Extra usage with its balance when the login can change Droid's choice; the
@@ -353,16 +353,33 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   page every frame, and laying out every card held it to about 6 fps. A sub-page has Zed's back button and breadcrumb. With more than one machine, a machine
   picker sits in the header. Registry icons are single-color (`currentColor`), so they are
   drawn in the text color on a neutral tile.
-- **Settings › Usage** (`SettingsPage::render_usage`, t3code's `UsageLimitsPooled`, accounts
-  topic 16): each installed agent whose accounts' limits are read (its listing's
-  `accounts.reads_usage`), with a card per window (`UsagePool`, by the window's name): what's
-  left across its accounts (100 less the mean used, each account counting the same, as in
-  t3code), "across N accounts" with more than one, and a bar with a segment per account, in
-  the order they're listed, filled by what's left of it (as its limit bar, `limit_color`), with
-  its avatar, name, % and reset (`format_short_resets_in`). Accounts found logged out are left out, their
-  last reads being out of date. A segment's tooltip has the account and when it resets, and a
-  click opens the account's Account tab (`show_agent_accounts`). With more than one machine,
-  the Agents page's machine picker sits in the header.
+- **Limit rows** (`usage_limits.rs`; t3code's `LimitWindows`, colored as OpenUsage's meters,
+  usage round topic 1): one window of an account in the Account tab, the gauge's popover and
+  (as a cell) the Usage page. A row has the window's name, "26% left" ("Used up" in red), a bar
+  of what's left with a hairline where even spending would be (`LimitWindow::time_left`), and
+  "resets in 4h 17m" (`format_resets_in`; "resets in under 1m" in the last minute, then
+  "resetting" until the next read, with no percentage or fill, since the last read's is out of
+  date). The fill is colored by pace (`usage_limits::pace`, OpenUsage's `Pace.evaluate` and
+  `meterState`): what's used so far, projected to the reset at the same rate. Landing with 10%
+  or more to spare is the accent; in the last 10% it's yellow, with "~4% spare" under the
+  reset; past the limit it's red, with a flame and "runs out in 9h 12m" (or "runs out at the
+  reset" when it lands right there). There's no pace in the first 1% of the window (at least a
+  minute), with nothing used, or for a warning under 5% used (OpenUsage's guards); then the
+  fill is the accent, yellow at 15% left or less (`LOW_PERCENT`). Used up is red. The bar's
+  tooltip adds OpenUsage's projection ("~20% left at reset", "~96% used at reset", "~12% over
+  the limit at reset") and the reset's time. A table's cell (`render_limit_cell`) is "68%" and
+  "↻ 2h 40m" over a thinner bar of the same colors, with the pace words in its tooltip.
+- **Settings › Usage** (`SettingsPage::render_usage`, usage round topic 2): each installed agent
+  whose accounts' limits are read (its listing's `accounts.reads_usage`), as a card with a
+  table (`UsageTable`): a column per window, by its name in the order they first appear, and a
+  row per account with a read, in the order they're listed (the External one first, tagged
+  "Outside"): its avatar, name, plan (and email, when it's named otherwise), and a cell per
+  window. Accounts found logged out are left out, their last reads being out of date. With more
+  than one account, an "All N accounts" row comes first, with what's left of each window across
+  them (100 less the mean used, each account counting the same, as t3code's
+  `UsageLimitsPooled`), and the title says "N accounts". Clicking a row opens the agent's
+  Account tab (`show_agent_accounts`). With more than one machine, the Agents page's machine
+  picker sits in the header.
 - **Settings › Skills** (`settings_page/skills.rs`, `agentz_server::skills`,
   `server/skill_requests.rs`; Zed's Skills page and Create a Skill form, accounts topics 17
   and 18): agentZ's own skills on the machine, folders with a `SKILL.md` in `skills/` in its
@@ -607,14 +624,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the wait, as Don't Continue does; an archived thread doesn't continue, and a subthread
   never waits. On Droid this only happens when Droid itself stops at its limit.
 - **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
-  t3code's `ComposerUsageLimits`, accounts topic 16): beside the agent in a started thread's
-  composer, what's left of its account's window closest to running out ("62%"), yellow at 15%
-  or less and red when used up, with the window's name in its tooltip. It shows once the
-  account has a read, and not while it's found logged out. A click opens that account's
-  windows (avatar, name, plan, `render_limit_windows`) with Usage ↗ for the agent's usage
-  page, and the card's limit resets line, whose Use Reset closes it for the thread's question
-  (`usage_limits::LimitResetAction`); Escape or a click outside closes it without stopping
-  the turn. A new thread shows the
+  t3code's `ComposerUsageLimits`, accounts topic 16, usage round topic 3): beside the agent in
+  a started thread's composer, what's left of its account's window closest to running out
+  ("62%", leaving out windows past their reset), yellow at 15% or less and red when used up,
+  with the window's name in its tooltip ("Weekly: 3% left"). It shows once the account has a
+  read, and not while it's found logged out. A click opens that account's windows (avatar,
+  name, plan, the limit rows) with Usage ↗ for the agent's usage page, the card's limit resets
+  line, whose Use Reset closes it for the thread's question
+  (`usage_limits::LimitResetAction`), and a footer with when the account was read ("Read 2m
+  ago") and Refresh (`Request::RefreshUsage`). It redraws every 5 seconds, so its countdowns
+  move on. Escape or a click outside closes it without stopping the turn. A new thread shows the
   accounts' limits in its account picker instead.
 - **New Thread** (`Shell::new_thread`, `Shell::start_draft`, `new_thread_modal.rs`; t3code's
   `useHandleNewThread`, the user's choice): opens a draft right away in the shown project, or
@@ -766,8 +785,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   with agentZ accounts, with an empty session of its own or the status command. The agent's
   reader (`accounts/readers.rs`) reads each account's identity and limits (`AccountStatus`,
   kept with when it was read): when an app opens and every 5 minutes while one is, for the
-  accounts not read lately, a few seconds apart (`server/usage_reads.rs`); after each turn on
-  the account; and on demand (`Request::RefreshUsage`). A read that fails, or finds the
+  accounts not read lately, a few seconds apart (`server/usage_reads.rs`); 5 seconds after the
+  earliest reset its last read names, while an app is open (`read_at_next_reset`, a wait per
+  account that a read naming another reset moves; an app that opens later reads an account
+  with a window reset since its read), so no row shows what was used before a reset; after
+  each turn on the account; and on demand (`Request::RefreshUsage`). A read that fails, or finds the
   account logged out, keeps the last numbers. Droid's reader (`Reader::DroidTerminal`,
   `accounts/droid.rs`) runs its terminal UI in a terminal nobody sees
   (`accounts/hidden_terminal.rs`), in `accounts/<agent id>/reader/`, and runs `/status` and

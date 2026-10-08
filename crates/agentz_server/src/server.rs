@@ -25,7 +25,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, Attachments, ThreadMessage, ThreadView};
@@ -202,6 +202,9 @@ pub(crate) struct Server {
     /// The attempt each account's limit reset is on until the agent answers it, so a retry
     /// after a timeout (or a second click) is the same attempt and can't spend a second reset.
     limit_reset_attempts: HashMap<(AgentId, Option<AccountId>), String>,
+    /// The earliest reset each account's last read names, when it's read again, and the wait
+    /// for it ([`usage_reads`]).
+    reset_reads: HashMap<(AgentId, Option<AccountId>), (SystemTime, tokio::task::AbortHandle)>,
     /// When threads' turns ended with an error, until a read of their account since then says
     /// whether a limit stopped them ([`limit_waits`]).
     failed_turns: HashMap<ThreadId, Instant>,
@@ -350,6 +353,7 @@ impl Server {
             reading_accounts: HashSet::default(),
             account_locks: HashMap::default(),
             limit_reset_attempts: HashMap::default(),
+            reset_reads: HashMap::default(),
             failed_turns: HashMap::default(),
             http_client,
             skills: Vec::new(),
