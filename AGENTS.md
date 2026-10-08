@@ -244,6 +244,10 @@ From Zed's guidelines, which this code follows:
   SIGCHLD handler that writes a byte to a socket its loop reads. Once the loop stops, nothing
   reads it, and on macOS the handler blocks when it's full, freezing every thread that takes a
   SIGCHLD: the whole server. `Terminal::end` drops a stopped loop's PTY at once.
+- **An ended terminal must not keep its event loop's sender.** `EventLoopSender` holds the
+  loop's poller (an epoll, an eventfd and a timerfd). An agent's terminals stay as long as
+  their thread, so a long thread's commands used up the server's 1024 descriptors, and every
+  new terminal, agent and usage read then failed with "No file descriptors available".
 - **A running server outlives its binary.** Installing renames the new binary into place, so an
   older server keeps running; it reports the hash beside its executable at start
   (`ServerWelcome::build`), and the app compares it with the installed one.

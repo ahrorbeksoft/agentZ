@@ -161,7 +161,9 @@ type TerminalEventLoop = EventLoop<TerminalPty, Listener>;
 
 pub(crate) struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
+    /// Until the event loop ends. It holds the loop's poller, whose descriptors must go with
+    /// the loop: an ended terminal stays for as long as its thread, to be looked at.
+    sender: Option<EventLoopSender>,
     /// The event loop's thread, until the process ends. It gives the loop back when stopped.
     event_loop: Option<JoinHandle<(TerminalEventLoop, EventLoopState)>>,
     /// The stopped loop, while the terminal is being handed to another server.
@@ -306,7 +308,7 @@ impl Terminal {
         let event_loop = event_loop.spawn();
         Ok(Self {
             term,
-            sender,
+            sender: Some(sender),
             event_loop: Some(event_loop),
             paused: None,
             detached: false,
@@ -334,7 +336,7 @@ impl Terminal {
             .event_loop
             .take()
             .context("the terminal's event loop has stopped")?;
-        self.sender.send(Msg::Shutdown).ok();
+        self.send(Msg::Shutdown);
         let (event_loop, _) = event_loop
             .join()
             .map_err(|_| anyhow!("the terminal's event loop panicked"))?;
@@ -465,6 +467,7 @@ impl Terminal {
             AlacEvent::Exit => {
                 // The loop has ended; its thread lets the PTY go as it finishes.
                 self.event_loop.take();
+                self.sender.take();
                 if self.exit.is_none() {
                     self.exited(TerminalExit {
                         code: None,
@@ -484,8 +487,16 @@ impl Terminal {
     }
 
     pub(crate) fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        if self.exit.is_none() {
-            Notifier(self.sender.clone()).notify(bytes);
+        if self.exit.is_none()
+            && let Some(sender) = &self.sender
+        {
+            Notifier(sender.clone()).notify(bytes);
+        }
+    }
+
+    fn send(&self, message: Msg) {
+        if let Some(sender) = &self.sender {
+            sender.send(message).ok();
         }
     }
 
@@ -528,7 +539,7 @@ impl Terminal {
                 }
                 self.size = size;
                 if self.exit.is_none() {
-                    self.sender.send(Msg::Resize(size.window_size())).ok();
+                    self.send(Msg::Resize(size.window_size()));
                 }
                 self.term.lock().resize(size);
                 true
@@ -649,7 +660,8 @@ impl Terminal {
     /// ignores the hangup, or one started with `nohup`, would otherwise outlive its terminal.
     fn end(&mut self) {
         let session = self.session_processes();
-        self.sender.send(Msg::Shutdown).ok();
+        self.send(Msg::Shutdown);
+        self.sender.take();
         // A stopped loop gives back its PTY, which must go at once: until then its SIGCHLD
         // handler stays registered, writing to a socket nothing reads anymore, and once that
         // fills, every thread that takes a SIGCHLD blocks in the handler. Dropping it waits for
@@ -1858,6 +1870,24 @@ mod tests {
         assert!(terminal.frame().exited.is_some());
     }
 
+    /// An ended terminal stays as long as its thread, for its output, so it mustn't keep the
+    /// event loop's poller: three descriptors for each command an agent ran used up the
+    /// server's.
+    #[tokio::test]
+    async fn ended_terminals_let_go_of_their_event_loops() {
+        let (mut ended, mut inbox) = start_sh(TerminalSize::default());
+        ended.input(TerminalInput::Bytes(b"exit\n".to_vec()));
+        wait_for(&mut ended, &mut inbox, |terminal| terminal.sender.is_none()).await;
+        assert!(ended.exit().is_some());
+        assert!(ended.event_loop.is_none());
+
+        let (mut killed, _inbox) = start_sh(TerminalSize::default());
+        killed.kill();
+        assert!(killed.exit().is_some());
+        assert!(killed.sender.is_none());
+        assert!(killed.event_loop.is_none());
+    }
+
     /// A killed terminal stays for its output, but its PTY must go: until it does, the PTY's
     /// SIGCHLD handler writes to a socket nothing reads anymore, and once that's full every
     /// thread that takes a SIGCHLD blocks in the handler, which stopped the whole server.
@@ -2028,7 +2058,7 @@ mod tests {
         };
         wait_until(&|| ready.exists(), "the script didn't start");
         // The loop has stopped and given back the PTY by the time the terminal is dropped.
-        terminal.sender.send(Msg::Shutdown).ok();
+        terminal.send(Msg::Shutdown);
         wait_until(
             &|| {
                 terminal
