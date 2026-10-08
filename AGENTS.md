@@ -73,9 +73,9 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   expected.
 - **GPUI tests** need `--features gpui_platform/runtime_shaders` (see Testing below).
 - **Linux:** this Mac can't build or run the Linux app, so it's built and checked on the user's
-  SSH machine `devbox1` (Ubuntu, with Rust and GUI build packages installed for it): copy the
-  tracked files (`git ls-files`) to `~/agentZ-linux` there, which needs a `.git` folder (`git
-  init`) for a dev build to find its assets, and `cargo build -p app` there. Run the app with
+  SSH machine `devbox1` (Ubuntu, with Rust and GUI build packages installed for it), in its
+  clone at `/root/projects/agentZ`: pull what's pushed, or copy uncommitted changes over it
+  (`git ls-files` with `rsync`), and `cargo build -p app` there. Run the app with
   its own `AGENTZ_DATA_DIR` (never `~/.agentz`: that machine's real server keeps its data
   there). To see it, run it under `Xvfb :99` (drive it with `xdotool`, capture with `import
   -window root`) or, for the window frame agentZ draws itself, under headless sway
