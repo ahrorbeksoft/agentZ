@@ -1047,6 +1047,24 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
 - In the app: the parent's Agents control lists them; a subthread opens read-only; its
   permission requests show on the parent, which becomes blocked, without a sound. The parent
   waits for its subthreads and completes once, after the last one's end reaches it.
+- **Agents control** (`agent_view::render_agents_section`, `design/subthreads/`): t3code's
+  list above the parent's composer, newest first, with Zed's subagent card headers as rows
+  (`thread_view::render_subagent_card`): a spinner, check, cross or faint circle, the title,
+  "· model" (`Thread::model`), "— 1 file changed +12 −0" (the subthread's own checkpoints,
+  `Request::ThreadDiff` with `DiffScope::All`, asked again after each of its turns), and Stop
+  while it runs (`Request::Cancel`). Its "4 Agents · 1 running" line folds it; it's open while
+  a subthread runs and folds to "· all done" once the last one ends (`sync_agents_section`),
+  until a click or a new subthread opens it again.
+- **An open subthread**: the header is its parent's (`header_thread`: the title and its
+  menu act on the parent), with Zed's subagent title bar under it
+  (`render_subthread_title_bar`: its title, a check or cross once it ended, Stop, and
+  Minimize to the parent). Its first message, the task, is a card ("Task from “…”" and the
+  role) instead of a bubble (`render_task_card`). t3code's `ProviderSubagentBar` takes the
+  composer's place (`render_subthread_bar`): the agent's icon, model and effort, "Working
+  1m 20s" or "Done in 2m 14s" (from the subthread's `created_at`, when it was delegated, to
+  now or its task's `ended_at`), "Runs on its own", Stop, and Open Parent. Ctrl-− (Zed's Go
+  Back, on macOS too) runs `agent::OpenParentThread` anywhere in the subthread, which the
+  command palette lists there, and both ways back show it in their tooltips.
 
 ### Diffs
 

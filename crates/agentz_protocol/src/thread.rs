@@ -687,8 +687,18 @@ impl ThreadView {
 
     /// The display name of the model the agent's model selector currently has chosen.
     pub fn model_name(&self) -> Option<String> {
+        self.chosen_option_name(acp::SessionConfigOptionCategory::Model)
+    }
+
+    /// The display name of the effort the agent's reasoning selector currently has chosen.
+    pub fn effort_name(&self) -> Option<String> {
+        self.chosen_option_name(acp::SessionConfigOptionCategory::ThoughtLevel)
+    }
+
+    /// The display name of what the agent's selector of `category` currently has chosen.
+    fn chosen_option_name(&self, category: acp::SessionConfigOptionCategory) -> Option<String> {
         self.state.config_options.iter().find_map(|option| {
-            if option.category != Some(acp::SessionConfigOptionCategory::Model) {
+            if option.category.as_ref() != Some(&category) {
                 return None;
             }
             let acp::SessionConfigKind::Select(select) = &option.kind else {

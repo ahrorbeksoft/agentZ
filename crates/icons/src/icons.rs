@@ -38,6 +38,7 @@ pub enum IconName {
     ArrowRight,
     ArrowRightLeft,
     ArrowUp,
+    ArrowUpLeft,
     ArrowUpRight,
     AtSign,
     Attach,
