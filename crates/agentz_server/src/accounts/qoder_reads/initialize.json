@@ -1,0 +1,41 @@
+{
+  "protocolVersion": 1,
+  "authMethods": [
+    {
+      "id": "qodercli-login",
+      "name": "Use qodercli login",
+      "description": "Use your existing qodercli login for this agent. If needed, sign in from qodercli first."
+    },
+    {
+      "type": "env_var",
+      "id": "qoder-personal-access-token",
+      "name": "Use QODER_PERSONAL_ACCESS_TOKEN",
+      "description": "Requires `QODER_PERSONAL_ACCESS_TOKEN` in the agent environment.",
+      "vars": [
+        {
+          "name": "QODER_PERSONAL_ACCESS_TOKEN"
+        }
+      ]
+    }
+  ],
+  "agentInfo": {
+    "name": "qoder-cli",
+    "title": "Qoder CLI",
+    "version": "0.2.14"
+  },
+  "agentCapabilities": {
+    "loadSession": true,
+    "sessionCapabilities": {
+      "list": {}
+    },
+    "promptCapabilities": {
+      "image": true,
+      "audio": true,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    }
+  }
+}

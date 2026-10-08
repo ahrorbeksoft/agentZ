@@ -79,13 +79,14 @@ pub struct KeyLogin {
 }
 
 /// The registry agents agentZ has a description of.
-pub const BUILT_IN: [&str; 6] = [
+pub const BUILT_IN: [&str; 7] = [
     "factory-droid",
     "claude-acp",
     "codex-acp",
     "devin",
     "grok-build",
     "antigravity-acp",
+    "qoder",
 ];
 
 /// The description of a registry agent, by its id.
@@ -97,6 +98,7 @@ pub fn built_in(agent_id: &str) -> Option<AgentDescription> {
         "devin" => Some(super::devin::description()),
         "grok-build" => Some(super::grok::description()),
         "antigravity-acp" => Some(super::antigravity::description()),
+        "qoder" => Some(super::qoder::description()),
         _ => None,
     }
 }

@@ -10,6 +10,7 @@ mod droid;
 mod grok;
 mod hidden_terminal;
 mod login_checks;
+mod qoder;
 mod readers;
 
 use std::collections::BTreeMap;

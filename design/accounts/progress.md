@@ -102,6 +102,24 @@ Notes for whoever continues:
   in every home, as Devin reads Claude's, so they're its outside folders, and the External
   account, which agentZ runs as the user has it, reads them too. Logging a new account in
   wasn't tried: it needs the user's browser.
+- Wave 2, Qoder (`accounts/qoder.rs`), as the easiest of the others: `QODER_CONFIG_DIR`
+  moves the whole home, the login included: it's `.auth/`, encrypted with the machine id
+  beside it, not the keychain (Qoder's keychain code is for MCP servers' logins, and its
+  package doesn't ship `keytar`). A session is its login check. It has no reader, unlike
+  plan.md's identity from `qodercli status -o json`: that command renews an expired login
+  itself, in a home a session may be using, which the rule against refreshing logins rules
+  out; and its quota is only in its terminal UI. Its key login is "Use
+  QODER_PERSONAL_ACCESS_TOKEN"; `QODER_PAT`, which it reads first, and `QODER_JOB_TOKEN` are
+  removed too. Its browser login ("Use qodercli login") runs a device login itself and
+  waits up to 3 minutes. Its skills are `skills` in the home plus the user's
+  `~/.agents/skills` (links followed), and its MCP servers are in `settings.json`, which a
+  new account may copy: one naming the login method still opens logged out, without
+  waiting. As every Qoder does, it adds `AGENTS.local.md` and `*.local.md` to the user's
+  `~/.config/git/ignore`. Checked against the real Qoder 0.2.14 in new homes: `initialize`
+  and `session/new` answer in about 4 seconds, "Authentication required", and a wrong token
+  fails `authenticate`. Not verified: a login (there's none on this Mac), and whether a
+  token login is kept in the home after the variable is gone, so that Log Out would leave
+  it logged in.
 - Wave 3 (item 28): Antigravity only, as the user asked; the rest wait. Antigravity
   (`accounts/antigravity.rs`): `GEMINI_HOME` with `AGY_ACP_FORCE_FILE_STORAGE=1`, a session
   as its login check, and "Gemini API key" (`GEMINI_API_KEY`) as its key login. It has no
@@ -354,5 +372,5 @@ Notes for whoever continues:
 | 24 | 19 | Settings › MCP Servers, passed to every session | done |
 | 25 | 20 | The accounts menu on each skill and server | done |
 | 26 | | Importing skills and servers from another machine (board topic first) | |
-| 27 | | Wave 2, one agent per commit | Grok Build done; the rest wait |
+| 27 | | Wave 2, one agent per commit | Grok Build and Qoder done; the rest wait |
 | 28 | | Wave 3, one agent per commit | Antigravity done; the rest wait |

@@ -744,7 +744,12 @@ Each entry: what it does, where it lives, and where it comes from.
   no login stored, a session waits minutes on a browser login. Its login check is a session,
   and it has no reader: nothing over ACP gives the identity or quota, and Google's quota API
   needs an access token, which it keeps only in memory. Its key login is "Gemini API key"
-  (`GEMINI_API_KEY`). Its answers in a new home are in `accounts/antigravity_reads/`. No
+  (`GEMINI_API_KEY`). Its answers in a new home are in `accounts/antigravity_reads/`.
+  Qoder's description (`accounts/qoder.rs`) moves its home, login (`.auth/`) included, with
+  `QODER_CONFIG_DIR`. Its login check is a session, and it has no reader: its quota is only in
+  its terminal UI, and its `status` renews an expired login itself, in a home a session may
+  be using. Its key login is "Use QODER_PERSONAL_ACCESS_TOKEN", which refuses a wrong token at
+  `authenticate`. Its answers in a new home are in `accounts/qoder_reads/`. No
   agent's terminal UI is read but Droid's (the user's rule). An
   agentZ account's agent runs in the account's folder, `accounts/<agent id>/<account id>/`,
   so every account is a process of its own with its own login and sessions: its threads,
@@ -752,7 +757,7 @@ Each entry: what it does, where it lives, and where it comes from.
   `ImportAgentSessions`) all take the account. Only
   agents with a description (`accounts/descriptions.rs`, one file per agent, such as
   `accounts/droid.rs`, `accounts/claude.rs`, `accounts/codex.rs`, `accounts/devin.rs`,
-  `accounts/grok.rs` and `accounts/antigravity.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
+  `accounts/grok.rs`, `accounts/antigravity.rs` and `accounts/qoder.rs`; a custom agent's `accounts` in `agents/custom.json`) can have more
   accounts. It names the variables that move the agent's home there, the folders among those
   that hold other programs' files too (linked from the user's), the entries every account
   shares with the External account's home (linked to them), the switches that keep
