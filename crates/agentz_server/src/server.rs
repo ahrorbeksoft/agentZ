@@ -66,7 +66,9 @@ use crate::{AgentControl, CustomAgent, ServerConfig};
 use terminal_requests::Terminals;
 use tools::{PendingToolCall, ToolResults};
 
-const MAX_THREAD_TITLE_CHARS: usize = 48;
+/// The views cut a title to the room they have; this only bounds a long pasted line, so the
+/// header shows and renames the whole first line.
+const MAX_THREAD_TITLE_CHARS: usize = 256;
 /// t3code sweeps every project each minute; lookups that aren't stale are skipped.
 const REPOSITORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the branches checked out where projects and threads work are read again, so a
@@ -2266,7 +2268,7 @@ fn registry_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("agents").join("registry")
 }
 
-/// The first line of the first prompt, shortened to fit the sidebar.
+/// The first line of the first prompt, shortened only when it's very long.
 fn thread_title_from_prompt(prompt: &str) -> String {
     let first_line = prompt.lines().next().unwrap_or_default().trim();
     if first_line.chars().count() <= MAX_THREAD_TITLE_CHARS {
@@ -2289,8 +2291,11 @@ mod tests {
             thread_title_from_prompt("Fix the login bug\nmore detail"),
             "Fix the login bug"
         );
-        let long = "Build a checkout page with a cart summary, a pay button and order history";
-        let title = thread_title_from_prompt(long);
+        let sentence = "i want you to draft a plan to improve a couple of bugs and things, for now \
+            just use temp dir, i'll give you bugs one by one";
+        assert_eq!(thread_title_from_prompt(sentence), sentence);
+        let long = "a".repeat(MAX_THREAD_TITLE_CHARS * 2);
+        let title = thread_title_from_prompt(&long);
         assert_eq!(title.chars().count(), MAX_THREAD_TITLE_CHARS);
         assert!(title.ends_with('…'));
     }

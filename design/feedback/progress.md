@@ -20,7 +20,7 @@ Notes for whoever continues:
 
 | Order | # | Item | Kind | Status |
 |---|---|---|---|---|
-| 1 | 9 | Thread title cut short, in the header and when renaming | fix | not started |
+| 1 | 9 | Thread title cut short, in the header and when renaming | fix | done: the server cut the first prompt to 48 characters with "…"; it keeps up to 256 now, and the views cut it to their width. Titles made before stay cut |
 | 2 | 3 | A running background task shows as waiting, and the finished sound waits for it | fix | not started |
 | 3 | 4 | Subthreads play no sounds | fix | not started |
 | 4 | 2 | Subthread count in the details popover, no "N agents" tooltip | fix | not started |
