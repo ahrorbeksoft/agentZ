@@ -28,23 +28,35 @@ pub enum ThemeMode {
     Dark,
 }
 
-/// Zed's `PlaySoundWhenAgentDone`, set for each sound.
+/// Zed's `PlaySoundWhenAgentDone`, set for each sound, with a choice for another app in front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaySound {
     Never,
-    /// While the user can't see the agent.
-    WhenHidden,
+    /// While the user can't see the agent: another thread or Settings is open, or another app
+    /// is in front. Zed's `when_hidden`, which older settings files still say.
+    #[serde(alias = "when_hidden")]
+    WhenInAnotherThread,
+    /// Only while another app is in front.
+    WhenInAnotherApp,
     Always,
 }
 
 impl PlaySound {
-    pub const ALL: [Self; 3] = [Self::Never, Self::WhenHidden, Self::Always];
+    pub const ALL: [Self; 4] = [
+        Self::Never,
+        Self::WhenInAnotherThread,
+        Self::WhenInAnotherApp,
+        Self::Always,
+    ];
 
-    pub fn should_play(self, is_visible: bool) -> bool {
+    /// `is_visible` is whether the user can see the agent, and `is_window_active` whether
+    /// agentZ is in front.
+    pub fn should_play(self, is_visible: bool, is_window_active: bool) -> bool {
         match self {
             Self::Never => false,
-            Self::WhenHidden => !is_visible,
+            Self::WhenInAnotherThread => !is_visible,
+            Self::WhenInAnotherApp => !is_window_active,
             Self::Always => true,
         }
     }
@@ -52,7 +64,8 @@ impl PlaySound {
     pub fn label(self) -> &'static str {
         match self {
             Self::Never => "Never",
-            Self::WhenHidden => "When hidden",
+            Self::WhenInAnotherThread => "When in another thread",
+            Self::WhenInAnotherApp => "When in another app",
             Self::Always => "Always",
         }
     }
@@ -117,7 +130,10 @@ pub struct AppSettings {
     /// When a permission request or a question arrives. Always by default, as herdr plays its
     /// request sound: it needs an answer either way.
     pub play_sound_when_input_needed: PlaySound,
-    /// macOS notifications show only while another app is in front, as t3code's do.
+    /// Both sounds' volume, from 0 (silent) to 1 (full), on top of the system's, as macOS's
+    /// Alert volume.
+    pub sound_volume: f32,
+    /// System notifications show only while another app is in front, as t3code's do.
     pub notify_when_unfocused: bool,
 }
 
@@ -142,8 +158,9 @@ impl Default for AppSettings {
             is_sidebar_hidden: false,
             use_modifier_to_send: false,
             show_thinking: false,
-            play_sound_when_finished: PlaySound::WhenHidden,
+            play_sound_when_finished: PlaySound::WhenInAnotherThread,
             play_sound_when_input_needed: PlaySound::Always,
+            sound_volume: 1.,
             notify_when_unfocused: true,
             saved_layouts: Vec::new(),
         }
@@ -307,6 +324,48 @@ pub fn is_sidebar_hidden(cx: &App) -> bool {
 mod tests {
     use gpui::TestAppContext;
     use theme::ThemeRegistry;
+
+    use super::{AppSettings, PlaySound};
+
+    /// A file from before the in-another-app choice and the volume keeps its sounds' choices,
+    /// at full volume.
+    #[test]
+    fn older_sound_settings_load() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "play_sound_when_finished": "when_hidden",
+            "play_sound_when_input_needed": "never",
+        }))
+        .expect("the settings parse");
+        assert_eq!(
+            settings.play_sound_when_finished,
+            PlaySound::WhenInAnotherThread
+        );
+        assert_eq!(settings.play_sound_when_input_needed, PlaySound::Never);
+        assert_eq!(settings.sound_volume, 1.);
+
+        let saved = serde_json::to_value(&settings).expect("the settings serialize");
+        assert_eq!(saved["play_sound_when_finished"], "when_in_another_thread");
+        assert_eq!(
+            serde_json::to_value(PlaySound::WhenInAnotherApp).expect("a value"),
+            "when_in_another_app"
+        );
+    }
+
+    #[test]
+    fn sounds_play_where_their_choice_says() {
+        // (on the thread, in another thread, in another app)
+        let places = |when: PlaySound| {
+            (
+                when.should_play(true, true),
+                when.should_play(false, true),
+                when.should_play(false, false),
+            )
+        };
+        assert_eq!(places(PlaySound::Never), (false, false, false));
+        assert_eq!(places(PlaySound::WhenInAnotherThread), (false, true, true));
+        assert_eq!(places(PlaySound::WhenInAnotherApp), (false, false, true));
+        assert_eq!(places(PlaySound::Always), (true, true, true));
+    }
 
     /// A bundled theme that doesn't parse is only logged, and left out of the list.
     #[gpui::test]

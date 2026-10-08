@@ -1,6 +1,7 @@
 //! The sounds an agent makes as it finishes its turn or starts waiting for the user: Zed's
 //! `agent_done.wav`, and t3code's `notification-input.mp3` for input. Played with AppKit's
-//! `NSSound` on macOS and the desktop's own player on Linux, where Zed brings in rodio.
+//! `NSSound` on macOS and the desktop's own player on Linux, where Zed brings in rodio, at the
+//! settings' volume.
 
 use gpui::App;
 
@@ -34,26 +35,38 @@ impl Sound {
 
 /// Plays the status's sound if the settings ask for it, as Zed's
 /// `PlaySoundWhenAgentDone::should_play` decides: `is_visible` is whether the user can see the
-/// agent.
-pub fn play_for_status(status: ThreadStatus, is_visible: bool, cx: &mut App) {
+/// agent, and `is_window_active` whether agentZ is in front.
+pub fn play_for_status(
+    status: ThreadStatus,
+    is_visible: bool,
+    is_window_active: bool,
+    cx: &mut App,
+) {
     let sound = Sound::for_status(status);
     let settings = AppSettingsStore::global(cx).read(cx).settings();
     let when = match sound {
         Sound::Finished => settings.play_sound_when_finished,
         Sound::NeedsInput => settings.play_sound_when_input_needed,
     };
-    if when.should_play(is_visible) {
+    if when.should_play(is_visible, is_window_active) {
         play(sound, cx);
     }
 }
 
+/// Plays the sound at the settings' volume.
 pub fn play(sound: Sound, cx: &mut App) {
+    #[cfg(not(test))]
+    let volume = AppSettingsStore::global(cx)
+        .read(cx)
+        .settings()
+        .sound_volume
+        .clamp(0., 1.);
     #[cfg(test)]
     cx.default_global::<PlayedForTest>().0.push(sound);
     #[cfg(all(target_os = "macos", not(test)))]
-    macos::play(sound, cx);
+    macos::play(sound, volume, cx);
     #[cfg(all(not(target_os = "macos"), not(test)))]
-    linux::play(sound, cx);
+    linux::play(sound, volume, cx);
 }
 
 /// What tests played, in place of the speakers.
@@ -93,7 +106,7 @@ mod macos {
 
     impl Global for Sounds {}
 
-    pub(super) fn play(sound: Sound, cx: &mut App) {
+    pub(super) fn play(sound: Sound, volume: f32, cx: &mut App) {
         let is_loaded = cx
             .try_global::<Sounds>()
             .is_some_and(|sounds| sounds.0.contains_key(&sound));
@@ -110,6 +123,7 @@ mod macos {
         if player.isPlaying() {
             player.stop();
         }
+        player.setVolume(volume);
         if !player.play() {
             log::error!("couldn't play {}", sound.asset_path());
         }
@@ -141,13 +155,18 @@ mod linux {
 
     use super::Sound;
 
-    pub(super) fn play(sound: Sound, cx: &mut App) {
+    pub(super) fn play(sound: Sound, volume: f32, cx: &mut App) {
         let Some(path) = cached(sound, cx).log_err() else {
             return;
         };
         cx.background_spawn(async move {
-            for player in ["pw-play", "paplay"] {
+            // `pw-play` takes a factor, and `paplay` a level where 65536 is full.
+            let pipewire_volume = volume.to_string();
+            let pulseaudio_volume = ((volume * 65536.).round() as u32).to_string();
+            for (player, volume) in [("pw-play", pipewire_volume), ("paplay", pulseaudio_volume)] {
                 match smol::process::Command::new(player)
+                    .arg("--volume")
+                    .arg(volume)
                     .arg(&path)
                     .status()
                     .await

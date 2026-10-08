@@ -176,7 +176,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   command palette and buttons).
 - **Start at login** (`login_item.rs`): an XDG autostart entry in `~/.config/autostart`.
 - **Sounds** (`sound.rs`): the desktop's player, `pw-play` else `paplay`, on a copy of the sound
-  in the cache folder.
+  in the cache folder, at the settings' volume (`--volume`: a factor for `pw-play`, 0 to 65536
+  for `paplay`).
 - **Names**: the local machine is "This Computer" (`machines::LOCAL_MACHINE_NAME`), and folders
   are revealed "in File Manager" (`ui::utils::reveal_in_file_manager_label`).
 - **Data** is in `~/.agentz`, as for a server there.
@@ -289,7 +290,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   first asks "Add “~/docs” as a project?". Search finds them, and labels them and archived
   threads in faint text.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
-  combining repositories), Appearance (Zed's theme modes), Notifications (sounds and macOS
+  combining repositories), Appearance (Zed's theme modes), Notifications (sounds and system
   notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, and a page
   per project
   (with Checkouts). As in Zed's settings, a page is a `list` of its header and sections
@@ -918,7 +919,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 ### Attention states and notifications
 
 herdr's states, t3code's labels and colors, Zed's notifications and sound, herdr's two sounds.
-Designed in `design/sounds/`.
+Designed in `design/sounds/` and `design/notifications/`.
 
 - The server sends facts: `working_threads`, `blocked_threads` (a permission waiting, its own
   or a subthread's), `awaiting_input_threads` (a request for input waiting),
@@ -936,14 +937,19 @@ Designed in `design/sounds/`.
 - "Displayed" is Zed's `agent_status_visible`: window active, settings closed, thread open.
 - **Sounds** (`sound.rs`, played with `NSSound`): Zed's agent-done sound as a thread finishes,
   t3code's input sound as it waits for a permission or an answer. Settings › Notifications
-  sets each to Zed's Never, When hidden (not displayed) or Always; finishing defaults to When
-  hidden, input to Always (as herdr always plays its request sound). Picking When hidden or
-  Always plays the sound once, as macOS's Sound settings do. Subthreads make no sound and no
+  sets each (`PlaySound`) to Never, When in another thread (Zed's When hidden: not displayed,
+  so Settings open or another app in front counts too), When in another app (only while
+  agentZ's window isn't active) or Always; finishing defaults to When in another thread, input
+  to Always (as herdr always plays its request sound). Picking a choice that plays plays the
+  sound once, as macOS's Sound settings do. A Volume row heads the section, as macOS's Alert
+  volume: a slider (`slider.rs`, which `ui` lacks) from silent to full, applied to both sounds
+  on top of the system's volume (`sound_volume`, full by default), and letting go of it saves
+  the level and plays the finished sound at it. Subthreads make no sound and no
   notification: their requests show on their top-level thread silently, and their parent
   plays its own once it's done.
 - **Notifications** (`Shell::notify_attention`): "Waiting for tool confirmation", "Waiting for
   your input" or "Finished", only while agentZ isn't the active app (t3code's rule; Settings ›
-  Notifications turns them off). macOS only shows them for an app bundle
+  Notifications › System notifications turns them off). macOS only shows them for an app bundle
   (`tooling/bundle-mac.sh`).
 - **Agents in Workspaces panes** (`ServerClient::set_spaces`, `Shell::notify_pane_attention`,
   herdr's pane notifications): an agent CLI going idle after working plays the finished sound,

@@ -66,6 +66,7 @@ use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
 use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
+use crate::slider::Slider;
 use crate::sound::{self, Sound};
 use crate::thread_entity::AgentThread;
 use crate::usage_limits::{
@@ -1029,9 +1030,10 @@ impl SettingsPage {
 
     fn render_notifications(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let settings = self.app_settings.read(cx).settings();
-        let (when_finished, when_input_needed, notify) = (
+        let (when_finished, when_input_needed, volume, notify) = (
             settings.play_sound_when_finished,
             settings.play_sound_when_input_needed,
+            settings.sound_volume,
             settings.notify_when_unfocused,
         );
         let app_settings = self.app_settings.clone();
@@ -1039,6 +1041,7 @@ impl SettingsPage {
             render_section(
                 "Sounds",
                 vec![
+                    self.render_volume_row(volume, cx),
                     self.render_sound_row(
                         "Sound when finished",
                         "When to play a sound as an agent finishes its turn.",
@@ -1059,10 +1062,10 @@ impl SettingsPage {
                 cx,
             ),
             render_section(
-                "macOS notifications",
+                "System notifications",
                 vec![render_row(
                     "Notify when agentZ isn't focused",
-                    "Shows a macOS notification when an agent finishes or needs input while \
+                    "Shows a system notification when an agent finishes or needs input while \
                      another app is in front.",
                     Switch::new("notify-when-unfocused", notify.into())
                         .on_click(move |state, _, cx| {
@@ -1078,6 +1081,38 @@ impl SettingsPage {
                 cx,
             ),
         ]
+    }
+
+    /// Both sounds' volume, as macOS's Alert volume: letting go of the slider plays the
+    /// finished sound at the new level.
+    fn render_volume_row(&self, volume: f32, cx: &mut Context<Self>) -> AnyElement {
+        let app_settings = self.app_settings.clone();
+        render_row(
+            "Volume",
+            "How loud agentZ's sounds play. Letting go plays the finished sound.",
+            h_flex()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::AudioOff)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(div().debug_selector(|| "sound-volume".to_string()).child(
+                    Slider::new("sound-volume", volume).on_release(move |volume, _, cx| {
+                        app_settings.update(cx, |store, cx| {
+                            store.update(|settings| settings.sound_volume = volume, cx)
+                        });
+                        sound::play(Sound::Finished, cx);
+                    }),
+                ))
+                .child(
+                    Icon::new(IconName::AudioOn)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// Zed's "Play sound when agent done" dropdown, for one sound. Picking a value that plays
@@ -7508,17 +7543,96 @@ mod tests {
             (PlaySound::Always, PlaySound::Always, vec![Sound::Finished])
         );
         assert_eq!(
-            pick("sound-when-input-needed", "MENU_ITEM-When hidden", cx),
+            pick(
+                "sound-when-input-needed",
+                "MENU_ITEM-When in another thread",
+                cx
+            ),
             (
                 PlaySound::Always,
-                PlaySound::WhenHidden,
+                PlaySound::WhenInAnotherThread,
                 vec![Sound::NeedsInput]
             )
         );
         assert_eq!(
-            pick("sound-when-finished", "MENU_ITEM-Never", cx),
-            (PlaySound::Never, PlaySound::WhenHidden, Vec::new())
+            pick("sound-when-finished", "MENU_ITEM-When in another app", cx),
+            (
+                PlaySound::WhenInAnotherApp,
+                PlaySound::WhenInAnotherThread,
+                vec![Sound::Finished]
+            )
         );
+        assert_eq!(
+            pick("sound-when-finished", "MENU_ITEM-Never", cx),
+            (PlaySound::Never, PlaySound::WhenInAnotherThread, Vec::new())
+        );
+    }
+
+    #[gpui::test]
+    fn letting_go_of_the_volume_saves_it_and_plays_the_finished_sound(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            crate::machines::init_for_test(vec![client], cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Notifications, window, cx)
+        });
+        cx.run_until_parked();
+        let volume = |cx: &mut gpui::VisualTestContext| {
+            page.read_with(cx, |page, cx| {
+                page.app_settings.read(cx).settings().sound_volume
+            })
+        };
+        let played =
+            |cx: &mut gpui::VisualTestContext| cx.update(|_, cx| sound::take_played_for_test(cx));
+        assert_eq!(volume(cx), 1.);
+        let slider = cx
+            .debug_bounds("sound-volume")
+            .expect("the volume has a slider");
+        let at = |fraction: f32| {
+            gpui::point(
+                slider.left() + gpui::px(7.) + (slider.size.width - gpui::px(14.)) * fraction,
+                slider.center().y,
+            )
+        };
+        let none = gpui::Modifiers::none();
+
+        // Dragging moves the knob without saving or playing anything.
+        cx.simulate_mouse_down(at(1.), gpui::MouseButton::Left, none);
+        cx.simulate_mouse_move(at(0.5), gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(volume(cx), 1.);
+        assert_eq!(played(cx), []);
+
+        // Past the slider's end, it stops at silent, and letting go anywhere saves it.
+        let below = gpui::point(
+            slider.left() - gpui::px(40.),
+            slider.bottom() + gpui::px(30.),
+        );
+        cx.simulate_mouse_move(below, gpui::MouseButton::Left, none);
+        cx.simulate_mouse_up(below, gpui::MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(volume(cx), 0.);
+        assert_eq!(played(cx), [Sound::Finished]);
+
+        // A press on the track sets the level there.
+        cx.simulate_click(at(0.25), none);
+        cx.run_until_parked();
+        assert!((volume(cx) - 0.25).abs() < 0.01, "{}", volume(cx));
+        assert_eq!(played(cx), [Sound::Finished]);
+
+        // Moving the mouse afterwards changes nothing.
+        cx.simulate_mouse_move(at(0.9), None, none);
+        cx.run_until_parked();
+        assert!((volume(cx) - 0.25).abs() < 0.01);
+        assert_eq!(played(cx), []);
     }
 
     #[gpui::test]

@@ -970,7 +970,7 @@ impl Shell {
         }
     }
 
-    /// The thread's sound, as the settings say, and a macOS notification while agentZ isn't
+    /// The thread's sound, as the settings say, and a system notification while agentZ isn't
     /// focused, as t3code notifies.
     fn notify_attention(
         &self,
@@ -979,7 +979,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        sound::play_for_status(status, self.is_thread_visible(thread_id, window, cx), cx);
+        sound::play_for_status(
+            status,
+            self.is_thread_visible(thread_id, window, cx),
+            window.is_window_active(),
+            cx,
+        );
         if !should_notify(window, cx) {
             return;
         }
@@ -1028,7 +1033,7 @@ impl Shell {
             && self.settings_page.is_none()
             && self.view == MainView::Workspaces
             && self.spaces_view.read(cx).shows_pane(key, cx);
-        sound::play_for_status(status, is_visible, cx);
+        sound::play_for_status(status, is_visible, window.is_window_active(), cx);
         if !should_notify(window, cx) {
             return;
         }
@@ -3120,6 +3125,22 @@ mod modal_tests {
             [Sound::NeedsInput, Sound::NeedsInput]
         );
         assert!(shown(cx).is_empty());
+
+        // When in another app, the finished sound stays quiet for both while agentZ is in
+        // front.
+        cx.update(|_, cx| {
+            AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(
+                    |settings| {
+                        settings.play_sound_when_finished =
+                            crate::app_settings::PlaySound::WhenInAnotherApp
+                    },
+                    cx,
+                )
+            })
+        });
+        assert_eq!(set(Working, Working, cx), []);
+        assert_eq!(set(Idle, Idle, cx), []);
 
         // With another app in front, nothing is in sight, and each gets a notification.
         cx.deactivate_window();
