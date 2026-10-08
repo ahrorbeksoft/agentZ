@@ -293,7 +293,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   combining repositories), Appearance (Zed's theme modes), Notifications (sounds and macOS
   notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, and a page
   per project
-  (with Checkouts).
+  (with Checkouts). As in Zed's settings, a page is a `list` of its header and sections
+  (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards are rows of
+  their own: a frame lays out only the rows in view, each on its own. Laid out whole, a page of
+  nested flex columns took taffy a measure of each label twice per column around it, and an
+  agent with seven accounts scrolled at 20 to 30 fps. The rows out of view are measured again
+  on each frame that isn't a scroll, since anything else may have changed their height.
 - **Settings › Agents** (`settings_page.rs`, Zed's settings sub-pages and ACP Registry page): the
   installed agents as rows, each opening the agent's own page. Its heading has the icon, name,
   a login status badge, the version and registry links, Update when there is one, and a "⋯"

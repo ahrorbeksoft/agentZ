@@ -7,6 +7,7 @@ mod accounts_menu;
 mod mcp_servers;
 mod skills;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -28,8 +29,8 @@ use agentz_protocol::agents::{
 use agentz_protocol::workspace::WorkspaceRemoval;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, ScrollHandle, Subscription, Task, UniformListScrollHandle,
-    WeakEntity, Window, actions, uniform_list,
+    ListAlignment, ListOffset, ListState, PathPromptOptions, PromptLevel, ScrollHandle,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, list, uniform_list,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
@@ -79,6 +80,10 @@ const AVATAR_SIZE: Pixels = px(32.);
 /// An account's avatar in a menu and on its trigger.
 const MENU_AVATAR_SIZE: Pixels = px(16.);
 const CONTENT_WIDTH: Pixels = px(720.);
+/// The space above each of a page's sections.
+const SECTION_SPACING: Rems = rems(1.5);
+/// The space between an agent's account cards.
+const ACCOUNT_SPACING: Rems = rems(0.625);
 /// An agent can keep hundreds of sessions in a project, so the Threads tab shows them a page at
 /// a time, as the sidebar shows archived threads.
 const SESSIONS_INITIAL_COUNT: usize = 10;
@@ -168,7 +173,13 @@ pub struct SettingsPage {
     /// Why deleting or switching an MCP server failed.
     mcp_server_error: Option<SharedString>,
     nav_scroll: ScrollHandle,
-    content_scroll: ScrollHandle,
+    /// The open section's rows, a list as Zed's settings pages are: laying out a page whole
+    /// made each frame of a scroll slow (taffy measures every row again at each level of
+    /// nesting), so a frame lays out the rows in view, each on its own.
+    content_list: ListState,
+    /// How far the content was scrolled when it was last drawn, which tells a scroll's frames
+    /// from changes to its rows.
+    content_scroll_top: ListOffset,
     registry_scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -256,7 +267,8 @@ impl SettingsPage {
             mcp_servers_page: mcp_servers::McpServersPage::List,
             mcp_server_error: None,
             nav_scroll: ScrollHandle::new(),
-            content_scroll: ScrollHandle::new(),
+            content_list: ListState::new(0, ListAlignment::Top, px(0.)).measure_all(),
+            content_scroll_top: ListOffset::default(),
             registry_scroll: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
         }
@@ -380,9 +392,14 @@ impl SettingsPage {
         self.agents_client(cx).read(cx).registry().clone()
     }
 
+    /// Shows a new page's rows from the top, measured afresh.
+    fn scroll_content_to_top(&self) {
+        self.content_list.reset(0);
+    }
+
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         if self.section != section {
-            self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            self.scroll_content_to_top();
         }
         self.section = section;
         // Agents always opens on the installed agents; leaving an agent's page stops the agent.
@@ -1345,14 +1362,15 @@ impl SettingsPage {
     }
 
     /// Settings › Agents: the installed agents, the ACP Registry, or one agent's page.
-    fn render_agents(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        match &self.agents_page {
+    fn render_agents(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<ContentRow> {
+        let sections = match &self.agents_page {
             AgentsPage::Installed => self.render_installed_agents(cx),
             // Laid out by `render_registry` instead, as its list scrolls on its own.
             AgentsPage::Registry => Vec::new(),
-            AgentsPage::Agent(_) => self.render_agent_page(window, cx),
+            AgentsPage::Agent(_) => return self.render_agent_page(window, cx),
             AgentsPage::CustomAgent(_) => self.render_custom_agent_form(window, cx),
-        }
+        };
+        sections.into_iter().map(ContentRow::section).collect()
     }
 
     /// The page's title (Zed's back button and breadcrumb on a sub-page) and the machine whose
@@ -1955,7 +1973,7 @@ impl SettingsPage {
 
     /// One agent's page: what it is and whether it's logged in, over tabs for its account, the
     /// defaults new threads start with, and its environment.
-    fn render_agent_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_agent_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<ContentRow> {
         let Some(panel) = self.agent_panel() else {
             return Vec::new();
         };
@@ -1963,9 +1981,20 @@ impl SettingsPage {
         let support = listing
             .as_ref()
             .and_then(|listing| listing.accounts.clone());
+        let heading = ContentRow::section(
+            v_flex()
+                .gap(px(22.))
+                .child(self.render_agent_heading(listing.as_ref(), cx))
+                .child(self.render_agent_tabs(panel.tab, cx))
+                .into_any_element(),
+        );
         let content = match panel.tab {
             AgentTab::Account => match &support {
-                Some(support) => self.render_accounts_tab(support, window, cx),
+                Some(support) => {
+                    return std::iter::once(heading)
+                        .chain(self.render_accounts_tab(support, window, cx))
+                        .collect();
+                }
                 None => self.render_account_tab(cx),
             },
             AgentTab::Defaults => self.render_agent_defaults(window, cx),
@@ -1984,14 +2013,7 @@ impl SettingsPage {
                 .into_any_element(),
             None => content,
         };
-        vec![
-            v_flex()
-                .gap(px(22.))
-                .child(self.render_agent_heading(listing.as_ref(), cx))
-                .child(self.render_agent_tabs(panel.tab, cx))
-                .into_any_element(),
-            content,
-        ]
+        vec![heading, ContentRow::section(content)]
     }
 
     /// The agent's icon, its name beside whether it's logged in, its version, description and
@@ -2189,7 +2211,7 @@ impl SettingsPage {
                                 .hover(|style| style.text_color(colors.text))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_agent_tab(tab, cx);
-                                    this.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                                    this.scroll_content_to_top();
                                 }))
                         })
                         .child(label)
@@ -2284,7 +2306,7 @@ impl SettingsPage {
             // The last page's inputs are gone, and actions need focus under the shell.
             window.focus(&self.focus_handle, cx);
         }
-        self.content_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.scroll_content_to_top();
         self.registry_scroll.set_offset(gpui::point(px(0.), px(0.)));
         cx.notify();
     }
@@ -3309,15 +3331,16 @@ impl SettingsPage {
     }
 
     /// The Account tab of an agent that can have more accounts: a card per account under
-    /// "Accounts" and Add Account, the External account first while it's listed.
+    /// "Accounts" and Add Account, the External account first while it's listed. Each card is a
+    /// row of the page's list, so a scroll lays out only the cards in view.
     fn render_accounts_tab(
         &self,
         support: &AccountSupport,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Vec<ContentRow> {
         let Some(panel) = self.agent_panel() else {
-            return div().into_any_element();
+            return Vec::new();
         };
         let colors = cx.theme().colors().clone();
         let status_colors = cx.theme().status().clone();
@@ -3398,26 +3421,29 @@ impl SettingsPage {
             )
             .disabled(panel.adding_account.is_some())
             .on_click(cx.listener(|this, _, _, cx| this.add_account(cx)));
-        v_flex()
-            .gap_2p5()
+        let header = h_flex()
+            .justify_between()
             .child(
-                h_flex()
-                    .justify_between()
-                    .child(
-                        Label::new("Accounts")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(div().debug_selector(|| "account-add".into()).child(add)),
+                Label::new("Accounts")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             )
-            .children(
-                panel
-                    .account_error
-                    .clone()
-                    .map(|error| Label::new(error).size(LabelSize::Small).color(Color::Error)),
+            .child(div().debug_selector(|| "account-add".into()).child(add))
+            .into_any_element();
+        let error = panel.account_error.clone().map(|error| {
+            Label::new(error)
+                .size(LabelSize::Small)
+                .color(Color::Error)
+                .into_any_element()
+        });
+        std::iter::once(ContentRow::section(header))
+            .chain(
+                error
+                    .into_iter()
+                    .chain(cards)
+                    .map(|row| ContentRow::new(row, ACCOUNT_SPACING)),
             )
-            .children(cards)
-            .into_any_element()
+            .collect()
     }
 
     /// An account as today's Account card shows the agent's login: its avatar in its color,
@@ -7104,9 +7130,61 @@ fn render_row(
         .into_any_element()
 }
 
-impl Render for SettingsPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+/// A row of a page's list, which is laid out on its own.
+struct ContentRow {
+    element: AnyElement,
+    /// The space between it and the row above it.
+    space_above: Rems,
+}
+
+impl ContentRow {
+    fn new(element: AnyElement, space_above: Rems) -> Self {
+        Self {
+            element,
+            space_above,
+        }
+    }
+
+    /// One of a page's sections, spaced from the one above as sections are.
+    fn section(element: AnyElement) -> Self {
+        Self::new(element, SECTION_SPACING)
+    }
+}
+
+/// The page's header and rows as its list draws them: each in the page's centered column, with
+/// the page's margin under the last one.
+fn content_list_items(header: AnyElement, rows: Vec<ContentRow>) -> Vec<Option<AnyElement>> {
+    let count = rows.len() + 1;
+    std::iter::once(ContentRow::section(header))
+        .chain(rows)
+        .enumerate()
+        .map(|(index, row)| {
+            // Blocks rather than flex columns: taffy measures a flex column's children twice,
+            // and once more for each column around it.
+            div()
+                .w_full()
+                .child(
+                    div()
+                        .max_w(CONTENT_WIDTH)
+                        .mx_auto()
+                        .px_8()
+                        .pt(row.space_above)
+                        .when(index + 1 == count, |column| column.pb_6())
+                        .child(row.element),
+                )
+                .into_any_element()
+        })
+        .map(Some)
+        .collect()
+}
+
+impl SettingsPage {
+    /// The open page's header, and its rows under it.
+    fn render_content(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, Vec<ContentRow>) {
         let headline = |title: SharedString| {
             Headline::new(title)
                 .size(HeadlineSize::Small)
@@ -7122,10 +7200,12 @@ impl Render for SettingsPage {
                 headline("Notifications".into()),
                 self.render_notifications(window, cx),
             ),
-            Section::Agents => (
-                self.render_agents_header(window, cx),
-                self.render_agents(window, cx),
-            ),
+            Section::Agents => {
+                return (
+                    self.render_agents_header(window, cx),
+                    self.render_agents(window, cx),
+                );
+            }
             Section::Usage => (self.render_usage_header(window, cx), self.render_usage(cx)),
             Section::Skills => (
                 self.render_skills_header(window, cx),
@@ -7144,6 +7224,84 @@ impl Render for SettingsPage {
                 None => (headline("General".into()), self.render_general(window, cx)),
             },
         };
+        (
+            header,
+            sections.into_iter().map(ContentRow::section).collect(),
+        )
+    }
+
+    /// The open page as a list, as Zed's settings pages are, so a frame lays out only the rows
+    /// in view, each on its own.
+    fn render_content_list(
+        &mut self,
+        header: AnyElement,
+        rows: Vec<ContentRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let items = content_list_items(header, rows);
+        let count = items.len();
+        let listed = self.content_list.item_count();
+        if count != listed {
+            let kept = count.min(listed);
+            self.content_list.splice(kept..listed, count - kept);
+        }
+        let scroll_top = self.content_list.logical_scroll_top();
+        let scrolled = scroll_top.item_ix != self.content_scroll_top.item_ix
+            || scroll_top.offset_in_item != self.content_scroll_top.offset_in_item;
+        self.content_scroll_top = scroll_top;
+        if !scrolled {
+            // The list lays out the rows in view each frame, but keeps the height a row out of
+            // view had when it was last laid out, and anything but a scroll may have changed it
+            // (a usage read, a login).
+            let first_in_view = scroll_top.item_ix.min(count);
+            let viewport_bottom = self.content_list.viewport_bounds().bottom();
+            let after_view = (first_in_view..count)
+                .find(|&index| {
+                    self.content_list
+                        .bounds_for_item(index)
+                        .is_none_or(|bounds| bounds.top() >= viewport_bottom)
+                })
+                .unwrap_or(count);
+            self.content_list.remeasure_items(0..first_in_view);
+            self.content_list.remeasure_items(after_view..count);
+        }
+
+        let items = Rc::new(RefCell::new(items));
+        let render_item = cx.processor(move |this, index: usize, window, cx| {
+            let mut items = items.borrow_mut();
+            // The list can lay out a row more than once in a frame, after it was taken.
+            if items.get(index).is_none_or(Option::is_none) {
+                let (header, rows) = this.render_content(window, cx);
+                *items = content_list_items(header, rows);
+            }
+            items
+                .get_mut(index)
+                .and_then(Option::take)
+                .unwrap_or_else(|| div().into_any_element())
+        });
+        div()
+            .id("settings-content-scroll")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(list(self.content_list.clone(), render_item).size_full())
+            .vertical_scrollbar_for(&self.content_list, window, cx)
+            .into_any_element()
+    }
+}
+
+impl Render for SettingsPage {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let (header, rows) = self.render_content(window, cx);
+        let content = if self.section == Section::Agents
+            && matches!(self.agents_page, AgentsPage::Registry)
+        {
+            self.render_registry(header, window, cx)
+        } else {
+            self.render_content_list(header, rows, window, cx)
+        };
         h_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -7151,39 +7309,7 @@ impl Render for SettingsPage {
             .size_full()
             .bg(colors.editor_background)
             .child(self.render_nav(window, cx))
-            .map(|page| {
-                if self.section == Section::Agents
-                    && let AgentsPage::Registry = self.agents_page
-                {
-                    return page.child(self.render_registry(header, window, cx));
-                }
-                page.child(
-                    div()
-                        .id("settings-content-scroll")
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(
-                            v_flex()
-                                .id("settings-content")
-                                .size_full()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.content_scroll)
-                                .items_center()
-                                .child(
-                                    v_flex()
-                                        .w_full()
-                                        .max_w(CONTENT_WIDTH)
-                                        .px_8()
-                                        .py_6()
-                                        .gap_6()
-                                        .child(header)
-                                        .children(sections),
-                                ),
-                        )
-                        .vertical_scrollbar_for(&self.content_scroll, window, cx),
-                )
-            })
+            .child(content)
     }
 }
 
@@ -8215,6 +8341,86 @@ mod tests {
             agent_id: mock,
             account: AccountId(1),
         }));
+    }
+
+    /// Scrolling lays the page out every frame, so laying out every account's card made a
+    /// scroll lag.
+    #[gpui::test]
+    fn an_agents_page_lays_out_only_the_account_cards_in_view(cx: &mut TestAppContext) {
+        let mut mock_listing = listing(
+            "mock",
+            "Mock",
+            InstallState::Installed {
+                version: "2.0.0".into(),
+                update_available: false,
+            },
+        );
+        mock_listing.accounts = Some(AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            reads_usage: true,
+            usage_page: None,
+            extra_usage_page: None,
+            copies_settings_files: false,
+            loads_skills: false,
+        });
+        let accounts = AgentAccounts {
+            accounts: (1..=40).map(|id| account(id, None, None)).collect(),
+            last_id: 40,
+            ..AgentAccounts::default()
+        };
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            client.update(cx, |client, cx| {
+                client.answer_for_test(|request| match request {
+                    Request::OpenLoginSession { account, .. } => {
+                        Some(Response::LoginSessionOpened(account.map_or(100, |id| id.0)))
+                    }
+                    Request::SubscribeThread(ConnectionId::LoginSession(_)) => {
+                        Some(Response::Thread(login_session(false)))
+                    }
+                    _ => None,
+                });
+                client.set_accounts_for_test([(AgentId::new("mock"), accounts)].into(), cx);
+            });
+            crate::machines::init_for_test(vec![client], cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.show_agent_accounts(MachineId::Local, &AgentId::new("mock"), false, window, cx)
+        });
+        cx.run_until_parked();
+
+        let first = cx
+            .debug_bounds("account-card-1")
+            .expect("the first account is in view");
+        assert!(cx.debug_bounds("account-card-40").is_none());
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: first.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-100_000.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("account-card-40").is_some());
+        assert!(cx.debug_bounds("account-card-1").is_none());
     }
 
     /// Settings › Usage pools each window across an agent's accounts, without the agents that
