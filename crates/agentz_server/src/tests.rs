@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::{
-    AccountChange, AccountChoice, AccountId, AgentAccounts, AtLimit, OveragePreference,
-    SettingsSource,
+    AccountChange, AccountChoice, AccountId, AgentAccounts, AtLimit, DuplicateLogin,
+    OveragePreference, SettingsSource,
 };
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
@@ -2388,6 +2388,15 @@ fn add_an_account_before_start(data_dir: &Path) -> AccountId {
     AccountId(1)
 }
 
+/// The mock agent's home for an agentZ account, with a login of its own rather than the
+/// External account's.
+fn account_home(data_dir: &Path, account: AccountId) -> PathBuf {
+    let home = data_dir.join("accounts/mock").join(account.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's home");
+    std::fs::write(home.join("email"), "work@example.com").expect("give it its own login");
+    home
+}
+
 /// Waits until the server has found the account logged in or out, `None` being the External
 /// one. It may have before the client subscribed.
 async fn wait_for_login_check(
@@ -2537,8 +2546,7 @@ async fn accounts_read_their_identity_and_limits() {
         ..mock_accounts()
     };
     let work = add_an_account_before_start(data_dir.path());
-    let home = data_dir.path().join("accounts/mock").join(work.to_string());
-    std::fs::create_dir_all(&home).expect("create the account's home");
+    let home = account_home(data_dir.path(), work);
     std::fs::write(home.join("login"), "").expect("log in the account");
     let Some(server) = TestServer::start_with_description(
         data_dir,
@@ -2569,7 +2577,7 @@ async fn accounts_read_their_identity_and_limits() {
         .status(Some(work))
         .cloned()
         .expect("a read");
-    assert_eq!(read.status.email.as_deref(), Some("mock@example.com"));
+    assert_eq!(read.status.email.as_deref(), Some("work@example.com"));
     assert_eq!(read.status.plan.as_deref(), Some("Pro"));
     assert!(read.status.windows[0].resets_at.is_some());
     assert_eq!(client.account_logged_in(Some(work)), Some(true));
@@ -2631,6 +2639,163 @@ async fn accounts_read_their_identity_and_limits() {
     );
 }
 
+/// An added account whose first read finds the email of one already listed is that account
+/// again: it's removed with its folder, and named as the duplicate. Another login stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_logged_in_twice_is_not_added() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let external_login = data_dir.path().join("external-login");
+    std::fs::write(&external_login, "").expect("log in the normal home");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        external_login.to_string_lossy().into_owned(),
+    );
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let email = |client: &TestClient, account| {
+        client
+            .accounts("mock")
+            .status(account)
+            .and_then(|read| read.status.email.clone())
+    };
+    client
+        .wait_until(|client| email(client, None).is_some())
+        .await;
+
+    let log_in = async |client: &mut TestClient, account: AccountId| {
+        let Response::LoginSessionOpened(login_session_id) = client
+            .ok(Request::OpenLoginSession {
+                agent_id: mock.clone(),
+                account: Some(account),
+            })
+            .await
+        else {
+            panic!("expected a login session");
+        };
+        let login = ConnectionId::LoginSession(login_session_id);
+        client.subscribe_thread(login).await;
+        client
+            .wait_until(|client| client.thread(login).status() == &ConnectionStatus::AuthRequired)
+            .await;
+        client
+            .ok(Request::Authenticate {
+                connection: login,
+                method_id: acp::AuthMethodId::new("mock-login"),
+                meta: None,
+            })
+            .await;
+    };
+
+    // The same login as the External account's.
+    let Response::AccountAdded(again) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    let home = server
+        .data_dir
+        .path()
+        .join("accounts/mock")
+        .join(again.to_string());
+    assert!(home.exists());
+    log_in(&mut client, again).await;
+    client
+        .wait_until(|client| client.accounts("mock").account(again).is_none())
+        .await;
+    assert_eq!(
+        client.accounts("mock").duplicate,
+        Some(DuplicateLogin {
+            account: again,
+            email: "mock@example.com".into(),
+        })
+    );
+    assert!(!home.exists());
+
+    // Another login.
+    let Response::AccountAdded(work) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    let home = server
+        .data_dir
+        .path()
+        .join("accounts/mock")
+        .join(work.to_string());
+    std::fs::write(home.join("email"), "work@example.com").expect("give it its own login");
+    log_in(&mut client, work).await;
+    client
+        .wait_until(|client| email(client, Some(work)).as_deref() == Some("work@example.com"))
+        .await;
+    assert_eq!(
+        client
+            .accounts("mock")
+            .duplicate
+            .map(|duplicate| duplicate.account),
+        Some(again)
+    );
+}
+
+/// Only an account Add Account made is taken for a duplicate: one listed before, whose read
+/// finds the External account's login, stays with its folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_listed_before_is_never_removed_as_a_duplicate() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let external_login = data_dir.path().join("external-login");
+    std::fs::write(&external_login, "").expect("log in the normal home");
+    command.env.insert(
+        "MOCK_LOGIN_FILE".into(),
+        external_login.to_string_lossy().into_owned(),
+    );
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    // Without an `email` file, it's mock@example.com, as the External account is.
+    let home = data_dir.path().join("accounts/mock").join(work.to_string());
+    std::fs::create_dir_all(&home).expect("create the account's home");
+    std::fs::write(home.join("login"), "").expect("log in the account");
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let email = |client: &TestClient, account| {
+        client
+            .accounts("mock")
+            .status(account)
+            .and_then(|read| read.status.email.clone())
+    };
+    client
+        .wait_until(|client| email(client, None).is_some() && email(client, Some(work)).is_some())
+        .await;
+    assert_eq!(email(&client, Some(work)), email(&client, None));
+    assert!(client.accounts("mock").account(work).is_some());
+    assert_eq!(client.accounts("mock").duplicate, None);
+    assert!(home.exists());
+}
+
 /// An account is read again soon after the earliest reset its read names, so the app doesn't
 /// show what was used before the reset until the next 5-minute refresh.
 #[tokio::test(flavor = "multi_thread")]
@@ -2644,8 +2809,7 @@ async fn accounts_are_read_again_at_their_reset() {
         ..mock_accounts()
     };
     let work = add_an_account_before_start(data_dir.path());
-    let home = data_dir.path().join("accounts/mock").join(work.to_string());
-    std::fs::create_dir_all(&home).expect("create the account's home");
+    let home = account_home(data_dir.path(), work);
     std::fs::write(home.join("login"), "").expect("log in the account");
     std::fs::write(home.join("usage"), "40").expect("use some of the window");
     let Some(server) = TestServer::start_with_description(
@@ -2698,8 +2862,7 @@ async fn droid_core_is_chosen_through_the_reader() {
         ..mock_accounts()
     };
     let work = add_an_account_before_start(data_dir.path());
-    let home = data_dir.path().join("accounts/mock").join(work.to_string());
-    std::fs::create_dir_all(&home).expect("create the account's home");
+    let home = account_home(data_dir.path(), work);
     // Droid-like, with nothing chosen.
     std::fs::write(home.join("overage"), "").expect("write the choice");
     let Some(server) = TestServer::start_with_description(
@@ -2784,8 +2947,7 @@ async fn limit_resets_are_used_through_the_reader() {
         ..mock_accounts()
     };
     let work = add_an_account_before_start(data_dir.path());
-    let home = data_dir.path().join("accounts/mock").join(work.to_string());
-    std::fs::create_dir_all(&home).expect("create the account's home");
+    let home = account_home(data_dir.path(), work);
     std::fs::write(home.join("usage"), "100").expect("use the account up");
     std::fs::write(home.join("limit_resets"), "2").expect("grant resets");
     let Some(server) = TestServer::start_with_description(
@@ -2875,8 +3037,7 @@ async fn threads_stopped_by_a_limit_continue_at_the_reset() {
         ..mock_accounts()
     };
     let work = add_an_account_before_start(data_dir.path());
-    let home = data_dir.path().join("accounts/mock").join(work.to_string());
-    std::fs::create_dir_all(&home).expect("create the account's home");
+    let home = account_home(data_dir.path(), work);
     std::fs::write(home.join("usage"), "100").expect("use the account up");
     let Some(server) = TestServer::start_with_description(
         data_dir,

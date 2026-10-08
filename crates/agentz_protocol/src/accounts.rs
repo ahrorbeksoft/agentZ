@@ -28,6 +28,16 @@ pub struct AgentAccounts {
     pub external_status: Option<StatusRead>,
     /// The last id given out, so none is given twice.
     pub last_id: u64,
+    /// The last account added whose login turned out to be one already listed, which was
+    /// removed again: Add Account's dialog says so.
+    pub duplicate: Option<DuplicateLogin>,
+}
+
+/// An added account whose first read found the email of an account already listed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DuplicateLogin {
+    pub account: AccountId,
+    pub email: String,
 }
 
 /// A login made in agentZ, in `accounts/<agent id>/<account id>/` in the data directory.
@@ -411,6 +421,31 @@ impl AgentAccounts {
         }
     }
 
+    /// The listed account other than `except` whose last read found the same login as
+    /// `status`, `Some(None)` being the External one: the same email, which vendors don't tell
+    /// apart by case, and the same plan when both name one, since one email can have a
+    /// personal plan and a team's.
+    pub fn listed_with_login(
+        &self,
+        status: &AccountStatus,
+        except: Option<AccountId>,
+    ) -> Option<Option<AccountId>> {
+        let email = status.email.as_deref()?;
+        self.listed().into_iter().find(|&account| {
+            account != except
+                && self.status(account).is_some_and(|read| {
+                    read.status
+                        .email
+                        .as_deref()
+                        .is_some_and(|found| found.eq_ignore_ascii_case(email))
+                        && match (&read.status.plan, &status.plan) {
+                            (Some(found), Some(plan)) => found == plan,
+                            _ => true,
+                        }
+                })
+        })
+    }
+
     /// What the last login check found for `account`, `None` being the External one.
     pub fn logged_in(&self, account: Option<AccountId>) -> Option<bool> {
         match account {
@@ -519,6 +554,37 @@ mod tests {
 
         // Ids aren't given twice.
         assert_eq!(accounts.add(), AccountId(3));
+    }
+
+    #[test]
+    fn a_login_is_the_same_email_on_the_same_plan() {
+        let status = |email: &str, plan: Option<&str>| AccountStatus {
+            email: Some(email.into()),
+            plan: plan.map(Into::into),
+            ..AccountStatus::default()
+        };
+        let read = |status| StatusRead {
+            status,
+            read_at: SystemTime::UNIX_EPOCH,
+        };
+        let mut accounts = AgentAccounts::default();
+        accounts.set_logged_in(None, true);
+        accounts.set_status(None, read(status("alex@hey.com", Some("Pro"))));
+        let work = accounts.add();
+        accounts.set_status(Some(work), read(status("work@acme.dev", None)));
+        let new = accounts.add();
+
+        let found = |status: AccountStatus| accounts.listed_with_login(&status, Some(new));
+        assert_eq!(found(status("Alex@Hey.com", Some("Pro"))), Some(None));
+        assert_eq!(found(status("alex@hey.com", None)), Some(None));
+        // One email can be on a personal plan and on a team's.
+        assert_eq!(found(status("alex@hey.com", Some("Team"))), None);
+        assert_eq!(
+            found(status("work@acme.dev", Some("Team"))),
+            Some(Some(work))
+        );
+        assert_eq!(found(status("sam@hey.com", Some("Pro"))), None);
+        assert_eq!(found(AccountStatus::default()), None);
     }
 
     #[test]

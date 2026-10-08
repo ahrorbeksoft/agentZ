@@ -282,6 +282,16 @@ impl AgentThread {
     }
 
     #[cfg(test)]
+    pub(crate) fn update_state_for_test(
+        &mut self,
+        update: impl FnOnce(&mut agentz_protocol::thread::ThreadState),
+        cx: &mut Context<Self>,
+    ) {
+        update(&mut self.view.state);
+        cx.notify();
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_status_for_test(&mut self, status: ConnectionStatus, cx: &mut Context<Self>) {
         self.view.state.status = status;
         cx.notify();

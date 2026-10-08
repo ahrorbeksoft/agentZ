@@ -205,6 +205,10 @@ pub(crate) struct Server {
     /// The earliest reset each account's last read names, when it's read again, and the wait
     /// for it ([`usage_reads`]).
     reset_reads: HashMap<(AgentId, Option<AccountId>), (SystemTime, tokio::task::AbortHandle)>,
+    /// Accounts made by Add Account that no read has found logged in yet: the first that does
+    /// says whether the login is one already listed ([`usage_reads`]). Only these, so an
+    /// account the user has had for a while is never taken for a duplicate and removed.
+    added_accounts: HashSet<(AgentId, AccountId)>,
     /// When threads' turns ended with an error, until a read of their account since then says
     /// whether a limit stopped them ([`limit_waits`]).
     failed_turns: HashMap<ThreadId, Instant>,
@@ -354,6 +358,7 @@ impl Server {
             account_locks: HashMap::default(),
             limit_reset_attempts: HashMap::default(),
             reset_reads: HashMap::default(),
+            added_accounts: HashSet::default(),
             failed_turns: HashMap::default(),
             http_client,
             skills: Vec::new(),

@@ -31,7 +31,7 @@ use crate::project_info::render_project_icon;
 use crate::project_switcher::ProjectSwitcher;
 use crate::save_layout_modal::{LayoutPane, SaveLayoutModal};
 use crate::server_client::MachineStatus;
-use crate::settings_page::{SettingsPage, SettingsPageEvent};
+use crate::settings_page::{AccountDialog, SettingsPage, SettingsPageEvent};
 use crate::shortcut_sheet::ShortcutSheet;
 use crate::sidebar::{AWAITING_INPUT_COLOR, SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::sound;
@@ -160,6 +160,8 @@ pub struct Shell {
     worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
     machine_modal: Option<(Entity<MachineModal>, Subscription)>,
     confirm_dialog: Option<(Entity<ConfirmDialog>, Subscription)>,
+    /// An agent's account dialog, over Settings. A confirmation it asks for shows in its place.
+    account_dialog: Option<(Entity<AccountDialog>, Subscription)>,
     overlay: Option<Overlay>,
     /// Shown in the main area in place of the thread while open.
     settings_page: Option<(Entity<SettingsPage>, Subscription)>,
@@ -366,6 +368,7 @@ impl Shell {
             worktree_modal: None,
             machine_modal: None,
             confirm_dialog: None,
+            account_dialog: None,
             overlay: None,
             settings_page: None,
             open_threads: HashMap::default(),
@@ -865,6 +868,9 @@ impl Shell {
                         SettingsPageEvent::OpenThread(thread) => {
                             this.open_thread(*thread, window, cx)
                         }
+                        SettingsPageEvent::OpenDialog(dialog) => {
+                            this.open_account_dialog(dialog.clone(), window, cx)
+                        }
                     });
                 self.settings_page = Some((page.clone(), subscription));
                 page
@@ -890,6 +896,7 @@ impl Shell {
         if self.settings_page.take().is_none() {
             return;
         }
+        self.account_dialog = None;
         self.focus_main(window, cx);
         self.mark_active_thread_viewed(window, cx);
         self.sync_diff_panel(cx);
@@ -1168,6 +1175,15 @@ impl Shell {
     }
 
     fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A confirmation over the account dialog gives it back.
+        if let Some((dialog, _)) = &self.account_dialog
+            && self.confirm_dialog.take().is_some()
+        {
+            window.focus(&dialog.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
+        let had_account_dialog = self.account_dialog.take().is_some();
         let had_new_thread_modal = self.new_thread_modal.take().is_some();
         let had_add_project_modal = self.add_project_modal.take().is_some();
         let had_worktree_modal = self.worktree_modal.take().is_some();
@@ -1185,6 +1201,7 @@ impl Shell {
             || had_worktree_modal
             || had_machine_modal
             || had_confirm_dialog
+            || had_account_dialog
             || overlay.is_some()
         {
             self.focus_main(window, cx);
@@ -1206,6 +1223,7 @@ impl Shell {
             || self.worktree_modal.is_some()
             || self.machine_modal.is_some()
             || self.confirm_dialog.is_some()
+            || self.account_dialog.is_some()
         {
             return false;
         }
@@ -1442,6 +1460,21 @@ impl Shell {
                 this.dismiss_modal(window, cx);
             });
         self.confirm_dialog = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    /// The settings page's account dialog, which the page focuses as it opens it.
+    fn open_account_dialog(
+        &mut self,
+        dialog: Entity<AccountDialog>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription =
+            cx.subscribe_in(&dialog, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            });
+        self.account_dialog = Some((dialog, subscription));
         cx.notify();
     }
 
@@ -1948,6 +1981,7 @@ impl Render for Shell {
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
         let is_dialog = self.machine_modal.is_some()
             || self.confirm_dialog.is_some()
+            || self.account_dialog.is_some()
             || self.overlay_kind() == Some(OverlayKind::SaveLayout);
         // Beside the thread, or filling its area when full screen.
         let diff_panel = self.diff_panel.clone();
@@ -2092,6 +2126,11 @@ impl Render for Shell {
                     })
                     .or_else(|| {
                         self.confirm_dialog
+                            .as_ref()
+                            .map(|(dialog, _)| AnyView::from(dialog.clone()))
+                    })
+                    .or_else(|| {
+                        self.account_dialog
                             .as_ref()
                             .map(|(dialog, _)| AnyView::from(dialog.clone()))
                     })

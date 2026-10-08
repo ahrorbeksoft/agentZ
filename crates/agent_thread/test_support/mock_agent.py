@@ -52,7 +52,8 @@ window resets in an hour, or at the time in seconds since the epoch in `resets_a
 once that has passed, none of it is used. While all of it is, prompts fail with "Usage limit
 reached", as agents' turns end at their limits. A `windows` file in MOCK_HOME (a JSON array of
 {"label", "used_percent", "resets_in", "length"}, the last two in seconds) replaces that window
-in `--usage` with those, to show several windows at different paces. A `.mock/settings.json`
+in `--usage` with those, to show several windows at different paces. An `email` file there
+gives the login that email in place of mock@example.com. A `.mock/settings.json`
 in MOCK_HOME with a list of `models` offers only those, as an organization's plan offers fewer.
 
 An `overage` file in MOCK_HOME makes it Droid-like at its limit: `--usage` then reports its
@@ -131,6 +132,8 @@ LIMIT_RESETS_FILE = (os.path.join(os.environ["MOCK_HOME"], "limit_resets")
                      if os.environ.get("MOCK_HOME") else None)
 LIMIT_RESET_ATTEMPT_FILE = (os.path.join(os.environ["MOCK_HOME"], "limit_reset_attempt")
                             if os.environ.get("MOCK_HOME") else None)
+# The email the home's login has, in place of mock@example.com.
+EMAIL_FILE = os.path.join(os.environ["MOCK_HOME"], "email") if os.environ.get("MOCK_HOME") else None
 
 
 def stored_login():
@@ -169,6 +172,10 @@ def read_text(path):
             return file.read().strip()
     except (TypeError, OSError):
         return None
+
+
+def email():
+    return read_text(EMAIL_FILE) or "mock@example.com"
 
 
 def limit_resets():
@@ -237,7 +244,7 @@ if sys.argv[-1] == "--usage":
             file.write(os.environ["AGENTZ_OVERAGE_PREFERENCE"])
     used = used_percent()
     five_hours = {"secs": 5 * 3600, "nanos": 0}
-    read = {"logged_in": True, "email": "mock@example.com", "plan": "Pro",
+    read = {"logged_in": True, "email": email(), "plan": "Pro",
             "windows": [{"label": "5-hour", "used_percent": used,
                          "resets_at": {"secs_since_epoch": resets_at(), "nanos_since_epoch": 0},
                          "length": five_hours}]}
@@ -477,7 +484,7 @@ def log_in():
 def send_auth_status():
     if logged_in():
         status = {"kind": "account", "label": "Mock Pro",
-                  "account": {"email": "mock@example.com", "plan": "Pro"}}
+                  "account": {"email": email(), "plan": "Pro"}}
     else:
         status = {"kind": "none"}
     send({"jsonrpc": "2.0", "method": "_auth/status_update", "params": {"authStatus": status}})

@@ -17,7 +17,6 @@ use std::time::SystemTime;
 use crate::agent_icons::agent_icon;
 use crate::machines::{GroupKey, MachineId, Machines, ProjectGroupingMode, ProjectKey, ThreadKey};
 use crate::project_store::ProjectStore;
-use agentz_protocol::CAPABILITY_IMPORT_SESSIONS;
 use agentz_protocol::accounts::{
     AccountChange, AccountChoice, AccountChoices, AccountId, AccountStatus, AccountSupport,
     AgentAccounts, AtLimit, LimitResets, LimitWindow, Overage, OveragePreference, SettingsSource,
@@ -27,10 +26,12 @@ use agentz_protocol::agents::{
     InstallState,
 };
 use agentz_protocol::workspace::WorkspaceRemoval;
+use agentz_protocol::{CAPABILITY_IMPORT_SESSIONS, Request, Response};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    ListAlignment, ListOffset, ListState, PathPromptOptions, PromptLevel, ScrollHandle,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, list, uniform_list,
+    AnyElement, App, BoxShadow, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, KeyBinding, ListAlignment, ListOffset, ListState, PathPromptOptions,
+    PromptLevel, ScrollHandle, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    actions, list, uniform_list,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
@@ -44,12 +45,11 @@ use ui::{
 use util::ResultExt as _;
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::Request;
 use agentz_protocol::thread::{AuthStatus, ConnectionStatus};
 
 use std::collections::BTreeMap;
 
-use crate::agent_login::{AgentLogin, LoginLayout};
+use crate::agent_login::{AgentLogin, LoginLayout, LoginStep};
 use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::app_settings::{AppSettingsStore, MachineProfile, PlaySound, ThemeMode};
 use crate::confirm_dialog::ConfirmRequest;
@@ -76,6 +76,7 @@ use crate::usage_limits::{
 
 const KEY_CONTEXT: &str = "SettingsPage";
 const ACCOUNT_RENAME_KEY_CONTEXT: &str = "AccountRename";
+const ACCOUNT_DIALOG_KEY_CONTEXT: &str = "AccountDialog";
 /// An account card's avatar, which its limits line up after.
 const AVATAR_SIZE: Pixels = px(32.);
 /// A window's column in a Usage page table, and the gap between columns. Narrower than the
@@ -89,6 +90,11 @@ const CONTENT_WIDTH: Pixels = px(720.);
 const SECTION_SPACING: Rems = rems(1.5);
 /// The space between an agent's account cards.
 const ACCOUNT_SPACING: Rems = rems(0.625);
+/// An account's avatar on its line, with several accounts.
+const LINE_AVATAR_SIZE: Pixels = px(26.);
+/// An account's card in its dialog, and Add Account's dialog.
+const ACCOUNT_DIALOG_WIDTH: Pixels = px(600.);
+const ADD_ACCOUNT_DIALOG_WIDTH: Pixels = px(480.);
 /// An agent can keep hundreds of sessions in a project, so the Threads tab shows them a page at
 /// a time, as the sidebar shows archived threads.
 const SESSIONS_INITIAL_COUNT: usize = 10;
@@ -107,6 +113,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", CloseSettings, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_DIALOG_KEY_CONTEXT)),
         KeyBinding::new("enter", text_input::Newline, Some("SkillBody > TextInput")),
     ]);
 }
@@ -119,6 +126,45 @@ pub enum SettingsPageEvent {
     Confirm(ConfirmRequest),
     /// Leave settings for the thread, as an agent's Threads tab opens one.
     OpenThread(ThreadKey),
+    /// Show an account's dialog, in the shell's modal layer.
+    OpenDialog(Entity<AccountDialog>),
+}
+
+/// An agent's account dialog: an account's whole card, opened from its line, or Add Account
+/// from picking how to log in to the account added. The settings page draws it and keeps what
+/// it shows; closing it, however it closes, tells the page.
+pub struct AccountDialog {
+    page: WeakEntity<SettingsPage>,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<DismissEvent> for AccountDialog {}
+
+impl Focusable for AccountDialog {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for AccountDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = self
+            .page
+            .upgrade()
+            .and_then(|page| page.update(cx, |page, cx| page.render_account_dialog(window, cx)));
+        if content.is_none() {
+            // The agent's page closed under it.
+            let dialog = cx.weak_entity();
+            cx.defer(move |cx| {
+                dialog.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
+            });
+        }
+        div()
+            .key_context(ACCOUNT_DIALOG_KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .children(content)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -333,7 +379,7 @@ impl SettingsPage {
         }
         self.select_agent_tab(AgentTab::Account, cx);
         if add_account {
-            self.add_account(cx);
+            self.add_account(window, cx);
         }
     }
 
@@ -2458,6 +2504,7 @@ impl SettingsPage {
             limit_tabs: HashMap::new(),
             switching_to_core: HashSet::new(),
             using_limit_reset: HashSet::new(),
+            dialog: None,
             _subscriptions: vec![accounts_changed],
         };
         self.show_agents_page(AgentsPage::Agent(panel), window, cx);
@@ -2545,6 +2592,15 @@ impl SettingsPage {
             .filter(|id| !panel.accounts.contains_key(id))
             .collect();
         let is_unchanged = missing.is_empty() && panel.accounts.len() == listed.len();
+        // With one account left, the page shows its card, and its dialog closes.
+        let shows_card = client.read(cx).accounts(&agent_id).listed().len() <= 1;
+        let has_account_dialog = panel
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog.content, DialogContent::Account(_)));
+        if shows_card && has_account_dialog {
+            self.close_account_dialog(cx);
+        }
         if is_unchanged {
             return;
         }
@@ -2568,6 +2624,17 @@ impl SettingsPage {
                 panel.renaming = None;
             }
         }
+        // A removed account's dialog closes with it.
+        let is_removed = self
+            .agent_panel()
+            .and_then(|panel| panel.dialog.as_ref())
+            .is_some_and(|dialog| {
+                matches!(dialog.content, DialogContent::Account(Some(id)) if !listed.contains(&id))
+            });
+        if is_removed {
+            self.close_account_dialog(cx);
+        }
+        self.sync_adding_login(cx);
         cx.notify();
     }
 
@@ -3461,18 +3528,40 @@ impl SettingsPage {
             _ => None,
         };
         let accounts = external.client().read(cx).accounts(&panel.agent_id);
-        let listed = accounts.listed();
+        // The account being added is in Add Account's dialog until it's done.
+        let adding = panel.adding().and_then(|adding| adding.account);
+        let listed: Vec<Option<AccountId>> = accounts
+            .listed()
+            .into_iter()
+            .filter(|&account| adding.is_none_or(|id| account != Some(id)))
+            .collect();
+        let in_dialog = panel
+            .dialog
+            .as_ref()
+            .and_then(|dialog| match dialog.content {
+                DialogContent::Account(account) => Some(account),
+                DialogContent::Adding(_) => None,
+            });
 
         let mut cards: Vec<AnyElement> = Vec::new();
-        for &account in &listed {
-            cards.push(self.render_account_card(
-                account,
-                &accounts,
-                support,
-                listed.len(),
-                window,
-                cx,
-            ));
+        // Lines sit against each other, as one table.
+        let mut lines: Vec<AnyElement> = Vec::new();
+        if listed.len() > 1 {
+            lines = self.render_account_lines(&listed, &accounts, cx);
+        } else {
+            cards.extend(listed.iter().map(|&account| {
+                self.render_account_card(
+                    account,
+                    &accounts,
+                    support,
+                    listed.len(),
+                    CardPlace::Page,
+                    window,
+                    cx,
+                )
+            }));
+        }
+        for &account in listed.iter().filter(|&&account| in_dialog != Some(account)) {
             if let Some(session) = panel.session(account) {
                 cards.extend(
                     session
@@ -3529,7 +3618,7 @@ impl SettingsPage {
                     .color(Color::Muted),
             )
             .disabled(panel.adding_account.is_some())
-            .on_click(cx.listener(|this, _, _, cx| this.add_account(cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.add_account(window, cx)));
         let header = h_flex()
             .justify_between()
             .child(
@@ -3545,25 +3634,233 @@ impl SettingsPage {
                 .color(Color::Error)
                 .into_any_element()
         });
+        let line_count = lines.len();
         std::iter::once(ContentRow::section(header))
             .chain(
                 error
                     .into_iter()
-                    .chain(cards)
                     .map(|row| ContentRow::new(row, ACCOUNT_SPACING)),
             )
+            .chain(lines.into_iter().enumerate().map(|(index, line)| {
+                let space_above = if index == 0 {
+                    ACCOUNT_SPACING
+                } else {
+                    rems(0.)
+                };
+                ContentRow::new(line, space_above)
+            }))
+            .chain(cards.into_iter().enumerate().map(|(index, card)| {
+                let space_above = if index == 0 && line_count > 0 {
+                    SECTION_SPACING
+                } else {
+                    ACCOUNT_SPACING
+                };
+                ContentRow::new(card, space_above)
+            }))
             .collect()
+    }
+
+    /// Several accounts as lines, the Usage page's: a head naming the windows, then a line per
+    /// account with its avatar, name, tags, email and plan, and a cell per window. A line opens
+    /// the account's whole card in a dialog. Each line is a row of the page's list, drawn as
+    /// part of one table.
+    fn render_account_lines(
+        &self,
+        listed: &[Option<AccountId>],
+        accounts: &AgentAccounts,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(panel) = self.agent_panel() else {
+            return Vec::new();
+        };
+        let colors = cx.theme().colors().clone();
+        let agent_name = panel.external.connection.read(cx).agent_name().clone();
+        let entries: Vec<AccountEntry> = listed
+            .iter()
+            .map(|&account| account_entry(accounts, account))
+            .collect();
+        let mut columns: Vec<String> = Vec::new();
+        for window in entries
+            .iter()
+            .filter(|entry| !entry.is_logged_out)
+            .flat_map(|entry| &entry.windows)
+        {
+            if !columns.contains(&window.label) {
+                columns.push(window.label.clone());
+            }
+        }
+        let column = |child: Option<AnyElement>| {
+            div()
+                .w(USAGE_COLUMN_WIDTH)
+                .flex_none()
+                .min_w_0()
+                .children(child)
+        };
+        let head = h_flex()
+            .px_4()
+            .py_2()
+            .gap(USAGE_COLUMN_GAP)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new("Account")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .children(columns.iter().map(|label| {
+                column(Some(
+                    Label::new(label.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate()
+                        .into_any_element(),
+                ))
+            }))
+            .child(div().w(px(16.)).flex_none());
+        let now = SystemTime::now();
+        let default = accounts.new_thread_account();
+        let count = entries.len();
+        let lines = entries.into_iter().enumerate().map(|(index, entry)| {
+            let account = entry.account;
+            let selector = account_selector(account);
+            let key = format!("line-{selector}");
+            let state = panel
+                .session(account)
+                .map(|session| AccountState::of(session.connection.read(cx)));
+            let detail: (SharedString, Color) = match state {
+                Some(AccountState::Failed) => {
+                    (format!("Couldn't start {agent_name}").into(), Color::Error)
+                }
+                Some(AccountState::LoggedOut) => ("Not logged in".into(), Color::Warning),
+                _ if entry.is_logged_out => ("Not logged in".into(), Color::Warning),
+                _ => (
+                    entry
+                        .email
+                        .iter()
+                        .filter(|&email| *email != entry.name.as_ref())
+                        .chain(&entry.plan)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                        .into(),
+                    Color::Muted,
+                ),
+            };
+            let windows = if entry.is_logged_out || state == Some(AccountState::LoggedOut) {
+                &[][..]
+            } else {
+                &entry.windows[..]
+            };
+            let line_selector = format!("account-line-{selector}");
+            let line = h_flex()
+                .id(SharedString::from(line_selector.clone()))
+                .debug_selector(move || line_selector)
+                .px_4()
+                .py(px(10.))
+                .gap(USAGE_COLUMN_GAP)
+                .cursor_pointer()
+                .hover(|line| line.bg(colors.element_hover))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_3()
+                        .child(render_entry_avatar(&entry, LINE_AVATAR_SIZE, cx))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .gap_px()
+                                .child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .child(Label::new(entry.name.clone()).truncate()),
+                                        )
+                                        .when(account.is_none(), |name| {
+                                            name.child(account_tag(
+                                                "Outside agentZ",
+                                                Color::Muted,
+                                                cx,
+                                            ))
+                                        })
+                                        .when(default == account, |name| {
+                                            name.child(account_tag("Default", Color::Accent, cx))
+                                        }),
+                                )
+                                .when(!detail.0.is_empty(), |column| {
+                                    column.child(
+                                        Label::new(detail.0)
+                                            .size(LabelSize::XSmall)
+                                            .color(detail.1)
+                                            .truncate(),
+                                    )
+                                }),
+                        ),
+                )
+                .children(columns.iter().enumerate().map(|(index, label)| {
+                    column(
+                        windows
+                            .iter()
+                            .find(|window| window.label == *label)
+                            .map(|window| render_limit_cell(&key, index, window, now, cx)),
+                    )
+                }))
+                .child(
+                    div().w(px(16.)).flex_none().child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_account_dialog(DialogContent::Account(account), window, cx)
+                }));
+            let is_last = index + 1 == count;
+            div()
+                .border_x_1()
+                .border_color(colors.border)
+                .bg(colors.panel_background)
+                .when(is_last, |line| {
+                    line.border_b_1().rounded_b_lg().overflow_hidden()
+                })
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .child(line),
+                )
+                .into_any_element()
+        });
+        std::iter::once(
+            div()
+                .debug_selector(|| "account-lines".into())
+                .border_1()
+                .border_b_0()
+                .border_color(colors.border)
+                .rounded_t_lg()
+                .bg(colors.panel_background)
+                .child(head)
+                .into_any_element(),
+        )
+        .chain(lines)
+        .collect()
     }
 
     /// An account as today's Account card shows the agent's login: its avatar in its color,
     /// its name with its tags, its plan, its limits, and its ⋯ menu. Logged out, its login
-    /// rows follow; before its first login, it's the "New account" card.
+    /// rows follow; before its first login, it's the "New account" card. In its dialog, it's
+    /// the dialog's whole content, with × to close it.
+    #[allow(clippy::too_many_arguments)]
     fn render_account_card(
         &self,
         account: Option<AccountId>,
         accounts: &AgentAccounts,
         support: &AccountSupport,
         listed_count: usize,
+        place: CardPlace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3622,11 +3919,25 @@ impl SettingsPage {
                 let selector = selector.clone();
                 move || format!("account-card-{selector}")
             })
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.panel_background)
-            .overflow_hidden();
+            .when(place == CardPlace::Page, |card| {
+                card.rounded_lg()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel_background)
+                    .overflow_hidden()
+            });
+        let close = (place == CardPlace::Dialog).then(|| {
+            div()
+                .debug_selector(|| "account-dialog-close".into())
+                .child(
+                    IconButton::new("account-dialog-close", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Close"))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_account_dialog(cx))),
+                )
+                .into_any_element()
+        });
 
         let is_new = state != AccountState::LoggedIn
             && name.is_none()
@@ -3687,6 +3998,7 @@ impl SettingsPage {
                     )
                     .into_any_element(),
             );
+            actions.extend(close);
             return card
                 .child(
                     h_flex()
@@ -3709,7 +4021,14 @@ impl SettingsPage {
                         .children(actions),
                 )
                 .when(listed_count > 1, |card| {
-                    card.child(self.render_copy_settings(id, accounts, support, window, cx))
+                    card.child(self.render_copy_settings(
+                        id,
+                        accounts,
+                        support,
+                        CardPlace::Page,
+                        window,
+                        cx,
+                    ))
                 })
                 .when(has_auth_methods && failure.is_none(), |card| {
                     card.child(session.login.clone())
@@ -3793,11 +4112,11 @@ impl SettingsPage {
                 .key_context(ACCOUNT_RENAME_KEY_CONTEXT)
                 .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
                     this.finish_account_rename(true, cx);
-                    window.focus(&this.focus_handle, cx);
+                    this.focus_after_rename(window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
                     this.finish_account_rename(false, cx);
-                    window.focus(&this.focus_handle, cx);
+                    this.focus_after_rename(window, cx);
                 }))
                 .px_1()
                 .rounded_sm()
@@ -3826,6 +4145,21 @@ impl SettingsPage {
                 .into_any_element(),
             );
         }
+        let shows_read = matches!(state, AccountState::LoggedIn | AccountState::Connecting);
+        if let Some(read) = read.filter(|_| shows_read) {
+            let read_selector = format!("account-read-{selector}");
+            actions.push(
+                div()
+                    .debug_selector(move || read_selector)
+                    .flex_none()
+                    .child(
+                        Label::new(read_ago(read.read_at, SystemTime::now()))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Placeholder),
+                    )
+                    .into_any_element(),
+            );
+        }
         let is_local = self.agents_machine == MachineId::Local;
         let menu = AccountMenu {
             account,
@@ -3841,6 +4175,7 @@ impl SettingsPage {
             can_log_out: can_log_out && state == AccountState::LoggedIn,
         };
         actions.push(render_account_menu(&selector, menu, cx));
+        actions.extend(close);
 
         let status = read
             .map(|read| read.status.clone())
@@ -3897,6 +4232,7 @@ impl SettingsPage {
         let at_limit = support
             .reads_usage
             .then(|| self.render_at_limit(account, choices.at_limit, at_limit_title, window, cx));
+        let settings: Vec<AnyElement> = overage.into_iter().chain(at_limit).collect();
 
         card.child(
             h_flex()
@@ -3941,10 +4277,29 @@ impl SettingsPage {
                 )
             },
         )
-        .children(overage)
-        .children(at_limit)
+        .when(!settings.is_empty(), |card| {
+            card.child(
+                v_flex()
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .children(settings),
+            )
+        })
         .when(shows_login, |card| card.child(session.login.clone()))
         .into_any_element()
+    }
+
+    /// After a rename, focus goes back where the card is: its dialog, or the page.
+    fn focus_after_rename(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = self
+            .agent_panel()
+            .and_then(|panel| panel.dialog.as_ref())
+            .and_then(|dialog| dialog.view.upgrade());
+        match dialog {
+            Some(dialog) => window.focus(&dialog.focus_handle(cx), cx),
+            None => window.focus(&self.focus_handle, cx),
+        }
     }
 
     /// The account's windows. An account with pools of limits has a tab for each over them, as
@@ -4022,7 +4377,7 @@ impl SettingsPage {
         };
         let id = format!("overage-{selector}");
         let control = if !overage.can_change {
-            Label::new(current)
+            Label::new(format!("{current}, set by your organization"))
                 .size(LabelSize::Small)
                 .color(Color::Muted)
                 .into_any_element()
@@ -4109,32 +4464,7 @@ impl SettingsPage {
                 .child(DropdownMenu::new(SharedString::from(id), label, menu).disabled(switching))
                 .into_any_element()
         };
-        let description = if overage.can_change {
-            "Saved to your Factory account; the CLI does the same."
-        } else {
-            "Set by your organization."
-        };
-        // Under the name, past the avatar, as the limits are.
-        h_flex()
-            .pl(px(16.) + AVATAR_SIZE + px(12.))
-            .pr_4()
-            .pb_3()
-            .gap_6()
-            .justify_between()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(Label::new("When a limit is reached"))
-                    .child(
-                        Label::new(description)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(control)
-            .into_any_element()
+        render_card_setting("When a limit is reached", control)
     }
 
     /// The card's Switch to Droid Core, which takes a moment: Droid's terminal UI saves it.
@@ -4266,44 +4596,26 @@ impl SettingsPage {
             }
         });
         let id = format!("at-limit-{selector}");
-        // Under the name, past the avatar, as the limits are.
-        h_flex()
-            .pl(px(16.) + AVATAR_SIZE + px(12.))
-            .pr_4()
-            .pb_3()
-            .gap_6()
-            .justify_between()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(Label::new(title))
-                    .child(
-                        Label::new("What threads on this account do.")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .debug_selector({
-                        let id = id.clone();
-                        move || id
-                    })
-                    .child(DropdownMenu::new(SharedString::from(id), label, menu)),
-            )
-            .into_any_element()
+        render_card_setting(
+            title,
+            div()
+                .debug_selector({
+                    let id = id.clone();
+                    move || id
+                })
+                .child(DropdownMenu::new(SharedString::from(id), label, menu))
+                .into_any_element(),
+        )
     }
 
     /// A new account's "Copy settings from": the other accounts, the default one first, then
-    /// Nothing.
+    /// Nothing. In Add Account's dialog, it's under the login methods, in the dialog's margins.
     fn render_copy_settings(
         &self,
         account: AccountId,
         accounts: &AgentAccounts,
         support: &AccountSupport,
+        place: CardPlace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4376,23 +4688,43 @@ impl SettingsPage {
         } else {
             "Its defaults and environment variables.".to_string()
         };
-        div()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(render_row(
-                "Copy settings from",
-                format!("{what} Defaults this account doesn't offer are dropped."),
-                div()
-                    .debug_selector(move || format!("copy-settings-{account}"))
-                    .child(DropdownMenu::new_with_element(
-                        SharedString::from(format!("copy-settings-{account}")),
-                        label,
-                        menu,
-                    ))
-                    .into_any_element(),
-                cx,
+        let description = format!("{what} Defaults this account doesn't offer are dropped.");
+        let control = div()
+            .debug_selector(move || format!("copy-settings-{account}"))
+            .child(DropdownMenu::new_with_element(
+                SharedString::from(format!("copy-settings-{account}")),
+                label,
+                menu,
             ))
-            .into_any_element()
+            .into_any_element();
+        let border = cx.theme().colors().border_variant;
+        match place {
+            CardPlace::Page => div()
+                .border_t_1()
+                .border_color(border)
+                .child(render_row("Copy settings from", description, control, cx))
+                .into_any_element(),
+            CardPlace::Dialog => h_flex()
+                .mt_2()
+                .pt_2p5()
+                .gap_4()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_px()
+                        .child(Label::new("Copy settings from").size(LabelSize::Small))
+                        .child(
+                            Label::new(description)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(div().flex_none().child(control))
+                .into_any_element(),
+        }
     }
 
     /// Copy settings from, then the account's agent starts again with them, to log in with its
@@ -4426,10 +4758,7 @@ impl SettingsPage {
                     return;
                 };
                 match copied {
-                    Ok(_) => {
-                        panel.accounts.remove(&account);
-                        this.sync_account_sessions(cx);
-                    }
+                    Ok(_) => this.restart_account_session(account, cx),
                     Err(error) => {
                         panel.account_error =
                             Some(format!("Couldn't copy the settings: {error:#}").into());
@@ -4443,13 +4772,14 @@ impl SettingsPage {
         cx.notify();
     }
 
-    /// Add Account: the server makes the account's folder, and the account arrives with the
-    /// agent's accounts, which opens its login session.
-    fn add_account(&mut self, cx: &mut Context<Self>) {
+    /// Add Account opens its dialog, and the server makes the account's folder. The account
+    /// arrives with the agent's accounts, which opens its login session, and the dialog logs
+    /// it in.
+    fn add_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.agent_panel() else {
             return;
         };
-        if panel.adding_account.is_some() {
+        if panel.adding_account.is_some() || panel.dialog.is_some() {
             return;
         }
         let agent_id = panel.agent_id.clone();
@@ -4467,10 +4797,29 @@ impl SettingsPage {
                     return;
                 };
                 panel.adding_account = None;
-                if let Err(error) = added {
-                    panel.account_error =
-                        Some(format!("Couldn't add an account: {error:#}").into());
+                let id = match added {
+                    Ok(Response::AccountAdded(id)) => id,
+                    Ok(response) => {
+                        log::error!("unexpected answer to Add Account: {response:?}");
+                        return;
+                    }
+                    Err(error) => {
+                        panel.account_error =
+                            Some(format!("Couldn't add an account: {error:#}").into());
+                        this.close_account_dialog(cx);
+                        cx.notify();
+                        return;
+                    }
+                };
+                match panel.adding_mut() {
+                    Some(adding) => adding.account = Some(id),
+                    // The dialog closed before the account was made.
+                    None => {
+                        this.remove_account(id, cx);
+                        return;
+                    }
                 }
+                this.sync_adding_login(cx);
                 cx.notify();
             })
             .log_err();
@@ -4479,7 +4828,484 @@ impl SettingsPage {
             panel.adding_account = Some(task);
             panel.account_error = None;
         }
+        self.open_account_dialog(
+            DialogContent::Adding(AddingAccount {
+                account: None,
+                login: None,
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the account dialog over the page, unless one is open.
+    fn open_account_dialog(
+        &mut self,
+        content: DialogContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .agent_panel()
+            .is_none_or(|panel| panel.dialog.is_some())
+        {
+            return;
+        }
+        let page = cx.weak_entity();
+        let dialog = cx.new(|cx| AccountDialog {
+            page,
+            focus_handle: cx.focus_handle(),
+        });
+        window.focus(&dialog.focus_handle(cx), cx);
+        let released = cx.observe_release(&dialog, |this, _, cx| this.account_dialog_closed(cx));
+        if let Some(panel) = self.agent_panel_mut() {
+            panel.dialog = Some(AccountDialogState {
+                view: dialog.downgrade(),
+                content,
+                _released: released,
+            });
+        }
+        cx.emit(SettingsPageEvent::OpenDialog(dialog));
         cx.notify();
+    }
+
+    /// Done, Cancel and the dialog's ×: the shell closes it, which tells the page.
+    fn close_account_dialog(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .agent_panel()
+            .and_then(|panel| panel.dialog.as_ref())
+            .and_then(|dialog| dialog.view.upgrade())
+        {
+            view.update(cx, |_, cx| cx.emit(DismissEvent));
+        }
+    }
+
+    /// An account added for a login that didn't finish is empty, so it goes with the dialog.
+    fn account_dialog_closed(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        let Some(dialog) = panel.dialog.take() else {
+            return;
+        };
+        cx.notify();
+        let DialogContent::Adding(AddingAccount {
+            account: Some(id), ..
+        }) = dialog.content
+        else {
+            return;
+        };
+        let accounts = panel.client(cx).read(cx).accounts(&panel.agent_id);
+        let is_logged_in = panel.session(Some(id)).is_some_and(|session| {
+            AccountState::of(session.connection.read(cx)) == AccountState::LoggedIn
+        });
+        if accounts.account(id).is_some() && !is_logged_in {
+            self.remove_account(id, cx);
+        }
+    }
+
+    /// Gives Add Account's dialog the new account's login, once both the account and its
+    /// session are there.
+    fn sync_adding_login(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        let agent_id = panel.agent_id.clone();
+        let Some(id) = panel
+            .adding_mut()
+            .filter(|adding| adding.login.is_none())
+            .and_then(|adding| adding.account)
+        else {
+            return;
+        };
+        let Some(connection) = panel
+            .accounts
+            .get(&id)
+            .map(|session| session.connection.clone())
+        else {
+            return;
+        };
+        let login =
+            cx.new(|cx| AgentLogin::new(connection, LoginLayout::Dialog, Some(agent_id), cx));
+        if let Some(adding) = self.agent_panel_mut().and_then(AgentPanel::adding_mut) {
+            adding.login = Some(login);
+        }
+        cx.notify();
+    }
+
+    /// Starts the account's agent again, in a new login session: after Copy settings from, or
+    /// to try again once it failed to start.
+    fn restart_account_session(&mut self, account: AccountId, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        panel.accounts.remove(&account);
+        if let Some(adding) = panel
+            .adding_mut()
+            .filter(|adding| adding.account == Some(account))
+        {
+            adding.login = None;
+        }
+        self.sync_account_sessions(cx);
+    }
+
+    /// The account dialog's content, `None` once there's nothing for it to show.
+    fn render_account_dialog(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.agent_panel()?;
+        let dialog = panel.dialog.as_ref()?;
+        let support = self
+            .registry(cx)
+            .read(cx)
+            .agent(&panel.agent_id)?
+            .accounts
+            .clone()?;
+        let accounts = panel.client(cx).read(cx).accounts(&panel.agent_id);
+        let colors = cx.theme().colors().clone();
+        let frame = v_flex()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(24.), gpui::black().opacity(0.45)).blur_radius(px(64.)),
+            ])
+            .overflow_hidden();
+        let elicitation_cards = |account: Option<AccountId>| -> Vec<AnyElement> {
+            panel
+                .session(account)
+                .map(|session| {
+                    session
+                        .elicitation_cards
+                        .iter()
+                        .map(|card| card.clone().into_any_element())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        match &dialog.content {
+            DialogContent::Account(account) => {
+                let account = *account;
+                let listed = accounts.listed();
+                if !listed.contains(&account) {
+                    return None;
+                }
+                let card = self.render_account_card(
+                    account,
+                    &accounts,
+                    &support,
+                    listed.len(),
+                    CardPlace::Dialog,
+                    window,
+                    cx,
+                );
+                Some(
+                    frame
+                        .debug_selector(|| "account-dialog".into())
+                        .w(ACCOUNT_DIALOG_WIDTH)
+                        .py_1()
+                        .child(card)
+                        .children(
+                            elicitation_cards(account)
+                                .into_iter()
+                                .map(|card| div().px_4().pb_3().child(card)),
+                        )
+                        .into_any_element(),
+                )
+            }
+            DialogContent::Adding(adding) => {
+                let (title, body, buttons) =
+                    self.render_adding_account(adding, &accounts, &support, window, cx);
+                let elicitations = adding
+                    .account
+                    .map(|id| elicitation_cards(Some(id)))
+                    .unwrap_or_default();
+                Some(
+                    frame
+                        .debug_selector(|| "add-account-dialog".into())
+                        .w(ADD_ACCOUNT_DIALOG_WIDTH)
+                        .px_4()
+                        .pt_4()
+                        .pb_3p5()
+                        .child(
+                            div()
+                                .mb_1()
+                                .text_size(px(15.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(body)
+                        .children(elicitations)
+                        .child(h_flex().mt_3p5().gap_2().justify_end().children(buttons))
+                        .into_any_element(),
+                )
+            }
+        }
+    }
+
+    /// Add Account's dialog by its step: the agent starting, how to log in with Copy settings
+    /// from, the login in progress or why it failed, then the account added, or the account it
+    /// turned out to be already.
+    fn render_adding_account(
+        &self,
+        adding: &AddingAccount,
+        accounts: &AgentAccounts,
+        support: &AccountSupport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (SharedString, AnyElement, Vec<AnyElement>) {
+        let Some(panel) = self.agent_panel() else {
+            return ("".into(), div().into_any_element(), Vec::new());
+        };
+        let agent_name = panel.external.connection.read(cx).agent_name().clone();
+        let adding_title: SharedString = format!("Add a {agent_name} account").into();
+        let button = |id: &'static str, label: &'static str, style: ActionStyle| {
+            ActionButton::new(id, label).style(style)
+        };
+        let wrap = |id: &'static str, button: ActionButton| {
+            div()
+                .debug_selector(move || id.into())
+                .child(button)
+                .into_any_element()
+        };
+        let done = |cx: &Context<Self>| {
+            wrap(
+                "add-account-done",
+                button("add-account-done", "Done", ActionStyle::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_account_dialog(cx))),
+            )
+        };
+        let cancel = |style: ActionStyle, cx: &Context<Self>| {
+            wrap(
+                "add-account-cancel",
+                button("add-account-cancel", "Cancel", style)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_account_dialog(cx))),
+            )
+        };
+        let centered = |children: Vec<AnyElement>| {
+            v_flex()
+                .py_4()
+                .items_center()
+                .gap_2p5()
+                .text_center()
+                .children(children)
+                .into_any_element()
+        };
+
+        let Some(id) = adding.account else {
+            let body = centered(vec![
+                spinner(Color::Muted),
+                Label::new(format!("Starting {agent_name}…"))
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ]);
+            return (adding_title, body, vec![cancel(ActionStyle::Ghost, cx)]);
+        };
+        if let Some(duplicate) = accounts
+            .duplicate
+            .as_ref()
+            .filter(|duplicate| duplicate.account == id)
+        {
+            let body = div()
+                .debug_selector(|| "add-account-duplicate".into())
+                .child(
+                    Label::new(format!(
+                        "{} is already one of {agent_name}'s accounts here, so nothing was added.",
+                        duplicate.email
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .into_any_element();
+            return ("Account already added".into(), body, vec![done(cx)]);
+        }
+        let session = panel.session(Some(id));
+        let state = session.map(|session| AccountState::of(session.connection.read(cx)));
+        match state {
+            Some(AccountState::LoggedIn) => {
+                let body = self.render_account_added(id, accounts, cx);
+                return ("Account added".into(), body, vec![done(cx)]);
+            }
+            Some(AccountState::Failed) => {
+                let error = session
+                    .and_then(|session| match session.connection.read(cx).status() {
+                        ConnectionStatus::Failed(error) => Some(error.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("Couldn't start {agent_name}").into());
+                let body = centered(vec![
+                    Icon::new(IconName::XCircle)
+                        .size(IconSize::Medium)
+                        .color(Color::Error)
+                        .into_any_element(),
+                    Label::new(format!("Couldn't start {agent_name}")).into_any_element(),
+                    Label::new(error)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                    wrap(
+                        "add-account-retry",
+                        button("add-account-retry", "Try Again", ActionStyle::Outline).on_click(
+                            cx.listener(move |this, _, _, cx| this.restart_account_session(id, cx)),
+                        ),
+                    ),
+                ]);
+                return (adding_title, body, vec![cancel(ActionStyle::Ghost, cx)]);
+            }
+            _ => {}
+        }
+        let login = adding
+            .login
+            .as_ref()
+            .filter(|_| state.is_some_and(|state| state != AccountState::Connecting));
+        let Some(login) = login else {
+            let body = centered(vec![
+                spinner(Color::Muted),
+                Label::new(format!("Starting {agent_name}…"))
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ]);
+            return (adding_title, body, vec![cancel(ActionStyle::Ghost, cx)]);
+        };
+        let step = login.read(cx).dialog_step(cx);
+        let mut body = v_flex();
+        if step == LoginStep::Choosing {
+            body = body.child(
+                div().mb_2p5().child(
+                    Label::new(
+                        "Each account has its own login, sessions and history. Choose how to \
+                         log in.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                ),
+            );
+        }
+        body = body.child(login.clone());
+        let has_others = accounts.listed().iter().any(|&account| account != Some(id));
+        if step == LoginStep::Choosing && has_others {
+            body = body.child(self.render_copy_settings(
+                id,
+                accounts,
+                support,
+                CardPlace::Dialog,
+                window,
+                cx,
+            ));
+        }
+        let back = || {
+            let login = login.clone();
+            wrap(
+                "add-account-back",
+                button("add-account-back", "Back", ActionStyle::Ghost)
+                    .on_click(move |_, _, cx| login.update(cx, |login, cx| login.back(cx))),
+            )
+        };
+        let buttons = match step {
+            LoginStep::Choosing => vec![cancel(ActionStyle::Ghost, cx)],
+            LoginStep::InProgress | LoginStep::Failed => {
+                vec![back(), cancel(ActionStyle::Outline, cx)]
+            }
+            LoginStep::Entering { can_submit } => {
+                let login = login.clone();
+                vec![
+                    back(),
+                    cancel(ActionStyle::Outline, cx),
+                    wrap(
+                        "add-account-log-in",
+                        button("add-account-log-in", "Log In", ActionStyle::Primary)
+                            .disabled(!can_submit)
+                            .on_click(move |_, _, cx| {
+                                login.update(cx, |login, cx| login.submit(cx))
+                            }),
+                    ),
+                ]
+            }
+        };
+        (adding_title, body.into_any_element(), buttons)
+    }
+
+    /// Add Account's result: the account named by its email, its plan and limits, and where
+    /// its settings came from.
+    fn render_account_added(
+        &self,
+        id: AccountId,
+        accounts: &AgentAccounts,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let entry = account_entry(accounts, Some(id));
+        let detail = entry
+            .email
+            .iter()
+            .filter(|&email| *email != entry.name.as_ref())
+            .chain(&entry.plan)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let key = format!("added-{id}");
+        let windows = (!entry.windows.is_empty())
+            .then(|| render_limit_windows(&key, &entry.windows, SystemTime::now(), cx));
+        let copied_from = accounts
+            .account(id)
+            .and_then(|account| match account.settings_from {
+                SettingsSource::Nothing => None,
+                SettingsSource::External => Some(None),
+                SettingsSource::Account(from) => Some(Some(from)),
+            })
+            .map(|from| account_entry(accounts, from).name);
+        let note = match copied_from {
+            Some(from) => {
+                format!("Its settings were copied from {from}. You can rename it from its ⋯ menu.")
+            }
+            None => "You can rename it from its ⋯ menu.".to_string(),
+        };
+        v_flex()
+            .debug_selector(|| "add-account-added".into())
+            .pt_1p5()
+            .gap_3()
+            .child(
+                v_flex()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel_background)
+                    .child(
+                        h_flex()
+                            .px_3()
+                            .py_2p5()
+                            .gap_3()
+                            .child(render_entry_avatar(&entry, px(24.), cx))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_px()
+                                    .child(Label::new(entry.name.clone()).truncate())
+                                    .when(!detail.is_empty(), |column| {
+                                        column.child(
+                                            Label::new(detail)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .truncate(),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .children(windows.map(|windows| {
+                        div()
+                            .px_3()
+                            .py_2p5()
+                            .border_t_1()
+                            .border_color(colors.border_variant)
+                            .child(windows)
+                    })),
+            )
+            .child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
+            .into_any_element()
     }
 
     /// Sends a request about the agent's accounts, to say why if it fails.
@@ -6407,7 +7233,37 @@ struct AgentPanel {
     switching_to_core: HashSet<Option<AccountId>>,
     /// Accounts whose Use Reset is on its way.
     using_limit_reset: HashSet<Option<AccountId>>,
+    /// The account dialog over the page, while it's open.
+    dialog: Option<AccountDialogState>,
     _subscriptions: Vec<Subscription>,
+}
+
+struct AccountDialogState {
+    view: WeakEntity<AccountDialog>,
+    content: DialogContent,
+    _released: Subscription,
+}
+
+/// What an agent's account dialog shows.
+enum DialogContent {
+    /// An account's whole card, `None` being the External account.
+    Account(Option<AccountId>),
+    Adding(AddingAccount),
+}
+
+/// Add Account's dialog, from the request for the account to its result.
+struct AddingAccount {
+    /// The account the server made for the login, once it answers.
+    account: Option<AccountId>,
+    /// The account's login in the dialog, once its session opens.
+    login: Option<Entity<AgentLogin>>,
+}
+
+/// Where an account's card is drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardPlace {
+    Page,
+    Dialog,
 }
 
 impl AgentPanel {
@@ -6423,6 +7279,21 @@ impl AgentPanel {
             AccountChoice::External if listed.contains(&None) => None,
             AccountChoice::Account(id) if listed.contains(&Some(id)) => Some(id),
             _ => accounts.new_thread_account(),
+        }
+    }
+
+    /// Add Account's dialog, while it's open.
+    fn adding(&self) -> Option<&AddingAccount> {
+        match &self.dialog.as_ref()?.content {
+            DialogContent::Adding(adding) => Some(adding),
+            DialogContent::Account(_) => None,
+        }
+    }
+
+    fn adding_mut(&mut self) -> Option<&mut AddingAccount> {
+        match &mut self.dialog.as_mut()?.content {
+            DialogContent::Adding(adding) => Some(adding),
+            DialogContent::Account(_) => None,
         }
     }
 
@@ -6935,12 +7806,9 @@ fn build_account_menu(
         },
     );
     if menu.can_refresh {
-        let read = menu.read_at.map(|read_at| {
-            match format_relative_time(read_at, SystemTime::now()).as_str() {
-                "now" => "read just now".to_string(),
-                ago => format!("read {ago} ago"),
-            }
-        });
+        let read = menu
+            .read_at
+            .map(|read_at| read_ago(read_at, SystemTime::now()));
         context_menu =
             context_menu.custom_entry(
                 move |_, _| {
@@ -7422,6 +8290,33 @@ fn render_row(
         .into_any_element()
 }
 
+/// A setting under an account card's hairline, in the body's size so it doesn't read as a
+/// heading: its name, and its menu at the right. It lines up with the limits, past the avatar.
+fn render_card_setting(title: impl Into<SharedString>, control: AnyElement) -> AnyElement {
+    h_flex()
+        .pl(px(16.) + AVATAR_SIZE + px(12.))
+        .pr_4()
+        .py(px(4.))
+        .gap_6()
+        .justify_between()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Label::new(title.into()).size(LabelSize::Small)),
+        )
+        .child(div().flex_none().child(control))
+        .into_any_element()
+}
+
+/// When an account's limits were read: "read just now", "read 5m ago".
+fn read_ago(read_at: SystemTime, now: SystemTime) -> String {
+    match format_relative_time(read_at, now).as_str() {
+        "now" => "read just now".to_string(),
+        ago => format!("read {ago} ago"),
+    }
+}
+
 /// A row of a page's list, which is laid out on its own.
 struct ContentRow {
     element: AnyElement,
@@ -7610,7 +8505,7 @@ mod tests {
     use std::cell::RefCell;
     use std::time::Duration;
 
-    use agentz_protocol::accounts::{Account, ExtraUsage, LimitPool, StatusRead};
+    use agentz_protocol::accounts::{Account, DuplicateLogin, ExtraUsage, LimitPool, StatusRead};
     use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
@@ -8277,6 +9172,300 @@ mod tests {
         assert!(cx.debug_bounds("agent-session-s-00").is_none());
     }
 
+    /// The settings page under a modal layer like the shell's, which shows its account dialog.
+    struct DialogHost {
+        page: Entity<SettingsPage>,
+        dialog: Option<(Entity<AccountDialog>, Subscription)>,
+        _subscription: Subscription,
+    }
+
+    impl DialogHost {
+        fn new(cx: &mut Context<Self>) -> Self {
+            let page = cx.new(SettingsPage::new);
+            let subscription = cx.subscribe(&page, |this, _, event: &SettingsPageEvent, cx| {
+                if let SettingsPageEvent::OpenDialog(dialog) = event {
+                    let dismissed = cx.subscribe(dialog, |this, _, _: &DismissEvent, cx| {
+                        this.dialog = None;
+                        cx.notify();
+                    });
+                    this.dialog = Some((dialog.clone(), dismissed));
+                    cx.notify();
+                }
+            });
+            Self {
+                page,
+                dialog: None,
+                _subscription: subscription,
+            }
+        }
+    }
+
+    impl Render for DialogHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .relative()
+                .child(self.page.clone())
+                .children(self.dialog.as_ref().map(|(dialog, _)| {
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .occlude()
+                        .child(dialog.clone())
+                }))
+        }
+    }
+
+    fn open_page_with_dialogs(
+        cx: &mut TestAppContext,
+    ) -> (Entity<SettingsPage>, &mut gpui::VisualTestContext) {
+        let (host, cx) = cx.add_window_view(|_, cx| DialogHost::new(cx));
+        let page = host.read_with(cx, |host, _| host.page.clone());
+        (page, cx)
+    }
+
+    /// Add Account is a dialog: how to log in and Copy settings from, the login's progress or
+    /// why it failed, then the account added. An account that's already there is refused, and
+    /// Cancel removes the empty account.
+    #[gpui::test]
+    fn adding_an_account_is_a_dialog_from_login_to_result(cx: &mut TestAppContext) {
+        let hour = Duration::from_secs(3600);
+        let mock = AgentId::new("mock");
+        let mut mock_listing = listing(
+            "mock",
+            "Mock",
+            InstallState::Installed {
+                version: "2.0.0".into(),
+                update_available: false,
+            },
+        );
+        mock_listing.accounts = Some(AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            reads_usage: true,
+            ..AccountSupport::default()
+        });
+        let mut accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    email: Some("alex@hey.com".into()),
+                    windows: vec![limit("5-hour", 38., 2 * hour, 5 * hour)],
+                    ..AccountStatus::default()
+                },
+                read_at: SystemTime::now(),
+            }),
+            ..AgentAccounts::default()
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let next_id = Rc::new(std::cell::Cell::new(3));
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            let requests = requests.clone();
+            let next_id = next_id.clone();
+            let accounts = accounts.clone();
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    match request {
+                        Request::OpenLoginSession { account, .. } => {
+                            Some(Response::LoginSessionOpened(account.map_or(100, |id| id.0)))
+                        }
+                        Request::SubscribeThread(ConnectionId::LoginSession(id)) => {
+                            Some(Response::Thread(login_session(*id == 100)))
+                        }
+                        Request::AddAccount(_) => {
+                            let id = next_id.get();
+                            next_id.set(id + 1);
+                            Some(Response::AccountAdded(AccountId(id)))
+                        }
+                        Request::RemoveAccount { .. } | Request::Authenticate { .. } => {
+                            Some(Response::Ok)
+                        }
+                        _ => None,
+                    }
+                });
+                client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = open_page_with_dialogs(cx);
+        page.update_in(cx, |page, window, cx| {
+            page.show_agent_accounts(MachineId::Local, &mock, false, window, cx)
+        });
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let sent = |request: &Request| requests.borrow().contains(request);
+        let removed = |id: u64| Request::RemoveAccount {
+            agent_id: mock.clone(),
+            account: AccountId(id),
+        };
+        // The server adds the account it was asked for, which then has its login session.
+        let publish = |accounts: &AgentAccounts, cx: &mut gpui::VisualTestContext| {
+            client.update(cx, |client, cx| {
+                client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+            });
+            cx.run_until_parked();
+        };
+        let list =
+            |accounts: &mut AgentAccounts, account: Account, cx: &mut gpui::VisualTestContext| {
+                accounts.last_id = account.id.0;
+                accounts.accounts.push(account);
+                publish(accounts, cx);
+            };
+        let connection = |id: u64, cx: &mut gpui::VisualTestContext| {
+            page.read_with(cx, |page, _| {
+                page.agent_panel()
+                    .and_then(|panel| panel.session(Some(AccountId(id))))
+                    .map(|session| session.connection.clone())
+                    .expect("the account has its login session")
+            })
+        };
+
+        // One account is its card, with no lines.
+        assert!(cx.debug_bounds("account-card-external").is_some());
+        assert!(cx.debug_bounds("account-lines").is_none());
+        click("account-add", cx);
+        assert!(sent(&Request::AddAccount(mock.clone())));
+        assert!(cx.debug_bounds("add-account-dialog").is_some());
+        let mut new_account = account(3, None, None);
+        new_account.settings_from = SettingsSource::External;
+        list(&mut accounts, new_account, cx);
+
+        // 1: how to log in, and Copy settings from. The account isn't on the page yet.
+        assert!(cx.debug_bounds("add-account-dialog").is_some());
+        assert!(cx.debug_bounds("copy-settings-3").is_some());
+        assert!(cx.debug_bounds("add-account-back").is_none());
+        assert!(cx.debug_bounds("account-lines").is_none());
+        assert!(cx.debug_bounds("account-card-3").is_none());
+        click("login-method-login", cx);
+        assert!(requests.borrow().iter().any(|request| matches!(
+            request,
+            Request::Authenticate {
+                connection: ConnectionId::LoginSession(3),
+                ..
+            }
+        )));
+
+        // 2: its progress, with Back; then why it failed, with Try Again.
+        let thread = connection(3, cx);
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| state.authenticating = Some(acp::AuthMethodId::new("login")),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("copy-settings-3").is_none());
+        assert!(cx.debug_bounds("add-account-back").is_some());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.authenticating = None;
+                    state.auth_error = Some("The code expired.".into());
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("login-try-again").is_some());
+        click("add-account-back", cx);
+        assert!(cx.debug_bounds("login-method-login").is_some());
+        assert!(cx.debug_bounds("login-try-again").is_none());
+
+        // 3: logged in, the account added, with its limits, and Done.
+        click("login-method-login", cx);
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.auth_error = None;
+                    state.status = ConnectionStatus::Ready;
+                    state.logged_in = Some(true);
+                },
+                cx,
+            )
+        });
+        accounts.accounts[0] = Account {
+            settings_from: SettingsSource::External,
+            ..account(
+                3,
+                None,
+                Some(AccountStatus {
+                    email: Some("work@acme.co".into()),
+                    plan: Some("Pro".into()),
+                    windows: vec![limit("5-hour", 10., 2 * hour, 5 * hour)],
+                    ..AccountStatus::default()
+                }),
+            )
+        };
+        publish(&accounts, cx);
+        assert!(cx.debug_bounds("add-account-added").is_some());
+        assert!(cx.debug_bounds("limit-added-3-window-0").is_some());
+        click("add-account-done", cx);
+        assert!(cx.debug_bounds("add-account-dialog").is_none());
+        assert!(!sent(&removed(3)));
+        // It sits in the list, which is lines now.
+        assert!(cx.debug_bounds("account-line-external").is_some());
+        assert!(cx.debug_bounds("account-line-3").is_some());
+
+        // A login that's an account already there adds nothing, and says so.
+        click("account-add", cx);
+        list(&mut accounts, account(4, None, None), cx);
+        assert!(cx.debug_bounds("login-method-login").is_some());
+        accounts
+            .accounts
+            .retain(|account| account.id != AccountId(4));
+        accounts.duplicate = Some(DuplicateLogin {
+            account: AccountId(4),
+            email: "work@acme.co".into(),
+        });
+        publish(&accounts, cx);
+        assert!(cx.debug_bounds("add-account-duplicate").is_some());
+        click("add-account-done", cx);
+        assert!(cx.debug_bounds("add-account-dialog").is_none());
+        assert!(!sent(&removed(4)));
+
+        // Cancel, or closing the dialog, removes the account added for it.
+        click("account-add", cx);
+        list(&mut accounts, account(5, None, None), cx);
+        click("add-account-cancel", cx);
+        assert!(cx.debug_bounds("add-account-dialog").is_none());
+        assert!(sent(&removed(5)));
+        click("account-add", cx);
+        list(&mut accounts, account(6, None, None), cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("add-account-dialog").is_none());
+        assert!(sent(&removed(6)));
+    }
+
     fn limit(label: &str, used_percent: f64, resets_in: Duration, length: Duration) -> LimitWindow {
         LimitWindow {
             label: label.into(),
@@ -8329,7 +9518,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn an_agents_accounts_are_cards_with_their_limits(cx: &mut TestAppContext) {
+    fn several_accounts_are_lines_whose_cards_open_in_a_dialog(cx: &mut TestAppContext) {
         let hour = Duration::from_secs(3600);
         let mock = AgentId::new("mock");
         let mut mock_listing = listing(
@@ -8445,7 +9634,7 @@ mod tests {
             crate::machines::init_for_test(vec![client.clone()], cx);
             client
         });
-        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let (page, cx) = open_page_with_dialogs(cx);
         let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
         cx.update(|_, cx| {
             let confirms = confirms.clone();
@@ -8458,33 +9647,54 @@ mod tests {
         });
         page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
         cx.run_until_parked();
-        let row = cx
-            .debug_bounds("agent-row-mock")
-            .expect("the agent is listed");
-        cx.simulate_click(row.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        click("agent-row-mock", cx);
         let sent = |request: &Request| requests.borrow().contains(request);
 
-        // The External account first, then agentZ's in the order they were added; the one new
-        // threads take is tagged.
+        // Several accounts are lines: the External account first, then agentZ's in the order
+        // they were added, each with a cell per window. Their cards open in a dialog.
         let external = cx
-            .debug_bounds("account-card-external")
+            .debug_bounds("account-line-external")
             .expect("the External account is listed");
         let work = cx
-            .debug_bounds("account-card-1")
+            .debug_bounds("account-line-1")
             .expect("an agentZ account is listed");
         let new = cx
-            .debug_bounds("account-card-2")
+            .debug_bounds("account-line-2")
             .expect("a new account is listed");
         assert!(external.top() < work.top() && work.top() < new.top());
-        assert!(cx.debug_bounds("account-card").is_none());
+        assert!(cx.debug_bounds("account-card-1").is_none());
+        assert!(cx.debug_bounds("limit-line-1-bar-0").is_some());
+        assert!(cx.debug_bounds("limit-line-1-bar-1").is_some());
+        assert!(cx.debug_bounds("limit-line-external-bar-1").is_none());
+        assert!(cx.debug_bounds("limit-line-2-bar-0").is_none());
+        assert!(cx.debug_bounds("account-dialog").is_none());
+
+        click("account-line-external", cx);
+        assert!(cx.debug_bounds("account-dialog").is_some());
+        assert!(cx.debug_bounds("account-card-external").is_some());
         assert!(cx.debug_bounds("account-tag-outside").is_some());
-        assert!(cx.debug_bounds("account-tag-default-1").is_some());
         assert!(cx.debug_bounds("account-tag-default-external").is_none());
+        // The head says when the limits were read, before the ⋯ menu and ×.
+        let read = cx
+            .debug_bounds("account-read-external")
+            .expect("the read's time is shown");
+        let menu = cx
+            .debug_bounds("account-menu-external")
+            .expect("the account has a menu");
+        let close = cx
+            .debug_bounds("account-dialog-close")
+            .expect("the dialog has ×");
+        assert!(read.right() <= menu.left() && menu.right() <= close.left());
 
         // A row per window, with a line where even spending would be: 2 hours of 5 are left.
-        assert!(cx.debug_bounds("limit-1-window-0").is_some());
-        assert!(cx.debug_bounds("limit-1-window-1").is_some());
+        assert!(cx.debug_bounds("limit-external-window-0").is_some());
         assert!(cx.debug_bounds("limit-external-window-1").is_none());
         let bar = cx
             .debug_bounds("limit-external-bar-0")
@@ -8500,12 +9710,15 @@ mod tests {
             .debug_bounds("limit-tabs-external")
             .expect("the External account's pools are tabs");
         assert!(tabs.bottom() <= bar.top());
-        assert!(cx.debug_bounds("limit-tabs-1").is_none());
         assert!(cx.debug_bounds("limit-external-1-window-1").is_none());
         cx.simulate_click(tabs.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("limit-external-1-window-1").is_some());
         assert!(cx.debug_bounds("limit-external-window-0").is_none());
+        // The dialog is centered, so it moves as the tab changes its height.
+        let tabs = cx
+            .debug_bounds("limit-tabs-external")
+            .expect("the tabs are still there");
         cx.simulate_click(
             gpui::point(tabs.right() - px(4.), tabs.center().y),
             gpui::Modifiers::none(),
@@ -8515,26 +9728,29 @@ mod tests {
         assert!(cx.debug_bounds("limit-external-1-window-1").is_none());
 
         // Droid's own "When a limit is reached" saves Switch to Droid Core.
-        assert!(cx.debug_bounds("overage-1").is_none());
         let overage = cx
             .debug_bounds("overage-external")
             .expect("the External account has Droid's choice");
+        assert!(cx.debug_bounds("at-limit-external").is_some());
         cx.simulate_click(overage.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("overage-external-extra-usage").is_some());
-        let droid_core = cx
-            .debug_bounds("overage-external-droid-core")
-            .expect("Switch to Droid Core is offered");
-        cx.simulate_click(droid_core.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        click("overage-external-droid-core", cx);
         assert!(sent(&Request::SwitchToDroidCore {
             agent_id: mock.clone(),
             account: None,
         }));
+        assert!(cx.debug_bounds("limit-resets-external").is_none());
+        assert!(cx.debug_bounds("extra-usage-external").is_none());
+        click("account-dialog-close", cx);
+        assert!(cx.debug_bounds("account-dialog").is_none());
 
         // An account with limit resets has a line for them under its limits, whose Use Reset
         // asks first.
-        assert!(cx.debug_bounds("limit-resets-external").is_none());
+        click("account-line-1", cx);
+        assert!(cx.debug_bounds("account-tag-default-1").is_some());
+        assert!(cx.debug_bounds("overage-1").is_none());
+        assert!(cx.debug_bounds("limit-tabs-1").is_none());
         let resets = cx
             .debug_bounds("limit-resets-1")
             .expect("Work's resets are under its limits");
@@ -8548,12 +9764,7 @@ mod tests {
             .expect("Work's credits are under its limits");
         assert!(extra_usage.top() >= resets.bottom());
         assert!(cx.debug_bounds("extra-usage-manage-1").is_some());
-        assert!(cx.debug_bounds("extra-usage-external").is_none());
-        let use_reset = cx
-            .debug_bounds("use-limit-reset-1")
-            .expect("a reset can be used");
-        cx.simulate_click(use_reset.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        click("use-limit-reset-1", cx);
         assert!(
             !requests
                 .borrow()
@@ -8577,56 +9788,9 @@ mod tests {
             account: Some(AccountId(1)),
         }));
 
-        // An account that hasn't logged in yet is the New account card, which Cancel removes
-        // without asking.
-        assert!(cx.debug_bounds("account-menu-1").is_some());
-        assert!(cx.debug_bounds("account-menu-2").is_none());
-        assert!(cx.debug_bounds("limit-2-window-0").is_none());
-        let cancel = cx
-            .debug_bounds("account-cancel-2")
-            .expect("a new account can be cancelled");
-        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(sent(&Request::RemoveAccount {
-            agent_id: mock.clone(),
-            account: AccountId(2),
-        }));
-        assert!(confirms.borrow().is_empty());
-
-        // Add Account asks the server, and the account it adds gets a login session and a card.
-        let add = cx
-            .debug_bounds("account-add")
-            .expect("accounts can be added");
-        cx.simulate_click(add.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(sent(&Request::AddAccount(mock.clone())));
-        accounts
-            .accounts
-            .retain(|account| account.id != AccountId(2));
-        accounts.accounts.push(account(3, None, None));
-        accounts.last_id = 3;
-        client.update(cx, |client, cx| {
-            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
-        });
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("account-card-2").is_none());
-        assert!(cx.debug_bounds("account-cancel-3").is_some());
-        assert!(sent(&Request::OpenLoginSession {
-            agent_id: mock.clone(),
-            account: Some(AccountId(3)),
-        }));
-
         // The ⋯ menu refreshes the usage.
-        let menu = cx
-            .debug_bounds("account-menu-1")
-            .expect("the account has a menu");
-        cx.simulate_click(menu.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        let refresh = cx
-            .debug_bounds("account-menu-refresh")
-            .expect("the menu has Refresh Usage");
-        cx.simulate_click(refresh.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        click("account-menu-1", cx);
+        click("account-menu-refresh", cx);
         assert!(sent(&Request::RefreshUsage {
             agent_id: mock.clone(),
             account: Some(AccountId(1)),
@@ -8637,19 +9801,11 @@ mod tests {
         let at_limit = cx
             .debug_bounds("at-limit-1")
             .expect("the account has the choice");
-        let limits = cx
-            .debug_bounds("limit-1-window-1")
-            .expect("the account has its limits");
-        assert!(at_limit.top() > limits.bottom());
-        assert!(cx.debug_bounds("at-limit-external").is_some());
+        assert!(at_limit.top() > extra_usage.bottom());
         cx.simulate_click(at_limit.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("at-limit-1-Stop").is_some());
-        let continue_at_reset = cx
-            .debug_bounds("at-limit-1-ContinueAtReset")
-            .expect("Continue at reset is offered");
-        cx.simulate_click(continue_at_reset.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        click("at-limit-1-ContinueAtReset", cx);
         assert!(sent(&Request::UpdateAccount {
             agent_id: mock.clone(),
             account: Some(AccountId(1)),
@@ -8699,6 +9855,32 @@ mod tests {
             page.agent_panel()
                 .is_some_and(|panel| panel.renaming.is_none())
         }));
+        // Focus is back in the dialog, which Escape closes.
+        assert!(cx.debug_bounds("account-dialog").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("account-dialog").is_none());
+
+        // An account that hasn't logged in yet is the New account card, which Cancel removes
+        // without asking.
+        click("account-line-2", cx);
+        assert!(cx.debug_bounds("account-menu-2").is_none());
+        assert!(cx.debug_bounds("limit-2-window-0").is_none());
+        click("account-cancel-2", cx);
+        assert!(sent(&Request::RemoveAccount {
+            agent_id: mock.clone(),
+            account: AccountId(2),
+        }));
+        assert!(confirms.borrow().is_empty());
+        accounts
+            .accounts
+            .retain(|account| account.id != AccountId(2));
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("account-dialog").is_none());
+        assert!(cx.debug_bounds("account-line-2").is_none());
 
         // Removing an account asks first.
         page.update(cx, |page, cx| {
@@ -8714,10 +9896,10 @@ mod tests {
         }));
     }
 
-    /// Scrolling lays the page out every frame, so laying out every account's card made a
+    /// Scrolling lays the page out every frame, so laying out every account's line made a
     /// scroll lag.
     #[gpui::test]
-    fn an_agents_page_lays_out_only_the_account_cards_in_view(cx: &mut TestAppContext) {
+    fn an_agents_page_lays_out_only_the_account_lines_in_view(cx: &mut TestAppContext) {
         let mut mock_listing = listing(
             "mock",
             "Mock",
@@ -8735,8 +9917,8 @@ mod tests {
             loads_skills: false,
         });
         let accounts = AgentAccounts {
-            accounts: (1..=40).map(|id| account(id, None, None)).collect(),
-            last_id: 40,
+            accounts: (1..=100).map(|id| account(id, None, None)).collect(),
+            last_id: 100,
             ..AgentAccounts::default()
         };
         cx.update(|cx| {
@@ -8780,9 +9962,9 @@ mod tests {
         cx.run_until_parked();
 
         let first = cx
-            .debug_bounds("account-card-1")
+            .debug_bounds("account-line-1")
             .expect("the first account is in view");
-        assert!(cx.debug_bounds("account-card-40").is_none());
+        assert!(cx.debug_bounds("account-line-100").is_none());
 
         cx.simulate_event(gpui::ScrollWheelEvent {
             position: first.center(),
@@ -8790,8 +9972,8 @@ mod tests {
             ..Default::default()
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("account-card-40").is_some());
-        assert!(cx.debug_bounds("account-card-1").is_none());
+        assert!(cx.debug_bounds("account-line-100").is_some());
+        assert!(cx.debug_bounds("account-line-1").is_none());
     }
 
     /// Settings › Usage has a table per agent: a column per window, "All N accounts" with what's
@@ -9047,7 +10229,7 @@ mod tests {
             crate::machines::init_for_test(vec![client.clone()], cx);
             client
         });
-        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let (page, cx) = open_page_with_dialogs(cx);
         page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
         cx.run_until_parked();
         let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
@@ -9079,10 +10261,13 @@ mod tests {
         };
         click("agent-row-mock", cx);
 
-        // Only the account the agent hasn't logged in yet offers Copy settings from: the
-        // default account first, then the others, then Nothing.
+        // Only the account the agent hasn't logged in yet offers Copy settings from, in its
+        // dialog: the default account first, then the others, then Nothing.
         assert!(cx.debug_bounds("account-picker").is_none());
+        click("account-line-1", cx);
         assert!(cx.debug_bounds("copy-settings-1").is_none());
+        click("account-dialog-close", cx);
+        click("account-line-2", cx);
         click("copy-settings-2", cx);
         let from_work = cx
             .debug_bounds("copy-settings-from-1")
@@ -9108,6 +10293,9 @@ mod tests {
         }));
         // It starts again with the variables copied.
         assert_eq!(count(&opened), 2);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("account-dialog").is_none());
 
         // Defaults are the account for new threads' at first, then the picked one's.
         click("agent-tab-defaults", cx);

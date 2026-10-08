@@ -40,6 +40,7 @@ impl Server {
                 }
                 // A copy that fails leaves the account with nothing copied, to pick again.
                 self.copy_account_settings(&agent_id, id, source).log_err();
+                self.added_accounts.insert((agent_id, id));
                 Ok(Response::AccountAdded(id))
             }
             Request::CopyAccountSettings {
@@ -51,24 +52,7 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::RemoveAccount { agent_id, account } => {
-                self.accounts
-                    .get(&agent_id)
-                    .account(account)
-                    .context("there's no such account")?;
-                // They write into its folder.
-                let stopped = self.stop_account_agents(&agent_id, account);
-                // The folder first: if it can't go, the account stays to try again.
-                accounts::remove_home(&self.data_dir, &agent_id, account)?;
-                self.accounts
-                    .update(&agent_id, |accounts| accounts.remove(account))?;
-                // Threads that are open start again, to say why they can't go on.
-                let watched = self.watched_threads();
-                for thread_id in stopped {
-                    if watched.contains(&thread_id) {
-                        self.update_thread(ConnectionId::Thread(thread_id), |_| {})
-                            .log_err();
-                    }
-                }
+                self.remove_account(&agent_id, account)?;
                 Ok(Response::Ok)
             }
             Request::UpdateAccount {
@@ -95,6 +79,30 @@ impl Server {
             }
             request => Err(anyhow!("not an account request: {request:?}")),
         }
+    }
+
+    /// Removes the account with its folder, stopping what runs on it.
+    pub(super) fn remove_account(&mut self, agent_id: &AgentId, account: AccountId) -> Result<()> {
+        self.accounts
+            .get(agent_id)
+            .account(account)
+            .context("there's no such account")?;
+        // They write into its folder.
+        let stopped = self.stop_account_agents(agent_id, account);
+        // The folder first: if it can't go, the account stays to try again.
+        accounts::remove_home(&self.data_dir, agent_id, account)?;
+        self.accounts
+            .update(agent_id, |accounts| accounts.remove(account))?;
+        self.added_accounts.remove(&(agent_id.clone(), account));
+        // Threads that are open start again, to say why they can't go on.
+        let watched = self.watched_threads();
+        for thread_id in stopped {
+            if watched.contains(&thread_id) {
+                self.update_thread(ConnectionId::Thread(thread_id), |_| {})
+                    .log_err();
+            }
+        }
+        Ok(())
     }
 
     /// How the agent keeps an account in a folder of agentZ's: a custom agent's from

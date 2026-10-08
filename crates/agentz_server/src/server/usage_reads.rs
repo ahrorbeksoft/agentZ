@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use agentz_protocol::Response;
-use agentz_protocol::accounts::{AccountId, AccountStatus, OveragePreference, StatusRead};
+use agentz_protocol::accounts::{
+    AccountId, AccountStatus, DuplicateLogin, OveragePreference, StatusRead,
+};
 use agentz_protocol::agents::{AgentId, InstallState};
 use anyhow::{Context as _, Result, anyhow};
 use util::ResultExt as _;
@@ -278,8 +280,31 @@ impl Server {
             .with_context(|| format!("agentZ can't read {}'s usage", self.agent_name(agent_id)))
     }
 
-    /// Keeps what a read found. A logged-out account keeps what it had.
+    /// Keeps what a read found. A logged-out account keeps what it had. The first read to find
+    /// an account Add Account made logged in, with another listed account's login, is that
+    /// account logged in again: the new one is removed, and named as a duplicate for Add
+    /// Account to say so.
     fn keep_read(&mut self, agent_id: &AgentId, account: Option<AccountId>, read: Read) {
+        if let Some(id) = account
+            && read.logged_in != Some(false)
+            && self.added_accounts.remove(&(agent_id.clone(), id))
+            && let Some(email) = read.status.email.clone()
+            && self
+                .accounts
+                .get(agent_id)
+                .listed_with_login(&read.status, account)
+                .is_some()
+        {
+            match self.remove_account(agent_id, id) {
+                Ok(()) => {
+                    self.accounts.update(agent_id, |accounts| {
+                        accounts.duplicate = Some(DuplicateLogin { account: id, email });
+                    });
+                    return;
+                }
+                Err(error) => log::error!("couldn't remove a duplicate account: {error:#}"),
+            }
+        }
         self.accounts.update(agent_id, |accounts| {
             if let Some(logged_in) = read.logged_in {
                 accounts.set_logged_in(account, logged_in);

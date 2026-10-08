@@ -3,6 +3,7 @@
 //! its form in place. In a thread, the methods are full-width buttons in the middle of it. A
 //! login in progress shows what's left to do: finishing in the browser, or entering a one-time
 //! code on the page the agent gave. Terminal methods run in a terminal on the agent's machine.
+//! In Add Account's dialog, the methods are a list, and the one picked shows its progress there.
 
 use std::time::Duration;
 
@@ -54,6 +55,21 @@ pub enum LoginLayout {
     Rows,
     /// A panel in the middle of a thread.
     Centered,
+    /// Add Account's dialog: the methods as a list, then the picked one's progress, with the
+    /// dialog's own buttons for Back and Cancel.
+    Dialog,
+}
+
+/// Where a login in Add Account's dialog stands, for the dialog's buttons.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginStep {
+    Choosing,
+    /// Typing in an API key or a gateway, which Log In sends.
+    Entering {
+        can_submit: bool,
+    },
+    InProgress,
+    Failed,
 }
 
 /// What was just copied, to say so on its button for a moment.
@@ -72,6 +88,13 @@ pub struct AgentLogin {
     login_terminal: Option<(acp::AuthMethodId, Entity<TerminalView>)>,
     /// The API-key or gateway method whose details are being typed in.
     entering: Option<acp::AuthMethod>,
+    /// The method last picked, which the dialog shows the progress of until Back, and tries
+    /// again after it fails.
+    chosen: Option<acp::AuthMethod>,
+    /// Whether the picked method's login was seen under way, and the failure there was as it
+    /// was picked: until either changes, that failure is an earlier login's.
+    chosen_started: bool,
+    failure_when_chosen: Option<SharedString>,
     api_key: Entity<TextInput>,
     base_url: Entity<TextInput>,
     headers: Vec<HeaderRow>,
@@ -124,6 +147,9 @@ impl AgentLogin {
                 if thread.read(cx).is_authenticating() && this.entering.is_some() {
                     this.stop_entering(cx);
                 }
+                if thread.read(cx).is_authenticating() && this.chosen.is_some() {
+                    this.chosen_started = true;
+                }
                 // The login's page and its forwarded ports are done with once it's over.
                 let thread = thread.read(cx);
                 if thread.login_page().is_none() {
@@ -151,6 +177,9 @@ impl AgentLogin {
             agent_id,
             login_terminal: None,
             entering: None,
+            chosen: None,
+            chosen_started: false,
+            failure_when_chosen: None,
             api_key,
             base_url,
             headers: Vec::new(),
@@ -194,6 +223,9 @@ impl AgentLogin {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.failure_when_chosen = self.failure(cx);
+        self.chosen = Some(method.clone());
+        self.chosen_started = false;
         if logs_in_through_terminal(&method) {
             self.stop_entering(cx);
             self.start_terminal_login(method.id().clone(), window, cx);
@@ -229,7 +261,7 @@ impl AgentLogin {
         }
     }
 
-    fn submit(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn submit(&mut self, cx: &mut Context<Self>) {
         let Some(method) = self.entering.clone() else {
             return;
         };
@@ -328,6 +360,7 @@ impl AgentLogin {
         };
         window.focus(&view.focus_handle(cx), cx);
         self.login_terminal = Some((method_id, view));
+        self.chosen_started = true;
         cx.notify();
     }
 
@@ -819,6 +852,8 @@ impl AgentLogin {
                 .on_click(cx.listener(move |this, _, _, cx| this.open(&wait, cx)))
         };
         let panel = v_flex().items_center().gap_3().text_center();
+        // The dialog has its own Cancel.
+        let in_dialog = self.layout == LoginLayout::Dialog;
 
         if let Some(code) = wait.code.clone() {
             let copy_code = {
@@ -871,17 +906,23 @@ impl AgentLogin {
                         .gap_1p5()
                         .child(spinner(Color::Muted))
                         .child(
-                            Label::new("Waiting for you to finish ·")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
+                            Label::new(if in_dialog {
+                                "Waiting for you to finish"
+                            } else {
+                                "Waiting for you to finish ·"
+                            })
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                         )
-                        .child(
-                            Button::new("login-cancel", "Cancel")
-                                .style(ButtonStyle::Transparent)
-                                .label_size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
-                        ),
+                        .when(!in_dialog, |row| {
+                            row.child(
+                                Button::new("login-cancel", "Cancel")
+                                    .style(ButtonStyle::Transparent)
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                            )
+                        }),
                 )
                 .into_any_element();
         }
@@ -890,7 +931,7 @@ impl AgentLogin {
             return panel
                 .child(spinner(Color::Accent))
                 .child(Label::new(format!("Logging in to {agent_name}…")))
-                .child(cancel("Cancel", cx))
+                .when(!in_dialog, |panel| panel.child(cancel("Cancel", cx)))
                 .into_any_element();
         }
 
@@ -945,6 +986,8 @@ impl AgentLogin {
                     ActionStyle::Primary,
                     cx,
                 )
+            } else if in_dialog {
+                open_button("Open the Page Again".to_string(), ActionStyle::Outline, cx)
             } else {
                 open_button("Open Again".to_string(), ActionStyle::Outline, cx)
             }
@@ -965,9 +1008,180 @@ impl AgentLogin {
                     .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
             }))
             .when(copy_link.is_some() || open.is_some(), |panel| {
-                panel.child(h_flex().mt_1().gap_2().children(copy_link).children(open))
+                let buttons = h_flex().mt_1().gap_2();
+                panel.child(if in_dialog {
+                    buttons.children(open).children(copy_link)
+                } else {
+                    buttons.children(copy_link).children(open)
+                })
             })
-            .child(cancel("Cancel", cx))
+            .when(!in_dialog, |panel| panel.child(cancel("Cancel", cx)))
+            .into_any_element()
+    }
+
+    /// Where the dialog's login stands.
+    pub(crate) fn dialog_step(&self, cx: &App) -> LoginStep {
+        if self.thread.read(cx).is_authenticating() {
+            return LoginStep::InProgress;
+        }
+        if self.entering.is_some() {
+            return LoginStep::Entering {
+                can_submit: self.can_submit(cx),
+            };
+        }
+        if self.chosen.is_none() {
+            return LoginStep::Choosing;
+        }
+        if self.chosen_failure(cx).is_some() {
+            LoginStep::Failed
+        } else {
+            LoginStep::InProgress
+        }
+    }
+
+    /// Why the picked method didn't log in, once it's tried.
+    fn chosen_failure(&self, cx: &App) -> Option<SharedString> {
+        self.chosen.as_ref()?;
+        let failure = self.failure(cx)?;
+        (self.chosen_started || self.failure_when_chosen.as_ref() != Some(&failure))
+            .then_some(failure)
+    }
+
+    /// Why the last login didn't work: what the agent said, or the terminal login's error.
+    fn failure(&self, cx: &App) -> Option<SharedString> {
+        if let Some((_, view)) = &self.login_terminal
+            && let Some(error) = view.read(cx).terminal().read(cx).error()
+        {
+            return Some(error.clone());
+        }
+        self.thread.read(cx).auth_error().cloned()
+    }
+
+    /// The dialog's Back: the login in progress stops, and the methods show again.
+    pub(crate) fn back(&mut self, cx: &mut Context<Self>) {
+        if self.thread.read(cx).is_authenticating() {
+            self.cancel_login(cx);
+        }
+        self.stop_entering(cx);
+        self.chosen = None;
+        self.login_terminal = None;
+        cx.notify();
+    }
+
+    /// The dialog's body: the methods, or the picked one's form, terminal, progress or failure.
+    fn render_dialog(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(method) = self.thread.read(cx).authenticating().cloned() {
+            return div()
+                .py_4()
+                .child(self.render_in_progress(&method, cx))
+                .into_any_element();
+        }
+        if let Some(method) = self.entering.clone() {
+            // Escape goes on to the dialog, which closes.
+            return v_flex()
+                .key_context(KEY_CONTEXT)
+                .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.submit(cx)))
+                .gap_4()
+                .child(render_method_heading(
+                    &method,
+                    self.thread.read(cx).agent_name(),
+                    cx,
+                ))
+                .child(self.render_entry_fields(&method, window, cx))
+                .into_any_element();
+        }
+        if let Some(terminal) = self.running_terminal_login(cx).map(|(_, view)| view) {
+            return self.render_terminal(terminal, cx);
+        }
+        let Some(method) = self.chosen.clone() else {
+            return self.render_method_list(window, cx);
+        };
+        if let Some(error) = self.chosen_failure(cx) {
+            return v_flex()
+                .py_4()
+                .items_center()
+                .gap_3()
+                .text_center()
+                .child(
+                    Icon::new(IconName::XCircle)
+                        .size(IconSize::Medium)
+                        .color(Color::Error),
+                )
+                .child(Label::new("Couldn't log in"))
+                .child(
+                    div()
+                        .max_w(px(380.))
+                        .child(Label::new(error).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .child(div().debug_selector(|| "login-try-again".into()).child(
+                    ActionButton::new("login-try-again", "Try Again").on_click(cx.listener(
+                        move |this, _, window, cx| this.choose(method.clone(), window, cx),
+                    )),
+                ))
+                .into_any_element();
+        }
+        // Picked, until the agent says it's logging in.
+        let agent_name = self.thread.read(cx).agent_name().clone();
+        v_flex()
+            .py_4()
+            .items_center()
+            .gap_3()
+            .child(spinner(Color::Accent))
+            .child(Label::new(format!("Logging in to {agent_name}…")))
+            .into_any_element()
+    }
+
+    /// The dialog's first step: each method a row to pick, with what the agent said about
+    /// logging in above them.
+    fn render_method_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let thread = self.thread.read(cx);
+        let agent_name = thread.agent_name().clone();
+        let methods = thread.auth_methods().to_vec();
+        v_flex()
+            .gap_0p5()
+            .children(self.render_description(window, cx))
+            .children(methods.into_iter().map(|method| {
+                let id = method.id().0.to_string();
+                let description = method_description(&method, &agent_name);
+                let selector = format!("login-method-{id}");
+                h_flex()
+                    .id(SharedString::from(format!("login-method-{id}")))
+                    .debug_selector(move || selector)
+                    .px_2p5()
+                    .py(px(9.))
+                    .gap_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(colors.element_hover))
+                    .child(icon_tile(
+                        Icon::new(method_icon(&method))
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        px(24.),
+                        cx,
+                    ))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_px()
+                            .child(Label::new(method.name().to_string()))
+                            .children(description.map(|description| {
+                                Label::new(description)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                            })),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose(method.clone(), window, cx)
+                    }))
+            }))
             .into_any_element()
     }
 
@@ -1211,6 +1425,29 @@ pub(crate) fn login_elicitation(thread: &ThreadView) -> Option<&Elicitation> {
     })
 }
 
+/// A method's icon, name and description, over its form.
+fn render_method_heading(method: &acp::AuthMethod, agent_name: &SharedString, cx: &App) -> Div {
+    h_flex()
+        .gap_3()
+        .child(icon_tile(
+            Icon::new(method_icon(method)).color(Color::Muted),
+            px(28.),
+            cx,
+        ))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(Label::new(method.name().to_string()))
+                .children(method_description(method, agent_name).map(|description| {
+                    Label::new(description)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                })),
+        )
+}
+
 /// A method's icon by how it logs in: a browser, a key, a gateway, or a terminal.
 fn method_icon(method: &acp::AuthMethod) -> IconName {
     if logs_in_through_terminal(method) {
@@ -1237,6 +1474,7 @@ impl Render for AgentLogin {
         let content = match self.layout {
             LoginLayout::Rows => self.render_rows(window, cx),
             LoginLayout::Centered => self.render_centered(window, cx),
+            LoginLayout::Dialog => self.render_dialog(window, cx),
         };
         div().w_full().text_ui(cx).child(content)
     }

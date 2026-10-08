@@ -293,8 +293,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   combining repositories), Appearance (Zed's theme modes), Notifications (sounds and system
   notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, and a page
   per project (below). As in Zed's settings, a page is a `list` of its header and sections
-  (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards are rows of
-  their own: a frame lays out only the rows in view, each on its own. Laid out whole, a page of
+  (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines
+  are rows of their own: a frame lays out only the rows in view, each on its own. Laid out whole, a page of
   nested flex columns took taffy a measure of each label twice per column around it, and an
   agent with seven accounts scrolled at 20 to 30 fps. The rows out of view are measured again
   on each frame that isn't a scroll, since anything else may have changed their height.
@@ -318,11 +318,21 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   tabs (Threads is described under Agent threads).
   Account is a card: the login methods while logged out, or the account the agent reported
   with Change Account and Log Out (both described under Agent threads). For an agent that can
-  have more accounts (its listing's `accounts`), Account lists a card per account instead,
-  the External one first, tagged "Outside agentZ": the avatar in the account's color, its name
-  (Rename's, else its email), "Default" on the one new threads take, its plan, its limit rows
-  (see Limit rows below), and a ⋯ menu (Rename in place, Use for New Threads, Color, Refresh
-  Usage, Open Usage Page, Show in Finder, Log Out, Remove Account).
+  have more accounts (its listing's `accounts`), Account shows its one account as a card
+  (usage round topic 4): the avatar in the account's color, its name (Rename's, else its
+  email), "Outside agentZ" on the External one, its plan, when its limits were read
+  ("read 2m ago") before a ⋯ menu (Rename in place, Use for New Threads, Color, Refresh Usage,
+  Open Usage Page, Show in Finder, Log Out, Remove Account), its limit rows (see Limit rows
+  below), and under a hairline its settings as small rows with their menus at the right
+  (`render_card_setting`). With several accounts (topic 5), they're lines instead, the
+  External one first (`SettingsPage::render_account_lines`, each line a row of the page's
+  list, drawn as one table): the avatar, name, tags ("Default" on the one new threads take),
+  email and plan, a cell per window as on the Usage page, and a chevron. A line opens an
+  `AccountDialog` in the shell's modal layer with the account's whole card
+  (`CardPlace::Dialog`, 600 px) and ×; the settings page keeps what the dialog shows
+  (`AgentPanel::dialog`) and draws it, and the dialog's release tells the page it closed. A
+  confirmation it asks for (Remove Account…, Use Reset) shows in its place and gives it back
+  (`Shell::dismiss_modal`). The dialog closes with its account, or once one account is left.
   An account with pools of limits (`AccountStatus::pool`, `other_pools`: Droid's Standard and
   Droid Core) has Zed's `ToggleButtonGroup` over its bars, a tab per pool as in Droid's
   `/limits`, and Extra usage with its balance when the login can change Droid's choice; the
@@ -330,7 +340,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   reached" (`SettingsPage::render_overage`, `Overage`, accounts topic 8), saved on Factory's
   server: Switch to Droid Core (`Request::SwitchToDroidCore`) or Use extra usage, which opens
   Factory's page (`AccountSupport::extra_usage_page`), as Droid's own does, since Droid never
-  saves it; read-only with "Set by your organization." when the login can't change it.
+  saves it; read-only ("…, set by your organization") when the login can't change it.
   agentZ's own Stop or Continue at reset is then titled "When <agent> stops at a limit".
   An account with limit resets (`AccountStatus::limit_resets`, Codex's; t3code's
   `ResetCredits`, accounts topic 9) has a line under its bars, "1 limit reset available ·
@@ -341,9 +351,25 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   of $500.00 left this month" (`usage_limits::render_extra_usage`), whose Manage ↗ opens the
   description's usage page. agentZ never turns paid usage on itself.
   Each account has its own login session (`OpenLoginSession` with the account) while the page
-  is open, and its login rows while logged out. Add Account makes a "New account" card that
-  Cancel removes, with "Copy settings from" (the other accounts, the default one first, or
-  Nothing) while more than one is listed. With more than one account, the Defaults,
+  is open, and its login rows while logged out. Add Account (topic 6, t3code's Add account
+  dialog) opens a dialog while the server makes the account (`AddingAccount`), which isn't on
+  the page until it's done. Its steps follow the account's login session: the agent's login
+  methods as a list (`AgentLogin` with `LoginLayout::Dialog`) with "Copy settings from" (the
+  other accounts, the default one first, or Nothing), which starts the session again with
+  them; then the picked method's progress in the dialog (the browser page or code, the
+  terminal, the key's fields with Log In), with Back (`AgentLogin::back`) and Cancel; a failed
+  login says why with Try Again (`LoginStep::Failed`). Logged in, it's "Account added": a
+  small card with the account's email, plan and limits, where its settings were copied from,
+  and Done. Cancel, Escape or the backdrop remove an account that isn't logged in
+  (`SettingsPage::account_dialog_closed`). The server refuses a login that's an account
+  already listed: the first read to find an account Add Account made logged in
+  (`Server::added_accounts`, so an account kept from before is never taken for one), with
+  another listed account's email on the same plan (`AgentAccounts::listed_with_login`: one
+  email can have a personal plan and a team's), removes it and names it in
+  `AgentAccounts::duplicate` (`Server::keep_read`), and the dialog
+  says "<email> is already one of <agent>'s accounts here, so nothing was added." An account
+  left from before the dialog, never logged in, is still the "New account" card, which Cancel
+  removes. With more than one account, the Defaults,
   Environment and Threads tabs share an "Account" menu over them that picks whose settings
   or sessions they show (`AgentPanel::picked_account`), opening on the account for new
   threads. Add Agent is Zed's
