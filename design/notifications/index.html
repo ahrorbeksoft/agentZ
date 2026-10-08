@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notification Options Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="notifications" data-title="Notification options and volume">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Notification options and volume <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>You said: “We need more options for notifications, because ‘when hidden’ here means when you are outside of the thread, not outside the app. And also we gotta be able to change the volume.”</p>
+<p>Today Settings › Notifications has two sound rows, each with <b>Never</b>, <b>When hidden</b> or <b>Always</b> (Zed’s values), and one switch for system notifications, which show only while agentZ isn’t the app in front. <b>When hidden</b> plays whenever the thread isn’t on screen, so it also plays while you work in agentZ on another thread. There is no choice for “only when I’m in another app”, and no volume.</p>
+<p>Words used throughout: a thread is <b>on screen</b> when agentZ’s window is in front, Settings is closed, and the thread is open in the Agents view or in a pane of the Workspaces tab that’s showing. <b>In front</b> means agentZ is the active app. Subthreads stay silent, and a thread with a background task still waits; these choices apply on top. The app’s two sounds:
+<button class="tbtn" onclick="new Audio('../sounds/audio/zed-agent-done.m4a').play()">▶ Finished</button>
+<button class="tbtn" onclick="new Audio('../sounds/audio/needs-input.mp3').play()">▶ Needs input</button></p>
+<p>Zed, t3code and herdr have no volume setting; their sounds play at the system’s volume. macOS has one “Alert volume” slider for all alert sounds. The mocks are Settings › Notifications in One Dark, as the app draws it.</p>`;
+</script>
+<script src="topics-notifications.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
