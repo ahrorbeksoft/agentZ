@@ -236,6 +236,13 @@ pub fn cursor_style_methods(input: TokenStream) -> TokenStream {
             self
         }
 
+        /// Sets cursor style when hovering over an element to `zoom-in`.
+        /// [Docs](https://tailwindcss.com/docs/cursor)
+        #visibility fn cursor_zoom_in(mut self) -> Self {
+            self.style().mouse_cursor = Some(gpui::CursorStyle::ZoomIn);
+            self
+        }
+
         /// Sets cursor style when hovering over an element to `no-drop`.
         /// [Docs](https://tailwindcss.com/docs/cursor)
         #visibility fn cursor_no_drop(mut self) -> Self {

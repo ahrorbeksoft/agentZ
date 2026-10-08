@@ -2,6 +2,7 @@
 //! (`agent_ui::conversation_view::thread_view`).
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -50,7 +51,8 @@ use crate::mention_menu::{
 use crate::agent_icons::agent_icon;
 use crate::agent_login::{AgentLogin, LoginLayout};
 use crate::attachment_image::{
-    AttachmentImage, ImagePreviewTooltip, ImageViewer, render_hover_preview,
+    AttachmentImage, ImagePreviewTooltip, ImageViewer, MessagePiece, ViewedImage, is_loading,
+    message_pieces, render_hover_preview, without_image_links,
 };
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{AgentIcon, account_fill_color};
@@ -116,6 +118,11 @@ const TOOL_TERMINAL_MAX_LINES: usize = 16;
 const TOOL_IMAGE_SIZE: gpui::Size<Pixels> = gpui::Size {
     width: px(384.),
     height: px(384.),
+};
+/// t3code's thumbnails of a message's images, cropped to fill.
+const MESSAGE_IMAGE_SIZE: gpui::Size<Pixels> = gpui::Size {
+    width: px(100.),
+    height: px(75.),
 };
 
 pub fn init(cx: &mut App) {
@@ -262,8 +269,12 @@ pub struct AgentView {
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
     /// Each markdown's row is measured again when it changes, as when it's parsed.
     _markdown_subscriptions: Vec<Subscription>,
-    /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
+    /// Tool calls the user opened or closed, relative to their default (those with images
+    /// open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
+    /// Tool calls' images drawn while they were still loading, by their entry and place: their
+    /// rows are measured again once they're there, since their size wasn't known.
+    loading_tool_images: RefCell<HashMap<(usize, usize), ImageSource>>,
     /// Tool calls whose input the user opened under their output.
     expanded_tool_inputs: HashSet<acp::ToolCallId>,
     /// Folded runs of work the user opened, by their first entry.
@@ -288,8 +299,9 @@ pub struct AgentView {
     /// Why a pasted or dropped file couldn't be attached.
     attachment_error: Option<SharedString>,
     hovered_image: Option<HoveredImage>,
-    /// The image to show in the viewer, which opens at the next render, where the window is.
-    pending_image_viewer: Option<ImageSource>,
+    /// The images to show in the viewer and which of them first, which opens at the next
+    /// render, where the window is.
+    pending_image_viewer: Option<(Vec<ViewedImage>, usize)>,
     image_viewer: Option<(Entity<ImageViewer>, Subscription)>,
     /// The `@query` the composer's cursor is at, while its menu is open.
     mention_query: Option<MentionQuery>,
@@ -456,8 +468,8 @@ impl AgentView {
                 }
                 TextInputEvent::ChipClicked(chip) => {
                     if let Some(Mention::Image(id)) = this.mentions.get(chip) {
-                        let image = this.attachment_image(id.clone(), cx);
-                        this.view_image(image.original(), cx);
+                        let images = this.viewed_images(std::slice::from_ref(id), None, cx);
+                        this.view_images(images, 0, cx);
                     }
                 }
             },
@@ -505,6 +517,7 @@ impl AgentView {
             markdowns: HashMap::default(),
             _markdown_subscriptions: Vec::new(),
             toggled_tool_calls: HashSet::default(),
+            loading_tool_images: RefCell::default(),
             expanded_tool_inputs: HashSet::default(),
             opened_runs: HashSet::default(),
             synced_working: false,
@@ -1576,9 +1589,17 @@ impl AgentView {
             match entry {
                 // An agent may replay a continued thread's first message with what it brought.
                 Entry::UserMessage(text) => {
-                    self.sync_markdown((index, 0), without_handoff(text), cx);
+                    let (text, _) = without_image_links(without_handoff(text));
+                    self.sync_markdown((index, 0), &text, cx);
                 }
-                Entry::AgentMessage(text) | Entry::AgentThought(text) => {
+                Entry::AgentMessage(text) => {
+                    for (part, piece) in message_pieces(text).into_iter().enumerate() {
+                        if let MessagePiece::Text(text) = piece {
+                            self.sync_markdown((index, part), text, cx);
+                        }
+                    }
+                }
+                Entry::AgentThought(text) => {
                     self.sync_markdown((index, 0), text, cx);
                 }
                 Entry::ToolCall(tool_call) => {
@@ -3320,15 +3341,22 @@ impl AgentView {
         index: usize,
         entry: &Entry,
         is_last: bool,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match entry {
-            Entry::UserMessage(_) => {
+            Entry::UserMessage(text) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 if self.is_task_message(index, cx) {
                     return self.render_task_card(index, style, cx);
                 }
+                let (text, images) = without_image_links(without_handoff(text));
+                let has_text = !text.is_empty();
+                // t3code's: the images above the text.
+                let thumbnails = (!images.is_empty()).then(|| {
+                    self.render_message_images(index, &images, 0..images.len(), cx)
+                        .when(has_text, |this| this.mb_2())
+                });
                 // Messages from other threads' agents are marked, as t3code marks
                 // `createdBy: agent`.
                 let sent_by = self.thread.read(cx).prompt_sender(index).map(|sender| {
@@ -3379,7 +3407,10 @@ impl AgentView {
                             .rounded_xl()
                             .bg(user_message_background(cx))
                             .text_ui(cx)
-                            .children(self.markdown((index, 0), style, cx)),
+                            .children(thumbnails)
+                            .when(has_text, |this| {
+                                this.children(self.markdown((index, 0), style, cx))
+                            }),
                     )
                     .child(
                         h_flex()
@@ -3407,7 +3438,7 @@ impl AgentView {
                     )
                     .into_any_element()
             }
-            Entry::AgentMessage(_) => {
+            Entry::AgentMessage(text) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 let show_controls = !self.thread.read(cx).is_working()
                     && self.thread.read(cx).entries()[index + 1..]
@@ -3415,16 +3446,48 @@ impl AgentView {
                         .all(|entry| {
                             !matches!(entry, Entry::AgentMessage(_) | Entry::UserMessage(_))
                         });
+                let pieces = message_pieces(text);
+                let has_images = pieces.len() > 1;
+                let images: Vec<AttachmentId> = pieces
+                    .iter()
+                    .filter_map(|piece| match piece {
+                        MessagePiece::Images(images) => Some(images.iter().cloned()),
+                        MessagePiece::Text(_) => None,
+                    })
+                    .flatten()
+                    .collect();
+                // The images show where they are in the text, as thumbnails.
+                let mut shown_images = 0;
+                let mut content = Vec::new();
+                for (part, piece) in pieces.into_iter().enumerate() {
+                    match piece {
+                        MessagePiece::Text(_) => {
+                            content.extend(
+                                self.markdown((index, part), style.clone(), cx)
+                                    .map(IntoElement::into_any_element),
+                            );
+                        }
+                        MessagePiece::Images(group) => {
+                            let shown = shown_images..shown_images + group.len();
+                            shown_images = shown.end;
+                            content.push(
+                                self.render_message_images(index, &images, shown, cx)
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
                 v_flex()
                     .w_full()
                     .child(
                         v_flex()
                             .px_5()
                             .py_1p5()
+                            .when(has_images, |this| this.gap_2())
                             .when(is_last && !show_controls, |this| this.pb_4())
                             .w_full()
                             .text_ui(cx)
-                            .children(self.markdown((index, 0), style, cx)),
+                            .children(content),
                     )
                     .when(show_controls, |this| {
                         this.child(self.render_thread_controls(index, cx))
@@ -3446,7 +3509,7 @@ impl AgentView {
         index: usize,
         entry: &Entry,
         is_last: bool,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let live_line = self.live_line(cx).filter(|line| line.run.contains(&index));
@@ -3498,7 +3561,7 @@ impl AgentView {
         entry: &Entry,
         is_last: bool,
         live_run: Option<Range<usize>>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match entry {
@@ -3777,7 +3840,7 @@ impl AgentView {
         index: usize,
         tool_call: &ToolCall,
         live_run: Option<Range<usize>>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -3809,8 +3872,10 @@ impl AgentView {
         };
         let is_live = live_run.is_some();
         let is_openable = is_live || (has_content && !needs_confirmation);
-        let is_open =
-            needs_confirmation || (!is_live && self.toggled_tool_calls.contains(&tool_call.id));
+        // One with an image starts open, so the image shows as the thread goes by.
+        let opens_at_first = !tool_call.images.is_empty();
+        let is_open = needs_confirmation
+            || (!is_live && opens_at_first != self.toggled_tool_calls.contains(&tool_call.id));
         let (added, removed) = tool_call.diffs.iter().map(FileDiff::line_counts).fold(
             (0, 0),
             |(added, removed), (more_added, more_removed)| {
@@ -3956,8 +4021,8 @@ impl AgentView {
                         output.push(div().text_xs().child(markdown).into_any_element());
                     }
                 }
-                for (image_index, id) in tool_call.images.iter().enumerate() {
-                    output.push(self.render_tool_image(index, image_index, id.clone(), cx));
+                for image_index in 0..tool_call.images.len() {
+                    output.push(self.render_tool_image(index, tool_call, image_index, window, cx));
                 }
                 // As in Zed, a tool call with an image shows only the image.
                 let shows_input = !is_execute
@@ -5080,15 +5145,16 @@ impl AgentView {
             let is_next = index == 0;
             let id = message.id;
             let text = self.prompt_text(&message.prompt, cx);
-            let images: Vec<AnyElement> = message
+            let image_ids: Vec<AttachmentId> = message
                 .prompt
                 .iter()
                 .filter_map(|part| match part {
                     PromptPart::Image(id) => Some(id.clone()),
                     _ => None,
                 })
-                .enumerate()
-                .map(|(image_index, id)| self.render_queued_image((index, image_index), id, cx))
+                .collect();
+            let images: Vec<AnyElement> = (0..image_ids.len())
+                .map(|image_index| self.render_queued_image(index, &image_ids, image_index, cx))
                 .collect();
             rows.push(
                 h_flex()
@@ -5198,16 +5264,19 @@ impl AgentView {
         )
     }
 
-    /// An image in a queued message: a small thumbnail, larger on hover, whole on click.
+    /// An image in a queued message: a small thumbnail, larger on hover, whole on click, with
+    /// the message's other images.
     fn render_queued_image(
         &self,
-        element_index: (usize, usize),
-        id: AttachmentId,
+        message_index: usize,
+        images: &[AttachmentId],
+        image_index: usize,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let image = self.attachment_image(id, cx);
-        let thumbnail = image.thumbnail();
-        let (message_index, image_index) = element_index;
+        let thumbnail = self
+            .attachment_image(images[image_index].clone(), cx)
+            .thumbnail();
+        let images = images.to_vec();
         let name = format!("queued-image-{message_index}-{image_index}");
         div()
             .id(SharedString::from(name.clone()))
@@ -5229,30 +5298,100 @@ impl AgentView {
                 cx.new(|_| ImagePreviewTooltip(thumbnail)).into()
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.view_image(image.original(), cx);
+                let images = this.viewed_images(&images, None, cx);
+                this.view_images(images, image_index, cx);
             }))
             .into_any_element()
     }
 
-    /// An image a tool gave back, as Zed shows one in a tool call's output; whole on click.
+    /// An image a tool gave back, at most Zed's size, in a thin border; a click opens it whole
+    /// in the viewer, with the tool call's other images.
     fn render_tool_image(
         &self,
         entry_index: usize,
+        tool_call: &ToolCall,
         image_index: usize,
-        id: AttachmentId,
-        cx: &Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let image = self.attachment_image(id, cx);
+        let thumbnail = self
+            .attachment_image(tool_call.images[image_index].clone(), cx)
+            .thumbnail();
+        if is_loading(&thumbnail, window, cx) {
+            self.loading_tool_images
+                .borrow_mut()
+                .insert((entry_index, image_index), thumbnail.clone());
+        }
+        let images = tool_call.images.clone();
+        let file_name: Option<SharedString> = tool_calls::file_path(tool_call)
+            .and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned().into()));
         let name = format!("tool-image-{entry_index}-{image_index}");
-        div()
-            .id(SharedString::from(name.clone()))
-            .debug_selector(move || name)
-            .cursor_pointer()
-            .child(FittedImage::new(image.thumbnail(), TOOL_IMAGE_SIZE))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.view_image(image.original(), cx);
-            }))
+        h_flex()
+            .child(
+                div()
+                    .id(SharedString::from(name.clone()))
+                    .debug_selector(move || name)
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .overflow_hidden()
+                    .cursor_zoom_in()
+                    .child(
+                        FittedImage::new(thumbnail, TOOL_IMAGE_SIZE)
+                            .map_image(|image| image.rounded(px(5.))),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let images = this.viewed_images(&images, file_name.clone(), cx);
+                        this.view_images(images, image_index, cx);
+                    })),
+            )
             .into_any_element()
+    }
+
+    /// A message's images side by side as t3code's thumbnails, two to a row, each opening the
+    /// viewer with the message's other images.
+    fn render_message_images(
+        &self,
+        entry_index: usize,
+        images: &[AttachmentId],
+        shown: Range<usize>,
+        cx: &Context<Self>,
+    ) -> Div {
+        let colors = cx.theme().colors();
+        let thumbnails = shown.map(|image_index| {
+            let thumbnail = self
+                .attachment_image(images[image_index].clone(), cx)
+                .thumbnail();
+            let images = images.to_vec();
+            let name = format!("message-image-{entry_index}-{image_index}");
+            div()
+                .id(SharedString::from(name.clone()))
+                .debug_selector(move || name)
+                .flex_none()
+                .w(MESSAGE_IMAGE_SIZE.width)
+                .h(MESSAGE_IMAGE_SIZE.height)
+                .rounded_lg()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.element_background)
+                .overflow_hidden()
+                .cursor_zoom_in()
+                .child(
+                    img(thumbnail)
+                        .size_full()
+                        .rounded(px(7.))
+                        .object_fit(ObjectFit::Cover),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let images = this.viewed_images(&images, None, cx);
+                    this.view_images(images, image_index, cx);
+                }))
+        });
+        h_flex()
+            .flex_wrap()
+            .gap_2()
+            .max_w(MESSAGE_IMAGE_SIZE.width * 2. + px(8.))
+            .children(thumbnails)
     }
 
     /// Puts a queued message back in the composer, its mentions as chips again, and takes it
@@ -5371,20 +5510,62 @@ impl AgentView {
         }
     }
 
-    /// Opens the image viewer at the next render, which has the window to focus it in.
-    fn view_image(&mut self, source: ImageSource, cx: &mut Context<Self>) {
+    /// Measures again the rows whose tool call images were drawn before they loaded. A row
+    /// above the view keeps the height it was measured at, and the conversation would jump as
+    /// it scrolls into view. The view is told when each image it drew has loaded.
+    fn remeasure_loaded_tool_images(&mut self, window: &mut Window, cx: &mut App) {
+        let mut loading = self.loading_tool_images.borrow_mut();
+        if loading.is_empty() {
+            return;
+        }
+        let mut loaded = Vec::new();
+        loading.retain(|(entry_index, _), source| {
+            let is_loading = is_loading(source, window, cx);
+            if !is_loading {
+                loaded.push(*entry_index);
+            }
+            is_loading
+        });
+        drop(loading);
+        for entry_index in loaded {
+            self.list_state
+                .remeasure_items(entry_index + 1..entry_index + 2);
+        }
+    }
+
+    /// This thread's images as the viewer shows them, whole, under `name` or "Image": nothing
+    /// keeps the name of an image pasted or given back.
+    fn viewed_images(
+        &self,
+        ids: &[AttachmentId],
+        name: Option<SharedString>,
+        cx: &App,
+    ) -> Vec<ViewedImage> {
+        let name = name.unwrap_or_else(|| "Image".into());
+        ids.iter()
+            .map(|id| ViewedImage {
+                source: self.attachment_image(id.clone(), cx).original(),
+                name: name.clone(),
+            })
+            .collect()
+    }
+
+    /// Opens the image viewer at `images[index]` at the next render, which has the window to
+    /// focus it in.
+    fn view_images(&mut self, images: Vec<ViewedImage>, index: usize, cx: &mut Context<Self>) {
         self.hovered_image = None;
-        self.pending_image_viewer = Some(source);
+        self.pending_image_viewer = Some((images, index));
         cx.notify();
     }
 
     fn open_image_viewer(
         &mut self,
-        source: ImageSource,
+        images: Vec<ViewedImage>,
+        index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let viewer = cx.new(|cx| ImageViewer::new(source, window, cx));
+        let viewer = cx.new(|cx| ImageViewer::new(images, index, window, cx));
         let subscription =
             cx.subscribe_in(&viewer, window, |this, _, _: &DismissEvent, window, cx| {
                 this.image_viewer = None;
@@ -5452,8 +5633,8 @@ impl AgentView {
                     Some(id) => {
                         clicked
                             .update(cx, |this, cx| {
-                                let image = this.attachment_image(id, cx);
-                                this.view_image(image.original(), cx);
+                                let images = this.viewed_images(&[id], None, cx);
+                                this.view_images(images, 0, cx);
                             })
                             .ok();
                     }
@@ -7749,9 +7930,10 @@ impl Render for AgentView {
         if let Some(position) = self.pending_composer_menu.take() {
             self.deploy_composer_menu(position, window, cx);
         }
-        if let Some(source) = self.pending_image_viewer.take() {
-            self.open_image_viewer(source, window, cx);
+        if let Some((images, index)) = self.pending_image_viewer.take() {
+            self.open_image_viewer(images, index, window, cx);
         }
+        self.remeasure_loaded_tool_images(window, cx);
         self.sync_mention_query(cx);
         let menu_open = self.mention_query.is_some() || !self.matching_commands(cx).is_empty();
         self.composer
@@ -10352,6 +10534,63 @@ mod tests {
         assert!(top.item_ix > 0, "the scroll stopped at the top");
     }
 
+    /// A tool call's image above the view loads after its row was measured; its row is measured
+    /// again, so scrolling up to it moves the conversation by the scroll alone.
+    #[gpui::test]
+    fn an_image_above_the_view_keeps_the_scroll_even(cx: &mut TestAppContext) {
+        const STEP: f32 = 25.;
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_image(&client, TALL_PNG, cx);
+        let Entry::ToolCall(mut screenshot) = tool_call(acp::ToolCallStatus::Completed) else {
+            panic!("a tool call");
+        };
+        screenshot.text.clear();
+        screenshot.images = vec![image_id()];
+        let mut entries = vec![
+            Entry::UserMessage("Take a screenshot".into()),
+            Entry::ToolCall(screenshot),
+        ];
+        entries.extend((0..30).map(|index| Entry::AgentMessage(format!("Message {index}"))));
+        thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-image-1-0").is_none(),
+            "above the view"
+        );
+
+        let rows: Vec<&'static str> = (1..=32)
+            .map(|row| &*format!("conversation-row-{row}").leak())
+            .collect();
+        let tops = |cx: &mut VisualTestContext| -> Vec<Option<f32>> {
+            rows.iter()
+                .map(|name| cx.debug_bounds(name).map(|bounds| f32::from(bounds.top())))
+                .collect()
+        };
+        let mut before = tops(cx);
+        for step in 0..120 {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(px(400.), px(300.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(STEP))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+            let after = tops(cx);
+            for (row, (before, after)) in rows.iter().zip(before.iter().zip(&after)) {
+                if let (Some(before), Some(after)) = (before, after) {
+                    assert_eq!(after - before, STEP, "{row} at step {step}");
+                }
+            }
+            before = after;
+            // Drawn at last, as it comes into view.
+            if cx.debug_bounds("tool-image-1-0").is_some() {
+                return;
+            }
+        }
+        panic!("never scrolled up to the image");
+    }
+
     /// An open tool call's output scrolls on its own: over it, the conversation stays put until
     /// the output reaches its end.
     #[gpui::test]
@@ -10732,7 +10971,8 @@ mod tests {
                 if *prompt == [PromptPart::Image(image_id()), PromptPart::Text(" ".into())])));
     }
 
-    /// A tool's image shows in its output, and a click shows it whole until Escape.
+    /// A tool call with an image starts open, showing it; a click shows it whole until Escape,
+    /// and a click on the row closes it as any row.
     #[gpui::test]
     fn an_image_opens_whole_in_the_viewer(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -10754,20 +10994,106 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        let row = cx
-            .debug_bounds("tool-call-row-1")
-            .expect("the tool call's row");
-        cx.simulate_click(row.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
         let image = cx.debug_bounds("tool-image-1-0").expect("the tool's image");
         cx.simulate_click(image.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("image-viewer").is_some());
         assert!(cx.debug_bounds("image-viewer-image").is_some());
+        assert_eq!(viewer_caption(&view, cx).as_deref(), Some("Image"));
 
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(cx.debug_bounds("image-viewer").is_none());
+
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-image-1-0").is_none());
+    }
+
+    /// What the open image viewer's caption says.
+    fn viewer_caption(view: &Entity<AgentView>, cx: &mut VisualTestContext) -> Option<String> {
+        view.read_with(cx, |view, cx| {
+            let (viewer, _) = view.image_viewer.as_ref()?;
+            Some(viewer.read(cx).caption())
+        })
+    }
+
+    /// The user's images show as thumbnails above the message's text, two to a row, and a
+    /// click opens one with arrows to the others.
+    #[gpui::test]
+    fn a_messages_images_show_as_thumbnails(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        let second = AttachmentId::parse(&format!("{}.png", "cd".repeat(32))).expect("an id");
+        let message = format!(
+            "{} {} The sidebar is cut off.",
+            image_id().markdown_link(),
+            second.markdown_link()
+        );
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage(message)], cx)
+        });
+        cx.run_until_parked();
+        let first = cx
+            .debug_bounds("message-image-0-0")
+            .expect("the first thumbnail");
+        let next = cx
+            .debug_bounds("message-image-0-1")
+            .expect("the second thumbnail");
+        assert_eq!(first.size, MESSAGE_IMAGE_SIZE);
+        assert_eq!(next.top(), first.top());
+        assert_eq!(next.left(), first.right() + px(8.));
+        let markdown = view.read_with(cx, |view, cx| {
+            view.markdowns[&(0, 0)].read(cx).source().to_string()
+        });
+        assert_eq!(markdown, "The sidebar is cut off.");
+
+        cx.simulate_click(next.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(viewer_caption(&view, cx).as_deref(), Some("Image · 2 of 2"));
+        cx.simulate_keystrokes("right");
+        assert_eq!(viewer_caption(&view, cx).as_deref(), Some("Image · 1 of 2"));
+    }
+
+    /// An image in the agent's reply shows as a thumbnail where it is in the text.
+    #[gpui::test]
+    fn an_agents_image_shows_where_it_is(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Fix it".into()),
+                    Entry::AgentMessage(format!(
+                        "Here's the window after the fix:\n\n{}\n\nIt fits now.",
+                        image_id().markdown_link()
+                    )),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("conversation-row-2")
+            .expect("the agent's message");
+        let thumbnail = cx
+            .debug_bounds("message-image-1-0")
+            .expect("the image's thumbnail");
+        assert_eq!(thumbnail.size, MESSAGE_IMAGE_SIZE);
+        // Text above it and below it.
+        assert!(thumbnail.top() > row.top() + px(20.));
+        assert!(thumbnail.bottom() < row.bottom() - px(20.));
+        let texts = view.read_with(cx, |view, cx| {
+            [(1, 0), (1, 2)].map(|key| view.markdowns[&key].read(cx).source().to_string())
+        });
+        assert_eq!(texts, ["Here's the window after the fix:", "It fits now."]);
     }
 
     /// An image taller than the room for it shrinks to fit, keeping its shape, in a tool's
@@ -10793,13 +11119,9 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        let row = cx
-            .debug_bounds("tool-call-row-1")
-            .expect("the tool call's row");
-        cx.simulate_click(row.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
         let image = cx.debug_bounds("tool-image-1-0").expect("the tool's image");
-        assert_eq!(image.size.height, TOOL_IMAGE_SIZE.height);
+        // In its border.
+        assert_eq!(image.size.height, TOOL_IMAGE_SIZE.height + px(2.));
 
         cx.simulate_click(image.center(), gpui::Modifiers::none());
         cx.run_until_parked();
@@ -10813,7 +11135,8 @@ mod tests {
         assert!((shape - 0.05).abs() < 0.001, "{shape}");
     }
 
-    /// An image link in a message shows the image's thumbnail while the mouse is on it.
+    /// An image link where images don't show as thumbnails, as in a thought, shows the image's
+    /// thumbnail while the mouse is on it.
     #[gpui::test]
     fn hovering_an_image_link_shows_its_thumbnail(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -10824,26 +11147,26 @@ mod tests {
             thread.set_entries_for_test(
                 vec![
                     Entry::UserMessage("Describe it".into()),
-                    Entry::AgentMessage(format!("{} is a red dot.", image_id().markdown_link())),
+                    Entry::AgentThought(format!("{} is a red dot.", image_id().markdown_link())),
                 ],
                 cx,
-            )
+            );
+            thread.set_working_for_test(true, cx);
         });
         cx.run_until_parked();
         let row = cx
-            .debug_bounds("conversation-row-2")
-            .expect("the agent's message");
-        // The message is centered at most as wide as the content, its first line at its top.
-        let left = row.left() + (row.size.width - row.size.width.min(MAX_CONTENT_WIDTH)) / 2.;
-        let on_link = gpui::point(left + px(30.), row.top() + px(14.));
+            .debug_bounds("thinking-row-1")
+            .expect("the thought's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let thought = cx.debug_bounds("thinking-content-1").expect("the thought");
+        // Its first line, past its border.
+        let on_link = gpui::point(thought.left() + px(30.), thought.top() + px(12.));
         cx.simulate_mouse_move(on_link, None, gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("image-hover-preview").is_some());
 
-        let past_text = gpui::point(
-            left + MAX_CONTENT_WIDTH.min(row.size.width) - px(30.),
-            on_link.y,
-        );
+        let past_text = gpui::point(thought.right() - px(30.), on_link.y);
         cx.simulate_mouse_move(past_text, None, gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("image-hover-preview").is_none());

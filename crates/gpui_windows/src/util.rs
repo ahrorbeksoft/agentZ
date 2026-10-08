@@ -103,7 +103,9 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     let (lock, name) = match style {
         CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => (&IBEAM, IDC_IBEAM),
         CursorStyle::Crosshair => (&CROSS, IDC_CROSS),
-        CursorStyle::PointingHand | CursorStyle::DragLink => (&HAND, IDC_HAND),
+        CursorStyle::PointingHand | CursorStyle::DragLink | CursorStyle::ZoomIn => {
+            (&HAND, IDC_HAND)
+        }
         CursorStyle::ResizeLeft
         | CursorStyle::ResizeRight
         | CursorStyle::ResizeLeftRight

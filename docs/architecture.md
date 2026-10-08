@@ -598,14 +598,23 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   `ExpandedImageDialog`): every image in a thread is kept by its server, so every client sees
   it. Clients fetch one by id (`Request::Attachment`), as a 640-pixel PNG thumbnail (made once
   and kept) or the original, through GPUI's asset cache (`AttachmentImage`); one that failed
-  while its machine was offline is fetched again once it's back. Hovering an image shows its
-  thumbnail (`ImagePreviewTooltip`, and `HoveredImage` for an `@Image` link in a message), and
-  a click opens the original in a viewer over the window (`ImageViewer`: a dark backdrop, the
-  image fit to the window; Esc, × or a click beside the image closes it). This covers composer chips, queued messages,
-  the user's and the agent's messages, and images in tool output, which show inline. Every one
-  is sized from the image's own size to fit its box whole (`text_input::FittedImage`): GPUI's
-  `max_w` and `max_h` clamp each side alone, which stretched a tall image's preview and cut off
-  its bottom in the viewer.
+  while its machine was offline is fetched again once it's back. Picked in
+  `design/tool-calls/` (topics 4–6): a message's images (`message_pieces`,
+  `without_image_links`) show as 100 × 75 thumbnails cropped to fill, two to a row: the
+  user's above its text, the agent's where they are in its reply. A tool call with an image
+  starts open, the image under its row at most 384 px wide and tall, in a thin border; its
+  row is measured again once the image loads (`remeasure_loaded_tool_images`), since its
+  height is known only then. Composer chips show their thumbnail on hover
+  (`ImagePreviewTooltip`, and `HoveredImage` for an `@Image` link in a thought). Every image
+  has a zoom-in cursor (`CursorStyle::ZoomIn`, added to GPUI) and a click opens the original
+  in t3code's viewer over the window (`ImageViewer`): the image fit to the window over a dark
+  backdrop, with arrows and ← → through the message's or tool call's other images, a caption
+  ("screenshot.png · 1 of 2", the file's name for a read, else "Image"), a click zooming to
+  200% where it lands and back, scrolling or pinching to zoom (up to 8×, "149% zoom" in the
+  caption), and dragging to move the zoomed image; Esc, × or a click beside the image closes
+  it. Every image is sized from its own size to fit its box whole (`text_input::FittedImage`):
+  GPUI's `max_w` and `max_h` clamp each side alone, which stretched a tall image's preview and
+  cut off its bottom in the viewer.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
   thread's menu (Pin or Unpin where it can be pinned, Rename, Continue with Another Agent ▸

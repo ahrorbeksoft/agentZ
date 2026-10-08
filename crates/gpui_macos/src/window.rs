@@ -2555,6 +2555,16 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            CursorStyle::ZoomIn => {
+                // New in macOS 15.
+                let has_zoom_in: BOOL =
+                    msg_send![class!(NSCursor), respondsToSelector: sel!(zoomInCursor)];
+                if has_zoom_in == YES {
+                    msg_send![class!(NSCursor), zoomInCursor]
+                } else {
+                    msg_send![class!(NSCursor), pointingHandCursor]
+                }
+            }
         };
 
         let bounds = NSView::bounds(this as *const Object as id);

@@ -1775,7 +1775,7 @@ impl RenderOnce for FittedImage {
 }
 
 /// The size of an image that's loaded, as an `img` of it lays out.
-fn image_size(source: &ImageSource, window: &mut Window, cx: &mut App) -> Option<Size<Pixels>> {
+pub fn image_size(source: &ImageSource, window: &mut Window, cx: &mut App) -> Option<Size<Pixels>> {
     let image = match source {
         ImageSource::Custom(load) => load(window, cx)?.ok()?,
         ImageSource::Image(image) => image.clone().use_render_image(window, cx)?,
