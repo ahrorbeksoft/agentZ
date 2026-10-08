@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logging In Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="login" data-title="Logging in">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Logging in <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>You said that when a message goes to an agent that isn't logged in, "it shows login (login also kinda ugly, we gotta improve that too)" (feedback #22). The other half of that report is built: such a message now fails with Retry. This round is the look.</p>
+<p>Today a thread that needs a login shows a <b>panel</b> in the middle of the conversation: the agent's icon, "Log in to Factory Droid", "Every thread with Factory Droid shares the login.", what the agent said when it asked, then a full-width <b>button</b> for each of the agent's <b>login methods</b>, the first one filled. Picking one shows its <b>step</b> there: a code to enter in the browser, a terminal, or an API key field. The same login shows in two more places, each its own way: the <b>Add Account dialog</b> (built in the Usage round, its methods as a list with chevrons) and a logged-out account's card on an agent's <b>Account tab</b> (a row per method with Log In).</p>
+<p>Zed shows the login as a callout at the bottom of an empty thread, with small buttons. t3code shows a banner that sends you to its provider settings, where its account rows log in. Each option says where it comes from.</p>
+<p>The mocks use <b>Factory Droid</b>, whose methods are "Login" (a pairing code in the browser) and "Factory API Key", and <b>Claude Agent</b>, whose "Claude Subscription" and "Anthropic Console" both log in in a terminal. Their names, descriptions and Droid's message are what those agents send. The mocks are JetBrains Dark, your theme, at the app's sizes. The screenshots beside each topic are today's app with the mock agent (One Dark); its methods cover every kind, which is why it has five.</p>`;
+</script>
+<script src="topics-login.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
