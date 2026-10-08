@@ -10,10 +10,11 @@ use anyhow::Result;
 use collections::HashMap;
 use gpui::{
     AnyView, App, Context, Decorations, DismissEvent, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, MouseButton, PathPromptOptions, Subscription, SystemNotification, Task,
-    Window, WindowControlArea,
+    FocusHandle, Focusable, Hsla, MouseButton, PathPromptOptions, Subscription, SystemNotification,
+    Task, Window, WindowControlArea,
 };
 use projects::{Thread, ThreadId};
+use theme::ThemeColors;
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::ResultExt as _;
 
@@ -1546,19 +1547,29 @@ impl Shell {
             ),
         };
         let shell = cx.entity().downgrade();
-        // Zed's toggle buttons, with the selected side gray rather than tinted with the
-        // accent (the user's pick in `design/jetbrains/`).
+        // Zed's toggle buttons, with the selected side a lighter gray rather than tinted with
+        // the accent (the user's pick in `design/jetbrains/`).
+        let selected_background = view_switch_selected_background(colors);
         let view_tab = |index: usize, label: &'static str, view: MainView| {
             let shell = shell.clone();
-            ButtonLike::new(("main-view", index))
-                .toggle_state(self.view == view)
-                .selected_style(ButtonStyle::Filled)
-                .child(div().px_2().child(Label::new(label).size(LabelSize::Small)))
-                .on_click(move |_, window, cx| {
-                    shell
-                        .update(cx, |shell, cx| shell.set_view(view, window, cx))
-                        .ok();
-                })
+            let is_selected = self.view == view;
+            div()
+                .when(is_selected, |tab| tab.bg(selected_background))
+                .child(
+                    ButtonLike::new(("main-view", index))
+                        .toggle_state(is_selected)
+                        .style(if is_selected {
+                            ButtonStyle::Transparent
+                        } else {
+                            ButtonStyle::Subtle
+                        })
+                        .child(div().px_2().child(Label::new(label).size(LabelSize::Small)))
+                        .on_click(move |_, window, cx| {
+                            shell
+                                .update(cx, |shell, cx| shell.set_view(view, window, cx))
+                                .ok();
+                        }),
+                )
         };
         let view_tabs = h_flex()
             .rounded_md()
@@ -1895,6 +1906,13 @@ impl Focusable for Shell {
     }
 }
 
+/// The view switch's selected side: the theme's text, faint, over the title bar. Themes may
+/// give elements the title bar's own color (Catppuccin does), but their text always stands
+/// out from it.
+fn view_switch_selected_background(colors: &ThemeColors) -> Hsla {
+    colors.text.opacity(0.12)
+}
+
 /// A count in the most urgent waiting state's color, for the view switch.
 fn render_waiting_badge(count: usize, status: ThreadStatus, cx: &App) -> Div {
     let color = match status {
@@ -2194,6 +2212,29 @@ mod tests {
             assert_eq!(thread_from_notification_tag(&pane.notification_tag()), None);
         }
         assert_eq!(thread_from_notification_tag("thread-7"), None);
+    }
+
+    /// The view switch's selected side stands out from the title bar in every bundled theme,
+    /// Catppuccin's too, whose element background is its title bar's color.
+    #[gpui::test]
+    fn the_selected_view_shows_in_every_theme(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let registry = theme::ThemeRegistry::global(cx);
+            let names = registry.list_names();
+            assert!(names.iter().any(|name| name.starts_with("Catppuccin")));
+            for name in names {
+                let theme = registry.get(&name).expect("listed theme");
+                let colors = theme.colors();
+                let title_bar = colors.title_bar_background;
+                let selected = title_bar.blend(super::view_switch_selected_background(colors));
+                let difference = (selected.l - title_bar.l).abs();
+                assert!(
+                    difference >= 0.05,
+                    "{name}: the selected side is only {difference} lighter or darker"
+                );
+            }
+        });
     }
 }
 

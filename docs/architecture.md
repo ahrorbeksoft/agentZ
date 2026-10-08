@@ -191,7 +191,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Window** (`shell.rs`): title bar (past the traffic lights, or at the left edge in full
   screen as in Zed) with the sidebar toggle (Cmd-B), project switcher (its footer is Add
   Project…),
-  connection status, and Agents | Workspaces tabs, the view not shown counting its agents
+  connection status, and Agents | Workspaces tabs (the selected side in the theme's text at
+  12% over the title bar, which shows in any Zed theme, where some give elements the title
+  bar's color), the view not shown counting its agents
   waiting for an approval or an answer beside its side, in the most urgent one's color; the
   sidebar; the open thread or settings; the
   diff panel; modals, which close on a press outside them. The connection status
