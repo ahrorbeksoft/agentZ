@@ -65,6 +65,10 @@ const STOP_BACKGROUND_TASK_REQUEST: &str = "_session/async_task/stop";
 /// Agent does.
 const OWN_WORK_QUIET: Duration = Duration::from_secs(30);
 
+/// How long after a background task ends by itself the agent may take to go on with its
+/// result, as Claude Agent does, before the thread counts as done without it.
+const OWN_WORK_GRACE: Duration = Duration::from_secs(15);
+
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
     WorkingChanged(bool),
@@ -195,6 +199,8 @@ enum MessageKind {
     /// [`OWN_WORK_QUIET`] passed since the agent, working without a prompt, had sent this many
     /// updates.
     OwnWorkQuiet(u64),
+    /// [`OWN_WORK_GRACE`] passed since the background task with this count ended.
+    OwnWorkOverdue(u64),
     /// The owner's work after the agent's work of its own is done.
     OwnWorkEnded,
 }
@@ -353,6 +359,12 @@ pub struct AgentThread {
     own_work_from: usize,
     /// The agent's work of its own ended, and the owner's work after a turn is being done.
     own_work_ending: bool,
+    /// A background task ended by itself while the agent was idle, and the agent is expected
+    /// to go on with its result for up to [`OWN_WORK_GRACE`].
+    own_work_due: bool,
+    /// Counts background tasks that ended by themselves, so only the latest one's grace ends
+    /// [`Self::own_work_due`].
+    tasks_ended: u64,
     /// Stops of background tasks the agent hasn't answered yet. What it says meanwhile is its
     /// note of the stop, not work of its own.
     stops_in_flight: usize,
@@ -578,6 +590,8 @@ impl AgentThread {
             own_work_updates: 0,
             own_work_from: 0,
             own_work_ending: false,
+            own_work_due: false,
+            tasks_ended: 0,
             stops_in_flight: 0,
             new_message_due: false,
         };
@@ -939,6 +953,11 @@ impl AgentThread {
                     self.end_own_work();
                 } else {
                     self.check_own_work_later();
+                }
+            }
+            MessageKind::OwnWorkOverdue(ended) => {
+                if ended == self.tasks_ended {
+                    self.own_work_due = false;
                 }
             }
         }
@@ -2128,11 +2147,31 @@ impl AgentThread {
                     }
                     // Ended: the agent says how in the conversation, as it picks it up.
                     _ => {
-                        tasks.remove(index);
+                        let task = tasks.remove(index);
+                        // A stop asked for here gets only the agent's note of it.
+                        if !task.stopping && !self.is_working() {
+                            self.expect_own_work();
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// The agent's turn is over, but not its work: something it left running in the
+    /// background, or what it goes on with once that ends.
+    pub fn is_waiting(&self) -> bool {
+        !self.view.state.background_tasks.is_empty() || self.own_work_due
+    }
+
+    fn expect_own_work(&mut self) {
+        self.own_work_due = true;
+        self.tasks_ended += 1;
+        let ended = self.tasks_ended;
+        self.spawn(async move {
+            tokio::time::sleep(OWN_WORK_GRACE).await;
+            MessageKind::OwnWorkOverdue(ended)
+        });
     }
 
     /// Whether the update shows the agent working although no prompt is: Claude Agent going
@@ -2274,6 +2313,8 @@ impl AgentThread {
     }
 
     fn set_working(&mut self, working: bool) {
+        // Work that starts is what was due; an agent that stops won't go on.
+        self.own_work_due = false;
         if !working {
             self.working_on_its_own = false;
             self.own_work_ending = false;
@@ -4074,10 +4115,17 @@ mod tests {
         assert_eq!(task.kind.as_ref(), "shell");
         assert_eq!(task.tool_call_id, Some(acp::ToolCallId::new("bash-1")));
         assert!(task.can_stop);
+        assert!(thread.thread.is_waiting());
 
+        // Once it ends, the agent's work with its result is due, and then it's on.
+        thread
+            .wait_until(|thread| thread.state.background_tasks.is_empty())
+            .await;
+        assert!(thread.thread.is_waiting() || thread.thread.is_working());
         thread
             .wait_until(|thread| thread.is_working() && thread.state.background_tasks.is_empty())
             .await;
+        assert!(!thread.thread.is_waiting());
         thread.update(|thread| thread.steer("next".into()));
         thread
             .wait_until(|thread| {
@@ -4117,6 +4165,8 @@ mod tests {
             })
             .await;
         assert!(!thread.thread.is_working());
+        // No work is due after a stop, so it's done.
+        assert!(!thread.thread.is_waiting());
         assert_eq!(
             agent_messages(&thread.thread),
             [

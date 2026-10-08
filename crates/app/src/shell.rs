@@ -994,7 +994,7 @@ impl Shell {
         let caption = match status {
             ThreadStatus::PendingApproval => "Waiting for tool confirmation",
             ThreadStatus::AwaitingInput => "Waiting for your input",
-            ThreadStatus::Working | ThreadStatus::Completed => "Finished",
+            ThreadStatus::Working | ThreadStatus::Waiting | ThreadStatus::Completed => "Finished",
         };
         let project = store
             .thread_project(thread.id)
@@ -1050,7 +1050,7 @@ impl Shell {
             .unwrap_or_default();
         let caption = match status {
             ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput => "Needs attention",
-            ThreadStatus::Working | ThreadStatus::Completed => "Finished",
+            ThreadStatus::Working | ThreadStatus::Waiting | ThreadStatus::Completed => "Finished",
         };
         let mut body = format!(
             "{} › {} · {caption}",

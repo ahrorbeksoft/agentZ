@@ -1782,7 +1782,15 @@ impl Server {
             || self.moving_threads.contains_key(&thread_id)
             || self.has_waiting_prompt(thread_id)
             || self.has_running_agent_terminal(thread_id)
-            || !thread.state.background_tasks.is_empty()
+            || thread.is_waiting()
+    }
+
+    /// The thread's work goes on after its turn, in its agent's background. It completes once
+    /// that's over, so it's done (and its sound plays) once, not with each piece.
+    fn is_waiting(&self, thread_id: ThreadId) -> bool {
+        self.threads
+            .get(&thread_id)
+            .is_some_and(AgentThread::is_waiting)
     }
 
     /// The command that starts the agent, with the environment from the account's settings
@@ -1902,6 +1910,18 @@ impl Server {
     /// Applies what the thread reports to the projects and its account's settings.
     fn thread_changed(&mut self, connection: ConnectionId) {
         self.changed_connections.insert(connection);
+        // Set before a turn's end is applied, so it doesn't complete the thread; cleared after,
+        // once the thread's working is up to date.
+        let waiting = match connection {
+            ConnectionId::Thread(thread_id) => {
+                let waiting = self.is_waiting(thread_id);
+                if waiting {
+                    self.projects.set_thread_waiting(thread_id, true);
+                }
+                Some((thread_id, waiting))
+            }
+            ConnectionId::LoginSession(_) => None,
+        };
         let (thread, agent_id, account) = match connection {
             ConnectionId::Thread(thread_id) => {
                 let record = self.projects.thread(thread_id);
@@ -2027,6 +2047,9 @@ impl Server {
                 (ConnectionId::LoginSession(_), _) => {}
             }
         }
+        if let Some((thread_id, false)) = waiting {
+            self.projects.set_thread_waiting(thread_id, false);
+        }
         #[cfg(unix)]
         if paused && let ConnectionId::Thread(thread_id) = connection {
             self.thread_paused(thread_id);
@@ -2111,6 +2134,17 @@ impl Server {
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());
             self.projects
                 .set_thread_awaiting_input(*thread_id, thread.is_awaiting_input());
+        }
+        // A subthread's end changes its parent's, and a stopped agent's work is over.
+        let waiting: Vec<(ThreadId, bool)> = self
+            .threads
+            .keys()
+            .copied()
+            .chain(self.projects.waiting_threads())
+            .map(|thread_id| (thread_id, self.is_waiting(thread_id)))
+            .collect();
+        for (thread_id, waiting) in waiting {
+            self.projects.set_thread_waiting(thread_id, waiting);
         }
         let projects = &self.projects;
         let login_sessions = &self.login_sessions;

@@ -896,11 +896,16 @@ herdr's states, t3code's labels and colors, Zed's notifications and sound, herdr
 Designed in `design/sounds/`.
 
 - The server sends facts: `working_threads`, `blocked_threads` (a permission waiting, its own
-  or a subthread's), `awaiting_input_threads` (a request for input waiting), and each thread's
-  `completed_at`. Each client decides "done" against the
+  or a subthread's), `awaiting_input_threads` (a request for input waiting),
+  `waiting_threads` (`Server::is_waiting`: the turn ended with a background task running, or
+  within 15 seconds of one ending by itself, while the agent is due to go on with its result,
+  `AgentThread::is_waiting`), and each thread's `completed_at`, set once it's neither working
+  nor waiting, so a thread completes (and its sound plays) once its work is over. Each client
+  decides "done" against the
   completions it has displayed (`viewed.json`), so viewing in one client doesn't clear another.
 - Statuses by priority: Pending Approval (warning), Awaiting Input (purple, each theme's fourth
-  player color), Working, Completed. Agent control's tools report `waiting_for_input`.
+  player color), Working, Waiting, Completed. Agent control's tools report
+  `waiting_for_input`.
 - "Displayed" is Zed's `agent_status_visible`: window active, settings closed, thread open.
 - **Sounds** (`sound.rs`, played with `NSSound`): Zed's agent-done sound as a thread finishes,
   t3code's input sound as it waits for a permission or an answer. Settings › Notifications

@@ -440,6 +440,9 @@ pub struct ProjectsSnapshot {
     pub blocked_threads: Vec<ThreadId>,
     /// Threads whose agent asked for input (ACP's elicitation) that the user hasn't given.
     pub awaiting_input_threads: Vec<ThreadId>,
+    /// Threads whose turn ended with their work still going: a background task, or tasks
+    /// delegated to subthreads. They complete once it's over.
+    pub waiting_threads: Vec<ThreadId>,
     /// Terminal threads running an agent CLI, with its name. The rest are plain shells.
     pub terminal_agents: Vec<(ThreadId, String)>,
     /// Terminal threads running a program in front of their shell, with its name.
@@ -518,6 +521,8 @@ pub struct ProjectStore {
     blocked_threads: HashSet<ThreadId>,
     /// Threads with a request for input waiting. Not persisted either.
     awaiting_input_threads: HashSet<ThreadId>,
+    /// Threads whose work goes on after their turn. Not persisted either.
+    waiting_threads: HashSet<ThreadId>,
     /// Terminal threads running an agent CLI, by its name. Not persisted either.
     terminal_agents: BTreeMap<ThreadId, String>,
     /// Terminal threads running a program in front of their shell. Not persisted either.
@@ -557,6 +562,7 @@ impl ProjectStore {
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
             awaiting_input_threads: HashSet::default(),
+            waiting_threads: HashSet::default(),
             terminal_agents: BTreeMap::new(),
             terminal_commands: BTreeMap::new(),
             terminal_folders: BTreeMap::new(),
@@ -782,6 +788,8 @@ impl ProjectStore {
         self.blocked_threads
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.awaiting_input_threads
+            .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
+        self.waiting_threads
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_agents
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
@@ -1014,6 +1022,7 @@ impl ProjectStore {
             self.working_threads.remove(&id);
             self.blocked_threads.remove(&id);
             self.awaiting_input_threads.remove(&id);
+            self.waiting_threads.remove(&id);
             self.changed();
         }
     }
@@ -1120,6 +1129,7 @@ impl ProjectStore {
                 self.working_threads.remove(&id);
                 self.blocked_threads.remove(&id);
                 self.awaiting_input_threads.remove(&id);
+                self.waiting_threads.remove(&id);
                 self.terminal_agents.remove(&id);
                 self.terminal_commands.remove(&id);
                 self.terminal_folders.remove(&id);
@@ -1411,7 +1421,7 @@ impl ProjectStore {
     }
 
     /// Marks whether the thread's agent is running; either change counts as activity, and
-    /// stopping completes the turn.
+    /// stopping completes the turn, unless its work goes on ([`Self::set_thread_waiting`]).
     pub fn set_thread_working(&mut self, id: ThreadId, working: bool) {
         let changed = if working {
             self.working_threads.insert(id)
@@ -1419,11 +1429,44 @@ impl ProjectStore {
             self.working_threads.remove(&id)
         };
         if changed {
-            if !working && let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
-            {
-                thread.completed_at = Some(SystemTime::now());
+            if !working && !self.waiting_threads.contains(&id) {
+                self.complete_thread(id);
             }
             self.record_thread_activity(id);
+        }
+    }
+
+    pub fn is_thread_waiting(&self, id: ThreadId) -> bool {
+        self.waiting_threads.contains(&id)
+    }
+
+    /// Marks whether the thread's work goes on after its turn. Set before the turn ends, it
+    /// holds the completion back until it's cleared.
+    pub fn set_thread_waiting(&mut self, id: ThreadId, waiting: bool) {
+        let changed = if waiting {
+            self.thread(id).is_some() && self.waiting_threads.insert(id)
+        } else {
+            self.waiting_threads.remove(&id)
+        };
+        if !changed {
+            return;
+        }
+        if !waiting && !self.working_threads.contains(&id) {
+            self.complete_thread(id);
+            self.record_thread_activity(id);
+        } else {
+            self.changed();
+        }
+    }
+
+    /// The threads whose work goes on after their turn.
+    pub fn waiting_threads(&self) -> impl Iterator<Item = ThreadId> + '_ {
+        self.waiting_threads.iter().copied()
+    }
+
+    fn complete_thread(&mut self, id: ThreadId) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+            thread.completed_at = Some(SystemTime::now());
         }
     }
 
@@ -1594,6 +1637,8 @@ impl ProjectStore {
         let mut awaiting_input_threads: Vec<_> =
             self.awaiting_input_threads.iter().copied().collect();
         awaiting_input_threads.sort();
+        let mut waiting_threads: Vec<_> = self.waiting_threads.iter().copied().collect();
+        waiting_threads.sort();
         ProjectsSnapshot {
             projects: self.projects.clone(),
             threads: self.threads.clone(),
@@ -1604,6 +1649,7 @@ impl ProjectStore {
             working_threads,
             blocked_threads,
             awaiting_input_threads,
+            waiting_threads,
             terminal_agents: self
                 .terminal_agents
                 .iter()
@@ -1649,6 +1695,7 @@ impl ProjectStore {
         this.working_threads = snapshot.working_threads.into_iter().collect();
         this.blocked_threads = snapshot.blocked_threads.into_iter().collect();
         this.awaiting_input_threads = snapshot.awaiting_input_threads.into_iter().collect();
+        this.waiting_threads = snapshot.waiting_threads.into_iter().collect();
         this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
         this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
         this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
@@ -2074,6 +2121,36 @@ mod tests {
         store.delete_thread(thread);
         assert!(!store.is_thread_awaiting_input(thread));
         assert!(store.snapshot().awaiting_input_threads.is_empty());
+    }
+
+    #[test]
+    fn a_waiting_thread_completes_once_its_work_is_over() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let thread = store.add_thread(project, "Thread", None).expect("thread");
+        let completed_at = |store: &ProjectStore| store.thread(thread)?.completed_at;
+
+        store.set_thread_working(thread, true);
+        store.set_thread_waiting(thread, true);
+        store.set_thread_working(thread, false);
+        assert_eq!(completed_at(&store), None);
+        let copy = ProjectStore::from_snapshot(store.snapshot());
+        assert!(copy.is_thread_waiting(thread));
+
+        // Work it goes on with doesn't complete it either, until it ends.
+        store.set_thread_working(thread, true);
+        store.set_thread_waiting(thread, false);
+        assert_eq!(completed_at(&store), None);
+        store.set_thread_working(thread, false);
+        assert!(completed_at(&store).is_some());
+
+        // Without a turn after it, the end of the wait completes it.
+        let first = completed_at(&store);
+        store.set_thread_waiting(thread, true);
+        std::thread::sleep(Duration::from_millis(2));
+        store.set_thread_waiting(thread, false);
+        assert!(completed_at(&store) > first);
     }
 
     #[test]

@@ -17,7 +17,9 @@ impl Sound {
     pub fn for_status(status: ThreadStatus) -> Self {
         match status {
             ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput => Self::NeedsInput,
-            ThreadStatus::Working | ThreadStatus::Completed => Self::Finished,
+            ThreadStatus::Working | ThreadStatus::Waiting | ThreadStatus::Completed => {
+                Self::Finished
+            }
         }
     }
 

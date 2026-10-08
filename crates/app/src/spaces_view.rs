@@ -5023,6 +5023,7 @@ fn rolled_up(statuses: impl Iterator<Item = ThreadStatus>) -> Option<ThreadStatu
         ThreadStatus::AwaitingInput => 3,
         ThreadStatus::Completed => 2,
         ThreadStatus::Working => 1,
+        ThreadStatus::Waiting => 0,
     })
 }
 

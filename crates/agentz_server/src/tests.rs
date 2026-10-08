@@ -724,6 +724,57 @@ async fn keeps_an_agent_with_a_background_task() {
     );
 }
 
+/// A turn that leaves a command in the background doesn't complete its thread: the thread
+/// waits, and completes once the agent's work with the command's result has ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_with_a_background_task_completes_after_it() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    let snapshot = |client: &TestClient| client.projects.clone().expect("projects");
+    let is_waiting =
+        move |client: &TestClient| snapshot(client).waiting_threads.contains(&thread_id);
+    let completed_at = move |client: &TestClient| {
+        snapshot(client)
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .and_then(|thread| thread.completed_at)
+    };
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("background-task 2"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && !thread.state.background_tasks.is_empty()
+        })
+        .await;
+    client.wait_until(is_waiting).await;
+    assert_eq!(completed_at(&client), None);
+
+    // The command ends, and the agent goes on with its result.
+    client
+        .wait_until(|client| client.thread(connection).is_working())
+        .await;
+    assert_eq!(completed_at(&client), None);
+    client
+        .wait_until(move |client| {
+            !client.thread(connection).is_working()
+                && !is_waiting(client)
+                && completed_at(client).is_some()
+        })
+        .await;
+}
+
 /// A new thread is a draft until its first message, as in t3code: one left with nothing typed
 /// is removed, and one with typed text stays until that's cleared.
 #[tokio::test(flavor = "multi_thread")]

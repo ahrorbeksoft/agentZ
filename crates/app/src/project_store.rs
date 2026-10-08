@@ -32,6 +32,8 @@ use crate::server_client::ServerClient;
 pub enum ThreadStatus {
     /// The agent finished a turn this client hasn't displayed yet.
     Completed,
+    /// The agent's turn ended with its work still going: a background task.
+    Waiting,
     Working,
     /// The agent asked for input (ACP's elicitation) that the user hasn't given yet.
     AwaitingInput,
@@ -162,6 +164,9 @@ impl ProjectStore {
             .any(|id| self.store.is_thread_working(id))
         {
             return Some(ThreadStatus::Working);
+        }
+        if self.store.is_thread_waiting(id) {
+            return Some(ThreadStatus::Waiting);
         }
         let completed_at = self.store.thread(id)?.completed_at?;
         let is_unseen = self
@@ -741,5 +746,54 @@ mod tests {
                 (thread, ThreadStatus::PendingApproval),
             ]
         );
+    }
+
+    /// A turn that left work in the background shows the thread waiting, and asks for
+    /// attention only once that work is over.
+    #[gpui::test]
+    fn a_waiting_thread_asks_for_attention_once_done(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            )
+        });
+        let project_store = client.read_with(cx, |client, _| client.projects().clone());
+        let attention = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let attention = attention.clone();
+            cx.subscribe(&project_store, move |_, event: &ProjectStoreEvent, _| {
+                if let ProjectStoreEvent::NeedsAttention(id, status) = event {
+                    attention.borrow_mut().push((*id, *status));
+                }
+            })
+            .detach();
+        });
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = projects::ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let thread = store.add_thread(project, "Thread", None).expect("thread");
+        let show = |store: &projects::ProjectStore, cx: &mut TestAppContext| {
+            project_store.update(cx, |project_store, cx| {
+                project_store.set_snapshot(store.snapshot(), cx);
+                project_store.thread_status(thread)
+            })
+        };
+        assert_eq!(show(&store, cx), None);
+
+        store.set_thread_working(thread, true);
+        assert_eq!(show(&store, cx), Some(ThreadStatus::Working));
+        store.set_thread_waiting(thread, true);
+        store.set_thread_working(thread, false);
+        assert_eq!(show(&store, cx), Some(ThreadStatus::Waiting));
+        assert!(attention.borrow().is_empty());
+
+        store.set_thread_waiting(thread, false);
+        assert_eq!(show(&store, cx), Some(ThreadStatus::Completed));
+        assert_eq!(*attention.borrow(), vec![(thread, ThreadStatus::Completed)]);
     }
 }

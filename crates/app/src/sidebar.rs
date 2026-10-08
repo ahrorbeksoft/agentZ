@@ -3947,6 +3947,7 @@ pub(crate) fn render_status_pill(status: ThreadStatus, cx: &App) -> impl IntoEle
         ThreadStatus::PendingApproval => ("Pending Approval", Color::Warning),
         ThreadStatus::AwaitingInput => ("Awaiting Input", AWAITING_INPUT_COLOR),
         ThreadStatus::Working => ("Working", Color::Accent),
+        ThreadStatus::Waiting => ("Waiting", Color::Accent),
         ThreadStatus::Completed => ("Completed", Color::Success),
     };
     h_flex().gap_1().child(render_status_dot(status, cx)).child(
@@ -3961,7 +3962,7 @@ pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElem
     let color = match status {
         ThreadStatus::PendingApproval => Color::Warning,
         ThreadStatus::AwaitingInput => AWAITING_INPUT_COLOR,
-        ThreadStatus::Working => Color::Accent,
+        ThreadStatus::Working | ThreadStatus::Waiting => Color::Accent,
         ThreadStatus::Completed => Color::Success,
     };
     div()
