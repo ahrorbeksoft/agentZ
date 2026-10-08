@@ -4190,50 +4190,51 @@ async fn agents_work_on_other_machines_through_the_app() {
         .await;
     assert_eq!(code, "machine_unavailable");
 
-    // The app: it tells this server about the other machine, and runs relayed calls there.
+    // The app: it tells each server about the other machine, and runs relayed calls there.
     let mut app_there = there.connect().await;
-    app_there.add_project(there.project_dir.path()).await;
+    let there_project_id = app_there.add_project(there.project_dir.path()).await;
+    let here_peers = Peers {
+        this_machine: "mac".into(),
+        machines: vec![
+            PeerMachine {
+                name: "devbox".into(),
+                online: true,
+            },
+            PeerMachine {
+                name: "laptop".into(),
+                online: false,
+            },
+        ],
+        checkouts: vec![PeerCheckouts {
+            project_id,
+            checkouts: vec![PeerCheckout {
+                machine: "devbox".into(),
+                path: there.project_dir.path().to_path_buf(),
+            }],
+        }],
+    };
     let mut app_here = here.connect().await;
-    app_here
+    app_here.ok(Request::SetPeers(here_peers.clone())).await;
+    app_there
         .ok(Request::SetPeers(Peers {
-            this_machine: "mac".into(),
-            machines: vec![
-                PeerMachine {
-                    name: "devbox".into(),
-                    online: true,
-                },
-                PeerMachine {
-                    name: "laptop".into(),
-                    online: false,
-                },
-            ],
+            this_machine: "devbox".into(),
+            machines: vec![PeerMachine {
+                name: "mac".into(),
+                online: true,
+            }],
             checkouts: vec![PeerCheckouts {
-                project_id,
+                project_id: there_project_id,
                 checkouts: vec![PeerCheckout {
-                    machine: "devbox".into(),
-                    path: there.project_dir.path().to_path_buf(),
+                    machine: "mac".into(),
+                    path: here.project_dir.path().to_path_buf(),
                 }],
             }],
         }))
         .await;
-    let relay = tokio::spawn(async move {
-        loop {
-            let ServerMessage::Event(Event::RelayToolCall(call)) = app_here.next_message().await
-            else {
-                continue;
-            };
-            assert_eq!(call.machine, "devbox");
-            let result = app_there
-                .call_tool(ToolCaller::Directory(call.path), &call.name, call.arguments)
-                .await;
-            app_here
-                .ok(Request::RelayToolResult {
-                    relay_id: call.relay_id,
-                    result,
-                })
-                .await;
-        }
-    });
+    let relays = [
+        relay_as_the_app(app_here, there.connect().await, "devbox"),
+        relay_as_the_app(app_there, here.connect().await, "mac"),
+    ];
 
     let capabilities = caller
         .tool(orchestrator, "orchestrator_capabilities", json!({}))
@@ -4291,6 +4292,29 @@ async fn agents_work_on_other_machines_through_the_app() {
     assert!(listed.contains(&(json!("devbox"), remote_thread.clone())));
     assert!(listed.contains(&(json!("mac"), json!(orchestrator.0))));
     assert_eq!(list["total"], json!(2));
+    assert_eq!(
+        list["machines"],
+        json!([
+            {"machine": "mac", "nextCursor": null},
+            {"machine": "devbox", "nextCursor": null},
+        ])
+    );
+    // And so does the other machine's, though each lists the other: a relayed list isn't
+    // relayed back.
+    let mut caller_there = there.connect().await;
+    let remote_thread_id = ThreadId(remote_thread.as_u64().expect("a thread id"));
+    let list = caller_there
+        .tool(remote_thread_id, "agentz_thread_list", json!({}))
+        .await;
+    let listed: Vec<(Value, Value)> = list["threads"]
+        .as_array()
+        .expect("threads")
+        .iter()
+        .map(|thread| (thread["machine"].clone(), thread["threadId"].clone()))
+        .collect();
+    assert!(listed.contains(&(json!("devbox"), remote_thread.clone())));
+    assert!(listed.contains(&(json!("mac"), json!(orchestrator.0))));
+    assert_eq!(list["total"], json!(2));
 
     // A task for another machine runs as an ordinary thread there.
     let delegated = caller
@@ -4317,7 +4341,45 @@ async fn agents_work_on_other_machines_through_the_app() {
             .await;
         assert_eq!(code, expected);
     }
-    relay.abort();
+
+    // A machine that doesn't answer is left out of the list instead of holding it up.
+    let mut stalled_app = here.connect().await;
+    stalled_app.ok(Request::SetPeers(here_peers)).await;
+    let list = caller
+        .tool(orchestrator, "agentz_thread_list", json!({}))
+        .await;
+    assert_eq!(thread_ids(&list), [orchestrator.0]);
+    assert_eq!(
+        list["machines"][1],
+        json!({"machine": "devbox", "error": "devbox didn't answer within 2 seconds."})
+    );
+    for relay in relays {
+        relay.abort();
+    }
+}
+
+/// Runs the calls the server behind `app` relays on `target`'s server, as the app does.
+fn relay_as_the_app(
+    mut app: TestClient,
+    mut target: TestClient,
+    machine: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let ServerMessage::Event(Event::RelayToolCall(call)) = app.next_message().await else {
+                continue;
+            };
+            assert_eq!(call.machine, machine);
+            let result = target
+                .call_tool(ToolCaller::Relayed(call.path), &call.name, call.arguments)
+                .await;
+            app.ok(Request::RelayToolResult {
+                relay_id: call.relay_id,
+                result,
+            })
+            .await;
+        }
+    })
 }
 
 #[tokio::test(flavor = "multi_thread")]

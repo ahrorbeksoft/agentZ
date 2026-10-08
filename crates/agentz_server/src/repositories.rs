@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, Result, anyhow};
 use projects::{GitHead, RepositoryIdentity};
 use regex::Regex;
 
@@ -27,24 +28,39 @@ static SCP_REMOTE: LazyLock<Regex> = LazyLock::new(|| {
 static URL_REMOTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(?:ssh|https?|git)://").expect("valid url pattern"));
 
-/// The identity of the repository `path` is in, or `None` outside git or without a remote.
-/// Git failing counts as `None`.
-pub(crate) async fn resolve(path: PathBuf) -> Option<RepositoryIdentity> {
-    let root = git(&path, &["rev-parse", "--show-toplevel"]).await?;
+/// The identity of the repository `path` is in, or `None` outside git or without a remote. An
+/// error means git couldn't tell (it couldn't start or took too long), not that there's no
+/// repository.
+pub(crate) async fn resolve(path: PathBuf) -> Result<Option<RepositoryIdentity>> {
+    if !path.is_dir() {
+        return Ok(None);
+    }
+    let Some(root) = git(&path, &["rev-parse", "--show-toplevel"]).await? else {
+        return Ok(None);
+    };
     let root = root.trim();
     if root.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let remotes = git(Path::new(root), &["remote", "-v"]).await?;
-    let (remote_name, remote_url) = primary_remote(&remote_fetch_urls(&remotes))?;
-    Some(identity(remote_name, remote_url, PathBuf::from(root)))
+    let Some(remotes) = git(Path::new(root), &["remote", "-v"]).await? else {
+        return Ok(None);
+    };
+    Ok(primary_remote(&remote_fetch_urls(&remotes))
+        .map(|(remote_name, remote_url)| identity(remote_name, remote_url, PathBuf::from(root))))
 }
 
-async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    tokio::time::timeout(GIT_TIMEOUT, crate::git::git(cwd, args, &[]))
+/// What git printed, or `None` when it answered with a failure, as it does outside a
+/// repository.
+async fn git(cwd: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = tokio::time::timeout(GIT_TIMEOUT, crate::git::command(cwd, args, &[]).output())
         .await
-        .ok()?
-        .ok()
+        .map_err(|_| anyhow!("git {} took over {GIT_TIMEOUT:?}", args.join(" ")))?
+        .context("running git")?;
+    match output.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned())),
+        Some(_) => Ok(None),
+        None => Err(anyhow!("git {} was killed", args.join(" "))),
+    }
 }
 
 /// Each remote's fetch URL, by name.
@@ -389,12 +405,25 @@ mod tests {
         let folder = tempfile::tempdir().expect("temp dir");
         let repository = folder.path().join("repo");
         let nested = repository.join("crates/app");
+        assert_eq!(
+            resolve(repository.clone()).await.expect("resolves"),
+            None,
+            "not there"
+        );
         std::fs::create_dir_all(&nested).expect("folders");
-        assert_eq!(resolve(repository.clone()).await, None, "not a repository");
+        assert_eq!(
+            resolve(repository.clone()).await.expect("resolves"),
+            None,
+            "not a repository"
+        );
         crate::git::git(&repository, &["init", "--quiet"], &[])
             .await
             .expect("git init");
-        assert_eq!(resolve(repository.clone()).await, None, "no remote");
+        assert_eq!(
+            resolve(repository.clone()).await.expect("resolves"),
+            None,
+            "no remote"
+        );
         crate::git::git(
             &repository,
             &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
@@ -402,7 +431,10 @@ mod tests {
         )
         .await
         .expect("adds the remote");
-        let identity = resolve(nested).await.expect("resolves");
+        let identity = resolve(nested)
+            .await
+            .expect("resolves")
+            .expect("a repository");
         assert_eq!(identity.canonical_key, "github.com/owner/repo");
         assert_eq!(
             std::fs::canonicalize(&identity.root_path).expect("root"),

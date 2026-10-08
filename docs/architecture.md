@@ -1074,7 +1074,11 @@ for `t3_`.
   delete threads or answer permissions; `clientRequestId` idempotency; agent-created threads and
   messages are marked `createdBy: agent` and shown as such.
 - **Across machines** (`tools/relay.rs`): calls naming another machine go through the app, which
-  reaches every machine, so they work only while the app is open.
+  reaches every machine, so they work only while the app is open. The app runs them there as
+  `ToolCaller::Relayed`, which never relays again: `agentz_thread_list`'s first page asks every
+  machine with the project on its own, and a relayed list asking back made the two machines pass
+  it back and forth forever. The list leaves out a machine that doesn't answer in 10 seconds,
+  with its error under `machines`.
 
 ### Subthreads
 
@@ -1249,7 +1253,9 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
 - **Merged projects** (`repositories.rs`, `machines::build_project_groups`, t3code's
   `projectGrouping.ts` and `normalizeGitRemoteUrl` with their tests): checkouts with the same
   primary remote are one project; modes `repository`, `repository_path`, `separate`. New Thread
-  then asks which checkout.
+  then asks which checkout. Each server looks a project's repository up again every 15 minutes;
+  a lookup git couldn't answer (it didn't start, as when the server is out of file descriptors,
+  or took over 10 seconds) keeps the repository it had, so the project stays combined.
 - **Machine icons** (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`): detected from
   the hardware, or chosen by clicking the machine's icon in Settings › Machines.
 - **Start at login** (`login_item.rs`): a launch agent that runs `agentz-server start` once.

@@ -772,7 +772,7 @@ pub struct PeerCheckout {
 }
 
 /// A tool call for another machine: the client runs it there for the project at `path`
-/// ([`ToolCaller::Directory`]) and answers with [`Request::RelayToolResult`].
+/// ([`ToolCaller::Relayed`]) and answers with [`Request::RelayToolResult`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RelayToolCall {
     pub relay_id: u64,
@@ -845,6 +845,10 @@ pub enum ToolCaller {
     Thread(ThreadId),
     /// A directory inside a project, as the CLI run elsewhere knows it.
     Directory(PathBuf),
+    /// A project's checkout, for a call another machine's server relayed through the app
+    /// ([`RelayToolCall`]). It runs here only: relaying it on would let two machines pass a
+    /// call back and forth forever.
+    Relayed(PathBuf),
 }
 
 /// A tool's answer: its result, or for a failure `{"code", "message"}` with t3code's failure

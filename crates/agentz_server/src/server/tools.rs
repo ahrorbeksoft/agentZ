@@ -101,11 +101,13 @@ impl ToolResults {
 }
 
 /// The project a call may manage, and the thread making it unless it came from the CLI run
-/// outside a thread.
+/// outside a thread or from another machine.
 #[derive(Clone, Copy, Debug)]
 struct Caller {
     project_id: ProjectId,
     thread_id: Option<ThreadId>,
+    /// Relayed from another machine ([`ToolCaller::Relayed`]), so it isn't relayed again.
+    relayed: bool,
 }
 
 impl Caller {
@@ -481,7 +483,7 @@ impl Server {
                 )
             })?,
             ToolCaller::Thread(thread_id) => *thread_id,
-            ToolCaller::Directory(path) => {
+            ToolCaller::Directory(path) | ToolCaller::Relayed(path) => {
                 let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                 // A project's worktrees and pastures count as part of it.
                 let (project_id, _) = self
@@ -508,6 +510,7 @@ impl Server {
                 return Ok(Caller {
                     project_id,
                     thread_id: None,
+                    relayed: matches!(caller, ToolCaller::Relayed(_)),
                 });
             }
         };
@@ -520,6 +523,7 @@ impl Server {
         Ok(Caller {
             project_id: thread.project_id,
             thread_id: Some(thread_id),
+            relayed: false,
         })
     }
 
@@ -536,7 +540,9 @@ impl Server {
             Value::Null => &empty,
             _ => return Err(invalid("The arguments must be an object.")),
         });
-        if let Some(outcome) = self.relay_if_elsewhere(caller, name, &arguments) {
+        if !caller.relayed
+            && let Some(outcome) = self.relay_if_elsewhere(caller, name, &arguments)
+        {
             return outcome;
         }
         let request_key = arguments.string("clientRequestId", 256)?.map(|request_id| {

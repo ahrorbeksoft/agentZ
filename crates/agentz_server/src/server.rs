@@ -470,7 +470,10 @@ impl Server {
         server
     }
 
-    /// Looks up the repository of each project whose last lookup is stale.
+    /// Looks up the repository of each project whose last lookup is stale. A lookup git
+    /// couldn't answer keeps the repository the project had: dropping it would take the
+    /// project out of its combined project, and other machines' agents would lose its
+    /// checkout here.
     fn refresh_repositories(&mut self) {
         let paths = self
             .projects
@@ -479,10 +482,22 @@ impl Server {
             .map(|project| project.path.clone());
         for path in self.repository_checks.take_due(paths, Instant::now()) {
             let resolved = repositories::resolve(path.clone());
-            self.spawn_then(resolved, move |server, repository| {
-                server
-                    .repository_checks
-                    .finish(path.clone(), repository.is_some(), Instant::now());
+            self.spawn_then(resolved, move |server, resolved| {
+                server.repository_checks.finish(
+                    path.clone(),
+                    matches!(resolved, Ok(Some(_))),
+                    Instant::now(),
+                );
+                let repository = match resolved {
+                    Ok(repository) => repository,
+                    Err(error) => {
+                        log::warn!(
+                            "couldn't look up {}'s repository: {error:#}",
+                            path.display()
+                        );
+                        return;
+                    }
+                };
                 let project = server
                     .projects
                     .projects()

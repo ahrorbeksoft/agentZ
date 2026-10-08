@@ -9,6 +9,7 @@
 //! lineage can't span two servers.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use agentz_protocol::{Event, PeerMachine, Peers, RelayToolCall, ServerMessage, ToolResult};
 use collections::HashMap;
@@ -37,6 +38,13 @@ pub(super) const RELAYED_TOOLS: [&str; 14] = [
     "agentz_workspace_list",
     "agentz_terminal_list",
 ];
+
+/// The list asks machines the caller didn't name, so one that doesn't answer is left out
+/// rather than holding up the rest.
+#[cfg(not(test))]
+const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Codes a relayed failure keeps; others become `orchestration_error`.
 const FAILURE_CODES: [&str; 19] = [
@@ -323,6 +331,9 @@ impl Server {
         arguments: &Arguments,
         local: Value,
     ) -> Step {
+        if caller.relayed {
+            return Step::Done(local);
+        }
         let this_machine = self
             .relays
             .latest()
@@ -371,7 +382,20 @@ impl Server {
                 ),
                 Err(failure) => async move { Err(failure) }.boxed(),
             };
-            lists.push(async move { (machine, list.await) });
+            lists.push(async move {
+                let list = tokio::time::timeout(LIST_RELAY_TIMEOUT, list)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(failure(
+                            "machine_unavailable",
+                            format!(
+                                "{machine} didn't answer within {} seconds.",
+                                LIST_RELAY_TIMEOUT.as_secs()
+                            ),
+                        ))
+                    });
+                (machine, list)
+            });
         }
         Step::Background(
             async move {
