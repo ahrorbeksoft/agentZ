@@ -128,7 +128,8 @@ From Zed's guidelines, which this code follows:
   JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp` (or
   `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>`, `delete <path>` and
   `tool-call <json>` (tool calls as given, as any agent would send them) script different
-  turns (see its docstring). `background-task [seconds]` leaves a command running
+  turns (see its docstring), and `network-error` fails its first turn as a lost connection
+  does. `background-task [seconds]` leaves a command running
   as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
   once it ends. With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
@@ -146,7 +147,7 @@ From Zed's guidelines, which this code follows:
   that variable as Droid's "Factory API Key" does; the server tests' mock is described with
   all three, so it can have accounts. Run with `--status`, it prints `{"logged_in": …}` as
   agents' status commands do, and with `MOCK_OPENS_LOGGED_OUT` its sessions open while it's
-  logged out, as Claude Agent's do. Run with `--usage`, it prints a read of its account
+  logged out, as Claude Agent's do, and their prompts ask for the login. Run with `--usage`, it prints a read of its account
   (email, plan, a 5-hour window that each reply in the home fills by 10%); once it's full,
   prompts fail with "Usage limit reached" until it resets (`resets_at` in the home sets
   when, in seconds since the epoch), and a `windows` file there (a JSON array of `label`,

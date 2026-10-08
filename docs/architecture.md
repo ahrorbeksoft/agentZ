@@ -581,6 +581,18 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the agent is on (`ThreadState::steering_queued`): once no tool call since the last message is
   running (or it asks for permission), the server cancels the turn and the queue sends the
   message. Editing or removing the front message disarms it.
+- **Retry** (`AgentThread::retry_message`, `Request::RetryMessage`, `ThreadState::failed_message`,
+  `agent_view.rs`'s `render_errors`; Zed's `retry_button`): a message the agent didn't get
+  through fails rather than waiting, and the callout above the composer has Retry, which sends
+  it again as it went (its mentions and the conversation a continued thread brings) without
+  showing it twice. A message the agent asked for a login at (Claude Agent asks at the
+  prompt), one sent while it needs a login, and one waiting for a session that asks for one
+  say "The message wasn't sent" (`FailedMessage::NeedsLogin`), and Retry works once the
+  agent is ready, after the login; logging in doesn't send it by itself. A turn that ends with
+  an error (`FailedMessage::TurnFailed`, "The agent stopped with an error") has Retry too:
+  Claude Agent and Codex retry a lost connection themselves, and the prompt fails once they
+  give up. The failed message and its error stay across a reload of the agent, and a new
+  message takes its place. The retried reply starts a message of its own.
 - **Background tasks** (`AgentThread::{apply_background_task_update, stop_background_task}`,
   `AgentView::render_background_tasks_section`; t3code's pending background work, new UI in the
   Agents section's style): Claude Agent reports what it leaves running after a turn (commands

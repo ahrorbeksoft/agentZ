@@ -20,8 +20,8 @@ use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
-    without_handoff,
+    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, PlanItem, SessionRestore,
+    ToolCall, without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
@@ -4942,22 +4942,52 @@ impl AgentView {
         )
     }
 
-    fn render_errors(&self, cx: &App) -> Option<AnyElement> {
+    fn render_errors(&self, cx: &Context<Self>) -> Option<AnyElement> {
         // The limit notice says it instead, even once closed.
         let at_limit = self.limit_reached(SystemTime::now(), cx).is_some();
         let thread = self.thread.read(cx);
+        // Zed's `retry_button`. The message goes once the agent is ready for it, which, when it
+        // asked for a login, is after one.
+        let retry_button = || {
+            let can_retry = thread.status() == &ConnectionStatus::Ready && !thread.is_working();
+            div().debug_selector(|| "retry-message".into()).child(
+                Button::new("retry-message", "Retry")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Filled)
+                    .disabled(!can_retry)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.thread
+                            .update(cx, |thread, cx| thread.retry_message(cx));
+                    })),
+            )
+        };
+        let failed_message = thread.failed_message();
         let callout = if let ConnectionStatus::Failed(error) = thread.status() {
             Callout::new()
                 .severity(Severity::Error)
                 .icon(IconName::XCircle)
                 .title(format!("{} couldn't start", self.agent_name(cx)))
                 .description(error.clone())
+        } else if failed_message == Some(FailedMessage::NeedsLogin) {
+            Callout::new()
+                .severity(Severity::Error)
+                .icon(IconName::XCircle)
+                .title("The message wasn't sent")
+                .description(format!(
+                    "{} asked for a login before taking it. Once you've logged in, retry.",
+                    self.agent_name(cx)
+                ))
+                .actions_slot(retry_button())
         } else if let Some(error) = thread.turn_error().filter(|_| !at_limit) {
             Callout::new()
                 .severity(Severity::Error)
                 .icon(IconName::XCircle)
                 .title("The agent stopped with an error")
                 .description(error.clone())
+                .when(
+                    failed_message == Some(FailedMessage::TurnFailed),
+                    |callout| callout.actions_slot(retry_button()),
+                )
         } else if let Some(error) = &self.continue_error {
             Callout::new()
                 .severity(Severity::Error)
@@ -10765,6 +10795,67 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("background-task-name-0").is_none());
+    }
+
+    /// A message the agent wanted a login for says it wasn't sent, with Retry, which works
+    /// once the agent is ready. A failed turn has Retry too.
+    #[gpui::test]
+    fn failed_messages_have_retry(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let retries = |cx: &mut VisualTestContext| {
+            sent(&client, cx)
+                .iter()
+                .filter(|request| matches!(request, Request::RetryMessage(_)))
+                .count()
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Build it".into())], cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.status = ConnectionStatus::AuthRequired;
+                    state.failed_message = Some(FailedMessage::NeedsLogin);
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let retry = cx.debug_bounds("retry-message").expect("Retry");
+        cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(retries(cx), 0, "not before the agent is logged in");
+
+        thread.update(cx, |thread, cx| {
+            thread.set_status_for_test(ConnectionStatus::Ready, cx)
+        });
+        cx.run_until_parked();
+        let retry = cx.debug_bounds("retry-message").expect("Retry");
+        cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(retries(cx), 1);
+
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.failed_message = Some(FailedMessage::TurnFailed);
+                    state.turn_error = Some("API Error: Connection error.".into());
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let retry = cx.debug_bounds("retry-message").expect("Retry");
+        cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(retries(cx), 2);
+
+        // An error with nothing to send again has no Retry.
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.failed_message = None, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("retry-message").is_none());
     }
 
     /// A message typed while the agent works goes to the queue the server keeps.

@@ -552,6 +552,9 @@ pub enum Request {
     Reauthenticate(ConnectionId),
     Logout(ConnectionId),
     RetrySession(ConnectionId),
+    /// Sends the message that didn't get through ([`thread::ThreadState::failed_message`])
+    /// again, once the agent is ready.
+    RetryMessage(ConnectionId),
     Reload(ConnectionId),
     /// From a login session: checks again whether the agent is logged in.
     CheckLogin(ConnectionId),

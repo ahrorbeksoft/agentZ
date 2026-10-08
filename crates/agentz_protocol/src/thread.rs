@@ -382,6 +382,9 @@ pub struct ThreadState {
     pub finished_turns: Vec<TurnTime>,
     pub last_stop_reason: Option<acp::StopReason>,
     pub turn_error: Option<SharedString>,
+    /// The user's last message didn't get through, and Retry sends it again
+    /// ([`crate::Request::RetryMessage`]).
+    pub failed_message: Option<FailedMessage>,
     /// The outcome of the last log in or out on a connection made only for that.
     pub login_notice: Option<SharedString>,
     /// What the agent says about itself when it starts.
@@ -665,6 +668,10 @@ impl ThreadView {
         self.state.turn_error.as_ref()
     }
 
+    pub fn failed_message(&self) -> Option<FailedMessage> {
+        self.state.failed_message
+    }
+
     pub fn last_stop_reason(&self) -> Option<&acp::StopReason> {
         self.state.last_stop_reason.as_ref()
     }
@@ -790,6 +797,15 @@ const HANDOFF_BUDGET: usize = 40_000;
 const HANDOFF_MESSAGE_LIMIT: usize = 6_000;
 /// The most tool calls named for one of the agent's turns.
 const HANDOFF_TOOL_LIMIT: usize = 20;
+
+/// Why the user's last message didn't get through ([`ThreadState::failed_message`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailedMessage {
+    /// The agent asked for a login instead of taking it.
+    NeedsLogin,
+    /// The agent's turn on it ended with [`ThreadState::turn_error`].
+    TurnFailed,
+}
 
 /// The conversation a thread continues with another agent, sent with its first message
 /// ("Continue with another agent").

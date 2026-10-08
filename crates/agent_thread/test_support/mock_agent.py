@@ -22,7 +22,8 @@ writes the text and a newline to the file, relative to the session's folder, and
 terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
 and replies "Terminal <exit code>: <output>", then releases it. "tool-call <json>" reports
 the tool call (or array of them) in the JSON as completed, as given (title, kind, rawInput,
-content, locations), and ends the turn.
+content, locations), and ends the turn. "network-error" starts a reply, then fails as a turn
+does once an agent gives up on a lost connection; sent again, it's echoed.
 
 With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail with
 "authentication required" and a pairing code, as Factory Droid does); "mock-login" creates
@@ -48,7 +49,7 @@ the file says, as FACTORY_API_KEY does, unless it's "refused". In a home, it als
 "mock-env-key", which logs in with that variable, as Droid's "Factory API Key" does. Run with
 `--status`, it prints {"logged_in": …} and exits with 1 when logged out, as agents' own status
 commands do. With MOCK_OPENS_LOGGED_OUT set, sessions open while it's logged out, as Claude
-Agent's do. Run with `--usage`, it prints what agentZ reads of an account: the email, plan and
+Agent's do, and their prompts fail with "authentication required" until it's logged in. Run with `--usage`, it prints what agentZ reads of an account: the email, plan and
 a 5-hour window, of which each reply in the home uses 10% (kept in `usage` in MOCK_HOME). The
 window resets in an hour, or at the time in seconds since the epoch in `resets_at` there, and
 once that has passed, none of it is used. While all of it is, prompts fail with "Usage limit
@@ -307,6 +308,8 @@ session_cwd = os.getcwd()
 settings = {"model": "sonnet", "effort": "medium", "mode": "default", "fast": False}
 # Set by logout: sessions then need a login, until the process restarts.
 logged_out = False
+# Set once a "network-error" prompt has failed, so it goes through when sent again.
+network_failed = False
 # Whether the client takes JetBrains AIR's async tasks, which Claude Agent reports its
 # background work with.
 async_tasks = False
@@ -747,6 +750,11 @@ for line in sys.stdin:
         params = message["params"]
         settings[params["configId"]] = params["value"]
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
+    elif (method == "session/prompt" and not logged_in()
+          and os.environ.get("MOCK_OPENS_LOGGED_OUT")):
+        # Its sessions open logged out, and it asks at the prompt, as Claude Agent does.
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "error": {"code": -32000, "message": "Authentication required"}})
     elif method == "session/prompt":
         params = message["params"]
         prompt_text = "".join(block.get("text", "") for block in params["prompt"]
@@ -765,6 +773,11 @@ for line in sys.stdin:
         if stops_at_limit():
             send({"jsonrpc": "2.0", "id": message["id"],
                   "error": {"code": -32603, "message": "Usage limit reached"}})
+        elif prompt_text == "network-error" and not network_failed:
+            network_failed = True
+            update(params["sessionId"], text_chunk("agent_message_chunk", "Let me"))
+            send({"jsonrpc": "2.0", "id": message["id"],
+                  "error": {"code": -32603, "message": "API Error: Connection error."}})
         elif prompt_text == "permission":
             next_request_id += 1
             pending[next_request_id] = (message["id"], params["sessionId"], prompt_text)

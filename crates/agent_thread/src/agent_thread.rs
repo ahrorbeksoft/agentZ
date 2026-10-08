@@ -29,8 +29,8 @@ use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
     AuthStatus, BackgroundTask, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry,
-    FileDiff, PendingHandoff, PermissionOption, PermissionRequest, PlanItem, QueuedMessage,
-    SessionDefaults, SessionRestore, ThreadState, ThreadView, ToolCall, TurnTime,
+    FailedMessage, FileDiff, PendingHandoff, PermissionOption, PermissionRequest, PlanItem,
+    QueuedMessage, SessionDefaults, SessionRestore, ThreadState, ThreadView, ToolCall, TurnTime,
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -283,6 +283,12 @@ struct Session {
     session_id: acp::SessionId,
 }
 
+struct SentMessage {
+    parts: Vec<MessagePart>,
+    /// The conversation that went with it, which goes again with it.
+    handoff: Option<PendingHandoff>,
+}
+
 pub struct AgentThread {
     /// What clients see.
     view: ThreadView,
@@ -304,6 +310,9 @@ pub struct AgentThread {
     /// The conversation this thread continues, taken from [`ThreadState::handoff`] by the first
     /// message, to go with it once that's sent.
     handoff_to_send: Option<PendingHandoff>,
+    /// The user's last message, as it went to the agent, to send again if it doesn't get
+    /// through ([`ThreadState::failed_message`]).
+    last_message: Option<SentMessage>,
     /// Given to the agent with every session it opens.
     mcp_servers: Vec<acp::McpServer>,
     /// Where images the agent shows or replays are kept, for messages to link to.
@@ -566,6 +575,7 @@ impl AgentThread {
             after_turn: VecDeque::new(),
             entries_changed_from: Some(0),
             handoff_to_send: None,
+            last_message: None,
             mcp_servers: Vec::new(),
             attachments: None,
             terminal_host: None,
@@ -762,6 +772,7 @@ impl AgentThread {
                 }
                 if std::mem::take(&mut self.waits_for_login) {
                     self.view.state.status = ConnectionStatus::AuthRequired;
+                    self.queued_prompts_need_login();
                     return;
                 }
                 // A login session opens an empty session too: it is how the login
@@ -910,17 +921,22 @@ impl AgentThread {
             MessageKind::PromptFinished(result) => {
                 self.turn_cancelled = None;
                 match result {
-                    Ok(response) => self.view.state.last_stop_reason = Some(response.stop_reason),
-                    // Some agents (OpenCode) open sessions logged out and ask at the first
-                    // prompt.
+                    Ok(response) => {
+                        self.view.state.last_stop_reason = Some(response.stop_reason);
+                        self.last_message = None;
+                    }
+                    // Some agents (Claude Agent, OpenCode) open sessions logged out and ask at
+                    // the first prompt.
                     Err(error) if is_auth_required(&error) => {
                         self.view.state.status = ConnectionStatus::AuthRequired;
                         self.found_logged_out();
                         self.view.state.auth_description = auth_description(&error);
+                        self.message_failed(FailedMessage::NeedsLogin);
                     }
                     Err(error) => {
                         log::error!("agent prompt failed: {error:?}");
                         self.view.state.turn_error = Some(error_message(&error).into());
+                        self.message_failed(FailedMessage::TurnFailed);
                     }
                 }
                 // A finished turn can't still be waiting on a permission answer.
@@ -987,7 +1003,9 @@ impl AgentThread {
         // The new agent waits for the old one to close the session it will load.
         let stopping = self.stop_agent();
         self.generation += 1;
-        if !self.has_conversation {
+        // What a loading session replayed comes again. An agent that asked for a login
+        // replayed nothing: its entries are messages that didn't go, which Retry sends.
+        if !self.has_conversation && self.view.state.status != ConnectionStatus::AuthRequired {
             self.view.entries.clear();
             self.view.state.finished_turns.clear();
             self.entry_changed(0);
@@ -1008,7 +1026,11 @@ impl AgentThread {
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
         self.view.state.login_page = None;
-        self.view.state.turn_error = None;
+        // A failed message can still go once the agent is back (after a login, often), and its
+        // error says why it failed.
+        if self.view.state.failed_message.is_none() {
+            self.view.state.turn_error = None;
+        }
         self.view.state.status = ConnectionStatus::Connecting;
         self.authenticate_once_connected = log_in_with;
         self.waits_for_login = false;
@@ -1132,7 +1154,8 @@ impl AgentThread {
 
     /// Gives up on the login in flight. Agents' browser logins only return once the user
     /// finishes (or the login expires), and some keep a callback server on a fixed port, so the
-    /// agent restarts, as t3code does. Prompts waiting for the login still go out after one.
+    /// agent restarts, as t3code does. A message that failed for want of the login can still be
+    /// retried after one.
     pub fn cancel_authentication(&mut self) {
         if self.view.state.authenticating.is_none() {
             return;
@@ -1317,6 +1340,8 @@ impl AgentThread {
         this.adopted_process = Some(ProcessGuard(process));
         let is_working = snapshot.view.is_working();
         this.view = snapshot.view;
+        // The message to retry stayed with the server it came from.
+        this.view.state.failed_message = None;
         this.has_conversation = true;
         // Ready once the new connection is.
         this.view.state.status = ConnectionStatus::Connecting;
@@ -1546,6 +1571,7 @@ impl AgentThread {
                 self.view.state.status = ConnectionStatus::AuthRequired;
                 self.found_logged_out();
                 self.view.state.auth_description = auth_description(&error);
+                self.queued_prompts_need_login();
                 self.set_working(false);
             }
             Err(error) => self.fail(format!("starting a session: {}", error_message(&error))),
@@ -1559,6 +1585,53 @@ impl AgentThread {
             self.emit(AgentThreadEvent::LoggedOut);
         }
         self.view.state.logged_in = Some(false);
+    }
+
+    /// The user's last message didn't get through: it waits for their Retry
+    /// ([`Self::retry_message`]).
+    fn message_failed(&mut self, reason: FailedMessage) {
+        if self.last_message.is_some() {
+            self.view.state.failed_message = Some(reason);
+        }
+    }
+
+    /// The agent asked for a login before its session opened, so the message waiting for the
+    /// session fails, as one the agent asks for a login at does. The user retries it once
+    /// logged in, rather than it going by itself after the login.
+    fn queued_prompts_need_login(&mut self) {
+        // Only one waits: the thread works while it does, and takes no other.
+        let Some(parts) = self.queued_prompts.pop() else {
+            return;
+        };
+        self.queued_prompts.clear();
+        // The conversation it continues is still to go, in `handoff_to_send`.
+        self.last_message = Some(SentMessage {
+            parts,
+            handoff: None,
+        });
+        self.message_failed(FailedMessage::NeedsLogin);
+    }
+
+    /// Sends the message that didn't get through ([`ThreadState::failed_message`]) again, as it
+    /// went, once the agent is ready for it. The thread shows it once.
+    pub fn retry_message(&mut self) {
+        if self.view.state.failed_message.is_none()
+            || self.view.state.status != ConnectionStatus::Ready
+            || self.is_working()
+        {
+            return;
+        }
+        let Some(message) = self.last_message.take() else {
+            return;
+        };
+        self.view.state.failed_message = None;
+        self.view.state.turn_error = None;
+        if message.handoff.is_some() {
+            self.handoff_to_send = message.handoff;
+        }
+        // The new reply isn't more of what the failed turn said.
+        self.new_message_due = true;
+        self.send_to_agent(message.parts);
     }
 
     /// Logs in with one of the agent's own methods, then opens the session. `meta` carries
@@ -1813,14 +1886,23 @@ impl AgentThread {
             self.handoff_to_send = Some(handoff);
         }
         self.view.state.turn_error = None;
+        // A new message takes the place of one that didn't get through.
+        self.view.state.failed_message = None;
+        self.last_message = None;
         match self.view.state.status {
             ConnectionStatus::Ready => self.send_to_agent(parts),
             ConnectionStatus::Connecting => {
                 self.queued_prompts.push(parts);
                 self.set_working(true);
             }
-            // Sent once the user has logged in and the session opens.
-            ConnectionStatus::AuthRequired => self.queued_prompts.push(parts),
+            // As if the agent had asked for the login at it: the user retries it once logged in.
+            ConnectionStatus::AuthRequired => {
+                self.last_message = Some(SentMessage {
+                    parts,
+                    handoff: None,
+                });
+                self.message_failed(FailedMessage::NeedsLogin);
+            }
             ConnectionStatus::Failed(_) => {}
         }
     }
@@ -1962,8 +2044,9 @@ impl AgentThread {
         if self.session.is_none() {
             return;
         }
-        let mut prompt = self.content_blocks(parts);
-        if let Some(handoff) = self.handoff_to_send.take() {
+        let mut prompt = self.content_blocks(parts.clone());
+        let handoff = self.handoff_to_send.take();
+        if let Some(handoff) = &handoff {
             // Embedded, the agent tells it from the message: replays show only the message.
             let block = if self
                 .view
@@ -1974,16 +2057,17 @@ impl AgentThread {
             {
                 acp::ContentBlock::Resource(acp::EmbeddedResource::new(
                     acp::EmbeddedResourceResource::TextResourceContents(
-                        acp::TextResourceContents::new(handoff.text, "agentz://handoff")
+                        acp::TextResourceContents::new(handoff.text.clone(), "agentz://handoff")
                             .mime_type("text/markdown".to_string()),
                     ),
                 ))
             } else {
-                acp::ContentBlock::Text(acp::TextContent::new(handoff.text))
+                acp::ContentBlock::Text(acp::TextContent::new(handoff.text.clone()))
             };
             prompt.insert(0, block);
             self.emit(AgentThreadEvent::HandoffSent(handoff.from));
         }
+        self.last_message = Some(SentMessage { parts, handoff });
         let Some(session) = &self.session else {
             return;
         };
@@ -4315,16 +4399,175 @@ mod tests {
         thread
             .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
             .await;
-        // The prompt waiting for the login is kept, with when it was sent.
+        // The message that failed for want of the login is kept, with when it was sent.
         assert_eq!(
             thread.thread.entries(),
             [Entry::UserMessage("hello".into())]
         );
         assert!(thread.thread.sent_time(0).is_some());
+        assert_eq!(
+            thread.thread.failed_message(),
+            Some(FailedMessage::NeedsLogin)
+        );
         thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(AgentThread::retry_message);
         thread
             .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
             .await;
+    }
+
+    /// A message the agent asks for a login at, as Claude Agent asks in a session it opened
+    /// logged out, fails. Once logged in, Retry sends it, and the thread shows it once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_that_needed_a_login_is_retried_after_one() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let login_dir = tempfile::tempdir().expect("temp dir");
+        command.env.insert(
+            "MOCK_LOGIN_FILE".into(),
+            login_dir
+                .path()
+                .join("logged-in")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        command
+            .env
+            .insert("MOCK_OPENS_LOGGED_OUT".into(), "1".into());
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("hello".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working() && thread.failed_message() == Some(FailedMessage::NeedsLogin)
+            })
+            .await;
+        assert_eq!(thread.thread.status(), &ConnectionStatus::AuthRequired);
+        // Not until the agent is ready for it.
+        thread.update(AgentThread::retry_message);
+        assert!(!thread.thread.is_working());
+
+        thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        // Logging in doesn't send it by itself.
+        assert_eq!(
+            thread.thread.failed_message(),
+            Some(FailedMessage::NeedsLogin)
+        );
+        assert_eq!(agent_text(&thread.thread), "");
+
+        thread.update(AgentThread::retry_message);
+        assert_eq!(thread.thread.failed_message(), None);
+        thread
+            .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
+            .await;
+        assert_eq!(user_messages(&thread.thread), ["hello"]);
+    }
+
+    /// A message sent while the session opens fails when the agent asks for a login to open
+    /// it, as one it asks at does, rather than going by itself once the user has logged in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_waiting_for_a_session_fails_when_it_needs_a_login() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        let login_dir = tempfile::tempdir().expect("temp dir");
+        command.env.insert(
+            "MOCK_LOGIN_FILE".into(),
+            login_dir
+                .path()
+                .join("logged-in")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let mut thread = start(command, None);
+        thread.update(|thread| thread.send("hello".into()));
+        assert!(thread.thread.is_working());
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::AuthRequired)
+            .await;
+        assert!(!thread.thread.is_working());
+        assert_eq!(
+            thread.thread.failed_message(),
+            Some(FailedMessage::NeedsLogin)
+        );
+
+        thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(!thread.thread.is_working());
+        thread.update(AgentThread::retry_message);
+        thread
+            .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
+            .await;
+        assert_eq!(user_messages(&thread.thread), ["hello"]);
+    }
+
+    /// A turn that fails, as on a lost connection, keeps its message and error, even across a
+    /// reload, and Retry sends the message again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_turn_is_retried() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("network-error".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working() && thread.failed_message() == Some(FailedMessage::TurnFailed)
+            })
+            .await;
+        assert_eq!(
+            thread.thread.turn_error().map(|error| error.as_ref()),
+            Some("API Error: Connection error.")
+        );
+
+        thread.update(AgentThread::reload);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(
+            thread.thread.failed_message(),
+            Some(FailedMessage::TurnFailed)
+        );
+        assert!(thread.thread.turn_error().is_some());
+
+        // The restarted mock fails it once more, then takes it.
+        thread.update(AgentThread::retry_message);
+        assert_eq!(thread.thread.turn_error(), None);
+        assert_eq!(thread.thread.failed_message(), None);
+        thread
+            .wait_until(|thread| {
+                !thread.is_working() && thread.failed_message() == Some(FailedMessage::TurnFailed)
+            })
+            .await;
+        thread.update(AgentThread::retry_message);
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).is_some_and(|text| text.contains("Echo"))
+            })
+            .await;
+        assert_eq!(thread.thread.failed_message(), None);
+        assert_eq!(thread.thread.turn_error(), None);
+        assert_eq!(user_messages(&thread.thread), ["network-error"]);
+        // Each try's reply is its own.
+        assert_eq!(
+            agent_messages(&thread.thread),
+            ["Let me", "Let me", "Echo: network-error"]
+        );
     }
 
     /// Logins that take something from the user pass it in `authenticate`'s `_meta`.

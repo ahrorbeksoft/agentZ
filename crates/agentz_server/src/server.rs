@@ -1011,6 +1011,10 @@ impl Server {
                 self.update_thread(connection, |thread| thread.retry_session())?;
                 Ok(Response::Ok)
             }
+            Request::RetryMessage(connection) => {
+                self.update_thread(connection, AgentThread::retry_message)?;
+                Ok(Response::Ok)
+            }
             Request::Reload(connection) => {
                 self.update_thread(connection, |thread| thread.reload())?;
                 Ok(Response::Ok)

@@ -428,6 +428,11 @@ impl AgentThread {
         self.request(Request::RetrySession, cx)
     }
 
+    /// Sends the message that didn't get through again.
+    pub fn retry_message(&mut self, cx: &mut Context<Self>) {
+        self.request(Request::RetryMessage, cx)
+    }
+
     /// Starts this continued thread without the conversation it would have brought.
     pub fn drop_handoff(&mut self, cx: &mut Context<Self>) {
         self.request(Request::DropHandoff, cx)

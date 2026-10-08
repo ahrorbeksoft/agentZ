@@ -22,7 +22,7 @@ use agentz_protocol::terminal::{
     TerminalSelectionKind, TerminalSelectionUpdate,
 };
 use agentz_protocol::thread::{
-    ConnectionStatus, Entry, LoginInput, ThreadView, api_key_meta, login_input,
+    ConnectionStatus, Entry, FailedMessage, LoginInput, ThreadView, api_key_meta, login_input,
 };
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -436,6 +436,73 @@ async fn prompts_a_thread_and_names_it() {
         })
         .await;
     assert!(error.is_err());
+}
+
+/// Retry sends a message whose turn failed again, with the conversation a continued thread
+/// brings, which went with it the first time. The thread shows the message once.
+#[tokio::test(flavor = "multi_thread")]
+async fn retries_a_failed_message() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let old = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(old).await;
+    client
+        .ok(Request::Prompt {
+            connection: old,
+            prompt: PromptPart::text("build the page"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            !client.thread(old).is_working() && !agent_text(client.thread(old)).is_empty()
+        })
+        .await;
+    let Response::ThreadCreated(new_id) = client
+        .ok(Request::ContinueThread {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+            account: AccountChoice::Default,
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let new = ConnectionId::Thread(new_id);
+    client.subscribe_thread(new).await;
+
+    client
+        .ok(Request::Prompt {
+            connection: new,
+            prompt: PromptPart::text("network-error"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(new);
+            !thread.is_working() && thread.failed_message() == Some(FailedMessage::TurnFailed)
+        })
+        .await;
+    client.ok(Request::RetryMessage(new)).await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(new);
+            !thread.is_working()
+                && agent_text(thread).ends_with("Echo: network-error [with agentz://handoff]")
+        })
+        .await;
+    let thread = client.thread(new);
+    assert_eq!(thread.failed_message(), None);
+    assert_eq!(thread.turn_error(), None);
+    let user_messages = thread
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::UserMessage(_)))
+        .count();
+    assert_eq!(user_messages, 1);
 }
 
 /// "Continue with another agent": a new thread in the same workspace, pointing back at the old
