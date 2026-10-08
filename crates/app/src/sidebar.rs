@@ -1667,14 +1667,14 @@ impl Sidebar {
                         .when(is_archivable, |this| this.child(archive_button)),
                 )
         });
-        // The same pen as the draft rows, so both kinds of unsent work read the same way.
-        let unsent_marker = has_unsent_text.then(|| {
-            div()
-                .id(thread_element_id("unsent-text", thread_id))
-                .debug_selector(|| format!("unsent-text-{}", thread_id.thread.0))
-                .flex_none()
-                .tooltip(Tooltip::text("Unsent draft"))
-                .child(render_draft_pen())
+        // The same badge as the draft rows, so both kinds of unsent work read the same way.
+        // Discard draft takes its place on hover.
+        let draft_badge = has_unsent_text.then(|| {
+            render_draft_badge(cx)
+                .debug_selector(|| format!("draft-badge-{}", thread_id.thread.0))
+                .when(has_hover_buttons, |this| {
+                    this.group_hover(group_name.clone(), |this| this.invisible())
+                })
         });
         let title_element = if is_renaming {
             self.render_rename_input(cx)
@@ -1695,7 +1695,6 @@ impl Sidebar {
                 .h_5()
                 .min_w_0()
                 .gap_1p5()
-                .children(unsent_marker)
                 .child(match &folder_name {
                     Some(_) => render_folder_icon(),
                     None => self.render_project_icon(machine, project.as_ref(), cx),
@@ -1715,6 +1714,7 @@ impl Sidebar {
                     ),
                 )
                 .children(pin)
+                .children(draft_badge)
                 .child(status_slot)
                 .children(hover_buttons);
             let title_line = h_flex().mt_1().min_w_0().child(title_element);
@@ -1724,9 +1724,9 @@ impl Sidebar {
                 .relative()
                 .min_w_0()
                 .gap_1p5()
-                .children(unsent_marker)
                 .child(title_element)
                 .children(pin)
+                .children(draft_badge)
                 .child(status_slot)
                 .children(hover_buttons);
             (None, title_line)
@@ -1856,7 +1856,7 @@ impl Sidebar {
     }
 
     /// t3code's draft row: a new thread with something typed and nothing sent, as its project
-    /// and the first line of the text, on a warning tint.
+    /// and the first line of the text, marked Draft as a card with unsent text is.
     fn render_draft_row(
         &self,
         store: &Entity<ProjectStore>,
@@ -1887,8 +1887,8 @@ impl Sidebar {
             .next()
             .unwrap_or_default()
             .to_string();
-        let tint = Color::Warning.color(cx);
         let selected_background = cx.theme().colors().ghost_element_selected;
+        let hover_background = cx.theme().colors().ghost_element_hover;
         let group_name =
             SharedString::from(format!("draft-row-{}-{}", machine.slug(), thread.id.0));
         let row = v_flex()
@@ -1905,8 +1905,7 @@ impl Sidebar {
                 if is_active {
                     row.bg(selected_background)
                 } else {
-                    row.bg(tint.opacity(0.04))
-                        .hover(|row| row.bg(tint.opacity(0.08)))
+                    row.hover(|row| row.bg(hover_background))
                 }
             })
             .when(is_offline, |row| row.opacity(0.5))
@@ -1916,7 +1915,6 @@ impl Sidebar {
                     .h_5()
                     .min_w_0()
                     .gap_1p5()
-                    .child(render_draft_pen())
                     .child(self.render_project_icon(machine, project.as_ref(), cx))
                     .child(
                         h_flex()
@@ -1935,12 +1933,32 @@ impl Sidebar {
                                 }),
                             ),
                     )
+                    // Discard draft takes the badge's place on hover, as on a card.
                     .child(
                         h_flex()
+                            .relative()
                             .h_full()
                             .flex_none()
-                            .visible_on_hover(group_name)
-                            .child(render_discard_draft_button(thread_id, store.clone(), cx)),
+                            .child(
+                                render_draft_badge(cx)
+                                    .debug_selector(|| {
+                                        format!("draft-badge-{}", thread_id.thread.0)
+                                    })
+                                    .group_hover(group_name.clone(), |this| this.invisible()),
+                            )
+                            .child(
+                                h_flex()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .visible_on_hover(group_name)
+                                    .child(render_discard_draft_button(
+                                        thread_id,
+                                        store.clone(),
+                                        cx,
+                                    )),
+                            ),
                     ),
             )
             .child(
@@ -3018,11 +3036,21 @@ fn render_checkout_marker(
     )
 }
 
-/// t3code's pen for unsent work.
-fn render_draft_pen() -> Icon {
-    Icon::new(IconName::SquarePen)
-        .size(IconSize::XSmall)
-        .color(Color::Warning)
+/// The gray "Draft" badge on unsent work, picked in `design/draft-cards/` over t3code's
+/// yellow pen, which read like Pending Approval.
+fn render_draft_badge(cx: &App) -> Div {
+    h_flex()
+        .flex_none()
+        .h_4()
+        .px(px(5.))
+        .rounded(px(4.))
+        .bg(cx.theme().colors().text_muted.opacity(0.12))
+        .child(
+            Label::new("Draft")
+                .size(LabelSize::XSmall)
+                .weight(FontWeight::MEDIUM)
+                .color(Color::Muted),
+        )
 }
 
 /// t3code's Discard draft button: a muted × that brightens under the mouse. Clearing the
@@ -3602,14 +3630,15 @@ mod view_tests {
         );
         // A draft is a row once something is typed, and never a card.
         assert!(shown("draft-row-1", cx));
+        assert!(shown("draft-badge-1", cx));
         assert!(!shown("thread-card-1", cx));
         assert!(!shown("draft-row-2", cx));
         assert!(!shown("thread-card-2", cx));
-        // A thread with unsent text is marked with the pen, unless it's open.
-        assert!(shown("unsent-text-3", cx));
-        assert!(!shown("unsent-text-4", cx));
+        // A thread with unsent text is marked Draft, unless it's open.
+        assert!(shown("draft-badge-3", cx));
+        assert!(!shown("draft-badge-4", cx));
         open(&sidebar, 3, cx);
-        assert!(!shown("unsent-text-3", cx));
+        assert!(!shown("draft-badge-3", cx));
 
         // The open draft keeps its row.
         open(&sidebar, 1, cx);

@@ -268,11 +268,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   thread's keys. Agents pin and unpin with `agentz_thread_organize`.
 - **Draft rows** (`sidebar.rs`, `Machines::typed_drafts`; t3code's `SidebarDraftBlock`): drafts
   (below, under Agent threads) aren't cards. One with text typed in it is a row above the cards,
-  newest first, with t3code's pen, its project, and the first line of the text on a warning
-  tint, and × (Discard draft) on hover. The open draft's row is the one it had when opened
+  newest first, with its project, a gray "Draft" badge at the end of that line
+  (`render_draft_badge`, picked in `design/draft-cards/` over t3code's yellow pen and tint,
+  which read like Pending Approval), and the first line of the text, and × (Discard draft) in
+  the badge's place on hover. The open draft's row is the one it had when opened
   (`Sidebar::frozen_draft`), so it doesn't repaint as you type, and a draft never left has
-  none. A thread with unsent text that isn't open gets the pen before its project ("Unsent
-  draft") and a Discard draft × beside Archive. Discarding clears the text
+  none. A thread with unsent text that isn't open gets the same badge just before its state or
+  time (on the title line with one project selected) and a Discard draft × beside Archive.
+  Discarding clears the text
   (`Request::SetUnsentText` with none), and the server then removes a draft no one has open.
 - **Shells shelf** (`sidebar.rs`): terminal threads, named after their current folder, under the
   project that folder is in; one becomes a thread card while an agent CLI runs in it. Under a
