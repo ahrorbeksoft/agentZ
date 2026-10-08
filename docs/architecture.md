@@ -227,11 +227,13 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   read from this Mac's disk only.
 - **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons (the machine's only
   mark on a card, Disconnected while it's offline; draft rows name it), the thread's own
-  branch with a worktree or pasture marker, attention state, details popover (a custom anchored
-  element, since GPUI tooltips follow the cursor), rename, delete, archive with an Archived
-  shelf, title search, context menu. Automatic titles (the first prompt, the agent, a shell's
-  folder, a terminal's agent CLI) keep updating under the user's own (`Thread::automatic_title`),
-  which shows while set; clearing it shows the automatic one again, as with workspaces. While
+  branch with a worktree or pasture marker, its subthreads' count by a people icon (accent
+  while one runs; the details say "3 subthreads, 1 running"), attention state, details popover
+  (a custom anchored element, since GPUI tooltips follow the cursor), rename, delete, archive
+  with an Archived shelf, title search, context menu. Automatic titles (the first prompt, the
+  agent, a shell's folder, a terminal's agent CLI) keep updating under the user's own
+  (`Thread::automatic_title`), which shows while set; clearing it shows the automatic one
+  again, as with workspaces. While
   the thread's agent lists more than one account, the agent's icon is drawn in the color of
   the thread's account, if it has one (`AgentAccounts::thread_color`,
   `sidebar::thread_agent_icon`): on the card and its details, in Go To, in Workspaces' panes,

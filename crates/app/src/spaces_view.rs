@@ -2273,6 +2273,7 @@ impl SpacesView {
             path: Some(path.clone()),
             workspace: None,
             agent: None,
+            subthreads: None,
             contents: contents.clone().map(Into::into),
         };
         // In git, the checkout at a glance; elsewhere, the general details.

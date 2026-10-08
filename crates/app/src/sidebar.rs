@@ -1425,6 +1425,10 @@ impl Sidebar {
                 ))
             }),
             agent,
+            subthreads: store.and_then(|store| {
+                let (count, running) = subthread_counts(store, thread.id);
+                subthreads_label(count, running).map(SharedString::from)
+            }),
             contents: None,
         }
     }
@@ -1506,20 +1510,7 @@ impl Sidebar {
             ),
             None => (checkout.as_ref().and_then(ThreadCheckout::branch), checkout),
         };
-        let subthreads = {
-            let store = store.read(cx);
-            let subthreads = store.subthreads(thread.id);
-            let running = subthreads
-                .iter()
-                .filter(|thread| {
-                    thread
-                        .task
-                        .as_ref()
-                        .is_some_and(|task| task.outcome.is_none())
-                })
-                .count();
-            (subthreads.len(), running)
-        };
+        let subthreads = subthread_counts(store.read(cx), thread.id);
         let started_by = thread
             .created_by
             .map(|creator| format!("Started by {}", store.read(cx).describe_creator(creator)));
@@ -1817,22 +1808,16 @@ impl Sidebar {
                     )
                     .when(subthreads.0 > 0, |this| {
                         let (count, running) = subthreads;
-                        let tooltip = match (count, running) {
-                            (1, 0) => "1 agent".to_string(),
-                            (count, 0) => format!("{count} agents"),
-                            (count, running) => format!("{count} agents, {running} running"),
-                        };
                         let color = if running > 0 {
                             Color::Accent
                         } else {
                             Color::Custom(faint_text)
                         };
+                        // The details popover says what the count is.
                         this.child(
                             h_flex()
-                                .id(thread_element_id("thread-agents", thread_id))
                                 .flex_none()
                                 .gap_0p5()
-                                .tooltip(Tooltip::text(tooltip))
                                 .child(
                                     Icon::new(IconName::UserGroup)
                                         .size(IconSize::XSmall)
@@ -2818,6 +2803,8 @@ pub(crate) struct ThreadDetails {
     pub(crate) workspace: Option<(WorkspaceKind, SharedString)>,
     /// The agent's icon, colored, and its label.
     pub(crate) agent: Option<(Icon, SharedString)>,
+    /// How many subthreads the thread has, and how many of them run.
+    pub(crate) subthreads: Option<SharedString>,
     /// What a Workspaces view workspace holds, such as "2 terminals · 1 agent".
     pub(crate) contents: Option<SharedString>,
 }
@@ -2906,6 +2893,12 @@ impl ThreadDetails {
             rows.push(detail_row(
                 icon.size(IconSize::XSmall).into_any_element(),
                 Label::new(label).truncate(),
+            ));
+        }
+        if let Some(subthreads) = &self.subthreads {
+            rows.push(detail_row(
+                small_icon(IconName::UserGroup),
+                Label::new(subthreads.clone()).truncate(),
             ));
         }
         if let Some(contents) = &self.contents {
@@ -3179,7 +3172,18 @@ pub(crate) fn format_relative_time(time: SystemTime, now: SystemTime) -> String 
 
 #[cfg(test)]
 mod tests {
-    use super::{format_relative_time, repository_branch};
+    use super::{format_relative_time, repository_branch, subthreads_label};
+
+    #[test]
+    fn subthreads_are_counted_with_those_running() {
+        assert_eq!(subthreads_label(0, 0), None);
+        assert_eq!(subthreads_label(1, 0).as_deref(), Some("1 subthread"));
+        assert_eq!(subthreads_label(3, 0).as_deref(), Some("3 subthreads"));
+        assert_eq!(
+            subthreads_label(3, 1).as_deref(),
+            Some("3 subthreads, 1 running")
+        );
+    }
 
     #[test]
     fn a_branch_names_its_repository_under_another_title() {
@@ -3940,6 +3944,31 @@ pub(crate) fn thread_account_color(machine: MachineId, thread: &Thread, cx: &App
 /// Purple, apart from the other statuses' colors. Every bundled theme's fourth player color is
 /// one, and `Color::Player` skips the first (the local user's).
 pub(crate) const AWAITING_INPUT_COLOR: Color = Color::Player(2);
+
+/// The thread's subthreads, and how many of them still run their task.
+fn subthread_counts(store: &projects::ProjectStore, thread: projects::ThreadId) -> (usize, usize) {
+    let subthreads = store.subthreads(thread);
+    let running = subthreads
+        .iter()
+        .filter(|thread| {
+            thread
+                .task
+                .as_ref()
+                .is_some_and(|task| task.outcome.is_none())
+        })
+        .count();
+    (subthreads.len(), running)
+}
+
+/// "3 subthreads, 1 running", or nothing without any.
+fn subthreads_label(count: usize, running: usize) -> Option<String> {
+    match (count, running) {
+        (0, _) => None,
+        (1, 0) => Some("1 subthread".to_string()),
+        (count, 0) => Some(format!("{count} subthreads")),
+        (count, running) => Some(format!("{count} subthreads, {running} running")),
+    }
+}
 
 /// t3code's status pill: a dot and a label in the status color.
 pub(crate) fn render_status_pill(status: ThreadStatus, cx: &App) -> impl IntoElement {
