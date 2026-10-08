@@ -3,6 +3,7 @@
 mod account_requests;
 mod attachment_requests;
 mod custom_agents;
+mod favicon_reads;
 #[cfg(unix)]
 mod hand_off;
 mod key_logins;
@@ -45,7 +46,7 @@ use collections::{HashMap, HashSet};
 use futures::channel::mpsc;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui_shared_string::SharedString;
-use projects::{ProjectStore, ThreadCreator, ThreadId};
+use projects::{ProjectId, ProjectStore, ThreadCreator, ThreadId};
 use registry::{AgentRegistryStore, CommandFuture, RegistryMessage};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -71,8 +72,8 @@ use tools::{PendingToolCall, ToolResults};
 const MAX_THREAD_TITLE_CHARS: usize = 256;
 /// t3code sweeps every project each minute; lookups that aren't stale are skipped.
 const REPOSITORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-/// How often the branches checked out where projects and threads work are read again, so a
-/// switch made outside agentZ shows soon.
+/// How often the branches checked out where projects and threads work, and projects' icons,
+/// are read again, so a change made outside agentZ shows soon.
 const GIT_HEAD_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) type ClientId = u64;
@@ -185,6 +186,9 @@ pub(crate) struct Server {
     /// The folders whose branches were last read, so a new one is read at once.
     git_head_folders: BTreeSet<PathBuf>,
     reading_git_heads: bool,
+    /// The projects whose folders were last looked in for an icon, so a new one is at once.
+    favicon_projects: BTreeSet<ProjectId>,
+    reading_favicons: bool,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     accounts: AccountStore,
@@ -339,6 +343,8 @@ impl Server {
             repository_checks: RepositoryChecks::default(),
             git_head_folders: BTreeSet::new(),
             reading_git_heads: false,
+            favicon_projects: BTreeSet::new(),
+            reading_favicons: false,
             registry,
             agent_settings,
             accounts,
@@ -439,14 +445,17 @@ impl Server {
         server.runtime.spawn(async move {
             loop {
                 tokio::time::sleep(GIT_HEAD_INTERVAL).await;
-                let refresh =
-                    Input::Run(Box::new(|server: &mut Server| server.refresh_git_heads()));
+                let refresh = Input::Run(Box::new(|server: &mut Server| {
+                    server.refresh_git_heads();
+                    server.refresh_favicons();
+                }));
                 if inputs.unbounded_send(refresh).is_err() {
                     break;
                 }
             }
         });
         server.refresh_git_heads();
+        server.refresh_favicons();
         server.check_external_logins();
         server.start_usage_refreshes();
         server.resume_limit_waits();
@@ -621,6 +630,11 @@ impl Server {
                 id,
                 request: Request::ListFiles(thread_id),
             } => self.list_files(client, id, thread_id),
+            Input::Request {
+                client,
+                id,
+                request: Request::ProjectFavicon(project_id),
+            } => self.project_favicon(client, id, project_id),
             Input::Request {
                 client,
                 id,
@@ -1110,6 +1124,7 @@ impl Server {
                 Err(anyhow!("using a limit reset is handled separately"))
             }
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
+            Request::ProjectFavicon(_) => Err(anyhow!("favicons are handled separately")),
 
             Request::Shutdown => {
                 self.stopping = true;
@@ -2131,6 +2146,7 @@ impl Server {
         self.stop_idle_agents();
         self.schedule_transcript_saves();
         self.refresh_new_git_heads();
+        self.refresh_new_favicons();
         for (thread_id, thread) in &self.threads {
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());

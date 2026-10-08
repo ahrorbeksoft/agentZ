@@ -16,7 +16,7 @@ use ui::{
 };
 
 use crate::OpenFolder;
-use crate::project_info::{ProjectInfoStore, render_project_icon};
+use crate::project_info::render_project_icon;
 use crate::sidebar::render_status_dot;
 
 const KEY_CONTEXT: &str = "ProjectSwitcher";
@@ -81,7 +81,6 @@ impl ProjectSwitcher {
                 this.update_entries(cx)
             }),
             cx.observe(&machines, |this, _, cx| this.update_entries(cx)),
-            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
         ];
         window.focus(&search.focus_handle(cx), cx);
 
@@ -279,9 +278,6 @@ impl ProjectSwitcher {
                     machine,
                     project: project.id,
                 };
-                let info = ProjectInfoStore::global(cx)
-                    .read(cx)
-                    .info(machine, project.id);
                 let name = group.name();
                 // A project on one machine is under that machine's heading.
                 let machine_label = (group.machines().len() > 1)
@@ -309,7 +305,7 @@ impl ProjectSwitcher {
                     .group_status(&group, cx)
                     .map(|status| render_status_dot(status, cx));
                 let is_offline = machines.is_group_offline(&group, cx);
-                item.start_slot(render_project_icon(project, info, px(16.), cx))
+                item.start_slot(render_project_icon(machine, project, px(16.), cx))
                     .child(
                         // Like Zed's popover, the path shows on hover rather than in the row.
                         h_flex()

@@ -477,6 +477,10 @@ pub enum Request {
     /// The files and folders of the folder a thread works in, for its composer's @-mentions:
     /// [`Response::Files`].
     ListFiles(ThreadId),
+    /// The icon file the server found in a project's folder
+    /// ([`projects::ProjectsSnapshot::favicons`]), for a client on another machine, which can't
+    /// read it: [`Response::ProjectFavicon`].
+    ProjectFavicon(ProjectId),
     RespondToPermission {
         connection: ConnectionId,
         tool_call_id: acp::ToolCallId,
@@ -889,6 +893,8 @@ pub enum Response {
     AccountAdded(AccountId),
     Attachment(AttachmentId),
     AttachmentData(AttachmentData),
+    /// A project's icon file, in base64.
+    ProjectFavicon(String),
     /// Where the server keeps a file sent with [`Request::UploadFile`].
     UploadedFile(PathBuf),
     /// The titles of the threads whose turns are running.

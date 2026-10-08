@@ -31,7 +31,7 @@ use ui::{
     prelude::*, right_click_menu,
 };
 
-use crate::project_info::{ProjectInfo, ProjectInfoStore, render_project_icon, workspace_icon};
+use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_switcher::compact_path;
 use crate::{NewThread, OpenSettings};
 
@@ -319,7 +319,6 @@ impl ThreadDrag {
 /// in a collapsible shelf at the bottom (t3code's "Settled" shelf).
 pub struct Sidebar {
     machines: Entity<Machines>,
-    project_info: Entity<ProjectInfoStore>,
     active_thread: Option<ThreadKey>,
     /// The open draft's row as it was when the draft was opened. Like t3code, the row doesn't
     /// repaint while you type in it, and a draft never left has none.
@@ -353,7 +352,6 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 impl Sidebar {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let machines = Machines::global(cx);
-        let project_info = ProjectInfoStore::global(cx);
         let search = cx.new(|cx| TextInput::new("Search…", cx));
         let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let subscriptions = vec![
@@ -361,7 +359,6 @@ impl Sidebar {
                 this.apply_rename(cx)
             }),
             cx.observe(&machines, |_, _, cx| cx.notify()),
-            cx.observe(&project_info, |_, _, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
                 this.search_index = 0;
                 this.search_scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -380,7 +377,6 @@ impl Sidebar {
         });
         Self {
             machines,
-            project_info,
             active_thread: None,
             frozen_draft: None,
             search,
@@ -416,15 +412,6 @@ impl Sidebar {
 
     fn store(&self, machine: MachineId, cx: &App) -> Option<Entity<ProjectStore>> {
         self.machines.read(cx).projects(machine, cx)
-    }
-
-    fn project_info<'a>(
-        &self,
-        machine: MachineId,
-        project: &Project,
-        cx: &'a App,
-    ) -> Option<&'a ProjectInfo> {
-        self.project_info.read(cx).info(machine, project.id)
     }
 
     fn start_renaming(
@@ -625,12 +612,7 @@ impl Sidebar {
         cx: &App,
     ) -> AnyElement {
         match project {
-            Some(project) => render_project_icon(
-                project,
-                self.project_info(machine, project, cx),
-                px(16.),
-                cx,
-            ),
+            Some(project) => render_project_icon(machine, project, px(16.), cx),
             None => div().size_4().flex_none().into_any_element(),
         }
     }
@@ -1412,12 +1394,7 @@ impl Sidebar {
         };
         ThreadDetails {
             title: thread.title.clone().into(),
-            project: project.map(|project| {
-                (
-                    project.clone(),
-                    self.project_info(machine, project, cx).cloned(),
-                )
-            }),
+            project: project.map(|project| (machine, project.clone())),
             machine: (
                 machines.machine_icon(machine, cx),
                 machines.label(machine, cx),
@@ -2801,7 +2778,7 @@ impl Render for Sidebar {
 /// t3code's thread popover: the title, then the project, branch, and model with agent.
 pub(crate) struct ThreadDetails {
     pub(crate) title: SharedString,
-    pub(crate) project: Option<(Project, Option<ProjectInfo>)>,
+    pub(crate) project: Option<(MachineId, Project)>,
     /// The machine's icon and name.
     pub(crate) machine: (IconName, SharedString),
     pub(crate) branch: Option<SharedString>,
@@ -2870,9 +2847,9 @@ impl ThreadDetails {
                 .into_any_element()
         };
         let mut rows = Vec::new();
-        if let Some((project, info)) = &self.project {
+        if let Some((machine, project)) = &self.project {
             rows.push(detail_row(
-                render_project_icon(project, info.as_ref(), px(12.), cx),
+                render_project_icon(*machine, project, px(12.), cx),
                 Label::new(project.name()).truncate(),
             ));
         }
@@ -3450,7 +3427,6 @@ mod view_tests {
             );
             let store = client.read(cx).projects().clone();
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
             store
         });

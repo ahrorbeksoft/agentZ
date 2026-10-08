@@ -453,6 +453,9 @@ pub struct ProjectsSnapshot {
     /// folders, their worktrees and pastures, and Workspaces threads' folders. Folders outside
     /// git have none.
     pub git_heads: Vec<(PathBuf, GitHead)>,
+    /// The icon file each project's server found in its folder (t3code's favicon scan).
+    /// Projects without one aren't listed.
+    pub favicons: Vec<(ProjectId, PathBuf)>,
     /// Drawer terminals running a program in front of their shell: thread, terminal number,
     /// program.
     pub drawer_commands: Vec<(ThreadId, u32, String)>,
@@ -531,6 +534,8 @@ pub struct ProjectStore {
     terminal_folders: BTreeMap<ThreadId, TerminalFolder>,
     /// The branches of [`ProjectStore::git_head_folders`]. Not persisted either.
     git_heads: BTreeMap<PathBuf, GitHead>,
+    /// The icon files found in projects' folders. Not persisted either.
+    favicons: BTreeMap<ProjectId, PathBuf>,
     /// Drawer terminals running a program in front of their shell. Not persisted either.
     drawer_commands: BTreeMap<(ThreadId, u32), String>,
     /// Counts changes, so the owner can tell whether a call changed anything.
@@ -567,6 +572,7 @@ impl ProjectStore {
             terminal_commands: BTreeMap::new(),
             terminal_folders: BTreeMap::new(),
             git_heads: BTreeMap::new(),
+            favicons: BTreeMap::new(),
             drawer_commands: BTreeMap::new(),
             revision: 0,
             saver: state_path.map(|path| Saver::new(path, "projects-saver")),
@@ -1621,6 +1627,20 @@ impl ProjectStore {
         }
     }
 
+    /// The icon file its server found in the project's folder, if any.
+    pub fn favicon(&self, project: ProjectId) -> Option<&Path> {
+        self.favicons.get(&project).map(PathBuf::as_path)
+    }
+
+    pub fn set_favicons(&mut self, mut favicons: BTreeMap<ProjectId, PathBuf>) {
+        // A project removed while its folder was read has no icon to show.
+        favicons.retain(|id, _| self.project(*id).is_some());
+        if self.favicons != favicons {
+            self.favicons = favicons;
+            self.changed();
+        }
+    }
+
     pub fn record_thread_activity(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.last_activity_at = Some(SystemTime::now());
@@ -1670,6 +1690,11 @@ impl ProjectStore {
                 .iter()
                 .map(|(folder, head)| (folder.clone(), head.clone()))
                 .collect(),
+            favicons: self
+                .favicons
+                .iter()
+                .map(|(id, path)| (*id, path.clone()))
+                .collect(),
             drawer_commands: self
                 .drawer_commands
                 .iter()
@@ -1700,6 +1725,7 @@ impl ProjectStore {
         this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
         this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
         this.git_heads = snapshot.git_heads.into_iter().collect();
+        this.favicons = snapshot.favicons.into_iter().collect();
         this.drawer_commands = snapshot
             .drawer_commands
             .into_iter()

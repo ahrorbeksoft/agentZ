@@ -225,8 +225,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   machine's server reads the branch checked out in its projects' folders, worktrees and pastures
   and Workspaces threads' folders every 5 seconds and when a new one appears
   (`Server::refresh_git_heads`, `repositories::read_git_head`), and sends them with the
-  projects (`ProjectStore::git_head`), so remote machines' cards show theirs too. Favicons are
-  read from this Mac's disk only.
+  projects (`ProjectStore::git_head`), so remote machines' cards show theirs too. It finds its
+  projects' favicons the same way, as t3code's server does (`favicons.rs`,
+  `server/favicon_reads.rs`, t3code's `ProjectFaviconResolver`): its well-known files in
+  order, then the icon an `index.html` or a root route declares, inside the project's folder.
+  The app shows this Mac's from disk and fetches another machine's from its server
+  (`Request::ProjectFavicon`), with the monogram while it loads or when there's none.
 - **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons (the machine's only
   mark on a card, Disconnected while it's offline; draft rows name it), the thread's own
   branch with a worktree or pasture marker, its subthreads' count by a people icon (accent

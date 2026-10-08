@@ -1,33 +1,22 @@
 //! What t3code's sidebar shows about a project besides its name: an icon (the project's
-//! favicon, or a colored monogram when it has none). The branches checked out come from each
-//! machine's server (`projects::ProjectStore::git_head`).
+//! favicon, or a colored monogram when it has none). Each machine's server finds its projects'
+//! favicons (`projects::ProjectStore::favicon`), as it reads the branches checked out
+//! (`projects::ProjectStore::git_head`).
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::machines::{MachineId, Machines};
-use crate::project_store::ProjectStore;
-use collections::HashMap;
+use agentz_protocol::{Request, Response};
+use anyhow::{Context as _, anyhow};
+use base64::Engine as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, Global, Hsla, Subscription,
-    Task, img, rgb,
+    AnyElement, App, Asset, FontWeight, Hsla, ImageFormat, ImageSource, RenderImage, img, rgb,
 };
 use projects::{Project, ProjectIcon, ProjectId, WorkspaceKind};
 use ui::{StyledImage as _, prelude::*};
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ProjectInfo {
-    pub favicon: Option<PathBuf>,
-}
-
-impl ProjectInfo {
-    /// Reads the project's files, so callers run it off the main thread.
-    pub fn read(root: &Path) -> Self {
-        Self {
-            favicon: find_favicon(root),
-        }
-    }
-}
+use crate::attachment_image::{LoadFailure, is_online};
+use crate::machines::{MachineId, Machines};
 
 /// A worktree's or pasture's icon, wherever workspaces are listed.
 pub fn workspace_icon(kind: WorkspaceKind) -> IconName {
@@ -37,226 +26,116 @@ pub fn workspace_icon(kind: WorkspaceKind) -> IconName {
     }
 }
 
-/// How often icons are re-read.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Every project's [`ProjectInfo`], kept current for the sidebar, the project switcher and
-/// settings. Read from this Mac's disk, so only this Mac's projects have any.
-pub struct ProjectInfoStore {
-    info: HashMap<ProjectId, ProjectInfo>,
-    refresh: Task<()>,
-    _projects_subscription: Subscription,
-}
-
-struct GlobalProjectInfo(Entity<ProjectInfoStore>);
-
-impl Global for GlobalProjectInfo {}
-
-/// Call after `machines::init`.
-pub fn init(cx: &mut App) {
-    let projects = Machines::local(cx).read(cx).projects().clone();
-    let store = cx.new(|cx| {
-        let subscription = cx.observe(&projects, |this: &mut ProjectInfoStore, projects, cx| {
-            // Added or removed projects shouldn't wait for the next refresh.
-            let current = projects.read(cx).projects();
-            let is_stale = current.len() != this.info.len()
-                || current
-                    .iter()
-                    .any(|project| !this.info.contains_key(&project.id));
-            if is_stale {
-                this.refresh = ProjectInfoStore::refresh_loop(projects, cx);
-            }
-        });
-        ProjectInfoStore {
-            info: HashMap::default(),
-            refresh: ProjectInfoStore::refresh_loop(projects.clone(), cx),
-            _projects_subscription: subscription,
-        }
-    });
-    cx.set_global(GlobalProjectInfo(store));
-}
-
-impl ProjectInfoStore {
-    pub fn global(cx: &App) -> Entity<Self> {
-        cx.global::<GlobalProjectInfo>().0.clone()
+/// The favicon its machine's server found for the project. This Mac's server found it on this
+/// Mac's disk; another machine's sends it ([`Request::ProjectFavicon`]).
+fn favicon(machine: MachineId, project: ProjectId, cx: &App) -> Option<ImageSource> {
+    let path = Machines::global(cx)
+        .read(cx)
+        .projects(machine, cx)?
+        .read(cx)
+        .favicon(project)?
+        .to_path_buf();
+    if machine == MachineId::Local {
+        return Some(path.into());
     }
-
-    pub fn info(&self, machine: MachineId, project: ProjectId) -> Option<&ProjectInfo> {
-        match machine {
-            MachineId::Local => self.info.get(&project),
-            MachineId::Remote(_) => None,
-        }
-    }
-
-    fn refresh_loop(projects: Entity<ProjectStore>, cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            loop {
-                let roots: Vec<(ProjectId, PathBuf)> = projects.read_with(cx, |projects, _| {
-                    projects
-                        .projects()
-                        .iter()
-                        .map(|project| (project.id, project.path.clone()))
-                        .collect()
-                });
-                let info = cx
-                    .background_spawn(async move {
-                        roots
-                            .into_iter()
-                            .map(|(id, root)| (id, ProjectInfo::read(&root)))
-                            .collect::<HashMap<_, _>>()
-                    })
-                    .await;
-                let updated = this.update(cx, |this, cx| {
-                    if this.info != info {
-                        this.info = info;
-                        cx.notify();
-                    }
-                });
-                if updated.is_err() {
-                    break;
-                }
-                cx.background_executor().timer(REFRESH_INTERVAL).await;
-            }
-        })
-    }
-}
-
-/// Well-known favicon paths, checked in order (t3code's list).
-const FAVICON_CANDIDATES: &[&str] = &[
-    "favicon.svg",
-    "favicon.ico",
-    "favicon.png",
-    "public/favicon.svg",
-    "public/favicon.ico",
-    "public/favicon.png",
-    "app/favicon.ico",
-    "app/favicon.png",
-    "app/icon.svg",
-    "app/icon.png",
-    "app/icon.ico",
-    "src/favicon.ico",
-    "src/favicon.svg",
-    "src/app/favicon.ico",
-    "src/app/icon.svg",
-    "src/app/icon.png",
-    "assets/icon.svg",
-    "assets/icon.png",
-    "assets/logo.svg",
-    "assets/logo.png",
-    ".idea/icon.svg",
-];
-
-/// Files that may declare the icon with a `<link rel="icon">` tag or `{ rel: "icon" }` metadata.
-const ICON_SOURCE_FILES: &[&str] = &[
-    "index.html",
-    "public/index.html",
-    "app/routes/__root.tsx",
-    "src/routes/__root.tsx",
-    "app/root.tsx",
-    "src/root.tsx",
-    "src/index.html",
-];
-
-fn find_favicon(root: &Path) -> Option<PathBuf> {
-    let existing = |relative: &str| {
-        let path = root.join(relative);
-        path.is_file().then_some(path)
+    let request = RemoteFavicon {
+        machine,
+        project,
+        path,
     };
-    if let Some(path) = FAVICON_CANDIDATES
-        .iter()
-        .find_map(|relative| existing(relative))
-    {
-        return Some(path);
+    Some(ImageSource::Custom(Arc::new(move |window, cx| {
+        let result = window.use_asset::<RemoteFaviconLoader>(&request, cx)?;
+        match result {
+            Ok(image) => Some(Ok(image)),
+            Err(failure) => {
+                // Asked for while the machine was offline: asked for again once it's back.
+                if failure.while_offline && is_online(request.machine, cx) {
+                    cx.remove_asset::<RemoteFaviconLoader>(&request);
+                }
+                Some(Err(failure.error))
+            }
+        }
+    })))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RemoteFavicon {
+    machine: MachineId,
+    project: ProjectId,
+    /// Where the server found it, so a different icon is fetched anew.
+    path: PathBuf,
+}
+
+/// Fetches a project's favicon from its machine's server and decodes it.
+enum RemoteFaviconLoader {}
+
+impl Asset for RemoteFaviconLoader {
+    type Source = RemoteFavicon;
+    type Output = Result<Arc<RenderImage>, LoadFailure>;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let client = Machines::global(cx).read(cx).client(source.machine, cx);
+        let while_offline = !client
+            .as_ref()
+            .is_some_and(|client| client.read(cx).is_online());
+        let response = client.map(|client| {
+            client
+                .read(cx)
+                .request(Request::ProjectFavicon(source.project))
+        });
+        let svg_renderer = cx.svg_renderer();
+        async move {
+            let image = async {
+                let response = response.context("the machine was removed")?.await?;
+                let Response::ProjectFavicon(data) = response else {
+                    return Err(anyhow!("unexpected response: {response:?}"));
+                };
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .context("decoding the icon's base64")?;
+                let format = image_format(&bytes)?;
+                gpui::Image::from_bytes(format, bytes).to_image_data(svg_renderer)
+            }
+            .await;
+            image.map_err(|error| {
+                log::error!(
+                    "failed to load the icon {}: {error:#}",
+                    source.path.display()
+                );
+                LoadFailure {
+                    error: error.into(),
+                    while_offline,
+                }
+            })
+        }
     }
-    ICON_SOURCE_FILES.iter().find_map(|relative| {
-        let source = std::fs::read_to_string(root.join(relative)).ok()?;
-        let href = icon_href(&source)?;
-        let href = href.trim_start_matches('/');
-        existing(&format!("public/{href}")).or_else(|| existing(href))
+}
+
+/// An image's format, told from its bytes as GPUI's loader does for a file on disk, which takes
+/// what isn't a known raster format for an SVG.
+fn image_format(bytes: &[u8]) -> anyhow::Result<ImageFormat> {
+    Ok(match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Png) => ImageFormat::Png,
+        Ok(image::ImageFormat::Jpeg) => ImageFormat::Jpeg,
+        Ok(image::ImageFormat::WebP) => ImageFormat::Webp,
+        Ok(image::ImageFormat::Gif) => ImageFormat::Gif,
+        Ok(image::ImageFormat::Bmp) => ImageFormat::Bmp,
+        Ok(image::ImageFormat::Tiff) => ImageFormat::Tiff,
+        Ok(image::ImageFormat::Ico) => ImageFormat::Ico,
+        Ok(image::ImageFormat::Pnm) => ImageFormat::Pnm,
+        Ok(format) => return Err(anyhow!("unsupported image format: {format:?}")),
+        Err(_) => ImageFormat::Svg,
     })
 }
 
-/// Finds the icon's `href` in a `<link>` tag or in object-like metadata, with `rel` and `href`
-/// in either order.
-fn icon_href(source: &str) -> Option<&str> {
-    // ASCII lowercasing keeps byte offsets, so positions found in `lower` index `source`.
-    let lower = source.to_ascii_lowercase();
-    let mut search_from = 0;
-    while let Some(offset) = lower.get(search_from..)?.find("<link") {
-        let start = search_from + offset;
-        let end = lower[start..]
-            .find('>')
-            .map_or(lower.len(), |end| start + end);
-        if has_icon_rel(&lower[start..end], '=')
-            && let Some(href) = attribute_value(&source[start..end], "href", '=')
-        {
-            return Some(href);
-        }
-        search_from = end;
-    }
-    let mut run_start = 0;
-    for run in source.split('}') {
-        let run_lower = &lower[run_start..run_start + run.len()];
-        if has_icon_rel(run_lower, ':')
-            && let Some(href) = attribute_value(run, "href", ':')
-        {
-            return Some(href);
-        }
-        run_start += run.len() + 1;
-    }
-    None
-}
-
-fn has_icon_rel(text_lower: &str, separator: char) -> bool {
-    let mut rest = text_lower;
-    while let Some(value) = attribute_value(rest, "rel", separator) {
-        if value == "icon" || value == "shortcut icon" {
-            return true;
-        }
-        let Some(position) = rest.find(value) else {
-            break;
-        };
-        rest = &rest[position + value.len()..];
-    }
-    false
-}
-
-/// The quoted value after `name` and `separator` (`href="…"` or `href: "…"`), up to the closing
-/// quote or a `?`.
-fn attribute_value<'a>(text: &'a str, name: &str, separator: char) -> Option<&'a str> {
-    let mut search_from = 0;
-    while let Some(offset) = text.get(search_from..)?.find(name) {
-        let start = search_from + offset;
-        search_from = start + name.len();
-        let starts_word = text[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|previous| !previous.is_alphanumeric() && previous != '-');
-        if !starts_word {
-            continue;
-        }
-        let rest = text[start + name.len()..].trim_start();
-        let Some(rest) = rest.strip_prefix(separator) else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-            continue;
-        };
-        let value = &rest[quote.len_utf8()..];
-        let end = value
-            .find(|c: char| c == quote || c == '?')
-            .unwrap_or(value.len());
-        return Some(&value[..end]);
-    }
-    None
-}
-
 /// The icon picked in the project's settings, else its favicon, else t3code's monogram tile
-/// (also shown when an image fails to load).
+/// (also shown while an image loads, and when it fails to).
 pub fn render_project_icon(
+    machine: MachineId,
     project: &Project,
-    info: Option<&ProjectInfo>,
     size: Pixels,
     cx: &App,
 ) -> AnyElement {
@@ -277,26 +156,27 @@ pub fn render_project_icon(
         Some(ProjectIcon::Image { path }) => (
             monogram(&name),
             monogram_color(&name, is_light),
-            Some(path.clone()),
+            Some(ImageSource::from(path.clone())),
         ),
         None => (
             monogram(&name),
             monogram_color(&name, is_light),
-            info.and_then(|info| info.favicon.clone()),
+            favicon(machine, project.id, cx),
         ),
     };
     let text = SharedString::from(text);
-    match image {
-        Some(favicon) => img(favicon)
-            .size(size)
-            .flex_none()
-            .rounded_sm()
-            .with_fallback(move || {
-                render_monogram(text.clone(), color, font_family.clone(), size).into_any_element()
-            })
-            .into_any_element(),
-        None => render_monogram(text, color, font_family, size).into_any_element(),
-    }
+    let Some(image) = image else {
+        return render_monogram(text, color, font_family, size).into_any_element();
+    };
+    let placeholder =
+        move || render_monogram(text.clone(), color, font_family.clone(), size).into_any_element();
+    img(image)
+        .size(size)
+        .flex_none()
+        .rounded_sm()
+        .with_loading(placeholder.clone())
+        .with_fallback(placeholder)
+        .into_any_element()
 }
 
 /// t3code draws the monogram on a 16px tile with 8.25px text and a 25% corner radius.
@@ -416,7 +296,89 @@ fn monogram_color_index(name: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::{Entity, TestAppContext};
+    use projects::ProjectsSnapshot;
+
     use super::*;
+    use crate::server_client::ServerClient;
+
+    /// A 1 by 1 pixel PNG.
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    struct ProjectIcons(Vec<MachineId>);
+
+    impl Render for ProjectIcons {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let project = Project {
+                id: ProjectId(1),
+                path: "/srv/demo".into(),
+                custom_name: None,
+                icon: None,
+                workspaces: Vec::new(),
+                repository: None,
+            };
+            h_flex().children(
+                self.0
+                    .iter()
+                    .map(|machine| render_project_icon(*machine, &project, px(16.), cx)),
+            )
+        }
+    }
+
+    /// A client whose project 1 has a favicon, and the requests it was asked, which it
+    /// answers with [`TINY_PNG`].
+    fn client_with_favicon(
+        machine: MachineId,
+        cx: &mut App,
+    ) -> (Entity<ServerClient>, Rc<RefCell<Vec<Request>>>) {
+        let client = ServerClient::new_for_test(machine, "".into(), SpacesSnapshot::default(), cx);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::ProjectFavicon(_) => Some(Response::ProjectFavicon(TINY_PNG.into())),
+                    _ => None,
+                }
+            })
+        });
+        let projects = client.read(cx).projects().clone();
+        projects.update(cx, |projects, cx| {
+            projects.set_snapshot(
+                ProjectsSnapshot {
+                    favicons: vec![(ProjectId(1), "/srv/demo/favicon.png".into())],
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        (client, requests)
+    }
+
+    /// Another machine's server sends the favicon it found; this Mac's is read from disk.
+    #[gpui::test]
+    fn remote_favicons_come_from_their_server(cx: &mut TestAppContext) {
+        let remote = MachineId::Remote(1);
+        let (local_requests, remote_requests) = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let (local, local_requests) = client_with_favicon(MachineId::Local, cx);
+            let (remote, remote_requests) = client_with_favicon(remote, cx);
+            crate::machines::init_for_test(vec![local, remote], cx);
+            (local_requests, remote_requests)
+        });
+        let (_view, cx) = cx.add_window_view(|_, _| ProjectIcons(vec![MachineId::Local, remote]));
+        cx.run_until_parked();
+        assert!(local_requests.borrow().is_empty());
+        assert_eq!(
+            *remote_requests.borrow(),
+            vec![Request::ProjectFavicon(ProjectId(1))]
+        );
+    }
 
     #[test]
     fn monograms() {
@@ -437,23 +399,14 @@ mod tests {
     }
 
     #[test]
-    fn icon_links() {
+    fn favicon_formats_come_from_their_bytes() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        assert_eq!(image_format(png).ok(), Some(ImageFormat::Png));
+        let ico = b"\0\0\x01\0\x01\0\x10\x10\0\0";
+        assert_eq!(image_format(ico).ok(), Some(ImageFormat::Ico));
         assert_eq!(
-            icon_href(
-                r#"<head><link rel="stylesheet" href="a.css"><link href="/logo.svg?v=2" rel="icon"></head>"#
-            ),
-            Some("/logo.svg")
+            image_format(br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#).ok(),
+            Some(ImageFormat::Svg)
         );
-        assert_eq!(
-            icon_href(
-                r#"links: () => [{ rel: 'stylesheet', href: 'a.css' }, { rel: "icon", href: "/favicon.png" }]"#
-            ),
-            Some("/favicon.png")
-        );
-        assert_eq!(
-            icon_href(r#"<link rel="shortcut icon" href='fav.ico'>"#),
-            Some("fav.ico")
-        );
-        assert_eq!(icon_href("<p>no icon</p>"), None);
     }
 }

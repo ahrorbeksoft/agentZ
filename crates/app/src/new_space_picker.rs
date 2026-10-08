@@ -19,7 +19,7 @@ use ui::{
 };
 
 use crate::machines::{MachineId, Machines};
-use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
+use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_switcher::{compact_path, fuzzy_match};
 use crate::spaces_view::SpaceKey;
 
@@ -331,10 +331,7 @@ impl NewSpacePicker {
                 });
                 match project {
                     Some(project) => {
-                        let info = ProjectInfoStore::global(cx)
-                            .read(cx)
-                            .info(entry.choice.machine, project.id);
-                        render_project_icon(&project, info, px(16.), cx)
+                        render_project_icon(entry.choice.machine, &project, px(16.), cx)
                     }
                     None => Icon::new(IconName::Folder)
                         .size(IconSize::Small)

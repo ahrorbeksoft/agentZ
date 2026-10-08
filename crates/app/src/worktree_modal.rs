@@ -19,7 +19,7 @@ use ui::{
 };
 
 use crate::machines::{MachineId, Machines, project_at};
-use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
+use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
 use crate::sidebar::render_folder_icon;
@@ -101,17 +101,18 @@ impl WorktreeModal {
             }
             WorktreeModalMode::Open => TextInput::new("Search worktrees…", cx),
         });
-        let subscriptions = vec![
-            cx.subscribe(&input, |this, _, _: &TextInputEvent, cx| {
-                this.error = None;
-                if this.mode == WorktreeModalMode::Open {
-                    this.selected_index = 0;
-                    this.update_rows(cx);
-                }
-                cx.notify();
-            }),
-            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
-        ];
+        let mut subscriptions = vec![cx.subscribe(&input, |this, _, _: &TextInputEvent, cx| {
+            this.error = None;
+            if this.mode == WorktreeModalMode::Open {
+                this.selected_index = 0;
+                this.update_rows(cx);
+            }
+            cx.notify();
+        })];
+        // The header's project icon arrives with the projects.
+        if let Some(projects) = &projects {
+            subscriptions.push(cx.observe(projects, |_, _, cx| cx.notify()));
+        }
         window.focus(&input.focus_handle(cx), cx);
         let load = match &projects {
             Some(projects) => {
@@ -420,13 +421,7 @@ impl WorktreeModal {
             .as_ref()
             .and_then(|projects| project_at(projects.read(cx).projects(), &self.folder).cloned());
         let icon = match &project {
-            Some(project) => {
-                let info = ProjectInfoStore::global(cx)
-                    .read(cx)
-                    .info(self.machine, project.id)
-                    .cloned();
-                render_project_icon(project, info.as_ref(), px(14.), cx)
-            }
+            Some(project) => render_project_icon(self.machine, project, px(14.), cx),
             None => render_folder_icon(),
         };
         let machine_label = (self.machine != MachineId::Local)
@@ -710,7 +705,6 @@ mod tests {
             let client =
                 ServerClient::new_for_test(MACHINE, "Server".into(), SpacesSnapshot::default(), cx);
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
     }
 

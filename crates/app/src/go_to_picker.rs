@@ -16,7 +16,7 @@ use ui::{
 
 use crate::controls::AgentIcon;
 use crate::machines::{Machines, ProjectKey, ThreadKey};
-use crate::project_info::{ProjectInfoStore, render_project_icon};
+use crate::project_info::render_project_icon;
 use crate::project_switcher::fuzzy_match;
 use crate::sidebar::thread_agent_icon;
 use crate::spaces_view::{PaneKey, SpaceKey, TabKey};
@@ -226,12 +226,7 @@ impl GoToPicker {
                     .projects(key.machine, cx)
                     .and_then(|store| store.read(cx).project(key.project).cloned());
                 match project {
-                    Some(project) => {
-                        let info = ProjectInfoStore::global(cx)
-                            .read(cx)
-                            .info(key.machine, project.id);
-                        render_project_icon(&project, info, px(16.), cx)
-                    }
+                    Some(project) => render_project_icon(key.machine, &project, px(16.), cx),
                     None => Icon::new(IconName::Folder)
                         .size(IconSize::Small)
                         .color(Color::Muted)

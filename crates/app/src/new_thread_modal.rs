@@ -10,7 +10,7 @@ use gpui::{
 use text_input::{TextInput, TextInputEvent};
 use ui::{ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};
 
-use crate::project_info::{ProjectInfoStore, render_project_icon};
+use crate::project_info::render_project_icon;
 use crate::project_switcher::compact_path;
 
 const KEY_CONTEXT: &str = "NewThreadModal";
@@ -57,7 +57,6 @@ impl NewThreadModal {
                 this.update_rows(cx);
             }),
             cx.observe(&machines, |this, _, cx| this.update_rows(cx)),
-            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
         ];
         window.focus(&search.focus_handle(cx), cx);
         let mut this = Self {
@@ -160,9 +159,6 @@ impl NewThreadModal {
         let Some((machine, project)) = group.primary() else {
             return div().into_any_element();
         };
-        let info = ProjectInfoStore::global(cx)
-            .read(cx)
-            .info(machine, project.id);
         let is_offline = machines.is_group_offline(&group, cx);
         let detail = match group.members.as_slice() {
             [(MachineId::Local, project)] => compact_path(&project.path),
@@ -189,7 +185,7 @@ impl NewThreadModal {
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(index == self.selected_index)
             .disabled(is_offline)
-            .start_slot(render_project_icon(project, info, px(16.), cx))
+            .start_slot(render_project_icon(machine, project, px(16.), cx))
             .child(
                 h_flex()
                     .min_w_0()

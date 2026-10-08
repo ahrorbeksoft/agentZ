@@ -27,7 +27,7 @@ use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
 use crate::go_to_picker::{GoToPicker, Place, thread_places};
 use crate::machine_modal::MachineModal;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
-use crate::project_info::{ProjectInfoStore, render_project_icon};
+use crate::project_info::render_project_icon;
 use crate::project_switcher::ProjectSwitcher;
 use crate::save_layout_modal::{LayoutPane, SaveLayoutModal};
 use crate::server_client::MachineStatus;
@@ -326,7 +326,6 @@ impl Shell {
                     this.open_project_settings(*project_id, window, cx)
                 }
             }),
-            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
             // With the theme mode set to System, the theme follows macOS's appearance.
             cx.observe_window_appearance(window, |_, _, cx| {
                 AppSettingsStore::global(cx).update(cx, |store, cx| store.reapply_theme(cx));
@@ -1521,7 +1520,6 @@ impl Shell {
         let colors = cx.theme().colors();
         let tabs_border = colors.border;
         let machines = self.machines.read(cx);
-        let project_info = ProjectInfoStore::global(cx).read(cx);
         let scope_group = match machines.scope(cx) {
             Scope::Group(key) => machines.group(&key, cx),
             Scope::All => None,
@@ -1535,7 +1533,7 @@ impl Shell {
             .and_then(|group| Some((group, group.primary()?)))
         {
             Some((group, (machine, project))) => (
-                render_project_icon(project, project_info.info(machine, project.id), px(14.), cx),
+                render_project_icon(machine, project, px(14.), cx),
                 group.name(),
             ),
             None => (
@@ -2278,7 +2276,6 @@ mod modal_tests {
                 )
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
             crate::new_thread_modal::init(cx);
         });
@@ -2321,7 +2318,6 @@ mod modal_tests {
                 cx,
             );
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
         });
         let (_shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
@@ -2350,7 +2346,6 @@ mod modal_tests {
                 cx,
             );
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
             crate::shortcut_sheet::init(cx);
         });
@@ -2440,7 +2435,6 @@ mod modal_tests {
                 )
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
             crate::command_palette::init(cx);
             crate::go_to_picker::init(cx);
@@ -2622,7 +2616,6 @@ mod modal_tests {
                 )
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
         });
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
@@ -2671,7 +2664,6 @@ mod modal_tests {
                 cx,
             );
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
         });
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
@@ -2697,7 +2689,6 @@ mod modal_tests {
                 cx,
             );
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
         });
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
@@ -2839,7 +2830,6 @@ mod modal_tests {
             });
             let store = client.read(cx).projects().clone();
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
             store
         });
@@ -3093,7 +3083,6 @@ mod modal_tests {
                 )
             });
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             crate::sidebar::init(cx);
             client
         });

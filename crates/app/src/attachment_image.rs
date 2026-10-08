@@ -68,7 +68,7 @@ impl AttachmentImage {
     }
 }
 
-fn is_online(machine: MachineId, cx: &App) -> bool {
+pub(crate) fn is_online(machine: MachineId, cx: &App) -> bool {
     Machines::global(cx)
         .read(cx)
         .client(machine, cx)
@@ -81,10 +81,12 @@ struct AttachmentRequest {
     thumbnail: bool,
 }
 
+/// An image a server couldn't send, and whether its machine was offline when it was asked
+/// for, so it's asked for again once it's back.
 #[derive(Clone)]
-struct LoadFailure {
-    error: ImageCacheError,
-    while_offline: bool,
+pub(crate) struct LoadFailure {
+    pub error: ImageCacheError,
+    pub while_offline: bool,
 }
 
 /// Fetches an image from its thread's server ([`Request::Attachment`]) and decodes it.

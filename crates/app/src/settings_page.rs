@@ -59,8 +59,7 @@ use crate::controls::{
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machine_icon_picker::MachineIconPicker;
 use crate::project_info::{
-    MONOGRAM_COLORS, ProjectInfoStore, automatic_monogram, monogram_swatch, render_project_icon,
-    workspace_icon,
+    MONOGRAM_COLORS, automatic_monogram, monogram_swatch, render_project_icon, workspace_icon,
 };
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
@@ -171,8 +170,6 @@ pub struct SettingsPage {
     nav_scroll: ScrollHandle,
     content_scroll: ScrollHandle,
     registry_scroll: UniformListScrollHandle,
-    /// Detected favicons, so automatic icons match the sidebar's.
-    project_info: Entity<ProjectInfoStore>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -240,8 +237,6 @@ impl SettingsPage {
                 cx.notify();
             }),
         );
-        let project_info = ProjectInfoStore::global(cx);
-        subscriptions.push(cx.observe(&project_info, |_, _, cx| cx.notify()));
         Self {
             focus_handle: cx.focus_handle(),
             machines,
@@ -263,7 +258,6 @@ impl SettingsPage {
             nav_scroll: ScrollHandle::new(),
             content_scroll: ScrollHandle::new(),
             registry_scroll: UniformListScrollHandle::new(),
-            project_info,
             _subscriptions: subscriptions,
         }
     }
@@ -705,12 +699,7 @@ impl SettingsPage {
         let fixed_count = items.len();
         let mut project_items = Vec::with_capacity(projects.len());
         for (machine, project) in &projects {
-            let icon = render_project_icon(
-                project,
-                self.project_info.read(cx).info(*machine, project.id),
-                px(14.),
-                cx,
-            );
+            let icon = render_project_icon(*machine, project, px(14.), cx);
             let label: SharedString = match machine {
                 MachineId::Local => project.name(),
                 MachineId::Remote(_) => format!(
@@ -5819,12 +5808,7 @@ impl SettingsPage {
             }));
         let icon_controls = h_flex()
             .gap_2()
-            .child(render_project_icon(
-                &project,
-                self.project_info.read(cx).info(machine, id),
-                px(24.),
-                cx,
-            ))
+            .child(render_project_icon(machine, &project, px(24.), cx))
             // The picker shows this Mac's files, which another machine can't read.
             .when(is_local, |this| {
                 this.child(
@@ -7289,7 +7273,6 @@ mod tests {
                 )
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
@@ -7371,7 +7354,6 @@ mod tests {
                 cx,
             );
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         page.update_in(cx, |page, window, cx| {
@@ -7443,7 +7425,6 @@ mod tests {
                 )
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         page.update_in(cx, |page, window, cx| {
@@ -7505,7 +7486,6 @@ mod tests {
                 )
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
@@ -7693,7 +7673,6 @@ mod tests {
                 .clone()
                 .update(cx, |store, cx| store.set_snapshot(snapshot, cx));
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         let opened = Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -7967,7 +7946,6 @@ mod tests {
                 client.set_accounts_for_test([(AgentId::new("mock"), accounts)].into(), cx);
             });
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
@@ -8340,7 +8318,6 @@ mod tests {
                 );
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         page.update_in(cx, |page, window, cx| {
@@ -8469,7 +8446,6 @@ mod tests {
                 client.set_agent_settings_for_test([(mock.clone(), external)].into(), cx);
             });
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));

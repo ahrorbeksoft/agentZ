@@ -433,6 +433,7 @@ dependencies = [
  "gpui_platform",
  "http_client",
  "idna",
+ "image",
  "log",
  "markdown",
  "menu",

@@ -39,7 +39,7 @@ use crate::controls::AgentIcon;
 use crate::go_to_picker::{Place, PlaceEntry, PlaceIcon};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey, project_at};
 use crate::new_space_picker::{NewSpacePicker, SpaceChoice};
-use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
+use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ThreadStatus;
 use crate::project_switcher::compact_path;
 use crate::save_layout_modal::LayoutPane;
@@ -683,7 +683,6 @@ impl SpacesView {
                 this.sync(window, cx)
             }),
             cx.subscribe(&search, |_, _, _: &TextInputEvent, cx| cx.notify()),
-            cx.observe(&ProjectInfoStore::global(cx), |_, _, cx| cx.notify()),
             // The tab bar's + lists the saved layouts.
             cx.observe(&AppSettingsStore::global(cx), |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -2231,12 +2230,6 @@ impl SpacesView {
             .and_then(|store| {
                 project_at(store.read(cx).projects(), space.current_folder()).cloned()
             });
-        let project_info = project.as_ref().and_then(|project| {
-            ProjectInfoStore::global(cx)
-                .read(cx)
-                .info(machine, project.id)
-                .cloned()
-        });
         let icon = match &project {
             // A worktree or pasture under its parent shows what kind of checkout it is.
             _ if entry.child.is_some() => {
@@ -2250,7 +2243,7 @@ impl SpacesView {
                 .color(Color::Muted)
                 .into_any_element()
             }
-            Some(project) => render_project_icon(project, project_info.as_ref(), px(16.), cx),
+            Some(project) => render_project_icon(machine, project, px(16.), cx),
             None => render_folder_icon(),
         };
         let project_key = project.as_ref().map(|project| ProjectKey {
@@ -2263,7 +2256,7 @@ impl SpacesView {
         let worktree_source = worktree_source(space);
         let details = ThreadDetails {
             title: label.clone(),
-            project: project.map(|project| (project, project_info)),
+            project: project.map(|project| (machine, project)),
             machine: (machine_icon, machine_label),
             branch: git.as_ref().map(|git| {
                 git.branch
@@ -5389,7 +5382,6 @@ mod tests {
             let client =
                 ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(), cx);
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
@@ -5458,7 +5450,6 @@ mod tests {
                 cx,
             );
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
@@ -5500,7 +5491,6 @@ mod tests {
                 })
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
@@ -5605,7 +5595,6 @@ mod tests {
             let client =
                 ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces(), cx);
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
@@ -5765,7 +5754,6 @@ mod tests {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
@@ -6016,7 +6004,6 @@ mod tests {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
@@ -6091,7 +6078,6 @@ mod tests {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
@@ -6173,7 +6159,6 @@ mod tests {
                 })
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));
@@ -6240,7 +6225,6 @@ mod tests {
                 })
             });
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| {
@@ -6336,7 +6320,6 @@ mod tests {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         let folder = |pane: u64, cx: &mut gpui::VisualTestContext| {
@@ -6368,7 +6351,6 @@ mod tests {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
@@ -6490,7 +6472,6 @@ mod tests {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(MachineId::Local, "This Mac".into(), state, cx);
             crate::machines::init_for_test(vec![client], cx);
-            crate::project_info::init(cx);
         });
         let (view, cx) = cx.add_window_view(|window, cx| SpacesView::new(window, cx));
         view.update_in(cx, |view, window, cx| view.set_visible(true, window, cx));

@@ -257,7 +257,6 @@ fn main() {
             settings_page::init(cx);
             agent_icons::init(cx);
             machines::init(cx);
-            project_info::init(cx);
             init_actions(cx);
             cx.background_spawn(async { login_item::refresh().log_err() })
                 .detach();

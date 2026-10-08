@@ -56,7 +56,7 @@ use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
-use crate::project_info::{ProjectInfoStore, render_project_icon, workspace_icon};
+use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
@@ -2337,13 +2337,7 @@ impl AgentView {
             cx.emit(AgentViewEvent::NewThreadInProject(project_id))
         });
         let machine = self.store.read(cx).machine();
-        let info_store = ProjectInfoStore::global(cx);
-        let icon = render_project_icon(
-            project,
-            info_store.read(cx).info(machine, project_id),
-            px(14.),
-            cx,
-        );
+        let icon = render_project_icon(machine, project, px(14.), cx);
         let hover = cx.theme().colors().ghost_element_hover;
         // Shrinks with the title when the header is narrow, so neither takes all the room.
         h_flex()
@@ -7995,7 +7989,6 @@ mod tests {
                 store.set_snapshot(snapshot(Some("Fix the login")), cx)
             });
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (view, cx) = cx.add_window_view(|_, cx| {

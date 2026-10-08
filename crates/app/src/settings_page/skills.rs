@@ -908,7 +908,6 @@ mod tests {
                 client.set_accounts_for_test([(mock.clone(), accounts())].into(), cx);
             });
             crate::machines::init_for_test(vec![client.clone()], cx);
-            crate::project_info::init(cx);
             client
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));

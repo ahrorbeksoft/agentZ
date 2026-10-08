@@ -3209,6 +3209,45 @@ async fn projects_show_their_branch() {
         .await;
 }
 
+/// Each machine's server finds its projects' favicons, and sends one to a client that can't
+/// read it from its own disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn projects_show_their_favicon() {
+    use base64::Engine as _;
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = server.project_dir.path();
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(folder).await;
+    let favicon = |client: &TestClient| {
+        let projects = client.projects.as_ref()?;
+        projects
+            .favicons
+            .iter()
+            .find(|(id, _)| *id == project_id)
+            .map(|(_, path)| path.clone())
+    };
+    // An icon added later shows at the next refresh.
+    std::fs::create_dir_all(folder.join("public")).expect("a folder");
+    std::fs::write(folder.join("public/favicon.svg"), "<svg/>").expect("written");
+    let expected = folder.join("public/favicon.svg");
+    client
+        .wait_until(|client| favicon(client).as_ref() == Some(&expected))
+        .await;
+    let Response::ProjectFavicon(data) = client.ok(Request::ProjectFavicon(project_id)).await
+    else {
+        panic!("not a favicon");
+    };
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("base64"),
+        b"<svg/>"
+    );
+}
+
 impl TestClient {
     async fn add_project(&mut self, path: &std::path::Path) -> ProjectId {
         match self

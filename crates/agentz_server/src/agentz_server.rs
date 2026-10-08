@@ -13,6 +13,7 @@ mod connection;
 mod continuations;
 mod detect;
 mod directories;
+mod favicons;
 mod git;
 #[cfg(unix)]
 pub mod handoff;
