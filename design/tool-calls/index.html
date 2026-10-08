@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool Calls and Images Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="tool-calls" data-title="Tool calls and images">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Tool calls and images <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>You asked to "improve photo views, and also tool calls", and for ToolSearch and agentZ's own tool calls: "we gotta do something like 'started a subthread' or something… we gotta make these look good".</p>
+<p>Today each tool call is a one-line <b>row</b> in one dim gray: the icon Zed gives its kind, then the agent's title. A click opens it. For most tools that shows the tool's <b>input</b> as raw JSON, then its <b>output</b>, up to 24 rem tall. An image a tool gives back shows under that, at most 384 px, and a click opens it in the image viewer. An image in a message is an "@Image" link that shows a preview on hover. agentZ's own tools and other MCP tools show the name the agent sends, such as <code>agentz___delegate_task</code>, with a hammer icon.</p>
+<p>This round decides the icons, when the input shows, long lines, images in tool calls and in messages, the image viewer, agentZ's own tools shown as what they did, ToolSearch, and how other MCP tools are named. Zed is the model for the thread. t3code names its own MCP tools by what they did ("Created thread", "Open chat") and links the threads they start, so most options come from one or the other.</p>
+<p>Words used: a <b>row</b> is a tool call's line. <b>Opening</b> it shows its <b>input</b> (what the agent passed to the tool) and its <b>output</b> (what came back). A <b>subthread</b> is a thread an agent started with delegate_task. agentZ's <b>own tools</b> are the ones agentZ gives every agent: threads, subthreads, terminals and workspaces. Other <b>MCP tools</b> come from servers you add in Settings › MCP Servers or in the agent itself. The mocks use JetBrains Dark, your theme, at the app's sizes: rows 24 px tall, row text 13 px, output 12 px.</p>`;
+</script>
+<script src="topics-tool-calls.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

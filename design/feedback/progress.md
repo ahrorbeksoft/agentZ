@@ -34,7 +34,7 @@ Notes for whoever continues:
 | 12 | 15 | Settings lists a combined project once, with a machine choice | design round | on the board: `design/settings-projects/` (how the sidebar lists it, choosing the machine, shared settings and the copy's own, what Remove does), being picked |
 | 13 | 5, 6, 7 | Usage screen, usage popover in threads, Account tab with several accounts, Add Account as a modal | design round | not started |
 | 14 | 11 | Subthreads: Agents list rows, an open subthread looks different, an easier way back | design round | on the board: `design/subthreads/` (the Agents list's rows and finished subthreads, an open subthread's header, look, first message and bottom bar, a shortcut to the parent), waiting for picks |
-| 15 | 12, 13 | Tool calls and images in threads, ToolSearch, agentZ's own tools ("Started a subthread") | design round | not started |
+| 15 | 12, 13 | Tool calls and images in threads, ToolSearch, agentZ's own tools ("Started a subthread") | design round | on the board: `design/tool-calls/` (icons, the input, long lines, images in tool calls and messages, the image viewer, agentZ's own tools, ToolSearch, other MCP tools' names), being picked |
 | 16 | 10 | Simpler thread terminals | design round | on the board: `design/thread-terminals/` (one shell, tabs or splits, which buttons stay and where, closing, where the terminal sits, resizing), waiting for picks |
 | 17 | 1 | Thread cards with a draft | design round | on the board: `design/draft-cards/` (what marks a card with unsent text, where the mark goes, new threads with nothing sent), waiting for picks |
 | 18 | 14 | Agents manage workspaces, terminals and projects on any machine, and delegate there | feature | not started |
