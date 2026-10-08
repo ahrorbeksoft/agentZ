@@ -352,6 +352,75 @@ Screenshots are in `evidence/`. The ones that show the user's account emails are
 - Find what opens it first: check the server log (`logs/server.log` in the data directory) for usage reads and `agy` runs around the time it happens, and ask the user when it last happened.
 - Don't log the user out of Antigravity, and don't refresh, change or copy its stored logins beyond what AGENTS.md allows.
 
+## 22. A message sent to a logged-out agent stays unsent after logging in, and failed messages can't be retried
+
+**Reported:** "When we send a message to an agent that's not logged in at all, it shows login (login also kinda ugly, we gotta improve that too). After a successful sign in nothing happens, first message stays there. What I want is that that message should fail and there should be a retry button to retry. Similarly, when there is a network error or something, after network is back we gotta send the message again sometimes (idk agents/ACPs may handle that for us, but if not we gotta handle that too)."
+
+**Evidence:** none attached. What the user saw:
+1. In a thread with an agent that isn't logged in, they sent the first message.
+2. The thread showed the agent's login.
+3. They logged in successfully.
+4. Nothing happened. The first message stayed in the thread, with no reply and no error.
+
+**Wanted:**
+- A message that can't be sent because the agent needs a login fails: the thread says it wasn't sent and shows a Retry button. After logging in, Retry sends it.
+- A message that fails for another reason, such as a network error, also gets Retry, so the user can send it again once the network is back without typing it again.
+- Find out first whether agents (or ACP) already resend after a network error. Add agentZ's Retry where they don't.
+- The login view looks better.
+
+**A lead (a quick look at `crates/agent_thread/src/agent_thread.rs`, not confirmed):**
+- Some agents open a session while logged out and ask for the login at the first prompt (Claude Agent, Devin, OpenCode). That prompt fails with "authentication required" (`PromptFinished`), and the thread shows the login. After the login succeeds, the status goes back to Ready, but nothing sends the message or marks it failed. That matches what the user saw.
+- Agents that ask at `session/new` instead get the message queued (`queued_prompts`) and sent once the session opens after the login. The user wants this case to fail with Retry too, so both cases behave the same.
+
+**Notes for whoever picks this up:**
+- Zed's thread view has a Retry button for failed turns (`retry_button` and `retry_generation` in `crates/agent_ui/src/conversation_view/thread_view.rs`). Check what it does for ACP agents and match it.
+- Test with the mock agent: `MOCK_LOGIN_FILE` makes it need a login, and `MOCK_OPENS_LOGGED_OUT` makes its sessions open logged out, as Claude Agent's do (AGENTS.md, Testing). Extend the mock with a prompt that fails like a network error if it has none.
+- The login view's look is a UI change, so it starts on the design board (`design/README.md`), with the current login screenshotted beside the options. Consider designing it with entry 7's Add Account modal, which also logs in to an agent.
+
+## 23. After the agent's account changes, a thread silently goes on in a new session without its history
+
+**Reported:** "I was using one account (there was no multi account support then). When my usage finished, I changed the account via terminal (outside of the login in the app), and continued the session, but the session could not be loaded and a new one loaded in the background, and the agent did not know what was happening at all. When I said continue, it continued unrelated things. Claude and Codex support this (I guess), people do things like this, but some agents might just not let the other account continue other sessions. So what I offer is: when the default account changed and we send another message to the thread, maybe that message should fail and tell the user to use a new thread or hand off to a new thread. Or maybe we check if the agent picked up where it left off (we should identify the account change and monitor), and if it continues, then success; if not, say that because of the account change the agent did not get the history, do this and that."
+
+**Evidence:** none attached. What happened, before agentZ supported several accounts per agent:
+1. The usage on the user's only account ran out.
+2. They switched the agent to another account in a terminal, outside agentZ's login.
+3. They went on in the same thread. The agent couldn't load the thread's session, and a new session opened in the background without saying so.
+4. The agent didn't know the conversation. Told "continue", it worked on something unrelated.
+
+Which agent it was isn't recorded. The user expects Claude and Codex to let another account continue a session, but some agents may not.
+
+**Wanted:**
+- A thread never goes on in a new session silently after the account changes.
+- The user offered two ways to do it. They haven't picked one:
+  - **A. Fail and redirect.** When the agent's account has changed, the next message in an existing thread fails, and tells the user to start a new thread or hand it off to a new thread.
+  - **B. Detect and check.** agentZ notices the account change and checks whether the agent picked up the session. If it did, the thread goes on as normal. If it didn't, the thread says the agent lost its history because the account changed, and offers what to do (a new thread, or a handoff).
+
+**Notes for whoever picks this up:**
+- Ask the user to choose between A and B before building. B fits agents that do continue sessions on another account, and A is simpler.
+- A lead seen while writing entry 22 (not confirmed): the thread already learns how its session opened. `SessionRestore` is `Loaded`, `ResumedWithoutHistory` or `New` (`session_opened` in `crates/agent_thread/src/agent_thread.rs`). A thread that had a session but gets a new one is the case to catch.
+- The account can change in more ways now: in a terminal outside agentZ (as here), in agentZ's own account switch, and when a limit is reached and threads go on with another account (the "When a limit is reached" setting in entry 7). Check every path.
+- Handoff to a new thread already exists. Reuse it for the offered action.
+- Test with the mock agent's accounts (`MOCK_HOME`, AGENTS.md, Testing). Extend it so a session can't be loaded from another account's home, if it can't do that already.
+
+## 24. An agent's own subagents show as a raw tool call
+
+**Reported:** "Subagents are just shown like this. We gotta improve that, maybe show them with subthreads, maybe just improve the UI."
+
+**Evidence:** `evidence/24-agent-subagent-call.png`, a tool call in a thread where the agent started one of its own subagents (not an agentZ subthread):
+- The title row is a hammer icon and "Task", with a spinner on the right while it runs.
+- Under it, a code block shows the tool's raw input as JSON: `"subagent_type": "worker"`, `"description": "Build subthreads round picks"`, `"await": true`, `"complexity": "heavy"`, and a `"prompt"` that runs off the right edge ("Build what the user picked in the \"Subthreads\" design round of agentZ. Repo: /root/projects…").
+- Nothing else shows what the subagent is doing, or that it's a subagent at all.
+- The fields match Factory Droid's Task tool. Claude Agent's Task tool is similar.
+
+**Wanted:**
+- An agent's subagents look like subagents, not a raw JSON tool call.
+- Possibly shown with agentZ's subthreads (in the Agents list above the composer), or just a better-looking tool call. The user hasn't decided.
+
+**Notes for whoever picks this up:**
+- This is a UI change, so it starts on the design board (`design/README.md`). Design it in the same round as entries 12 and 13 (tool calls, agentZ's own tools), and keep it consistent with entry 11 (how subthreads look).
+- t3code's `ProviderSubagentBar` (`references/t3code`), which the Agents list was based on, shows an agent's own subagents. Check how it gets them and what it shows, and how Zed (`references/zed`, `crates/agent_ui`) shows these calls.
+- Find out what the agent reports over ACP while its subagent runs (progress, the subagent's own tool calls, its result), since that limits what can be shown.
+
 ## 25. `agentz_thread_list` never answers when the project is on more than one machine
 
 **Reported:** handed off from a thread on Devbox 1. There, `agentz_thread_list` hung, both as the MCP tool and as `agentz-server call agentz_thread_list '{"limit":20}'`. The MCP call waited 30 minutes until Claude Code aborted it. The server was otherwise healthy, and other relayed calls worked (`agentz_thread_launch` with `machine: "This Mac"`).
