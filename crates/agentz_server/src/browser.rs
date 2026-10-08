@@ -49,7 +49,7 @@ pub fn install(directory: &Path, executable: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_executable(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_executable(path: &Path, contents: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     let temporary = path.with_extension("tmp");
     std::fs::write(&temporary, contents)

@@ -741,10 +741,20 @@ Each entry: what it does, where it lives, and where it comes from.
   and `AGY_ACP_FORCE_FILE_STORAGE` keeps its login in that home
   (`antigravity-acp/acp_token.json`) instead of the keychain entry every home would share.
   A new account's folder starts empty: with a login method named in its `settings.json` and
-  no login stored, a session waits minutes on a browser login. Its login check is a session,
-  and it has no reader: nothing over ACP gives the identity or quota, and Google's quota API
-  needs an access token, which it keeps only in memory. Its key login is "Gemini API key"
-  (`GEMINI_API_KEY`). Its answers in a new home are in `accounts/antigravity_reads/`.
+  no login stored, a session waits minutes on a browser login. Its login check is a session.
+  Nothing over ACP gives the identity or quota, so its reader (`Reader::GoogleCloudCode`,
+  OpenUsage's Antigravity provider) sends the refresh token in the account's
+  `acp_token.json` to Google for an access token (the one login agentZ renews: Google keeps
+  the refresh token as it is, and nothing is written back), then asks Cloud Code's
+  `retrieveUserQuotaSummary` (each model group's 5-hour and Weekly windows, the first group
+  as the account's pool and the rest as other pools), `loadCodeAssist` (the plan) and
+  Google's user info (the email and name); a login Google refuses reads logged out. The
+  External account's ACP login is in a keychain entry only the ACP server may read, so it
+  reads the `agy` CLI's entry instead, and with under a minute left on that token runs
+  `agy -p /usage` for the CLI to renew it, with an `open` and `BROWSER` in the reader folder
+  that do nothing, so no login page opens. Its key login is "Gemini API key"
+  (`GEMINI_API_KEY`). Its answers in a new home and Google's are in
+  `accounts/antigravity_reads/`.
   Qoder's description (`accounts/qoder.rs`) moves its home, login (`.auth/`) included, with
   `QODER_CONFIG_DIR`. Its login check is a session, and it has no reader: its quota is only in
   its terminal UI, and its `status` renews an expired login itself, in a home a session may

@@ -212,7 +212,11 @@ From Zed's guidelines, which this code follows:
   names their own status command as the login check. Read a stored login only where nothing else
   gives the quota (`design/accounts/plan.md`, reader kind 7), and never change, refresh or copy
   it: every agent stores its login differently, and many vendors' refresh tokens work once, so
-  a refresh by agentZ logs the agent out. Don't read an agent's terminal UI for its quota: the
+  a refresh by agentZ logs the agent out. Antigravity is the one exception the user allowed:
+  Google keeps a refresh token as it is, so its reader gets an access token from each
+  account's stored login and writes nothing back. Its External account reads the `agy` CLI's
+  login instead, which `agy` renews itself, run where `open` does nothing: a login it can't
+  renew opens Google's login page in the user's browser. Don't read an agent's terminal UI for its quota: the
   user allows only Droid's (`accounts/hidden_terminal.rs`).
 - **Threads from older builds may lack `session_id` or `model`.** They fill in the next time the
   thread is opened.

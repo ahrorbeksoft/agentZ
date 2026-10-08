@@ -122,12 +122,8 @@ Notes for whoever continues:
   it logged in.
 - Wave 3 (item 28): Antigravity only, as the user asked; the rest wait. Antigravity
   (`accounts/antigravity.rs`): `GEMINI_HOME` with `AGY_ACP_FORCE_FILE_STORAGE=1`, a session
-  as its login check, and "Gemini API key" (`GEMINI_API_KEY`) as its key login. It has no
-  reader, so its card shows no identity or quota. plan.md's kind 7 doesn't fit: its token
-  file holds only the refresh token, and the access token stays in the server's memory, so
-  reading Google's quota API would mean getting a new access token, which the rule against
-  refreshing logins forbids. Whether that grant, kept in memory and never written, may be
-  the exception is the user's call. A new account's folder starts empty: with `auth.type` in
+  as its login check, and "Gemini API key" (`GEMINI_API_KEY`) as its key login. A new
+  account's folder starts empty: with `auth.type` in
   `antigravity-acp/settings.json` and no login stored, `session/new` waits up to 5 minutes
   on a browser login. Checked against the real server 1.3.0 in a new home with the switch:
   `initialize` and `session/new` answer in about 4 seconds, "Authentication required", and
@@ -135,6 +131,28 @@ Notes for whoever continues:
   the home, as Droid's does; they aren't removed. Not verified: logging a new account in (it
   needs the user's browser), and whether a wrong Gemini key fails at `authenticate` or only
   at the first prompt.
+- Antigravity's quota (`Reader::GoogleCloudCode`), after the user asked for it on every
+  account and allowed getting an access token from each account's stored Google login, the
+  one exception to never refreshing a login: the ACP server's `acp_token.json` holds only
+  the client and the refresh token (it gets a new access token each time it starts), and
+  Google keeps refresh tokens as they are. The access token is kept only for the read. Then,
+  as OpenUsage reads Antigravity, Cloud Code's `retrieveUserQuotaSummary` (each model
+  group's 5-hour and weekly windows: "Gemini Models" as the account's pool, "Claude and GPT
+  models" as another), `loadCodeAssist` (the paid tier's name, else the current one's) and
+  Google's user info (email and name). A login Google refuses (`invalid_grant`) reads logged
+  out. The ACP server exposes nothing of this over ACP (only `/plan` and `/logout`). The
+  External account's ACP login is in the keychain entry `gemini`/`antigravity-acp`, which
+  only Google's signed ACP server may read (anything else makes macOS ask the user), so it
+  reads the `agy` CLI's `gemini`/`antigravity` entry instead, which `security` may read, and
+  says nothing of whether the ACP server is logged in. With under a minute left on that
+  token, it runs `agy -p /usage --output-format json` (print mode, no turn, no conversation)
+  for `agy` to renew it, with an `open` first on `PATH` and a `BROWSER` that do nothing, and
+  no input: a logged-out `agy` opens Google's login with `open`, which did open pages in the
+  user's browser during the research. Checked against the real External login (Google AI
+  Pro): the plan, both pools and their windows read, and the renew worked; each `agy` run leaves a log and a small file in
+  `~/.gemini/antigravity-cli/implicit/`. Not verified: an account's own login (none exists
+  yet), two logged-in accounts at once, and other tiers. An External account logged in with
+  a key or gateway shows the `agy` login's quota if there is one.
 - Item 18 (`server/limit_waits.rs`): "When a limit is reached" sits under the card's limits,
   past the avatar, as in the mock, and only for agents that read usage, since waiting needs
   the reset from a read; an agent with one account has it too, as it has the notice. The
@@ -373,4 +391,4 @@ Notes for whoever continues:
 | 25 | 20 | The accounts menu on each skill and server | done |
 | 26 | | Importing skills and servers from another machine (board topic first) | |
 | 27 | | Wave 2, one agent per commit | Grok Build and Qoder done; the rest wait |
-| 28 | | Wave 3, one agent per commit | Antigravity done; the rest wait |
+| 28 | | Wave 3, one agent per commit | Antigravity done, with its quota; the rest wait |

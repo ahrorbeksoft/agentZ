@@ -241,6 +241,11 @@ Readers come in seven kinds:
    agent renews its token when it uses it, so an empty session (no prompt) may *(check per
    agent)*. API keys (Devin's, Factory's, OpenCode Go's, Z.ai's) don't expire this way.
 
+   The one exception is Antigravity (the user's choice): its ACP server keeps only the
+   refresh token, getting a new access token each time it starts, and Google keeps refresh
+   tokens as they are. So agentZ gets an access token from it for each read, and writes
+   nothing back.
+
 Readers return one shape: `AccountStatus { logged_in, email, name, plan, windows, credits }`,
 with each window `{ label, used_percent, resets_at }`.
 
@@ -556,8 +561,12 @@ Notes:
     goes to one fixed keychain entry that every home shares, and that's where the user's
     current login is.
   - Logged out: `session/new` fails.
-  - Identity and quota: nothing over ACP. The only source is Google's APIs with the stored
-    token (reader kind 7).
+  - Identity and quota: nothing over ACP. Google's APIs give them, as OpenUsage reads them:
+    Cloud Code's `retrieveUserQuotaSummary` (each model group's 5-hour and weekly windows)
+    and `loadCodeAssist` (the tier), and Google's user info, sent an access token got from
+    the stored refresh token (kind 7, its exception). The External account's ACP login is in
+    a keychain entry only the ACP server may read, so the `agy` CLI's login stands in for it,
+    which `agy -p /usage` renews.
   - Skills: `<home>/config/skills`, `<home>/antigravity-cli/skills`. MCP: http and sse,
     accepted.
 - **Kimi CLI** (`kimi acp`):
@@ -643,7 +652,9 @@ Decided by the user:
   may be agent-specific. agentZ only adds skills and servers of its own, for every agent.
 - Agents that need HOME moved get links to the user's `.gitconfig`, `.ssh` and `.config`.
 - agentZ may read an agent's stored login where that's the only quota source (reader kind 7),
-  and never refreshes it.
+  and never refreshes it, but for Antigravity, whose access token it gets from the stored
+  refresh token. For Antigravity's External account, it may run the `agy` CLI to renew the
+  CLI's own login.
 - No agent's terminal UI is read but Droid's (reader kind 5).
 - Skills and MCP servers are per machine, and can be imported from another machine.
 - "Copy settings from" also copies the agent's own settings files.

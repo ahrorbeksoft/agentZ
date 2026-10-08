@@ -1,0 +1,9 @@
+{
+  "sub": "100000000000000000001",
+  "name": "Example Person",
+  "given_name": "Example",
+  "family_name": "Person",
+  "picture": "https://lh3.googleusercontent.com/a/example",
+  "email": "work@example.com",
+  "email_verified": true
+}

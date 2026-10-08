@@ -44,6 +44,10 @@ pub enum Reader {
     /// Grok's own ACP extensions `_x.ai/auth/check_subscription` and `_x.ai/billing`, asked
     /// right after `initialize`, with no session (plan.md, reader kind 3).
     GrokExtensions,
+    /// Google's Cloud Code quota summary and tier, and Google's user info, sent an access token
+    /// from the account's stored Google login, as OpenUsage reads Antigravity's (plan.md,
+    /// reader kind 7).
+    GoogleCloudCode,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -80,6 +84,7 @@ impl Reader {
             Reader::CodexAppServer => super::codex::read(agent, folder).await,
             Reader::DevinApi => super::devin::read(agent, http).await,
             Reader::GrokExtensions => super::grok::read(agent, folder).await,
+            Reader::GoogleCloudCode => super::antigravity::read(agent, http, folder).await,
             Reader::Command(command) => {
                 let output =
                     run_with_account_env(command.program.as_deref(), &command.args, agent).await?;
@@ -154,7 +159,8 @@ impl Reader {
             Reader::ClaudeCode
             | Reader::CodexAppServer
             | Reader::DevinApi
-            | Reader::GrokExtensions => {
+            | Reader::GrokExtensions
+            | Reader::GoogleCloudCode => {
                 bail!("only Factory Droid has Droid Core")
             }
         }
@@ -193,7 +199,8 @@ impl Reader {
             | Reader::DroidTerminal
             | Reader::ClaudeCode
             | Reader::DevinApi
-            | Reader::GrokExtensions => bail!("only Codex has limit resets"),
+            | Reader::GrokExtensions
+            | Reader::GoogleCloudCode => bail!("only Codex has limit resets"),
         }
     }
 }
