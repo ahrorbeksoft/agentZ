@@ -542,8 +542,9 @@ pub enum Request {
     /// Starts the continued thread without the conversation it would have brought.
     DropHandoff(ConnectionId),
     /// From the agent's own process, through agentZ's `xdg-open`: it tried to open a page in a
-    /// browser while logging in. Clients show it ([`thread::ThreadState::login_page`]); refused
-    /// when the connection isn't logging in.
+    /// browser. While it logs in, clients show it ([`thread::ThreadState::login_page`]); refused
+    /// when the connection isn't logging in, or the page opens on the agent's machine. Dropped
+    /// when its session opens with nobody asking it to log in, or it's a login session's.
     OpenLoginPage {
         connection: ConnectionId,
         url: String,

@@ -149,8 +149,10 @@ pub(crate) struct Server {
     data_dir: PathBuf,
     custom_agents: BTreeMap<AgentId, CustomAgent>,
     agent_control: Option<AgentControl>,
-    /// Where agentZ's `xdg-open` and the like are, when agents' login pages go to the clients.
+    /// Where agentZ's `xdg-open` and the like are ([`Self::with_browser_programs`]).
     browser_programs: Option<PathBuf>,
+    /// Agents' login pages go to the clients: this machine is reached over SSH.
+    hands_pages_to_clients: bool,
     terminal_shell: Option<String>,
     /// The socket clients connect to, for handing off.
     #[cfg(unix)]
@@ -298,16 +300,12 @@ impl Server {
             detected: None,
             chosen: machine_kind::load_choice(&data_dir.join("machine.json")),
         };
-        let browser_programs = config
-            .agent_control
-            .as_ref()
-            .filter(|_| config.hands_pages_to_clients)
-            .and_then(|control| {
-                let directory = data_dir.join("browser");
-                browser::install(&directory, &control.executable)
-                    .log_err()
-                    .map(|()| directory)
-            });
+        let browser_programs = config.agent_control.as_ref().and_then(|control| {
+            let directory = data_dir.join("browser");
+            browser::install(&directory, &control.executable)
+                .log_err()
+                .map(|()| directory)
+        });
         let mut server = Self {
             runtime,
             inputs,
@@ -316,6 +314,7 @@ impl Server {
             custom_agents: config.custom_agents,
             agent_control: config.agent_control,
             browser_programs,
+            hands_pages_to_clients: config.hands_pages_to_clients,
             terminal_shell: config.terminal_shell,
             #[cfg(unix)]
             listener: config.listener,
@@ -974,6 +973,7 @@ impl Server {
             }
             Request::OpenLoginPage { connection, url } => {
                 let in_terminal_login = self.terminal_login_runs(connection);
+                let for_clients = self.hands_pages_to_clients;
                 // Only a connection that's running: this mustn't start a thread's agent.
                 let runs = match connection {
                     ConnectionId::Thread(thread_id) => self.threads.contains_key(&thread_id),
@@ -985,7 +985,7 @@ impl Server {
                     return Err(anyhow!("the agent isn't running"));
                 }
                 self.update_thread(connection, |thread| {
-                    thread.open_login_page(url.into(), in_terminal_login)
+                    thread.open_login_page(url.into(), in_terminal_login, for_clients)
                 })?
                 .map_err(|error| anyhow!(error))?;
                 Ok(Response::Ok)
@@ -1892,8 +1892,8 @@ impl Server {
         login_session_id
     }
 
-    /// Puts agentZ's `xdg-open` and the like first for the agent of `connection`, when agents'
-    /// login pages go to the clients.
+    /// Puts agentZ's `xdg-open` and the like first for the agent of `connection`, which ask the
+    /// server before opening a page ([`AgentThread::open_login_page`]).
     fn with_browser_programs(
         &self,
         command: CommandFuture,

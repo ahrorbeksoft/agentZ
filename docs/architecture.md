@@ -703,16 +703,27 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   `Request::OpenLoginPage`, `ThreadState::login_page`, `agentz_client::ssh::HeldForward`,
   `agent_login::loopback_forwards`; VS Code Remote's `BROWSER` helper and port forwarding): a
   browser there isn't one the user sees, and the page sends it back to `localhost` there, where
-  the agent waits. A server on Linux, or one SSH started, writes its own `xdg-open`,
-  `x-www-browser`, `www-browser`, `sensible-browser` (and `open` on a Mac) into `browser/` in
-  its data directory, and puts them first on agents' and login terminals' `PATH`, with
-  `BROWSER` and `AGENTZ_CONNECTION`. While the connection logs in (`authenticate`, or its login
-  terminal), they hand the page to the server, which the clients show as "Continue in your
+  the agent waits. The server writes its own `xdg-open`, `x-www-browser`, `www-browser`,
+  `sensible-browser` (and `open` on a Mac) into `browser/` in its data directory, and puts them
+  first on agents' `PATH` (and, on Linux or when SSH started it, login terminals'), with
+  `BROWSER` and `AGENTZ_CONNECTION`. On Linux or when SSH started the server, while the
+  connection logs in (`authenticate`, or its login terminal), they hand the page to the
+  server, which the clients show as "Continue in your
   browser" with Copy Link and "Open <host>" (the user's choice over opening it by itself), or a
   row under the login terminal. Otherwise they run the real program. Open forwards the ports of
   the `localhost` addresses the page names (`redirect_uri`) through the machine's shared SSH
   connection (`ssh -O forward`), then opens it; the forward is cancelled 30 seconds after the
   login ends, so a fixed port (Codex's 1455) isn't left taken on the Mac.
+- **No login pages nobody asked for** (`AgentThread::open_login_page`,
+  `started_login_unasked`): every server writes those programs, and puts them first for every
+  agent on any machine. A page an agent opens while its session opens, with nobody asking it
+  to log in, is a login it started on its own (Antigravity's `session/new`, with a login
+  method in its `settings.json` and none stored, opens Google's and waits minutes on it). The
+  server drops the page, the agent is found logged out, and it starts again without a session
+  (`waits_for_login`): a thread (a new thread's draft too) shows its login, Settings its login
+  rows, and the server's own login check closes. A login session opens no page at all unless
+  it's logging in. Elsewhere than an SSH machine, a page from a login the user started, or a
+  thread's page outside a login, opens in the real browser.
 - **The login panel** (`agent_login.rs`, agentZ's own design, since Zed only has a callout):
   `LoginLayout::Rows` on the agent's page, a row for each method; `LoginLayout::Centered` in the
   middle of a thread that needs a login, a full-width button for each method. While logged out,
@@ -807,7 +818,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   and `AGY_ACP_FORCE_FILE_STORAGE` keeps its login in that home
   (`antigravity-acp/acp_token.json`) instead of the keychain entry every home would share.
   A new account's folder starts empty: with a login method named in its `settings.json` and
-  no login stored, a session waits minutes on a browser login. Its login check is a session.
+  no login stored, a session waits minutes on a browser login, which agentZ doesn't open
+  (see "No login pages nobody asked for"). Its login check is a session.
   Nothing over ACP gives the identity or quota, so its reader (`Reader::GoogleCloudCode`,
   OpenUsage's Antigravity provider) sends the refresh token in the account's
   `acp_token.json` to Google for an access token (the one login agentZ renews: Google keeps

@@ -321,6 +321,9 @@ pub struct AgentThread {
     key_method: Option<acp::AuthMethodId>,
     /// The login to start once the restarted agent is up ([`Self::restart_with`]).
     authenticate_once_connected: Option<acp::AuthMethodId>,
+    /// The restarted agent waits for the user to log in instead of opening a session
+    /// ([`Self::started_login_unasked`]).
+    waits_for_login: bool,
     defaults: SessionDefaults,
     events: Vec<AgentThreadEvent>,
     /// `None` for a thread that never starts.
@@ -572,6 +575,7 @@ impl AgentThread {
             opens_session: true,
             key_method: None,
             authenticate_once_connected: None,
+            waits_for_login: false,
             defaults: SessionDefaults::default(),
             events: Vec::new(),
             runtime,
@@ -754,6 +758,10 @@ impl AgentThread {
                 if let Some(method_id) = self.authenticate_once_connected.take() {
                     self.view.state.status = ConnectionStatus::AuthRequired;
                     self.authenticate(method_id, None);
+                    return;
+                }
+                if std::mem::take(&mut self.waits_for_login) {
+                    self.view.state.status = ConnectionStatus::AuthRequired;
                     return;
                 }
                 // A login session opens an empty session too: it is how the login
@@ -1003,6 +1011,7 @@ impl AgentThread {
         self.view.state.turn_error = None;
         self.view.state.status = ConnectionStatus::Connecting;
         self.authenticate_once_connected = log_in_with;
+        self.waits_for_login = false;
         self.set_working(false);
         self.connect_agent(
             async move {
@@ -1128,6 +1137,12 @@ impl AgentThread {
         if self.view.state.authenticating.is_none() {
             return;
         }
+        self.restart_keeping_prompts();
+    }
+
+    /// [`Self::reload`], keeping the prompts waiting for the session, and the entries that
+    /// show them while there's no session to replay them.
+    fn restart_keeping_prompts(&mut self) {
         let queued_prompts = std::mem::take(&mut self.queued_prompts);
         // Without a session, the entries are only those prompts: nothing will replay them.
         let conversation = self.session.is_none().then(|| {
@@ -1599,19 +1614,52 @@ impl AgentThread {
             .any(|entry| matches!(entry, Entry::UserMessage(_)))
     }
 
-    /// The agent tried to open a page in a browser while logging in, and agentZ's `xdg-open`
-    /// handed it here for the clients to open (see [`ThreadState::login_page`]). Refused unless
-    /// it's logging in, through `authenticate` or the connection's login terminal.
+    /// The agent tried to open a page in a browser, and agentZ's `xdg-open` (or `open`) asked
+    /// here first. While it's logging in, through `authenticate` or the connection's login
+    /// terminal, the page goes to the clients if `for_clients` (see
+    /// [`ThreadState::login_page`]). Otherwise, while its session opens, the page is a login
+    /// nobody asked for ([`Self::started_login_unasked`]), and a connection made only to log in
+    /// or out opens no page at all. An `Err` leaves the page to the real program.
     pub fn open_login_page(
         &mut self,
         url: SharedString,
         in_terminal_login: bool,
+        for_clients: bool,
     ) -> std::result::Result<(), String> {
-        if self.view.state.authenticating.is_none() && !in_terminal_login {
+        let logging_in = self.view.state.authenticating.is_some()
+            || self.authenticate_once_connected.is_some()
+            || in_terminal_login;
+        if !logging_in {
+            if self.view.state.status == ConnectionStatus::Connecting {
+                self.started_login_unasked();
+                return Ok(());
+            }
+            if !self.opens_session {
+                return Ok(());
+            }
             return Err(format!("{} isn't logging in", self.view.state.agent_name));
+        }
+        if !for_clients {
+            return Err("login pages open on the agent's machine".into());
         }
         self.view.state.login_page = Some(url);
         Ok(())
+    }
+
+    /// The agent opened a page while its session opens, with nobody asking it to log in: a login
+    /// it started on its own, which the session waits on (Antigravity's, with a login method in
+    /// its settings and none stored, waits minutes on Google's). So it's logged out, and it
+    /// starts again without a session, for the user to log in. Messages sent meanwhile go once
+    /// the session opens.
+    fn started_login_unasked(&mut self) {
+        self.found_logged_out();
+        // Started again already, or not up yet: once it is, its session opens, and the page
+        // comes again.
+        if self.waits_for_login || self.view.state.command.is_none() {
+            return;
+        }
+        self.restart_keeping_prompts();
+        self.waits_for_login = true;
     }
 
     /// A terminal login starts over, so the page its last run asked for is moot.

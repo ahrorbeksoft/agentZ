@@ -32,7 +32,9 @@ logins, as real agents offer them:
   URL, as Codex's device-code login does, and logs in once the client accepts.
 - "mock-browser-open-login" (with MOCK_BROWSER_OPEN set) opens a page with `xdg-open` that
   sends the browser back to a callback on 127.0.0.1, as Devin's and Codex's browser logins do,
-  and logs in once a request with a `code` arrives there. It fails if `xdg-open` does.
+  and logs in once a request with a `code` arrives there. It fails if `xdg-open` does. With
+  MOCK_SESSION_LOGS_IN set too, `session/new` starts this login on its own while it's logged
+  out, and waits on it, as Antigravity's does with a login method in its settings.
 - "mock-api-key" takes `_meta["api-key"]["apiKey"]`, as Codex's does.
 - "mock-gateway" (to clients that set `auth._meta.gateway`) takes `_meta["gateway"]`
   with a `baseUrl`, as Claude Agent's does.
@@ -604,6 +606,9 @@ def call_mcp_tool(name=None, arguments=None):
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
+    if (method == "session/new" and os.environ.get("MOCK_SESSION_LOGS_IN") and not logged_in()
+            and browser_open_login() is None):
+        log_in()
     if method is None and "id" in message:
         request_id, session_id, prompt_text = pending.pop(message["id"])
         outcome = message.get("result", {}).get("outcome", {})

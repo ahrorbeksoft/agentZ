@@ -990,7 +990,9 @@ impl Server {
             .get("PATH")
             .cloned()
             .or_else(|| std::env::var("PATH").ok());
-        if let Some(directory) = &self.browser_programs {
+        if let Some(directory) = &self.browser_programs
+            && self.hands_pages_to_clients
+        {
             env.extend(browser::agent_env(directory, connection, path.as_deref()));
         }
         let removed = command

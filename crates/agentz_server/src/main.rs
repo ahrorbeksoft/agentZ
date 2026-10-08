@@ -484,7 +484,8 @@ fn open_url(program: &str, skip: &Path, arguments: Vec<String>) -> Result<()> {
             });
             match handed_over {
                 Ok(()) => return Ok(()),
-                // Not logging in: the page is the real program's to open.
+                // Not logging in, or logging in where pages open on this machine: the page is
+                // the real program's to open.
                 Err(error) => log::debug!("not handing the page to agentZ: {error:#}"),
             }
         }

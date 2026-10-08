@@ -4,6 +4,9 @@
 //! and `open` on a Mac), which hand the page to the server while the agent logs in. The clients
 //! show it, and open it where the user is, forwarding its `localhost` port back over SSH. Outside
 //! a login, the real program runs, as it would have.
+//!
+//! Every machine's agents get them: one that opens a page while its session opens, with nobody
+//! asking it to log in, started a login of its own, which the server doesn't open.
 
 use std::path::{Path, PathBuf};
 
@@ -39,7 +42,7 @@ pub fn install(directory: &Path, executable: &Path) -> Result<()> {
         let path = directory.join(program);
         let script = format!(
             "#!/bin/sh\n\
-             # agentZ: hands a login page to the Mac you work from. See agentz-server open-url.\n\
+             # agentZ: hands an agent's login page to agentZ first. See agentz-server open-url.\n\
              exec {} open-url --program {program} --skip {} -- \"$@\"\n",
             shell_quote(&executable.to_string_lossy()),
             shell_quote(&directory.to_string_lossy()),
@@ -71,10 +74,16 @@ pub fn agent_env(
         Some(path) => format!("{directory}:{path}"),
         None => directory.clone(),
     };
+    // A Mac has no `xdg-open` to fall back on.
+    let browser = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
     vec![
         ("PATH".to_string(), path),
         // Python's `webbrowser` and Rust's `webbrowser` try it first.
-        ("BROWSER".to_string(), format!("{directory}/xdg-open")),
+        ("BROWSER".to_string(), format!("{directory}/{browser}")),
         (
             CONNECTION_ENV_VAR.to_string(),
             connection_to_string(connection),
