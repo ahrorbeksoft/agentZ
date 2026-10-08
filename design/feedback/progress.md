@@ -36,5 +36,5 @@ Notes for whoever continues:
 | 14 | 11 | Subthreads: Agents list rows, an open subthread looks different, an easier way back | design round | not started |
 | 15 | 12, 13 | Tool calls and images in threads, ToolSearch, agentZ's own tools ("Started a subthread") | design round | not started |
 | 16 | 10 | Simpler thread terminals | design round | not started |
-| 17 | 1 | Thread cards with a draft | design round | not started |
+| 17 | 1 | Thread cards with a draft | design round | on the board: `design/draft-cards/` (what marks a card with unsent text, where the mark goes, new threads with nothing sent), waiting for picks |
 | 18 | 14 | Agents manage workspaces, terminals and projects on any machine, and delegate there | feature | not started |
