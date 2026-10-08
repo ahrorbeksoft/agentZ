@@ -899,8 +899,10 @@ Designed in `design/sounds/`.
   or a subthread's), `awaiting_input_threads` (a request for input waiting),
   `waiting_threads` (`Server::is_waiting`: the turn ended with a background task running, or
   within 15 seconds of one ending by itself, while the agent is due to go on with its result,
-  `AgentThread::is_waiting`), and each thread's `completed_at`, set once it's neither working
-  nor waiting, so a thread completes (and its sound plays) once its work is over. Each client
+  `AgentThread::is_waiting`; or with subthreads whose end it hasn't heard of), and each
+  thread's `completed_at`, set once it's neither working nor waiting, so a thread completes
+  (and its sound plays) once its work is over, not as each subthread's result reaches it.
+  Each client
   decides "done" against the
   completions it has displayed (`viewed.json`), so viewing in one client doesn't clear another.
 - Statuses by priority: Pending Approval (warning), Awaiting Input (purple, each theme's fourth
@@ -911,7 +913,9 @@ Designed in `design/sounds/`.
   t3code's input sound as it waits for a permission or an answer. Settings › Notifications
   sets each to Zed's Never, When hidden (not displayed) or Always; finishing defaults to When
   hidden, input to Always (as herdr always plays its request sound). Picking When hidden or
-  Always plays the sound once, as macOS's Sound settings do.
+  Always plays the sound once, as macOS's Sound settings do. Subthreads make no sound and no
+  notification: their requests show on their top-level thread silently, and their parent
+  plays its own once it's done.
 - **Notifications** (`Shell::notify_attention`): "Waiting for tool confirmation", "Waiting for
   your input" or "Finished", only while agentZ isn't the active app (t3code's rule; Settings ›
   Notifications turns them off). macOS only shows them for an app bundle
@@ -950,7 +954,8 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
 - Finalization runs after every batch: a task ends when its child is idle with nothing queued.
   The parent hears with t3code's message; tasks unfinished at shutdown end as Interrupted.
 - In the app: the parent's Agents control lists them; a subthread opens read-only; its
-  permission requests show on the parent, which becomes blocked.
+  permission requests show on the parent, which becomes blocked, without a sound. The parent
+  waits for its subthreads and completes once, after the last one's end reaches it.
 
 ### Diffs
 

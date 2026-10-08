@@ -108,15 +108,10 @@ impl ProjectStore {
                     store.is_thread_blocked(thread.id) && !self.store.is_thread_blocked(thread.id);
                 let became_awaiting_input = store.is_thread_awaiting_input(thread.id)
                     && !self.store.is_thread_awaiting_input(thread.id);
-                // A subthread's requests are answered in its top-level thread, and its
-                // completion is the parent's business.
+                // A subthread is its parent's business: its requests show on its top-level
+                // thread without a sound, and its end reaches the parent, which completes
+                // after its last subthread.
                 if thread.task.is_some() {
-                    if became_blocked {
-                        cx.emit(ProjectStoreEvent::NeedsAttention(
-                            store.root_thread(thread.id),
-                            ThreadStatus::PendingApproval,
-                        ));
-                    }
                     continue;
                 }
                 let completed = !store.is_thread_working(thread.id)
@@ -795,5 +790,68 @@ mod tests {
         store.set_thread_waiting(thread, false);
         assert_eq!(show(&store, cx), Some(ThreadStatus::Completed));
         assert_eq!(*attention.borrow(), vec![(thread, ThreadStatus::Completed)]);
+    }
+
+    /// A subthread never asks for attention: its request shows on its parent, silently, and
+    /// its end is the parent's to hear.
+    #[gpui::test]
+    fn subthreads_ask_for_no_attention(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            )
+        });
+        let project_store = client.read_with(cx, |client, _| client.projects().clone());
+        let attention = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let attention = attention.clone();
+            cx.subscribe(&project_store, move |_, event: &ProjectStoreEvent, _| {
+                if let ProjectStoreEvent::NeedsAttention(id, status) = event {
+                    attention.borrow_mut().push((*id, *status));
+                }
+            })
+            .detach();
+        });
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = projects::ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let parent = store.add_thread(project, "Parent", None).expect("thread");
+        let child = store
+            .add_subthread(
+                projects::Task {
+                    parent,
+                    prompt: "Look into it".into(),
+                    role: None,
+                    client_request_id: None,
+                    outcome: None,
+                    delivered: false,
+                },
+                None,
+            )
+            .expect("subthread");
+        let show = |store: &projects::ProjectStore, cx: &mut TestAppContext| {
+            project_store.update(cx, |project_store, cx| {
+                project_store.set_snapshot(store.snapshot(), cx);
+                project_store.thread_status(parent)
+            })
+        };
+        assert_eq!(show(&store, cx), None);
+
+        store.set_thread_working(child, true);
+        assert_eq!(show(&store, cx), Some(ThreadStatus::Working));
+        store.set_thread_blocked(child, true);
+        assert_eq!(show(&store, cx), Some(ThreadStatus::PendingApproval));
+        store.set_thread_awaiting_input(child, true);
+        show(&store, cx);
+        store.set_thread_blocked(child, false);
+        store.set_thread_awaiting_input(child, false);
+        store.set_thread_working(child, false);
+        show(&store, cx);
+        assert!(attention.borrow().is_empty());
     }
 }

@@ -1785,12 +1785,14 @@ impl Server {
             || thread.is_waiting()
     }
 
-    /// The thread's work goes on after its turn, in its agent's background. It completes once
-    /// that's over, so it's done (and its sound plays) once, not with each piece.
+    /// The thread's work goes on after its turn: in its agent's background, or in its
+    /// subthreads until it has heard of the last one's end. It completes once that's over, so
+    /// it's done (and its sound plays) once, not with each piece.
     fn is_waiting(&self, thread_id: ThreadId) -> bool {
         self.threads
             .get(&thread_id)
             .is_some_and(AgentThread::is_waiting)
+            || self.has_unannounced_tasks(thread_id)
     }
 
     /// The command that starts the agent, with the environment from the account's settings

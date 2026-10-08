@@ -22,7 +22,7 @@ Notes for whoever continues:
 |---|---|---|---|---|
 | 1 | 9 | Thread title cut short, in the header and when renaming | fix | done: the server cut the first prompt to 48 characters with "…"; it keeps up to 256 now, and the views cut it to their width. Titles made before stay cut |
 | 2 | 3 | A running background task shows as waiting, and the finished sound waits for it | fix | done: the server completed a thread as its turn ended, whatever it left running. It now keeps it in `waiting_threads` (shown as Waiting) while a background task runs and for 15 seconds after one ends, while the agent is due to go on, and completes it once that's over |
-| 3 | 4 | Subthreads play no sounds | fix | not started |
+| 3 | 4 | Subthreads play no sounds | fix | done: subthreads' own completions were already silent, but each one's end started a turn in the parent, which completed it and played the sound; a subthread's permission request played the input sound on the parent too. The parent now waits while it has subthreads it hasn't heard the end of, and subthreads' requests are silent |
 | 4 | 2 | Subthread count in the details popover, no "N agents" tooltip | fix | not started |
 | 5 | 17 | Account color behind the agent icon, as designed; account in the details popover | fix | not started |
 | 6 | 8 | Agents / Workspaces switcher marks the active view in every Zed theme | fix | not started |

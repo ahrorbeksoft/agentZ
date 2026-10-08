@@ -4280,6 +4280,84 @@ async fn subthread_permission_requests_block_the_parent() {
     assert_eq!(status["status"], json!("completed"));
 }
 
+/// A parent that delegated tasks waits for them: hearing that one ended doesn't complete it
+/// while another runs, and it completes once, after hearing of the last.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_completes_after_its_last_task() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    client.subscribe_thread(ConnectionId::Thread(parent)).await;
+    let is_waiting = move |client: &TestClient| {
+        client
+            .projects
+            .as_ref()
+            .is_some_and(|projects| projects.waiting_threads.contains(&parent))
+    };
+    let completed_at =
+        move |client: &TestClient| client.project_thread(parent).and_then(|t| t.completed_at);
+
+    let blocked = task_id(
+        &client
+            .tool(parent, "delegate_task", json!({"task": "permission"}))
+            .await,
+    );
+    let quick = task_id(
+        &client
+            .tool(parent, "delegate_task", json!({"task": "hello"}))
+            .await,
+    );
+    client
+        .wait_until(move |client| {
+            client.task(quick).is_some_and(|task| task.delivered)
+                && !client.thread(ConnectionId::Thread(parent)).is_working()
+                && client
+                    .user_messages(parent)
+                    .iter()
+                    .any(|message| message.contains(&quick.0.to_string()))
+        })
+        .await;
+    assert!(is_waiting(&client));
+    assert_eq!(completed_at(&client), None);
+
+    let connection = ConnectionId::Thread(blocked);
+    client.subscribe_thread(connection).await;
+    client
+        .wait_until(|client| {
+            !client
+                .thread(connection)
+                .state
+                .permission_requests
+                .is_empty()
+        })
+        .await;
+    let tool_call_id = client.thread(connection).state.permission_requests[0]
+        .tool_call_id
+        .clone();
+    client
+        .ok(Request::RespondToPermission {
+            connection,
+            tool_call_id,
+            option_id: acp::PermissionOptionId::new("allow"),
+        })
+        .await;
+    client
+        .wait_until(move |client| {
+            client.task(blocked).is_some_and(|task| task.delivered)
+                && !client.thread(ConnectionId::Thread(parent)).is_working()
+                && !is_waiting(client)
+                && completed_at(client).is_some()
+        })
+        .await;
+}
+
 /// The app's view of a snapshot, for the questions it asks of one.
 struct ProjectStoreSnapshot<'a>(&'a ProjectsSnapshot);
 
