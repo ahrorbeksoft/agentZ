@@ -20,7 +20,9 @@ word at a time, 500 ms apart, then replies. "write <path> <text>"
 writes the text and a newline to the file, relative to the session's folder, and
 "delete <path>" removes it. "terminal <command>" runs the command in a client
 terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
-and replies "Terminal <exit code>: <output>", then releases it.
+and replies "Terminal <exit code>: <output>", then releases it. "tool-call <json>" reports
+the tool call (or array of them) in the JSON as completed, as given (title, kind, rawInput,
+content, locations), and ends the turn.
 
 With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail with
 "authentication required" and a pairing code, as Factory Droid does); "mock-login" creates
@@ -784,6 +786,13 @@ for line in sys.stdin:
             arguments = json.loads(parts[2]) if len(parts) > 2 else None
             update(params["sessionId"], text_chunk("agent_message_chunk",
                                                    "MCP: " + call_mcp_tool(name, arguments)))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text.startswith("tool-call "):
+            calls = json.loads(prompt_text[len("tool-call "):])
+            for index, call in enumerate(calls if isinstance(calls, list) else [calls]):
+                update(params["sessionId"], {"sessionUpdate": "tool_call",
+                                             "toolCallId": f"scripted-{message['id']}-{index}",
+                                             "status": "completed", **call})
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text.startswith("write ") or prompt_text.startswith("delete "):
             parts = prompt_text.split(" ", 2)

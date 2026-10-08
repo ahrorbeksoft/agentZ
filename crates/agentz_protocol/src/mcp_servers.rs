@@ -9,6 +9,47 @@ use crate::accounts::AgentAccount;
 /// The name of the server agentZ gives every thread for its own tools.
 pub const AGENTZ_SERVER_NAME: &str = "agentz";
 
+/// The tools of the `agentz` server, by name, with their titles, so clients can name them
+/// without asking the server. The server's tests keep it in step with its definitions.
+pub const AGENTZ_TOOLS: [(&str, &str); 24] = [
+    (
+        "orchestrator_capabilities",
+        "Get orchestration capabilities",
+    ),
+    ("agentz_thread_list", "List agentZ threads"),
+    ("agentz_thread_read", "Read an agentZ thread"),
+    ("agentz_thread_launch", "Launch an agentZ thread"),
+    ("create_threads", "Create agentZ threads"),
+    ("agentz_thread_send", "Send to an agentZ thread"),
+    ("agentz_thread_wait", "Wait for an agentZ thread"),
+    ("agentz_thread_interrupt", "Interrupt an agentZ thread"),
+    ("agentz_thread_update", "Rename an agentZ thread"),
+    ("agentz_thread_organize", "Organize an agentZ thread"),
+    ("agentz_thread_diff", "Read an agentZ thread's changes"),
+    ("delegate_task", "Delegate a child task"),
+    ("agentz_workspace_status", "Get this thread's workspace"),
+    ("agentz_workspace_list", "List branches and workspaces"),
+    (
+        "agentz_workspace_handoff",
+        "Hand off this thread to a new workspace",
+    ),
+    (
+        "agentz_workspace_sync",
+        "Sync this pasture from the project",
+    ),
+    (
+        "agentz_workspace_bring_back",
+        "Bring this pasture's branch to the project",
+    ),
+    ("task_status", "Get delegated task status"),
+    ("task_cancel", "Cancel delegated task"),
+    ("agentz_terminal_list", "List agentZ terminals"),
+    ("agentz_terminal_start", "Start an agentZ terminal"),
+    ("agentz_terminal_send", "Type into an agentZ terminal"),
+    ("agentz_terminal_read", "Read an agentZ terminal"),
+    ("agentz_terminal_wait", "Wait for an agentZ terminal"),
+];
+
 /// Agents that ignore the MCP servers ACP gives them (design/accounts plan.md): their
 /// sessions get none of agentZ's.
 pub const IGNORES_MCP_SERVERS: [&str; 4] = ["autohand", "cline", "cortex-code", "pi-acp"];

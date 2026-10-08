@@ -69,6 +69,9 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
+use crate::tool_calls::{
+    self, CallState, ListedTool, OwnTool, Sentence, SubjectStyle, ToolCallKind,
+};
 use crate::usage_limits::{
     LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, tightest_window,
 };
@@ -261,6 +264,8 @@ pub struct AgentView {
     _markdown_subscriptions: Vec<Subscription>,
     /// Tool calls the user opened or closed, relative to their default (edits open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
+    /// Tool calls whose input the user opened under their output.
+    expanded_tool_inputs: HashSet<acp::ToolCallId>,
     /// Folded runs of work the user opened, by their first entry.
     opened_runs: HashSet<usize>,
     /// Whether the agent was working when the rows were last measured: a turn's last run folds
@@ -500,6 +505,7 @@ impl AgentView {
             markdowns: HashMap::default(),
             _markdown_subscriptions: Vec::new(),
             toggled_tool_calls: HashSet::default(),
+            expanded_tool_inputs: HashSet::default(),
             opened_runs: HashSet::default(),
             synced_working: false,
             synced_live_line: None,
@@ -3786,11 +3792,21 @@ impl AgentView {
             .permission_request(&tool_call.id)
             .is_some();
         let is_execute = matches!(tool_call.kind, acp::ToolKind::Execute);
-        let has_content = !tool_call.text.is_empty()
-            || !tool_call.diffs.is_empty()
-            || !tool_call.terminals.is_empty()
-            || !tool_call.images.is_empty()
-            || tool_call.raw_input.is_some();
+        let (kind, sentence) = self.tool_call_kind(tool_call, cx);
+        let listed_tools = match &kind {
+            ToolCallKind::ToolSearch(search) => search.tools.as_slice(),
+            _ => &[],
+        };
+        let has_content = match &kind {
+            ToolCallKind::ToolSearch(_) => !listed_tools.is_empty() || !tool_call.text.is_empty(),
+            _ => {
+                !tool_call.text.is_empty()
+                    || !tool_call.diffs.is_empty()
+                    || !tool_call.terminals.is_empty()
+                    || !tool_call.images.is_empty()
+                    || tool_call.raw_input.is_some()
+            }
+        };
         let is_live = live_run.is_some();
         let is_openable = is_live || (has_content && !needs_confirmation);
         let is_open =
@@ -3814,20 +3830,11 @@ impl AgentView {
                 }
             })
         };
-        let icon = Icon::new(match tool_call.kind {
-            acp::ToolKind::Read => IconName::ToolSearch,
-            acp::ToolKind::Edit => IconName::ToolPencil,
-            acp::ToolKind::Delete => IconName::ToolDeleteFile,
-            acp::ToolKind::Move => IconName::ArrowRightLeft,
-            acp::ToolKind::Search => IconName::ToolSearch,
-            acp::ToolKind::Execute => IconName::ToolTerminal,
-            acp::ToolKind::Think => IconName::ToolThink,
-            acp::ToolKind::Fetch => IconName::ToolWeb,
-            acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
-            _ => IconName::ToolHammer,
-        })
-        .size(IconSize::Small)
-        .color(Color::Custom(work_row_color(cx)));
+        let found = match &kind {
+            ToolCallKind::ToolSearch(search) => search.found(),
+            _ => None,
+        };
+        let opens = sentence.as_ref().and_then(|sentence| sentence.opens);
         let row = h_flex()
             .id(("tool-call-row", index))
             .debug_selector(|| format!("tool-call-row-{index}"))
@@ -3841,10 +3848,53 @@ impl AgentView {
                     .hover(|style| style.bg(colors.ghost_element_hover))
                     .on_click(toggle)
             })
-            .child(h_flex().w(px(24.)).flex_none().justify_center().child(icon))
-            .child(self.render_tool_call_label(tool_call, in_progress, cx))
+            .child(
+                h_flex()
+                    .w(px(24.))
+                    .flex_none()
+                    .justify_center()
+                    .child(tool_call_icon(tool_call, &kind, cx)),
+            )
+            .child(self.render_tool_call_label(
+                tool_call,
+                &kind,
+                sentence.as_ref(),
+                in_progress,
+                cx,
+            ))
             .when(added + removed > 0, |this| {
                 this.child(div().flex_none().child(diff_stat(added, removed)))
+            })
+            .when_some(found, |this, found| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(colors.text_placeholder)
+                        .child(format!("{found} found")),
+                )
+            })
+            .when_some(opens, |this, thread_id| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .debug_selector(move || format!("tool-call-open-{index}"))
+                        .child(
+                            Button::new(("tool-call-open", index), "Open")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Accent)
+                                .end_icon(
+                                    Icon::new(IconName::ArrowUpRight)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    // The row behind it opens and closes on a click.
+                                    cx.stop_propagation();
+                                    cx.emit(AgentViewEvent::OpenThread(thread_id));
+                                })),
+                        ),
+                )
             })
             .when(in_progress, |this| {
                 this.child(
@@ -3875,45 +3925,49 @@ impl AgentView {
                 )
             });
 
-        // What it read, ran or wrote, under the row past its icon, scrolling past 24rem.
+        // What it read, ran or wrote, under the row past its icon, scrolling past 24rem. The
+        // input waits behind "Input" at its end, as Zed's "View Raw Input" does.
         let mut output = Vec::new();
         if is_open && has_content {
             let is_edit =
                 matches!(tool_call.kind, acp::ToolKind::Edit) || !tool_call.diffs.is_empty();
-            if !is_execute && !is_edit && tool_call.raw_input.is_some() {
-                output.extend(
-                    self.markdown(
-                        (index, RAW_INPUT_PART),
-                        tool_output_style(true, window, cx),
-                        cx,
-                    )
-                    .map(|markdown| div().text_xs().child(markdown).into_any_element()),
-                );
-            }
-            for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
-                output.push(render_diff(diff, (index, diff_index), cx));
-            }
-            for terminal_id in &tool_call.terminals {
-                if let Some(terminal) = self.tool_terminals.get(terminal_id) {
-                    output.push(
-                        div()
-                            .w_full()
-                            .py_1()
-                            .rounded_md()
-                            .bg(colors.terminal_background)
-                            .child(terminal.clone())
-                            .into_any_element(),
-                    );
+            if !listed_tools.is_empty() {
+                output.push(render_listed_tools(index, listed_tools, cx));
+            } else {
+                for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
+                    output.push(render_diff(diff, (index, diff_index), cx));
                 }
-            }
-            for part in 0..tool_call.text.len() {
-                let style = tool_output_style(is_execute, window, cx);
-                if let Some(markdown) = self.markdown((index, part + 1), style, cx) {
-                    output.push(div().text_xs().child(markdown).into_any_element());
+                for terminal_id in &tool_call.terminals {
+                    if let Some(terminal) = self.tool_terminals.get(terminal_id) {
+                        output.push(
+                            div()
+                                .w_full()
+                                .py_1()
+                                .rounded_md()
+                                .bg(colors.terminal_background)
+                                .child(terminal.clone())
+                                .into_any_element(),
+                        );
+                    }
                 }
-            }
-            for (image_index, id) in tool_call.images.iter().enumerate() {
-                output.push(self.render_tool_image(index, image_index, id.clone(), cx));
+                for part in 0..tool_call.text.len() {
+                    let style = tool_output_style(is_execute, window, cx);
+                    if let Some(markdown) = self.markdown((index, part + 1), style, cx) {
+                        output.push(div().text_xs().child(markdown).into_any_element());
+                    }
+                }
+                for (image_index, id) in tool_call.images.iter().enumerate() {
+                    output.push(self.render_tool_image(index, image_index, id.clone(), cx));
+                }
+                // As in Zed, a tool call with an image shows only the image.
+                let shows_input = !is_execute
+                    && !is_edit
+                    && tool_call.images.is_empty()
+                    && tool_call.raw_input.is_some()
+                    && !matches!(kind, ToolCallKind::ToolSearch(_));
+                if shows_input {
+                    output.push(self.render_tool_input(index, &tool_call.id, window, cx));
+                }
             }
         }
         let details = (!output.is_empty()).then(|| {
@@ -3936,72 +3990,217 @@ impl AgentView {
             .into_any_element()
     }
 
+    /// What the tool call is, and for one of agentZ's tools, what it did, naming the threads it
+    /// acted on by their titles now.
+    fn tool_call_kind(&self, tool_call: &ToolCall, cx: &App) -> (ToolCallKind, Option<Sentence>) {
+        let kind = ToolCallKind::of(tool_call);
+        let sentence = match &kind {
+            ToolCallKind::Own {
+                tool,
+                arguments,
+                output,
+            } => {
+                let store = self.store.read(cx);
+                let title_of = |thread_id: ThreadId| {
+                    store.thread(thread_id).map(|thread| thread.title.clone())
+                };
+                Some(tool.sentence(
+                    arguments,
+                    output.as_ref(),
+                    CallState::of(&tool_call.status),
+                    &title_of,
+                ))
+            }
+            _ => None,
+        };
+        (kind, sentence)
+    }
+
+    /// The "Input" line at the end of an opened tool call, opening to its input as JSON.
+    fn render_tool_input(
+        &self,
+        index: usize,
+        tool_call_id: &acp::ToolCallId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_expanded = self.expanded_tool_inputs.contains(tool_call_id);
+        let toggle = {
+            let tool_call_id = tool_call_id.clone();
+            cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                if !this.expanded_tool_inputs.remove(&tool_call_id) {
+                    this.expanded_tool_inputs.insert(tool_call_id.clone());
+                }
+                cx.notify();
+            })
+        };
+        let input = is_expanded
+            .then(|| {
+                self.markdown(
+                    (index, RAW_INPUT_PART),
+                    tool_output_style(true, window, cx),
+                    cx,
+                )
+            })
+            .flatten()
+            .map(|markdown| {
+                div()
+                    .debug_selector(move || format!("tool-call-input-json-{index}"))
+                    .text_xs()
+                    .child(markdown)
+            });
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex().child(
+                    h_flex()
+                        .id(("tool-call-input", index))
+                        .debug_selector(move || format!("tool-call-input-{index}"))
+                        .h(px(20.))
+                        .px_0p5()
+                        .gap_1()
+                        .rounded_xs()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .on_click(toggle)
+                        .child(
+                            Label::new("Input")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .buffer_font(cx),
+                        )
+                        .child(
+                            Icon::new(if is_expanded {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        ),
+                ),
+            )
+            .children(input)
+            .into_any_element()
+    }
+
     /// What the tool call did, in t3code's words where its kind says what: "Ran" and the
-    /// command in the code font, "Edited" and the file; otherwise the agent's own title. Paths in
-    /// the thread's folder read relative to it.
+    /// command in the code font, "Edited" and the file; agentZ's own tools as what they did
+    /// ("Started a subthread:" and its title), a ToolSearch as the tools it loaded, another MCP
+    /// tool in words with its server; otherwise the agent's own title. Paths in the thread's
+    /// folder read relative to it.
     fn render_tool_call_label(
         &self,
         tool_call: &ToolCall,
+        kind: &ToolCallKind,
+        sentence: Option<&Sentence>,
         in_progress: bool,
         cx: &App,
     ) -> AnyElement {
-        let folder = self
-            .store
-            .read(cx)
-            .thread_folder(self.thread_id)
-            .map(|folder| format!("{}/", folder.display()));
-        let relative = |text: &str| -> String {
-            match &folder {
-                Some(folder) => text.replace(folder.as_str(), ""),
-                None => text.to_string(),
-            }
-        };
-        let (verb, subject) = if matches!(tool_call.kind, acp::ToolKind::Execute) {
-            // A backslash before a newline continues the command on the next line, so on one
-            // line it's a space.
-            let command = tool_call
-                .title
-                .trim()
-                .trim_matches('`')
-                .replace("\\\r\n", " ")
-                .replace("\\\n", " ");
-            (
-                Some(if in_progress { "Running" } else { "Ran" }),
-                Some(command),
-            )
-        } else if let [diff] = tool_call.diffs.as_slice() {
-            (
-                Some("Edited"),
-                Some(relative(&diff.path.display().to_string())),
-            )
-        } else if tool_call.diffs.len() > 1 {
-            (
-                None,
-                Some(format!("Edited {} files", tool_call.diffs.len())),
-            )
-        } else {
-            (None, Some(relative(&tool_call.title)))
-        };
-        let subject = one_line(&subject.unwrap_or_default());
+        let colors = cx.theme().colors();
         // One dim gray for the whole row, so rows read apart from the agent's messages; the
         // command keeps the code font.
-        h_flex()
+        let label = h_flex()
             .flex_1()
             .min_w_0()
             .gap_1()
             .text_size(rems_from_px(13_f32))
-            .text_color(work_row_color(cx))
-            .children(verb.map(|verb| div().flex_none().child(verb)))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .when(verb.is_some(), |this| {
-                        this.font_buffer(cx).text_size(rems_from_px(12_f32))
-                    })
-                    .child(subject),
-            )
-            .into_any_element()
+            .text_color(work_row_color(cx));
+        match (kind, sentence) {
+            (ToolCallKind::Own { .. }, Some(sentence)) => {
+                let Some(subject) = &sentence.subject else {
+                    return label
+                        .child(div().min_w_0().truncate().child(sentence.verb.clone()))
+                        .into_any_element();
+                };
+                label
+                    .child(div().flex_none().child(sentence.verb.clone()))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .map(|this| match subject.style {
+                                SubjectStyle::Title => this.text_color(colors.text_muted),
+                                SubjectStyle::Code => {
+                                    this.font_buffer(cx).text_size(rems_from_px(12_f32))
+                                }
+                                SubjectStyle::Plain => this,
+                            })
+                            .child(one_line(&subject.text)),
+                    )
+                    .into_any_element()
+            }
+            (ToolCallKind::ToolSearch(search), _) => label
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(one_line(&search.label(CallState::of(&tool_call.status)))),
+                )
+                .into_any_element(),
+            (ToolCallKind::Mcp(name), _) => label
+                .child(div().min_w_0().truncate().child(name.words()))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(colors.text_placeholder)
+                        .child(name.server.clone()),
+                )
+                .into_any_element(),
+            _ => {
+                let folder = self
+                    .store
+                    .read(cx)
+                    .thread_folder(self.thread_id)
+                    .map(|folder| format!("{}/", folder.display()));
+                let relative = |text: &str| -> String {
+                    match &folder {
+                        Some(folder) => text.replace(folder.as_str(), ""),
+                        None => text.to_string(),
+                    }
+                };
+                let (verb, subject) = if matches!(tool_call.kind, acp::ToolKind::Execute) {
+                    // A backslash before a newline continues the command on the next line, so
+                    // on one line it's a space.
+                    let command = tool_call
+                        .title
+                        .trim()
+                        .trim_matches('`')
+                        .replace("\\\r\n", " ")
+                        .replace("\\\n", " ");
+                    (
+                        Some(if in_progress { "Running" } else { "Ran" }),
+                        Some(command),
+                    )
+                } else if let [diff] = tool_call.diffs.as_slice() {
+                    (
+                        Some("Edited"),
+                        Some(relative(&diff.path.display().to_string())),
+                    )
+                } else if tool_call.diffs.len() > 1 {
+                    (
+                        None,
+                        Some(format!("Edited {} files", tool_call.diffs.len())),
+                    )
+                } else {
+                    (None, Some(relative(&tool_call.title)))
+                };
+                let subject = one_line(&subject.unwrap_or_default());
+                label
+                    .children(verb.map(|verb| div().flex_none().child(verb)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when(verb.is_some(), |this| {
+                                this.font_buffer(cx).text_size(rems_from_px(12_f32))
+                            })
+                            .child(subject),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 
     fn render_permission_buttons(
@@ -4076,6 +4275,7 @@ impl AgentView {
             terminals: Vec::new(),
             images: Vec::new(),
         };
+        let (kind, sentence) = self.tool_call_kind(&tool_call, cx);
         Some(
             v_flex()
                 .my_1p5()
@@ -4091,7 +4291,13 @@ impl AgentView {
                         h_flex()
                             .px_1()
                             .min_h(px(24.))
-                            .child(self.render_tool_call_label(&tool_call, false, cx)),
+                            .child(self.render_tool_call_label(
+                                &tool_call,
+                                &kind,
+                                sentence.as_ref(),
+                                false,
+                                cx,
+                            )),
                     ),
                 )
                 .child(buttons)
@@ -7725,12 +7931,14 @@ impl Render for AgentView {
 }
 
 /// Tool output is secondary to the conversation, so it uses the small buffer-font sizing Zed
-/// uses for command cards.
+/// uses for command cards. Its code blocks wrap long lines at their edge, as t3code's tool
+/// output does, where Zed's scroll sideways.
 fn tool_output_style(is_terminal_tool: bool, window: &Window, cx: &App) -> MarkdownStyle {
     let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
     if is_terminal_tool {
         style = style.with_agent_buffer_font(cx);
     }
+    style.code_block_overflow_x_scroll = false;
     style.base_text_style.font_size = rems_from_px(12_f32).into();
     style.base_text_style.line_height = rems_from_px(17_f32).into();
     style.code_block.text.font_size = Some(rems_from_px(12_f32).into());
@@ -8111,6 +8319,65 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
         )
 }
 
+/// A tool call's icon: a read's or an edit's file's own type's icon, as Zed's edit cards show;
+/// otherwise t3code's by its kind (an eye for a read, a pen on a square for an edit), the
+/// agentZ mark for agentZ's tools, and a plug for other MCP tools.
+fn tool_call_icon(tool_call: &ToolCall, kind: &ToolCallKind, cx: &App) -> Icon {
+    let icon = match kind {
+        ToolCallKind::Own { .. } => Icon::new(IconName::AgentZ),
+        ToolCallKind::ToolSearch(_) => Icon::new(IconName::ToolSearch),
+        ToolCallKind::Mcp(_) => Icon::new(IconName::Plug),
+        ToolCallKind::Plain => match tool_calls::file_path(tool_call)
+            .and_then(|path| tool_calls::file_icon(&path, cx))
+        {
+            Some(icon_path) => Icon::from_path(icon_path),
+            None => Icon::new(match tool_call.kind {
+                acp::ToolKind::Read => IconName::Eye,
+                acp::ToolKind::Edit => IconName::SquarePen,
+                acp::ToolKind::Delete => IconName::ToolDeleteFile,
+                acp::ToolKind::Move => IconName::ArrowRightLeft,
+                acp::ToolKind::Search => IconName::ToolSearch,
+                acp::ToolKind::Execute => IconName::ToolTerminal,
+                acp::ToolKind::Think => IconName::ToolThink,
+                acp::ToolKind::Fetch => IconName::ToolWeb,
+                acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
+                _ => IconName::ToolHammer,
+            }),
+        },
+    };
+    icon.size(IconSize::Small)
+        .color(Color::Custom(work_row_color(cx)))
+}
+
+/// The tools an opened ToolSearch loaded or found, one a line by what they do: agentZ's by
+/// their titles, other MCP tools in words with their server, and the agent's own by name.
+fn render_listed_tools(index: usize, tools: &[String], cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    v_flex()
+        .debug_selector(move || format!("tool-call-tools-{index}"))
+        .children(tools.iter().map(|name| {
+            let (icon, words, server) = match ListedTool::named(name) {
+                ListedTool::Own(tool) => (IconName::AgentZ, tool.title().to_string(), None),
+                ListedTool::Mcp(mcp) => (IconName::Plug, mcp.words(), Some(mcp.server)),
+                ListedTool::Other(name) => (IconName::ToolHammer, name, None),
+            };
+            h_flex()
+                .min_h(px(20.))
+                .gap_1p5()
+                .text_size(rems_from_px(12_f32))
+                .text_color(colors.text_muted)
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                .child(div().min_w_0().truncate().child(words))
+                .children(server.map(|server| {
+                    div()
+                        .flex_none()
+                        .text_color(colors.text_placeholder)
+                        .child(server)
+                }))
+        }))
+        .into_any_element()
+}
+
 /// The gray of a tool call's row: t3code's secondary label, the muted gray a quarter of the way
 /// toward the background, dimmer than the agent's messages.
 fn work_row_color(cx: &App) -> Hsla {
@@ -8239,12 +8506,20 @@ enum WorkAction {
     Edit,
     Command,
     CodeSearch,
+    /// One of agentZ's tools, by the group it counts in.
+    Own(OwnTool),
     Other,
 }
 
 impl WorkAction {
-    /// t3code's `toolGroupAction` for ACP's tool kinds.
+    /// t3code's `toolGroupAction` for ACP's tool kinds, with agentZ's tools by what they did,
+    /// as t3code counts its own.
     fn of(tool_call: &ToolCall) -> Self {
+        match ToolCallKind::of(tool_call) {
+            ToolCallKind::Own { tool, .. } => return Self::Own(tool.fold_group()),
+            ToolCallKind::ToolSearch(_) => return Self::Other,
+            ToolCallKind::Mcp(_) | ToolCallKind::Plain => {}
+        }
         match tool_call.kind {
             acp::ToolKind::Read => Self::Read,
             acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move => Self::Edit,
@@ -8259,8 +8534,9 @@ impl WorkAction {
     fn priority(self) -> u8 {
         match self {
             Self::Command | Self::Edit => 0,
+            Self::Own(tool) if tool.leads_summary() => 0,
             Self::Read | Self::CodeSearch => 1,
-            Self::Other => 2,
+            Self::Own(_) | Self::Other => 2,
         }
     }
 
@@ -8288,6 +8564,18 @@ impl WorkAction {
                     "Searched code {}",
                     plural(tool_calls.len(), "time", "times")
                 )
+            }
+            Self::Own(tool) => {
+                let count = tool_calls
+                    .iter()
+                    .map(|tool_call| match ToolCallKind::of(tool_call) {
+                        ToolCallKind::Own {
+                            tool, arguments, ..
+                        } => tool.fold_count(&arguments),
+                        _ => 1,
+                    })
+                    .sum();
+                tool.fold_label(count)
             }
             Self::Other => format!("Used {}", plural(tool_calls.len(), "tool", "tools")),
         }
@@ -9607,6 +9895,96 @@ mod tests {
         assert!(cx.debug_bounds("tool-call-row-1").is_some());
     }
 
+    fn mcp_call(title: &str, input: &str, output: &str) -> Entry {
+        Entry::ToolCall(ToolCall {
+            id: acp::ToolCallId::new(title.to_string()),
+            title: title.into(),
+            kind: acp::ToolKind::Other,
+            status: acp::ToolCallStatus::Completed,
+            text: vec![output.into()],
+            diffs: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(format!("```json\n{input}\n```")),
+            terminals: Vec::new(),
+            images: Vec::new(),
+        })
+    }
+
+    /// An opened row shows its output, with its input behind "Input" at the end.
+    #[gpui::test]
+    fn an_opened_tool_call_keeps_its_input_behind_a_line(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("File it".into()),
+                    mcp_call(
+                        "github___create_issue",
+                        r#"{"title": "Flaky test"}"#,
+                        "Created issue #12",
+                    ),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+        let input = cx
+            .debug_bounds("tool-call-input-1")
+            .expect("the input's line");
+        assert!(cx.debug_bounds("tool-call-input-json-1").is_none());
+        cx.simulate_click(input.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-input-json-1").is_some());
+        // Opening the input leaves the row open.
+        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+    }
+
+    /// A subthread agentZ started ends in "Open", and a ToolSearch opens to its tools, with no
+    /// input.
+    #[gpui::test]
+    fn agentzs_tools_open_what_they_made(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Delegate it".into()),
+                    mcp_call(
+                        "agentz___delegate_task",
+                        r#"{"task": "Research the bug", "title": "Research"}"#,
+                        r#"{"taskId": 7, "childThreadId": 7, "title": "Research"}"#,
+                    ),
+                    mcp_call(
+                        "ToolSearch",
+                        r#"{"query": "select:mcp__agentz__delegate_task,mcp__agentz__thread_wait"}"#,
+                        "Loaded 2 tool(s): mcp__agentz__delegate_task, mcp__agentz__thread_wait",
+                    ),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let run = cx.debug_bounds("work-run-1").expect("the folded run");
+        cx.simulate_click(run.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-open-1").is_some());
+        assert!(cx.debug_bounds("tool-call-open-2").is_none());
+        let search = cx
+            .debug_bounds("tool-call-row-2")
+            .expect("the ToolSearch's row");
+        cx.simulate_click(search.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-tools-2").is_some());
+        assert!(cx.debug_bounds("tool-call-input-2").is_none());
+    }
+
     #[test]
     fn a_read_file_is_one_code_block() {
         assert_eq!(
@@ -9720,6 +10098,24 @@ mod tests {
                 Entry::AgentThought("Ah".into())
             ]),
             "Thought (×2)"
+        );
+        // agentZ's own tools count what they made, first.
+        let subthread = |index: usize| {
+            let mut entry = mcp_call(
+                "agentz___delegate_task",
+                r#"{"task": "Research"}"#,
+                r#"{"taskId": 7, "childThreadId": 7}"#,
+            );
+            if let Entry::ToolCall(tool_call) = &mut entry {
+                tool_call.id = acp::ToolCallId::new(format!("delegate-{index}"));
+            }
+            entry
+        };
+        let mut entries: Vec<Entry> = (0..3).map(subthread).collect();
+        entries.push(work("read", Read, None));
+        assert_eq!(
+            summarize_work(&entries),
+            "Started 3 subthreads and read 1 file"
         );
     }
 

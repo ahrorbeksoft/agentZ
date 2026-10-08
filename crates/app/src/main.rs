@@ -38,6 +38,7 @@ mod terminal_mouse;
 mod terminal_thread_view;
 mod terminal_view;
 mod thread_entity;
+mod tool_calls;
 mod usage_limits;
 mod welcome;
 mod window_decorations;

@@ -126,8 +126,9 @@ From Zed's guidelines, which this code follows:
 - **Unit and integration:** `agent_thread` tests drive the real mock agent process (login, logout,
   reload, defaults, history replay). Extend the mock when you need a protocol feature; it speaks
   JSON-RPC over stdio in a few lines of Python. Its prompts `permission`, `mcp` (or
-  `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>` and `delete <path>` script
-  different turns (see its docstring). `background-task [seconds]` leaves a command running
+  `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>`, `delete <path>` and
+  `tool-call <json>` (tool calls as given, as any agent would send them) script different
+  turns (see its docstring). `background-task [seconds]` leaves a command running
   as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
   once it ends. With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with

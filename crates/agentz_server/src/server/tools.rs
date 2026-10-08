@@ -2317,3 +2317,26 @@ pub(super) fn definitions() -> Value {
     }
     tools
 }
+
+#[cfg(test)]
+mod tests {
+    use agentz_protocol::mcp_servers::AGENTZ_TOOLS;
+
+    /// Clients name the tools from the protocol's list, so it must be the server's.
+    #[test]
+    fn the_protocol_lists_every_tool_with_its_title() {
+        let definitions = super::definitions();
+        let defined: Vec<(&str, &str)> = definitions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|tool| {
+                (
+                    tool["name"].as_str().unwrap_or_default(),
+                    tool["title"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(defined, AGENTZ_TOOLS.to_vec());
+    }
+}

@@ -518,8 +518,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   title with the thread folder stripped, always on one line (`one_line`: newlines and runs of
   spaces become one space, as t3code's truncated rows show a multi-line command, and a
   command's `\`-newline continuations too); a spinner while it runs, "Failed" when it fails, a
-  chevron on hover. Every row starts closed and a click opens its output beside it (input,
-  diffs, terminals, text), up to 24 rems tall; a call awaiting permission stays open. A read's
+  chevron on hover. Every row starts closed and a click opens its output beside it (diffs,
+  terminals, text, images), up to 24 rems tall, with the input as JSON behind a small "Input"
+  line at its end (Zed's "View Raw Input"), left out for commands, edits and calls with an
+  image; its code blocks wrap long lines (t3code). A call awaiting permission stays open. A read's
   text is the file, so it shows as one code block (`as_code_block`): Claude fences it, but Droid
   sends it bare, and as markdown it would lose its lines and indentation. Rows are
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
@@ -543,6 +545,20 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   12s"; under a finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
   (`ThreadState::sent_times` by entry, `finished_turns` by each turn's end entry), so they
   survive reopening the thread; messages and turns an agent replays from history have none.
+- **Tool call rows** (`tool_calls.rs`, `agent_view.rs`; picked in `design/tool-calls/`): a read
+  or an edit of one file gets its file type's icon from the icon theme (Zed's edit cards),
+  other kinds t3code's (an eye, a pen on a square, a terminal, a globe). agentZ's own tools
+  (`ToolCallKind::Own`, known in every agent's spelling: `agentz___…`, `mcp__agentz__…`,
+  Codex's "Tool: agentz/…", Gemini's "(agentz MCP Server)", bare or `agentz_…`) get the agentZ
+  mark and say what they did (`OwnTool::sentence`): "Started a subthread:" and its title
+  (looked up by thread id, never another machine's), "Starting a subthread…" while running,
+  the base form when failed, and rows that made a subthread, thread or terminal end in "Open".
+  A folded run counts them ("Started 3 subthreads"), first. Their titles come from
+  `agentz_protocol::mcp_servers::AGENTZ_TOOLS`, which a server test keeps equal to its
+  definitions. A ToolSearch says "Loaded 3 agentZ tools" for a `select:` query or "Searched
+  tools for “issues”" with "2 found", and opens to the tools one a line by their titles, with
+  no JSON. Other MCP tools (`mcp_name`) read as the tool in words and their server, dimmer,
+  with a plug ("Create issue github").
 - **Queued messages** (`server/queue_requests.rs`, `agent_view.rs`; Zed's message queue): a
   message sent while the agent works, or while others wait, joins the thread's queue on its
   server (`Request::QueueMessage`), which saves it in `queues.json` and sends one each time a
