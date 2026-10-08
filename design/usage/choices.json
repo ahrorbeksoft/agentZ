@@ -1,6 +1,14 @@
 {
   "topics": {
-    "list": {
+    "row": {
+      "pick": "D",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "page": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -8,7 +16,7 @@
       "note": "",
       "also": []
     },
-    "machine": {
+    "popover": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -16,7 +24,7 @@
       "note": "",
       "also": []
     },
-    "split": {
+    "single": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -24,7 +32,15 @@
       "note": "",
       "also": []
     },
-    "remove": {
+    "several": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "add": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -33,5 +49,5 @@
       "also": []
     }
   },
-  "updated": "2026-10-08T10:27:50.405Z"
+  "updated": "2026-10-08T10:53:49.954Z"
 }

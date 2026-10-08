@@ -1,6 +1,6 @@
 {
   "topics": {
-    "icons": {
+    "rows": {
       "pick": "B",
       "picks": [],
       "none": false,
@@ -8,7 +8,33 @@
       "note": "",
       "also": []
     },
-    "input": {
+    "finished": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": [
+        "A"
+      ]
+    },
+    "header": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "look": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "start": {
       "pick": "B",
       "picks": [],
       "none": false,
@@ -16,7 +42,7 @@
       "note": "",
       "also": []
     },
-    "long-lines": {
+    "bottom": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -24,47 +50,7 @@
       "note": "",
       "also": []
     },
-    "tool-images": {
-      "pick": "B",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "message-images": {
-      "pick": "A",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "viewer": {
-      "pick": "A",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "own-tools": {
-      "pick": "A",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "toolsearch": {
-      "pick": "A",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "mcp-names": {
+    "shortcut": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -73,5 +59,5 @@
       "also": []
     }
   },
-  "updated": "2026-10-08T10:37:42.767Z"
+  "updated": "2026-10-08T10:33:13.033Z"
 }

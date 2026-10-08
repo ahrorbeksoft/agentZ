@@ -1,6 +1,40 @@
 {
   "topics": {
-    "list": {
+    "shells": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "B": ""
+      },
+      "note": "",
+      "also": []
+    },
+    "buttons": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "placement": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "closing": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "position": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -8,23 +42,7 @@
       "note": "",
       "also": []
     },
-    "machine": {
-      "pick": "A",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "split": {
-      "pick": "A",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "remove": {
+    "size": {
       "pick": "A",
       "picks": [],
       "none": false,
@@ -33,5 +51,5 @@
       "also": []
     }
   },
-  "updated": "2026-10-08T10:27:50.405Z"
+  "updated": "2026-10-08T10:40:16.367Z"
 }

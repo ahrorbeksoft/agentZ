@@ -1,31 +1,23 @@
 {
   "topics": {
-    "list": {
-      "pick": "A",
+    "mark": {
+      "pick": "C",
       "picks": [],
       "none": false,
       "comments": {},
       "note": "",
       "also": []
     },
-    "machine": {
-      "pick": "A",
+    "place": {
+      "pick": "B",
       "picks": [],
       "none": false,
       "comments": {},
       "note": "",
       "also": []
     },
-    "split": {
-      "pick": "A",
-      "picks": [],
-      "none": false,
-      "comments": {},
-      "note": "",
-      "also": []
-    },
-    "remove": {
-      "pick": "A",
+    "rows": {
+      "pick": "B",
       "picks": [],
       "none": false,
       "comments": {},
@@ -33,5 +25,5 @@
       "also": []
     }
   },
-  "updated": "2026-10-08T10:27:50.405Z"
+  "updated": "2026-10-08T10:41:49.001Z"
 }
