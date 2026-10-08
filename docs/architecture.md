@@ -105,15 +105,18 @@ so an open tool call's output raced the conversation.
 
 - **Releases** (`.github/workflows/release.yml`): a `v<version>` tag matching
   `crates/app/Cargo.toml` builds the Linux servers, then the universal app with them in its
-  resources, and publishes a GitHub release with `agentZ-macos.zip`,
+  resources and the x86_64 Linux app (`tooling/bundle-linux.sh`, on Ubuntu 22.04 for an older
+  glibc), and publishes a GitHub release with `agentZ-macos.zip`, `agentZ-linux-x86_64.tar.gz`,
   `agentz-server-<rust target>`, `install.sh` and `SHA256SUMS`. There's no update server: the
-  app carries every machine's server, so remote ones update over SSH (Machines over SSH below).
+  apps carry every machine's server, so remote ones update over SSH (Machines over SSH below).
 - **Installing** (`site/install.sh`, served at `https://ahrorbeksoft.github.io/agentZ/install.sh`):
   takes the latest release (or `AGENTZ_VERSION`) and checks it against `SHA256SUMS`. On a Mac it
   puts `agentZ.app` in `/Applications` (curl doesn't quarantine it, so the ad-hoc signature is
   enough). On Linux it puts the server where the app installs it over SSH,
   `~/.agentz/server/<version>/agentz-server` with its `.sha256`, so the app finds it in place,
-  and links it from `~/.local/bin`.
+  and links it from `~/.local/bin`. In a desktop session (or with `AGENTZ_APP=1`) it also puts
+  the app in `~/.local/agentz.app` as Zed's script puts Zed: `agentz` linked from
+  `~/.local/bin`, and its desktop entry in `~/.local/share/applications` pointing there.
 - **Website** (`site/`, `.github/workflows/pages.yml`): the landing page on GitHub Pages,
   published when `site/` changes. Its screenshots show demo data only: custom agents running the
   mock agent under real agents' names, with `MOCK_SCRIPTS` giving their scripted turns
@@ -149,6 +152,39 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 ## Features
 
 Each entry: what it does, where it lives, and where it comes from.
+
+### Linux
+
+The app runs on Linux as on macOS: the same views, with GPUI's Linux platform (Wayland or X11,
+drawn with Vulkan through `gpui_wgpu`). What differs:
+
+- **Platform** (`crates/app/Cargo.toml`): GPUI's own `wayland` and `x11` features, as Zed's
+  `zed` crate turns them on; without them GPUI takes Linux for headless and opens no window.
+- **Keys** (`terminal_view::init`, `spaces_view::init`, `terminal_thread_view::init`): the app's
+  shortcuts are `secondary-…` (Cmd on macOS, Ctrl on Linux). In a terminal, Zed's Linux keys:
+  Ctrl-Shift-C/V/A/F, Ctrl-Shift-L to clear, and the Ctrl keys the shortcuts take elsewhere
+  (Ctrl-B, -D, -E, -J, -N, -O, -P, -Q, -W) go to the shell. Workspaces takes Ghostty's Linux
+  keys: Ctrl-Shift-N/T/W, Ctrl-Shift-O and -E to split, Ctrl-PageUp/Down, Alt-1…9,
+  Ctrl-Alt-arrows.
+- **Window frame** (`window_decorations.rs`, `Shell::render_title_bar`; Zed's
+  `client_side_decorations` and `platform_title_bar`): the window asks for client-side
+  decorations and the desktop entry's app id (`dev.agentz.agentZ`). Where the desktop leaves the
+  frame to the app (GNOME on Wayland), it draws a border and shadow to resize by, and the title
+  bar has minimize, maximize and close where the desktop lays them out, double-click to
+  maximize and right-click for the window menu; it dims while the window is inactive. Only the
+  top corners are rounded: the sidebar and panes reach the bottom with square backgrounds,
+  which GPUI can't clip. No traffic-light room, and no app menu (its items all have keys, the
+  command palette and buttons).
+- **Start at login** (`login_item.rs`): an XDG autostart entry in `~/.config/autostart`.
+- **Sounds** (`sound.rs`): the desktop's player, `pw-play` else `paplay`, on a copy of the sound
+  in the cache folder.
+- **Names**: the local machine is "This Computer" (`machines::LOCAL_MACHINE_NAME`), and folders
+  are revealed "in File Manager" (`ui::utils::reveal_in_file_manager_label`).
+- **Data** is in `~/.agentz`, as for a server there.
+- **Bundle** (`tooling/bundle-linux.sh`, Zed's `bundle-linux`): `agentz.app` with `bin/agentz`,
+  the static musl `agentz-server` beside it (so it can install itself on a machine like this),
+  other machines' servers in `remote-servers/`, a desktop entry and the icon. It carries no
+  libraries: the app links only libc, xkbcommon and xcb.
 
 ### Window, sidebar and settings
 

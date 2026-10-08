@@ -1,7 +1,7 @@
-//! Starting this Mac's server when the user logs in: a launchd agent that runs
-//! `agentz-server start`, which returns once the server listens. Nothing restarts it after
-//! that, so a server the user stops stays stopped until the next login. Remote servers start
-//! when the app connects.
+//! Starting this machine's server when the user logs in: a launchd agent on macOS, an XDG
+//! autostart entry on Linux, that runs `agentz-server start`, which returns once the server
+//! listens. Nothing restarts it after that, so a server the user stops stays stopped until the
+//! next login. Remote servers start when the app connects.
 
 use std::path::{Path, PathBuf};
 
@@ -10,20 +10,46 @@ use anyhow::{Context as _, Result};
 const LABEL: &str = "dev.agentz.server";
 const DATA_DIR_ENV_VAR: &str = "AGENTZ_DATA_DIR";
 
-/// The launchd agent's label and contents. A scratch data directory gets its own agent, so
+/// The login item's label and contents. A scratch data directory gets its own, so
 /// development runs don't replace the real one.
-struct LaunchAgent {
+struct LoginItem {
     label: String,
-    plist: String,
+    contents: String,
 }
 
-impl LaunchAgent {
+impl LoginItem {
     fn new(executable: &Path, data_dir: Option<&Path>) -> Self {
         let label = match data_dir {
             Some(data_dir) => format!("{LABEL}.{}", label_suffix(data_dir)),
             None => LABEL.to_string(),
         };
-        let environment = data_dir
+        let contents = if cfg!(target_os = "macos") {
+            launch_agent_plist(&label, executable, data_dir)
+        } else {
+            autostart_entry(executable, data_dir)
+        };
+        Self { label, contents }
+    }
+
+    fn path(&self) -> Result<PathBuf> {
+        if cfg!(target_os = "macos") {
+            let home = dirs::home_dir().context("finding the home folder")?;
+            Ok(home
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{}.plist", self.label)))
+        } else {
+            let config = dirs::config_dir().context("finding the config folder")?;
+            Ok(config
+                .join("autostart")
+                .join(format!("{}.desktop", self.label)))
+        }
+    }
+}
+
+/// A launchd agent that runs the server once at login.
+fn launch_agent_plist(label: &str, executable: &Path, data_dir: Option<&Path>) -> String {
+    let environment = data_dir
             .map(|data_dir| {
                 format!(
                     "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>{DATA_DIR_ENV_VAR}</key>\n\t\t<string>{}</string>\n\t</dict>\n",
@@ -31,8 +57,8 @@ impl LaunchAgent {
                 )
             })
             .unwrap_or_default();
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -52,25 +78,48 @@ impl LaunchAgent {
 </dict>
 </plist>
 "#,
-            label = xml_escape(&label),
-            executable = xml_escape(&executable.to_string_lossy()),
-        );
-        Self { label, plist }
-    }
-
-    fn path(&self) -> Result<PathBuf> {
-        let home = dirs::home_dir().context("finding the home folder")?;
-        Ok(home
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{}.plist", self.label)))
-    }
+        label = xml_escape(label),
+        executable = xml_escape(&executable.to_string_lossy()),
+    )
 }
 
-fn current() -> Result<LaunchAgent> {
+/// An XDG autostart entry that runs the server once at login.
+fn autostart_entry(executable: &Path, data_dir: Option<&Path>) -> String {
+    let mut arguments = Vec::new();
+    if let Some(data_dir) = data_dir {
+        arguments.push("env".to_string());
+        arguments.push(format!("{DATA_DIR_ENV_VAR}={}", data_dir.to_string_lossy()));
+    }
+    arguments.push(executable.to_string_lossy().into_owned());
+    arguments.push("start".to_string());
+    let exec = arguments
+        .iter()
+        .map(|argument| exec_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "[Desktop Entry]\nType=Application\nName=agentZ Server\nExec={exec}\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+/// An `Exec` argument quoted as the Desktop Entry spec asks: in double quotes, with `"`, `` ` ``,
+/// `$` and `\` escaped, then every backslash escaped again for the string value.
+fn exec_quote(argument: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in argument.chars() {
+        if matches!(character, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted.replace('\\', "\\\\")
+}
+
+fn current() -> Result<LoginItem> {
     let executable = crate::server_client::server_binary()?;
     let data_dir = std::env::var_os(DATA_DIR_ENV_VAR).map(PathBuf::from);
-    Ok(LaunchAgent::new(&executable, data_dir.as_deref()))
+    Ok(LoginItem::new(&executable, data_dir.as_deref()))
 }
 
 pub fn is_enabled() -> bool {
@@ -87,7 +136,7 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::write(&path, agent.plist).with_context(|| format!("writing {}", path.display()))
+        std::fs::write(&path, agent.contents).with_context(|| format!("writing {}", path.display()))
     } else {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -102,7 +151,7 @@ pub fn refresh() -> Result<()> {
     let agent = current()?;
     let path = agent.path()?;
     match std::fs::read_to_string(&path) {
-        Ok(contents) if contents != agent.plist => std::fs::write(&path, agent.plist)
+        Ok(contents) if contents != agent.contents => std::fs::write(&path, agent.contents)
             .with_context(|| format!("writing {}", path.display())),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -138,20 +187,21 @@ mod tests {
 
     #[test]
     fn launch_agent_runs_the_server_at_load() {
-        let agent = LaunchAgent::new(
+        let plist = launch_agent_plist(
+            LABEL,
             Path::new("/Applications/agentZ & Co.app/agentz-server"),
             None,
         );
-        assert_eq!(agent.label, "dev.agentz.server");
-        assert!(agent.plist.contains(
+        assert!(plist.contains(
             "\t\t<string>/Applications/agentZ &amp; Co.app/agentz-server</string>\n\t\t<string>start</string>"
         ));
-        assert!(agent.plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
-        assert!(!agent.plist.contains("KeepAlive"));
-        assert!(!agent.plist.contains(DATA_DIR_ENV_VAR));
+        assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        assert!(!plist.contains("KeepAlive"));
+        assert!(!plist.contains(DATA_DIR_ENV_VAR));
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[allow(
         clippy::disallowed_methods,
         reason = "a test, with nothing else to block"
@@ -159,11 +209,12 @@ mod tests {
     fn launch_agent_is_a_valid_property_list() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("agent.plist");
-        let agent = LaunchAgent::new(
+        let plist = launch_agent_plist(
+            LABEL,
             Path::new("/Applications/agentZ <dev>.app/agentz-server"),
             Some(Path::new("/tmp/a&b")),
         );
-        std::fs::write(&path, agent.plist).expect("writes the plist");
+        std::fs::write(&path, plist).expect("writes the plist");
         let output = std::process::Command::new("/usr/bin/plutil")
             .arg("-lint")
             .arg(&path)
@@ -177,14 +228,31 @@ mod tests {
     }
 
     #[test]
-    fn scratch_data_directories_get_their_own_launch_agent() {
-        let agent = LaunchAgent::new(
-            Path::new("/bin/agentz-server"),
-            Some(Path::new("/tmp/azshot/Data")),
-        );
-        assert_eq!(agent.label, "dev.agentz.server.tmp-azshot-data");
-        assert!(agent.plist.contains(
+    fn scratch_data_directories_get_their_own_login_item() {
+        let data_dir = Some(Path::new("/tmp/azshot/Data"));
+        let item = LoginItem::new(Path::new("/bin/agentz-server"), data_dir);
+        assert_eq!(item.label, "dev.agentz.server.tmp-azshot-data");
+        let plist = launch_agent_plist(&item.label, Path::new("/bin/agentz-server"), data_dir);
+        assert!(plist.contains(
             "<key>AGENTZ_DATA_DIR</key>\n\t\t<string>/tmp/azshot/Data</string>\n\t</dict>\n\t<key>RunAtLoad</key>"
+        ));
+    }
+
+    /// On Linux, an autostart entry runs the server, its arguments quoted as the Desktop Entry
+    /// spec asks.
+    #[test]
+    fn autostart_entry_runs_the_server_at_login() {
+        let entry = autostart_entry(Path::new("/home/me/.local/agentZ app/agentz-server"), None);
+        assert!(entry.starts_with("[Desktop Entry]\nType=Application\n"));
+        assert!(entry.contains("\nExec=\"/home/me/.local/agentZ app/agentz-server\" \"start\"\n"));
+        assert!(entry.contains("\nNoDisplay=true\n"));
+
+        let entry = autostart_entry(
+            Path::new("/opt/a$b/agentz-server"),
+            Some(Path::new("/tmp/az.\\x")),
+        );
+        assert!(entry.contains(
+            "Exec=\"env\" \"AGENTZ_DATA_DIR=/tmp/az.\\\\\\\\x\" \"/opt/a\\\\$b/agentz-server\" \"start\""
         ));
     }
 }

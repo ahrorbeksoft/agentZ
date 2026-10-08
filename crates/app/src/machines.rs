@@ -200,6 +200,13 @@ struct GlobalMachines(Entity<Machines>);
 impl Global for GlobalMachines {}
 
 /// Call after the app settings are loaded.
+/// What the machine the app runs on is called.
+pub const LOCAL_MACHINE_NAME: &str = if cfg!(target_os = "macos") {
+    "This Mac"
+} else {
+    "This Computer"
+};
+
 pub fn init(cx: &mut App) {
     let settings = AppSettingsStore::global(cx);
     let machines = cx.new(|cx| {
@@ -209,7 +216,12 @@ pub fn init(cx: &mut App) {
             _settings_subscription: cx
                 .observe(&settings, |this: &mut Machines, _, cx| this.sync(cx)),
         };
-        let local = ServerClient::new(MachineId::Local, "This Mac".into(), Transport::Local, cx);
+        let local = ServerClient::new(
+            MachineId::Local,
+            LOCAL_MACHINE_NAME.into(),
+            Transport::Local,
+            cx,
+        );
         this.add(local, cx);
         this.sync(cx);
         this

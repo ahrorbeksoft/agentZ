@@ -1,6 +1,6 @@
 # agentZ
 
-A native macOS app for working with coding agents over the [Agent Client Protocol](https://agentclientprotocol.com)
+A native app for macOS and Linux for working with coding agents over the [Agent Client Protocol](https://agentclientprotocol.com)
 (ACP): install agents from the ACP Registry, open threads with them across several projects and
 machines, in their own worktrees or pastures, alongside real terminals. A background server on
 each machine keeps the agents running. It is built on GPUI, Zed's UI framework.
@@ -72,6 +72,16 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   `cargo clippy --workspace` fails on a gpui example that needs an unported crate; that's
   expected.
 - **GPUI tests** need `--features gpui_platform/runtime_shaders` (see Testing below).
+- **Linux:** this Mac can't build or run the Linux app, so it's built and checked on the user's
+  SSH machine `devbox1` (Ubuntu, with Rust and GUI build packages installed for it): copy the
+  tracked files (`git ls-files`) to `~/agentZ-linux` there, which needs a `.git` folder (`git
+  init`) for a dev build to find its assets, and `cargo build -p app` there. Run the app with
+  its own `AGENTZ_DATA_DIR` (never `~/.agentz`: that machine's real server keeps its data
+  there). To see it, run it under `Xvfb :99` (drive it with `xdotool`, capture with `import
+  -window root`) or, for the window frame agentZ draws itself, under headless sway
+  (`WLR_BACKENDS=headless WLR_RENDERER=pixman sway`, capture with `grim`). Cap a release build's
+  memory (`systemd-run --user --scope -p MemoryMax=5500M`): that machine has 7 GB and the user's
+  agents. Code behind `cfg(not(target_os = "macos"))` only compiles there.
 - **Disk is tight** (a few GB free). `target/debug/incremental` once grew to 14 GB and froze the
   machine, and stale builds piled up to 42 GB in `target/debug`. Clean periodically, not only
   when space runs out: check `df -h ~` and `du -sh target` at the start of each session and

@@ -427,17 +427,23 @@ mod tests {
 
         // By key, as typed or spelled out.
         sheet.update(cx, |sheet, cx| {
-            sheet
-                .search
-                .update(cx, |search, cx| search.set_text("cmd-f", cx))
+            sheet.search.update(cx, |search, cx| {
+                search.set_text(crate::platform_keys("cmd-f", "ctrl-shift-f"), cx)
+            })
         });
         assert_eq!(labels(&sheet, cx), ["Find"]);
+        // On Linux, Ctrl-Shift-E would match Ctrl-Shift-Enter too.
+        let (spelled_out, label) = if cfg!(target_os = "macos") {
+            ("command-shift-d", "Split Down")
+        } else {
+            ("ctrl-shift-o", "Split Right")
+        };
         sheet.update(cx, |sheet, cx| {
             sheet
                 .search
-                .update(cx, |search, cx| search.set_text("command-shift-d", cx))
+                .update(cx, |search, cx| search.set_text(spelled_out, cx))
         });
-        assert_eq!(labels(&sheet, cx), ["Split Down"]);
+        assert_eq!(labels(&sheet, cx), [label]);
         sheet.update(cx, |sheet, cx| {
             sheet
                 .search
@@ -475,7 +481,7 @@ mod tests {
         let in_terminal_thread = stack(&["Shell", "TerminalThread", "Terminal"]);
         let (sheet, cx) =
             cx.add_window_view(|window, cx| ShortcutSheet::new(in_terminal_thread, window, cx));
-        cx.simulate_input("cmd-w");
+        cx.simulate_input(crate::platform_keys("cmd-w", "ctrl-shift-w"));
         assert_eq!(labels(&sheet, cx), ["Close Terminal"]);
 
         let in_drawer = stack(&["Shell", "Terminal"]);

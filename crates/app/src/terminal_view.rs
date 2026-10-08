@@ -88,16 +88,7 @@ pub fn init(cx: &mut App) {
     let send_keystroke = |key: &str| SendKeystroke(key.to_string());
     let send_text = |text: &str| SendText(text.to_string());
     cx.bind_keys([
-        KeyBinding::new("cmd-c", Copy, context),
-        KeyBinding::new("cmd-v", Paste, context),
-        KeyBinding::new("cmd-a", SelectAll, context),
-        KeyBinding::new("cmd-k", Clear, context),
-        // Some nice conveniences
-        KeyBinding::new("cmd-backspace", send_keystroke("ctrl-u"), context),
         KeyBinding::new("alt-delete", send_text("\u{1b}d"), context),
-        KeyBinding::new("cmd-delete", send_keystroke("ctrl-k"), context),
-        KeyBinding::new("cmd-right", send_keystroke("ctrl-e"), context),
-        KeyBinding::new("cmd-left", send_keystroke("ctrl-a"), context),
         // Terminal.app compatibility
         KeyBinding::new("alt-left", send_text("\u{1b}b"), context),
         KeyBinding::new("alt-right", send_text("\u{1b}f"), context),
@@ -115,27 +106,66 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-r", send_keystroke("ctrl-r"), context),
         KeyBinding::new("ctrl-backspace", send_keystroke("ctrl-w"), context),
         KeyBinding::new("shift-pageup", ScrollPageUp, context),
-        KeyBinding::new("cmd-up", ScrollPageUp, context),
         KeyBinding::new("shift-pagedown", ScrollPageDown, context),
-        KeyBinding::new("cmd-down", ScrollPageDown, context),
         KeyBinding::new("shift-up", ScrollLineUp, context),
         KeyBinding::new("shift-down", ScrollLineDown, context),
         KeyBinding::new("shift-home", ScrollToTop, context),
-        KeyBinding::new("cmd-home", ScrollToTop, context),
         KeyBinding::new("shift-end", ScrollToBottom, context),
-        KeyBinding::new("cmd-end", ScrollToBottom, context),
-        // Zed's keys for the font size.
-        KeyBinding::new("cmd-=", IncreaseFontSize, context),
-        KeyBinding::new("cmd-+", IncreaseFontSize, context),
-        KeyBinding::new("cmd--", DecreaseFontSize, context),
-        KeyBinding::new("cmd-0", ResetFontSize, context),
-        // Zed's buffer search keys.
-        KeyBinding::new("cmd-f", Find, context),
-        KeyBinding::new("cmd-f", Find, Some(FIND_KEY_CONTEXT)),
         KeyBinding::new("enter", SelectNextMatch, Some(FIND_KEY_CONTEXT)),
         KeyBinding::new("shift-enter", SelectPreviousMatch, Some(FIND_KEY_CONTEXT)),
         KeyBinding::new("escape", DismissFind, Some(FIND_KEY_CONTEXT)),
     ]);
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-c", Copy, context),
+            KeyBinding::new("cmd-v", Paste, context),
+            KeyBinding::new("cmd-a", SelectAll, context),
+            KeyBinding::new("cmd-k", Clear, context),
+            // Some nice conveniences
+            KeyBinding::new("cmd-backspace", send_keystroke("ctrl-u"), context),
+            KeyBinding::new("cmd-delete", send_keystroke("ctrl-k"), context),
+            KeyBinding::new("cmd-right", send_keystroke("ctrl-e"), context),
+            KeyBinding::new("cmd-left", send_keystroke("ctrl-a"), context),
+            KeyBinding::new("cmd-up", ScrollPageUp, context),
+            KeyBinding::new("cmd-down", ScrollPageDown, context),
+            KeyBinding::new("cmd-home", ScrollToTop, context),
+            KeyBinding::new("cmd-end", ScrollToBottom, context),
+            // Zed's keys for the font size.
+            KeyBinding::new("cmd-=", IncreaseFontSize, context),
+            KeyBinding::new("cmd-+", IncreaseFontSize, context),
+            KeyBinding::new("cmd--", DecreaseFontSize, context),
+            KeyBinding::new("cmd-0", ResetFontSize, context),
+            // Zed's buffer search keys.
+            KeyBinding::new("cmd-f", Find, context),
+            KeyBinding::new("cmd-f", Find, Some(FIND_KEY_CONTEXT)),
+        ]);
+    } else {
+        // Zed's Linux terminal keys: the app's own hold Shift as well as Ctrl, and the Ctrl
+        // keys its shortcuts take elsewhere (Toggle Diff's Ctrl-D…) go to the shell here.
+        cx.bind_keys([
+            KeyBinding::new("ctrl-shift-c", Copy, context),
+            KeyBinding::new("ctrl-insert", Copy, context),
+            KeyBinding::new("ctrl-shift-v", Paste, context),
+            KeyBinding::new("shift-insert", Paste, context),
+            KeyBinding::new("ctrl-shift-a", SelectAll, context),
+            KeyBinding::new("ctrl-shift-l", Clear, context),
+            KeyBinding::new("ctrl-b", send_keystroke("ctrl-b"), context),
+            KeyBinding::new("ctrl-d", send_keystroke("ctrl-d"), context),
+            KeyBinding::new("ctrl-e", send_keystroke("ctrl-e"), context),
+            KeyBinding::new("ctrl-j", send_keystroke("ctrl-j"), context),
+            KeyBinding::new("ctrl-n", send_keystroke("ctrl-n"), context),
+            KeyBinding::new("ctrl-o", send_keystroke("ctrl-o"), context),
+            KeyBinding::new("ctrl-p", send_keystroke("ctrl-p"), context),
+            KeyBinding::new("ctrl-q", send_keystroke("ctrl-q"), context),
+            KeyBinding::new("ctrl-w", send_keystroke("ctrl-w"), context),
+            KeyBinding::new("ctrl-=", IncreaseFontSize, context),
+            KeyBinding::new("ctrl-+", IncreaseFontSize, context),
+            KeyBinding::new("ctrl--", DecreaseFontSize, context),
+            KeyBinding::new("ctrl-0", ResetFontSize, context),
+            KeyBinding::new("ctrl-shift-f", Find, context),
+            KeyBinding::new("ctrl-shift-f", Find, Some(FIND_KEY_CONTEXT)),
+        ]);
+    }
 }
 
 /// Zed's terminal search bar: a query, its matches' count and buttons to step through them.
@@ -1006,15 +1036,18 @@ mod tests {
             cx.update(|_, cx| f32::from(terminal_element::font_size(cx)))
         };
         assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE);
-        cx.simulate_keystrokes("cmd-=");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-=", "ctrl-="));
         assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE + 1.);
-        cx.simulate_keystrokes("cmd-- cmd-- cmd--");
+        cx.simulate_keystrokes(crate::platform_keys(
+            "cmd-- cmd-- cmd--",
+            "ctrl-- ctrl-- ctrl--",
+        ));
         assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE - 2.);
         for _ in 0..20 {
-            cx.simulate_keystrokes("cmd--");
+            cx.simulate_keystrokes(crate::platform_keys("cmd--", "ctrl--"));
         }
         assert_eq!(size(cx), terminal_element::MIN_FONT_SIZE);
-        cx.simulate_keystrokes("cmd-0");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-0", "ctrl-0"));
         assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE);
     }
 
@@ -1093,7 +1126,7 @@ mod tests {
             })
         };
 
-        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-shift-f"));
         cx.run_until_parked();
         assert!(cx.debug_bounds("terminal-find").is_some());
         assert_eq!(count(cx), Some("0/0".into()));
@@ -1143,7 +1176,7 @@ mod tests {
                 cx,
             )
         });
-        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-shift-f"));
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
             let find_bar = view.find_bar.as_ref().expect("the find bar is open");

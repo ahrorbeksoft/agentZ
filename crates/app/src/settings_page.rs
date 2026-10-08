@@ -978,8 +978,8 @@ impl SettingsPage {
         );
         let mut rows = vec![render_row(
             "Combine matching repositories across machines",
-            "Checkouts of one repository, on this Mac or other machines, share one entry in \
-             the projects list.",
+            "Checkouts of one repository, on this machine or others, share one entry in the \
+             projects list.",
             switch.into_any_element(),
             cx,
         )];
@@ -5526,7 +5526,7 @@ impl SettingsPage {
         let is_enabled = profile.is_none_or(|profile| profile.enabled);
         let label: SharedString = match profile {
             Some(profile) => profile.display_label().into(),
-            None => "This Mac".into(),
+            None => crate::machines::LOCAL_MACHINE_NAME.into(),
         };
         let transport = match profile {
             Some(profile) => format!("SSH {}", profile.target),
@@ -6210,7 +6210,7 @@ struct AccountMenu {
     can_refresh: bool,
     read_at: Option<SystemTime>,
     usage_page: Option<String>,
-    /// Show in Finder's, on this Mac.
+    /// Show in Finder's (or the file manager's), on this machine.
     folder: Option<PathBuf>,
     can_log_out: bool,
 }
@@ -6671,10 +6671,14 @@ fn build_account_menu(
     }
     if let Some(folder) = menu.folder.clone() {
         context_menu = context_menu.item(
-            ContextMenuEntry::new("Show in Finder")
-                .icon(IconName::Folder)
-                .icon_color(Color::Muted)
-                .handler(move |_, cx| cx.reveal_path(&folder)),
+            ContextMenuEntry::new(if cfg!(target_os = "macos") {
+                "Show in Finder"
+            } else {
+                "Show in File Manager"
+            })
+            .icon(IconName::Folder)
+            .icon_color(Color::Muted)
+            .handler(move |_, cx| cx.reveal_path(&folder)),
         );
     }
     if menu.can_log_out || account.is_some() {

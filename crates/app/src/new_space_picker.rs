@@ -181,7 +181,7 @@ impl NewSpacePicker {
             let section: SharedString = if has_remotes {
                 client.label().clone()
             } else {
-                "This Mac".into()
+                crate::machines::LOCAL_MACHINE_NAME.into()
             };
             let mut candidates = vec![Entry {
                 choice: SpaceChoice {
@@ -448,9 +448,13 @@ impl Render for NewSpacePicker {
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new("⌘↩ Open Another")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(if cfg!(target_os = "macos") {
+                            "⌘↩ Open Another"
+                        } else {
+                            "Ctrl-↩ Open Another"
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     ),
             )
     }

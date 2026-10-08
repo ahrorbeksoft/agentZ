@@ -1,12 +1,13 @@
 #!/bin/sh
-# Installs agentZ from its GitHub releases: the app on a Mac, or agentz-server on a Linux machine
-# you reach from the app over SSH.
+# Installs agentZ from its GitHub releases: the app on a Mac; on Linux, agentz-server, for a
+# machine you reach from the app over SSH, and the app too on a desktop.
 #
 #   curl -fsSL https://ahrorbeksoft.github.io/agentZ/install.sh | sh
 #
 # Run it again to update. AGENTZ_VERSION=0.1.0 installs that release instead of the latest one.
 # On a Mac, AGENTZ_APP_DIR picks where the app goes (/Applications by default, or
-# ~/Applications when /Applications isn't writable).
+# ~/Applications when /Applications isn't writable). On Linux, the app goes in ~/.local when
+# this runs in a desktop session; AGENTZ_APP=1 installs it anyway, AGENTZ_APP=0 never.
 set -eu
 
 repository=ahrorbeksoft/agentZ
@@ -106,12 +107,65 @@ install_linux() {
     ln -sf "$directory/agentz-server" "$bin_directory/agentz-server"
 
     say "Installed agentz-server $version in $directory"
-    say "In agentZ on your Mac, open Settings > Machines > Add Machine and enter this machine's"
-    say "SSH address (for example $(id -un)@$(uname -n)). The app starts the server when it connects."
+    say "In agentZ on your computer, open Settings > Machines > Add Machine and enter this"
+    say "machine's SSH address (for example $(id -un)@$(uname -n)). The app starts the server when"
+    say "it connects."
     case ":$PATH:" in
         *":$bin_directory:"*) ;;
         *) say "To run agentz-server yourself, add $bin_directory to your PATH." ;;
     esac
+}
+
+# The app, as Zed's install.sh puts Zed in ~/.local: agentz.app there, agentz in ~/.local/bin,
+# and its desktop entry pointing at both.
+install_linux_app() {
+    asset="agentZ-linux-$arch.tar.gz"
+    if ! awk -v name="$asset" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' \
+        "$temporary/SHA256SUMS"; then
+        say "agentZ $version has no app for $arch Linux; installed only the server."
+        return
+    fi
+    say "Downloading agentZ $version for Linux..."
+    download "$base/$asset" "$temporary/$asset"
+    verify "$temporary/$asset" "$asset"
+    mkdir -p "$temporary/unpacked"
+    tar -xzf "$temporary/$asset" -C "$temporary/unpacked"
+    [ -x "$temporary/unpacked/agentz.app/bin/agentz" ] || fail "$asset has no agentz.app in it"
+
+    mkdir -p "$HOME/.local"
+    destination="$HOME/.local/agentz.app"
+    if [ -e "$destination" ]; then
+        mv "$destination" "$temporary/previous.app" || fail "couldn't replace $destination"
+    fi
+    if ! mv "$temporary/unpacked/agentz.app" "$destination"; then
+        if [ -e "$temporary/previous.app" ]; then
+            mv "$temporary/previous.app" "$destination"
+        fi
+        fail "couldn't put agentZ in $HOME/.local"
+    fi
+
+    if command -v ldd > /dev/null 2>&1; then
+        missing=$(ldd "$destination/bin/agentz" 2> /dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found$/\1/p')
+        if [ -n "$missing" ]; then
+            say "Your system is missing libraries that agentZ needs:"
+            say "$missing" | sed 's/^/    /'
+            say "Install them with your package manager, or agentZ won't start."
+        fi
+    fi
+
+    bin_directory="$HOME/.local/bin"
+    applications="$HOME/.local/share/applications"
+    mkdir -p "$bin_directory" "$applications"
+    ln -sf "$destination/bin/agentz" "$bin_directory/agentz"
+    app_id=dev.agentz.agentZ
+    sed -e "s|^TryExec=agentz$|TryExec=$destination/bin/agentz|" \
+        -e "s|^Exec=agentz$|Exec=$destination/bin/agentz|" \
+        -e "s|^Icon=$app_id$|Icon=$destination/share/icons/hicolor/1024x1024/apps/$app_id.png|" \
+        "$destination/share/applications/$app_id.desktop" > "$applications/$app_id.desktop"
+
+    say "Installed agentZ $version in $destination"
+    say "Open it from your applications, or run: $bin_directory/agentz"
+    say "If agentZ was running, quit and reopen it to use the new version."
 }
 
 need curl
@@ -152,6 +206,15 @@ case "$(uname -s)" in
             fail "Android isn't supported"
         fi
         install_linux
+        case "${AGENTZ_APP:-}" in
+            1) install_linux_app ;;
+            0) ;;
+            *)
+                if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+                    install_linux_app
+                fi
+                ;;
+        esac
         ;;
     *) fail "this installs on macOS and Linux, not $(uname -s)" ;;
 esac

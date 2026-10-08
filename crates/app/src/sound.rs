@@ -1,6 +1,6 @@
 //! The sounds an agent makes as it finishes its turn or starts waiting for the user: Zed's
 //! `agent_done.wav`, and t3code's `notification-input.mp3` for input. Played with AppKit's
-//! `NSSound`, where Zed brings in rodio.
+//! `NSSound` on macOS and the desktop's own player on Linux, where Zed brings in rodio.
 
 use gpui::App;
 
@@ -21,7 +21,7 @@ impl Sound {
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(all(test, not(target_os = "macos")), allow(dead_code))]
     fn asset_path(self) -> &'static str {
         match self {
             Self::Finished => "sounds/agent_done.wav",
@@ -45,12 +45,13 @@ pub fn play_for_status(status: ThreadStatus, is_visible: bool, cx: &mut App) {
     }
 }
 
-#[cfg_attr(not(any(test, target_os = "macos")), allow(unused_variables))]
 pub fn play(sound: Sound, cx: &mut App) {
     #[cfg(test)]
     cx.default_global::<PlayedForTest>().0.push(sound);
     #[cfg(all(target_os = "macos", not(test)))]
     macos::play(sound, cx);
+    #[cfg(all(not(target_os = "macos"), not(test)))]
+    linux::play(sound, cx);
 }
 
 /// What tests played, in place of the speakers.
@@ -123,6 +124,63 @@ mod macos {
 
     pub(super) fn decode(bytes: &[u8]) -> Option<Retained<NSSound>> {
         NSSound::initWithData(NSSound::alloc(), &NSData::with_bytes(bytes))
+    }
+}
+
+/// The desktop's own player, as no audio library is linked: PipeWire's `pw-play`, which takes
+/// the MP3 too, else PulseAudio's `paplay`. It plays a copy of the sound in the cache folder.
+#[cfg(all(not(target_os = "macos"), not(test)))]
+mod linux {
+    use std::path::PathBuf;
+
+    use anyhow::{Context as _, Result};
+    use gpui::{App, AppContext as _};
+    use util::ResultExt as _;
+
+    use super::Sound;
+
+    pub(super) fn play(sound: Sound, cx: &mut App) {
+        let Some(path) = cached(sound, cx).log_err() else {
+            return;
+        };
+        cx.background_spawn(async move {
+            for player in ["pw-play", "paplay"] {
+                match smol::process::Command::new(player)
+                    .arg(&path)
+                    .status()
+                    .await
+                {
+                    Ok(status) if status.success() => return,
+                    Ok(status) => log::warn!("{player} couldn't play {}: {status}", path.display()),
+                    // Not installed: the next one may be.
+                    Err(_) => {}
+                }
+            }
+            log::warn!("found no player for {}", path.display());
+        })
+        .detach();
+    }
+
+    fn cached(sound: Sound, cx: &App) -> Result<PathBuf> {
+        let asset = sound.asset_path();
+        let file_name = asset.rsplit('/').next().unwrap_or(asset);
+        let path = dirs::cache_dir()
+            .context("finding the cache folder")?
+            .join("agentz")
+            .join("sounds")
+            .join(file_name);
+        if !path.exists() {
+            let bytes = cx
+                .asset_source()
+                .load(asset)?
+                .with_context(|| format!("no asset at {asset}"))?;
+            if let Some(folder) = path.parent() {
+                std::fs::create_dir_all(folder)
+                    .with_context(|| format!("creating {}", folder.display()))?;
+            }
+            std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        }
+        Ok(path)
     }
 }
 

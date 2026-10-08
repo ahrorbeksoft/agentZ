@@ -27,10 +27,15 @@ actions!(
     ]
 );
 
-/// Cmd-W closes a terminal thread, as it closes a Workspaces pane. A thread's drawer terminals
-/// aren't in this context, so it leaves them alone.
+/// Cmd-W (Ctrl-Shift-W on Linux) closes a terminal thread, as it closes a Workspaces pane. A
+/// thread's drawer terminals aren't in this context, so it leaves them alone.
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-w", CloseTerminal, Some(KEY_CONTEXT))]);
+    let keystroke = if cfg!(target_os = "macos") {
+        "cmd-w"
+    } else {
+        "ctrl-shift-w"
+    };
+    cx.bind_keys([KeyBinding::new(keystroke, CloseTerminal, Some(KEY_CONTEXT))]);
 }
 
 pub struct TerminalThreadView {
@@ -320,13 +325,13 @@ mod tests {
             })
         };
 
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-w", "ctrl-shift-w"));
         cx.run_until_parked();
         assert!(!cx.has_pending_prompt());
         assert_eq!(deletes(cx), 1);
 
         cx.update(|_, cx| set_running(Some("npm"), cx));
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-w", "ctrl-shift-w"));
         assert_eq!(
             cx.pending_prompt(),
             Some((
@@ -337,7 +342,7 @@ mod tests {
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         assert_eq!(deletes(cx), 1);
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-w", "ctrl-shift-w"));
         cx.simulate_prompt_answer("Close");
         cx.run_until_parked();
         assert_eq!(deletes(cx), 2);

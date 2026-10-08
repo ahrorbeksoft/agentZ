@@ -9990,7 +9990,7 @@ mod tests {
         cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
         cx.simulate_mouse_move(end, gpui::MouseButton::Left, gpui::Modifiers::none());
         cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_keystrokes("cmd-c");
+        cx.simulate_keystrokes("secondary-c");
         let copied = cx.read_from_clipboard().and_then(|item| item.text());
         assert_eq!(copied.as_deref(), Some("Copy this reply"));
     }

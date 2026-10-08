@@ -125,36 +125,53 @@ actions!(
 #[action(namespace = workspaces, no_json)]
 pub struct ActivateTab(pub usize);
 
-/// Mac-style keys for herdr's actions. A terminal pane needs none of them: they all hold Cmd,
-/// which terminals don't receive.
+/// Ghostty's keys for herdr's actions: its Mac keys, which all hold Cmd, and its Linux keys,
+/// which hold Ctrl-Shift or Alt. A terminal pane needs none of them.
 pub fn init(cx: &mut App) {
     let context = Some(KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new("cmd-shift-n", NewWorkspace, context),
-        KeyBinding::new("cmd-t", NewTab, context),
-        KeyBinding::new("cmd-}", NextTab, context),
-        KeyBinding::new("cmd-{", PreviousTab, context),
-        KeyBinding::new("cmd-d", SplitRight, context),
-        KeyBinding::new("cmd-shift-d", SplitDown, context),
-        KeyBinding::new("cmd-w", ClosePane, context),
-        KeyBinding::new("cmd-shift-enter", ToggleZoom, context),
-        KeyBinding::new("cmd-alt-left", ActivatePaneLeft, context),
-        KeyBinding::new("cmd-alt-right", ActivatePaneRight, context),
-        KeyBinding::new("cmd-alt-up", ActivatePaneUp, context),
-        KeyBinding::new("cmd-alt-down", ActivatePaneDown, context),
-        KeyBinding::new("cmd-1", ActivateTab(1), context),
-        KeyBinding::new("cmd-2", ActivateTab(2), context),
-        KeyBinding::new("cmd-3", ActivateTab(3), context),
-        KeyBinding::new("cmd-4", ActivateTab(4), context),
-        KeyBinding::new("cmd-5", ActivateTab(5), context),
-        KeyBinding::new("cmd-6", ActivateTab(6), context),
-        KeyBinding::new("cmd-7", ActivateTab(7), context),
-        KeyBinding::new("cmd-8", ActivateTab(8), context),
-        KeyBinding::new("cmd-9", ActivateTab(9), context),
         KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(SEARCH_KEY_CONTEXT)),
     ]);
+    let tab_modifier = if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-shift-n", NewWorkspace, context),
+            KeyBinding::new("cmd-t", NewTab, context),
+            KeyBinding::new("cmd-}", NextTab, context),
+            KeyBinding::new("cmd-{", PreviousTab, context),
+            KeyBinding::new("cmd-d", SplitRight, context),
+            KeyBinding::new("cmd-shift-d", SplitDown, context),
+            KeyBinding::new("cmd-w", ClosePane, context),
+            KeyBinding::new("cmd-shift-enter", ToggleZoom, context),
+            KeyBinding::new("cmd-alt-left", ActivatePaneLeft, context),
+            KeyBinding::new("cmd-alt-right", ActivatePaneRight, context),
+            KeyBinding::new("cmd-alt-up", ActivatePaneUp, context),
+            KeyBinding::new("cmd-alt-down", ActivatePaneDown, context),
+        ]);
+        "cmd"
+    } else {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-shift-n", NewWorkspace, context),
+            KeyBinding::new("ctrl-shift-t", NewTab, context),
+            KeyBinding::new("ctrl-pagedown", NextTab, context),
+            KeyBinding::new("ctrl-pageup", PreviousTab, context),
+            KeyBinding::new("ctrl-shift-o", SplitRight, context),
+            KeyBinding::new("ctrl-shift-e", SplitDown, context),
+            KeyBinding::new("ctrl-shift-w", ClosePane, context),
+            KeyBinding::new("ctrl-shift-enter", ToggleZoom, context),
+            KeyBinding::new("ctrl-alt-left", ActivatePaneLeft, context),
+            KeyBinding::new("ctrl-alt-right", ActivatePaneRight, context),
+            KeyBinding::new("ctrl-alt-up", ActivatePaneUp, context),
+            KeyBinding::new("ctrl-alt-down", ActivatePaneDown, context),
+        ]);
+        "alt"
+    };
+    cx.bind_keys(
+        (1..=9).map(|tab| {
+            KeyBinding::new(&format!("{tab_modifier}-{tab}"), ActivateTab(tab), context)
+        }),
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2613,10 +2630,10 @@ impl SpacesView {
                             .icon_color(Color::Muted)
                             .handler(copy_path),
                     )
-                    // Finder can only show this Mac's folders.
+                    // The file manager can only show this machine's folders.
                     .when(machine == MachineId::Local, |menu| {
                         menu.item(
-                            ContextMenuEntry::new("Reveal in Finder")
+                            ContextMenuEntry::new(ui::utils::reveal_in_file_manager_label(false))
                                 .icon(IconName::FolderOpen)
                                 .icon_color(Color::Muted)
                                 .handler(reveal),
@@ -5402,7 +5419,7 @@ mod tests {
 
         // Zoomed, the focused pane fills the tab alone. The keys reach the view past the
         // focused terminal.
-        cx.simulate_keystrokes("cmd-shift-enter");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-shift-enter", "ctrl-shift-enter"));
         cx.run_until_parked();
         assert!(bounds(cx, "pane-3").is_none());
         assert!(bounds(cx, "pane-4").is_none());
@@ -5413,7 +5430,10 @@ mod tests {
         assert_eq!(zoomed.bottom(), bottom.bottom());
 
         // Back from zoom, the left pane is to the left of the focused one.
-        cx.simulate_keystrokes("cmd-shift-enter cmd-alt-left");
+        cx.simulate_keystrokes(crate::platform_keys(
+            "cmd-shift-enter cmd-alt-left",
+            "ctrl-shift-enter ctrl-alt-left",
+        ));
         cx.run_until_parked();
         let focused = view.read_with(cx, |view, cx| view.focused_pane(cx));
         assert_eq!(focused.map(|pane| pane.pane), Some(PaneId(3)));
@@ -6368,7 +6388,7 @@ mod tests {
 
         // Cmd-W on Claude Code asks first, even while it only waits at its prompt.
         view.update_in(cx, |view, window, cx| view.focus_pane(pane(5), window, cx));
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-w", "ctrl-shift-w"));
         assert_eq!(
             cx.pending_prompt(),
             Some((
@@ -6379,7 +6399,7 @@ mod tests {
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         assert_eq!(sent(cx), [close_pane(3)]);
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-w", "ctrl-shift-w"));
         cx.simulate_prompt_answer("Close");
         cx.run_until_parked();
         assert_eq!(sent(cx), [close_pane(3), close_pane(5)]);

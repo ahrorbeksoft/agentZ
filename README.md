@@ -2,7 +2,7 @@
 
 # agentZ
 
-A native macOS app for working with coding agents over the
+A native app for macOS and Linux for working with coding agents over the
 [Agent Client Protocol](https://agentclientprotocol.com) (ACP). Install agents from the ACP
 Registry, open threads with them across several projects and machines, in their own worktrees or
 pastures, alongside real terminals. A background server on each machine keeps the agents
@@ -24,10 +24,14 @@ It installs `agentZ.app` in `/Applications` (or `~/Applications` when `/Applicat
 writable). Run it again to update. `AGENTZ_VERSION=0.1.0` installs a given release, and
 `AGENTZ_APP_DIR` picks another folder.
 
-On a Linux machine (x86_64 or arm64), the same command installs `agentz-server` in
-`~/.agentz/server/<version>/`, with a link in `~/.local/bin`. Then add the machine in the app
-under Settings › Machines › Add Machine. You don't have to do this: when you add a machine, the
-app uploads the server itself; installing it first only saves that upload.
+On Linux (x86_64 or arm64), the same command installs `agentz-server` in
+`~/.agentz/server/<version>/`, with a link in `~/.local/bin`, for a machine you reach from the app
+over SSH: add it in the app under Settings › Machines › Add Machine. You don't have to do this:
+when you add a machine, the app uploads the server itself; installing it first only saves that
+upload. Run in a desktop session on x86_64, it installs the app too, in `~/.local/agentz.app`,
+with `agentz` in `~/.local/bin` and an entry in your applications (`AGENTZ_APP=1` installs it
+anyway, `AGENTZ_APP=0` never). It needs Wayland or X11, Vulkan, and xkbcommon, which desktops
+have.
 
 You can also download a build from the [releases page](https://github.com/ahrorbeksoft/agentZ/releases/latest)
 and check it against `SHA256SUMS`. The app is signed ad hoc, not notarized by Apple, so a zip
@@ -49,6 +53,7 @@ rm -rf /Applications/agentZ.app
 # Linux
 ~/.local/bin/agentz-server stop
 rm -rf ~/.agentz/server ~/.local/bin/agentz-server
+rm -rf ~/.local/agentz.app ~/.local/bin/agentz ~/.local/share/applications/dev.agentz.agentZ.desktop
 ```
 
 Your threads and settings stay in `~/Library/Application Support/agentZ/` on a Mac and
@@ -56,11 +61,15 @@ Your threads and settings stay in `~/Library/Application Support/agentZ/` on a M
 
 ## Build from source
 
-Needs Rust (the version in `rust-toolchain.toml` installs itself through rustup).
+Needs Rust (the version in `rust-toolchain.toml` installs itself through rustup). On Linux, also a
+C toolchain and the libraries GPUI builds against; on Debian and Ubuntu: `build-essential cmake
+clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev
+libzstd-dev`.
 
 ```sh
 cargo build                       # the app (target/debug/agentz) and agentz-server
 tooling/bundle-mac.sh             # target/bundle/agentZ.app, a release build
+tooling/bundle-linux.sh           # target/bundle/agentZ-linux-<arch>.tar.gz, on Linux
 tooling/build-remote-servers.sh   # Linux servers for SSH machines (needs zig and cargo-zigbuild)
 ```
 
@@ -78,7 +87,8 @@ git push origin v0.1.0
 ```
 
 `.github/workflows/release.yml` builds the Linux servers (static musl, x86_64 and arm64), the
-universal macOS app with those servers inside it, and publishes them with `install.sh` and
+universal macOS app and the x86_64 Linux app with those servers inside them, and publishes them
+with `install.sh` and
 `SHA256SUMS` as a GitHub release. The website in `site/` deploys to GitHub Pages from
 `.github/workflows/pages.yml` whenever it changes on `main`. `install.sh` always fetches from
 the latest release, so there's no update server.

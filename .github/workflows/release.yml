@@ -1,7 +1,7 @@
 # Publishes a release when a version tag is pushed: `git tag v0.1.0 && git push origin v0.1.0`.
 # The tag must match the version in crates/app/Cargo.toml. The release has the universal macOS
-# app, the Linux servers (also bundled in the app, for machines it reaches over SSH),
-# install.sh and SHA256SUMS.
+# app, the x86_64 Linux app, the Linux servers (also bundled in the apps, for machines they
+# reach over SSH), install.sh and SHA256SUMS.
 name: Release
 
 on:
@@ -70,9 +70,35 @@ jobs:
           path: target/bundle/agentZ-macos.zip
           if-no-files-found: error
 
+  linux-app:
+    name: Linux app
+    needs: linux-servers
+    # The oldest Ubuntu runner, so the app runs where glibc is older too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the libraries GPUI builds against (Zed's list, as agentZ needs them)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libfontconfig-dev libzstd-dev
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-servers
+          path: target/remote-servers
+      - run: tooling/bundle-linux.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-app
+          path: target/bundle/agentZ-linux-x86_64.tar.gz
+          if-no-files-found: error
+
   release:
     name: GitHub release
-    needs: [linux-servers, macos-app]
+    needs: [linux-servers, macos-app, linux-app]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -88,8 +114,8 @@ jobs:
         run: |
           cp site/install.sh dist/
           cd dist
-          sha256sum agentZ-macos.zip agentz-server-* install.sh > SHA256SUMS
+          sha256sum agentZ-macos.zip agentZ-linux-*.tar.gz agentz-server-* install.sh > SHA256SUMS
           cat SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
             --title "agentZ ${GITHUB_REF_NAME#v}" \
-            agentZ-macos.zip agentz-server-* install.sh SHA256SUMS
+            agentZ-macos.zip agentZ-linux-*.tar.gz agentz-server-* install.sh SHA256SUMS

@@ -39,6 +39,7 @@ mod terminal_view;
 mod thread_entity;
 mod usage_limits;
 mod welcome;
+mod window_decorations;
 mod worktree_modal;
 
 use std::sync::Arc;
@@ -46,7 +47,7 @@ use std::sync::Arc;
 use assets::Assets;
 use gpui::{
     App, Bounds, Focusable as _, Font, KeyBinding, Menu, MenuItem, Pixels, TitlebarOptions,
-    WindowBounds, WindowOptions, actions, point, px, size,
+    WindowBounds, WindowDecorations, WindowOptions, actions, point, px, size,
 };
 use reqwest_client::ReqwestClient;
 use theme::{LoadThemes, ThemeRegistry, ThemeSettingsProvider, UiDensity};
@@ -82,6 +83,9 @@ actions!(
         GoTo,
     ]
 );
+
+/// The app's id on Linux: its desktop entry's name, as the bundle id is on macOS.
+const APP_ID: &str = "dev.agentz.agentZ";
 
 const UI_FONT_FAMILY: &str = "IBM Plex Sans";
 const MONO_FONT_FAMILY: &str = "Lilex";
@@ -148,6 +152,16 @@ fn init_for_test(cx: &mut App) {
     new_space_picker::init(cx);
     spaces_view::init(cx);
     bind_keys(cx);
+}
+
+/// The keys a test presses: the Mac's, or their Linux counterparts.
+#[cfg(test)]
+pub(crate) fn platform_keys(mac: &'static str, linux: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        mac
+    } else {
+        linux
+    }
 }
 
 /// The shell's keys are bound in its context, not globally: GPUI ranks a binding without a
@@ -261,6 +275,10 @@ fn main() {
                     // as Zed's does. Left to AppKit too, macOS 27 zooms the window on the
                     // double-click as well, so it zooms and immediately unzooms.
                     app_owns_titlebar_drag: true,
+                    // On Linux, the frame too where the desktop lets it (Zed's default), and
+                    // the desktop entry's name, which Wayland matches the window to.
+                    window_decorations: Some(WindowDecorations::Client),
+                    app_id: Some(APP_ID.to_string()),
                     ..Default::default()
                 },
                 |window, cx| {

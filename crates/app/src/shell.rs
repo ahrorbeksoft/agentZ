@@ -9,9 +9,9 @@ use agentz_protocol::workspace::WorkspaceChoice;
 use anyhow::Result;
 use collections::HashMap;
 use gpui::{
-    AnyView, App, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, MouseButton, PathPromptOptions, Subscription, SystemNotification, Task, Window,
-    WindowControlArea,
+    AnyView, App, Context, Decorations, DismissEvent, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, MouseButton, PathPromptOptions, Subscription, SystemNotification, Task,
+    Window, WindowControlArea,
 };
 use projects::{Thread, ThreadId};
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
@@ -38,6 +38,7 @@ use crate::spaces_view::{self, PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::welcome::{Section, SectionButton, render_welcome};
+use crate::window_decorations::{self, RoundedTopCorners as _, Side};
 use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
     GoTo, NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleCommandPalette, ToggleDiff,
@@ -1588,6 +1589,20 @@ impl Shell {
             .child(view_tabs)
             .children(badge_after);
 
+        let decorations = window.window_decorations();
+        let supported_controls = window.window_controls();
+        let right_controls = (!window.is_fullscreen())
+            .then(|| window_decorations::window_controls(Side::Right, window, cx))
+            .flatten();
+        // Zed's: on Linux, an inactive window's title bar, and one being dragged, dims.
+        let title_bar_background = if cfg!(target_os = "macos")
+            || (window.is_window_active() && !self.should_move_window)
+        {
+            colors.title_bar_background
+        } else {
+            colors.title_bar_inactive_background
+        };
+
         h_flex()
             .id("title-bar")
             .window_control_area(WindowControlArea::Drag)
@@ -1595,18 +1610,36 @@ impl Shell {
             .flex_none()
             .w_full()
             // Full screen hides the traffic lights, so nothing needs their room (as in Zed).
+            // Linux has window controls where the desktop puts them, when agentZ draws them.
             .map(|title_bar| {
                 if window.is_fullscreen() {
                     title_bar.pl_2()
-                } else {
+                } else if cfg!(target_os = "macos") {
                     title_bar.pl(TRAFFIC_LIGHTS_WIDTH)
+                } else if let Some(controls) =
+                    window_decorations::window_controls(Side::Left, window, cx)
+                {
+                    title_bar.child(controls)
+                } else {
+                    title_bar.pl_2()
                 }
             })
-            .pr_3()
+            .when(right_controls.is_none(), |title_bar| title_bar.pr_3())
             .gap_2()
             .border_b_1()
             .border_color(colors.border)
-            .bg(colors.title_bar_background)
+            .bg(title_bar_background)
+            .map(|title_bar| match decorations {
+                Decorations::Client { tiling } => title_bar.rounded_top_corners(tiling).when(
+                    supported_controls.window_menu,
+                    |title_bar| {
+                        title_bar.on_mouse_down(MouseButton::Right, |event, window, _| {
+                            window.show_window_menu(event.position)
+                        })
+                    },
+                ),
+                Decorations::Server => title_bar,
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.should_move_window = true),
@@ -1622,9 +1655,14 @@ impl Shell {
                     window.start_window_move();
                 }
             }))
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
+            .on_click(move |event, window, _| {
+                if event.click_count() != 2 {
+                    return;
+                }
+                if cfg!(target_os = "macos") {
                     window.titlebar_double_click();
+                } else if supported_controls.maximize && window.is_resizable() {
+                    window.zoom_window();
                 }
             })
             .child(
@@ -1715,6 +1753,7 @@ impl Shell {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(view_tabs),
             )
+            .children(right_controls)
     }
 
     /// Each machine that can't be reached or runs an older server, by its own icon with a dot
@@ -1900,8 +1939,9 @@ impl Render for Shell {
         let shows_workspaces = self.view == MainView::Workspaces && settings_page.is_none();
         let no_thread = (!shows_workspaces && settings_page.is_none() && active_view.is_none())
             .then(|| self.render_no_thread(cx));
+        let decorations = window.window_decorations();
 
-        v_flex()
+        let shell = v_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_folder))
@@ -1934,6 +1974,10 @@ impl Render for Shell {
             .relative()
             .size_full()
             .bg(background)
+            .map(|shell| match decorations {
+                Decorations::Client { tiling } => shell.rounded_top_corners(tiling),
+                Decorations::Server => shell,
+            })
             .text_color(text_color)
             .font_ui(cx)
             .text_ui(cx)
@@ -2068,7 +2112,8 @@ impl Render for Shell {
                             ),
                     )
                 },
-            )
+            );
+        window_decorations::client_side_decorations(shell, window, cx)
     }
 }
 
@@ -2222,6 +2267,8 @@ mod modal_tests {
         assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
     }
 
+    // Linux has no traffic lights to leave room for.
+    #[cfg(target_os = "macos")]
     #[gpui::test]
     fn full_screen_moves_the_title_bar_left(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2277,7 +2324,7 @@ mod modal_tests {
             })
         };
 
-        cx.simulate_keystrokes("cmd-/");
+        cx.simulate_keystrokes("secondary-/");
         assert!(is_open(cx));
         assert!(cx.debug_bounds("shortcut-group-General").is_some());
         // The sheet has the keys while it's open.
@@ -2291,9 +2338,9 @@ mod modal_tests {
         });
 
         // Cmd-/ closes it too.
-        cx.simulate_keystrokes("cmd-/");
+        cx.simulate_keystrokes("secondary-/");
         assert!(is_open(cx));
-        cx.simulate_keystrokes("cmd-/");
+        cx.simulate_keystrokes("secondary-/");
         assert!(!is_open(cx));
     }
 
@@ -2374,7 +2421,7 @@ mod modal_tests {
         };
 
         // The Agents view's actions, and not the Workspaces view's.
-        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_keystrokes("secondary-shift-p");
         assert!(is_open(cx));
         assert!(cx.debug_bounds("command-agentz: toggle diff").is_some());
         assert!(cx.debug_bounds("command-workspaces: split right").is_none());
@@ -2395,13 +2442,13 @@ mod modal_tests {
             shell.set_view(MainView::Workspaces, window, cx)
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_keystrokes("secondary-shift-p");
         assert!(cx.debug_bounds("command-workspaces: split right").is_some());
         assert!(cx.debug_bounds("command-agentz: toggle diff").is_none());
         // Its key closes it, and Go To's opens Go To in its place.
-        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_keystrokes("secondary-shift-p");
         assert!(!is_open(cx));
-        cx.simulate_keystrokes("cmd-shift-p cmd-p");
+        cx.simulate_keystrokes("secondary-shift-p secondary-p");
         assert_eq!(
             shell.read_with(cx, |shell, _| shell.overlay_kind()),
             Some(OverlayKind::GoTo)
@@ -2418,7 +2465,7 @@ mod modal_tests {
         });
         cx.run_until_parked();
 
-        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_keystrokes("secondary-shift-p");
         cx.simulate_input("save layout");
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
@@ -2458,7 +2505,7 @@ mod modal_tests {
         cx.run_until_parked();
 
         // In Agents, its threads come first.
-        cx.simulate_keystrokes("cmd-p");
+        cx.simulate_keystrokes("secondary-p");
         let thread = cx
             .debug_bounds("go-to-Fix the login")
             .expect("the thread is listed");
@@ -2479,7 +2526,7 @@ mod modal_tests {
         });
 
         // In Workspaces, the workspaces come first; a thread opens in Agents.
-        cx.simulate_keystrokes("cmd-p");
+        cx.simulate_keystrokes("secondary-p");
         let thread = cx
             .debug_bounds("go-to-Fix the login")
             .expect("the thread is listed");
@@ -2592,9 +2639,9 @@ mod modal_tests {
         });
         let hidden = |cx: &mut gpui::VisualTestContext| cx.update(|_, cx| is_sidebar_hidden(cx));
         assert!(!hidden(cx));
-        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_keystrokes("secondary-b");
         assert!(hidden(cx));
-        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_keystrokes("secondary-b");
         assert!(!hidden(cx));
     }
 
@@ -2626,14 +2673,14 @@ mod modal_tests {
         shell.update_in(cx, |shell, window, cx| {
             shell.set_view(MainView::Workspaces, window, cx)
         });
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-d", "ctrl-shift-o"));
         assert_eq!(dispatched.borrow().last(), Some(&"workspaces::SplitRight"));
         assert!(!shell.read_with(cx, |shell, _| shell.show_diff));
 
         shell.update_in(cx, |shell, window, cx| {
             shell.set_view(MainView::Agents, window, cx)
         });
-        cx.simulate_keystrokes("cmd-d");
+        cx.simulate_keystrokes("secondary-d");
         assert_eq!(dispatched.borrow().last(), Some(&"agentz::ToggleDiff"));
         assert!(shell.read_with(cx, |shell, _| shell.show_diff));
     }
