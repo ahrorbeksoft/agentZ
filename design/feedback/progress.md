@@ -28,12 +28,13 @@ Notes for whoever continues:
 | 6 | 8 | Agents / Workspaces switcher marks the active view in every Zed theme | fix | not started |
 | 7 | 16 | Project icon scan from t3code | fix | not started |
 | 8 | 19 | Scrolling an agent's accounts feels buggy | fix (cause unknown) | not started |
-| 9 | 20 | Stop installing the server with install.sh, and drop it from the release | fix | not started |
-| 10 | 18 | More notification choices (outside the thread or the app), and a volume setting | design round | not started |
-| 11 | 15 | Settings lists a combined project once, with a machine choice | design round | not started |
-| 12 | 5, 6, 7 | Usage screen, usage popover in threads, Account tab with several accounts, Add Account as a modal | design round | not started |
-| 13 | 11 | Subthreads: Agents list rows, an open subthread looks different, an easier way back | design round | not started |
-| 14 | 12, 13 | Tool calls and images in threads, ToolSearch, agentZ's own tools ("Started a subthread") | design round | not started |
-| 15 | 10 | Simpler thread terminals | design round | not started |
-| 16 | 1 | Thread cards with a draft | design round | not started |
-| 17 | 14 | Agents manage workspaces, terminals and projects on any machine, and delegate there | feature | not started |
+| 9 | 21 | Antigravity starts an OAuth login at random times | fix (cause unknown) | not started |
+| 10 | 20 | Stop installing the server with install.sh, and drop it from the release | fix | not started |
+| 11 | 18 | More notification choices (outside the thread or the app), and a volume setting | design round | not started |
+| 12 | 15 | Settings lists a combined project once, with a machine choice | design round | not started |
+| 13 | 5, 6, 7 | Usage screen, usage popover in threads, Account tab with several accounts, Add Account as a modal | design round | not started |
+| 14 | 11 | Subthreads: Agents list rows, an open subthread looks different, an easier way back | design round | not started |
+| 15 | 12, 13 | Tool calls and images in threads, ToolSearch, agentZ's own tools ("Started a subthread") | design round | not started |
+| 16 | 10 | Simpler thread terminals | design round | not started |
+| 17 | 1 | Thread cards with a draft | design round | not started |
+| 18 | 14 | Agents manage workspaces, terminals and projects on any machine, and delegate there | feature | not started |

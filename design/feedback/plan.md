@@ -336,3 +336,19 @@ Screenshots are in `evidence/`. The ones that show the user's account emails are
 - `site/install.sh` and `.github/workflows/release.yml` changed last in 9e31cba ("Run the app on Linux, packaged as Zed packages Zed"), along with `tooling/bundle-linux.sh`. Read that commit first, so the Linux packaging keeps working.
 - Update `docs/architecture.md` and the README if they describe installing with `install.sh`.
 
+## 21. Antigravity starts an OAuth login at random times
+
+**Reported:** "Antigravity randomly triggers OAuth."
+
+**Evidence:** none attached. The user didn't say what appears (presumably Google's login page in the browser), how often, on which machine, or for which account.
+
+**A lead from AGENTS.md (Pitfalls, not confirmed as the cause):** Antigravity's usage reader reads each agentZ account's stored login and gets an access token from Google, writing nothing back. Its External account reads the `agy` CLI's login instead. `agy` renews that login itself, and is run where `open` does nothing, but a login it can't renew opens Google's login page in the user's browser. So a usage refresh of the External account may be what opens it.
+
+**Wanted:**
+- Nothing in agentZ opens an OAuth login for Antigravity unless the user asked to log in.
+- When a stored login can't be renewed, show the account as logged out (or its usage as unavailable) and let the user log in from the Account tab.
+
+**Notes for whoever picks this up:**
+- Find what opens it first: check the server log (`logs/server.log` in the data directory) for usage reads and `agy` runs around the time it happens, and ask the user when it last happened.
+- Don't log the user out of Antigravity, and don't refresh, change or copy its stored logins beyond what AGENTS.md allows.
+
