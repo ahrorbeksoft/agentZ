@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projects in Settings Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="settings-projects" data-title="Projects in Settings">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Projects in Settings <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>You reported: “We gotta merge projects in the settings too, with a dropdown or select machines.” The settings sidebar lists each machine’s copy of a project as its own row (“ielts-today”, “ielts-today · Ahrorbek’s Laptop”, “fluency.uz” three times), while the project switcher and New Thread list a combined project once.</p>
+<p>Today each row opens a page for that one copy: Project (Name, Icon, Monogram, Folder), Repository (Repository, Grouping, Combined with), Checkouts and Danger. Name, Icon and Monogram already change every copy; Folder, Grouping, Checkouts and Remove change only that copy. “Combined with” names the other copies in a sentence. The Agents and Usage pages pick their machine with a dropdown in the top right (“This Mac”).</p>
+<p>This round decides how the settings sidebar lists a combined project, how you choose the machine on its page, how the page separates what’s shared from what belongs to one copy, and what Remove removes. The topics build on each other: “Choosing the machine” offers options that only fit one sidebar or one Remove, and says so.</p>
+<p>Words used: a <b>combined project</b> is one repository’s folders on several machines shown as one project (General’s “Combine matching repositories across machines”). A <b>copy</b> is one machine’s folder of it, with its own threads. <b>Checkouts</b> are the worktrees and pastures made from a copy, as in the page’s Checkouts section. The mocks use the projects from your screenshot, in One Dark at the app’s sizes.</p>`;
+</script>
+<script src="topics-settings-projects.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
