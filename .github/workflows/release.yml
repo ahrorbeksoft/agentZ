@@ -1,7 +1,7 @@
 # Publishes a release when a version tag is pushed: `git tag v0.1.0 && git push origin v0.1.0`.
 # The tag must match the version in crates/app/Cargo.toml. The release has the universal macOS
-# app, the x86_64 Linux app, the Linux servers (also bundled in the apps, for machines they
-# reach over SSH), install.sh and SHA256SUMS.
+# app and the x86_64 Linux app, each carrying the Linux servers for machines it reaches over SSH,
+# and SHA256SUMS, which site/install.sh checks them against.
 name: Release
 
 on:
@@ -98,7 +98,7 @@ jobs:
 
   release:
     name: GitHub release
-    needs: [linux-servers, macos-app, linux-app]
+    needs: [macos-app, linux-app]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -106,16 +106,16 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
+          pattern: "*-app"
           path: dist
           merge-multiple: true
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp site/install.sh dist/
           cd dist
-          sha256sum agentZ-macos.zip agentZ-linux-*.tar.gz agentz-server-* install.sh > SHA256SUMS
+          sha256sum agentZ-macos.zip agentZ-linux-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
             --title "agentZ ${GITHUB_REF_NAME#v}" \
-            agentZ-macos.zip agentZ-linux-*.tar.gz agentz-server-* install.sh SHA256SUMS
+            agentZ-macos.zip agentZ-linux-*.tar.gz SHA256SUMS

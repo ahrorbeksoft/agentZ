@@ -106,17 +106,16 @@ so an open tool call's output raced the conversation.
 - **Releases** (`.github/workflows/release.yml`): a `v<version>` tag matching
   `crates/app/Cargo.toml` builds the Linux servers, then the universal app with them in its
   resources and the x86_64 Linux app (`tooling/bundle-linux.sh`, on Ubuntu 22.04 for an older
-  glibc), and publishes a GitHub release with `agentZ-macos.zip`, `agentZ-linux-x86_64.tar.gz`,
-  `agentz-server-<rust target>`, `install.sh` and `SHA256SUMS`. There's no update server: the
-  apps carry every machine's server, so remote ones update over SSH (Machines over SSH below).
+  glibc), and publishes a GitHub release with `agentZ-macos.zip`, `agentZ-linux-x86_64.tar.gz`
+  and `SHA256SUMS`. There's no update server: the apps carry every machine's server, so remote
+  ones install and update over SSH (Machines over SSH below).
 - **Installing** (`site/install.sh`, served at `https://ahrorbeksoft.github.io/agentZ/install.sh`):
-  takes the latest release (or `AGENTZ_VERSION`) and checks it against `SHA256SUMS`. On a Mac it
-  puts `agentZ.app` in `/Applications` (curl doesn't quarantine it, so the ad-hoc signature is
-  enough). On Linux it puts the server where the app installs it over SSH,
-  `~/.agentz/server/<version>/agentz-server` with its `.sha256`, so the app finds it in place,
-  and links it from `~/.local/bin`. In a desktop session (or with `AGENTZ_APP=1`) it also puts
-  the app in `~/.local/agentz.app` as Zed's script puts Zed: `agentz` linked from
-  `~/.local/bin`, and its desktop entry in `~/.local/share/applications` pointing there.
+  takes the latest release (or `AGENTZ_VERSION`) and checks it against `SHA256SUMS`. It installs
+  only the app: a machine reached over SSH gets its server from the app. On a Mac it puts
+  `agentZ.app` in `/Applications` (curl doesn't quarantine it, so the ad-hoc signature is
+  enough). On Linux, in a desktop session (or with `AGENTZ_APP=1`), it puts the app in
+  `~/.local/agentz.app` as Zed's script puts Zed: `agentz` linked from `~/.local/bin`, and its
+  desktop entry in `~/.local/share/applications` pointing there.
 - **Website** (`site/`, `.github/workflows/pages.yml`): the landing page on GitHub Pages,
   published when `site/` changes. Its screenshots show demo data only: custom agents running the
   mock agent under real agents' names, with `MOCK_SCRIPTS` giving their scripted turns

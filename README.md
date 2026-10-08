@@ -24,14 +24,12 @@ It installs `agentZ.app` in `/Applications` (or `~/Applications` when `/Applicat
 writable). Run it again to update. `AGENTZ_VERSION=0.1.0` installs a given release, and
 `AGENTZ_APP_DIR` picks another folder.
 
-On Linux (x86_64 or arm64), the same command installs `agentz-server` in
-`~/.agentz/server/<version>/`, with a link in `~/.local/bin`, for a machine you reach from the app
-over SSH: add it in the app under Settings › Machines › Add Machine. You don't have to do this:
-when you add a machine, the app uploads the server itself; installing it first only saves that
-upload. Run in a desktop session on x86_64, it installs the app too, in `~/.local/agentz.app`,
-with `agentz` in `~/.local/bin` and an entry in your applications (`AGENTZ_APP=1` installs it
-anyway, `AGENTZ_APP=0` never). It needs Wayland or X11, Vulkan, and xkbcommon, which desktops
-have.
+On a Linux desktop (x86_64), the same command installs the app in `~/.local/agentz.app`, with
+`agentz` in `~/.local/bin` and an entry in your applications (`AGENTZ_APP=1` installs it outside
+a desktop session too). It needs Wayland or X11, Vulkan, and xkbcommon, which desktops have.
+
+A machine you reach from the app over SSH needs nothing installed: add it under Settings ›
+Machines › Add Machine, and the app installs its server there when it connects.
 
 You can also download a build from the [releases page](https://github.com/ahrorbeksoft/agentZ/releases/latest)
 and check it against `SHA256SUMS`. The app is signed ad hoc, not notarized by Apple, so a zip
@@ -51,9 +49,12 @@ The server keeps running when you quit the app, so stop it first:
 rm -rf /Applications/agentZ.app
 
 # Linux
-~/.local/bin/agentz-server stop
-rm -rf ~/.agentz/server ~/.local/bin/agentz-server
+~/.local/agentz.app/bin/agentz-server stop
 rm -rf ~/.local/agentz.app ~/.local/bin/agentz ~/.local/share/applications/dev.agentz.agentZ.desktop
+
+# A machine the app reached over SSH
+for server in ~/.agentz/server/*/agentz-server; do "$server" stop; done
+rm -rf ~/.agentz/server
 ```
 
 Your threads and settings stay in `~/Library/Application Support/agentZ/` on a Mac and
@@ -87,9 +88,8 @@ git push origin v0.1.0
 ```
 
 `.github/workflows/release.yml` builds the Linux servers (static musl, x86_64 and arm64), the
-universal macOS app and the x86_64 Linux app with those servers inside them, and publishes them
-with `install.sh` and
-`SHA256SUMS` as a GitHub release. The website in `site/` deploys to GitHub Pages from
+universal macOS app and the x86_64 Linux app with those servers inside them, and publishes the
+apps with `SHA256SUMS` as a GitHub release. The website in `site/` deploys to GitHub Pages from
 `.github/workflows/pages.yml` whenever it changes on `main`. `install.sh` always fetches from
 the latest release, so there's no update server.
 

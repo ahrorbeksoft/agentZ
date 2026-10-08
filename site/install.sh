@@ -1,13 +1,13 @@
 #!/bin/sh
-# Installs agentZ from its GitHub releases: the app on a Mac; on Linux, agentz-server, for a
-# machine you reach from the app over SSH, and the app too on a desktop.
+# Installs the agentZ app from its GitHub releases, on a Mac or a Linux desktop. A machine you
+# reach from the app over SSH needs nothing installed: the app installs its server there.
 #
 #   curl -fsSL https://ahrorbeksoft.github.io/agentZ/install.sh | sh
 #
 # Run it again to update. AGENTZ_VERSION=0.1.0 installs that release instead of the latest one.
 # On a Mac, AGENTZ_APP_DIR picks where the app goes (/Applications by default, or
-# ~/Applications when /Applications isn't writable). On Linux, the app goes in ~/.local when
-# this runs in a desktop session; AGENTZ_APP=1 installs it anyway, AGENTZ_APP=0 never.
+# ~/Applications when /Applications isn't writable). On Linux, the app goes in ~/.local, when
+# this runs in a desktop session or with AGENTZ_APP=1.
 set -eu
 
 repository=ahrorbeksoft/agentZ
@@ -84,46 +84,13 @@ install_mac() {
     say "If agentZ was running, quit and reopen it to use the new version."
 }
 
-install_linux() {
-    target="$arch-unknown-linux-musl"
-    asset="agentz-server-$target"
-    say "Downloading agentz-server $version for $target..."
-    download "$base/$asset" "$temporary/$asset"
-    verify "$temporary/$asset" "$asset"
-
-    # Where the app installs servers over SSH, with the hash it checks, so it finds this one
-    # already in place and doesn't upload its own.
-    directory="$HOME/.agentz/server/$version"
-    mkdir -p "$directory"
-    staged="$directory/agentz-server.tmp.$$"
-    cp "$temporary/$asset" "$staged"
-    chmod 755 "$staged"
-    # A rename leaves a server that runs from the old file running.
-    mv "$staged" "$directory/agentz-server"
-    sha256 "$directory/agentz-server" > "$directory/agentz-server.sha256"
-
-    bin_directory="$HOME/.local/bin"
-    mkdir -p "$bin_directory"
-    ln -sf "$directory/agentz-server" "$bin_directory/agentz-server"
-
-    say "Installed agentz-server $version in $directory"
-    say "In agentZ on your computer, open Settings > Machines > Add Machine and enter this"
-    say "machine's SSH address (for example $(id -un)@$(uname -n)). The app starts the server when"
-    say "it connects."
-    case ":$PATH:" in
-        *":$bin_directory:"*) ;;
-        *) say "To run agentz-server yourself, add $bin_directory to your PATH." ;;
-    esac
-}
-
 # The app, as Zed's install.sh puts Zed in ~/.local: agentz.app there, agentz in ~/.local/bin,
 # and its desktop entry pointing at both.
 install_linux_app() {
     asset="agentZ-linux-$arch.tar.gz"
     if ! awk -v name="$asset" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' \
         "$temporary/SHA256SUMS"; then
-        say "agentZ $version has no app for $arch Linux; installed only the server."
-        return
+        fail "agentZ $version has no app for $arch Linux"
     fi
     say "Downloading agentZ $version for Linux..."
     download "$base/$asset" "$temporary/$asset"
@@ -205,16 +172,12 @@ case "$(uname -s)" in
         if [ "$(uname -o 2> /dev/null)" = Android ]; then
             fail "Android isn't supported"
         fi
-        install_linux
-        case "${AGENTZ_APP:-}" in
-            1) install_linux_app ;;
-            0) ;;
-            *)
-                if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
-                    install_linux_app
-                fi
-                ;;
-        esac
+        if [ "${AGENTZ_APP:-}" != 1 ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+            say "A machine you reach from agentZ over SSH needs nothing installed: add it under"
+            say "Settings > Machines, and the app installs its server there."
+            fail "this isn't a desktop session, so there's no app to install (AGENTZ_APP=1 installs it anyway)"
+        fi
+        install_linux_app
         ;;
     *) fail "this installs on macOS and Linux, not $(uname -s)" ;;
 esac
