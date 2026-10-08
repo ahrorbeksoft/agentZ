@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread Terminals Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="thread-terminals" data-title="Thread terminals">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Thread terminals <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>You wrote: “We gotta simplify thread terminals.” You didn’t say what to cut, so the options run from small trims to a different model.</p>
+<p>Today a thread’s terminal opens with <b>Cmd-J</b> or the terminal button in the thread’s header. It sits under the composer, 280 pixels tall, and its top edge drags. It starts with one shell and a bordered toolbar floating over the shell’s top right corner: split side by side, split top and bottom, new terminal (+), full screen, and close (×). + adds a shell in a group of its own. A split adds one beside the shell in front, up to four in a group, sharing the space evenly. One group shows at a time. From the second shell on, a list on the right names the groups and shells, and the buttons move into it. × ends the shell in front at once. Hiding keeps every shell running, with a dot on the header button. This follows t3code’s terminal drawer, with full screen added.</p>
+<p>This round decides how many shells a thread has and whether they split, which buttons stay, where they go, what closing does, where the terminal sits, and how it resizes. Workspaces panes are a separate feature and don’t change. Zed’s terminal panel (tabs, a Split menu, Zoom) and herdr’s panes are the references.</p>
+<p>Words used: the <b>terminal</b> is the area at the bottom of a thread. A <b>shell</b> is one session in it. A <b>tab</b> is one shell’s name in a strip above it, as in Zed’s terminal panel. A <b>split</b> shows two shells at once, side by side or one above the other. <b>Hide</b> keeps the shells running; <b>close</b> ends a shell. The mocks are a thread in One Dark at the app’s sizes. Where a mock has a dark strip on top, that strip isn’t part of the app: it shows today’s toolbar beside the change.</p>`;
+</script>
+<script src="topics-terminals.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
