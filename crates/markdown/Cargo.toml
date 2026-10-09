@@ -27,6 +27,7 @@ html5ever.workspace = true
 linkify.workspace = true
 log.workspace = true
 markup5ever_rcdom.workspace = true
+mermaid_render.workspace = true
 pulldown-cmark.workspace = true
 rope.workspace = true
 smallvec.workspace = true

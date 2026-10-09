@@ -21,6 +21,7 @@ members = [
     "crates/icons",
     "crates/markdown",
     "crates/menu",
+    "crates/mermaid_render",
     "crates/path",
     "crates/refineable",
     "crates/refineable/derive_refineable",
@@ -88,6 +89,7 @@ http_client_tls = { path = "crates/http_client_tls" }
 icons = { path = "crates/icons" }
 markdown = { path = "crates/markdown" }
 menu = { path = "crates/menu" }
+mermaid_render = { path = "crates/mermaid_render" }
 path = { path = "crates/path" }
 perf = { path = "tooling/perf" }
 refineable = { path = "crates/refineable" }
@@ -289,6 +291,7 @@ lru = "0.16"
 lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "f1783e63a7f4eb4397bf51d4148b4895a1f7ab16" }
 mach2 = "0.5"
 markup5ever_rcdom = "0.39"
+merman = { version = "=0.8.0-alpha.5", default-features = false }
 metal = "0.33"
 mime = "0.3.17"
 minidumper = "0.11"

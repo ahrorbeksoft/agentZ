@@ -33,7 +33,7 @@ use gpui::{
     ListOffset, ListState, MouseMoveEvent, ObjectFit, Pixels, Point, PromptLevel, ScrollHandle,
     Stateful, Subscription, Task, Window, anchored, canvas, deferred, img, list, pulsating_between,
 };
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind};
 use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
 use ui::{
@@ -1971,7 +1971,18 @@ impl AgentView {
                 });
             }
             None => {
-                let markdown = cx.new(|cx| Markdown::new(text.to_string().into(), None, None, cx));
+                let markdown = cx.new(|cx| {
+                    Markdown::new_with_options(
+                        text.to_string().into(),
+                        None,
+                        None,
+                        MarkdownOptions {
+                            render_mermaid_diagrams: true,
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                });
                 // Markdown parses in the background, so the list may measure the row before
                 // there's any text to show. A row measured above the view keeps that height
                 // until it's drawn, and the conversation jumps as it scrolls into view.
@@ -6891,8 +6902,12 @@ impl AgentView {
         let markdown = self.markdowns.get(&key)?;
         let hovered = cx.weak_entity();
         let clicked = cx.weak_entity();
+        let list_state = self.list_state.clone();
         Some(
             MarkdownElement::new(markdown.clone(), style)
+                // A zoomed diagram grows or shrinks its message, which would otherwise pull
+                // the conversation back to its bottom.
+                .on_mermaid_zoom(move |_, _| list_state.pause_following_tail())
                 .on_url_hover(move |url, window, cx| {
                     let id = url.as_deref().and_then(AttachmentId::from_uri);
                     let position = window.mouse_position();
@@ -11572,6 +11587,29 @@ mod tests {
         assert_eq!(turn_at(px(113.), rail, 3), Some(2));
         assert_eq!(turn_at(px(140.), rail, 3), Some(2));
         assert_eq!(turn_at(px(105.), rail, 0), None);
+    }
+
+    /// As in Zed's threads, a mermaid block in a reply is drawn as a diagram.
+    #[gpui::test]
+    fn a_mermaid_block_in_a_reply_is_a_diagram(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Draw the login".into()),
+                    Entry::AgentMessage(
+                        "```mermaid\nflowchart TD\n  A[Login] --> B[Home]\n```".into(),
+                    ),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let diagram = cx
+            .debug_bounds("mermaid-diagram")
+            .expect("the diagram is drawn");
+        assert!(diagram.size.height > px(0.));
     }
 
     fn tool_call(status: acp::ToolCallStatus) -> Entry {

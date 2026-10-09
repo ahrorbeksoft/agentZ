@@ -508,6 +508,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   mouse. A gutter narrower than 48 pixels shows the rail only under the mouse, one too narrow
   for the buttons leaves them out, and one with no room hides it. The rail is drawn again once
   the rows laid out after a jump put other turns in view.
+- **Mermaid diagrams** (`markdown/src/mermaid.rs`, `mermaid_render`; Zed's, with
+  `MarkdownOptions::render_mermaid_diagrams` set in `AgentView::sync_markdown` as Zed's
+  `create_markdown` does): a ` ```mermaid ` block in a message, the agent's or the user's, is
+  drawn as a diagram with Preview and Code tabs, a copy button, and Ctrl or Cmd with the wheel
+  to zoom (`on_mermaid_zoom` pauses following the tail meanwhile). `merman` turns it into an SVG
+  in the theme's colors on a background thread. A block is code until its fence closes, one that
+  changes keeps its last diagram until the new one is drawn, and a theme change draws them
+  again. The diagram types are Zed's: flowchart, sequence,
+  class, state, ER, gantt, pie, git graph, mindmap, timeline, quadrant chart, XY chart and
+  journey; others stay code.
 - **Whole conversations** (`agentz_server/src/transcripts.rs`, `AgentThread::{restore_transcript,
   transcript}`; t3code keeps its own history and ignores the replay): agents replay only part
   of a long session when it loads (Factory Droid about the last 100 messages), so the server keeps
