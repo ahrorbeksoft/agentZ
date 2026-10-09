@@ -1379,6 +1379,8 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   then asks which checkout. Each server looks a project's repository up again every 15 minutes;
   a lookup git couldn't answer (it didn't start, as when the server is out of file descriptors,
   or took over 10 seconds) keeps the repository it had, so the project stays combined.
+  The project switcher's button and a combined project's row there show the icon of each
+  machine it's on, named in the icon's tooltip (`project_switcher::render_machine_icons`).
 - **Machine icons** (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`): detected from
   the hardware, or chosen by clicking the machine's icon in Settings › Machines.
 - **Start at login** (`login_item.rs`): a launch agent that runs `agentz-server start` once.

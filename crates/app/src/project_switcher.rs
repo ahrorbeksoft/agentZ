@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 
-use crate::machines::{GroupKey, MachineId, Machines, ProjectKey, Scope};
+use crate::machines::{GroupKey, MachineId, Machines, ProjectGroup, ProjectKey, Scope};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Window,
@@ -280,9 +280,7 @@ impl ProjectSwitcher {
                 };
                 let name = group.name();
                 // A project on one machine is under that machine's heading.
-                let machine_label = (group.machines().len() > 1)
-                    .then(|| machines.group_machines_label(&group, cx))
-                    .flatten();
+                let machine_icons = render_machine_icons(&group, cx);
                 let path: SharedString = group
                     .members
                     .iter()
@@ -313,12 +311,7 @@ impl ProjectSwitcher {
                             .min_w_0()
                             .gap_1()
                             .child(HighlightedLabel::new(name, positions))
-                            .children(machine_label.map(|label| {
-                                Label::new(label)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate()
-                            }))
+                            .children(machine_icons)
                             .when(is_offline, |row| row.opacity(0.5))
                             .children(status)
                             .children(check)
@@ -455,6 +448,39 @@ impl Render for ProjectSwitcher {
     }
 }
 
+/// The machines a project combined from several is on, each by its icon (its kind, as
+/// Settings › Machines chose it), named in the icon's tooltip. `None` on one machine.
+pub(crate) fn render_machine_icons(group: &ProjectGroup, cx: &App) -> Option<AnyElement> {
+    let group_machines = group.machines();
+    if group_machines.len() < 2 {
+        return None;
+    }
+    let machines = Machines::global(cx).read(cx);
+    Some(
+        h_flex()
+            .flex_none()
+            .gap_0p5()
+            .children(
+                group_machines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, machine)| {
+                        let label = machines.label(machine, cx);
+                        div()
+                            .id(("machine-icon", index))
+                            .debug_selector(|| format!("machine-icon-{label}"))
+                            .child(
+                                Icon::new(machines.machine_icon(machine, cx))
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .tooltip(Tooltip::text(label))
+                    }),
+            )
+            .into_any_element(),
+    )
+}
+
 /// Case-insensitive subsequence match, returning the byte positions of the matched characters;
 /// `query` must already be lowercase.
 pub(crate) fn fuzzy_match(query: &str, candidate: &str) -> Option<Vec<usize>> {
@@ -476,6 +502,84 @@ pub fn compact_path(path: &std::path::Path) -> String {
         return format!("~/{}", relative.display());
     }
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod view_tests {
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::TestAppContext;
+    use projects::{Project, ProjectId, ProjectsSnapshot, RepositoryIdentity};
+
+    use super::ProjectSwitcher;
+    use crate::machines::{MachineId, Machines, Scope};
+    use crate::server_client::ServerClient;
+
+    /// A project on several machines shows each one's icon, named in its tooltip, where it
+    /// used to name them all.
+    #[gpui::test]
+    fn a_project_on_several_machines_shows_their_icons(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let clients = [
+                (MachineId::Local, "This Mac", "/work/agentZ"),
+                (MachineId::Remote(1), "Devbox 1", "/root/projects/agentZ"),
+                (MachineId::Remote(2), "Devbox 2", "/srv/other"),
+            ]
+            .map(|(machine, label, path)| {
+                let client = ServerClient::new_for_test(
+                    machine,
+                    label.into(),
+                    SpacesSnapshot::default(),
+                    cx,
+                );
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+                let repository = (path != "/srv/other").then(|| RepositoryIdentity {
+                    canonical_key: "github.com/ahrorbeksoft/agentz".into(),
+                    root_path: path.into(),
+                    remote_name: "origin".into(),
+                    remote_url: "https://github.com/ahrorbeksoft/agentZ.git".into(),
+                    display_name: None,
+                    owner: Some("ahrorbeksoft".into()),
+                    name: Some("agentZ".into()),
+                });
+                let projects = client.read(cx).projects().clone();
+                projects.update(cx, |store, cx| {
+                    store.set_snapshot(
+                        ProjectsSnapshot {
+                            projects: vec![Project {
+                                id: ProjectId(1),
+                                path: path.into(),
+                                custom_name: None,
+                                icon: None,
+                                workspaces: Vec::new(),
+                                repository,
+                            }],
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                });
+                client
+            });
+            crate::machines::init_for_test(clients.to_vec(), cx);
+            let machines = Machines::global(cx);
+            let group = machines
+                .read(cx)
+                .project_groups(cx)
+                .into_iter()
+                .find(|group| group.machines().len() == 2)
+                .expect("agentZ on two machines");
+            Machines::set_scope(Scope::Group(group.key), cx);
+        });
+        let (_, cx) =
+            cx.add_window_view(|window, cx| ProjectSwitcher::new(|_, _, _| {}, window, cx));
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("machine-icon-This Mac").is_some());
+        assert!(cx.debug_bounds("machine-icon-Devbox 1").is_some());
+        // A project on one machine is under its heading, with no icon of its own.
+        assert!(cx.debug_bounds("machine-icon-Devbox 2").is_none());
+    }
 }
 
 #[cfg(test)]

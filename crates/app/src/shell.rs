@@ -28,7 +28,7 @@ use crate::go_to_picker::{GoToPicker, Place, thread_places};
 use crate::machine_modal::MachineModal;
 use crate::new_thread_modal::{NewThreadModal, NewThreadModalEvent};
 use crate::project_info::render_project_icon;
-use crate::project_switcher::ProjectSwitcher;
+use crate::project_switcher::{ProjectSwitcher, render_machine_icons};
 use crate::save_layout_modal::{LayoutPane, SaveLayoutModal};
 use crate::server_client::MachineStatus;
 use crate::settings_page::{AccountDialog, SettingsPage, SettingsPageEvent};
@@ -1558,8 +1558,7 @@ impl Shell {
         };
         let scope_machines = scope_group
             .as_ref()
-            .filter(|group| group.machines().len() > 1)
-            .and_then(|group| machines.group_machines_label(group, cx));
+            .and_then(|group| render_machine_icons(group, cx));
         let (scope_icon, scope_label): (AnyElement, SharedString) = match scope_group
             .as_ref()
             .and_then(|group| Some((group, group.primary()?)))
@@ -1758,11 +1757,7 @@ impl Shell {
                                             .gap_1p5()
                                             .child(scope_icon)
                                             .child(Label::new(scope_label).size(LabelSize::Small))
-                                            .children(scope_machines.map(|label| {
-                                                Label::new(label)
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted)
-                                            }))
+                                            .children(scope_machines)
                                             .child(
                                                 Icon::new(IconName::ChevronDown)
                                                     .size(IconSize::XSmall)
