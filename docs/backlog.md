@@ -297,6 +297,20 @@ same. It was decided to add a background in the account's color, but that isn't 
 - Give each new account a color when it's added (random, or something like it), so accounts
   differ without the user picking colors.
 
+### Every kind of tool call through design rounds again
+
+Take every kind of tool call through design rounds again, agentZ's own MCP tools included. How
+they look today was picked in earlier rounds (`design/thread/`, `design/tool-calls/`,
+`design/agent-subagents/`); each kind now gets designs to pick from again.
+
+- **Every kind:** agents' own tools by ACP's kinds (read, edit, delete, move, search, execute,
+  think, fetch, switch mode, other); every one of agentZ's MCP tools (`AGENTZ_TOOLS`: threads,
+  subthreads, delegated tasks, workspaces, terminals, commands, projects); ToolSearch; other
+  MCP servers' tools; and agents' own subagents.
+- **Overlaps with** A better view of subagents, A better view of subthreads, and Tool output in
+  a file view above: those can be topics of these rounds.
+- What to change: not given yet.
+
 ## Bugs
 
 ### Open the message queue when a message is queued
