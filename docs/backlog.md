@@ -251,6 +251,14 @@ Notes from the research (not decided):
   agents' logins in account homes (`accounts/`), which agentZ never changes.
 - The UI parts start on the design board, as every UI change does.
 
+### A better view of subagents in threads
+
+The current view of a subagent in a thread ([screenshot](backlog/subagent-view.png)) has no
+steps: it shows the subagent's title and type, the task it was given and its report, but not
+what it did along the way. The user doesn't like it and wants it replaced.
+
+- What the new view should be: not given yet, beyond not being stepless.
+
 ## Bugs
 
 ### Open the message queue when a message is queued
