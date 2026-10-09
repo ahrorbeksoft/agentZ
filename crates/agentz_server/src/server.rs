@@ -17,6 +17,7 @@ mod skill_requests;
 mod space_requests;
 mod subagents;
 mod terminal_requests;
+mod title_requests;
 mod tools;
 mod usage_reads;
 mod workspace_requests;
@@ -38,6 +39,7 @@ use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, McpServer};
 use agentz_protocol::skills::Skill;
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
+use agentz_protocol::title_generation::TitleGenerationState;
 use agentz_protocol::{
     AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, Request,
     Response, ServerMessage, SessionSnapshot,
@@ -233,6 +235,13 @@ pub(crate) struct Server {
     spaces: SpaceStore,
     /// The kind of machine this is, as detected and as chosen.
     machine_icon: MachineIcon,
+    /// How threads their agent doesn't title are titled, and the CLIs found to do it.
+    title_generation: TitleGenerationState,
+    title_generation_path: Option<std::ffi::OsString>,
+    /// Threads whose agent titled them, which a generated title doesn't replace.
+    agent_titled_threads: HashSet<ThreadId>,
+    /// Threads a title was generated for, or is being: once each.
+    generated_titles: HashSet<ThreadId>,
     clients: HashMap<ClientId, Client>,
     // What session subscribers were last sent.
     projects_revision_sent: u64,
@@ -243,6 +252,7 @@ pub(crate) struct Server {
     skills_sent: Vec<Skill>,
     mcp_servers_sent: Vec<McpServer>,
     machine_icon_sent: MachineIcon,
+    title_generation_sent: TitleGenerationState,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
     /// When each draft no client has open is removed, unless something is typed in it (see
@@ -309,6 +319,12 @@ impl Server {
         let machine_icon = MachineIcon {
             detected: None,
             chosen: machine_kind::load_choice(&data_dir.join("machine.json")),
+        };
+        let title_generation = TitleGenerationState {
+            settings: crate::title_generation::load(&data_dir)
+                .log_err()
+                .unwrap_or_default(),
+            providers: Vec::new(),
         };
         let browser_programs = config.agent_control.as_ref().and_then(|control| {
             let directory = data_dir.join("browser");
@@ -378,6 +394,11 @@ impl Server {
             spaces,
             machine_icon_sent: machine_icon.clone(),
             machine_icon,
+            title_generation_sent: title_generation.clone(),
+            title_generation,
+            title_generation_path: config.title_generation_path,
+            agent_titled_threads: HashSet::default(),
+            generated_titles: HashSet::default(),
             clients: HashMap::default(),
             registry_changed: false,
             changed_connections: HashSet::default(),
@@ -441,6 +462,7 @@ impl Server {
         server.spawn_then(machine_kind::detect(), |server, detected| {
             server.machine_icon.detected = detected;
         });
+        server.find_title_providers();
         let inputs = server.inputs.clone();
         server.runtime.spawn(async move {
             loop {
@@ -793,6 +815,7 @@ impl Server {
                     mcp_servers: self.mcp_servers.clone(),
                     spaces: self.spaces.snapshot(),
                     machine_icon: self.machine_icon.clone(),
+                    title_generation: self.title_generation.clone(),
                 }))
             }
             Request::SubscribeThread(connection) => {
@@ -1179,6 +1202,7 @@ impl Server {
                 self.machine_icon.chosen = icon;
                 Ok(Response::Ok)
             }
+            Request::SetTitleGeneration(settings) => self.set_title_generation(settings),
             Request::SetPeers(peers) => {
                 self.client(client)?;
                 self.relays.set_peers(client, peers);
@@ -2077,9 +2101,11 @@ impl Server {
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::SessionLogin(login)) => {
                     self.projects.set_session_login(thread_id, login)
                 }
-                (ConnectionId::Thread(thread_id), AgentThreadEvent::TitleChanged(title)) => self
-                    .projects
-                    .rename_thread(thread_id, thread_title_from_prompt(&title)),
+                (ConnectionId::Thread(thread_id), AgentThreadEvent::TitleChanged(title)) => {
+                    self.projects
+                        .rename_thread(thread_id, thread_title_from_prompt(&title));
+                    self.agent_titled_thread(thread_id);
+                }
                 // Its first message, sent or queued, makes a draft a thread.
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::FirstPrompt(title)) => {
                     self.projects
@@ -2157,6 +2183,12 @@ impl Server {
         }
         if let Some((thread_id, false)) = waiting {
             self.projects.set_thread_waiting(thread_id, false);
+        }
+        if turn_ended
+            && !runs_in_parent
+            && let ConnectionId::Thread(thread_id) = connection
+        {
+            self.title_after_first_turn(thread_id);
         }
         #[cfg(unix)]
         if paused && let ConnectionId::Thread(thread_id) = connection {
@@ -2320,6 +2352,10 @@ impl Server {
         if self.machine_icon != self.machine_icon_sent {
             self.machine_icon_sent = self.machine_icon.clone();
             self.broadcast(Event::MachineIcon(self.machine_icon.clone()));
+        }
+        if self.title_generation != self.title_generation_sent {
+            self.title_generation_sent = self.title_generation.clone();
+            self.broadcast(Event::TitleGeneration(self.title_generation.clone()));
         }
 
         for connection in std::mem::take(&mut self.changed_connections) {

@@ -254,6 +254,7 @@ mod tests {
                 agent_control: None,
                 hands_pages_to_clients: false,
                 terminal_shell: None,
+                title_generation_path: None,
                 listener: None,
                 handed_over: None,
             },

@@ -88,6 +88,7 @@ impl TestServer {
                 }),
                 hands_pages_to_clients,
                 terminal_shell: Some("/bin/sh".into()),
+                title_generation_path: None,
                 listener: None,
                 handed_over: None,
             },

@@ -216,6 +216,7 @@ async fn serve(socket: &Path, handoff: Option<Handoff>) -> Result<()> {
             }),
             hands_pages_to_clients: agentz_server::browser::hands_pages_to_clients(),
             terminal_shell: None,
+            title_generation_path: None,
             listener: Some(listener.as_raw_fd()),
             handed_over,
         },

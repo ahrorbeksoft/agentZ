@@ -250,6 +250,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Accounts kept from before then got theirs, the External one's included, once, as the server
   loaded them (`AgentAccounts::give_colors`, `colors_given`), so No Color from the account's
   Color menu stays.
+- **Generated titles** (`agentz_server/src/title_generation.rs`, `server/title_requests.rs`,
+  Settings › General › Thread titles; t3code's text generation): off by default, and kept per
+  machine in `title-generation.json`. Once on, after a thread's first turn, the server asks
+  the chosen CLI on its `PATH` (Codex, Claude or `agy`) for a title from the first message,
+  with t3code's prompt, output schema and arguments, run in an empty temporary folder. Only
+  threads whose agent never set a title (ACP's `session_info_update`) and the user didn't
+  rename get one, once each, as their automatic title. The server looks for the CLIs at
+  start and whenever the setting changes, with Codex's models from `codex debug models` and
+  the others' from t3code's lists; the page picks the provider, model and reasoning effort.
 - **Pinned threads** (`sidebar.rs`, `Machines::active_threads`, `projects::order_key`; t3code's
   `pinnedAt`, order keys and `planSidebarThreadDrop`, the user's picks in `design/pins/`):
   pinned cards come first, with nothing between them and the rest, each with a muted pin

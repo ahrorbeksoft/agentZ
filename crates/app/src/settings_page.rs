@@ -25,6 +25,7 @@ use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
     InstallState,
 };
+use agentz_protocol::title_generation::{TitleGeneration, TitleProvider, effort_label};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use agentz_protocol::{CAPABILITY_IMPORT_SESSIONS, Request, Response};
 use gpui::{
@@ -212,6 +213,8 @@ pub struct SettingsPage {
     monogram_input: Entity<TextInput>,
     /// The machine whose agents Settings › Agents shows.
     agents_machine: MachineId,
+    /// The machine whose thread titles Settings › General shows.
+    titles_machine: MachineId,
     agent_search: Entity<TextInput>,
     /// Machines whose server is being updated, so a second click doesn't restart it midway.
     updating: HashSet<MachineId>,
@@ -278,6 +281,14 @@ impl SettingsPage {
                 {
                     this.agents_machine = MachineId::Local;
                 }
+                if this
+                    .machines
+                    .read(cx)
+                    .client(this.titles_machine, cx)
+                    .is_none()
+                {
+                    this.titles_machine = MachineId::Local;
+                }
                 cx.notify();
             }),
             cx.observe(&app_settings, |_, _, cx| cx.notify()),
@@ -321,6 +332,7 @@ impl SettingsPage {
             name_input,
             monogram_input,
             agents_machine: MachineId::Local,
+            titles_machine: MachineId::Local,
             agent_search,
             updating: Default::default(),
             starts_at_login: crate::login_item::is_enabled(),
@@ -1010,6 +1022,11 @@ impl SettingsPage {
                 ],
                 cx,
             ),
+            render_section(
+                "Thread titles",
+                self.render_title_generation_rows(window, cx),
+                cx,
+            ),
             render_section("Projects", self.render_grouping_rows(window, cx), cx),
             render_section(
                 "Server",
@@ -1071,6 +1088,255 @@ impl SettingsPage {
                 .into_any_element(),
             cx,
         )
+    }
+
+    /// t3code's text generation model, for thread titles: whether the machine titles threads
+    /// whose agent doesn't, and with which CLI, model and reasoning effort. Each machine keeps
+    /// its own, since the CLIs are installed on it.
+    fn render_title_generation_rows(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut rows = Vec::new();
+        if self.machines.read(cx).has_remotes() {
+            rows.push(render_row(
+                "Machine",
+                "Each machine titles its own threads, with the CLIs installed on it.",
+                self.render_titles_machine_picker(window, cx),
+                cx,
+            ));
+        }
+        let Some(client) = self.machines.read(cx).client(self.titles_machine, cx) else {
+            return rows;
+        };
+        let state = client.read(cx).title_generation().clone();
+        let settings = state.settings.clone();
+        let choose = move |settings: TitleGeneration, cx: &mut App| {
+            client.update(cx, |client, cx| {
+                client.choose_title_generation(settings, cx)
+            })
+        };
+        rows.push(render_row(
+            "Generate thread titles",
+            "Titles a thread from its first message when its agent doesn't name it, with a \
+             coding agent's CLI installed on the machine.",
+            div()
+                .debug_selector(|| "generate-titles".into())
+                .child(
+                    Switch::new("generate-titles", settings.enabled.into()).on_click({
+                        let settings = settings.clone();
+                        let choose = choose.clone();
+                        move |state, _, cx| {
+                            choose(
+                                TitleGeneration {
+                                    enabled: *state == ToggleState::Selected,
+                                    ..settings.clone()
+                                },
+                                cx,
+                            )
+                        }
+                    }),
+                )
+                .into_any_element(),
+            cx,
+        ));
+        if !settings.enabled {
+            return rows;
+        }
+
+        let info = state
+            .providers
+            .iter()
+            .find(|info| info.provider == settings.provider);
+        let provider_description: SharedString = match info {
+            None if state.providers.is_empty() => "Looking for the CLIs installed…".into(),
+            Some(info) if !info.installed => format!(
+                "{} isn't installed on this machine, so threads keep their first message as \
+                 their title.",
+                settings.provider.program().unwrap_or("Its CLI")
+            )
+            .into(),
+            _ => "The CLI that writes the titles.".into(),
+        };
+        let menu = ContextMenu::build(window, cx, {
+            let settings = settings.clone();
+            let providers = state.providers.clone();
+            let choose = choose.clone();
+            move |mut menu, _, _| {
+                for provider in TitleProvider::ALL {
+                    let installed = providers
+                        .iter()
+                        .any(|info| info.provider == provider && info.installed);
+                    let label = if installed || providers.is_empty() {
+                        provider.label().to_string()
+                    } else {
+                        format!("{} (not installed)", provider.label())
+                    };
+                    let chosen = TitleGeneration {
+                        enabled: true,
+                        provider: provider.clone(),
+                        model: None,
+                        effort: None,
+                    };
+                    let choose = choose.clone();
+                    menu = menu.item(
+                        ContextMenuEntry::new(label)
+                            .toggleable(IconPosition::End, settings.provider == provider)
+                            .handler(move |_, cx| choose(chosen.clone(), cx)),
+                    );
+                }
+                menu
+            }
+        });
+        rows.push(render_row(
+            "Provider",
+            provider_description,
+            div()
+                .debug_selector(|| "title-provider".into())
+                .child(DropdownMenu::new(
+                    "title-provider",
+                    settings.provider.label(),
+                    menu,
+                ))
+                .into_any_element(),
+            cx,
+        ));
+
+        let models = info.map(|info| info.models.clone()).unwrap_or_default();
+        let model = models.iter().find(|model| model.id == settings.model());
+        let model_label: SharedString = model
+            .map(|model| model.name.clone())
+            .unwrap_or_else(|| settings.model().to_string())
+            .into();
+        let menu = ContextMenu::build(window, cx, {
+            let settings = settings.clone();
+            let models = models.clone();
+            let choose = choose.clone();
+            move |mut menu, _, _| {
+                for model in &models {
+                    let effort = settings
+                        .effort()
+                        .filter(|effort| model.efforts.iter().any(|offered| offered == effort))
+                        .filter(|effort| Some(*effort) != settings.provider.default_effort())
+                        .map(str::to_string);
+                    let chosen = TitleGeneration {
+                        model: (model.id != settings.provider.default_model())
+                            .then(|| model.id.clone()),
+                        effort,
+                        ..settings.clone()
+                    };
+                    let choose = choose.clone();
+                    menu = menu.toggleable_entry(
+                        model.name.clone(),
+                        model.id == settings.model(),
+                        IconPosition::End,
+                        None,
+                        move |_, cx| choose(chosen.clone(), cx),
+                    );
+                }
+                menu
+            }
+        });
+        rows.push(render_row(
+            "Model",
+            "The model the CLI writes titles with.",
+            div()
+                .debug_selector(|| "title-model".into())
+                .child(
+                    DropdownMenu::new("title-model", model_label, menu).disabled(models.is_empty()),
+                )
+                .into_any_element(),
+            cx,
+        ));
+
+        let efforts = model.map(|model| model.efforts.clone()).unwrap_or_default();
+        if !efforts.is_empty() {
+            let current = settings
+                .effort()
+                .filter(|effort| efforts.iter().any(|offered| offered == effort))
+                .unwrap_or(&efforts[0])
+                .to_string();
+            let menu = ContextMenu::build(window, cx, {
+                let settings = settings.clone();
+                let current = current.clone();
+                move |mut menu, _, _| {
+                    for effort in &efforts {
+                        let chosen = TitleGeneration {
+                            effort: (Some(effort.as_str()) != settings.provider.default_effort())
+                                .then(|| effort.clone()),
+                            ..settings.clone()
+                        };
+                        let choose = choose.clone();
+                        menu = menu.toggleable_entry(
+                            effort_label(effort),
+                            *effort == current,
+                            IconPosition::End,
+                            None,
+                            move |_, cx| choose(chosen.clone(), cx),
+                        );
+                    }
+                    menu
+                }
+            });
+            rows.push(render_row(
+                "Reasoning effort",
+                "How much the model thinks before it writes a title.",
+                div()
+                    .debug_selector(|| "title-effort".into())
+                    .child(DropdownMenu::new(
+                        "title-effort",
+                        effort_label(&current),
+                        menu,
+                    ))
+                    .into_any_element(),
+                cx,
+            ));
+        }
+        rows
+    }
+
+    fn render_titles_machine_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let machines: Vec<(MachineId, SharedString)> = self
+            .machines
+            .read(cx)
+            .clients()
+            .iter()
+            .map(|client| (client.read(cx).machine(), client.read(cx).label().clone()))
+            .collect();
+        let current = self.titles_machine;
+        let label = self.machines.read(cx).label(current, cx);
+        let icon = self.machines.read(cx).machine_icon(current, cx);
+        let this = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for (machine, label) in machines {
+                let this = this.clone();
+                menu = menu.toggleable_entry(
+                    label,
+                    machine == current,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        this.update(cx, |this, cx| {
+                            this.titles_machine = machine;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                );
+            }
+            menu
+        });
+        let trigger = h_flex()
+            .gap_1p5()
+            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+            .child(Label::new(label))
+            .into_any_element();
+        DropdownMenu::new_with_element("titles-machine", trigger, menu).into_any_element()
     }
 
     /// t3code's "Combine matching repositories" switch, which turns grouping off or back to
@@ -8705,6 +8971,116 @@ mod tests {
         assert_eq!(
             pick("sound-when-finished", "MENU_ITEM-Never", cx),
             (PlaySound::Never, PlaySound::WhenInAnotherThread, Vec::new())
+        );
+    }
+
+    /// Thread titles are off until they're turned on; then the CLI, its model and the model's
+    /// reasoning effort can be picked, and each pick goes to the machine's server.
+    #[gpui::test]
+    fn thread_titles_pick_a_cli_its_model_and_effort(cx: &mut TestAppContext) {
+        use agentz_protocol::title_generation::{
+            TitleGenerationState, TitleModel, TitleProviderInfo,
+        };
+
+        let model = |id: &str, name: &str, efforts: &[&str]| TitleModel {
+            id: id.into(),
+            name: name.into(),
+            efforts: efforts.iter().map(|effort| effort.to_string()).collect(),
+        };
+        let state = TitleGenerationState {
+            settings: TitleGeneration::default(),
+            providers: vec![
+                TitleProviderInfo {
+                    provider: TitleProvider::Codex,
+                    installed: true,
+                    models: vec![
+                        model("gpt-6-luna", "GPT-6-Luna", &["low", "high"]),
+                        model("gpt-mini", "GPT-Mini", &[]),
+                    ],
+                },
+                TitleProviderInfo {
+                    provider: TitleProvider::Claude,
+                    installed: false,
+                    models: vec![model("claude-haiku-4-5", "Claude Haiku 4.5", &[])],
+                },
+                TitleProviderInfo {
+                    provider: TitleProvider::Antigravity,
+                    installed: false,
+                    models: Vec::new(),
+                },
+            ],
+        };
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| {
+                client.set_title_generation_for_test(state, cx)
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::General, window, cx)
+        });
+        cx.run_until_parked();
+        let click = |name: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let last_sent = |cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| client.sent_for_test().last().cloned())
+        };
+        let sent = |settings: TitleGeneration| Some(Request::SetTitleGeneration(settings));
+
+        assert!(cx.debug_bounds("title-provider").is_none());
+        click("generate-titles", cx);
+        let enabled = TitleGeneration {
+            enabled: true,
+            ..TitleGeneration::default()
+        };
+        assert_eq!(last_sent(cx), sent(enabled.clone()));
+
+        // Codex's default model offers its efforts.
+        click("title-effort", cx);
+        click("MENU_ITEM-High", cx);
+        assert_eq!(
+            last_sent(cx),
+            sent(TitleGeneration {
+                effort: Some("high".into()),
+                ..enabled.clone()
+            })
+        );
+
+        // A model without efforts drops the effort, and its row.
+        click("title-model", cx);
+        click("MENU_ITEM-GPT-Mini", cx);
+        assert_eq!(
+            last_sent(cx),
+            sent(TitleGeneration {
+                model: Some("gpt-mini".into()),
+                ..enabled.clone()
+            })
+        );
+        assert!(cx.debug_bounds("title-effort").is_none());
+
+        // Another CLI starts at its own default model, and one that isn't installed says so.
+        click("title-provider", cx);
+        click("MENU_ITEM-Claude (not installed)", cx);
+        assert_eq!(
+            last_sent(cx),
+            sent(TitleGeneration {
+                provider: TitleProvider::Claude,
+                ..enabled
+            })
         );
     }
 
