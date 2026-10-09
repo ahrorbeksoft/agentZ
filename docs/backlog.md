@@ -223,6 +223,34 @@ Notes from the research (not decided):
 - **Hidden in a chat:** worktrees, pastures, diffs, branches and project scripts.
 - The UI parts start on the design board, as every UI change does.
 
+### Storage settings: what agentZ keeps on disk, and deleting it
+
+A settings page (name not decided: Storage or similar) that lists what agentZ produces on disk,
+with sizes, so the user can see what takes space and delete it.
+
+- **Chats,** each with its size counting everything it keeps (its conversation, attachments
+  and folder), and a way to delete them.
+- **Maybe more:** other caches and logs agentZ makes, and anything else it produces (not
+  decided which).
+
+Notes from the research (not decided):
+
+- **t3code's Settings › Storage** (`references/t3code`, `docs/user/project-settings.md`,
+  `apps/web/src/components/settings/StorageSettings.tsx`) has no sizes, only rules: where new
+  worktrees go; automatic worktree cleanup per machine or project (after some inactive days,
+  once merged, or with no commits of their own; never with uncommitted changes or a running
+  session); deleting worktrees with deleted threads; and how many days to keep browser
+  captures and rotated logs. Current logs and message attachments are always kept.
+- **What agentZ keeps** (`docs/architecture.md`, Data): for each thread, `transcripts/<id>.json`,
+  `attachments/<id>/` and `handoffs/<id>.json`; threads' `worktrees/` and `pastures/`;
+  `logs/server.log`; caches such as `agents/registry/` (with installed agents) and
+  downloaded `node/`. Chats and artifacts would add their own folders.
+- **Each machine has its own:** every server keeps its own data folder, so the page would show
+  one machine at a time, as the Agents page's machine picker does.
+- **Kept safe:** a running thread's or chat's data, worktrees with uncommitted changes, and
+  agents' logins in account homes (`accounts/`), which agentZ never changes.
+- The UI parts start on the design board, as every UI change does.
+
 ## Bugs
 
 ### Open the message queue when a message is queued
