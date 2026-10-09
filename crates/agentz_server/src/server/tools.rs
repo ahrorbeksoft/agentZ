@@ -52,7 +52,7 @@ const DEFAULT_LIST_LIMIT: u64 = 50;
 const DEFAULT_READ_LIMIT: u64 = 50;
 const DEFAULT_CHARS_PER_ITEM: u64 = 4_000;
 const MAX_CHARS_PER_ITEM: u64 = 50_000;
-const MAX_LAST_MESSAGE_CHARS: usize = 8_000;
+pub(super) const MAX_LAST_MESSAGE_CHARS: usize = 8_000;
 const MAX_TOOL_RESULTS_KEPT: usize = 1_000;
 const DEFAULT_PATCH_CHARS: u64 = 50_000;
 const MAX_PATCH_CHARS: u64 = 1_000_000;
@@ -366,11 +366,12 @@ impl Server {
             .projects
             .threads()
             .iter()
+            // The agent's own end with its word of them.
             .filter(|thread| {
                 thread
                     .task
                     .as_ref()
-                    .is_some_and(|task| task.outcome.is_none())
+                    .is_some_and(|task| task.outcome.is_none() && !task.is_agents_own())
             })
             .map(|thread| thread.id)
             .collect();
@@ -1245,6 +1246,7 @@ impl Server {
                         client_request_id,
                         outcome: None,
                         delivered: false,
+                        agent_session: None,
                     },
                     Some(agent_id),
                 )
@@ -1296,11 +1298,12 @@ impl Server {
     /// Ends the task as cancelled, stops its agent's turn, and cancels its own tasks.
     fn cancel_task(&mut self, task: ThreadId, reason: Option<String>) {
         for thread_id in self.projects.thread_and_subthreads(task) {
+            // The agent's own end as its agent stops them, or with its turn.
             let ended = self
                 .projects
                 .thread(thread_id)
                 .and_then(|thread| thread.task.as_ref())
-                .is_none_or(|task| task.outcome.is_some());
+                .is_none_or(|task| task.outcome.is_some() || task.is_agents_own());
             if ended {
                 continue;
             }
@@ -1782,7 +1785,8 @@ struct LaunchSpec {
 }
 
 /// Ends the tasks that were running when the server last stopped. Their parents are told once
-/// it's running again.
+/// it's running again. The agent's own subagents go on if their agent was handed over, and end
+/// with it otherwise.
 pub(super) fn interrupt_unfinished_tasks(projects: &mut ProjectStore) {
     let unfinished: Vec<ThreadId> = projects
         .threads()
@@ -1791,7 +1795,7 @@ pub(super) fn interrupt_unfinished_tasks(projects: &mut ProjectStore) {
             thread
                 .task
                 .as_ref()
-                .is_some_and(|task| task.outcome.is_none())
+                .is_some_and(|task| task.outcome.is_none() && !task.is_agents_own())
         })
         .map(|thread| thread.id)
         .collect();
@@ -1981,7 +1985,7 @@ fn text_item(position: usize, kind: &str, text: &str, max_chars: usize) -> Value
     })
 }
 
-fn truncate(text: &str, max_chars: usize) -> (String, bool) {
+pub(super) fn truncate(text: &str, max_chars: usize) -> (String, bool) {
     match text.char_indices().nth(max_chars) {
         Some((end, _)) => (text[..end].to_string(), true),
         None => (text.to_string(), false),
@@ -1989,7 +1993,7 @@ fn truncate(text: &str, max_chars: usize) -> (String, bool) {
 }
 
 /// The agent's answer to the last user message.
-fn last_agent_message(entries: &[Entry]) -> Option<&str> {
+pub(super) fn last_agent_message(entries: &[Entry]) -> Option<&str> {
     entries
         .iter()
         .rev()

@@ -24,12 +24,17 @@ pub enum ToolCallKind {
     ToolSearch(ToolSearch),
     /// Another MCP server's tool.
     Mcp(McpName),
+    /// One of the agent's own subagents.
+    Subagent(SubagentCall),
     /// Anything else, shown by its kind and the agent's title.
     Plain,
 }
 
 impl ToolCallKind {
     pub fn of(tool_call: &ToolCall) -> Self {
+        if let Some(subagent) = SubagentCall::of(tool_call) {
+            return Self::Subagent(subagent);
+        }
         let title = tool_call.title.trim();
         if is_tool_search(title) {
             return Self::ToolSearch(ToolSearch::of(tool_call));
@@ -60,6 +65,72 @@ impl ToolCallKind {
             output: tool_call.text.iter().find_map(|text| json_in(text)),
         }
     }
+}
+
+/// One of the agent's own subagents: Claude Agent's, which work in a subthread of their own and
+/// show as the card the server adds, or a call that names a `subagent_type` (Factory Droid's
+/// Task, and Claude Agent's own Task without subagent sessions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentCall {
+    /// What it's doing: the call's description, or its title.
+    pub description: String,
+    /// Its kind ("worker", "Explore"), when the agent says.
+    pub kind: Option<String>,
+    /// What the agent asked of it.
+    pub prompt: Option<String>,
+    /// The values of its other options ("heavy" for Droid's complexity).
+    pub options: Vec<String>,
+    /// The subthread it works in.
+    pub subthread: Option<ThreadId>,
+}
+
+impl SubagentCall {
+    pub fn of(tool_call: &ToolCall) -> Option<Self> {
+        if let Some(subthread) = tool_call.subthread {
+            return Some(Self {
+                description: tool_call.title.trim().to_string(),
+                kind: None,
+                prompt: None,
+                options: Vec::new(),
+                subthread: Some(subthread),
+            });
+        }
+        if !may_be_subagent(tool_call) {
+            return None;
+        }
+        let input = raw_input(tool_call)?;
+        let input = input.as_object()?;
+        let kind = text_in(input.get("subagent_type"))?;
+        let options = input
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "subagent_type" | "description" | "prompt"))
+            .filter_map(|(_, value)| text_in(Some(value)))
+            .collect();
+        Some(Self {
+            description: text_in(input.get("description"))
+                .unwrap_or_else(|| tool_call.title.trim().to_string()),
+            kind: Some(kind),
+            prompt: text_in(input.get("prompt")),
+            options,
+            subthread: None,
+        })
+    }
+}
+
+/// Whether the call is one of the agent's own subagents ([`SubagentCall`]).
+pub fn is_subagent(tool_call: &ToolCall) -> bool {
+    tool_call.subthread.is_some()
+        || (may_be_subagent(tool_call) && SubagentCall::of(tool_call).is_some())
+}
+
+/// Most calls can't be a subagent, and are told apart without parsing their input: Droid's
+/// Task is of kind "other", and Claude Agent's "think".
+fn may_be_subagent(tool_call: &ToolCall) -> bool {
+    matches!(tool_call.kind, acp::ToolKind::Other | acp::ToolKind::Think)
+        && tool_call
+            .raw_input
+            .as_deref()
+            .is_some_and(|input| input.contains("\"subagent_type\""))
 }
 
 /// An MCP tool, by its server's name and its own.
@@ -990,6 +1061,9 @@ mod tests {
             }),
             terminals: Vec::new(),
             images: Vec::new(),
+            started_at: None,
+            duration: None,
+            subthread: None,
         }
     }
 
@@ -1329,5 +1403,45 @@ mod tests {
         assert_eq!(file_path(&read), Some(PathBuf::from("/tmp/other.rs")));
         let search = tool_call("Search", Some(json!({"path": "src"})), None);
         assert_eq!(file_path(&search), None);
+    }
+
+    #[test]
+    fn subagents_read_as_what_they_do() {
+        let droid = tool_call(
+            "Task",
+            Some(json!({
+                "subagent_type": "worker",
+                "description": "Build subthreads round picks",
+                "await": true,
+                "complexity": "heavy",
+                "prompt": "Build what the user picked.",
+            })),
+            None,
+        );
+        let ToolCallKind::Subagent(subagent) = ToolCallKind::of(&droid) else {
+            panic!("a subagent");
+        };
+        assert_eq!(
+            subagent,
+            SubagentCall {
+                description: "Build subthreads round picks".into(),
+                kind: Some("worker".into()),
+                prompt: Some("Build what the user picked.".into()),
+                options: vec!["heavy".into()],
+                subthread: None,
+            }
+        );
+
+        let mut claude = tool_call("Find where the login view is drawn", None, None);
+        claude.subthread = Some(ThreadId(7));
+        let ToolCallKind::Subagent(subagent) = ToolCallKind::of(&claude) else {
+            panic!("a subagent");
+        };
+        assert_eq!(subagent.description, "Find where the login view is drawn");
+        assert_eq!(subagent.kind, None);
+        assert_eq!(subagent.subthread, Some(ThreadId(7)));
+
+        let task = tool_call("Task", Some(json!({"description": "Not a subagent"})), None);
+        assert!(matches!(ToolCallKind::of(&task), ToolCallKind::Plain));
     }
 }

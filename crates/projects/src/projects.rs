@@ -345,6 +345,23 @@ pub struct Task {
     /// word that it ended.
     #[serde(default)]
     pub delivered: bool,
+    /// Set on the agent's own subagent, by its session under the parent's (Claude Agent's
+    /// subagent sessions): the parent's agent runs it and hears its end itself, so it has no
+    /// agent of its own.
+    #[serde(default)]
+    pub agent_session: Option<String>,
+}
+
+impl Task {
+    /// One of the parent's agent's own subagents ([`Task::agent_session`]).
+    pub fn is_agents_own(&self) -> bool {
+        self.agent_session.is_some()
+    }
+
+    /// Listed with the parent's subthreads: the agent's own subagents only while they run.
+    pub fn is_listed(&self) -> bool {
+        !self.is_agents_own() || self.outcome.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2109,6 +2126,7 @@ mod tests {
             client_request_id: None,
             outcome: None,
             delivered: false,
+            agent_session: None,
         };
         let child = store.add_subthread(task(parent), None).expect("subthread");
         let grandchild = store.add_subthread(task(child), None).expect("subthread");
@@ -2257,6 +2275,7 @@ mod tests {
                     client_request_id: None,
                     outcome: None,
                     delivered: false,
+                    agent_session: None,
                 },
                 None,
             )
@@ -2332,6 +2351,7 @@ mod tests {
                     client_request_id: None,
                     outcome: None,
                     delivered: false,
+                    agent_session: None,
                 },
                 None,
             )

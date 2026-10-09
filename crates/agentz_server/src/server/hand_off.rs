@@ -62,7 +62,10 @@ impl Server {
             let mut running: Vec<String> = self
                 .threads
                 .iter()
-                .filter(|(thread_id, thread)| self.is_busy(**thread_id) && !thread.can_hand_off())
+                // A subagent goes on with the agent that runs it.
+                .filter(|(thread_id, thread)| {
+                    self.is_busy(**thread_id) && !thread.can_hand_off() && !thread.runs_in_parent()
+                })
                 .filter_map(|(thread_id, _)| self.projects.thread(*thread_id))
                 .map(|thread| thread.title.to_string())
                 .collect();

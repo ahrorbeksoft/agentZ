@@ -12,7 +12,7 @@ mod wire;
 
 pub use attachments::Attachments;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,32 @@ pub enum AgentThreadEvent {
     /// The connection paused after [`AgentThread::pause`], with everything the agent sent
     /// before handled: the thread can be handed off.
     Paused,
+    /// The agent started one of its own subagents, in a session of its own.
+    SubagentStarted(Subagent),
+    /// What the agent sent in a subagent's session, for its subthread.
+    SubagentUpdate {
+        session: String,
+        update: acp::SessionUpdate,
+    },
+    /// A subagent ended, or stopped with the agent or its session.
+    SubagentEnded {
+        session: String,
+        end: projects::TaskEnd,
+    },
+}
+
+/// One of the agent's own subagents, which it runs in a session under the thread's: Claude
+/// Agent's native subagent sessions (JetBrains AIR's `nativeSubagentSessions`). The agent
+/// sends its steps to that session, and hears of its end itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Subagent {
+    /// The subagent's session.
+    pub session: String,
+    /// The subagent that started it, by its session; `None` for the thread's own.
+    pub parent_session: Option<String>,
+    pub name: String,
+    /// What it was asked: its prompt, or else its description.
+    pub task: String,
 }
 
 /// Work the owner does around every turn, such as taking checkpoints. The turn waits for it:
@@ -203,6 +229,33 @@ enum MessageKind {
     OwnWorkOverdue(u64),
     /// The owner's work after the agent's work of its own is done.
     OwnWorkEnded,
+    /// The agent reported on one of its own subagents, in the session given.
+    Subagent {
+        session: acp::SessionId,
+        update: SubagentNotice,
+    },
+}
+
+/// A `session/update` by which Claude Agent reports its subagents' sessions (JetBrains AIR's
+/// native subagent sessions). ACP's own updates don't include them.
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "sessionUpdate",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum SubagentNotice {
+    SubagentSpawned {
+        subagent_session_id: String,
+        name: Option<String>,
+        task: Option<String>,
+        prompt: Option<String>,
+    },
+    SubagentStateUpdate {
+        subagent_session_id: String,
+        /// "completed", "failed", "cancelled" or "disconnected".
+        state: String,
+    },
 }
 
 /// A `session/update` of JetBrains AIR's async tasks extension, by which Claude Agent reports
@@ -382,6 +435,14 @@ pub struct AgentThread {
     stops_in_flight: usize,
     /// The agent's next message starts an entry of its own rather than going on with the last.
     new_message_due: bool,
+    /// The sessions of the agent's own subagents ([`Subagent`]), and whether each still runs.
+    /// Their updates go to their subthreads rather than into this conversation. Those of one
+    /// that's over, or that a loading session replays (its subthread has its conversation
+    /// already), are dropped.
+    subagent_sessions: HashMap<String, bool>,
+    /// The thread is a subagent's ([`Self::subagent`]): it takes no messages, and only the
+    /// parent's agent stops it.
+    runs_in_parent: bool,
 }
 
 /// The agent's process id, and whether stopping the thread stops it.
@@ -446,6 +507,9 @@ pub struct AgentSnapshot {
     /// The agent works without a prompt ([`AgentThread::working_on_its_own`]).
     #[serde(default)]
     working_on_its_own: bool,
+    /// [`AgentThread::subagent_sessions`].
+    #[serde(default)]
+    subagent_sessions: HashMap<String, bool>,
     /// Requests the agent waits on an answer to, as it sent them.
     unanswered: Vec<String>,
     stdout_rest: Vec<u8>,
@@ -547,6 +611,92 @@ impl AgentThread {
         this
     }
 
+    /// The subthread of one of the agent's own subagents ([`Subagent`]). It has no agent of its
+    /// own: the parent's runs the subagent, and the owner passes on what that sends in the
+    /// subagent's session ([`Self::apply_subagent_update`]).
+    pub fn subagent(agent_name: SharedString, cwd: PathBuf) -> Self {
+        let (mut this, _) = Self::new(None, agent_name, ConnectionStatus::Ready, cwd);
+        this.has_conversation = true;
+        this.runs_in_parent = true;
+        this
+    }
+
+    /// The subagent works, from the agent that gave it `prompt`, if that's still to show.
+    pub fn start_subagent(&mut self, prompt: Option<(String, projects::ThreadCreator)>) {
+        if let Some((prompt, from)) = prompt {
+            let index = self.view.entries.len();
+            self.view.state.sent_times.push((index, SystemTime::now()));
+            self.view.state.prompts_from_agents.push((index, from));
+            self.push_entry(Entry::UserMessage(prompt));
+        }
+        self.set_working(true);
+    }
+
+    /// Whether it's a subagent's thread ([`Self::subagent`]).
+    pub fn runs_in_parent(&self) -> bool {
+        self.runs_in_parent
+    }
+
+    /// What the parent's agent sent in the subagent's session.
+    pub fn apply_subagent_update(&mut self, update: acp::SessionUpdate) {
+        self.apply_update(update);
+        // Named by the parent's agent as it started it.
+        self.pending_title = None;
+    }
+
+    /// The subagent ended, so its subthread is done.
+    pub fn end_subagent(&mut self) {
+        self.set_working(false);
+    }
+
+    /// Shows a subagent the agent started as a card in the conversation, which opens its
+    /// subthread.
+    pub fn add_subagent_card(&mut self, subagent: &Subagent, subthread: projects::ThreadId) {
+        self.push_entry(Entry::ToolCall(ToolCall {
+            id: subagent_card_id(&subagent.session),
+            title: subagent.name.clone(),
+            kind: acp::ToolKind::Other,
+            status: acp::ToolCallStatus::InProgress,
+            text: Vec::new(),
+            diffs: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+            terminals: Vec::new(),
+            images: Vec::new(),
+            started_at: Some(SystemTime::now()),
+            duration: None,
+            subthread: Some(subthread),
+        }));
+    }
+
+    /// The card of the subagent working in `subthread` shows its end, and its report.
+    pub fn end_subagent_card(
+        &mut self,
+        subthread: projects::ThreadId,
+        end: projects::TaskEnd,
+        report: Option<String>,
+    ) {
+        let Some(index) = self.view.entries.iter().rposition(|entry| {
+            matches!(
+                entry,
+                Entry::ToolCall(tool_call)
+                    if tool_call.subthread == Some(subthread) && tool_call.is_running()
+            )
+        }) else {
+            return;
+        };
+        self.entry_changed(index);
+        let Entry::ToolCall(tool_call) = &mut self.view.entries[index] else {
+            return;
+        };
+        tool_call.status = match end {
+            projects::TaskEnd::Completed => acp::ToolCallStatus::Completed,
+            _ => acp::ToolCallStatus::Failed,
+        };
+        tool_call.text = report.into_iter().collect();
+        note_end(tool_call);
+    }
+
     fn new(
         runtime: Option<tokio::runtime::Handle>,
         agent_name: SharedString,
@@ -608,6 +758,8 @@ impl AgentThread {
             tasks_ended: 0,
             stops_in_flight: 0,
             new_message_due: false,
+            subagent_sessions: HashMap::new(),
+            runs_in_parent: false,
         };
         (this, inbox)
     }
@@ -958,6 +1110,7 @@ impl AgentThread {
             MessageKind::BackgroundTaskStopped { task_id, result } => {
                 self.background_task_stopped(task_id, result)
             }
+            MessageKind::Subagent { session, update } => self.subagent_notice(session, update),
             // Unless a turn took over meanwhile.
             MessageKind::OwnWorkEnded if self.own_work_ending => self.own_work_ended(),
             MessageKind::OwnWorkEnded => {}
@@ -1084,6 +1237,7 @@ impl AgentThread {
         self.pausing = None;
         self.connection = None;
         self.session = None;
+        self.end_subagents();
         async move {
             if let Some(closing) = closing {
                 closing.await;
@@ -1101,6 +1255,7 @@ impl AgentThread {
         self.session = None;
         // They belong to the session.
         self.view.state.background_tasks.clear();
+        self.end_subagents();
     }
 
     /// Whether the open session can be closed: the agent supports it and still runs here (it
@@ -1281,6 +1436,7 @@ impl AgentThread {
                 pid,
                 prompt_id: wire.prompt_id,
                 working_on_its_own: self.working_on_its_own,
+                subagent_sessions: self.subagent_sessions.clone(),
                 unanswered: wire.unanswered,
                 stdout_rest: wire.stdout_rest,
                 stderr_rest: wire.stderr_rest,
@@ -1350,6 +1506,7 @@ impl AgentThread {
         this.mcp_servers = snapshot.mcp_servers;
         this.defaults = snapshot.defaults;
         this.stderr_lines = snapshot.stderr_lines.into();
+        this.subagent_sessions = snapshot.subagent_sessions;
         this.terminal_host = terminal_host.clone();
         if is_working {
             this.emit(AgentThreadEvent::WorkingChanged(true));
@@ -1519,6 +1676,9 @@ impl AgentThread {
         };
         self.view.state.status = ConnectionStatus::Connecting;
         self.view.state.auth_error = None;
+        self.end_subagents();
+        // The new session's are new.
+        self.subagent_sessions.clear();
         self.dropping_replay = self.has_conversation && self.previous_session.is_some();
         let opening = open_session(
             connection.clone(),
@@ -1866,7 +2026,7 @@ impl AgentThread {
     /// Sends a message of text and what's mentioned in it.
     pub fn send_message(&mut self, parts: Vec<MessagePart>) {
         let parts = trim_message(parts);
-        if parts.is_empty() || self.is_working() {
+        if parts.is_empty() || self.is_working() || self.runs_in_parent {
             return;
         }
         if !self
@@ -1917,7 +2077,7 @@ impl AgentThread {
     /// goes at once, as [`Self::send_message`] sends it.
     pub fn steer_message(&mut self, parts: Vec<MessagePart>) {
         let parts = trim_message(parts);
-        if parts.is_empty() {
+        if parts.is_empty() || self.runs_in_parent {
             return;
         }
         if !self.is_working() {
@@ -2098,7 +2258,7 @@ impl AgentThread {
 
     /// Asks the agent to stop the current turn.
     pub fn cancel(&mut self) {
-        if !self.is_working() {
+        if !self.is_working() || self.runs_in_parent {
             return;
         }
         if let Some(cancelled) = &self.turn_cancelled {
@@ -2479,6 +2639,7 @@ impl AgentThread {
         }
         self.view.state.status = ConnectionStatus::Failed(message.into());
         self.session = None;
+        self.end_subagents();
         self.queued_prompts.clear();
         self.after_turn.clear();
         self.view.state.background_tasks.clear();
@@ -2521,6 +2682,19 @@ impl AgentThread {
     fn handle_incoming(&mut self, incoming: Incoming) {
         match incoming {
             Incoming::Notification(notification) => {
+                if let Some(&running) = self.subagent_sessions.get(&*notification.session_id.0) {
+                    // The subthread starts with the prompt, so what the agent sends as the
+                    // user's there is only its tools' results.
+                    if running
+                        && !matches!(notification.update, acp::SessionUpdate::UserMessageChunk(_))
+                    {
+                        self.emit(AgentThreadEvent::SubagentUpdate {
+                            session: notification.session_id.0.to_string(),
+                            update: notification.update,
+                        });
+                    }
+                    return;
+                }
                 if self.dropping_replay && is_conversation_update(&notification.update) {
                     return;
                 }
@@ -2547,7 +2721,21 @@ impl AgentThread {
             Incoming::Permission(request, responder) => {
                 let tool_call_id = request.tool_call.tool_call_id.clone();
                 // Permission requests can describe a tool call we haven't been told about yet.
-                self.apply_tool_call_update(request.tool_call.clone());
+                // A subagent's goes to its subthread, and the request is asked here, at its card.
+                let is_subagents = self
+                    .subagent_sessions
+                    .get(&*request.session_id.0)
+                    .is_some_and(|running| *running);
+                let subagent_card = if is_subagents {
+                    self.emit(AgentThreadEvent::SubagentUpdate {
+                        session: request.session_id.0.to_string(),
+                        update: acp::SessionUpdate::ToolCallUpdate(request.tool_call.clone()),
+                    });
+                    Some(subagent_card_id(&request.session_id.0))
+                } else {
+                    self.apply_tool_call_update(request.tool_call.clone());
+                    None
+                };
                 let title = request.tool_call.fields.title.clone().unwrap_or_default();
                 self.permission_responders
                     .push((tool_call_id.clone(), responder));
@@ -2563,6 +2751,7 @@ impl AgentThread {
                             kind: option.kind,
                         })
                         .collect(),
+                    subagent_card,
                 });
             }
             Incoming::Elicitation(request, responder) => {
@@ -2598,6 +2787,78 @@ impl AgentThread {
                     opened: false,
                 });
             }
+        }
+    }
+
+    fn subagent_notice(&mut self, session: acp::SessionId, notice: SubagentNotice) {
+        match notice {
+            SubagentNotice::SubagentSpawned {
+                subagent_session_id,
+                name,
+                task,
+                prompt,
+            } => {
+                // Replayed as the session loads: the subthread is there already.
+                if self.view.state.status != ConnectionStatus::Ready {
+                    self.subagent_sessions.insert(subagent_session_id, false);
+                    return;
+                }
+                if self.subagent_sessions.contains_key(&subagent_session_id) {
+                    return;
+                }
+                let parent_session = self
+                    .subagent_sessions
+                    .contains_key(&*session.0)
+                    .then(|| session.0.to_string());
+                self.subagent_sessions
+                    .insert(subagent_session_id.clone(), true);
+                let task = prompt.or(task).unwrap_or_default();
+                self.emit(AgentThreadEvent::SubagentStarted(Subagent {
+                    name: name
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| "Subagent".to_string()),
+                    session: subagent_session_id,
+                    parent_session,
+                    task,
+                }));
+            }
+            SubagentNotice::SubagentStateUpdate {
+                subagent_session_id,
+                state,
+            } => {
+                let Some(running) = self.subagent_sessions.get_mut(&subagent_session_id) else {
+                    return;
+                };
+                if !std::mem::replace(running, false) {
+                    return;
+                }
+                let end = match state.as_str() {
+                    "completed" => projects::TaskEnd::Completed,
+                    "failed" => projects::TaskEnd::Failed,
+                    "cancelled" => projects::TaskEnd::Cancelled,
+                    _ => projects::TaskEnd::Interrupted,
+                };
+                self.emit(AgentThreadEvent::SubagentEnded {
+                    session: subagent_session_id,
+                    end,
+                });
+            }
+        }
+    }
+
+    /// The subagents still running stop with the agent, or with the session they run under.
+    fn end_subagents(&mut self) {
+        let mut ended = Vec::new();
+        for (session, running) in &mut self.subagent_sessions {
+            if std::mem::replace(running, false) {
+                ended.push(session.clone());
+            }
+        }
+        for session in ended {
+            self.emit(AgentThreadEvent::SubagentEnded {
+                session,
+                end: projects::TaskEnd::Interrupted,
+            });
         }
     }
 
@@ -2712,11 +2973,21 @@ impl AgentThread {
             raw_input: tool_call.raw_input.as_ref().and_then(raw_input_text),
             terminals: Vec::new(),
             images: Vec::new(),
+            started_at: None,
+            duration: None,
+            subthread: None,
         };
         self.tool_content(tool_call.content).apply_to(&mut entry);
+        let live = self.view.state.status == ConnectionStatus::Ready;
         if let Some(existing) = self.tool_call_mut(&entry.id) {
+            entry.started_at = existing.started_at;
+            entry.duration = existing.duration;
+            entry.subthread = existing.subthread;
+            note_end(&mut entry);
             *existing = entry;
         } else {
+            entry.started_at = live.then(SystemTime::now);
+            note_end(&mut entry);
             self.push_entry(Entry::ToolCall(entry));
         }
     }
@@ -2742,10 +3013,16 @@ impl AgentThread {
                 raw_input: fields.raw_input.as_ref().and_then(raw_input_text),
                 terminals: Vec::new(),
                 images: Vec::new(),
+                started_at: None,
+                duration: None,
+                subthread: None,
             };
             if let Some(content) = content {
                 content.apply_to(&mut entry);
             }
+            entry.started_at =
+                (self.view.state.status == ConnectionStatus::Ready).then(SystemTime::now);
+            note_end(&mut entry);
             self.push_entry(Entry::ToolCall(entry));
             return;
         };
@@ -2770,6 +3047,7 @@ impl AgentThread {
         if let Some(raw_input) = fields.raw_input.as_ref() {
             existing.raw_input = raw_input_text(raw_input);
         }
+        note_end(existing);
     }
 
     /// What a tool call shows of its content: text, diffs, terminals, and images, which are
@@ -2859,6 +3137,15 @@ impl AgentThread {
     /// The first entry that changed since this was last called, if any did.
     pub fn take_entries_changed_from(&mut self) -> Option<usize> {
         self.entries_changed_from.take()
+    }
+}
+
+/// Notes how long the tool call ran, once it ended, if it started here.
+fn note_end(tool_call: &mut ToolCall) {
+    if tool_call.duration.is_none() && !tool_call.is_running() {
+        tool_call.duration = tool_call
+            .started_at
+            .and_then(|started| started.elapsed().ok());
     }
 }
 
@@ -3133,6 +3420,33 @@ fn background_task_update(
         .ok()
 }
 
+/// The notification's subagent update, with the session it came in, if it's one
+/// ([`SubagentNotice`]).
+fn subagent_notice(
+    notification: &agent_client_protocol::UntypedMessage,
+) -> Option<(acp::SessionId, SubagentNotice)> {
+    if notification.method != "session/update" {
+        return None;
+    }
+    let update = notification.params.get("update")?;
+    let kind = update.get("sessionUpdate")?.as_str()?;
+    if !kind.starts_with("subagent_") {
+        return None;
+    }
+    let session = notification.params.get("sessionId")?.as_str()?;
+    serde_json::from_value(update.clone())
+        .inspect_err(|error| {
+            log::warn!("the agent sent a subagent update that couldn't be read: {error}")
+        })
+        .ok()
+        .map(|update| (acp::SessionId::new(session.to_string()), update))
+}
+
+/// The id of the card in the thread for the agent's own subagent running in `session`.
+fn subagent_card_id(session: &str) -> acp::ToolCallId {
+    acp::ToolCallId::new(format!("subagent:{session}"))
+}
+
 /// Web links in a line the agent printed, except local callback addresses, which only the
 /// agent itself can use.
 fn login_links(line: &str) -> Vec<String> {
@@ -3295,14 +3609,17 @@ fn client_capabilities(supports_terminals: bool) -> acp::ClientCapabilities {
                 .url(acp::ElicitationUrlCapabilities::new()),
         )
         // JetBrains AIR's async tasks, by which Claude Agent reports what it left running and
-        // stops it, are only for clients that call themselves AIR. That also changes a little
-        // of how it reports tool calls: a file read or search names the files without their
-        // text, and a subagent's text stays inside its tool call.
+        // stops it, and its native subagent sessions, in which it runs each subagent, are only
+        // for clients that call themselves AIR. That also changes a little of how it reports
+        // tool calls: a file read or search names the files without their text.
         .meta(acp::Meta::from_iter([
             ("terminal-auth".to_string(), true.into()),
             (
                 "jetbrains".to_string(),
-                serde_json::json!({"air": {"version": 1, "capabilities": ["asyncTasks"]}}),
+                serde_json::json!({"air": {
+                    "version": 1,
+                    "capabilities": ["asyncTasks", "nativeSubagentSessions"],
+                }}),
             ),
         ]))
 }
@@ -3356,18 +3673,22 @@ fn client_connection(
         // Before the typed updates, which can't read these and would drop them.
         .on_receive_notification(
             async move |notification: agent_client_protocol::UntypedMessage, connection| {
-                match background_task_update(&notification) {
-                    Some(update) => {
-                        background_task_sender
-                            .send(MessageKind::BackgroundTask(update))
-                            .ok();
-                        Ok(agent_client_protocol::Handled::Yes)
-                    }
-                    None => Ok(agent_client_protocol::Handled::No {
-                        message: (notification, connection),
-                        retry: false,
-                    }),
+                if let Some(update) = background_task_update(&notification) {
+                    background_task_sender
+                        .send(MessageKind::BackgroundTask(update))
+                        .ok();
+                    return Ok(agent_client_protocol::Handled::Yes);
                 }
+                if let Some((session, update)) = subagent_notice(&notification) {
+                    background_task_sender
+                        .send(MessageKind::Subagent { session, update })
+                        .ok();
+                    return Ok(agent_client_protocol::Handled::Yes);
+                }
+                Ok(agent_client_protocol::Handled::No {
+                    message: (notification, connection),
+                    retry: false,
+                })
             },
             agent_client_protocol::on_receive_notification!(),
         )
@@ -4274,6 +4595,193 @@ mod tests {
         assert_eq!(thread.thread.state.finished_turns.len(), 3);
     }
 
+    /// Claude Agent runs each subagent in a session of its own once the client says it takes
+    /// them: its steps go to the subagent's subthread, not into the thread, which hears when
+    /// each starts and ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runs_subagents_in_sessions_of_their_own() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("subagents 0".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).as_deref() == Some("Both subagents are done.")
+            })
+            .await;
+        // The thread has only its own conversation.
+        assert_eq!(user_messages(&thread.thread), ["subagents 0"]);
+        assert_eq!(agent_messages(&thread.thread), ["Both subagents are done."]);
+        assert!(
+            !thread
+                .thread
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Entry::ToolCall(_)))
+        );
+
+        let started: Vec<Subagent> = thread
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentThreadEvent::SubagentStarted(subagent) => Some(subagent.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[0].name, "Find where the login view is drawn");
+        assert_eq!(
+            started[0].task,
+            "Find the code that draws the login view in a thread."
+        );
+        assert_eq!(started[0].parent_session, None);
+        let ended: Vec<(String, projects::TaskEnd)> = thread
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentThreadEvent::SubagentEnded { session, end } => Some((session.clone(), *end)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ended,
+            started
+                .iter()
+                .map(|subagent| (subagent.session.clone(), projects::TaskEnd::Completed))
+                .collect::<Vec<_>>()
+        );
+
+        // What its session got makes up a subagent's subthread.
+        let mut subthread = AgentThread::subagent("Mock".into(), std::env::temp_dir());
+        subthread.start_subagent(Some((
+            started[0].task.clone(),
+            projects::ThreadCreator::Thread(projects::ThreadId(1)),
+        )));
+        assert!(subthread.is_working());
+        for event in &thread.events {
+            if let AgentThreadEvent::SubagentUpdate { session, update } = event
+                && *session == started[0].session
+            {
+                subthread.apply_subagent_update(update.clone());
+            }
+        }
+        subthread.end_subagent();
+        assert!(!subthread.is_working());
+        assert_eq!(
+            user_messages(&subthread),
+            ["Find the code that draws the login view in a thread."]
+        );
+        let steps: Vec<(&str, bool)> = subthread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::ToolCall(tool_call) => {
+                    Some((tool_call.title.as_str(), tool_call.duration.is_some()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("Search for \"render_centered\"", true),
+                ("Read crates/app/src/agent_login.rs", true),
+                ("Read crates/app/src/agent_view.rs", true),
+            ]
+        );
+        assert_eq!(
+            last_agent_message(&subthread).as_deref(),
+            Some(
+                "The thread's login is drawn by `AgentLogin::render_centered` in \
+                 `crates/app/src/agent_login.rs`."
+            )
+        );
+        // A subagent's thread takes no messages: its agent is the parent's.
+        subthread.send("more".into());
+        assert_eq!(user_messages(&subthread).len(), 1);
+
+        // Its card in the parent's conversation runs until it ends, with its report.
+        let subthread_id = projects::ThreadId(2);
+        thread.update(|thread| thread.add_subagent_card(&started[0], subthread_id));
+        let card = |thread: &AgentThread| {
+            thread.entries().iter().find_map(|entry| match entry {
+                Entry::ToolCall(tool_call) if tool_call.subthread == Some(subthread_id) => {
+                    Some(tool_call.clone())
+                }
+                _ => None,
+            })
+        };
+        let running = card(&thread.thread).expect("a card");
+        assert_eq!(running.title, "Find where the login view is drawn");
+        assert!(running.is_running());
+        thread.update(|thread| {
+            thread.end_subagent_card(
+                subthread_id,
+                projects::TaskEnd::Completed,
+                Some("The report.".into()),
+            )
+        });
+        let done = card(&thread.thread).expect("a card");
+        assert_eq!(done.status, acp::ToolCallStatus::Completed);
+        assert_eq!(done.text, ["The report."]);
+        assert!(done.duration.is_some());
+    }
+
+    /// A subagent's permission request is asked in the thread, while its tool call goes to
+    /// the subagent's subthread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn asks_a_subagents_permission_in_the_thread() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("subagents permission".into()));
+        thread
+            .wait_until(|thread| !thread.state.permission_requests.is_empty())
+            .await;
+        let request = thread.thread.state.permission_requests[0].clone();
+        assert_eq!(request.title, "Edit .env");
+        assert_eq!(
+            thread.thread.orphan_permission_requests().count(),
+            1,
+            "the tool call is the subagent's"
+        );
+        let session = thread.events.iter().find_map(|event| match event {
+            AgentThreadEvent::SubagentUpdate {
+                session,
+                update: acp::SessionUpdate::ToolCallUpdate(update),
+            } if update.tool_call_id == request.tool_call_id => Some(session.clone()),
+            _ => None,
+        });
+        let session = session.expect("the tool call goes to the subagent's subthread");
+        assert_eq!(request.subagent_card, Some(subagent_card_id(&session)));
+        thread.update(|thread| {
+            thread
+                .respond_to_permission(&request.tool_call_id, acp::PermissionOptionId::new("allow"))
+        });
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).as_deref() == Some("Both subagents are done.")
+            })
+            .await;
+        assert!(
+            !thread
+                .thread
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Entry::ToolCall(_)))
+        );
+    }
+
     /// Stopping a background task stops it on the agent's side. The agent's note of the stop
     /// is a message of its own, and not work: the thread stays idle.
     #[tokio::test(flavor = "multi_thread")]
@@ -4977,7 +5485,21 @@ mod tests {
         replayed
             .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
             .await;
-        assert_eq!(replayed.thread.entries(), transcript.entries);
+        // A replayed tool call has no times: it didn't run here.
+        let untimed = |entries: &[Entry]| -> Vec<Entry> {
+            entries
+                .iter()
+                .cloned()
+                .map(|mut entry| {
+                    if let Entry::ToolCall(tool_call) = &mut entry {
+                        tool_call.started_at = None;
+                        tool_call.duration = None;
+                    }
+                    entry
+                })
+                .collect()
+        };
+        assert_eq!(replayed.thread.entries(), untimed(&transcript.entries));
     }
 
     /// Every page of an agent's sessions is listed, and a thread opened with a listed session

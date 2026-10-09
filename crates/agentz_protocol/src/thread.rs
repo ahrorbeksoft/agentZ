@@ -86,6 +86,24 @@ pub struct ToolCall {
     /// Images the tool gave back, kept for the thread.
     #[serde(default)]
     pub images: Vec<AttachmentId>,
+    /// When the agent started it, if that was seen here rather than replayed.
+    #[serde(default)]
+    pub started_at: Option<SystemTime>,
+    /// How long it ran, once it ended, if it started here.
+    #[serde(default)]
+    pub duration: Option<std::time::Duration>,
+    /// The subthread one of the agent's own subagents works in: this is its card.
+    #[serde(default)]
+    pub subthread: Option<projects::ThreadId>,
+}
+
+impl ToolCall {
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.status,
+            acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
+        )
+    }
 }
 
 /// A message waiting in a thread's queue for the agent to be free.
@@ -223,6 +241,10 @@ pub struct PermissionRequest {
     pub tool_call_id: acp::ToolCallId,
     pub title: String,
     pub options: Vec<PermissionOption>,
+    /// The card of the agent's own subagent that asks it. Its tool call is in the subagent's
+    /// subthread, not in this thread.
+    #[serde(default)]
+    pub subagent_card: Option<acp::ToolCallId>,
 }
 
 /// A request for input from the agent (ACP's `elicitation/create`), waiting on the user.
@@ -683,11 +705,23 @@ impl ThreadView {
             .find(|request| &request.tool_call_id == tool_call_id)
     }
 
-    /// Permission requests whose tool call isn't shown as an entry.
+    /// The permission request of the agent's own subagent whose card is `card`.
+    pub fn subagent_permission_request(
+        &self,
+        card: &acp::ToolCallId,
+    ) -> Option<&PermissionRequest> {
+        self.state
+            .permission_requests
+            .iter()
+            .find(|request| request.subagent_card.as_ref() == Some(card))
+    }
+
+    /// Permission requests whose tool call isn't shown as an entry, nor a subagent's card.
     pub fn orphan_permission_requests(&self) -> impl Iterator<Item = &PermissionRequest> {
         self.state.permission_requests.iter().filter(|request| {
             !self.entries.iter().any(|entry| {
-                matches!(entry, Entry::ToolCall(tool_call) if tool_call.id == request.tool_call_id)
+                matches!(entry, Entry::ToolCall(tool_call) if tool_call.id == request.tool_call_id
+                    || request.subagent_card.as_ref() == Some(&tool_call.id))
             })
         })
     }
@@ -1141,6 +1175,9 @@ mod tests {
             raw_input: None,
             terminals: Vec::new(),
             images: Vec::new(),
+            started_at: None,
+            duration: None,
+            subthread: None,
         })
     }
 

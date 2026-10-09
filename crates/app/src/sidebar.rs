@@ -3986,9 +3986,14 @@ pub(crate) fn thread_account_color(machine: MachineId, thread: &Thread, cx: &App
 /// one, and `Color::Player` skips the first (the local user's).
 pub(crate) const AWAITING_INPUT_COLOR: Color = Color::Player(2);
 
-/// The thread's subthreads, and how many of them still run their task.
+/// The thread's subthreads, and how many of them still run their task. The agent's own
+/// subagents count only while they run, as the Agents list shows them.
 fn subthread_counts(store: &projects::ProjectStore, thread: projects::ThreadId) -> (usize, usize) {
-    let subthreads = store.subthreads(thread);
+    let subthreads: Vec<&projects::Thread> = store
+        .subthreads(thread)
+        .into_iter()
+        .filter(|thread| thread.task.as_ref().is_some_and(projects::Task::is_listed))
+        .collect();
     let running = subthreads
         .iter()
         .filter(|thread| {

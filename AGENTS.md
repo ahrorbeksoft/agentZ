@@ -131,7 +131,10 @@ From Zed's guidelines, which this code follows:
   turns (see its docstring), and `network-error` fails its first turn as a lost connection
   does. `background-task [seconds]` leaves a command running
   as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
-  once it ends. With `MOCK_LOGIN_FILE` in its env it needs a login, and
+  once it ends. `subagents [seconds]` runs two subagents at once in sessions of their own, as
+  Claude Agent does with AIR's native subagent sessions (`subagents permission` has the first
+  ask for permission), and `droid-task [seconds]` runs one as Factory Droid's Task call does.
+  With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
   `MOCK_BROWSER_OPEN` too, a browser login that runs `xdg-open` and waits on a `127.0.0.1`
   callback, as Devin's and Codex's do (`tests/browser.rs` drives it as on an SSH machine), and

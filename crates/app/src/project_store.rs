@@ -830,6 +830,7 @@ mod tests {
                     client_request_id: None,
                     outcome: None,
                     delivered: false,
+                    agent_session: None,
                 },
                 None,
             )

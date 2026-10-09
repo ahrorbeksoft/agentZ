@@ -4885,6 +4885,237 @@ async fn subthread_permission_requests_block_the_parent() {
     assert_eq!(status["status"], json!("completed"));
 }
 
+/// The agent's own subagents (Claude Agent's) work in subthreads, which show what the agent
+/// sends in their sessions and end with their reports. The agent hears of their ends itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_own_subagents_work_in_subthreads() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(parent);
+    client.wait_until_ready(parent).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("subagents"),
+        })
+        .await;
+    let subagents_of = |client: &TestClient, parent: ThreadId| -> Vec<projects::Thread> {
+        client
+            .projects
+            .as_ref()
+            .map(|projects| {
+                projects
+                    .threads
+                    .iter()
+                    .filter(|thread| {
+                        thread
+                            .task
+                            .as_ref()
+                            .is_some_and(|task| task.parent == parent)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working()
+                && agent_text(thread) == "Both subagents are done."
+                && subagents_of(client, parent).len() == 2
+                && subagents_of(client, parent)
+                    .iter()
+                    .all(|thread| thread.task.as_ref().is_some_and(|task| task.delivered))
+        })
+        .await;
+    let subagents = subagents_of(&client, parent);
+    let expected = [
+        (
+            "Find where the login view is drawn",
+            "Find the code that draws the login view in a thread.",
+            vec![
+                "Search for \"render_centered\"",
+                "Read crates/app/src/agent_login.rs",
+                "Read crates/app/src/agent_view.rs",
+            ],
+            "The thread's login is drawn by `AgentLogin::render_centered` in \
+             `crates/app/src/agent_login.rs`.",
+        ),
+        (
+            "Find how Add Account logs in",
+            "Find how the Add Account dialog logs an account in.",
+            vec![
+                "Search for \"LoginLayout::Dialog\"",
+                "Read crates/app/src/settings_page.rs",
+            ],
+            "Add Account shows the same login in `LoginLayout::Dialog`.",
+        ),
+    ];
+    let mut subagent_entries = Vec::new();
+    for (subagent, (name, prompt, steps, report)) in subagents.iter().zip(&expected) {
+        assert_eq!(subagent.title.to_string(), *name);
+        assert_eq!(subagent.created_by, Some(ThreadCreator::Thread(parent)));
+        let task = subagent.task.as_ref().expect("a task");
+        assert!(task.is_agents_own());
+        assert_eq!(task.prompt, *prompt);
+        let outcome = task.outcome.as_ref().expect("ended");
+        assert_eq!(outcome.end, projects::TaskEnd::Completed);
+        assert_eq!(outcome.summary.as_deref(), Some(*report));
+
+        // Its subthread shows its prompt, its steps and its report.
+        let subthread = ConnectionId::Thread(subagent.id);
+        client.subscribe_thread(subthread).await;
+        let view = client.thread(subthread);
+        assert!(!view.is_working());
+        assert_eq!(client.user_messages(subagent.id), [*prompt]);
+        let done_steps: Vec<&str> = view
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::ToolCall(tool_call)
+                    if tool_call.status == acp::ToolCallStatus::Completed =>
+                {
+                    Some(tool_call.title.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done_steps, *steps);
+        assert_eq!(agent_text(view), *report);
+        subagent_entries.push((subthread, view.entries().to_vec()));
+
+        // The agent runs it: it takes no messages.
+        let refused = client
+            .request(Request::Prompt {
+                connection: subthread,
+                prompt: PromptPart::text("more"),
+            })
+            .await;
+        assert!(refused.is_err());
+    }
+
+    // The parent shows each as a card that opens its subthread, ended with its report.
+    let cards: Vec<(
+        Option<ThreadId>,
+        String,
+        acp::ToolCallStatus,
+        Vec<String>,
+        bool,
+    )> = client
+        .thread(connection)
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::ToolCall(tool_call) => Some((
+                tool_call.subthread,
+                tool_call.title.clone(),
+                tool_call.status,
+                tool_call.text.clone(),
+                tool_call.duration.is_some(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let expected_cards: Vec<_> = subagents
+        .iter()
+        .zip(&expected)
+        .map(|(subagent, (name, _, _, report))| {
+            (
+                Some(subagent.id),
+                name.to_string(),
+                acp::ToolCallStatus::Completed,
+                vec![report.to_string()],
+                true,
+            )
+        })
+        .collect();
+    assert_eq!(cards, expected_cards);
+    // It isn't told of their ends, and they aren't threads of the project.
+    assert_eq!(client.user_messages(parent), ["subagents"]);
+    let list = client.tool(parent, "agentz_thread_list", json!({})).await;
+    assert_eq!(thread_ids(&list), vec![parent.0]);
+
+    // Subagents running as the server stops end with their agent.
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("subagents 5"),
+        })
+        .await;
+    client
+        .wait_until(|client| subagents_of(client, parent).len() == 4)
+        .await;
+    let stopped: Vec<ThreadId> = subagents_of(&client, parent)[2..]
+        .iter()
+        .map(|thread| thread.id)
+        .collect();
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+
+    let Some(server) = TestServer::start_with(server.data_dir, server.project_dir) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    client
+        .wait_until(|client| {
+            stopped.iter().all(|subagent| {
+                client
+                    .task(*subagent)
+                    .is_some_and(|task| task.outcome.is_some())
+            })
+        })
+        .await;
+    for subagent in &stopped {
+        let task = client.task(*subagent).expect("a task");
+        let outcome = task.outcome.as_ref().expect("ended");
+        assert_eq!(outcome.end, projects::TaskEnd::Interrupted);
+        assert!(task.delivered);
+    }
+    // Ended subagents' subthreads keep their conversations.
+    for (subthread, entries) in subagent_entries {
+        client.subscribe_thread(subthread).await;
+        assert!(!client.thread(subthread).is_working());
+        assert_eq!(client.thread(subthread).entries(), entries.as_slice());
+    }
+    for subagent in &stopped {
+        client
+            .subscribe_thread(ConnectionId::Thread(*subagent))
+            .await;
+        assert!(!client.thread(ConnectionId::Thread(*subagent)).is_working());
+    }
+    // The parent's cards of the stopped ones show they ended.
+    client.subscribe_thread(connection).await;
+    let running_cards = client
+        .thread(connection)
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::ToolCall(tool_call) if tool_call.is_running()))
+        .count();
+    assert_eq!(running_cards, 0);
+    assert!(
+        !client
+            .user_messages(parent)
+            .iter()
+            .any(|message| message.starts_with("Delegated task"))
+    );
+}
+
 /// A parent that delegated tasks waits for them: hearing that one ended doesn't complete it
 /// while another runs, and it completes once, after hearing of the last.
 #[tokio::test(flavor = "multi_thread")]

@@ -13,7 +13,15 @@ for a second (or the seconds given) and ends its turn; to a client that takes Je
 async tasks (`_meta.jetbrains.air.capabilities` has "asyncTasks"), it reports the task as
 Claude Agent does, and stops it on `_session/async_task/stop`, noting the stop in the
 conversation. Once the command is done, it says so a word at a time with no prompt, as Claude
-Agent goes on when a background task ends, and ends with a usage update with its cost. A
+Agent goes on when a background task ends, and ends with a usage update with its cost.
+"subagents [seconds]" runs two subagents at once, as Claude Agent does: to a client that takes
+its native subagent sessions (`_meta.jetbrains.air.capabilities` has "nativeSubagentSessions"),
+it announces each (`subagent_spawned`), sends their searches, reads and reports in their own
+sessions, a step every 0.2 seconds (or the seconds given), and ends each with
+`subagent_state_update`; to others, each is one completed call with its report. "subagents
+permission" has the first ask for permission in its session first. "droid-task [seconds]" runs
+a subagent as Factory Droid does: a "Task" tool call, with its type, description, complexity and
+prompt as input, that completes with the report after half a second (or the seconds given). A
 prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
 word at a time, 500 ms apart, then replies. "write <path> <text>"
@@ -313,6 +321,9 @@ network_failed = False
 # Whether the client takes JetBrains AIR's async tasks, which Claude Agent reports its
 # background work with.
 async_tasks = False
+# Whether the client takes Claude Agent's native subagent sessions, in which it runs each
+# subagent.
+native_subagents = False
 # Background commands still running, by task id: an event set to stop each, and its name.
 background_tasks = {}
 background_task_count = 0
@@ -473,6 +484,93 @@ def client_request(method, params):
             if "error" in reply:
                 raise RuntimeError(reply["error"].get("message", "error"))
             return reply["result"]
+
+
+SUBAGENTS = [
+    {"name": "Find where the login view is drawn",
+     "prompt": "Find the code that draws the login view in a thread.",
+     "steps": [{"title": "Search for \"render_centered\"", "kind": "search"},
+               {"title": "Read crates/app/src/agent_login.rs", "kind": "read"},
+               {"title": "Read crates/app/src/agent_view.rs", "kind": "read"}],
+     "report": "The thread's login is drawn by `AgentLogin::render_centered` in "
+               "`crates/app/src/agent_login.rs`."},
+    {"name": "Find how Add Account logs in",
+     "prompt": "Find how the Add Account dialog logs an account in.",
+     "steps": [{"title": "Search for \"LoginLayout::Dialog\"", "kind": "search"},
+               {"title": "Read crates/app/src/settings_page.rs", "kind": "read"}],
+     "report": "Add Account shows the same login in `LoginLayout::Dialog`."},
+]
+
+
+def run_subagents(request_id, session_id, pause, asks_permission):
+    """Two subagents at once, as Claude Agent runs them."""
+    if not native_subagents:
+        for index, subagent in enumerate(SUBAGENTS):
+            update(session_id, {"sessionUpdate": "tool_call",
+                                "toolCallId": f"agent-{request_id}-{index}",
+                                "title": subagent["name"], "kind": "think", "status": "completed",
+                                "rawInput": {"description": subagent["name"],
+                                             "prompt": subagent["prompt"],
+                                             "subagent_type": "Explore"},
+                                "content": [{"type": "content", "content": {
+                                    "type": "text", "text": subagent["report"]}}]})
+    else:
+        sessions = [f"subagent-{request_id}-{index}" for index in range(len(SUBAGENTS))]
+        for subagent, child in zip(SUBAGENTS, sessions):
+            send_task_update(session_id, {"sessionUpdate": "subagent_spawned",
+                                          "subagentSessionId": child, "name": subagent["name"],
+                                          "task": subagent["prompt"],
+                                          "prompt": subagent["prompt"], "capabilities": {}})
+        if asks_permission:
+            client_request("session/request_permission", {
+                "sessionId": sessions[0],
+                "toolCall": {"toolCallId": f"{sessions[0]}-edit", "title": "Edit .env",
+                             "kind": "edit", "status": "pending"},
+                "options": [{"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+                            {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]})
+            send_task_update(sessions[0], {"sessionUpdate": "tool_call_update",
+                                           "toolCallId": f"{sessions[0]}-edit",
+                                           "status": "completed"})
+        # Their steps interleave, as two subagents' at once do.
+        for step in range(max(len(subagent["steps"]) for subagent in SUBAGENTS)):
+            for subagent, child in zip(SUBAGENTS, sessions):
+                if step >= len(subagent["steps"]):
+                    continue
+                call_id = f"{child}-step-{step}"
+                send_task_update(child, {"sessionUpdate": "tool_call", "toolCallId": call_id,
+                                         "status": "in_progress", **subagent["steps"][step]})
+                time.sleep(pause)
+                send_task_update(child, {"sessionUpdate": "tool_call_update",
+                                         "toolCallId": call_id, "status": "completed"})
+        for subagent, child in zip(SUBAGENTS, sessions):
+            send_task_update(child, text_chunk("agent_message_chunk", subagent["report"]))
+            send_task_update(session_id, {"sessionUpdate": "subagent_state_update",
+                                          "subagentSessionId": child, "state": "completed"})
+            time.sleep(pause)
+    update(session_id, text_chunk("agent_message_chunk", "Both subagents are done."))
+    send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+
+
+def run_droid_task(request_id, session_id, seconds):
+    """A subagent as Factory Droid runs it: a tool call, with no steps of its own."""
+    call_id = f"task-{request_id}"
+    update(session_id, {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Task",
+                        "kind": "other", "status": "in_progress",
+                        "rawInput": {"subagent_type": "worker",
+                                     "description": "Build subthreads round picks",
+                                     "await": True, "complexity": "heavy",
+                                     "prompt": "Build what the user picked in the Subthreads "
+                                               "design round. Read "
+                                               "design/subthreads/decisions.md first."}})
+    time.sleep(seconds)
+    update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                        "status": "completed",
+                        "content": [{"type": "content", "content": {
+                            "type": "text",
+                            "text": "Built the seven picks in `design/subthreads/decisions.md`. "
+                                    "`cargo test -p app` passes."}}]})
+    update(session_id, text_chunk("agent_message_chunk", "The worker is done."))
+    send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
 def logged_in():
@@ -644,6 +742,7 @@ for line in sys.stdin:
         capabilities = message["params"].get("clientCapabilities", {})
         air = ((capabilities.get("_meta") or {}).get("jetbrains") or {}).get("air") or {}
         async_tasks = "asyncTasks" in (air.get("capabilities") or [])
+        native_subagents = "nativeSubagentSessions" in (air.get("capabilities") or [])
         if capabilities.get("auth", {}).get("terminal"):
             auth_methods.append({"id": "mock-terminal-login", "name": "Log in in a terminal",
                                  "type": "terminal", "args": ["--login"]})
@@ -861,6 +960,13 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
             threading.Thread(target=run_background_task,
                              args=(session_id, task_id, seconds, stop), daemon=True).start()
+        elif prompt_text == "subagents" or prompt_text.startswith("subagents "):
+            argument = prompt_text.split(" ", 1)[1] if " " in prompt_text else ""
+            pause = 0.2 if argument in ("", "permission") else float(argument)
+            run_subagents(message["id"], params["sessionId"], pause, argument == "permission")
+        elif prompt_text == "droid-task" or prompt_text.startswith("droid-task "):
+            seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 0.5
+            run_droid_task(message["id"], params["sessionId"], seconds)
         elif prompt_text == "slow":
             for word in ["One", " two", " three", " four", " five"]:
                 update(params["sessionId"], text_chunk("agent_message_chunk", word))

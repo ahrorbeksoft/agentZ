@@ -15,6 +15,7 @@ mod queue_requests;
 mod session_requests;
 mod skill_requests;
 mod space_requests;
+mod subagents;
 mod terminal_requests;
 mod tools;
 mod usage_reads;
@@ -1450,6 +1451,20 @@ impl Server {
             .clone()
             .filter(|_| !never_prompted)
             .map(acp::SessionId::new);
+        if let Some(task) = thread.task.as_ref().filter(|task| task.is_agents_own()) {
+            let running = task.outcome.is_none();
+            let agent_name = thread
+                .agent_id
+                .clone()
+                .map(|agent_id| self.agent_name(&AgentId::new(agent_id)))
+                .unwrap_or_else(|| "Agent".into());
+            let agent_thread = self.restored_subagent_thread(thread_id, agent_name, cwd, running);
+            self.saved_transcripts.remove(&thread_id);
+            if let Some(revision) = agent_thread.conversation_revision() {
+                self.saved_transcripts.insert(thread_id, revision);
+            }
+            return Ok(agent_thread);
+        }
         if thread.terminal.is_some() {
             return Ok(AgentThread::failed(
                 "Terminal".into(),
@@ -1519,6 +1534,7 @@ impl Server {
         {
             agent_thread.restore_transcript(transcript);
         }
+        self.end_subagent_cards(thread_id, &mut agent_thread);
         self.saved_transcripts.remove(&thread_id);
         if let Some(revision) = agent_thread.conversation_revision() {
             self.saved_transcripts.insert(thread_id, revision);
@@ -1967,6 +1983,8 @@ impl Server {
             }
             ConnectionId::LoginSession(_) => None,
         };
+        // A subagent's turn is its parent's agent's, which reads the account as it ends.
+        let mut runs_in_parent = false;
         let (thread, agent_id, account) = match connection {
             ConnectionId::Thread(thread_id) => {
                 let record = self.projects.thread(thread_id);
@@ -1974,6 +1992,9 @@ impl Server {
                     .and_then(|thread| thread.agent_id.clone())
                     .map(AgentId::new);
                 let account = record.and_then(|thread| thread.account);
+                runs_in_parent = record
+                    .and_then(|thread| thread.task.as_ref())
+                    .is_some_and(projects::Task::is_agents_own);
                 (self.threads.get_mut(&thread_id), agent_id, account)
             }
             ConnectionId::LoginSession(login_session_id) => {
@@ -2011,6 +2032,7 @@ impl Server {
         let mut logged_in_here = false;
         let mut reported_login = None;
         let mut turn_ended = false;
+        let mut subagent_events = Vec::new();
 
         for event in events {
             match (connection, event) {
@@ -2089,7 +2111,18 @@ impl Server {
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffDropped) => {
                     continuations::remove(&self.data_dir, thread_id).log_err();
                 }
+                (
+                    ConnectionId::Thread(_),
+                    event @ (AgentThreadEvent::SubagentStarted(_)
+                    | AgentThreadEvent::SubagentUpdate { .. }
+                    | AgentThreadEvent::SubagentEnded { .. }),
+                ) => subagent_events.push(event),
                 (ConnectionId::LoginSession(_), _) => {}
+            }
+        }
+        if let ConnectionId::Thread(thread_id) = connection {
+            for event in subagent_events {
+                self.subagent_event(thread_id, event);
             }
         }
         if let Some((thread_id, false)) = waiting {
@@ -2135,7 +2168,7 @@ impl Server {
                 reported_login,
             );
             // The turn moved its account's limits.
-            if turn_ended {
+            if turn_ended && !runs_in_parent {
                 if turn_failed && let ConnectionId::Thread(thread_id) = connection {
                     self.turn_failed(thread_id, agent_id, account);
                 }
@@ -2163,6 +2196,7 @@ impl Server {
         self.close_orphaned_panes();
         self.close_orphaned_terminals();
         self.move_threads();
+        self.end_orphaned_subagents();
         self.finish_tasks();
         let answers = self.answer_waiting_tool_calls();
         self.send_waiting_prompts();

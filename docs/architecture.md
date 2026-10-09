@@ -602,8 +602,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   types don't read, are caught raw (`background_task_update`) into
   `ThreadState::background_tasks`, shown in the activity bar with how long each has run and
   Stop (`Request::StopBackgroundTask`, the `_session/async_task/stop` request). Being AIR also
-  means read and search results come without the file's text, and a subagent's text stays in
-  its tool call.
+  means read and search results come without the file's text, and that its subagents run in
+  sessions of their own (AIR's `nativeSubagentSessions`; see Agents' own subagents).
 - **Work after a turn** (`AgentThread::{starts_own_work, end_own_work}`): when a background
   task ends, Claude Agent goes on with no prompt. A message, thought or tool call while no turn
   runs (and the session is open, and no stop is in flight, whose note doesn't count) makes the
@@ -1134,6 +1134,40 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   now or its task's `ended_at`), "Runs on its own", Stop, and Open Parent. Ctrl-− (Zed's Go
   Back, on macOS too) runs `agent::OpenParentThread` anywhere in the subthread, which the
   command palette lists there, and both ways back show it in their tooltips.
+
+### Agents' own subagents
+
+Picked in `design/agent-subagents/`; Zed's subagent card (`render_subagent_card`,
+`render_subagent_expanded_content`) and t3code's child threads.
+
+- **Claude Agent's run as subthreads** (`server/subagents.rs`): agentZ's `initialize` says it
+  takes AIR's `nativeSubagentSessions`, so Claude Agent announces each subagent
+  (`subagent_spawned`: name, task, prompt), sends its steps and words in a session of its own,
+  and says when it ends (`subagent_state_update`). `AgentThread` reads them raw
+  (`subagent_notice`) and emits `SubagentStarted`, `SubagentUpdate` and `SubagentEnded`. The
+  server makes each a subthread with a `Task` marked by its session (`Task::agent_session`,
+  `is_agents_own`), whose `AgentThread::subagent` has no agent of its own: it shows what the
+  parent's agent sends in that session, and takes no messages. A subagent's own subagents go
+  under it. The parent gets a card (a tool call with `subthread`, `add_subagent_card`), which
+  ends with the subagent, with its report and how long it ran (`end_subagent_card`). The
+  agent hears of the end itself, so the parent isn't told (`delivered`); subagents still
+  running when the agent stops, or at shutdown, end as Interrupted
+  (`end_orphaned_subagents`). A subagent's permission request is asked in the parent, at its
+  card (`PermissionRequest::subagent_card`), while its tool call goes to the subthread.
+- **The row** (`AgentView::render_subagent`, `tool_calls::SubagentCall`): any subagent call
+  (one with a subthread, or whose input has a `subagent_type`, as Factory Droid's Task has) is
+  a row of its own, not folded into a run of work: a bot icon, the description, the type as a
+  tag, Open for a subthread, and a spinner, or the time and a check ("Failed", "Stopped") once
+  done. While a subthread's runs, the step it's on shows under it; a permission request takes
+  the step's place.
+- **Opened**: a subthread's shows Zed's preview (`render_subagent_preview`, following the
+  subthread with `sync_subagent_threads`): its last 8 steps, fading at the top when there are
+  more, its report, and a strip that opens the subthread ("Make Subagent Full Screen").
+  Droid's, which has no steps, shows "Task" with its options as tags and its prompt, "Report",
+  and Input (`render_subagent_task`).
+- **Its subthread** opens as agentZ's own do, with no Stop in its title bar or bar: the agent
+  runs it. The Agents list and the sidebar's count show it only while it runs
+  (`Task::is_listed`), with "Claude Agent’s" in place of the model and Stop.
 
 ### Diffs
 
