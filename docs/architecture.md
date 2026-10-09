@@ -770,7 +770,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
   Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
   existing one), the machine picker, the account picker and the branch. Changing any of them
-  replaces the draft with a new one. The account picker (`AgentView::render_account_picker`,
+  replaces the draft with a new one, and the old one leaves the store at once
+  (`ProjectStore::delete_thread`), so its row doesn't flash in the thread list until the
+  server answers. The account picker (`AgentView::render_account_picker`,
   §12 of the accounts round) shows only while the agent lists more than one account: the
   draft's account with its avatar, and a menu of the accounts with their plan (or "Logged
   out") and the window closest to running out (`usage_limits::tightest_window`), then Add

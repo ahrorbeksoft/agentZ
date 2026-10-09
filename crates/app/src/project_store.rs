@@ -617,7 +617,12 @@ impl ProjectStore {
         self.send(Request::ReorderThreads { section, keys }, cx)
     }
 
+    /// Gone at once, as archiving is: a draft made again with another account or agent is
+    /// deleted right after, and its row would otherwise flash above the cards until the server
+    /// answers.
     pub fn delete_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        self.store.delete_thread(id);
+        cx.notify();
         self.send(Request::DeleteThread(id), cx)
     }
 

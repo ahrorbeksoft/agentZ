@@ -10519,7 +10519,7 @@ mod tests {
         let store = view.read_with(cx, |view, _| view.store.clone());
         let mut on_work = snapshot(Some("Fix the login"));
         on_work.threads[0].account = Some(work);
-        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
+        store.update(cx, |store, cx| store.set_snapshot(on_work.clone(), cx));
         cx.run_until_parked();
         requests.borrow_mut().clear();
         let worktree = WorkspaceChoice::New {
@@ -10536,6 +10536,9 @@ mod tests {
                 .borrow()
                 .contains(&created(AccountChoice::Account(work), worktree.clone()))
         );
+        // The draft it was made again from is deleted; this view stands for it again.
+        store.update(cx, |store, cx| store.set_snapshot(on_work.clone(), cx));
+        cx.run_until_parked();
         requests.borrow_mut().clear();
         view.update(cx, |view, cx| {
             view.change_new_thread_starter(Starter::Agent(AgentId::new("other")), cx)
@@ -10550,6 +10553,8 @@ mod tests {
         )));
 
         // Add Account… opens the agent's accounts to add one there.
+        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
+        cx.run_until_parked();
         click("new-thread-account", cx);
         click("MENU_ITEM-Add Account…", cx);
         assert_eq!(*events.borrow(), vec![(mock, true)]);
