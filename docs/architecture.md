@@ -485,6 +485,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   diffs a thread from the first entry that changed (`AgentThread::take_entries_changed_from`)
   and sends streamed text as what was appended (`ThreadUpdate::appended`), not the whole message
   each chunk.
+- **Scrollbars** (`agent_view.rs`'s `with_scrollbar`; Zed's `vertical_scrollbar_for` on its
+  thread's list): the conversation has Zed's scrollbar, and so does every area in the thread
+  that scrolls: a tool call's output (an edit's long lines sideways), the Agents, Background
+  Tasks, Plan and queue lists, the handoff preview and the new thread screen. Each goes on a
+  wrapper that doesn't scroll, and a tool call's handle and scrollbar are kept by its id, since
+  the conversation's rows share their call sites.
 - **Whole conversations** (`agentz_server/src/transcripts.rs`, `AgentThread::{restore_transcript,
   transcript}`; t3code keeps its own history and ignores the replay): agents replay only part
   of a long session when it loads (Factory Droid about the last 100 messages), so the server keeps
