@@ -1502,21 +1502,27 @@ impl Server {
         };
         let account = thread.account;
         let mut command = self.agent_command(&agent_id, account, true);
+        let session_account = AgentAccount {
+            agent_id: agent_id.clone(),
+            account,
+        };
         let mut mcp_servers = Vec::new();
         if let Some(control) = self.agent_control.clone() {
-            let token = uuid::Uuid::new_v4().to_string();
-            self.tool_sessions.insert(token.clone(), thread_id);
-            mcp_servers.push(acp::McpServer::Stdio(
-                acp::McpServerStdio::new(AGENTZ_SERVER_NAME, &control.executable)
-                    .args(vec!["mcp-bridge".into()])
-                    .env(vec![
-                        acp::EnvVariable::new(
-                            "AGENTZ_SOCKET",
-                            control.socket.to_string_lossy().into_owned(),
-                        ),
-                        acp::EnvVariable::new("AGENTZ_MCP_TOKEN", token),
-                    ]),
-            ));
+            if mcp_servers::gives_agentz(&self.mcp_servers, &session_account) {
+                let token = uuid::Uuid::new_v4().to_string();
+                self.tool_sessions.insert(token.clone(), thread_id);
+                mcp_servers.push(acp::McpServer::Stdio(
+                    acp::McpServerStdio::new(AGENTZ_SERVER_NAME, &control.executable)
+                        .args(vec!["mcp-bridge".into()])
+                        .env(vec![
+                            acp::EnvVariable::new(
+                                "AGENTZ_SOCKET",
+                                control.socket.to_string_lossy().into_owned(),
+                            ),
+                            acp::EnvVariable::new("AGENTZ_MCP_TOKEN", token),
+                        ]),
+                ));
+            }
             // For agents without MCP, which can still run the CLI from their shell tool, as
             // herdr's `HERDR_*` variables allow.
             command = async move {
@@ -1565,10 +1571,7 @@ impl Server {
         }
         mcp_servers.extend(mcp_servers::for_session(
             &self.mcp_servers,
-            &AgentAccount {
-                agent_id: agent_id.clone(),
-                account,
-            },
+            &session_account,
         ));
         agent_thread.set_mcp_servers(mcp_servers);
         agent_thread.set_turn_hook(self.turn_hook(cwd, thread_id));

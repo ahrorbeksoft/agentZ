@@ -1,13 +1,13 @@
 //! agentZ's own MCP servers (design/accounts decisions.md §19), kept in `mcp-servers.json` in
 //! the data directory. Every session's agent gets the enabled ones beside agentZ's `agentz`
 //! server, as Zed gives agents its context servers; the agent's thread leaves out remote ones
-//! its agent doesn't take.
+//! its agent doesn't take. `agentz` is kept in the list too, for its switch and accounts menu.
 
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::AgentAccount;
-use agentz_protocol::mcp_servers::{McpServer, McpTransport};
+use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, McpServer, McpTransport};
 use anyhow::{Result, anyhow};
 
 use crate::agent_settings::{read_json, write_json};
@@ -16,8 +16,13 @@ fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("mcp-servers.json")
 }
 
+/// The servers, with agentZ's own first, on until its switch turns it off.
 pub fn load(data_dir: &Path) -> Result<Vec<McpServer>> {
-    Ok(read_json(&path(data_dir))?.unwrap_or_default())
+    let mut servers: Vec<McpServer> = read_json(&path(data_dir))?.unwrap_or_default();
+    if !servers.iter().any(McpServer::is_agentz) {
+        servers.insert(0, McpServer::agentz());
+    }
+    Ok(servers)
 }
 
 fn save(data_dir: &Path, servers: &[McpServer]) -> Result<()> {
@@ -32,6 +37,9 @@ pub fn save_server(
     mut server: McpServer,
 ) -> Result<()> {
     server.name = server.name.trim().to_string();
+    if replacing == Some(AGENTZ_SERVER_NAME) {
+        return Err(anyhow!("agentZ's own server can't be configured."));
+    }
     let index = match replacing {
         Some(name) => Some(
             servers
@@ -55,6 +63,9 @@ pub fn save_server(
 }
 
 pub fn delete_server(data_dir: &Path, servers: &mut Vec<McpServer>, name: &str) -> Result<()> {
+    if name == AGENTZ_SERVER_NAME {
+        return Err(anyhow!("agentZ's own server can't be removed."));
+    }
     let count = servers.len();
     servers.retain(|server| server.name != name);
     if servers.len() == count {
@@ -78,13 +89,22 @@ pub fn change(
     save(data_dir, servers)
 }
 
-/// What a session on `account` is given of agentZ's servers.
+/// Whether a session on `account` gets agentZ's own server.
+pub fn gives_agentz(servers: &[McpServer], account: &AgentAccount) -> bool {
+    servers
+        .iter()
+        .find(|server| server.is_agentz())
+        .is_none_or(|server| server.reaches(account))
+}
+
+/// What a session on `account` is given of the user's servers. agentZ's own is added by the
+/// thread, with its credential ([`gives_agentz`]).
 pub fn for_session(servers: &[McpServer], account: &AgentAccount) -> Vec<acp::McpServer> {
     servers
         .iter()
         .filter(|server| server.reaches(account))
-        .map(|server| match &server.transport {
-            McpTransport::Local { command, args, env } => acp::McpServer::Stdio(
+        .filter_map(|server| match &server.transport {
+            McpTransport::Local { command, args, env } => Some(acp::McpServer::Stdio(
                 acp::McpServerStdio::new(server.name.clone(), find_program(command))
                     .args(args.clone())
                     .env(
@@ -92,15 +112,16 @@ pub fn for_session(servers: &[McpServer], account: &AgentAccount) -> Vec<acp::Mc
                             .map(|(name, value)| acp::EnvVariable::new(name, value))
                             .collect(),
                     ),
-            ),
-            McpTransport::Remote { url, headers } => acp::McpServer::Http(
+            )),
+            McpTransport::Remote { url, headers } => Some(acp::McpServer::Http(
                 acp::McpServerHttp::new(server.name.clone(), url.clone()).headers(
                     headers
                         .iter()
                         .map(|(name, value)| acp::HttpHeader::new(name, value))
                         .collect(),
                 ),
-            ),
+            )),
+            McpTransport::Agentz => None,
         })
         .collect()
 }
@@ -142,7 +163,7 @@ mod tests {
     fn saves_renames_and_deletes_servers() -> Result<()> {
         let data_dir = tempfile::tempdir()?;
         let mut servers = load(data_dir.path())?;
-        assert!(servers.is_empty());
+        assert_eq!(servers, [McpServer::agentz()]);
         let local = |command: &str| McpTransport::Local {
             command: command.into(),
             args: vec!["-y".into(), "server-github".into()],
@@ -193,7 +214,7 @@ mod tests {
                 .iter()
                 .map(|server| &server.name)
                 .collect::<Vec<_>>(),
-            ["gh", "linear"]
+            ["agentz", "gh", "linear"]
         );
 
         let account = |agent_id: &str, account: Option<u64>| AgentAccount {
@@ -216,12 +237,51 @@ mod tests {
         change(data_dir.path(), &mut servers, "gh", |server| {
             server.kept_off = kept_off.clone()
         })?;
-        assert_eq!(load(data_dir.path())?[0].kept_off, kept_off);
+        assert_eq!(load(data_dir.path())?[1].kept_off, kept_off);
         assert!(for_session(&servers, &account("claude", Some(2))).is_empty());
         assert_eq!(for_session(&servers, &account("claude", Some(3))), given);
 
         delete_server(data_dir.path(), &mut servers, "gh")?;
-        assert_eq!(load(data_dir.path())?.len(), 1);
+        assert_eq!(load(data_dir.path())?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn agentz_is_switched_but_not_configured_or_removed() -> Result<()> {
+        let data_dir = tempfile::tempdir()?;
+        let mut servers = load(data_dir.path())?;
+        let claude = AgentAccount {
+            agent_id: AgentId::new("claude".to_string()),
+            account: None,
+        };
+        assert!(gives_agentz(&servers, &claude));
+        assert!(for_session(&servers, &claude).is_empty());
+
+        let replaced = save_server(
+            data_dir.path(),
+            &mut servers,
+            Some(AGENTZ_SERVER_NAME),
+            server("other", McpTransport::Agentz),
+        );
+        assert_eq!(
+            replaced.map_err(|error| error.to_string()),
+            Err("agentZ's own server can't be configured.".into())
+        );
+        let deleted = delete_server(data_dir.path(), &mut servers, AGENTZ_SERVER_NAME);
+        assert_eq!(
+            deleted.map_err(|error| error.to_string()),
+            Err("agentZ's own server can't be removed.".into())
+        );
+
+        change(
+            data_dir.path(),
+            &mut servers,
+            AGENTZ_SERVER_NAME,
+            |server| server.enabled = false,
+        )?;
+        let servers = load(data_dir.path())?;
+        assert_eq!(servers.len(), 1);
+        assert!(!gives_agentz(&servers, &claude));
         Ok(())
     }
 }

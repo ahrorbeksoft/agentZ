@@ -77,6 +77,16 @@ impl TestServer {
         command: AgentCommand,
         description: crate::AgentDescription,
     ) -> Option<Self> {
+        Self::start_with_control(data_dir, project_dir, command, description, None)
+    }
+
+    fn start_with_control(
+        data_dir: tempfile::TempDir,
+        project_dir: tempfile::TempDir,
+        command: AgentCommand,
+        description: crate::AgentDescription,
+        agent_control: Option<crate::AgentControl>,
+    ) -> Option<Self> {
         let custom_agents = BTreeMap::from_iter([(
             AgentId::new("mock"),
             CustomAgent {
@@ -94,7 +104,7 @@ impl TestServer {
                 http_client: Arc::new(http_client::BlockedHttpClient),
                 shell_environment_ready: futures::future::ready(()).boxed().shared(),
                 custom_agents,
-                agent_control: None,
+                agent_control,
                 hands_pages_to_clients: false,
                 terminal_shell: Some("/bin/sh".into()),
                 listener: None,
@@ -2207,6 +2217,7 @@ async fn mcp_servers_go_to_every_session() {
                     ),
                     _ => None,
                 }) == Some(vec![
+                    ("agentz", true),
                     ("github", true),
                     ("linear", true),
                     ("postgres", false),
@@ -2290,6 +2301,80 @@ async fn mcp_servers_go_to_every_session() {
             })
             .await;
     }
+}
+
+/// agentZ's own server is listed with the user's, on at first, and its switch keeps it out of
+/// sessions started afterwards, though it can't be configured or removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn agentz_server_is_switched_off_in_its_list() {
+    use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, McpServer};
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let control = crate::AgentControl {
+        executable: PathBuf::from("/bin/true"),
+        socket: data_dir.path().join("server.sock"),
+    };
+    let Some(server) = TestServer::start_with_control(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        Some(control),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    expect_mcp_servers(&mut client, &server, "MCP servers: agentz").await;
+
+    let error = client
+        .request(Request::DeleteMcpServer(AGENTZ_SERVER_NAME.into()))
+        .await
+        .expect_err("agentz can't be removed");
+    assert_eq!(error.message, "agentZ's own server can't be removed.");
+    client
+        .ok(Request::SetMcpServerEnabled {
+            name: AGENTZ_SERVER_NAME.into(),
+            enabled: false,
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client.events.iter().rev().find_map(|event| match event {
+                Event::McpServers(servers) => Some(servers.clone()),
+                _ => None,
+            }) == Some(vec![McpServer {
+                enabled: false,
+                ..McpServer::agentz()
+            }])
+        })
+        .await;
+    expect_mcp_servers(&mut client, &server, "MCP servers: none").await;
+    let saved = std::fs::read_to_string(server.data_dir.path().join("mcp-servers.json"))
+        .expect("mcp-servers.json is written");
+    assert!(saved.contains("\"enabled\": false") || saved.contains("\"enabled\":false"));
+}
+
+/// Starts a thread and has the mock agent name the MCP servers its session got.
+async fn expect_mcp_servers(client: &mut TestClient, server: &TestServer, expected: &str) {
+    let thread_id = client.create_thread(server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("mcp-servers"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == expected
+        })
+        .await;
 }
 
 #[cfg(unix)]

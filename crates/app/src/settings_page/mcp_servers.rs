@@ -253,6 +253,8 @@ impl SettingsPage {
         let selector = format!("mcp-server-{}", server.name);
         let name = server.name.clone();
         let configured = server.clone();
+        // agentZ's own server is only switched, as Zed lists an extension's without Configure.
+        let editable = !server.is_agentz();
         h_flex()
             .debug_selector(move || selector)
             .px_4()
@@ -269,7 +271,9 @@ impl SettingsPage {
                             .gap_2()
                             .child(Label::new(server.name.clone()))
                             .child(account_tag(
-                                if server.is_remote() {
+                                if server.is_agentz() {
+                                    "Built-in"
+                                } else if server.is_remote() {
                                     "Remote"
                                 } else {
                                     "Local"
@@ -283,7 +287,7 @@ impl SettingsPage {
                             Label::new(server.detail())
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
-                                .buffer_font(cx)
+                                .when(editable, |label| label.buffer_font(cx))
                                 .truncate(),
                         ),
                     )
@@ -298,45 +302,53 @@ impl SettingsPage {
                     .flex_none()
                     .gap_1()
                     .children(accounts_menu)
-                    .child(
-                        div()
-                            .debug_selector(move || format!("mcp-server-configure-{index}"))
+                    .when(editable, |actions| {
+                        actions
                             .child(
-                                IconButton::new(
-                                    ("mcp-server-configure", index),
-                                    IconName::Settings,
-                                )
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Configure MCP Server"))
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.open_mcp_server_form(
-                                            configured.is_remote(),
-                                            Some(&configured),
-                                            window,
-                                            cx,
+                                div()
+                                    .debug_selector(move || format!("mcp-server-configure-{index}"))
+                                    .child(
+                                        IconButton::new(
+                                            ("mcp-server-configure", index),
+                                            IconName::Settings,
                                         )
-                                    },
-                                )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || format!("mcp-server-delete-{index}"))
-                            .child({
-                                let name = name.clone();
-                                IconButton::new(("mcp-server-delete", index), IconName::Trash)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Uninstall MCP Server"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.send_mcp_server_request(
-                                            Request::DeleteMcpServer(name.clone()),
-                                            "Couldn't delete the server",
-                                            cx,
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("Configure MCP Server"))
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.open_mcp_server_form(
+                                                    configured.is_remote(),
+                                                    Some(&configured),
+                                                    window,
+                                                    cx,
+                                                )
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("mcp-server-delete-{index}"))
+                                    .child({
+                                        let name = name.clone();
+                                        IconButton::new(
+                                            ("mcp-server-delete", index),
+                                            IconName::Trash,
                                         )
-                                    }))
-                            }),
-                    )
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("Uninstall MCP Server"))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.send_mcp_server_request(
+                                                    Request::DeleteMcpServer(name.clone()),
+                                                    "Couldn't delete the server",
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                    }),
+                            )
+                    })
                     .child(
                         div()
                             .debug_selector(move || format!("mcp-server-switch-{index}"))
@@ -452,7 +464,7 @@ impl SettingsPage {
                 url.clone(),
                 headers.clone(),
             ),
-            None => Default::default(),
+            Some(McpTransport::Agentz) | None => Default::default(),
         };
         let rows = |kind: Pairs, pairs: Vec<(String, String)>, cx: &mut Context<Self>| {
             pairs
@@ -1060,6 +1072,57 @@ mod tests {
         }));
         click("mcp-server-delete-1", cx);
         assert!(sent(&Request::DeleteMcpServer("linear".into())));
+    }
+
+    #[gpui::test]
+    fn agentz_is_only_switched(cx: &mut TestAppContext) {
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let requests = requests.clone();
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    Some(Response::Ok)
+                });
+                client.set_mcp_servers_for_test(vec![McpServer::agentz(), github()], cx);
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::McpServers, window, cx)
+        });
+        cx.run_until_parked();
+        let agentz = cx
+            .debug_bounds("mcp-server-agentz")
+            .expect("agentz is listed");
+        let github = cx
+            .debug_bounds("mcp-server-github")
+            .expect("github is listed");
+        assert!(agentz.top() < github.top());
+        assert!(cx.debug_bounds("mcp-server-configure-0").is_none());
+        assert!(cx.debug_bounds("mcp-server-delete-0").is_none());
+        assert!(cx.debug_bounds("mcp-server-configure-1").is_some());
+
+        let switch = cx
+            .debug_bounds("mcp-server-switch-0")
+            .expect("agentz has a switch");
+        cx.simulate_click(switch.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(requests.borrow().contains(&Request::SetMcpServerEnabled {
+            name: "agentz".into(),
+            enabled: false,
+        }));
+        drop(client);
     }
 
     #[gpui::test]

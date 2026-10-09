@@ -1,6 +1,6 @@
 //! agentZ's own MCP servers (design/accounts decisions.md §19): kept by the server in
-//! `mcp-servers.json` in its data directory and given to every agent's sessions, beside agentZ's
-//! own `agentz` server, as Zed gives its context servers.
+//! `mcp-servers.json` in its data directory and given to every agent's sessions, as Zed gives its
+//! context servers. agentZ's own `agentz` server is listed with them, to be switched off there.
 
 use serde::{Deserialize, Serialize};
 
@@ -84,9 +84,27 @@ pub enum McpTransport {
         url: String,
         headers: Vec<(String, String)>,
     },
+    /// agentZ's own tools (`agentz-server mcp-bridge`), named [`AGENTZ_SERVER_NAME`]. It's
+    /// always listed, first, and can be switched off and kept off accounts, but not configured
+    /// or removed.
+    Agentz,
 }
 
 impl McpServer {
+    /// agentZ's own server as it's first listed: on for every account.
+    pub fn agentz() -> Self {
+        Self {
+            name: AGENTZ_SERVER_NAME.into(),
+            enabled: true,
+            transport: McpTransport::Agentz,
+            kept_off: Vec::new(),
+        }
+    }
+
+    pub fn is_agentz(&self) -> bool {
+        matches!(self.transport, McpTransport::Agentz)
+    }
+
     /// Whether a session of the account gets it.
     pub fn reaches(&self, account: &AgentAccount) -> bool {
         self.enabled
@@ -107,6 +125,9 @@ impl McpServer {
                 .collect::<Vec<_>>()
                 .join(" "),
             McpTransport::Remote { url, .. } => url.clone(),
+            McpTransport::Agentz => {
+                "agentZ's own tools: threads, tasks, workspaces, terminals and commands.".into()
+            }
         }
     }
 
@@ -135,6 +156,7 @@ impl McpServer {
                 }
                 no_duplicates(headers, "header")
             }
+            McpTransport::Agentz => Err("agentZ's own server can't be configured.".into()),
         }
     }
 }
