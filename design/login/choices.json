@@ -1,0 +1,55 @@
+{
+  "topics": {
+    "place": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "for a new thread in the center, and for after a first message inside a window",
+      "also": [
+        "C"
+      ]
+    },
+    "methods": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "words": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "steps": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "unsent": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "everywhere": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-09T03:40:44.520Z"
+}

@@ -20,8 +20,8 @@ use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, PlanItem, SessionRestore,
-    ToolCall, without_handoff,
+    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
+    without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
@@ -49,13 +49,13 @@ use crate::mention_menu::{
 };
 
 use crate::agent_icons::agent_icon;
-use crate::agent_login::{AgentLogin, LoginLayout};
+use crate::agent_login::{AgentLogin, LoginDialog, LoginLayout};
 use crate::attachment_image::{
     AttachmentImage, ImagePreviewTooltip, ImageViewer, MessagePiece, ViewedImage, is_loading,
     message_pieces, render_hover_preview, without_image_links,
 };
 use crate::confirm_dialog::ConfirmRequest;
-use crate::controls::{AgentIcon, account_fill_color};
+use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::project_info::{render_project_icon, workspace_icon};
@@ -342,8 +342,10 @@ pub struct AgentView {
     /// The terminals the agent runs its commands in, by the ids it got, shown in their tool
     /// calls.
     tool_terminals: HashMap<String, Entity<TerminalView>>,
-    /// The agent's login methods, shown when it needs a login.
+    /// The agent's login methods, shown in an empty thread while it needs a login.
     login: Entity<AgentLogin>,
+    /// The login after a message, opened from the line over the composer.
+    login_dialog: Option<(Entity<LoginDialog>, Subscription)>,
     /// What the agent is asking the user, by ACP's `elicitation/create`.
     elicitation_cards: Vec<Entity<ElicitationCard>>,
     /// What the composer says while empty: to log in first, while the agent needs a login.
@@ -401,8 +403,8 @@ impl AgentView {
                 .handles_paste()
         });
         let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
-        let login = cx
-            .new(|cx| AgentLogin::new(thread.clone(), LoginLayout::Centered, agent_id.clone(), cx));
+        let login =
+            cx.new(|cx| AgentLogin::new(thread.clone(), LoginLayout::Card, agent_id.clone(), cx));
         let subscriptions = vec![
             cx.subscribe(&rename_input, |this, _, _: &TextInputEvent, cx| {
                 this.apply_rename(cx)
@@ -560,6 +562,7 @@ impl AgentView {
             drawer_full_screen: false,
             tool_terminals: HashMap::default(),
             login,
+            login_dialog: None,
             elicitation_cards: Vec::new(),
             composer_placeholder: COMPOSER_PLACEHOLDER.into(),
             title_menu: PopoverMenuHandle::default(),
@@ -2447,22 +2450,10 @@ impl AgentView {
             };
             self.render_entry(index - 1, &entry, index == entry_count, window, cx)
         } else {
-            let needs_login = self.needs_login(cx);
             v_flex()
                 .w_full()
                 .pb_4()
                 .children(self.render_tail_rows(cx))
-                .when(needs_login, |this| {
-                    this.child(
-                        v_flex()
-                            .debug_selector(|| "thread-login".into())
-                            .w_full()
-                            .px_5()
-                            .py_8()
-                            .items_center()
-                            .child(self.login.clone()),
-                    )
-                })
                 .into_any_element()
         };
         div()
@@ -3416,25 +3407,37 @@ impl AgentView {
                         h_flex()
                             .h_5()
                             .gap_2()
-                            .visible_on_hover(group)
-                            .children(sent_at.map(|time| {
-                                Label::new(time).size(LabelSize::XSmall).color(Color::Muted)
-                            }))
                             .child(
-                                IconButton::new(("copy-user-message", index), IconName::Copy)
-                                    .icon_size(IconSize::XSmall)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text("Copy Message"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(Entry::UserMessage(text)) =
-                                            this.thread.read(cx).entries().get(index)
-                                        {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                without_handoff(text).to_string(),
-                                            ));
-                                        }
-                                    })),
-                            ),
+                                h_flex()
+                                    .gap_2()
+                                    .visible_on_hover(group)
+                                    .children(sent_at.map(|time| {
+                                        Label::new(time).size(LabelSize::XSmall).color(Color::Muted)
+                                    }))
+                                    .child(
+                                        IconButton::new(
+                                            ("copy-user-message", index),
+                                            IconName::Copy,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Copy Message"))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if let Some(Entry::UserMessage(text)) =
+                                                    this.thread.read(cx).entries().get(index)
+                                                {
+                                                    cx.write_to_clipboard(
+                                                        gpui::ClipboardItem::new_string(
+                                                            without_handoff(text).to_string(),
+                                                        ),
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .children(self.render_not_sent(index, cx)),
                     )
                     .into_any_element()
             }
@@ -4942,52 +4945,153 @@ impl AgentView {
         )
     }
 
+    /// Messages' "Not Delivered" under the user's last message when it didn't get through, with
+    /// Retry, which sends it once the agent is ready for it: after a login, when it asked for
+    /// one (Zed's `retry_button`).
+    fn render_not_sent(&self, index: usize, cx: &Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        thread.failed_message()?;
+        let last_message = thread
+            .entries()
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::UserMessage(_)))?;
+        if last_message != index {
+            return None;
+        }
+        let can_retry = thread.status() == &ConnectionStatus::Ready && !thread.is_working();
+        Some(
+            h_flex()
+                .debug_selector(|| "message-not-sent".into())
+                .gap_1()
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error),
+                )
+                .child(
+                    Label::new("Not sent")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                )
+                .child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    div().debug_selector(|| "retry-message".into()).child(
+                        Button::new("retry-message", "Retry")
+                            .style(ButtonStyle::Transparent)
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Accent)
+                            .disabled(!can_retry)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.thread
+                                    .update(cx, |thread, cx| thread.retry_message(cx));
+                            })),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// After a message, the agent's login is a line over the composer, whose Log In… opens it
+    /// in a dialog, as t3code's banner sends you to setup.
+    fn render_login_notice(&self, has_rows: bool, cx: &Context<Self>) -> Option<AnyElement> {
+        if !has_rows || !self.needs_login(cx) {
+            return None;
+        }
+        Some(
+            div()
+                .debug_selector(|| "login-notice".into())
+                .px_2()
+                .pb_2()
+                .child(
+                    Callout::new()
+                        .severity(Severity::Info)
+                        .title(format!("{} needs a login", self.agent_name(cx)))
+                        .actions_slot(
+                            div().debug_selector(|| "open-login-dialog".into()).child(
+                                ActionButton::new("open-login-dialog", "Log In…")
+                                    .style(ActionStyle::Primary)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_login_dialog(window, cx)
+                                    })),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The account the thread logs in, named in its login while the agent has more than one.
+    fn login_account(&self, cx: &App) -> Option<SharedString> {
+        let agent_id = self.agent_id.as_ref()?;
+        let accounts = self.client.read(cx).accounts(agent_id);
+        if accounts.listed().len() < 2 {
+            return None;
+        }
+        let account = self.store.read(cx).thread(self.thread_id)?.account;
+        let entry = account_entry(&accounts, account);
+        Some(
+            match entry
+                .email
+                .filter(|email| email.as_str() != entry.name.as_ref())
+            {
+                Some(email) => format!("{} · {email}", entry.name).into(),
+                None => entry.name,
+            },
+        )
+    }
+
+    fn open_login_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let line = self.login_account(cx).unwrap_or_else(|| {
+            format!(
+                "Every thread with {} shares the login.",
+                self.agent_name(cx)
+            )
+            .into()
+        });
+        let thread = self.thread.clone();
+        let agent_id = self.agent_id.clone();
+        let dialog = cx.new(|cx| LoginDialog::new(thread, agent_id, line, cx));
+        let subscription =
+            cx.subscribe_in(&dialog, window, |this, _, _: &DismissEvent, window, cx| {
+                this.login_dialog = None;
+                window.focus(&this.focus_handle(cx), cx);
+                cx.notify();
+            });
+        window.focus(&dialog.focus_handle(cx), cx);
+        self.login_dialog = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    fn render_login_dialog(&self) -> Option<AnyElement> {
+        let (dialog, _) = self.login_dialog.as_ref()?;
+        Some(
+            deferred(
+                anchored()
+                    .position(gpui::point(px(0.), px(0.)))
+                    .child(dialog.clone()),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
+    }
+
     fn render_errors(&self, cx: &Context<Self>) -> Option<AnyElement> {
         // The limit notice says it instead, even once closed.
         let at_limit = self.limit_reached(SystemTime::now(), cx).is_some();
         let thread = self.thread.read(cx);
-        // Zed's `retry_button`. The message goes once the agent is ready for it, which, when it
-        // asked for a login, is after one.
-        let retry_button = || {
-            let can_retry = thread.status() == &ConnectionStatus::Ready && !thread.is_working();
-            div().debug_selector(|| "retry-message".into()).child(
-                Button::new("retry-message", "Retry")
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Filled)
-                    .disabled(!can_retry)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.thread
-                            .update(cx, |thread, cx| thread.retry_message(cx));
-                    })),
-            )
-        };
-        let failed_message = thread.failed_message();
+        // A message that didn't get through has its Retry under it.
         let callout = if let ConnectionStatus::Failed(error) = thread.status() {
             Callout::new()
                 .severity(Severity::Error)
                 .icon(IconName::XCircle)
                 .title(format!("{} couldn't start", self.agent_name(cx)))
                 .description(error.clone())
-        } else if failed_message == Some(FailedMessage::NeedsLogin) {
-            Callout::new()
-                .severity(Severity::Error)
-                .icon(IconName::XCircle)
-                .title("The message wasn't sent")
-                .description(format!(
-                    "{} asked for a login before taking it. Once you've logged in, retry.",
-                    self.agent_name(cx)
-                ))
-                .actions_slot(retry_button())
         } else if let Some(error) = thread.turn_error().filter(|_| !at_limit) {
             Callout::new()
                 .severity(Severity::Error)
                 .icon(IconName::XCircle)
                 .title("The agent stopped with an error")
                 .description(error.clone())
-                .when(
-                    failed_message == Some(FailedMessage::TurnFailed),
-                    |callout| callout.actions_slot(retry_button()),
-                )
         } else if let Some(error) = &self.continue_error {
             Callout::new()
                 .severity(Severity::Error)
@@ -7995,6 +8099,11 @@ impl Render for AgentView {
         if is_new_thread {
             self.load_new_thread_git(cx);
         }
+        if needs_login && !has_rows {
+            let account = self.login_account(cx);
+            self.login
+                .update(cx, |login, cx| login.set_account(account, cx));
+        }
 
         v_flex()
             .key_context(THREAD_KEY_CONTEXT)
@@ -8103,8 +8212,8 @@ impl Render for AgentView {
                                         .child(Label::new(prompt).color(Color::Muted)),
                                 )
                             })
-                            // The login takes the empty thread's middle, or follows its history
-                            // as the list's tail.
+                            // The login's card takes the empty thread's middle. After a message,
+                            // a line over the composer opens it in a dialog.
                             .when(needs_login && !has_rows, |this| {
                                 this.child(
                                     v_flex()
@@ -8122,6 +8231,7 @@ impl Render for AgentView {
                     )
                     .children(self.render_request_elicitations(cx))
                     .children(self.render_limit_notice(cx))
+                    .children(self.render_login_notice(has_rows, cx))
                     .children(self.render_errors(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
@@ -8139,6 +8249,7 @@ impl Render for AgentView {
             .children(self.render_drawer(cx))
             .children(self.render_image_hover(cx))
             .children(self.render_image_viewer())
+            .children(self.render_login_dialog())
     }
 }
 
@@ -8854,7 +8965,7 @@ fn summarize_work(entries: &[Entry]) -> String {
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
-    use agentz_protocol::thread::QueuedMessage;
+    use agentz_protocol::thread::{FailedMessage, QueuedMessage};
     use gpui::{TestAppContext, VisualTestContext};
     use projects::{Project, ProjectsSnapshot};
 
@@ -10797,8 +10908,8 @@ mod tests {
         assert!(cx.debug_bounds("background-task-name-0").is_none());
     }
 
-    /// A message the agent wanted a login for says it wasn't sent, with Retry, which works
-    /// once the agent is ready. A failed turn has Retry too.
+    /// A message the agent wanted a login for is marked "Not sent" under it, with Retry, which
+    /// works once the agent is ready. A failed turn's message has it too.
     #[gpui::test]
     fn failed_messages_have_retry(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -10856,6 +10967,138 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("retry-message").is_none());
+    }
+
+    fn login_methods() -> Vec<acp::AuthMethod> {
+        vec![
+            acp::AuthMethod::Agent(acp::AuthMethodAgent::new("login", "Log In")),
+            acp::AuthMethod::Agent(acp::AuthMethodAgent::new("key", "Use an API key").meta(
+                acp::Meta::from_iter([("api-key".to_string(), serde_json::json!({}))]),
+            )),
+        ]
+    }
+
+    fn click(selector: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is shown"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn authenticated_with(
+        client: &Entity<ServerClient>,
+        method: &str,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        sent(client, cx).iter().any(|request| {
+            matches!(request, Request::Authenticate { method_id, .. } if method_id.0.as_ref() == method)
+        })
+    }
+
+    /// An empty thread's login is a card in its middle: the methods as rows, and the one picked
+    /// shows its step in their place, with Back to them.
+    #[gpui::test]
+    fn an_empty_threads_login_is_a_card(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.status = ConnectionStatus::AuthRequired;
+                    state.auth_methods = login_methods();
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("login-card").is_some());
+        assert!(cx.debug_bounds("login-notice").is_none());
+        assert!(cx.debug_bounds("login-back").is_none());
+
+        click("login-method-key", cx);
+        assert!(
+            cx.debug_bounds("login-method-login").is_none(),
+            "the step takes the methods' place"
+        );
+        assert!(cx.debug_bounds("login-back").is_some());
+        cx.simulate_input("sk-test");
+        click("login-submit", cx);
+        assert!(authenticated_with(&client, "key", cx));
+
+        click("login-back", cx);
+        assert!(cx.debug_bounds("login-method-login").is_some());
+        assert!(cx.debug_bounds("login-back").is_none());
+    }
+
+    /// After a message, the login is a line over the composer, whose Log In… opens it in a
+    /// dialog, and the message that didn't go is marked under it. Logged in, the dialog says
+    /// as whom, with Done, and only the mark stays.
+    #[gpui::test]
+    fn a_login_after_a_message_opens_in_a_dialog(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Build it".into())], cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.status = ConnectionStatus::AuthRequired;
+                    state.auth_methods = login_methods();
+                    state.failed_message = Some(FailedMessage::NeedsLogin);
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("login-card").is_none());
+        assert!(cx.debug_bounds("message-not-sent").is_some());
+        assert!(
+            cx.debug_bounds("login-dialog").is_none(),
+            "it doesn't open by itself"
+        );
+
+        click("open-login-dialog", cx);
+        assert!(cx.debug_bounds("login-dialog").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("login-dialog").is_none());
+
+        click("open-login-dialog", cx);
+        click("login-method-key", cx);
+        assert!(cx.debug_bounds("login-dialog-log-in").is_some());
+        click("login-dialog-back", cx);
+        assert!(cx.debug_bounds("login-method-key").is_some());
+        click("login-dialog-cancel", cx);
+        assert!(cx.debug_bounds("login-dialog").is_none());
+
+        click("open-login-dialog", cx);
+        click("login-method-login", cx);
+        assert!(authenticated_with(&client, "login", cx));
+        assert!(cx.debug_bounds("login-dialog-back").is_some());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.status = ConnectionStatus::Ready;
+                    state.auth_status = Some(agentz_protocol::thread::AuthStatus {
+                        kind: "account".into(),
+                        account: Some(agentz_protocol::thread::AuthAccount {
+                            email: Some("alex@hey.com".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("login-dialog-logged-in").is_some());
+        assert!(cx.debug_bounds("login-notice").is_none());
+        assert!(cx.debug_bounds("message-not-sent").is_some());
+        click("login-dialog-done", cx);
+        assert!(cx.debug_bounds("login-dialog").is_none());
     }
 
     /// A message typed while the agent works goes to the queue the server keeps.

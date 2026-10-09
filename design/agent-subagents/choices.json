@@ -1,0 +1,39 @@
+{
+  "topics": {
+    "row": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "open": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "steps": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "list": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "B": "only if they have steps"
+      },
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-09T03:44:03.974Z"
+}

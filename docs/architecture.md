@@ -582,14 +582,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   running (or it asks for permission), the server cancels the turn and the queue sends the
   message. Editing or removing the front message disarms it.
 - **Retry** (`AgentThread::retry_message`, `Request::RetryMessage`, `ThreadState::failed_message`,
-  `agent_view.rs`'s `render_errors`; Zed's `retry_button`): a message the agent didn't get
-  through fails rather than waiting, and the callout above the composer has Retry, which sends
-  it again as it went (its mentions and the conversation a continued thread brings) without
-  showing it twice. A message the agent asked for a login at (Claude Agent asks at the
-  prompt), one sent while it needs a login, and one waiting for a session that asks for one
-  say "The message wasn't sent" (`FailedMessage::NeedsLogin`), and Retry works once the
-  agent is ready, after the login; logging in doesn't send it by itself. A turn that ends with
-  an error (`FailedMessage::TurnFailed`, "The agent stopped with an error") has Retry too:
+  `agent_view.rs`'s `render_not_sent`; Zed's `retry_button`; login round topic 5, chat apps'
+  "Not Delivered"): a message the agent didn't get through fails rather than waiting, and is
+  marked "Not sent · Retry" in red under its bubble, whose Retry sends it again as it went (its
+  mentions and the conversation a continued thread brings) without showing it twice. A message
+  the agent asked for a login at (Claude Agent asks at the prompt), one sent while it needs a
+  login, and one waiting for a session that asks for one fail so
+  (`FailedMessage::NeedsLogin`), and Retry works once the agent is ready, after the login;
+  logging in doesn't send it by itself. A turn that ends with an error
+  (`FailedMessage::TurnFailed`, its callout "The agent stopped with an error") has the mark too:
   Claude Agent and Codex retry a lost connection themselves, and the prompt fails once they
   give up. The failed message and its error stay across a reload of the agent, and a new
   message takes its place. The retried reply starts a message of its own.
@@ -780,8 +781,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   are ACP's `authenticate`, and the agent opens the browser itself on its machine. `terminal`
   methods, and older ones naming a command in `_meta["terminal-auth"]`
   (`agentz_protocol::thread::terminal_login_command`), run on the agent's machine in a
-  `TerminalKey::Login` terminal (`Request::TerminalLogin`) that the thread's login callout or
-  the agent's settings page shows. That's where the agent keeps its login, so this works for
+  `TerminalKey::Login` terminal (`Request::TerminalLogin`) that the thread's login card or
+  dialog, or the agent's settings page shows. That's where the agent keeps its login, so this works for
   remote machines too. When it exits with 0 the server closes it, records the method, and
   restarts the agent, which opens its session logged in. `initialize` advertises
   `auth.terminal` and Zed's `_meta["terminal-auth"]`: without them Claude Agent offers no login
@@ -821,10 +822,23 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   rows, and the server's own login check closes. A login session opens no page at all unless
   it's logging in. Elsewhere than an SSH machine, a page from a login the user started, or a
   thread's page outside a login, opens in the real browser.
-- **The login panel** (`agent_login.rs`, agentZ's own design, since Zed only has a callout):
-  `LoginLayout::Rows` on the agent's page, a row for each method; `LoginLayout::Centered` in the
-  middle of a thread that needs a login, a full-width button for each method. While logged out,
-  the thread's composer is dimmed, says "Log in to <agent> to send a message", and doesn't send.
+- **The login panel** (`agent_login.rs`, the login round's picks, in the look of Add Account's
+  dialog, since Zed only has a callout): one look everywhere (topic 6), only the frame differs.
+  The methods are rows (topic 2): the method's icon in a tile, its name, the agent's
+  description of it and a chevron; a click starts it. The picked one's step takes their place
+  (topic 4): the code with Copy Code and Open, the method's name over its terminal, the key's
+  field; it ends in Back to the methods and Cancel, or Log In for a key
+  (`AgentLogin::render_footer`). `LoginLayout::Rows` is an account's card on the agent's page,
+  `LoginLayout::Dialog` Add Account's dialog, and `LoginLayout::Card` an empty thread's login
+  (topic 1 A): a 440 px card in its middle, the agent's icon and "Log in to <agent>", under it
+  what the agent said, else "Every thread with <agent> shares the login." or with several
+  accounts the thread's (topic 3 B, Zed's description), then the rows or the step. After a
+  message (topic 1 C), the thread shows only a line over the composer, "<agent> needs a
+  login" with Log In… (`AgentView::render_login_notice`), which opens `LoginDialog` over the
+  thread, titled "Log in to <agent>": the rows, the step, then "Logged in as …" with Done. It
+  doesn't open by itself, and Escape, Cancel or the backdrop close it, ending a login under
+  way. While logged out, the thread's composer is dimmed, says "Log in to <agent> to send a
+  message", and doesn't send.
 - **The account** (`agentz_protocol::thread::AuthStatus`): Claude Agent and Codex report their
   login, unasked, with `_auth/status_update` (the account's email, plan and how it's logged
   in). The Account card shows it, or "Logged in" with the method agentZ logged in with.

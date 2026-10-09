@@ -1,14 +1,14 @@
 //! agentZ's own controls for the login, account and input-request surfaces, where `ui`'s
 //! styles fall short: buttons with a solid accent or red fill, a field frame with a focus
-//! ring, an account avatar, an agent's icon on its account's color, an icon tile, and a
-//! one-time code in boxes.
+//! ring, an account avatar, an agent's icon on its account's color, an icon tile, a one-time
+//! code in boxes, and a dialog's frame.
 
 use gpui::{
     AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, Focusable as _, FontWeight, Hsla,
     SharedString, Window, div, linear_color_stop, linear_gradient,
 };
 use text_input::TextInput;
-use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
+use ui::{CommonAnimationExt as _, prelude::*};
 
 /// What a field's text, and a button's label, are set in.
 pub(crate) const CONTROL_TEXT_SIZE: f32 = 13.;
@@ -24,14 +24,6 @@ pub(crate) enum ActionStyle {
     Ghost,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ActionSize {
-    /// 28px, beside fields and in rows.
-    Medium,
-    /// 32px, for a panel's main choices.
-    Large,
-}
-
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// A text button in one of [`ActionStyle`]'s styles.
@@ -40,12 +32,9 @@ pub(crate) struct ActionButton {
     id: ElementId,
     label: SharedString,
     style: ActionStyle,
-    size: ActionSize,
     start_icon: Option<Icon>,
     end_icon: Option<Icon>,
-    full_width: bool,
     disabled: bool,
-    tooltip: Option<SharedString>,
     on_click: Option<ClickHandler>,
 }
 
@@ -55,23 +44,15 @@ impl ActionButton {
             id: id.into(),
             label: label.into(),
             style: ActionStyle::Outline,
-            size: ActionSize::Medium,
             start_icon: None,
             end_icon: None,
-            full_width: false,
             disabled: false,
-            tooltip: None,
             on_click: None,
         }
     }
 
     pub(crate) fn style(mut self, style: ActionStyle) -> Self {
         self.style = style;
-        self
-    }
-
-    pub(crate) fn size(mut self, size: ActionSize) -> Self {
-        self.size = size;
         self
     }
 
@@ -86,18 +67,8 @@ impl ActionButton {
         self
     }
 
-    pub(crate) fn full_width(mut self) -> Self {
-        self.full_width = true;
-        self
-    }
-
     pub(crate) fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
-        self
-    }
-
-    pub(crate) fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
-        self.tooltip = Some(tooltip.into());
         self
     }
 
@@ -114,10 +85,6 @@ impl RenderOnce for ActionButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
-        let (height, padding, radius) = match self.size {
-            ActionSize::Medium => (px(28.), px(11.), px(6.)),
-            ActionSize::Large => (px(32.), px(14.), px(7.)),
-        };
         let transparent = gpui::transparent_black();
         let (background, border, text) = match self.style {
             ActionStyle::Primary => (colors.text_accent, transparent, on_fill_color(cx)),
@@ -136,15 +103,14 @@ impl RenderOnce for ActionButton {
         } else {
             Color::Muted
         };
-        let tooltip = self.tooltip;
         h_flex()
             .id(self.id)
             .flex_none()
-            .h(height)
-            .px(padding)
+            .h(px(28.))
+            .px(px(11.))
             .gap(px(6.))
             .justify_center()
-            .rounded(radius)
+            .rounded(px(6.))
             .border_1()
             .border_color(border)
             .bg(background)
@@ -156,7 +122,6 @@ impl RenderOnce for ActionButton {
             })
             .text_color(text)
             .whitespace_nowrap()
-            .when(self.full_width, |this| this.w_full())
             .map(|this| match self.on_click {
                 Some(on_click) if !self.disabled => this
                     .cursor_pointer()
@@ -166,9 +131,6 @@ impl RenderOnce for ActionButton {
                 _ => this,
             })
             .when(self.disabled, |this| this.opacity(0.45))
-            .when_some(tooltip, |this, tooltip| {
-                this.tooltip(Tooltip::text(tooltip))
-            })
             .children(self.start_icon.map(|icon| icon.color(icon_color)))
             .child(self.label)
             .children(self.end_icon.map(|icon| icon.color(icon_color)))
@@ -458,6 +420,29 @@ pub(crate) fn key_hint(key: &'static str, cx: &App) -> AnyElement {
         .text_color(colors.text_muted)
         .child(key)
         .into_any_element()
+}
+
+/// A dialog's frame, as Add Account's: a raised card with t3code's soft shadow.
+pub(crate) fn dialog_frame(cx: &App) -> gpui::Div {
+    let colors = cx.theme().colors();
+    v_flex()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.elevated_surface_background)
+        .shadow(vec![
+            BoxShadow::new(px(0.), px(24.), gpui::black().opacity(0.45)).blur_radius(px(64.)),
+        ])
+        .overflow_hidden()
+}
+
+/// A dialog's title, over its body.
+pub(crate) fn dialog_title(title: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .mb_1()
+        .text_size(px(15.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(title.into())
 }
 
 /// A small colored dot, for a status.

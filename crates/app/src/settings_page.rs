@@ -28,10 +28,10 @@ use agentz_protocol::agents::{
 use agentz_protocol::workspace::WorkspaceRemoval;
 use agentz_protocol::{CAPABILITY_IMPORT_SESSIONS, Request, Response};
 use gpui::{
-    AnyElement, App, BoxShadow, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, ListAlignment, ListOffset, ListState, PathPromptOptions,
-    PromptLevel, ScrollHandle, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
-    actions, list, uniform_list,
+    AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, KeyBinding, ListAlignment, ListOffset, ListState, PathPromptOptions, PromptLevel,
+    ScrollHandle, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, list,
+    uniform_list,
 };
 use projects::{Project, ProjectIcon, ProjectId, ThreadId, ThreadOrder, Workspace};
 use text_input::{TextInput, TextInputEvent};
@@ -55,7 +55,7 @@ use crate::app_settings::{AppSettingsStore, MachineProfile, PlaySound, ThemeMode
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{
     ACCOUNT_COLORS, ActionButton, ActionStyle, account_badge, account_color, avatar, color_hex,
-    icon_tile, spinner, status_badge, status_dot, text_field,
+    dialog_frame, dialog_title, icon_tile, spinner, status_badge, status_dot, text_field,
 };
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machine_icon_picker::MachineIconPicker;
@@ -94,7 +94,7 @@ const ACCOUNT_SPACING: Rems = rems(0.625);
 const LINE_AVATAR_SIZE: Pixels = px(26.);
 /// An account's card in its dialog, and Add Account's dialog.
 const ACCOUNT_DIALOG_WIDTH: Pixels = px(600.);
-const ADD_ACCOUNT_DIALOG_WIDTH: Pixels = px(480.);
+pub(crate) const ADD_ACCOUNT_DIALOG_WIDTH: Pixels = px(480.);
 /// An agent can keep hundreds of sessions in a project, so the Threads tab shows them a page at
 /// a time, as the sidebar shows archived threads.
 const SESSIONS_INITIAL_COUNT: usize = 10;
@@ -4964,16 +4964,7 @@ impl SettingsPage {
             .accounts
             .clone()?;
         let accounts = panel.client(cx).read(cx).accounts(&panel.agent_id);
-        let colors = cx.theme().colors().clone();
-        let frame = v_flex()
-            .rounded(px(12.))
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.elevated_surface_background)
-            .shadow(vec![
-                BoxShadow::new(px(0.), px(24.), gpui::black().opacity(0.45)).blur_radius(px(64.)),
-            ])
-            .overflow_hidden();
+        let frame = dialog_frame(cx);
         let elicitation_cards = |account: Option<AccountId>| -> Vec<AnyElement> {
             panel
                 .session(account)
@@ -5030,13 +5021,7 @@ impl SettingsPage {
                         .px_4()
                         .pt_4()
                         .pb_3p5()
-                        .child(
-                            div()
-                                .mb_1()
-                                .text_size(px(15.))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(title),
-                        )
+                        .child(dialog_title(title))
                         .child(body)
                         .children(elicitations)
                         .child(h_flex().mt_3p5().gap_2().justify_end().children(buttons))
@@ -5170,7 +5155,7 @@ impl SettingsPage {
             ]);
             return (adding_title, body, vec![cancel(ActionStyle::Ghost, cx)]);
         };
-        let step = login.read(cx).dialog_step(cx);
+        let step = login.read(cx).step(cx);
         let mut body = v_flex();
         if step == LoginStep::Choosing {
             body = body.child(
@@ -7439,7 +7424,10 @@ fn login_method_subject(method: &str) -> Option<String> {
 
 /// "Logged in as …" with the account the agent reported (Claude Agent and Codex report one),
 /// else the method last used from agentZ.
-fn logged_in_title(status: Option<&AuthStatus>, login_method: Option<&str>) -> SharedString {
+pub(crate) fn logged_in_title(
+    status: Option<&AuthStatus>,
+    login_method: Option<&str>,
+) -> SharedString {
     if let Some(status) = status {
         if let Some(email) = status
             .account

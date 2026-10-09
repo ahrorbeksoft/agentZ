@@ -149,6 +149,7 @@ fn init_for_test(cx: &mut App) {
     agent_icons::init(cx);
     text_input::init(cx);
     agent_view::init(cx);
+    agent_login::init(cx);
     terminal_view::init(cx);
     terminal_thread_view::init(cx);
     new_space_picker::init(cx);
