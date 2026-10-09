@@ -16,6 +16,7 @@ use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
 use agentz_protocol::terminal::TerminalKey;
+use agentz_protocol::title_generation::TitleGenerationState;
 use agentz_protocol::{
     AgentSettingsChange, CAPABILITY_HAND_OFF, CAPABILITY_RELAY, ClientKind, ConnectionId,
     DirectoryListing, Event, MachineIcon, MachineKind, Peers, RelayToolCall, Request, Response,
@@ -112,6 +113,8 @@ pub struct ServerClient {
     unseen_panes: BTreeSet<PaneId>,
     /// What kind of machine the server says it's on, and the kind chosen for it.
     machine_icon: MachineIcon,
+    /// How the machine titles threads whose agent doesn't, and the CLIs it found for it.
+    title_generation: TitleGenerationState,
     /// Open threads and login sessions, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
@@ -162,6 +165,7 @@ impl ServerClient {
                 spaces: SpacesSnapshot::default(),
                 unseen_panes: BTreeSet::new(),
                 machine_icon: MachineIcon::default(),
+                title_generation: TitleGenerationState::default(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
@@ -538,6 +542,17 @@ impl ServerClient {
         }
     }
 
+    pub fn title_generation(&self) -> &TitleGenerationState {
+        &self.title_generation
+    }
+
+    fn set_title_generation(&mut self, state: TitleGenerationState, cx: &mut Context<Self>) {
+        if state != self.title_generation {
+            self.title_generation = state;
+            cx.notify();
+        }
+    }
+
     /// Chooses the machine's icon, for every client of its server. Choosing what was
     /// detected clears the choice, as t3code's picker does, so detection keeps deciding.
     pub fn choose_machine_icon(&self, kind: MachineKind, cx: &App) {
@@ -747,6 +762,7 @@ impl ServerClient {
         self.set_mcp_servers(session.mcp_servers, cx);
         self.set_spaces(session.spaces, cx);
         self.set_machine_icon_state(session.machine_icon, cx);
+        self.set_title_generation(session.title_generation, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }
@@ -772,6 +788,7 @@ impl ServerClient {
                     | Event::McpServers(_)
                     | Event::Spaces(_)
                     | Event::MachineIcon(_)
+                    | Event::TitleGeneration(_)
             )
         {
             queued.push(event);
@@ -788,6 +805,7 @@ impl ServerClient {
             Event::McpServers(mcp_servers) => self.set_mcp_servers(mcp_servers, cx),
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
+            Event::TitleGeneration(state) => self.set_title_generation(state, cx),
             Event::Thread { connection, update } => {
                 if let Some(thread) = self.threads.get(&connection).and_then(|t| t.upgrade()) {
                     thread.update(cx, |thread, cx| thread.apply_update(update, cx));
