@@ -554,9 +554,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   chevron on hover. Every row starts closed and a click opens its output beside it (diffs,
   terminals, text, images), up to 24 rems tall, with the input as JSON behind a small "Input"
   line at its end (Zed's "View Raw Input"), left out for commands, edits and calls with an
-  image; its code blocks wrap long lines (t3code). A call awaiting permission stays open. A read's
-  text is the file, so it shows as one code block (`as_code_block`): Claude fences it, but Droid
-  sends it bare, and as markdown it would lose its lines and indentation. Rows are
+  image; its code blocks wrap long lines (t3code). A call awaiting permission stays open. Every
+  tool's text shows as it was printed, as one code block in the buffer font (`as_code_block`):
+  Claude fences some of it, but most agents send it bare, and as markdown a `git diff` lost its
+  lines and indentation, its `---` became a dash and its `-` lines bullets. A subagent's report
+  is the one text still drawn as markdown. Rows are
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
   from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
   "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
