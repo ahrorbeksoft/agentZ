@@ -90,6 +90,28 @@ such as picking a branch and checking out from an existing branch.
 
 - Research how t3code does it first (`references/t3code`), then decide what to build.
 
+### Mermaid diagrams in threads, as in Zed
+
+Draw ` ```mermaid ` code blocks in agents' messages as diagrams, the way Zed's agent threads do,
+for every agent. Only mermaid: not the full set of agent-described components (charts, tables,
+cards in json-render's format), which was considered and left out.
+
+Notes from the research (Zed in `references/zed`):
+
+- Zed turns the diagram into an SVG with the `merman` crate (`crates/mermaid_render`, merman
+  `=0.8.0-alpha.5`, features `layout-cytoscape` and `svg`), colors it with the theme and accent
+  colors from `player_colors`, and draws it through gpui's `svg_renderer`.
+- The markdown side is `crates/markdown/src/mermaid.rs`, turned on by
+  `MarkdownOptions::render_mermaid_diagrams` (set in `acp_thread.rs`'s `create_markdown`). It
+  keeps the last drawn diagram while a block streams in, and the diagrams can be zoomed
+  (`on_mermaid_zoom` in `thread_view.rs`). A theme change redraws them
+  (`invalidate_mermaid_caches` in `conversation_view.rs`).
+- agentZ already has gpui's `svg_renderer` (`parse_svg`, `render_parsed`), `usvg`, `resvg` and
+  `quick-xml`. `merman` isn't in `Cargo.lock` yet. Our copy of the markdown crate has no
+  `mermaid.rs`, only the parser's tests for mermaid fences.
+- Supported diagram types, from Zed's system prompt: flowchart, sequence, class, state, ER,
+  gantt, pie, gitgraph, mindmap, timeline, quadrant chart, xy chart and journey.
+
 ## Bugs
 
 ### Open the message queue when a message is queued
