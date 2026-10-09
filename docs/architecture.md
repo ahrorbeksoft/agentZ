@@ -500,6 +500,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Tasks, Plan and queue lists, the handoff preview and the new thread screen. Each goes on a
   wrapper that doesn't scroll, and a tool call's handle and scrollbar are kept by its id, since
   the conversation's rows share their call sites.
+- **Turn rail** (`agent_view.rs`'s `render_turn_rail`; t3code's `TimelineMinimap`): once a
+  thread has two of the user's messages, a strip for each sits in the gutter left of the
+  conversation's text, bright while its message is in view. Under the mouse, the strips widen
+  around the turn there and a card previews it (the message and the agent's last reply in it);
+  a click goes to it, as do Previous turn and Next turn above and below, seen only under the
+  mouse. A gutter narrower than 48 pixels shows the rail only under the mouse, one too narrow
+  for the buttons leaves them out, and one with no room hides it. The rail is drawn again once
+  the rows laid out after a jump put other turns in view.
 - **Whole conversations** (`agentz_server/src/transcripts.rs`, `AgentThread::{restore_transcript,
   transcript}`; t3code keeps its own history and ignores the replay): agents replay only part
   of a long session when it loads (Factory Droid about the last 100 messages), so the server keeps
@@ -1145,10 +1153,13 @@ for `t3_`.
   answering.
 - **Policy**: the caller's project only; no broader permissions than the caller; agents can't
   delete threads or answer permissions; `clientRequestId` idempotency; agent-created threads and
-  messages are marked `createdBy: agent` and shown as such. The Workspaces view's panes belong
-  to no project, so any thread may list, open and type into them, as the user can, run
-  commands, which can do no more than typing into a pane, and add a project, which runs
-  nothing; removing projects and closing panes stay with the user.
+  messages are marked `createdBy: agent` and shown as such. The message that tells an agent its
+  delegated tasks ended (`send_follow_ups`, t3code's wording) is the exception: it goes in the
+  user's place, as nothing else starts a turn while an agent is idle, but it's marked
+  (`ThreadState::task_notices`) and not shown, so the agent's next turn just follows. The
+  Workspaces view's panes belong to no project, so any thread may list, open and type into
+  them, as the user can, run commands, which can do no more than typing into a pane, and add a
+  project, which runs nothing; removing projects and closing panes stay with the user.
 - **Across machines** (`tools/relay.rs`): calls naming another machine go through the app, which
   reaches every machine, so they work only while the app is open. The app runs them there as
   `ToolCaller::Relayed`, which never relays again: `agentz_thread_list`'s first page asks every

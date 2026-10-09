@@ -2,7 +2,7 @@
 //! (`agent_ui::conversation_view::thread_view`).
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -27,11 +27,11 @@ use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardEntry,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, Bounds, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FollowMode, Hsla, ImageSource, KeyBinding, ListAlignment, ListState,
-    ObjectFit, Pixels, Point, PromptLevel, ScrollHandle, Stateful, Subscription, Task, Window,
-    anchored, deferred, img, list, pulsating_between,
+    FocusHandle, Focusable, FollowMode, FontWeight, Hsla, ImageSource, KeyBinding, ListAlignment,
+    ListOffset, ListState, MouseMoveEvent, ObjectFit, Pixels, Point, PromptLevel, ScrollHandle,
+    Stateful, Subscription, Task, Window, anchored, canvas, deferred, img, list, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind};
@@ -112,6 +112,63 @@ pub(crate) const RESIZE_EDGE_SIZE: Pixels = px(6.);
 /// The drawer's top edge, being dragged to resize it.
 struct DraggedDrawerEdge;
 
+/// Which parts of the turn rail the mouse is over, and the turn it last pointed at.
+#[derive(Default)]
+struct TurnRailHover {
+    turn: Option<usize>,
+    over_strips: bool,
+    over_preview: bool,
+    over_buttons: bool,
+}
+
+/// Which turns' messages are in view, by their place among the turns, and the turn being
+/// read: the first in view, or else the last above the view (t3code's
+/// `resolveTimelineMinimapCurrentIndex`).
+#[derive(PartialEq)]
+struct TurnsInView {
+    in_view: Vec<bool>,
+    current: Option<usize>,
+}
+
+impl TurnsInView {
+    /// For the turns' entries, as the conversation was last laid out.
+    fn of(list_state: &ListState, turns: &[usize]) -> Self {
+        let mut in_view = Vec::with_capacity(turns.len());
+        let mut first_in_view = None;
+        let mut last_above = None;
+        for (turn, entry) in turns.iter().enumerate() {
+            // The head row comes before the entries.
+            let row = entry + 1;
+            let above = list_state.item_is_above_viewport(row);
+            let shown =
+                above == Some(false) && list_state.item_is_below_viewport(row) == Some(false);
+            if shown && first_in_view.is_none() {
+                first_in_view = Some(turn);
+            }
+            if above == Some(true) {
+                last_above = Some(turn);
+            }
+            in_view.push(shown);
+        }
+        Self {
+            in_view,
+            current: first_in_view.or(last_above),
+        }
+    }
+}
+
+impl TurnRailHover {
+    fn is_hovered(&self) -> bool {
+        self.over_strips || self.over_preview || self.over_buttons
+    }
+
+    /// The turn whose preview shows: the one under the mouse, kept while the mouse is on its
+    /// preview.
+    fn previewed(&self) -> Option<usize> {
+        self.turn.filter(|_| self.over_strips || self.over_preview)
+    }
+}
+
 /// The most lines of a command's terminal a tool call shows.
 const TOOL_TERMINAL_MAX_LINES: usize = 16;
 /// The most an image in a tool call's output takes, as Zed's `max_w_96` and `max_h_96`.
@@ -124,6 +181,24 @@ const MESSAGE_IMAGE_SIZE: gpui::Size<Pixels> = gpui::Size {
     width: px(100.),
     height: px(75.),
 };
+
+// The turn rail, t3code's timeline minimap: a strip for each of the user's messages in the
+// gutter left of the conversation's text, with Previous and Next turn above and below it.
+const TURN_RAIL_MIN_TURNS: usize = 2;
+const TURN_STRIP_SPACING: Pixels = px(8.);
+/// From the conversation's left edge.
+const TURN_RAIL_LEFT: Pixels = px(12.);
+const TURN_RAIL_MAX_WIDTH: Pixels = px(40.);
+/// A gutter this wide shows the rail all the time; a narrower one only under the mouse, as
+/// it would cover the text otherwise.
+const TURN_RAIL_PERSISTENT_GUTTER: Pixels = px(48.);
+/// The buttons are centered 4 pixels into the rail, so they reach this far into it, and a
+/// rail narrower than that leaves them out rather than have them cover the text.
+const TURN_BUTTON_REACH: Pixels = px(14.);
+const TURN_BUTTON_SIZE: Pixels = px(20.);
+/// From the rail's left edge.
+const TURN_PREVIEW_LEFT: Pixels = px(32.);
+const TURN_PREVIEW_WIDTH: Pixels = px(320.);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -266,6 +341,11 @@ pub struct AgentView {
     /// The conversation: a head row, the entries, then a tail row, drawn only where visible
     /// (Zed's thread list).
     list_state: ListState,
+    /// The conversation's width when it was last drawn, which places the turn rail.
+    conversation_width: Pixels,
+    turn_rail_hover: TurnRailHover,
+    /// Where the turn rail's strips were last drawn, to find the turn under the mouse.
+    turn_rail_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// The entries' revisions the rows and markdowns were last synced with.
     synced_revisions: Vec<u64>,
     markdowns: HashMap<MarkdownKey, Entity<Markdown>>,
@@ -520,6 +600,9 @@ impl AgentView {
                 list_state.set_follow_mode(FollowMode::Tail);
                 list_state
             },
+            conversation_width: px(0.),
+            turn_rail_hover: TurnRailHover::default(),
+            turn_rail_bounds: Rc::default(),
             synced_revisions: Vec::new(),
             markdowns: HashMap::default(),
             _markdown_subscriptions: Vec::new(),
@@ -2722,6 +2805,293 @@ impl AgentView {
         rows
     }
 
+    /// The entries of the user's own messages: the turns the turn rail goes between.
+    fn user_turns(&self, cx: &App) -> Vec<usize> {
+        let thread = self.thread.read(cx);
+        thread
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                matches!(entry, Entry::UserMessage(_)) && !thread.is_task_notice(*index)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Scrolls to a turn's message, which stops following the end of the conversation.
+    fn scroll_to_turn(&mut self, entry: usize, cx: &mut Context<Self>) {
+        self.list_state.scroll_to(ListOffset {
+            item_ix: entry + 1,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
+    /// Measures the conversation, whose width places the turn rail, and draws it again when
+    /// that changes, or when the rows laid out after the rail was drawn put other turns in
+    /// view (as after a jump to a turn whose rows weren't measured yet).
+    fn render_conversation_measure(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let drawn_width = self.conversation_width;
+        let turns = self.user_turns(cx);
+        let list_state = self.list_state.clone();
+        let drawn_turns = TurnsInView::of(&list_state, &turns);
+        canvas(
+            move |bounds, window, cx| {
+                let width = bounds.size.width;
+                if width != drawn_width || TurnsInView::of(&list_state, &turns) != drawn_turns {
+                    window.defer(cx, move |_, cx| {
+                        view.update(cx, |view, cx| {
+                            view.conversation_width = width;
+                            cx.notify();
+                        })
+                        .log_err();
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
+    /// t3code's timeline minimap, in the gutter left of the conversation's text: a strip for
+    /// each of the user's messages, bright while it's in view, a preview of the turn under the
+    /// mouse, and Previous and Next turn buttons. Shown once there are two turns, all the time
+    /// where the gutter is wide and only under the mouse where it's narrow.
+    fn render_turn_rail(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let turns = self.user_turns(cx);
+        let count = turns.len();
+        if count < TURN_RAIL_MIN_TURNS {
+            return None;
+        }
+        let gutter = turn_rail_gutter(self.conversation_width, window.rem_size());
+        let collapsed_width = (gutter.floor() - TURN_RAIL_LEFT).min(TURN_RAIL_MAX_WIDTH);
+        // It would cover the text.
+        if collapsed_width <= px(0.) {
+            return None;
+        }
+        let always_shown = gutter >= TURN_RAIL_PERSISTENT_GUTTER;
+        let TurnsInView { in_view, current } = TurnsInView::of(&self.list_state, &turns);
+        let previewed = self
+            .turn_rail_hover
+            .previewed()
+            .filter(|turn| *turn < count);
+        let height = (TURN_STRIP_SPACING * (count - 1) as f32)
+            .min(window.viewport_size().height - window.rem_size() * 18.)
+            .max(px(1.));
+        let colors = cx.theme().colors();
+
+        let strips = in_view.iter().enumerate().map(|(turn, shown)| {
+            // t3code's fisheye around the turn under the mouse.
+            let distance = previewed.map(|previewed| previewed.abs_diff(turn));
+            let width = match distance {
+                Some(0) => px(24.),
+                Some(1) => px(16.),
+                Some(2) => px(10.),
+                _ => px(8.),
+            };
+            let color = if *shown {
+                colors.text.opacity(0.9)
+            } else if distance == Some(0) {
+                colors.text_muted.opacity(0.75)
+            } else {
+                colors.text_muted.opacity(0.35)
+            };
+            div()
+                .debug_selector(move || format!("turn-strip-{turn}"))
+                .absolute()
+                .left_0()
+                .top(turn_offset(turn, count, height) - px(1.))
+                .h(px(2.))
+                .w(width)
+                .rounded_full()
+                .bg(color)
+        });
+        let preview = previewed.map(|turn| {
+            let (message, reply) = turn_preview(self.thread.read(cx).entries(), &turns, turn);
+            let card = v_flex()
+                .id("turn-preview")
+                .debug_selector(|| "turn-preview".into())
+                // Over it, the turn stays, and a click doesn't jump.
+                .occlude()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.turn_rail_hover.over_preview = *hovered;
+                    cx.notify();
+                }))
+                .w(TURN_PREVIEW_WIDTH)
+                .p_3()
+                .gap_1()
+                .elevation_2(cx)
+                .child(
+                    Label::new(message)
+                        .weight(FontWeight::MEDIUM)
+                        .single_line()
+                        .truncate(),
+                )
+                .when_some(reply, |this, reply| {
+                    this.child(
+                        div()
+                            .text_ui(cx)
+                            .text_color(colors.text_muted)
+                            .line_clamp(3)
+                            .child(reply),
+                    )
+                });
+            // The first turn's preview hangs below its strip, the last's above it, and the
+            // others' are centered on it.
+            div()
+                .absolute()
+                .left(TURN_PREVIEW_LEFT)
+                .top(turn_offset(turn, count, height))
+                .h_0()
+                .w(TURN_PREVIEW_WIDTH)
+                .flex()
+                .flex_col()
+                .map(|this| match turn {
+                    0 => this.justify_start(),
+                    turn if turn + 1 == count => this.justify_end(),
+                    _ => this.justify_center(),
+                })
+                .child(card)
+        });
+        let rail_bounds = self.turn_rail_bounds.clone();
+        let strips = div()
+            .id("turn-rail")
+            .debug_selector(|| "turn-rail".into())
+            .relative()
+            .h(height)
+            // With a preview, the way to it stays on the rail.
+            .w(if previewed.is_some() {
+                TURN_PREVIEW_LEFT + TURN_PREVIEW_WIDTH
+            } else {
+                collapsed_width
+            })
+            .cursor_pointer()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.turn_rail_hover.over_strips = *hovered;
+                cx.notify();
+            }))
+            .on_mouse_move({
+                let rail_bounds = rail_bounds.clone();
+                cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    let turn = turn_at(event.position.y, rail_bounds.get(), count);
+                    if this.turn_rail_hover.turn != turn {
+                        this.turn_rail_hover.turn = turn;
+                        cx.notify();
+                    }
+                })
+            })
+            .on_click({
+                let rail_bounds = rail_bounds.clone();
+                let turns = turns.clone();
+                cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    let turn = turn_at(event.position().y, rail_bounds.get(), count);
+                    if let Some(entry) = turn.and_then(|turn| turns.get(turn)) {
+                        this.scroll_to_turn(*entry, cx);
+                    }
+                })
+            })
+            .child(
+                canvas(move |bounds, _, _| rail_bounds.set(bounds), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(12.))
+                    .h_full()
+                    .w(px(1.))
+                    .bg(colors.border.opacity(0.15)),
+            )
+            .children(strips)
+            .children(preview);
+
+        // The buttons would reach past a narrow gutter into the text.
+        let buttons_fit = collapsed_width >= TURN_BUTTON_REACH;
+        let previous = current
+            .and_then(|current| current.checked_sub(1))
+            .and_then(|turn| turns.get(turn).copied());
+        let next = current.and_then(|current| turns.get(current + 1).copied());
+        let previous_button = self.render_turn_button(
+            "previous-turn",
+            IconName::ChevronUp,
+            "Previous turn",
+            buttons_fit.then_some(previous),
+            cx,
+        );
+        let next_button = self.render_turn_button(
+            "next-turn",
+            IconName::ChevronDown,
+            "Next turn",
+            buttons_fit.then_some(next),
+            cx,
+        );
+        // The buttons are centered 4 pixels into the rail.
+        let buttons_left = TURN_RAIL_LEFT + px(4.) - TURN_BUTTON_SIZE * 0.5;
+        Some(
+            v_flex()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(buttons_left)
+                .items_start()
+                .justify_center()
+                .gap(px(2.))
+                .when(
+                    !always_shown && !self.turn_rail_hover.is_hovered(),
+                    |this| this.opacity(0.),
+                )
+                .child(previous_button)
+                .child(div().pl(TURN_RAIL_LEFT - buttons_left).child(strips))
+                .child(next_button)
+                .into_any_element(),
+        )
+    }
+
+    /// Previous or Next turn, seen only under the mouse, as t3code's. `None` leaves its place
+    /// empty; `Some(None)` is a button with no turn to go to.
+    fn render_turn_button(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        label: &'static str,
+        target: Option<Option<usize>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(target) = target else {
+            return div().size(TURN_BUTTON_SIZE).into_any_element();
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .size(TURN_BUTTON_SIZE)
+            .flex()
+            .items_center()
+            .justify_center()
+            .opacity(0.)
+            .hover(|style| style.opacity(1.))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.turn_rail_hover.over_buttons = *hovered;
+                cx.notify();
+            }))
+            .child(
+                IconButton::new(id, icon)
+                    .icon_size(IconSize::Small)
+                    .disabled(target.is_none())
+                    .tooltip(Tooltip::text(label))
+                    .when_some(target, |this, entry| {
+                        this.on_click(
+                            cx.listener(move |this, _, _, cx| this.scroll_to_turn(entry, cx)),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_mention_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.mention_query.as_ref()?;
         let this = cx.entity().downgrade();
@@ -3580,6 +3950,9 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match entry {
+            Entry::UserMessage(_) if self.thread.read(cx).is_task_notice(index) => {
+                div().into_any_element()
+            }
             Entry::UserMessage(text) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 if self.is_task_message(index, cx) {
@@ -9013,6 +9386,8 @@ impl Render for AgentView {
                                     .flex_1()
                                     .w_full(),
                                 )
+                                .child(self.render_conversation_measure(cx))
+                                .children(self.render_turn_rail(window, cx))
                                 .vertical_scrollbar_for(
                                     &self.list_state,
                                     window,
@@ -9680,6 +10055,62 @@ struct LiveLine {
     /// Whether that entry shows a permission request's buttons, which a request's coming and
     /// going doesn't mark as a change to the entry.
     awaits_confirmation: bool,
+}
+
+/// The space left of the conversation's text, for the turn rail: beside the centered column,
+/// and the rows' own padding (`px_5`).
+fn turn_rail_gutter(conversation_width: Pixels, rem_size: Pixels) -> Pixels {
+    (conversation_width - conversation_width.min(MAX_CONTENT_WIDTH)) * 0.5 + rem_size * 1.25
+}
+
+/// How far down the turn rail a turn's strip is: the turns spread evenly over it.
+fn turn_offset(turn: usize, count: usize, height: Pixels) -> Pixels {
+    if count <= 1 {
+        return px(0.);
+    }
+    height * (turn.min(count - 1) as f32 / (count - 1) as f32)
+}
+
+/// The turn whose strip is nearest `y` on a rail drawn in `rail` (t3code's
+/// `resolveTimelineMinimapIndexFromPointer`).
+fn turn_at(y: Pixels, rail: Bounds<Pixels>, count: usize) -> Option<usize> {
+    if count == 0 || rail.size.height <= px(0.) {
+        return None;
+    }
+    let progress = ((y - rail.top()) / rail.size.height).clamp(0., 1.);
+    Some(((progress * (count - 1) as f32).round() as usize).min(count - 1))
+}
+
+/// What the turn rail's preview shows of a turn: the user's message, and the agent's last
+/// message before the next turn, each as one run of words (t3code's `compactMinimapPreview`).
+fn turn_preview(
+    entries: &[Entry],
+    turns: &[usize],
+    turn: usize,
+) -> (SharedString, Option<SharedString>) {
+    fn compact(text: &str) -> Option<SharedString> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        (!words.is_empty()).then(|| words.join(" ").into())
+    }
+    let Some(&start) = turns.get(turn) else {
+        return ("User message".into(), None);
+    };
+    let end = turns.get(turn + 1).copied().unwrap_or(entries.len());
+    let message = match entries.get(start) {
+        Some(Entry::UserMessage(text)) => compact(&without_image_links(without_handoff(text)).0),
+        _ => None,
+    };
+    let reply = entries
+        .get(start + 1..end.max(start + 1))
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            Entry::AgentMessage(text) => Some(text),
+            _ => None,
+        })
+        .and_then(|text| compact(&without_image_links(text).0));
+    (message.unwrap_or_else(|| "User message".into()), reply)
 }
 
 /// Where the last turn's entries start: after the user's last message.
@@ -11004,6 +11435,138 @@ mod tests {
         thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
         cx.run_until_parked();
         assert!(cx.debug_bounds("conversation-row-302").is_some());
+    }
+
+    /// Three turns of the user's, with a delegated task's notice in the second, each turn long
+    /// enough that only one shows at a time. Returns the entries of the user's messages.
+    fn turns_with_a_notice(thread: &Entity<AgentThread>, cx: &mut VisualTestContext) -> [usize; 3] {
+        let mut entries = Vec::new();
+        let mut turns = Vec::new();
+        let mut notice = 0;
+        for (turn, message) in ["Fix the login", "Now the tests", "Ship it"]
+            .into_iter()
+            .enumerate()
+        {
+            turns.push(entries.len());
+            entries.push(Entry::UserMessage(message.into()));
+            for line in 0..40 {
+                entries.push(Entry::AgentMessage(format!("Working on it, step {line}.")));
+            }
+            if turn == 1 {
+                notice = entries.len();
+                entries.push(Entry::UserMessage(
+                    "Delegated task 7 reached a terminal state. Use task_status with taskId 7 \
+                     to read the result."
+                        .into(),
+                ));
+            }
+            entries.push(Entry::AgentMessage(format!("Done with “{message}”.")));
+        }
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.task_notices = vec![notice], cx);
+            thread.set_entries_for_test(entries, cx);
+        });
+        cx.run_until_parked();
+        [turns[0], turns[1], turns[2]]
+    }
+
+    /// t3code's timeline minimap: a strip for each of the user's messages, a preview of the
+    /// one under the mouse, and buttons to the previous and next one.
+    #[gpui::test]
+    fn the_turn_rail_goes_between_the_users_messages(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let turns = turns_with_a_notice(&thread, cx);
+        // Drawn again once the conversation's width is known.
+        cx.run_until_parked();
+        let scroll_top = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.list_state.logical_scroll_top().item_ix)
+        };
+
+        // The notice isn't one of the user's turns.
+        assert!(cx.debug_bounds("turn-strip-2").is_some());
+        assert!(cx.debug_bounds("turn-strip-3").is_none());
+        // At the end, the last turn is the one being read, and there's none after it.
+        let button = cx
+            .debug_bounds("previous-turn")
+            .expect("the previous turn button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(scroll_top(cx), turns[1] + 1);
+        let button = cx
+            .debug_bounds("previous-turn")
+            .expect("the previous turn button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(scroll_top(cx), turns[0] + 1);
+        let button = cx.debug_bounds("next-turn").expect("the next turn button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(scroll_top(cx), turns[1] + 1);
+
+        // Over the last strip, its turn shows: the message and the agent's last reply.
+        assert!(cx.debug_bounds("turn-preview").is_none());
+        let last_strip = cx.debug_bounds("turn-strip-2").expect("the last strip");
+        // Its center is on the rail's bottom edge.
+        let over_last_strip = last_strip.center() - gpui::point(px(0.), px(1.));
+        cx.simulate_mouse_move(over_last_strip, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let preview = cx.debug_bounds("turn-preview").expect("the turn's preview");
+        assert!(preview.left() > last_strip.right());
+        // It hangs above the last strip, inside the conversation.
+        assert!(preview.bottom() <= last_strip.bottom() + px(2.));
+        // Clicking the strip goes to its turn.
+        cx.simulate_click(over_last_strip, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(scroll_top(cx), turns[2] + 1);
+    }
+
+    /// The notice of delegated tasks that ended goes to the agent in the user's place, but it
+    /// isn't the user's, so it isn't shown.
+    #[gpui::test]
+    fn a_delegated_tasks_notice_is_not_shown(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        turns_with_a_notice(&thread, cx);
+        let notice = thread.read_with(cx, |thread, _| thread.state.task_notices[0]);
+        view.update(cx, |view, cx| view.scroll_to_turn(notice, cx));
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds(format!("conversation-row-{}", notice + 1).leak())
+            .expect("the notice's row");
+        assert_eq!(row.size.height, px(0.));
+    }
+
+    #[test]
+    fn the_turn_rails_preview_has_the_message_and_the_last_reply() {
+        let entries = vec![
+            Entry::UserMessage("Fix\n  the   login".into()),
+            Entry::AgentMessage("Looking.".into()),
+            Entry::AgentMessage("Fixed it.\n\nThe test passes.".into()),
+            Entry::UserMessage("   ".into()),
+        ];
+        assert_eq!(
+            turn_preview(&entries, &[0, 3], 0),
+            (
+                SharedString::from("Fix the login"),
+                Some(SharedString::from("Fixed it. The test passes."))
+            )
+        );
+        assert_eq!(
+            turn_preview(&entries, &[0, 3], 1),
+            (SharedString::from("User message"), None)
+        );
+    }
+
+    #[test]
+    fn the_turn_rail_points_at_the_nearest_strip() {
+        let rail = Bounds::new(gpui::point(px(12.), px(100.)), gpui::size(px(40.), px(16.)));
+        assert_eq!(turn_at(px(90.), rail, 3), Some(0));
+        assert_eq!(turn_at(px(103.), rail, 3), Some(0));
+        assert_eq!(turn_at(px(105.), rail, 3), Some(1));
+        assert_eq!(turn_at(px(113.), rail, 3), Some(2));
+        assert_eq!(turn_at(px(140.), rail, 3), Some(2));
+        assert_eq!(turn_at(px(105.), rail, 0), None);
     }
 
     fn tool_call(status: acp::ToolCallStatus) -> Entry {

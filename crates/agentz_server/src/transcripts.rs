@@ -101,6 +101,7 @@ mod tests {
             plan: &transcript.plan,
             finished_turns: &transcript.finished_turns,
             prompts_from_agents: &transcript.prompts_from_agents,
+            task_notices: &transcript.task_notices,
             sent_times: &transcript.sent_times,
         };
         save(data_dir.path(), thread_id, saved).expect("saved");

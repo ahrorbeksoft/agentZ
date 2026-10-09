@@ -352,7 +352,11 @@ impl Server {
                     (text, from, tasks)
                 }
             };
-            thread.send_from(text, from);
+            if ended_tasks.is_empty() {
+                thread.send_from(text, from);
+            } else {
+                thread.send_task_notice(text, from);
+            }
             for task in ended_tasks {
                 self.projects
                     .update_task(task, |task| task.delivered = true);

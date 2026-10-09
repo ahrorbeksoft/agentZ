@@ -4163,6 +4163,7 @@ async fn agents_queue_restart_and_interrupt_turns() {
     );
     assert_eq!(entries[2], Entry::UserMessage("second".into()));
     assert_eq!(client.thread(connection).state.prompts_from_agents.len(), 2);
+    assert!(client.thread(connection).state.task_notices.is_empty());
 
     client
         .tool(
@@ -4964,6 +4965,14 @@ async fn agents_delegate_tasks_to_subthreads() {
         .find(|message| message.contains(&slow.0.to_string()))
         .expect("an announcement");
     assert!(announced.starts_with("Delegated task"), "{announced}");
+    // It isn't the user's, so the app doesn't show it.
+    let parent_view = client.thread(ConnectionId::Thread(parent));
+    let announcement_index = parent_view
+        .entries()
+        .iter()
+        .position(|entry| matches!(entry, Entry::UserMessage(text) if *text == announced))
+        .expect("the announcement's entry");
+    assert!(parent_view.is_task_notice(announcement_index));
     let status = client
         .tool(parent, "task_status", json!({"taskId": slow.0}))
         .await;

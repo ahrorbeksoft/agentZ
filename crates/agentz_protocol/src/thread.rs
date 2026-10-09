@@ -416,6 +416,11 @@ pub struct ThreadState {
     /// entry index, in order. A list rather than a map: integer map keys don't survive serde's
     /// buffering of the protocol's untagged fallbacks.
     pub prompts_from_agents: Vec<(usize, ThreadCreator)>,
+    /// User messages that tell the agent its delegated tasks ended, by entry index, in order.
+    /// They go in the user's place, as nothing else starts a turn while an agent is idle, but
+    /// they aren't the user's, so they aren't shown.
+    #[serde(default)]
+    pub task_notices: Vec<usize>,
     /// When each user message sent here went, by entry index, in order (t3code's time under
     /// the message). Messages replayed from history have none.
     #[serde(default)]
@@ -545,6 +550,11 @@ impl ThreadView {
             .iter()
             .find(|(prompt_index, _)| *prompt_index == index)
             .map(|(_, sender)| *sender)
+    }
+
+    /// Whether the user message at `index` only tells the agent its delegated tasks ended.
+    pub fn is_task_notice(&self, index: usize) -> bool {
+        self.state.task_notices.contains(&index)
     }
 
     /// When the user message at `index` was sent, if it was sent here.

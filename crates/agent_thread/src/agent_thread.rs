@@ -532,6 +532,7 @@ pub struct Transcript {
     pub plan: Vec<PlanItem>,
     pub finished_turns: Vec<TurnTime>,
     pub prompts_from_agents: Vec<(usize, projects::ThreadCreator)>,
+    pub task_notices: Vec<usize>,
     pub sent_times: Vec<(usize, SystemTime)>,
 }
 
@@ -544,6 +545,7 @@ pub struct TranscriptRef<'a> {
     pub plan: &'a [PlanItem],
     pub finished_turns: &'a [TurnTime],
     pub prompts_from_agents: &'a [(usize, projects::ThreadCreator)],
+    pub task_notices: &'a [usize],
     pub sent_times: &'a [(usize, SystemTime)],
 }
 
@@ -554,6 +556,7 @@ impl From<TranscriptRef<'_>> for Transcript {
             plan: transcript.plan.to_vec(),
             finished_turns: transcript.finished_turns.to_vec(),
             prompts_from_agents: transcript.prompts_from_agents.to_vec(),
+            task_notices: transcript.task_notices.to_vec(),
             sent_times: transcript.sent_times.to_vec(),
         }
     }
@@ -805,6 +808,7 @@ impl AgentThread {
         self.view.state.plan = transcript.plan;
         self.view.state.finished_turns = transcript.finished_turns;
         self.view.state.prompts_from_agents = transcript.prompts_from_agents;
+        self.view.state.task_notices = transcript.task_notices;
         self.view.state.sent_times = transcript.sent_times;
         self.entry_changed(0);
         self.has_conversation = true;
@@ -830,6 +834,7 @@ impl AgentThread {
             plan: &self.view.state.plan,
             finished_turns: &self.view.state.finished_turns,
             prompts_from_agents: &self.view.state.prompts_from_agents,
+            task_notices: &self.view.state.task_notices,
             sent_times: &self.view.state.sent_times,
         })
     }
@@ -1206,6 +1211,7 @@ impl AgentThread {
             self.view.state.finished_turns.clear();
             self.entry_changed(0);
             self.view.state.prompts_from_agents.clear();
+            self.view.state.task_notices.clear();
             self.view.state.sent_times.clear();
             self.view.state.plan.clear();
         }
@@ -1370,15 +1376,17 @@ impl AgentThread {
             (
                 std::mem::take(&mut self.view.entries),
                 std::mem::take(&mut self.view.state.prompts_from_agents),
+                std::mem::take(&mut self.view.state.task_notices),
                 std::mem::take(&mut self.view.state.sent_times),
             )
         });
         self.reload();
         self.queued_prompts = queued_prompts;
-        if let Some((entries, prompts_from_agents, sent_times)) = conversation {
+        if let Some((entries, prompts_from_agents, task_notices, sent_times)) = conversation {
             self.view.entries = entries;
             self.entry_changed(0);
             self.view.state.prompts_from_agents = prompts_from_agents;
+            self.view.state.task_notices = task_notices;
             self.view.state.sent_times = sent_times;
         }
     }
@@ -2238,6 +2246,15 @@ impl AgentThread {
         self.send(text);
         if self.view.entries.len() > index {
             self.view.state.prompts_from_agents.push((index, from));
+        }
+    }
+
+    /// Tells the agent its delegated tasks ended, in a message that isn't shown as the user's.
+    pub fn send_task_notice(&mut self, text: String, from: projects::ThreadCreator) {
+        let index = self.view.entries.len();
+        self.send_from(text, from);
+        if self.view.entries.len() > index {
+            self.view.state.task_notices.push(index);
         }
     }
 
