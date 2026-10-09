@@ -14,6 +14,7 @@
 //! stay with the user. Mutations take an optional `clientRequestId`, so a retry returns the
 //! first answer instead of doing the work again.
 
+mod commands;
 mod project_tools;
 mod relay;
 mod terminals;
@@ -627,6 +628,7 @@ impl Server {
             "agentz_terminal_send" => self.terminal_send(caller, &arguments),
             "agentz_terminal_read" => self.terminal_read(caller, &arguments),
             "agentz_terminal_wait" => self.terminal_wait(caller, &arguments, timed_out),
+            "agentz_command_run" => self.command_run(caller, &arguments),
             "agentz_project_add" => self.project_add(&arguments),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
@@ -2500,6 +2502,7 @@ pub(super) fn definitions() -> Value {
     ]);
     if let Value::Array(tools) = &mut tools {
         tools.extend(terminals::definitions());
+        tools.extend(commands::definitions());
         tools.extend(project_tools::definitions());
         let machine = json!({
             "type": "string",

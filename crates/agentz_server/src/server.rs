@@ -155,6 +155,8 @@ pub(crate) struct Server {
     /// Agents' login pages go to the clients: this machine is reached over SSH.
     hands_pages_to_clients: bool,
     terminal_shell: Option<String>,
+    /// Commands wait for it to have the user's `PATH`.
+    shell_environment_ready: registry::ShellEnvironmentReady,
     /// The socket clients connect to, for handing off.
     #[cfg(unix)]
     listener: Option<std::os::fd::RawFd>,
@@ -296,7 +298,7 @@ impl Server {
         let (mut registry, registry_inbox) = AgentRegistryStore::new(
             runtime.clone(),
             http_client.clone(),
-            config.shell_environment_ready,
+            config.shell_environment_ready.clone(),
             registry_dir(&data_dir),
             data_dir.join("node"),
         );
@@ -324,6 +326,7 @@ impl Server {
             browser_programs,
             hands_pages_to_clients: config.hands_pages_to_clients,
             terminal_shell: config.terminal_shell,
+            shell_environment_ready: config.shell_environment_ready,
             #[cfg(unix)]
             listener: config.listener,
             handing_off: false,

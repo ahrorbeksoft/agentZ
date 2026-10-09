@@ -1088,23 +1088,32 @@ for `t3_`.
   `delegate_task`, `task_status`, `task_cancel`; workspace tools (`tools/workspaces.rs`); terminal
   tools after herdr's `pane` commands (`tools/terminals.rs`), which also reach the Workspaces
   view's panes (`paneId`; `agentz_terminal_start` with `folder`, `workspaceId` or `paneId` opens
-  a workspace, a tab or a split); `agentz_project_add` (`tools/project_tools.rs`), the app's
-  Add Project, which looks the repository up before answering.
+  a workspace, a tab or a split); `agentz_command_run` (`tools/commands.rs`), a one-off command
+  for its output and exit code, which herdr lacks (its agents type into a pane and read it
+  back): the user's shell with `-c` and no terminal, in the thread's folder unless given one,
+  stdout and stderr through one pipe so they keep their order, the last 50,000 bytes kept, and
+  the command's process group killed once `timeoutMs` (60 seconds) is up; what it leaves running
+  in the background holds the call up for only 200 ms more; `agentz_project_add`
+  (`tools/project_tools.rs`), the app's Add Project, which looks the repository up before
+  answering.
 - **Policy**: the caller's project only; no broader permissions than the caller; agents can't
   delete threads or answer permissions; `clientRequestId` idempotency; agent-created threads and
   messages are marked `createdBy: agent` and shown as such. The Workspaces view's panes belong
-  to no project, so any thread may list, open and type into them, as the user can, and add a
-  project, which runs nothing; removing projects and closing panes stay with the user.
+  to no project, so any thread may list, open and type into them, as the user can, run
+  commands, which can do no more than typing into a pane, and add a project, which runs
+  nothing; removing projects and closing panes stay with the user.
 - **Across machines** (`tools/relay.rs`): calls naming another machine go through the app, which
   reaches every machine, so they work only while the app is open. The app runs them there as
   `ToolCaller::Relayed`, which never relays again: `agentz_thread_list`'s first page asks every
   machine with the project on its own, and a relayed list asking back made the two machines pass
   it back and forth forever. The list leaves out a machine that doesn't answer in 10 seconds,
   with its error under `machines`. Thread tools need the project there (a checkout the app
-  combines with it, sent in `Peers`); the terminal tools and `agentz_project_add`
-  (`MACHINE_TOOLS`) work on any machine, relayed without a checkout (`ToolCaller::Relayed(None)`,
-  which the app allows only to machines it told the server of, and which that machine's server
-  lets reach nothing of a project). So an agent can open a terminal there, clone the repository
+  combines with it, sent in `Peers`); the terminal tools, `agentz_command_run` and
+  `agentz_project_add` (`MACHINE_TOOLS`) work on any machine, relayed without a checkout
+  (`ToolCaller::Relayed(None)`, which the app allows only to machines it told the server of, and
+  which that machine's server lets reach nothing of a project). A command relayed without a
+  `folder` gets the project's checkout there, when there is one, else runs in the home folder.
+  So an agent can open a terminal there, clone the repository
   and add it; when that's the caller's repository, the answer waits up to 10 seconds for the app
   to combine them and says whether it did (`combinedWithThisProject`).
 - **Tasks on another machine** (`delegate_elsewhere`, `delegate_from_elsewhere`):

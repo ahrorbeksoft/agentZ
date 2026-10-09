@@ -4596,6 +4596,21 @@ async fn agents_set_up_a_project_on_another_machine() {
         )
         .await;
     assert_eq!(waited["matched"], json!(true));
+    // A one-off command there needs none either.
+    let there_canonical = std::fs::canonicalize(there_folder).expect("the folder there");
+    let ran = caller
+        .tool(
+            orchestrator,
+            "agentz_command_run",
+            json!({"machine": "devbox", "folder": there_folder, "command": "pwd -P; ls -d repo"}),
+        )
+        .await;
+    assert_eq!(
+        ran["output"],
+        json!(format!("{}\nrepo\n", there_canonical.display()))
+    );
+    assert_eq!(ran["exitCode"], json!(0));
+    assert_eq!(ran["machine"], json!("devbox"));
     let terminals = caller
         .tool(
             orchestrator,
@@ -4631,6 +4646,18 @@ async fn agents_set_up_a_project_on_another_machine() {
         )
         .await;
     assert_eq!(list["total"], json!(0));
+    // Commands there now run in the project's checkout by default.
+    let ran = caller
+        .tool(
+            orchestrator,
+            "agentz_command_run",
+            json!({"machine": "devbox", "command": "pwd -P"}),
+        )
+        .await;
+    assert_eq!(
+        ran["output"],
+        json!(format!("{}\n", there_canonical.join("repo").display()))
+    );
 
     // The same repository the app keeps apart is said to be, after a wait.
     let fork = caller
@@ -6814,6 +6841,89 @@ async fn agents_drive_terminals_through_tools() {
         .filter_map(|terminal| terminal["kind"].as_str())
         .collect();
     assert_eq!(kinds, ["drawer", "terminal_thread"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_run_one_off_commands() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let mut run = async |arguments: Value| {
+        client
+            .tool(thread_id, "agentz_command_run", arguments)
+            .await
+    };
+
+    // In the thread's folder, with stdout and stderr in the order they were written.
+    let ran = run(json!({"command": "pwd -P; echo oops >&2; echo done; exit 3"})).await;
+    let folder = std::fs::canonicalize(server.project_dir.path()).expect("the project's folder");
+    assert_eq!(
+        ran["output"],
+        json!(format!("{}\noops\ndone\n", folder.display()))
+    );
+    assert_eq!(ran["exitCode"], json!(3));
+    assert_eq!(ran["signal"], json!(null));
+    assert_eq!(ran["timedOut"], json!(false));
+    assert_eq!(ran["outputTruncated"], json!(false));
+    let elsewhere = tempfile::tempdir().expect("a folder");
+    let ran = run(json!({"command": "pwd -P", "folder": elsewhere.path()})).await;
+    let elsewhere_canonical = std::fs::canonicalize(elsewhere.path()).expect("the folder");
+    assert_eq!(
+        ran["output"],
+        json!(format!("{}\n", elsewhere_canonical.display()))
+    );
+
+    // Once time is up, it's stopped along with what it started.
+    let ran = run(json!({"command": "sleep 30 & echo $!; wait", "timeoutMs": 500})).await;
+    assert_eq!(ran["timedOut"], json!(true), "{ran}");
+    assert_eq!(ran["exitCode"], json!(null));
+    assert_eq!(ran["signal"], json!("SIGKILL"));
+    let sleeping: libc::pid_t = ran["output"]
+        .as_str()
+        .and_then(|output| output.trim().parse().ok())
+        .expect("the background command's pid");
+    // SAFETY: signal 0 only checks the process exists.
+    let is_alive = move || unsafe { libc::kill(sleeping, 0) == 0 };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while is_alive() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!is_alive());
+
+    // What it leaves running doesn't hold the call up.
+    let started = Instant::now();
+    let ran = run(json!({"command": "(sleep 5; echo late) & echo left"})).await;
+    assert_eq!(ran["output"], json!("left\n"));
+    assert_eq!(ran["exitCode"], json!(0));
+    assert!(started.elapsed() < Duration::from_secs(4));
+
+    // A long output keeps its end.
+    let ran = run(json!({"command": "yes 0123456789 | head -n 20000; echo end"})).await;
+    assert_eq!(ran["outputTruncated"], json!(true));
+    let output = ran["output"].as_str().expect("the output");
+    assert!(output.ends_with("0123456789\nend\n"), "{output}");
+    assert!(output.len() <= 50_000);
+
+    for arguments in [
+        json!({}),
+        json!({"command": " "}),
+        json!({"command": "true", "folder": "/no/such/folder"}),
+        json!({"command": "true", "folder": "relative"}),
+    ] {
+        assert_eq!(
+            client
+                .tool_failure(
+                    ToolCaller::Thread(thread_id),
+                    "agentz_command_run",
+                    arguments
+                )
+                .await,
+            "invalid_request"
+        );
+    }
 }
 
 impl TestClient {

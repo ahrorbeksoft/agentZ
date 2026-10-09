@@ -10,9 +10,9 @@
 //! server asks there how it's going while the app is open ([`Server::poll_remote_tasks`]), so
 //! the parent waits for it, hears of its end and cancels it as any task's.
 //!
-//! The Workspaces view's terminals and adding a project need no project, so they reach every
-//! machine the app does: an agent can clone a repository there and add it, and once the app
-//! combines it with the caller's project, the rest of the tools work there too.
+//! The Workspaces view's terminals, commands and adding a project need no project, so they
+//! reach every machine the app does: an agent can clone a repository there and add it, and
+//! once the app combines it with the caller's project, the rest of the tools work there too.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -34,7 +34,7 @@ use crate::server::ClientId;
 
 /// The tools that take `machine`, run on that machine's checkout of the project, or for
 /// [`MACHINE_TOOLS`], on the machine.
-pub(super) const RELAYED_TOOLS: [&str; 19] = [
+pub(super) const RELAYED_TOOLS: [&str; 20] = [
     "orchestrator_capabilities",
     "agentz_thread_list",
     "agentz_thread_read",
@@ -53,18 +53,20 @@ pub(super) const RELAYED_TOOLS: [&str; 19] = [
     "agentz_terminal_send",
     "agentz_terminal_read",
     "agentz_terminal_wait",
+    "agentz_command_run",
     "agentz_project_add",
 ];
 
 /// The relayed tools that also work on a machine without the caller's project: the
-/// Workspaces view's terminals, and adding a project. The project's checkout goes along when
-/// there is one, for its terminals.
-pub(super) const MACHINE_TOOLS: [&str; 6] = [
+/// Workspaces view's terminals, commands, and adding a project. The project's checkout goes
+/// along when there is one, for its terminals and as commands' folder.
+pub(super) const MACHINE_TOOLS: [&str; 7] = [
     "agentz_terminal_list",
     "agentz_terminal_start",
     "agentz_terminal_send",
     "agentz_terminal_read",
     "agentz_terminal_wait",
+    "agentz_command_run",
     "agentz_project_add",
 ];
 
@@ -245,6 +247,13 @@ impl Server {
                 .and_then(|thread| thread.agent_id.clone())
         {
             arguments.insert("agentId".into(), json!(agent_id));
+        }
+        // The other machine's server can't tell which of its checkouts the caller works in.
+        if name == "agentz_command_run"
+            && !arguments.contains_key("folder")
+            && let Some(path) = &target.path
+        {
+            arguments.insert("folder".into(), json!(path));
         }
         Some(if name == "delegate_task" {
             self.delegate_elsewhere(caller, target, arguments)
@@ -770,7 +779,8 @@ impl Server {
             .collect();
         capabilities["features"]["otherMachines"] = json!(
             "Tools that take machine run on that machine's checkout of this project. Pass machine \
-             to orchestrator_capabilities for its agents. The terminal tools and \
+             to orchestrator_capabilities for its agents. Run one-off commands there with \
+             agentz_command_run. The terminal tools, agentz_command_run and \
              agentz_project_add also work on a machine without this project: open a Workspaces \
              terminal there with agentz_terminal_start (machine and folder), clone the \
              repository, then add the clone with agentz_project_add, and the app combines it \

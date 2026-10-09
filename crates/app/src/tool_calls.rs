@@ -229,6 +229,7 @@ pub enum OwnTool {
     TerminalSend,
     TerminalRead,
     TerminalWait,
+    CommandRun,
     ProjectAdd,
 }
 
@@ -258,6 +259,7 @@ impl OwnTool {
         Self::TerminalSend,
         Self::TerminalRead,
         Self::TerminalWait,
+        Self::CommandRun,
         Self::ProjectAdd,
     ];
 
@@ -556,6 +558,11 @@ impl OwnTool {
                 terminal(),
                 None,
             ),
+            Self::CommandRun => (
+                verbs("Run", "Running", "Ran"),
+                argument("command").map(Subject::code),
+                None,
+            ),
             Self::ProjectAdd => (
                 verbs("Add a project:", "Adding a project:", "Added a project:"),
                 argument("path").map(Subject::code),
@@ -591,12 +598,12 @@ impl OwnTool {
         }
     }
 
-    /// Making a subthread, a thread or a terminal leads a folded run's summary, as commands and
-    /// edits do.
+    /// Making a subthread, a thread or a terminal, and running a command, lead a folded run's
+    /// summary, as commands and edits do.
     pub fn leads_summary(self) -> bool {
         matches!(
             self,
-            Self::DelegateTask | Self::ThreadLaunch | Self::TerminalStart
+            Self::DelegateTask | Self::ThreadLaunch | Self::TerminalStart | Self::CommandRun
         )
     }
 
@@ -636,6 +643,7 @@ impl OwnTool {
             Self::TerminalSend => counted("Typed into a terminal", "Typed into {} terminals"),
             Self::TerminalRead => counted("Read a terminal", "Read {} terminals"),
             Self::TerminalWait => counted("Waited for a terminal", "Waited for {} terminals"),
+            Self::CommandRun => counted("Ran a command", "Ran {} commands"),
             Self::ProjectAdd => counted("Added a project", "Added {} projects"),
         }
     }
@@ -1295,6 +1303,11 @@ mod tests {
                 OwnTool::ProjectAdd,
                 json!({"path": "~/src/agentZ", "machine": "devbox"}),
                 "Added a project: ~/src/agentZ",
+            ),
+            (
+                OwnTool::CommandRun,
+                json!({"command": "cargo test", "machine": "devbox"}),
+                "Ran cargo test",
             ),
             (
                 OwnTool::WorkspaceHandoff,
