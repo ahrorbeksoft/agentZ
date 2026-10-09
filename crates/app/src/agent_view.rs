@@ -551,7 +551,7 @@ impl AgentView {
             files_loading: false,
             files_changed: false,
             _files_load: Task::ready(()),
-            queue_expanded: false,
+            queue_expanded: true,
             command_menu_index: 0,
             command_menu_dismissed_for: None,
             agents_expanded: true,
@@ -2053,6 +2053,7 @@ impl AgentView {
         // sends them one at a time as each turn ends, like Zed's.
         let thread = self.thread.read(cx);
         if thread.is_working() || !thread.state.queued_messages.is_empty() {
+            self.queue_expanded = true;
             self.thread
                 .update(cx, |thread, cx| thread.queue_message(prompt, cx));
             cx.notify();
@@ -5275,6 +5276,9 @@ impl AgentView {
         };
         let prompt = PromptPart::text(text);
         let waits = thread.is_working() || !thread.state.queued_messages.is_empty();
+        if waits {
+            self.queue_expanded = true;
+        }
         self.list_state.scroll_to_end();
         self.thread.update(cx, |thread, cx| {
             if waits {
@@ -6095,6 +6099,7 @@ impl AgentView {
                     this.child(
                         v_flex()
                             .id("queued-messages")
+                            .debug_selector(|| "queued-messages".into())
                             .max_h_40()
                             .overflow_y_scroll()
                             .children(rows),
@@ -11902,7 +11907,8 @@ mod tests {
         assert!(cx.debug_bounds("login-dialog").is_none());
     }
 
-    /// A message typed while the agent works goes to the queue the server keeps.
+    /// A message typed while the agent works goes to the queue the server keeps, and the
+    /// queue opens to show it, also after the user closed it.
     #[gpui::test]
     fn messages_typed_while_the_agent_works_queue_on_the_server(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -11912,6 +11918,7 @@ mod tests {
             thread.set_entries_for_test(vec![Entry::UserMessage("Run the tests".into())], cx);
             thread.set_working_for_test(true, cx);
         });
+        view.update(cx, |view, _| view.queue_expanded = false);
         let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
         cx.update(|window, cx| window.focus(&focus, cx));
         cx.simulate_input("Then the docs");
@@ -11925,6 +11932,18 @@ mod tests {
                 .iter()
                 .any(|request| matches!(request, Request::Prompt { .. }))
         );
+        thread.update(cx, |thread, cx| {
+            thread.set_queued_messages_for_test(
+                vec![QueuedMessage {
+                    id: 1,
+                    prompt: PromptPart::text("Then the docs"),
+                }],
+                false,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("queued-messages").is_some());
     }
 
     /// The queue shows what the server keeps. Editing a message takes it out of the queue and

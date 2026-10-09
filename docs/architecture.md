@@ -587,7 +587,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   server (`Request::QueueMessage`), which saves it in `queues.json` and sends one each time a
   turn ends, so the queue outlives the app and the server. Clients show it from
   `ThreadState::queued_messages`, with Edit, Steer, Send Now (`SendQueuedMessageNow`, which
-  moves it to the front and cancels the turn) and ×, and Clear All. Its images show as
+  moves it to the front and cancels the turn) and ×, and Clear All. The list starts open, as
+  Zed's does, and opens again whenever the user queues a message. Its images show as
   thumbnails. Edit takes the message off the queue and back into the composer with its chips
   (files, folders, threads, images) as they were (`AgentView::restore_prompt`).
 - **Steer** (`server/queue_requests.rs`, `AgentThread::steer_message`, picked in
