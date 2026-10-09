@@ -287,6 +287,16 @@ backticked words turn into inline code.
 
 - Show every tool's output in a file view style, as it was printed, not as markdown.
 
+### Tell accounts apart in the sidebar's thread cards
+
+In the sidebar's thread cards ([screenshot](backlog/thread-cards-accounts.png)), nothing shows
+which account a thread's agent uses: threads with the same agent on different accounts look the
+same. It was decided to add a background in the account's color, but that isn't built yet.
+
+- Build the background in the account's color.
+- Give each new account a color when it's added (random, or something like it), so accounts
+  differ without the user picking colors.
+
 ## Bugs
 
 ### Open the message queue when a message is queued
