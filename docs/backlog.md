@@ -278,6 +278,15 @@ states. Use task_status with each taskId to read the results."
 - Find a better way to tell the agent its tasks ended. If there isn't one, hide the message
   from the user.
 
+### Tool output in a file view, not as markdown
+
+Tool output is drawn as markdown, so it doesn't look as it was printed. In a `git diff`'s output
+([screenshot](backlog/tool-output-markdown.png)), `--- a/docs/backlog.md` becomes
+"— a/docs/backlog.md", lines that start with a dash become bullets, `**…**` turns bold and
+backticked words turn into inline code.
+
+- Show every tool's output in a file view style, as it was printed, not as markdown.
+
 ## Bugs
 
 ### Open the message queue when a message is queued
