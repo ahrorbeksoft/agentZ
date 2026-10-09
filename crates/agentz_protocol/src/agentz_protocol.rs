@@ -777,7 +777,9 @@ pub struct PeerCheckout {
 pub struct RelayToolCall {
     pub relay_id: u64,
     pub machine: String,
-    pub path: PathBuf,
+    /// `None` when the project isn't there, for the tools that work without one: the
+    /// Workspaces view's terminals and adding a project.
+    pub path: Option<PathBuf>,
     pub name: String,
     pub arguments: serde_json::Value,
 }
@@ -846,9 +848,9 @@ pub enum ToolCaller {
     /// A directory inside a project, as the CLI run elsewhere knows it.
     Directory(PathBuf),
     /// A project's checkout, for a call another machine's server relayed through the app
-    /// ([`RelayToolCall`]). It runs here only: relaying it on would let two machines pass a
-    /// call back and forth forever.
-    Relayed(PathBuf),
+    /// ([`RelayToolCall`]), or no project for one that needs none. It runs here only:
+    /// relaying it on would let two machines pass a call back and forth forever.
+    Relayed(Option<PathBuf>),
 }
 
 /// A tool's answer: its result, or for a failure `{"code", "message"}` with t3code's failure

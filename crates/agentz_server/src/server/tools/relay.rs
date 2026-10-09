@@ -7,22 +7,28 @@
 //! Threads keep living on their own machine. A task delegated to another machine is an
 //! ordinary thread there, followed with `machine` on the thread tools, since its parent's
 //! lineage can't span two servers.
+//!
+//! The Workspaces view's terminals and adding a project need no project, so they reach every
+//! machine the app does: an agent can clone a repository there and add it, and once the app
+//! combines it with the caller's project, the rest of the tools work there too.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentz_protocol::{Event, PeerMachine, Peers, RelayToolCall, ServerMessage, ToolResult};
 use collections::HashMap;
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{BoxFuture, join_all};
+use projects::ProjectId;
 use serde_json::{Map, Value, json};
 
 use super::{Arguments, Caller, Continuation, Failure, Outcome, Server, Step, failure, invalid};
 use crate::server::ClientId;
 
-/// The tools that take `machine`, run on that machine's checkout of the project.
-pub(super) const RELAYED_TOOLS: [&str; 14] = [
+/// The tools that take `machine`, run on that machine's checkout of the project, or for
+/// [`MACHINE_TOOLS`], on the machine.
+pub(super) const RELAYED_TOOLS: [&str; 19] = [
     "orchestrator_capabilities",
     "agentz_thread_list",
     "agentz_thread_read",
@@ -37,7 +43,31 @@ pub(super) const RELAYED_TOOLS: [&str; 14] = [
     "delegate_task",
     "agentz_workspace_list",
     "agentz_terminal_list",
+    "agentz_terminal_start",
+    "agentz_terminal_send",
+    "agentz_terminal_read",
+    "agentz_terminal_wait",
+    "agentz_project_add",
 ];
+
+/// The relayed tools that also work on a machine without the caller's project: the
+/// Workspaces view's terminals, and adding a project. The project's checkout goes along when
+/// there is one, for its terminals.
+pub(super) const MACHINE_TOOLS: [&str; 6] = [
+    "agentz_terminal_list",
+    "agentz_terminal_start",
+    "agentz_terminal_send",
+    "agentz_terminal_read",
+    "agentz_terminal_wait",
+    "agentz_project_add",
+];
+
+/// How long adding a project on another machine waits for the app to combine it with the
+/// caller's, when it's the same repository.
+#[cfg(not(test))]
+const COMBINE_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const COMBINE_WAIT: Duration = Duration::from_secs(2);
 
 /// The list asks machines the caller didn't name, so one that doesn't answer is left out
 /// rather than holding up the rest.
@@ -75,12 +105,35 @@ pub(in crate::server) struct Relays {
     peers: Vec<(ClientId, Peers)>,
     pending: HashMap<u64, (ClientId, oneshot::Sender<ToolResult>)>,
     next_id: u64,
+    /// Told when the peers change.
+    peer_waiters: Vec<oneshot::Sender<()>>,
 }
 
 impl Relays {
     pub(in crate::server) fn set_peers(&mut self, client: ClientId, peers: Peers) {
         self.peers.retain(|(other, _)| *other != client);
         self.peers.push((client, peers));
+        for waiter in self.peer_waiters.drain(..) {
+            // The call waiting may have gone meanwhile.
+            waiter.send(()).ok();
+        }
+    }
+
+    fn peers_changed(&mut self) -> oneshot::Receiver<()> {
+        self.peer_waiters.retain(|waiter| !waiter.is_canceled());
+        let (sender, receiver) = oneshot::channel();
+        self.peer_waiters.push(sender);
+        receiver
+    }
+
+    /// The project's checkouts the app combines with it.
+    fn checkouts(&self, project_id: Option<ProjectId>) -> Option<&agentz_protocol::PeerCheckouts> {
+        let project_id = project_id?;
+        self.latest()?
+            .1
+            .checkouts
+            .iter()
+            .find(|checkouts| checkouts.project_id == project_id)
     }
 
     pub(in crate::server) fn finish(&mut self, relay_id: u64, result: ToolResult) {
@@ -110,7 +163,8 @@ impl Relays {
 struct Target {
     client: ClientId,
     machine: String,
-    path: PathBuf,
+    /// The project's checkout there; `None` for [`MACHINE_TOOLS`] on a machine without it.
+    path: Option<PathBuf>,
 }
 
 impl Server {
@@ -132,7 +186,7 @@ impl Server {
         if !RELAYED_TOOLS.contains(&name) {
             return Some(Err(invalid(format!("{name} only works on this machine."))));
         }
-        let target = match self.relay_target(caller, machine) {
+        let target = match self.relay_target(caller, machine, !MACHINE_TOOLS.contains(&name)) {
             Ok(target) => target,
             Err(failure) => return Some(Err(failure)),
         };
@@ -150,6 +204,8 @@ impl Server {
         }
         Some(if name == "delegate_task" {
             self.delegate_elsewhere(target, arguments)
+        } else if name == "agentz_project_add" {
+            Ok(self.add_project_elsewhere(caller, target, arguments))
         } else {
             Ok(Step::Background(self.relay(
                 target,
@@ -159,7 +215,14 @@ impl Server {
         })
     }
 
-    fn relay_target(&self, caller: Caller, machine: &str) -> Result<Target, Failure> {
+    /// The machine the call names, and the caller's project's checkout there, which only
+    /// `needs_project` calls must have.
+    fn relay_target(
+        &self,
+        caller: Caller,
+        machine: &str,
+        needs_project: bool,
+    ) -> Result<Target, Failure> {
         let Some((client, peers)) = self.relays.latest() else {
             return Err(failure(
                 "machine_unavailable",
@@ -185,27 +248,27 @@ impl Server {
                 format!("{} isn't connected.", known.name),
             ));
         }
-        let path = peers
-            .checkouts
-            .iter()
-            .find(|checkouts| checkouts.project_id == caller.project_id)
+        let path = self
+            .relays
+            .checkouts(caller.project_id)
             .and_then(|checkouts| {
                 checkouts
                     .checkouts
                     .iter()
                     .find(|checkout| checkout.machine.eq_ignore_ascii_case(&known.name))
             })
-            .map(|checkout| checkout.path.clone())
-            .ok_or_else(|| {
-                failure(
-                    "capability_denied",
-                    format!(
-                        "This project isn't on {}. Add its repository there as a project in \
-                         agentZ first.",
-                        known.name
-                    ),
-                )
-            })?;
+            .map(|checkout| checkout.path.clone());
+        if path.is_none() && needs_project {
+            return Err(failure(
+                "capability_denied",
+                format!(
+                    "This project isn't on {}. Clone its repository there in a Workspaces \
+                     terminal (agentz_terminal_start with machine and folder) and add it with \
+                     agentz_project_add first.",
+                    known.name
+                ),
+            ));
+        }
         Ok(Target {
             client,
             machine: known.name.clone(),
@@ -323,6 +386,70 @@ impl Server {
         ))
     }
 
+    /// A project added on another machine, and whether the app combined it with the caller's,
+    /// which takes a moment: the app hears of the project, then tells this server.
+    fn add_project_elsewhere(
+        &mut self,
+        caller: Caller,
+        target: Target,
+        arguments: Map<String, Value>,
+    ) -> Step {
+        let machine = target.machine.clone();
+        let added = self.relay(target, "agentz_project_add", Value::Object(arguments));
+        let repository = caller
+            .project_id
+            .and_then(|project_id| self.projects.project(project_id))
+            .and_then(|project| project.repository.as_ref())
+            .map(|repository| repository.canonical_key.clone());
+        Step::Then(
+            async move {
+                let added = added.await;
+                Box::new(move |server: &mut Server| {
+                    let added = added?;
+                    let same_repository = repository.is_some()
+                        && added["repository"].as_str() == repository.as_deref();
+                    if !same_repository {
+                        return Ok(Step::Done(combined(added, false, false)));
+                    }
+                    server.until_combined(caller, machine, added, Instant::now() + COMBINE_WAIT)
+                }) as Continuation
+            }
+            .boxed(),
+        )
+    }
+
+    fn until_combined(
+        &mut self,
+        caller: Caller,
+        machine: String,
+        added: Value,
+        deadline: Instant,
+    ) -> Outcome {
+        let path = added["path"].as_str().map(PathBuf::from);
+        let is_combined = self
+            .relays
+            .checkouts(caller.project_id)
+            .zip(path)
+            .is_some_and(|(checkouts, path)| {
+                checkouts.checkouts.iter().any(|checkout| {
+                    checkout.machine.eq_ignore_ascii_case(&machine) && checkout.path == path
+                })
+            });
+        if is_combined || Instant::now() >= deadline {
+            return Ok(Step::Done(combined(added, true, is_combined)));
+        }
+        let changed = self.relays.peers_changed();
+        Ok(Step::Then(
+            async move {
+                tokio::time::timeout_at(deadline.into(), changed).await.ok();
+                Box::new(move |server: &mut Server| {
+                    server.until_combined(caller, machine, added, deadline)
+                }) as Continuation
+            }
+            .boxed(),
+        ))
+    }
+
     /// The list from this machine, with the threads of the project's checkouts on the others
     /// when it's the first page. Each thread names its machine.
     pub(super) fn list_everywhere(
@@ -345,13 +472,7 @@ impl Server {
         let is_first_page = arguments.0.get("cursor").is_none_or(|cursor| cursor == 0);
         let others: Vec<String> = self
             .relays
-            .latest()
-            .and_then(|(_, peers)| {
-                peers
-                    .checkouts
-                    .iter()
-                    .find(|checkouts| checkouts.project_id == caller.project_id)
-            })
+            .checkouts(caller.project_id)
             .map(|checkouts| {
                 let mut machines: Vec<String> = Vec::new();
                 for checkout in &checkouts.checkouts {
@@ -374,7 +495,7 @@ impl Server {
             .clamp(1, 100) as usize;
         let mut lists = Vec::new();
         for machine in others {
-            let list = match self.relay_target(caller, &machine) {
+            let list = match self.relay_target(caller, &machine, true) {
                 Ok(target) => self.relay(
                     target,
                     "agentz_thread_list",
@@ -435,10 +556,7 @@ impl Server {
         let Some((_, peers)) = self.relays.latest() else {
             return;
         };
-        let checkouts = peers
-            .checkouts
-            .iter()
-            .find(|checkouts| checkouts.project_id == caller.project_id);
+        let checkouts = self.relays.checkouts(caller.project_id);
         capabilities["machine"]["name"] = json!(peers.this_machine);
         capabilities["otherMachines"] = peers
             .machines
@@ -459,9 +577,30 @@ impl Server {
             .collect();
         capabilities["features"]["otherMachines"] = json!(
             "Tools that take machine run on that machine's checkout of this project. Pass machine \
-             to orchestrator_capabilities for its agents."
+             to orchestrator_capabilities for its agents. The terminal tools and \
+             agentz_project_add also work on a machine without this project: open a Workspaces \
+             terminal there with agentz_terminal_start (machine and folder), clone the \
+             repository, then add the clone with agentz_project_add, and the app combines it \
+             with this project."
         );
     }
+}
+
+/// Says whether a project added on another machine joined the caller's.
+fn combined(mut added: Value, same_repository: bool, is_combined: bool) -> Value {
+    added["combinedWithThisProject"] = json!(is_combined);
+    added["note"] = json!(match (same_repository, is_combined) {
+        (_, true) => {
+            "The app combined it with this project, so the tools that take machine now work in \
+             this checkout."
+        }
+        (true, false) => {
+            "It has this project's repository, but the app hasn't combined them: its project \
+             grouping settings may keep them apart."
+        }
+        (false, false) => "It isn't this project's repository, so it's a project of its own.",
+    });
+    added
 }
 
 /// Names the machine on the result and on each thread in it.

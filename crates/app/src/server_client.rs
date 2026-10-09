@@ -353,14 +353,16 @@ impl ServerClient {
         self.peers_sent = Some(peers);
     }
 
-    /// The server was told of this checkout, so its agents may work there.
-    pub(crate) fn may_relay_to(&self, machine: &str, path: &std::path::Path) -> bool {
-        self.peers_sent.as_ref().is_some_and(|peers| {
-            peers
+    /// The server was told of this checkout, so its agents may work there. Without one, the
+    /// call reaches only what needs no project there, which that machine's server enforces.
+    pub(crate) fn may_relay_to(&self, machine: &str, path: Option<&std::path::Path>) -> bool {
+        self.peers_sent.as_ref().is_some_and(|peers| match path {
+            Some(path) => peers
                 .checkouts
                 .iter()
                 .flat_map(|checkouts| &checkouts.checkouts)
-                .any(|checkout| checkout.machine == machine && checkout.path == path)
+                .any(|checkout| checkout.machine == machine && checkout.path == path),
+            None => peers.machines.iter().any(|known| known.name == machine),
         })
     }
 

@@ -158,6 +158,7 @@ pub enum OwnTool {
     TerminalSend,
     TerminalRead,
     TerminalWait,
+    ProjectAdd,
 }
 
 impl OwnTool {
@@ -186,6 +187,7 @@ impl OwnTool {
         Self::TerminalSend,
         Self::TerminalRead,
         Self::TerminalWait,
+        Self::ProjectAdd,
     ];
 
     pub fn named(name: &str) -> Option<Self> {
@@ -229,6 +231,11 @@ impl OwnTool {
                 Ok(title) => Subject::title(title),
                 Err(words) => Subject::plain(words),
             })
+        };
+        // A Workspaces pane, by `paneId`, is no thread's.
+        let terminal = || match arguments.get("paneId").filter(|pane| !pane.is_null()) {
+            Some(_) => Some(Subject::plain("a terminal")),
+            None => thread("threadId", "a terminal", "this thread's terminal"),
         };
         let opened = |key: &str| {
             output
@@ -462,22 +469,25 @@ impl OwnTool {
                     "Starting a terminal:",
                     "Started a terminal:",
                 ),
-                argument("command").map(Subject::code),
+                argument("command")
+                    .or_else(|| argument("folder"))
+                    .map(Subject::code),
                 opened("threadId"),
             ),
             Self::TerminalSend => (
                 verbs("Type into", "Typing into", "Typed into"),
-                thread("threadId", "a terminal", "this thread's terminal"),
+                terminal(),
                 None,
             ),
-            Self::TerminalRead => (
-                verbs("Read", "Reading", "Read"),
-                thread("threadId", "a terminal", "this thread's terminal"),
-                None,
-            ),
+            Self::TerminalRead => (verbs("Read", "Reading", "Read"), terminal(), None),
             Self::TerminalWait => (
                 verbs("Wait for", "Waiting for", "Waited for"),
-                thread("threadId", "a terminal", "this thread's terminal"),
+                terminal(),
+                None,
+            ),
+            Self::ProjectAdd => (
+                verbs("Add a project:", "Adding a project:", "Added a project:"),
+                argument("path").map(Subject::code),
                 None,
             ),
         };
@@ -555,6 +565,7 @@ impl OwnTool {
             Self::TerminalSend => counted("Typed into a terminal", "Typed into {} terminals"),
             Self::TerminalRead => counted("Read a terminal", "Read {} terminals"),
             Self::TerminalWait => counted("Waited for a terminal", "Waited for {} terminals"),
+            Self::ProjectAdd => counted("Added a project", "Added {} projects"),
         }
     }
 
@@ -1195,6 +1206,21 @@ mod tests {
                 OwnTool::TerminalSend,
                 json!({"text": "q"}),
                 "Typed into this thread's terminal",
+            ),
+            (
+                OwnTool::TerminalRead,
+                json!({"paneId": 3, "machine": "devbox"}),
+                "Read a terminal",
+            ),
+            (
+                OwnTool::TerminalStart,
+                json!({"folder": "~/src", "machine": "devbox"}),
+                "Started a terminal: ~/src",
+            ),
+            (
+                OwnTool::ProjectAdd,
+                json!({"path": "~/src/agentZ", "machine": "devbox"}),
+                "Added a project: ~/src/agentZ",
             ),
             (
                 OwnTool::WorkspaceHandoff,

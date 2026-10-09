@@ -4358,11 +4358,229 @@ async fn agents_work_on_other_machines_through_the_app() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_set_up_a_project_on_another_machine() {
+    let (Some(here), Some(there)) = (TestServer::start(), TestServer::start()) else {
+        return;
+    };
+    const REMOTE: &str = "https://github.com/team/repo.git";
+    let folder = here.project_dir.path();
+    git(folder, &["init", "--quiet"]).await;
+    git(folder, &["remote", "add", "origin", REMOTE]).await;
+    let mut caller = here.connect().await;
+    let Response::Session(session) = caller.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    caller.projects = Some(session.projects);
+    let project_id = caller.add_project(folder).await;
+    caller
+        .wait_until(|client| {
+            client.projects.as_ref().is_some_and(|projects| {
+                projects
+                    .projects
+                    .iter()
+                    .any(|project| project.id == project_id && project.repository.is_some())
+            })
+        })
+        .await;
+    let orchestrator = caller.create_thread_in(project_id).await;
+
+    // The app knows both machines, and the project is only here.
+    let here_peers = move |checkouts: Vec<PeerCheckout>| Peers {
+        this_machine: "mac".into(),
+        machines: vec![PeerMachine {
+            name: "devbox".into(),
+            online: true,
+        }],
+        checkouts: vec![PeerCheckouts {
+            project_id,
+            checkouts,
+        }],
+    };
+    let mut app_here = here.connect().await;
+    app_here.ok(Request::SetPeers(here_peers(Vec::new()))).await;
+    let mut app_there = there.connect().await;
+    app_there
+        .ok(Request::SetPeers(Peers {
+            this_machine: "devbox".into(),
+            machines: vec![PeerMachine {
+                name: "mac".into(),
+                online: true,
+            }],
+            checkouts: Vec::new(),
+        }))
+        .await;
+    // The app combines the clone at `repo` once it's added; the one at `fork` its grouping
+    // keeps apart.
+    let relay = relay_as_the_app_then(
+        app_here,
+        there.connect().await,
+        "devbox",
+        move |name, result| {
+            let path = result.value["path"].as_str()?;
+            (name == "agentz_project_add" && path.ends_with("/repo")).then(|| {
+                here_peers(vec![PeerCheckout {
+                    machine: "devbox".into(),
+                    path: path.into(),
+                }])
+            })
+        },
+    );
+
+    let capabilities = caller
+        .tool(orchestrator, "orchestrator_capabilities", json!({}))
+        .await;
+    assert_eq!(
+        capabilities["otherMachines"][0]["hasThisProject"],
+        json!(false)
+    );
+    let code = caller
+        .tool_failure(
+            ToolCaller::Thread(orchestrator),
+            "agentz_thread_list",
+            json!({"machine": "devbox"}),
+        )
+        .await;
+    assert_eq!(code, "capability_denied");
+    // The other machine's server holds a call without a project to what needs none.
+    let mut client_there = there.connect().await;
+    let result = client_there
+        .call_tool(ToolCaller::Relayed(None), "agentz_thread_list", json!({}))
+        .await;
+    assert!(result.is_error);
+    assert_eq!(result.value["code"], json!("capability_denied"));
+
+    // A Workspaces terminal there needs no project: the agent makes the repository in it.
+    let there_folder = there.project_dir.path();
+    let pane = caller
+        .tool(
+            orchestrator,
+            "agentz_terminal_start",
+            json!({"machine": "devbox", "folder": there_folder}),
+        )
+        .await;
+    assert_eq!(pane["kind"], json!("pane"));
+    assert_eq!(pane["machine"], json!("devbox"));
+    let pane_id = pane["paneId"].clone();
+    caller
+        .tool(
+            orchestrator,
+            "agentz_terminal_send",
+            json!({
+                "machine": "devbox",
+                "paneId": pane_id,
+                "text": format!(
+                    "for d in repo fork; do git init -q $d && git -C $d remote add origin {REMOTE}; \
+                     done; mkdir notes; echo made-$((40+2))"
+                ),
+                "submit": true,
+            }),
+        )
+        .await;
+    let waited = caller
+        .tool(
+            orchestrator,
+            "agentz_terminal_wait",
+            json!({"machine": "devbox", "paneId": pane_id, "match": "made-42"}),
+        )
+        .await;
+    assert_eq!(waited["matched"], json!(true));
+    let terminals = caller
+        .tool(
+            orchestrator,
+            "agentz_terminal_list",
+            json!({"machine": "devbox"}),
+        )
+        .await;
+    assert!(
+        terminals["terminals"]
+            .as_array()
+            .expect("terminals")
+            .iter()
+            .any(|terminal| terminal["paneId"] == pane_id)
+    );
+
+    // Added there, the clone is combined with this project, and the thread tools reach it.
+    let added = caller
+        .tool(
+            orchestrator,
+            "agentz_project_add",
+            json!({"machine": "devbox", "path": there_folder.join("repo")}),
+        )
+        .await;
+    assert_eq!(added["repository"], json!("github.com/team/repo"));
+    assert_eq!(added["machine"], json!("devbox"));
+    assert_eq!(added["alreadyAdded"], json!(false));
+    assert_eq!(added["combinedWithThisProject"], json!(true));
+    let list = caller
+        .tool(
+            orchestrator,
+            "agentz_thread_list",
+            json!({"machine": "devbox"}),
+        )
+        .await;
+    assert_eq!(list["total"], json!(0));
+
+    // The same repository the app keeps apart is said to be, after a wait.
+    let fork = caller
+        .tool(
+            orchestrator,
+            "agentz_project_add",
+            json!({"machine": "devbox", "path": there_folder.join("fork")}),
+        )
+        .await;
+    assert_eq!(fork["repository"], json!("github.com/team/repo"));
+    assert_eq!(fork["combinedWithThisProject"], json!(false));
+    assert!(
+        fork["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("grouping"))
+    );
+    let notes = caller
+        .tool(
+            orchestrator,
+            "agentz_project_add",
+            json!({"machine": "devbox", "path": there_folder.join("notes")}),
+        )
+        .await;
+    assert_eq!(notes["repository"], json!(null));
+    assert_eq!(notes["combinedWithThisProject"], json!(false));
+
+    // Here, adding the project again finds it, and only folders count.
+    let again = caller
+        .tool(orchestrator, "agentz_project_add", json!({"path": folder}))
+        .await;
+    assert_eq!(again["projectId"], json!(project_id.0));
+    assert_eq!(again["alreadyAdded"], json!(true));
+    for path in ["relative/path", "/no/such/folder"] {
+        let code = caller
+            .tool_failure(
+                ToolCaller::Thread(orchestrator),
+                "agentz_project_add",
+                json!({"path": path}),
+            )
+            .await;
+        assert_eq!(code, "invalid_request");
+    }
+    relay.abort();
+}
+
 /// Runs the calls the server behind `app` relays on `target`'s server, as the app does.
 fn relay_as_the_app(
+    app: TestClient,
+    target: TestClient,
+    machine: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    relay_as_the_app_then(app, target, machine, |_, _| None)
+}
+
+/// [`relay_as_the_app`], telling the server the peers `after` gives once a call is answered,
+/// as the app does when a call there changed its projects.
+fn relay_as_the_app_then(
     mut app: TestClient,
     mut target: TestClient,
     machine: &'static str,
+    mut after: impl FnMut(&str, &ToolResult) -> Option<Peers> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -4373,11 +4591,15 @@ fn relay_as_the_app(
             let result = target
                 .call_tool(ToolCaller::Relayed(call.path), &call.name, call.arguments)
                 .await;
+            let peers = after(&call.name, &result);
             app.ok(Request::RelayToolResult {
                 relay_id: call.relay_id,
                 result,
             })
             .await;
+            if let Some(peers) = peers {
+                app.ok(Request::SetPeers(peers)).await;
+            }
         }
     })
 }

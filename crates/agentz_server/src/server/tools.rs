@@ -14,6 +14,7 @@
 //! stay with the user. Mutations take an optional `clientRequestId`, so a retry returns the
 //! first answer instead of doing the work again.
 
+mod project_tools;
 mod relay;
 mod terminals;
 mod workspaces;
@@ -104,13 +105,25 @@ impl ToolResults {
 /// outside a thread or from another machine.
 #[derive(Clone, Copy, Debug)]
 struct Caller {
-    project_id: ProjectId,
+    /// `None` for a call relayed from another machine whose project isn't here, which reaches
+    /// only what needs no project: the Workspaces view's terminals, and adding a project.
+    project_id: Option<ProjectId>,
     thread_id: Option<ThreadId>,
     /// Relayed from another machine ([`ToolCaller::Relayed`]), so it isn't relayed again.
     relayed: bool,
 }
 
 impl Caller {
+    fn project(self) -> Result<ProjectId, Failure> {
+        self.project_id.ok_or_else(|| {
+            failure(
+                "capability_denied",
+                "The calling thread's project isn't on this machine. Add its repository here as \
+                 a project in agentZ first.",
+            )
+        })
+    }
+
     fn creator(self) -> ThreadCreator {
         match self.thread_id {
             Some(thread_id) => ThreadCreator::Thread(thread_id),
@@ -483,7 +496,14 @@ impl Server {
                 )
             })?,
             ToolCaller::Thread(thread_id) => *thread_id,
-            ToolCaller::Directory(path) | ToolCaller::Relayed(path) => {
+            ToolCaller::Relayed(None) => {
+                return Ok(Caller {
+                    project_id: None,
+                    thread_id: None,
+                    relayed: true,
+                });
+            }
+            ToolCaller::Directory(path) | ToolCaller::Relayed(Some(path)) => {
                 let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                 // A project's worktrees and pastures count as part of it.
                 let (project_id, _) = self
@@ -508,7 +528,7 @@ impl Server {
                         )
                     })?;
                 return Ok(Caller {
-                    project_id,
+                    project_id: Some(project_id),
                     thread_id: None,
                     relayed: matches!(caller, ToolCaller::Relayed(_)),
                 });
@@ -521,7 +541,7 @@ impl Server {
             )
         })?;
         Ok(Caller {
-            project_id: thread.project_id,
+            project_id: Some(thread.project_id),
             thread_id: Some(thread_id),
             relayed: false,
         })
@@ -547,8 +567,8 @@ impl Server {
         }
         let request_key = arguments.string("clientRequestId", 256)?.map(|request_id| {
             format!(
-                "{}:{:?}:{name}:{request_id}",
-                caller.project_id.0,
+                "{:?}:{:?}:{name}:{request_id}",
+                caller.project_id.map(|project_id| project_id.0),
                 caller.thread_id.map(|thread_id| thread_id.0)
             )
         });
@@ -603,6 +623,7 @@ impl Server {
             "agentz_terminal_send" => self.terminal_send(caller, &arguments),
             "agentz_terminal_read" => self.terminal_read(caller, &arguments),
             "agentz_terminal_wait" => self.terminal_wait(caller, &arguments, timed_out),
+            "agentz_project_add" => self.project_add(&arguments),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
         Ok(match (request_key, step) {
@@ -629,23 +650,23 @@ impl Server {
     }
 
     fn capabilities(&mut self, caller: Caller) -> Outcome {
+        let caller_project = caller.project()?;
         // A thread started in a workspace pane belongs to no project, and works in its folder.
-        let (project_id, project_name, project_path) =
-            match self.projects.project(caller.project_id) {
-                Some(project) => (
-                    Some(project.id.0),
-                    Some(project.name().to_string()),
-                    project.path.clone(),
-                ),
-                None if caller.project_id == ProjectId::WORKSPACES => {
-                    let folder = caller
-                        .thread_id
-                        .and_then(|thread_id| self.projects.thread_folder(thread_id))
-                        .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
-                    (None, None, folder)
-                }
-                None => return Err(failure("orchestration_error", "The project was removed.")),
-            };
+        let (project_id, project_name, project_path) = match self.projects.project(caller_project) {
+            Some(project) => (
+                Some(project.id.0),
+                Some(project.name().to_string()),
+                project.path.clone(),
+            ),
+            None if caller_project == ProjectId::WORKSPACES => {
+                let folder = caller
+                    .thread_id
+                    .and_then(|thread_id| self.projects.thread_folder(thread_id))
+                    .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+                (None, None, folder)
+            }
+            None => return Err(failure("orchestration_error", "The project was removed.")),
+        };
         let caller_thread = caller
             .thread_id
             .and_then(|thread_id| self.projects.thread(thread_id));
@@ -719,6 +740,7 @@ impl Server {
     }
 
     fn thread_list(&self, caller: Caller, arguments: &Arguments) -> Outcome {
+        let project_id = caller.project()?;
         let statuses = match arguments.array("statuses")? {
             Some(statuses) => Some(
                 statuses
@@ -746,7 +768,7 @@ impl Server {
             .projects
             .threads()
             .iter()
-            .filter(|thread| thread.project_id == caller.project_id && thread.task.is_none())
+            .filter(|thread| thread.project_id == project_id && thread.task.is_none())
             .filter(|thread| thread.archived_at.is_some() == archived)
             .filter(|thread| {
                 title_contains
@@ -769,7 +791,7 @@ impl Server {
             .collect();
         let next_cursor = (cursor + page.len() < total).then_some(cursor + page.len());
         Ok(Step::Done(json!({
-            "projectId": caller.project_id.0,
+            "projectId": project_id.0,
             "currentThreadId": caller.thread_id.map(|thread_id| thread_id.0),
             "threads": page,
             "nextCursor": next_cursor,
@@ -914,6 +936,7 @@ impl Server {
         arguments: &Arguments,
         prompt_key: &str,
     ) -> Result<LaunchSpec, Failure> {
+        caller.project()?;
         let prompt = arguments
             .string(prompt_key, MAX_PROMPT_CHARS)?
             .map(String::from);
@@ -1072,18 +1095,20 @@ impl Server {
     }
 
     fn launch(&mut self, caller: Caller, spec: LaunchSpec, folder: Folder) -> Value {
-        let Some(thread_id) = self.projects.add_thread(
-            caller.project_id,
-            projects::NEW_THREAD_TITLE,
-            Some(spec.agent_id.0.to_string()),
-        ) else {
+        let Some(thread_id) = caller.project_id.and_then(|project_id| {
+            self.projects.add_thread(
+                project_id,
+                projects::NEW_THREAD_TITLE,
+                Some(spec.agent_id.0.to_string()),
+            )
+        }) else {
             return json!({"error": "The project was removed."});
         };
         // A launched thread doesn't inherit the caller's workspace, as in t3code. Outside every
         // project there's no checkout to start in, so it works where the caller does.
         let folder = match folder {
             Folder::Chosen(folder) => Some(folder),
-            Folder::Default if caller.project_id == ProjectId::WORKSPACES => Some(
+            Folder::Default if caller.project_id == Some(ProjectId::WORKSPACES) => Some(
                 caller
                     .thread_id
                     .and_then(|thread_id| self.projects.thread_folder(thread_id)),
@@ -1669,10 +1694,11 @@ impl Server {
 
     /// A thread the caller may manage: one in its project.
     fn target(&self, caller: Caller, thread_id: Option<ThreadId>) -> Result<ThreadId, Failure> {
+        let project_id = caller.project()?;
         let thread_id = thread_id.ok_or_else(|| invalid("threadId is required."))?;
         // Threads of other projects are reported as missing, so they can't be probed for.
         match self.projects.thread(thread_id) {
-            Some(thread) if thread.project_id == caller.project_id => Ok(thread_id),
+            Some(thread) if thread.project_id == project_id => Ok(thread_id),
             _ => Err(failure(
                 "thread_not_found",
                 format!("There is no thread {} in this project.", thread_id.0),
@@ -2305,18 +2331,28 @@ pub(super) fn definitions() -> Value {
     ]);
     if let Value::Array(tools) = &mut tools {
         tools.extend(terminals::definitions());
+        tools.extend(project_tools::definitions());
         let machine = json!({
             "type": "string",
             "maxLength": 256,
             "description": "Another machine with this project, by its name in orchestrator_capabilities' otherMachines. Thread ids are per machine, so pass it again for that machine's threads. Omit for this machine.",
         });
+        let any_machine = json!({
+            "type": "string",
+            "maxLength": 256,
+            "description": "Another machine, by its name in orchestrator_capabilities' otherMachines, with this project or not. Thread, pane and workspace ids are per machine, so pass it again for that machine's. Omit for this machine.",
+        });
         for tool in tools {
-            let is_relayed = tool["name"]
-                .as_str()
-                .is_some_and(|name| relay::RELAYED_TOOLS.contains(&name));
-            if is_relayed
-                && let Some(properties) = tool["inputSchema"]["properties"].as_object_mut()
-            {
+            let name = tool["name"].as_str().unwrap_or_default().to_string();
+            if !relay::RELAYED_TOOLS.contains(&name.as_str()) {
+                continue;
+            }
+            if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+                let machine = if relay::MACHINE_TOOLS.contains(&name.as_str()) {
+                    &any_machine
+                } else {
+                    &machine
+                };
                 properties.insert("machine".into(), machine.clone());
             }
         }

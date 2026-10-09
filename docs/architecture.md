@@ -1069,16 +1069,27 @@ for `t3_`.
 - **Tools** (`server/tools.rs`): `orchestrator_capabilities`, `agentz_thread_list`/`_read`/
   `_launch`/`_send`/`_wait`/`_interrupt`/`_update`/`_organize`/`_diff`, `create_threads`,
   `delegate_task`, `task_status`, `task_cancel`; workspace tools (`tools/workspaces.rs`); terminal
-  tools after herdr's `pane` commands (`tools/terminals.rs`).
+  tools after herdr's `pane` commands (`tools/terminals.rs`), which also reach the Workspaces
+  view's panes (`paneId`; `agentz_terminal_start` with `folder`, `workspaceId` or `paneId` opens
+  a workspace, a tab or a split); `agentz_project_add` (`tools/project_tools.rs`), the app's
+  Add Project, which looks the repository up before answering.
 - **Policy**: the caller's project only; no broader permissions than the caller; agents can't
   delete threads or answer permissions; `clientRequestId` idempotency; agent-created threads and
-  messages are marked `createdBy: agent` and shown as such.
+  messages are marked `createdBy: agent` and shown as such. The Workspaces view's panes belong
+  to no project, so any thread may list, open and type into them, as the user can, and add a
+  project, which runs nothing; removing projects and closing panes stay with the user.
 - **Across machines** (`tools/relay.rs`): calls naming another machine go through the app, which
   reaches every machine, so they work only while the app is open. The app runs them there as
   `ToolCaller::Relayed`, which never relays again: `agentz_thread_list`'s first page asks every
   machine with the project on its own, and a relayed list asking back made the two machines pass
   it back and forth forever. The list leaves out a machine that doesn't answer in 10 seconds,
-  with its error under `machines`.
+  with its error under `machines`. Thread tools need the project there (a checkout the app
+  combines with it, sent in `Peers`); the terminal tools and `agentz_project_add`
+  (`MACHINE_TOOLS`) work on any machine, relayed without a checkout (`ToolCaller::Relayed(None)`,
+  which the app allows only to machines it told the server of, and which that machine's server
+  lets reach nothing of a project). So an agent can open a terminal there, clone the repository
+  and add it; when that's the caller's repository, the answer waits up to 10 seconds for the app
+  to combine them and says whether it did (`combinedWithThisProject`).
 
 ### Subthreads
 

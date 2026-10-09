@@ -411,7 +411,11 @@ impl Machines {
             .cloned();
         let response = match target {
             // Only to checkouts the server was told of, whatever it asks.
-            Some(target) if source.read(cx).may_relay_to(&call.machine, &call.path) => {
+            Some(target)
+                if source
+                    .read(cx)
+                    .may_relay_to(&call.machine, call.path.as_deref()) =>
+            {
                 target.read(cx).request(Request::CallTool {
                     caller: ToolCaller::Relayed(call.path),
                     name: call.name,

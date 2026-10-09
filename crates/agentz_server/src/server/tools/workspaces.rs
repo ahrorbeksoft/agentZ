@@ -115,7 +115,7 @@ impl Server {
             preparing.push(match placement {
                 Placement::Default => Preparing::Ready(Folder::Default),
                 Placement::Choice(choice) => match self
-                    .prepare_workspace(caller.project_id, choice)
+                    .prepare_workspace(caller.project()?, choice)
                     .map_err(|error| invalid(format!("{error:#}")))?
                 {
                     PreparedWorkspace::Ready(folder) => Preparing::Ready(Folder::Chosen(folder)),
@@ -136,7 +136,7 @@ impl Server {
                 .collect();
             return then(self, folders);
         }
-        let project_id = caller.project_id;
+        let project_id = caller.project()?;
         Ok(Step::Then(
             async move {
                 let made =
@@ -180,7 +180,7 @@ impl Server {
             .thread_folder(thread_id)
             .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
         // A thread started in a workspace pane has no project, so no root.
-        let root = match caller.project_id {
+        let root = match caller.project()? {
             ProjectId::WORKSPACES => None,
             project_id => Some(self.caller_project_path(project_id)?),
         };
@@ -209,11 +209,11 @@ impl Server {
             .number("limit")?
             .unwrap_or(DEFAULT_BRANCH_LIMIT)
             .clamp(1, 1_000) as usize;
-        let root = self.caller_project_path(caller.project_id)?;
+        let root = self.caller_project_path(caller.project()?)?;
         let data_dir = self.data_dir.clone();
         let workspaces: Vec<(Workspace, Vec<ThreadId>)> = self
             .projects
-            .project(caller.project_id)
+            .project(caller.project()?)
             .map(|project| {
                 project
                     .workspaces
@@ -332,7 +332,7 @@ impl Server {
         let continuation = arguments
             .string("continuationPrompt", MAX_PROMPT_CHARS)?
             .map(String::from);
-        let project_id = caller.project_id;
+        let project_id = caller.project()?;
         self.with_folders(caller, vec![Placement::Choice(choice)], move |server, folders| {
             let Some(Folder::Chosen(Some(path))) = folders.into_iter().next() else {
                 return Err(failure("operation_failed", "No workspace was made."));
@@ -374,7 +374,7 @@ impl Server {
             }
         };
         let work = self
-            .sync_workspace(caller.project_id, &path, branch, merge)
+            .sync_workspace(caller.project()?, &path, branch, merge)
             .map_err(|error| invalid(format!("{error:#}")))?;
         Ok(message_in_background(work))
     }
@@ -385,7 +385,7 @@ impl Server {
             .string("branch", MAX_BRANCH_CHARS)?
             .map(String::from);
         let work = self
-            .bring_back_workspace(caller.project_id, &path, branch)
+            .bring_back_workspace(caller.project()?, &path, branch)
             .map_err(|error| invalid(format!("{error:#}")))?;
         Ok(message_in_background(work))
     }
