@@ -5868,6 +5868,16 @@ async fn threads_work_in_worktrees_and_pastures() {
             .is_err()
     );
 
+    // The task's end is told to its parent in a turn of the parent's, in the worktree.
+    client
+        .wait_until(|client| {
+            client
+                .projects
+                .as_ref()
+                .is_some_and(|projects| projects.working_threads.is_empty())
+        })
+        .await;
+
     // Removing asks first when work would be lost.
     let Response::WorkspaceRemoval(removal) = client
         .ok(Request::RemoveWorkspace {
