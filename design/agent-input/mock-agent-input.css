@@ -1,0 +1,5 @@
+/* This round's mock pieces, on top of board/mock.css. Scoped to .m like it. */
+.m ol li, .m ul li { margin: 1px 0; }
+.m .qfade { position: relative; max-height: 150px; overflow: hidden; }
+.m .qfade::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 56px; background: linear-gradient(180deg, rgba(43,45,48,0), #2b2d30); }
+.m .qring { box-shadow: 0 0 0 2px rgba(53,116,240,.55); }

@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="mock-artifacts.css">
+<style>body{background:#111;margin:0;padding:12px;font:13px sans-serif;color:#ddd} .o{margin:0 0 18px} .k{margin:0 0 6px;color:#f5d76e}</style>
+</head><body>
+<script src="../board/mock.js"></script>
+<script>const TOPICS = [];</script>
+<script src="mock-artifacts.js"></script>
+<script src="topics-artifacts.js"></script>
+<script>
+const [id, only] = location.hash.slice(1).split(':');
+const topic = TOPICS.find((t) => t.id === id);
+document.body.innerHTML = topic.options.filter((o) => !only || only.includes(o.key)).map((o) => `<div class="o"><div class="k">${o.key}. ${o.name}</div>${o.mock()}</div>`).join('');
+</script>
+</body></html>

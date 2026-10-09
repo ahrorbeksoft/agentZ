@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project Copies Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="project-copies" data-title="Project copies">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Project copies <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>From the backlog: “When the same project exists on several machines, show it as one project, not one per machine. Learn how t3code does it first and follow that. Add some way to see whether the copies on each machine are in sync (and how they differ if they aren’t).”</p>
+<p>Most of the first half is built already, the way t3code does it: copies with the same primary remote are one project in the project switcher, the title bar, New Thread, the sidebar’s filter and Settings (the settings-projects round). What’s left there is one topic, the project’s name. t3code has nothing for the second half (it lists each machine’s checkout in project settings, but never compares them), so those topics borrow from agentZ’s Workspaces git popover and t3code’s git status.</p>
+<p>The mocks use the user’s machines and projects: <b>agentZ</b> (This Mac has 3 uncommitted files, Devbox 1 is a commit behind), <b>ielts-today</b> (in sync on This Mac and Ahrorbek’s Laptop) and <b>fluency.uz</b> on all three, which differ most: Devbox 1 is on <b>payments</b> with 3 commits not pushed and an uncommitted file, the laptop is 12 commits behind with a stash and an extra remote. They weren’t checked against a second machine; the current state is from the code and the screenshots beside each topic.</p>`;
+</script>
+<script src="mock-project-copies.js"></script>
+<script src="topics-project-copies.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

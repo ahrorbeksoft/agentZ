@@ -3678,6 +3678,54 @@ mod view_tests {
         assert!(shown("thread-card-2", cx));
     }
 
+    /// Picking another account or agent for a draft makes it again: the new draft opens in its
+    /// place with its text, and the old one is deleted. The old one isn't listed meanwhile,
+    /// while the server deletes it, or its row would flash above the cards.
+    #[gpui::test]
+    fn a_draft_made_again_isnt_listed_while_its_deleted(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let shown =
+            |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
+        show(
+            &store,
+            vec![thread(1, true, None), thread(3, false, None)],
+            cx,
+        );
+        open(&sidebar, 1, cx);
+        show(
+            &store,
+            vec![
+                thread(1, true, Some("Fix the login")),
+                thread(2, true, None),
+                thread(3, false, None),
+            ],
+            cx,
+        );
+        cx.update(|_, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_active_thread(
+                    Some(ThreadKey {
+                        machine: MachineId::Local,
+                        thread: ThreadId(2),
+                    }),
+                    cx,
+                )
+            });
+            store.update(cx, |store, cx| store.delete_thread(ThreadId(1), cx));
+        });
+        cx.run_until_parked();
+        assert!(!shown("draft-row-1", cx));
+        assert!(shown("thread-card-3", cx));
+        let sent = cx.update(|_, cx| {
+            Machines::global(cx)
+                .read(cx)
+                .client(MachineId::Local, cx)
+                .map(|client| client.read(cx).sent_for_test())
+                .unwrap_or_default()
+        });
+        assert!(sent.contains(&Request::DeleteThread(ThreadId(1))));
+    }
+
     #[gpui::test]
     fn a_pinned_card_leads_and_its_pin_unpins_it(cx: &mut TestAppContext) {
         let (_, store, cx) = new_sidebar(cx);

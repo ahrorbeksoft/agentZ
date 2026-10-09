@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Artifacts Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="mock-artifacts.css">
+</head>
+<body data-area="artifacts" data-title="Artifacts">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Artifacts <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>The UI parts of <b>artifacts</b>, from the backlog: pages an agent publishes from a thread or a chat, one self-contained <code>.html</code> or <code>.md</code> file each, with a version for every publish. Each machine’s server keeps them in its data folder and serves them on <code>127.0.0.1</code> with a secret token in the link; they open in your own browser (no webview), in the app’s theme, with export and a way to send what you pick back to the thread. Design boards like this one become one use of them. Storage and serving are decided; this round is how they look and where they show.</p>
+<p>The models: <b>Claude Code’s artifacts</b> (a page at a private link that opens in the browser and updates in place, each publish a version; a ⧉ pill under the prompt with the session’s artifacts, <code>/artifacts</code> to list them all, and a thin header on the page with a button to all of them, the title with a menu, and Share holding the version picker). <b>Claude Design</b>’s Export menu and its “Send to Claude Code”. <b>t3code</b>’s HTML pages, shown inside its thread, which get its theme as CSS variables. And agentZ’s own <b>design board</b>, which saves your picks for the agent to read.</p>
+<p>Words used: a <b>page</b> is one artifact as you see it in the browser; a <b>version</b> is one publish of it; <b>published</b> means the agent called agentZ’s publish tool. The name itself is a topic; the mocks say “artifacts”. The demo: <b>Checkout layouts</b>, three layouts Claude Agent published from <i>Add the checkout page</i> in storefront for you to pick from; <b>Limiter benchmarks</b> from Codex on Devbox 1; <b>Release notes 0.9</b>, a Markdown page from Factory Droid; and <b>Async runtimes compared</b> from a chat. The mocks are JetBrains Dark, your theme, at the app’s sizes; pages are shown in a browser window. The screenshots beside the topics are today’s app with the mock agent, in One Dark.</p>`;
+</script>
+<script src="mock-artifacts.js"></script>
+<script src="topics-artifacts.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

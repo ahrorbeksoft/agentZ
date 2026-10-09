@@ -1,0 +1,7 @@
+/* This round's mock pieces, on top of board/mock.css. Scoped to .m like it. */
+.m .zlink { color: #c4c6ca; text-decoration: underline; text-decoration-color: rgba(196,198,202,.35); text-underline-offset: 2px; }
+.m .zlink.hov { color: var(--ac); text-decoration-color: rgba(84,138,247,.6); }
+.m .zclamp { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
+.m .ztip { position: absolute; z-index: 5; background: #2b2d30; border: 1px solid var(--b); border-radius: 6px; padding: 4px 8px; font-size: 12px; color: var(--t); box-shadow: 0 6px 18px rgba(0,0,0,.4); white-space: nowrap; }
+.m .zdivider { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ph); margin: 8px 0; }
+.m .zdivider::before, .m .zdivider::after { content: ''; flex: 1; height: 1px; background: var(--b); }

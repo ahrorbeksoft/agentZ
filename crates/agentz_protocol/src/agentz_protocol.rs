@@ -23,6 +23,7 @@ pub mod spaces;
 pub mod terminal;
 pub mod terminal_keys;
 pub mod thread;
+pub mod title_generation;
 pub mod workspace;
 
 use std::collections::BTreeMap;
@@ -727,6 +728,9 @@ pub enum Request {
     /// The machine's icon, or `None` for the detected one. Reaches session subscribers as
     /// [`Event::MachineIcon`].
     SetMachineIcon(Option<MachineKind>),
+    /// How the machine titles threads whose agent doesn't. Reaches session subscribers as
+    /// [`Event::TitleGeneration`], once the server has looked for the providers again.
+    SetTitleGeneration(title_generation::TitleGeneration),
     /// The answer to an [`Event::RelayToolCall`].
     RelayToolResult {
         relay_id: u64,
@@ -933,6 +937,8 @@ pub struct SessionSnapshot {
     pub spaces: SpacesSnapshot,
     #[serde(default)]
     pub machine_icon: MachineIcon,
+    #[serde(default)]
+    pub title_generation: title_generation::TitleGenerationState,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -945,6 +951,7 @@ pub enum Event {
     McpServers(Vec<McpServer>),
     Spaces(SpacesSnapshot),
     MachineIcon(MachineIcon),
+    TitleGeneration(title_generation::TitleGenerationState),
     Thread {
         connection: ConnectionId,
         update: ThreadUpdate,

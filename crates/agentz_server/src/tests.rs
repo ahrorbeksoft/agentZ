@@ -87,6 +87,24 @@ impl TestServer {
         description: crate::AgentDescription,
         agent_control: Option<crate::AgentControl>,
     ) -> Option<Self> {
+        Self::start_with_config(
+            data_dir,
+            project_dir,
+            command,
+            description,
+            agent_control,
+            None,
+        )
+    }
+
+    fn start_with_config(
+        data_dir: tempfile::TempDir,
+        project_dir: tempfile::TempDir,
+        command: AgentCommand,
+        description: crate::AgentDescription,
+        agent_control: Option<crate::AgentControl>,
+        title_generation_path: Option<std::ffi::OsString>,
+    ) -> Option<Self> {
         let custom_agents = BTreeMap::from_iter([(
             AgentId::new("mock"),
             CustomAgent {
@@ -107,6 +125,7 @@ impl TestServer {
                 agent_control,
                 hands_pages_to_clients: false,
                 terminal_shell: Some("/bin/sh".into()),
+                title_generation_path,
                 listener: None,
                 handed_over: None,
             },
@@ -8143,4 +8162,241 @@ async fn images_are_kept_for_the_thread() {
         assert!(Instant::now() < deadline, "the images are still kept");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A fake `codex` and `claude` in a folder of their own, which answer with `title` as the real
+/// CLIs do and write each call's arguments and stdin to `calls.jsonl` there, and the `PATH`
+/// to find them on.
+#[cfg(unix)]
+fn fake_title_clis(title: &str) -> (tempfile::TempDir, std::ffi::OsString) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let folder = tempfile::tempdir().expect("temp dir");
+    let calls = folder.path().join("calls.jsonl");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if args[:2] == ["debug", "models"]:
+    print(json.dumps({{"models": [
+        {{"slug": "gpt-test", "display_name": "GPT-Test", "visibility": "list",
+          "supported_reasoning_levels": [{{"effort": "low"}}, {{"effort": "high"}}]}}]}}))
+    sys.exit(0)
+prompt = sys.stdin.read()
+with open({calls:?}, "a") as calls:
+    calls.write(json.dumps({{"program": os.path.basename(sys.argv[0]), "args": args,
+                            "stdin": prompt, "cwd": os.getcwd()}}) + "\n")
+answer = {{"title": {title:?}, "needsRefinement": False}}
+if "--output-last-message" in args:
+    with open(args[args.index("--output-last-message") + 1], "w") as output:
+        output.write(json.dumps(answer))
+else:
+    print(json.dumps({{"type": "result", "structured_output": answer}}))
+"#,
+        calls = calls.to_string_lossy(),
+        title = format!("\"{title}\""),
+    );
+    for name in ["codex", "claude"] {
+        let path = folder.path().join(name);
+        std::fs::write(&path, &script).expect("fake CLI");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let mut search_path = folder.path().as_os_str().to_owned();
+    search_path.push(":/usr/bin:/bin");
+    (folder, search_path)
+}
+
+#[cfg(unix)]
+fn title_cli_calls(folder: &Path) -> Vec<Value> {
+    std::fs::read_to_string(folder.join("calls.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a call"))
+        .collect()
+}
+
+#[cfg(unix)]
+async fn prompt_and_wait(client: &mut TestClient, thread_id: ThreadId, prompt: &str) {
+    let connection = ConnectionId::Thread(thread_id);
+    if !client.threads.contains_key(&connection) {
+        client.subscribe_thread(connection).await;
+    }
+    let replies = agent_text(client.thread(connection)).len();
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text(prompt),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread).len() > replies
+        })
+        .await;
+}
+
+#[cfg(unix)]
+fn thread_title(client: &TestClient, thread_id: ThreadId) -> Option<String> {
+    client
+        .projects
+        .as_ref()?
+        .threads
+        .iter()
+        .find(|thread| thread.id == thread_id)
+        .map(|thread| thread.title.clone())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn titles_threads_their_agent_does_not_name() {
+    use agentz_protocol::title_generation::{TitleGeneration, TitleProvider};
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let (clis, search_path) = fake_title_clis("Login Redirect Fix");
+    let Some(server) = TestServer::start_with_config(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        None,
+        Some(search_path),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    assert!(!session.title_generation.settings.enabled);
+
+    // Off, nothing is generated.
+    let unnamed = client.create_thread(&server).await;
+    prompt_and_wait(&mut client, unnamed, "hello").await;
+
+    let settings = TitleGeneration {
+        enabled: true,
+        ..TitleGeneration::default()
+    };
+    client
+        .ok(Request::SetTitleGeneration(settings.clone()))
+        .await;
+    // The providers are found again, Codex with the models it lists.
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| match event {
+                Event::TitleGeneration(state) => {
+                    state.settings == settings
+                        && state.providers.iter().any(|info| {
+                            info.provider == TitleProvider::Codex
+                                && info.installed
+                                && info.models.iter().any(|model| model.id == "gpt-test")
+                        })
+                        && state.providers.iter().any(|info| {
+                            info.provider == TitleProvider::Antigravity && !info.installed
+                        })
+                }
+                _ => false,
+            })
+        })
+        .await;
+
+    // The agent's own title is kept, and so is the user's.
+    let agent_named = client.create_thread(&server).await;
+    prompt_and_wait(&mut client, agent_named, "demo").await;
+    let user_named = client.create_thread(&server).await;
+    client
+        .ok(Request::RenameThread {
+            thread_id: user_named,
+            title: "Mine".into(),
+        })
+        .await;
+    prompt_and_wait(&mut client, user_named, "hello").await;
+
+    let thread_id = client.create_thread(&server).await;
+    prompt_and_wait(&mut client, thread_id, "fix the login redirect").await;
+    client
+        .wait_until(|client| {
+            thread_title(client, thread_id).as_deref() == Some("Login Redirect Fix")
+        })
+        .await;
+    let calls = title_cli_calls(clis.path());
+    let [call] = calls.as_slice() else {
+        panic!("expected one call, got {calls:#?}");
+    };
+    let args: Vec<&str> = call["args"]
+        .as_array()
+        .expect("args")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(call["program"], "codex");
+    assert_eq!(args[..2], ["exec", "--ephemeral"]);
+    assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6-luna"]));
+    assert!(args.contains(&"model_reasoning_effort=\"low\""));
+    assert_eq!(args.last(), Some(&"-"));
+    let prompt = call["stdin"].as_str().expect("prompt");
+    assert!(prompt.starts_with("Generate a title that will help the user recognize this agentZ"));
+    assert!(prompt.ends_with("\n\nUser message:\nfix the login redirect"));
+    assert_ne!(
+        call["cwd"].as_str().map(PathBuf::from),
+        Some(server.project_dir.path().to_path_buf())
+    );
+    assert_eq!(
+        thread_title(&client, agent_named).as_deref(),
+        Some("Checkout page with pay button")
+    );
+    assert_eq!(thread_title(&client, user_named).as_deref(), Some("Mine"));
+    assert_eq!(thread_title(&client, unnamed).as_deref(), Some("hello"));
+
+    // Once a thread: its next turns keep the title.
+    prompt_and_wait(&mut client, thread_id, "hello again").await;
+    assert_eq!(title_cli_calls(clis.path()).len(), 1);
+
+    // Claude, with the chosen model and effort, as t3code runs it.
+    client
+        .ok(Request::SetTitleGeneration(TitleGeneration {
+            enabled: true,
+            provider: TitleProvider::Claude,
+            model: Some("claude-sonnet-5-5".into()),
+            effort: Some("high".into()),
+        }))
+        .await;
+    let claude_named = client.create_thread(&server).await;
+    prompt_and_wait(&mut client, claude_named, "the checkout flow").await;
+    client
+        .wait_until(|client| {
+            thread_title(client, claude_named).as_deref() == Some("Login Redirect Fix")
+        })
+        .await;
+    let calls = title_cli_calls(clis.path());
+    let call = calls.last().expect("a call");
+    assert_eq!(call["program"], "claude");
+    let args: Vec<&str> = call["args"]
+        .as_array()
+        .expect("args")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for pair in [
+        ["--model", "claude-sonnet-5-5"],
+        ["--effort", "high"],
+        ["--tools", ""],
+        ["--permission-mode", "dontAsk"],
+        ["--output-format", "json"],
+    ] {
+        assert!(args.windows(2).any(|window| window == pair), "{pair:?} in {args:?}");
+    }
+    assert!(call["stdin"]
+        .as_str()
+        .is_some_and(|prompt| prompt.ends_with("User message:\nthe checkout flow")));
+    // Kept for the machine.
+    assert_eq!(
+        crate::title_generation::load(server.data_dir.path())
+            .expect("saved")
+            .provider,
+        TitleProvider::Claude
+    );
 }

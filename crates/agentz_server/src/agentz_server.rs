@@ -25,6 +25,7 @@ mod skills;
 mod spaces;
 mod terminal_programs;
 mod terminals;
+mod title_generation;
 mod transcripts;
 mod workspaces;
 
@@ -65,6 +66,9 @@ pub struct ServerConfig {
     /// The shell terminals run, and run commands with (`-c`). `None` is the user's login
     /// shell, which tests avoid since it reads the user's own setup.
     pub terminal_shell: Option<String>,
+    /// The `PATH` the CLIs that write thread titles are looked for on and run with. `None` is
+    /// the server's own.
+    pub title_generation_path: Option<std::ffi::OsString>,
     /// The socket clients connect to, handed with the terminals to a newer server
     /// ([`agentz_protocol::Request::HandOff`]). `None` can't hand off.
     #[cfg(unix)]

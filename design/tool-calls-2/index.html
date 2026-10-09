@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Every Kind of Tool Call Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="mock-tool-calls-2.css">
+</head>
+<body data-area="tool-calls-2" data-title="Every kind of tool call">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Every kind of tool call <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>From the backlog: “Take every kind of tool call through design rounds again… each kind now gets designs to pick from again”, and “Show every tool’s output in a file view style, as it was printed, not as markdown.” This round covers the tools agents bring themselves, by ACP’s kinds (read, edit, delete, move, search, execute, think, fetch, switch mode, other), their states and folded runs, the file view for their output, ToolSearch, other MCP servers’ tools and images. agentZ’s own tools and subagents are in another round.</p>
+<p>Today each tool call is a one-line <b>row</b> in one dim gray: an icon by its kind (a read’s or edit’s file icon), then a label, mostly the agent’s own title with the project’s folder taken out. Commands say “Ran” and the command; edits “Edited” and the path with +/− counts. Opening a row shows its <b>output</b>: an edit’s diff, a command’s terminal, or the text the tool sent back, now shown as printed in a code block, up to 24 rem tall; “Input” under it opens the JSON the agent passed. A run of several folds to one line once the agent writes after it.</p>
+<p>Each agent titles the same tool its own way, as the mocks show: Claude Agent’s <code>grep -n "roundTotal" src</code>, Codex’s “Search for 'roundTotal' in src”, Factory Droid’s “Grep roundTotal in src”. Zed is the model for the diff, the terminal card and the states; t3code for the rows, runs and error lines. Options marked “new” are neither’s.</p>
+<p>Words used: a <b>row</b> is a tool call’s line; <b>opening</b> it shows its <b>output</b>; a <b>run</b> is the tool calls between two messages; the <b>file view</b> is the block the output section designs. Some topics show one detail decided in another (for example a file view header); pick each topic for what it’s about. The mocks use One Dark at the app’s sizes: rows 24 px tall, row text 13 px, output 12 px on 17 px lines, in the code font. The demo is a storefront’s cart total being off by a cent.</p>`;
+</script>
+<script src="mock-tool-calls-2.js"></script>
+<script src="topics-tool-calls-2.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

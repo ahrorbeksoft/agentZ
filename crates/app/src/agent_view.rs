@@ -30,16 +30,16 @@ use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, FollowMode, Hsla, ImageSource, KeyBinding, ListAlignment, ListState,
-    ObjectFit, Pixels, Point, PromptLevel, Subscription, Task, Window, anchored, deferred, img,
-    list, pulsating_between,
+    ObjectFit, Pixels, Point, PromptLevel, ScrollHandle, Stateful, Subscription, Task, Window,
+    anchored, deferred, img, list, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use projects::{ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind};
 use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, Chip, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
-    IconPosition, PopoverMenu, PopoverMenuHandle, Severity, SpinnerLabel, SplitButton,
-    SplitButtonStyle, Switch, ToggleState, Tooltip, prelude::*,
+    IconPosition, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars, Severity, SpinnerLabel,
+    SplitButton, SplitButtonStyle, Switch, ToggleState, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -815,7 +815,11 @@ impl AgentView {
     /// t3code's Agents control with Zed's subagent headers as its rows: each subthread's state,
     /// title and model, and what it changed. The agent's own subagents show only while they
     /// run, with the agent's name: it runs them, so they have no Stop or model of their own.
-    fn render_agents_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_agents_section(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let store = self.store.clone();
         let store = store.read(cx);
         let subthreads: Vec<projects::Thread> = store
@@ -1060,13 +1064,18 @@ impl AgentView {
             v_flex()
                 .child(summary)
                 .when(expanded, |this| {
-                    this.child(
+                    this.child(with_scrollbar(
                         v_flex()
                             .id("agent-rows")
                             .max_h(rems_from_px(33. * MAX_AGENT_ROWS_SHOWN as f32))
                             .overflow_y_scroll()
                             .children(rows),
-                    )
+                        div(),
+                        "agent-rows".into(),
+                        ScrollAxes::Vertical,
+                        window,
+                        cx,
+                    ))
                 })
                 .into_any_element(),
         )
@@ -1074,7 +1083,11 @@ impl AgentView {
 
     /// What the agent left running after its turn, such as commands it sent to the background,
     /// in the Agents section's style: each with how long it has run, and Stop.
-    fn render_background_tasks_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_background_tasks_section(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let tasks = self.thread.read(cx).state.background_tasks.clone();
         if tasks.is_empty() {
             return None;
@@ -1200,13 +1213,18 @@ impl AgentView {
             v_flex()
                 .child(summary)
                 .when(expanded, |this| {
-                    this.child(
+                    this.child(with_scrollbar(
                         v_flex()
                             .id("background-task-rows")
                             .max_h(rems_from_px(31. * MAX_AGENT_ROWS_SHOWN as f32))
                             .overflow_y_scroll()
                             .children(rows),
-                    )
+                        div(),
+                        "background-task-rows".into(),
+                        ScrollAxes::Vertical,
+                        window,
+                        cx,
+                    ))
                 })
                 .into_any_element(),
         )
@@ -4232,7 +4250,13 @@ impl AgentView {
                 output.push(render_listed_tools(index, listed_tools, cx));
             } else {
                 for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
-                    output.push(render_diff(diff, (index, diff_index), cx));
+                    output.push(render_diff(
+                        diff,
+                        (index, diff_index),
+                        format!("tool-diff-{}-{diff_index}", tool_call.id),
+                        window,
+                        cx,
+                    ));
                 }
                 for terminal_id in &tool_call.terminals {
                     if let Some(terminal) = self.tool_terminals.get(terminal_id) {
@@ -4241,7 +4265,7 @@ impl AgentView {
                                 .w_full()
                                 .py_1()
                                 .rounded_md()
-                                .bg(colors.terminal_background)
+                                .bg(cx.theme().colors().terminal_background)
                                 .child(terminal.clone())
                                 .into_any_element(),
                         );
@@ -4268,15 +4292,21 @@ impl AgentView {
             }
         }
         let details = (!output.is_empty()).then(|| {
-            v_flex()
-                .id(("tool-call-output", index))
-                .debug_selector(|| format!("tool-call-output-{index}"))
-                .ml(px(30.))
-                .max_h(rems(24.))
-                .overflow_y_scroll()
-                .py_1()
-                .gap_1()
-                .children(output)
+            with_scrollbar(
+                v_flex()
+                    .id(("tool-call-output", index))
+                    .debug_selector(|| format!("tool-call-output-{index}"))
+                    .max_h(rems(24.))
+                    .overflow_y_scroll()
+                    .py_1()
+                    .gap_1()
+                    .children(output),
+                div().ml(px(30.)),
+                format!("tool-call-output-{}", tool_call.id),
+                ScrollAxes::Vertical,
+                window,
+                cx,
+            )
         });
 
         v_flex()
@@ -4632,7 +4662,7 @@ impl AgentView {
         index: usize,
         tool_call: &ToolCall,
         subagent: &SubagentCall,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -4675,20 +4705,28 @@ impl AgentView {
                 .child(heading("Report"))
                 .child(div().text_ui(cx).children(report))
         });
-        v_flex()
-            .id(("tool-call-output", index))
-            .debug_selector(|| format!("tool-call-output-{index}"))
-            .ml(px(30.))
-            .max_h(rems(24.))
-            .overflow_y_scroll()
-            .py_1()
-            .gap_2()
-            .children(task)
-            .children(report)
-            .when(tool_call.raw_input.is_some(), |this| {
-                this.child(self.render_tool_input(index, &tool_call.id, window, cx))
-            })
-            .into_any_element()
+        let input = tool_call
+            .raw_input
+            .is_some()
+            .then(|| self.render_tool_input(index, &tool_call.id, window, cx));
+        with_scrollbar(
+            v_flex()
+                .id(("tool-call-output", index))
+                .debug_selector(|| format!("tool-call-output-{index}"))
+                .max_h(rems(24.))
+                .overflow_y_scroll()
+                .py_1()
+                .gap_2()
+                .children(task)
+                .children(report)
+                .children(input),
+            div().ml(px(30.)),
+            format!("tool-call-output-{}", tool_call.id),
+            ScrollAxes::Vertical,
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 
     /// What the tool call is, and for one of agentZ's tools, what it did, naming the threads it
@@ -5826,7 +5864,11 @@ impl AgentView {
         Some(div().px_2().pb_2().child(callout).into_any_element())
     }
 
-    fn render_plan_section(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_plan_section(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let plan = self.thread.read(cx).plan().to_vec();
         if plan.is_empty() {
             return None;
@@ -5943,7 +5985,11 @@ impl AgentView {
         )
     }
 
-    fn render_queue_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_queue_section(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
         let messages = thread.state.queued_messages.clone();
         let is_steering = thread.state.steering_queued;
@@ -6098,14 +6144,19 @@ impl AgentView {
             v_flex()
                 .child(summary)
                 .when(expanded, |this| {
-                    this.child(
+                    this.child(with_scrollbar(
                         v_flex()
                             .id("queued-messages")
                             .debug_selector(|| "queued-messages".into())
                             .max_h_40()
                             .overflow_y_scroll()
                             .children(rows),
-                    )
+                        div(),
+                        "queued-messages".into(),
+                        ScrollAxes::Vertical,
+                        window,
+                        cx,
+                    ))
                 })
                 .into_any_element(),
         )
@@ -6524,12 +6575,16 @@ impl AgentView {
     }
 
     /// The bar above the message editor: agents, plan, edited files and queued messages.
-    fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_activity_bar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let sections: Vec<AnyElement> = [
-            self.render_agents_section(cx),
-            self.render_background_tasks_section(cx),
+            self.render_agents_section(window, cx),
+            self.render_background_tasks_section(window, cx),
             self.render_plan_section(window, cx),
-            self.render_queue_section(cx),
+            self.render_queue_section(window, cx),
         ]
         .into_iter()
         .flatten()
@@ -7145,7 +7200,11 @@ impl AgentView {
 
     /// The conversation a continued thread brings with its first message, as an attachment in
     /// the composer: a click shows exactly what goes to the agent, × starts without it.
-    fn render_handoff_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_handoff_chip(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let handoff = self.thread.read(cx).pending_handoff()?.clone();
         let title = SharedString::from(handoff.from_title.clone());
         let agent_name = SharedString::from(handoff.from_agent.clone());
@@ -7212,20 +7271,27 @@ impl AgentView {
                 cx.notify();
             }));
         let preview = self.handoff_expanded.then(|| {
-            div()
-                .id("handoff-preview")
-                .debug_selector(|| "handoff-preview".into())
-                .max_h(px(200.))
-                .overflow_y_scroll()
-                .p_2()
-                .rounded_md()
-                .border_1()
-                .border_color(colors.border_variant)
-                .bg(colors.editor_background)
-                .font_buffer(cx)
-                .text_xs()
-                .text_color(colors.text_muted)
-                .child(handoff.text.clone())
+            with_scrollbar(
+                div()
+                    .id("handoff-preview")
+                    .debug_selector(|| "handoff-preview".into())
+                    .max_h(px(200.))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.editor_background)
+                    .font_buffer(cx)
+                    .text_xs()
+                    .text_color(colors.text_muted)
+                    .child(handoff.text.clone()),
+                div(),
+                "handoff-preview".into(),
+                ScrollAxes::Vertical,
+                window,
+                cx,
+            )
         });
         Some(
             v_flex()
@@ -7238,7 +7304,12 @@ impl AgentView {
         )
     }
 
-    fn render_message_editor(&self, style: ComposerStyle, cx: &mut Context<Self>) -> AnyElement {
+    fn render_message_editor(
+        &self,
+        style: ComposerStyle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
         let agent_name = self.agent_name(cx);
@@ -7346,7 +7417,7 @@ impl AgentView {
                     })
                     // A draft can still be typed, but the composer reads as waiting on the login.
                     .when(needs_login, |this| this.opacity(0.55))
-                    .children(self.render_handoff_chip(cx))
+                    .children(self.render_handoff_chip(window, cx))
                     .child(
                         v_flex()
                             .relative()
@@ -7417,16 +7488,17 @@ impl AgentView {
     /// The new thread screen (t3code's): a headline, the composer as a card, and under it
     /// where the thread works. Until the first message, the agent, checkout and machine can
     /// still change.
-    fn render_new_thread(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_new_thread(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let headline: SharedString = match self.continued_title(cx) {
             Some(title) => format!("Continue “{title}”").into(),
             None => "What should we work on?".into(),
         };
-        v_flex()
+        let screen = v_flex()
             .id("new-thread")
             .debug_selector(|| "new-thread".into())
             .flex_1()
             .min_h_0()
+            .w_full()
             .items_center()
             .justify_center()
             .px_4()
@@ -7446,12 +7518,20 @@ impl AgentView {
                     .child(
                         v_flex()
                             .gap_2()
-                            .child(self.render_message_editor(ComposerStyle::Card, cx))
+                            .child(self.render_message_editor(ComposerStyle::Card, window, cx))
                             .child(self.render_new_thread_strip(cx))
                             .children(self.render_errors(cx)),
                     ),
-            )
-            .into_any_element()
+            );
+        with_scrollbar(
+            screen,
+            v_flex().flex_1().min_h_0().w_full(),
+            "new-thread".into(),
+            ScrollAxes::Vertical,
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 
     /// The agent, in the new thread's composer: a menu of the machine's installed agents.
@@ -8669,11 +8749,11 @@ fn chip_content(icon: Icon, label: SharedString) -> Div {
         )
 }
 
-fn render_plan_entries(plan: &[PlanItem], _window: &Window, cx: &App) -> AnyElement {
+fn render_plan_entries(plan: &[PlanItem], window: &mut Window, cx: &mut App) -> AnyElement {
     let colors = cx.theme().colors();
     let entry_bg = colors.editor_background;
     let count = plan.len();
-    v_flex()
+    let entries = v_flex()
         .id("plan-entries")
         .max_h_40()
         .overflow_y_scroll()
@@ -8706,13 +8786,58 @@ fn render_plan_entries(plan: &[PlanItem], _window: &Window, cx: &App) -> AnyElem
                         .child(icon)
                         .child(item.content.clone()),
                 )
-        }))
-        .into_any_element()
+        }));
+    with_scrollbar(
+        entries,
+        div(),
+        "plan-entries".into(),
+        ScrollAxes::Vertical,
+        window,
+        cx,
+    )
+    .into_any_element()
+}
+
+/// A scrolling area in the thread with Zed's scrollbar, which goes on a wrapper that doesn't
+/// scroll, else it would scroll away with the content. The rows of the conversation share the
+/// call sites, so each area's handle and scrollbar are kept by `key` (a tool call's has its
+/// id), for as long as the area is drawn.
+fn with_scrollbar(
+    scroller: Stateful<Div>,
+    wrapper: Div,
+    key: String,
+    axes: ScrollAxes,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let handle = window
+        .use_keyed_state(
+            ElementId::Name(format!("{key}-scroll").into()),
+            cx,
+            |_, _| ScrollHandle::new(),
+        )
+        .read(cx)
+        .clone();
+    wrapper
+        .child(scroller.track_scroll(&handle))
+        .custom_scrollbars(
+            Scrollbars::new(axes)
+                .tracked_scroll_handle(&handle)
+                .id(ElementId::Name(format!("{key}-scrollbar").into())),
+            window,
+            cx,
+        )
 }
 
 /// A tool call's edit. Long lines scroll sideways, as in Zed's editor, rather than being cut
 /// off.
-fn render_diff(diff: &FileDiff, (entry, part): (usize, usize), cx: &App) -> AnyElement {
+fn render_diff(
+    diff: &FileDiff,
+    (entry, part): (usize, usize),
+    key: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let colors = cx.theme().colors();
     let lines = v_flex()
         .min_w_full()
@@ -8747,7 +8872,7 @@ fn render_diff(diff: &FileDiff, (entry, part): (usize, usize), cx: &App) -> AnyE
                         .child(line.to_string())
                 }),
         );
-    div()
+    let scroller = div()
         .id(("tool-diff", entry * 1000 + part))
         .w_full()
         .overflow_x_scroll()
@@ -8756,8 +8881,16 @@ fn render_diff(diff: &FileDiff, (entry, part): (usize, usize), cx: &App) -> AnyE
         .font_buffer(cx)
         .text_size(rems_from_px(12_f32))
         .line_height(rems_from_px(18_f32))
-        .child(lines)
-        .into_any_element()
+        .child(lines);
+    with_scrollbar(
+        scroller,
+        div().w_full(),
+        key,
+        ScrollAxes::Horizontal,
+        window,
+        cx,
+    )
+    .into_any_element()
 }
 
 impl Focusable for AgentView {
@@ -8849,7 +8982,7 @@ impl Render for AgentView {
                 this.child(self.render_subthread_title_bar(parent, cx))
             })
             .when(!is_drawer_full_screen && is_new_thread, |this| {
-                this.child(self.render_new_thread(cx))
+                this.child(self.render_new_thread(window, cx))
             })
             // A full-screen terminal hides the conversation and the composer.
             .when(!is_drawer_full_screen && !is_new_thread, |this| {
@@ -8879,6 +9012,11 @@ impl Render for AgentView {
                                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
                                     .flex_1()
                                     .w_full(),
+                                )
+                                .vertical_scrollbar_for(
+                                    &self.list_state,
+                                    window,
+                                    cx,
                                 )
                             })
                             .when(!has_rows && is_connecting, |this| {
@@ -8956,7 +9094,7 @@ impl Render for AgentView {
                         } else if !self.client.read(cx).is_online() {
                             this.child(self.render_offline_notice(cx))
                         } else {
-                            this.child(self.render_message_editor(ComposerStyle::Bar, cx))
+                            this.child(self.render_message_editor(ComposerStyle::Bar, window, cx))
                         }
                     })
             })
@@ -11550,6 +11688,54 @@ mod tests {
         assert_eq!(row_top(cx), top);
         scroll("tool-call-output-31", 40., cx);
         assert_eq!(row_top(cx), top + 40.);
+    }
+
+    /// A tool call's output has a scrollbar of its own: dragging its thumb scrolls the output.
+    #[gpui::test]
+    fn a_tool_calls_output_scrolls_with_its_scrollbar(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let mut read = tool_call(acp::ToolCallStatus::Completed);
+        if let Entry::ToolCall(tool_call) = &mut read {
+            tool_call.kind = acp::ToolKind::Read;
+            tool_call.title = "Read /tmp/demo/total.ts".into();
+            tool_call.text = vec![
+                (1..=200)
+                    .map(|line| format!("const line{line} = {line};"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ];
+            tool_call.raw_input = Some("{\"path\": \"/tmp/demo/total.ts\"}".into());
+        }
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Read it".into()), read], cx)
+        });
+        cx.run_until_parked();
+        let row = cx.debug_bounds("tool-call-row-1").expect("the read's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let input_top = |cx: &mut VisualTestContext| {
+            f32::from(
+                cx.debug_bounds("tool-call-input-1")
+                    .expect("the Input line")
+                    .top(),
+            )
+        };
+        let before = input_top(cx);
+        let output = cx.debug_bounds("tool-call-output-1").expect("the output");
+        let thumb = gpui::point(output.right() - px(5.), output.top() + px(10.));
+        cx.simulate_mouse_move(thumb, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(thumb, gpui::MouseButton::Left, gpui::Modifiers::none());
+        let below = gpui::point(thumb.x, thumb.y + px(100.));
+        cx.simulate_mouse_move(below, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(below, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            input_top(cx) < before - 100.,
+            "the output didn't scroll: {before} to {}",
+            input_top(cx)
+        );
     }
 
     /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.
