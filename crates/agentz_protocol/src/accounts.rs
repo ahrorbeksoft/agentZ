@@ -31,7 +31,22 @@ pub struct AgentAccounts {
     /// The last account added whose login turned out to be one already listed, which was
     /// removed again: Add Account's dialog says so.
     pub duplicate: Option<DuplicateLogin>,
+    /// Whether its accounts were given colors ([`Self::give_colors`]), which happens once, so
+    /// an account the user set to No Color keeps none.
+    pub colors_given: bool,
 }
+
+/// The colors an account can have, as they're kept: t3code's project colors in Tailwind's 600
+/// shade, in the order the Color menu lists them (`controls::ACCOUNT_COLORS` in the app).
+pub const ACCOUNT_COLORS: [&str; 8] = [
+    "#dc2626", "#ea580c", "#ca8a04", "#16a34a", "#0d9488", "#2563eb", "#9333ea", "#db2777",
+];
+
+/// The order accounts are given [`ACCOUNT_COLORS`] in: the first few far apart, red (which
+/// reads as an error) last.
+const GIVEN_COLORS: [&str; 8] = [
+    "#2563eb", "#16a34a", "#ea580c", "#9333ea", "#0d9488", "#db2777", "#ca8a04", "#dc2626",
+];
 
 /// An added account whose first read found the email of an account already listed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -377,13 +392,19 @@ impl AgentAccounts {
         }
     }
 
-    /// A new account, logged out until it logs in.
+    /// A new account, logged out until it logs in, in a color its agent's other accounts don't
+    /// have yet.
     pub fn add(&mut self) -> AccountId {
+        self.give_colors();
         self.last_id += 1;
         let id = AccountId(self.last_id);
+        let color = self.unused_color(self.last_id);
         self.accounts.push(Account {
             id,
-            choices: AccountChoices::default(),
+            choices: AccountChoices {
+                color: Some(color.to_string()),
+                ..AccountChoices::default()
+            },
             settings: AgentSettings::default(),
             logged_in: None,
             logs_in_with_key: false,
@@ -391,6 +412,58 @@ impl AgentAccounts {
             settings_from: SettingsSource::Nothing,
         });
         id
+    }
+
+    /// Gives the External account and every one of agentZ's without a color one, unless they
+    /// were given colors before, so the user's accounts differ without picking colors. Returns
+    /// whether it changed anything.
+    pub fn give_colors(&mut self) -> bool {
+        if self.colors_given {
+            return false;
+        }
+        self.colors_given = true;
+        if self.external.color.is_none() {
+            self.external.color = Some(self.unused_color(0).to_string());
+        }
+        for index in 0..self.accounts.len() {
+            if self.accounts[index].choices.color.is_none() {
+                let color = self.unused_color(self.accounts[index].id.0);
+                self.accounts[index].choices.color = Some(color.to_string());
+            }
+        }
+        true
+    }
+
+    /// The first color, in the order they're given, that none of the agent's accounts has, or
+    /// once each is taken, one of the least used, picked by `seed` (an account's id) so that
+    /// accounts added one after another vary.
+    fn unused_color(&self, seed: u64) -> &'static str {
+        let uses = |color: &str| {
+            std::iter::once(&self.external)
+                .chain(self.accounts.iter().map(|account| &account.choices))
+                .filter(|choices| {
+                    choices
+                        .color
+                        .as_deref()
+                        .is_some_and(|kept| kept.eq_ignore_ascii_case(color))
+                })
+                .count()
+        };
+        let fewest = GIVEN_COLORS
+            .iter()
+            .map(|color| uses(color))
+            .min()
+            .unwrap_or(0);
+        let least_used: Vec<&'static str> = GIVEN_COLORS
+            .into_iter()
+            .filter(|color| uses(color) == fewest)
+            .collect();
+        let index = if fewest == 0 {
+            0
+        } else {
+            (seed % least_used.len() as u64) as usize
+        };
+        least_used.get(index).copied().unwrap_or(GIVEN_COLORS[0])
     }
 
     /// Whether the account logs in with a key agentZ keeps. The External account never does.
@@ -673,7 +746,11 @@ mod tests {
 
         let first = accounts.add();
         assert_eq!(accounts.thread_color(None), blue.as_deref());
+        assert_eq!(accounts.thread_color(Some(first)), Some("#16a34a"));
         // Without a color of its own, its icon stays as it was.
+        accounts
+            .change(Some(first), AccountChange::SetColor(None))
+            .expect("no color");
         assert_eq!(accounts.thread_color(Some(first)), None);
         assert_eq!(accounts.thread_color(Some(AccountId(9))), None);
 
@@ -683,12 +760,60 @@ mod tests {
         accounts
             .change(
                 Some(second),
-                AccountChange::SetColor(Some("#16a34a".into())),
+                AccountChange::SetColor(Some("#9333ea".into())),
             )
             .expect("color");
-        assert_eq!(accounts.thread_color(Some(second)), Some("#16a34a"));
+        assert_eq!(accounts.thread_color(Some(second)), Some("#9333ea"));
         // An External thread keeps its color while the normal home is logged out.
         assert_eq!(accounts.thread_color(None), blue.as_deref());
+    }
+
+    #[test]
+    fn gives_each_account_a_color_the_others_dont_have() {
+        let color = |accounts: &AgentAccounts, account| {
+            accounts
+                .choices(account)
+                .and_then(|choices| choices.color.clone())
+        };
+        let mut accounts = AgentAccounts::default();
+        let first = accounts.add();
+        assert_eq!(color(&accounts, None).as_deref(), Some("#2563eb"));
+        assert_eq!(color(&accounts, Some(first)).as_deref(), Some("#16a34a"));
+        // A color the user picked is skipped, and No Color stays.
+        accounts
+            .change(None, AccountChange::SetColor(None))
+            .expect("no color");
+        accounts
+            .change(Some(first), AccountChange::SetColor(Some("#EA580C".into())))
+            .expect("color");
+        let second = accounts.add();
+        assert_eq!(color(&accounts, None), None);
+        assert_eq!(color(&accounts, Some(second)).as_deref(), Some("#2563eb"));
+        assert!(!accounts.give_colors());
+        assert_eq!(color(&accounts, None), None);
+
+        // With every color taken, one of the least used.
+        for _ in 0..7 {
+            accounts.add();
+        }
+        let mut uses = std::collections::BTreeMap::new();
+        for account in accounts.listed() {
+            if let Some(color) = color(&accounts, account) {
+                *uses.entry(color).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(uses.len(), ACCOUNT_COLORS.len());
+        assert!(uses.values().all(|&count| (1..=2).contains(&count)));
+
+        // Accounts kept from before colors were given get them as they're loaded.
+        let mut old: AgentAccounts =
+            serde_json::from_str(r##"{"accounts": [{"id": 1}, {"id": 2, "color": "#2563eb"}]}"##)
+                .expect("deserialize");
+        assert!(old.give_colors());
+        assert_eq!(color(&old, None).as_deref(), Some("#16a34a"));
+        assert_eq!(color(&old, Some(AccountId(1))).as_deref(), Some("#ea580c"));
+        assert_eq!(color(&old, Some(AccountId(2))).as_deref(), Some("#2563eb"));
+        assert!(!old.give_colors());
     }
 
     #[test]

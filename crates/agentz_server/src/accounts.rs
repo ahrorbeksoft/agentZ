@@ -41,16 +41,25 @@ pub struct AccountStore {
 }
 
 impl AccountStore {
+    /// Accounts kept from before agentZ gave them colors get them here, and are saved so.
     pub fn load(path: Option<PathBuf>) -> Self {
-        let accounts = path
+        let mut accounts: BTreeMap<AgentId, AgentAccounts> = path
             .as_deref()
             .and_then(|path| read_json(path).log_err().flatten())
             .unwrap_or_default();
-        Self {
+        let mut colors_given = false;
+        for agent_accounts in accounts.values_mut() {
+            colors_given |= agent_accounts.give_colors();
+        }
+        let store = Self {
             accounts,
             path,
             revision: 0,
+        };
+        if colors_given {
+            store.save();
         }
+        store
     }
 
     pub fn all(&self) -> &BTreeMap<AgentId, AgentAccounts> {
@@ -185,6 +194,43 @@ mod tests {
 
         let store = AccountStore::load(Some(path));
         assert!(store.get(&mock).account(id).is_some());
+    }
+
+    #[test]
+    fn colors_accounts_kept_from_before_colors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("accounts.json");
+        std::fs::write(
+            &path,
+            r#"{"mock": {"accounts": [{"id": 1}, {"id": 2}], "last_id": 2}}"#,
+        )
+        .expect("write");
+        let mock = AgentId::new("mock");
+        let colors = |store: &AccountStore| {
+            let accounts = store.get(&mock);
+            accounts
+                .listed()
+                .into_iter()
+                .map(|account| {
+                    accounts
+                        .choices(account)
+                        .and_then(|choices| choices.color.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let store = AccountStore::load(Some(path.clone()));
+        let given = colors(&store);
+        assert!(given.iter().all(Option::is_some));
+        assert_eq!(
+            given
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        // Saved, so they keep them.
+        assert_eq!(colors(&AccountStore::load(Some(path))), given);
     }
 
     #[test]

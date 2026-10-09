@@ -244,7 +244,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`AgentAccounts::thread_color`, `sidebar::thread_agent_icon`, `controls::AgentIcon`, as the
   accounts round's mock draws it): on the card and its details, in Go To, in Workspaces'
   panes, rows and agents list, and in the thread's composer. Meanwhile the details popover
-  names the account too, with its avatar, after the agent.
+  names the account too, with its avatar, after the agent. Each account is given a color as
+  it's added (`AgentAccounts::add`): the first of `ACCOUNT_COLORS` its agent's accounts don't
+  have, in an order that keeps the first few apart, then one of the least used, by its id.
+  Accounts kept from before then got theirs, the External one's included, once, as the server
+  loaded them (`AgentAccounts::give_colors`, `colors_given`), so No Color from the account's
+  Color menu stays.
 - **Pinned threads** (`sidebar.rs`, `Machines::active_threads`, `projects::order_key`; t3code's
   `pinnedAt`, order keys and `planSidebarThreadDrop`, the user's picks in `design/pins/`):
   pinned cards come first, with nothing between them and the rest, each with a muted pin

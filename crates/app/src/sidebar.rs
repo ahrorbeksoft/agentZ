@@ -3532,6 +3532,9 @@ mod view_tests {
             .change(Some(work), AccountChange::SetColor(Some(green.into())))
             .expect("color");
         accounts
+            .change(Some(side), AccountChange::SetColor(None))
+            .expect("no color");
+        accounts
             .change(Some(work), AccountChange::Rename(Some("Work".into())))
             .expect("name");
         set_accounts(&accounts, cx);

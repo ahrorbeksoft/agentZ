@@ -487,3 +487,15 @@ pub(crate) fn link_host(url: &str) -> Option<String> {
 pub(crate) fn copy_to_clipboard(text: &str, cx: &mut App) {
     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ACCOUNT_COLORS, color_hex};
+
+    /// The server gives accounts colors from the menu's, as kept.
+    #[test]
+    fn gives_accounts_the_colors_the_menu_lists() {
+        let listed = ACCOUNT_COLORS.map(|(_, kept, _)| color_hex(kept));
+        assert_eq!(listed, agentz_protocol::accounts::ACCOUNT_COLORS);
+    }
+}
