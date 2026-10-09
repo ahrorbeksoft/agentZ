@@ -140,7 +140,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `accounts/<agent id>/reader/` | server | Where the agent's reader runs its terminal UI (Droid's), with the settings it runs with |
 | `skills/<name>/` | server | agentZ's skills (Settings › Skills), each linked into every account's skills folder |
 | `skills.json` | server | The accounts each of agentZ's skills is kept off (its accounts menu) |
-| `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off |
+| `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off, and whether agentZ's own `agentz` server is on |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
@@ -438,7 +438,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`Request::SetMcpServerEnabled`). Add Server is Add Local Server (Server Name, Command,
   Arguments, Environment Variables) and Add Remote Server (Server Name, URL, Headers), Zed's
   form as a sub-page with its checks and words; Zed's timeout and OAuth client ID are left out,
-  ACP having neither (`Request::SaveMcpServer`). `start_thread` adds the enabled ones to the
+  ACP having neither (`Request::SaveMcpServer`). agentZ's own `agentz` server is listed first
+  (`McpTransport::Agentz`, which `mcp_servers::load` adds to the file's list while it's missing),
+  tagged Built-in, with its switch and accounts menu but no Configure or Uninstall, as Zed lists
+  an extension's server; the server refuses to configure or remove it. Off, or kept off an
+  account, it's left out of sessions started afterwards (`mcp_servers::gives_agentz`); the
+  agent's `AGENTZ_*` variables for the CLI stay. `start_thread` adds the enabled ones to the
   session's servers after `agentz` (`mcp_servers::for_session`; a bare command is looked up on
   the server's `PATH`, as ACP wants an absolute path), and `agent_thread`'s `open_session`
   leaves out HTTP and SSE servers its agent doesn't announce in `mcpCapabilities`. Agents that

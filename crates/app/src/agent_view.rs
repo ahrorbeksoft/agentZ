@@ -1811,12 +1811,14 @@ impl AgentView {
                     self.sync_markdown((index, 0), text, cx);
                 }
                 Entry::ToolCall(tool_call) => {
-                    let is_read = matches!(tool_call.kind, acp::ToolKind::Read);
+                    // A subagent's text is its report, which it writes in markdown.
+                    let is_subagent =
+                        matches!(ToolCallKind::of(tool_call), ToolCallKind::Subagent(_));
                     for (part, text) in tool_call.text.iter().enumerate() {
-                        let text = if is_read {
-                            as_code_block(text)
-                        } else {
+                        let text = if is_subagent {
                             Cow::Borrowed(text.as_str())
+                        } else {
+                            as_code_block(text)
                         };
                         self.sync_markdown((index, part + 1), &text, cx);
                     }
@@ -8983,9 +8985,9 @@ fn tool_output_style(is_terminal_tool: bool, window: &Window, cx: &App) -> Markd
     style
 }
 
-/// A read's text is the file as it is. Claude fences it as code, but Droid sends it bare, and
-/// as markdown its lines would join into paragraphs, `#` lines become headings and HTML show as
-/// loose text.
+/// A tool's output is shown as it was printed. Claude fences some of it as code, but most
+/// agents send it bare, and as markdown its lines would join into paragraphs, `#` lines become
+/// headings, `- ` lines bullets, `--` a dash and HTML loose text.
 fn as_code_block(text: &str) -> Cow<'_, str> {
     if text.trim().is_empty() || is_code_block(text) {
         return Cow::Borrowed(text);
@@ -11067,8 +11069,10 @@ mod tests {
         assert_eq!(as_code_block(""), "");
     }
 
+    /// Every tool's output shows as it was printed, not as markdown: a read's file, and a
+    /// command's output with lines markdown would turn into a dash and bullets.
     #[gpui::test]
-    fn a_read_shows_the_file_as_code(cx: &mut TestAppContext) {
+    fn tool_output_shows_as_printed(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         let mut read = tool_call(acp::ToolCallStatus::Completed);
@@ -11077,18 +11081,34 @@ mod tests {
             tool_call.title = "Read /tmp/demo/index.html".into();
             tool_call.text = vec!["<!doctype html>\n<html lang=\"en\">".into()];
         }
+        let mut command = tool_call(acp::ToolCallStatus::Completed);
+        if let Entry::ToolCall(tool_call) = &mut command {
+            tool_call.id = acp::ToolCallId::new("diff");
+            tool_call.kind = acp::ToolKind::Execute;
+            tool_call.title = "git diff".into();
+            tool_call.text = vec!["--- a/docs/backlog.md\n+++ b/docs/backlog.md\n- **old**".into()];
+        }
         thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(vec![Entry::UserMessage("Read it".into()), read], cx)
+            thread.set_entries_for_test(
+                vec![Entry::UserMessage("Read it".into()), read, command],
+                cx,
+            )
         });
         cx.run_until_parked();
-        let source = view.read_with(cx, |view, cx| {
-            view.markdowns
-                .get(&(1, 1))
-                .map(|markdown| markdown.read(cx).source().to_string())
-        });
+        let source = |entry: usize, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                view.markdowns
+                    .get(&(entry, 1))
+                    .map(|markdown| markdown.read(cx).source().to_string())
+            })
+        };
         assert_eq!(
-            source.as_deref(),
+            source(1, cx).as_deref(),
             Some("```\n<!doctype html>\n<html lang=\"en\">\n```")
+        );
+        assert_eq!(
+            source(2, cx).as_deref(),
+            Some("```\n--- a/docs/backlog.md\n+++ b/docs/backlog.md\n- **old**\n```")
         );
     }
 
