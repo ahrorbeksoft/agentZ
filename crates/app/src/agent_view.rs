@@ -20,8 +20,8 @@ use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FileDiff, PlanItem, SessionRestore, ToolCall,
-    without_handoff,
+    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, LostHistory, PlanItem,
+    SessionRestore, ToolCall, without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
@@ -5105,7 +5105,12 @@ impl AgentView {
     }
 
     fn render_restore_notice(&self, cx: &App) -> Option<AnyElement> {
-        let (title, description) = match self.thread.read(cx).session_restore()? {
+        let thread = self.thread.read(cx);
+        // The lost conversation's notice over the composer says it.
+        if thread.lost_history().is_some() {
+            return None;
+        }
+        let (title, description) = match thread.session_restore()? {
             SessionRestore::ResumedWithoutHistory => (
                 "Resumed Session",
                 "This agent does not support viewing previous messages. However, your session will still continue from where you last left off.",
@@ -5591,7 +5596,11 @@ impl AgentView {
     /// one (Zed's `retry_button`).
     fn render_not_sent(&self, index: usize, cx: &Context<Self>) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
-        thread.failed_message()?;
+        // Without the conversation, it goes only if the user wants it to.
+        let retry_label = match thread.failed_message()? {
+            FailedMessage::LostHistory => "Send Anyway",
+            FailedMessage::NeedsLogin | FailedMessage::TurnFailed => "Retry",
+        };
         let last_message = thread
             .entries()
             .iter()
@@ -5617,7 +5626,7 @@ impl AgentView {
                 .child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
                 .child(
                     div().debug_selector(|| "retry-message".into()).child(
-                        Button::new("retry-message", "Retry")
+                        Button::new("retry-message", retry_label)
                             .style(ButtonStyle::Transparent)
                             .label_size(LabelSize::XSmall)
                             .color(Color::Accent)
@@ -5656,6 +5665,62 @@ impl AgentView {
                                     })),
                             ),
                         ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The agent couldn't load the thread's conversation, so messages sent here wait ("Not sent
+    /// · Send Anyway"): a line over the composer says why, and continues in a new thread on the
+    /// same agent and account, which brings the conversation along.
+    fn render_lost_history_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.is_archived {
+            return None;
+        }
+        let lost = self.thread.read(cx).lost_history()?;
+        let agent_name = self.agent_name(cx);
+        let why = match lost {
+            LostHistory::AccountChanged => format!(
+                "{agent_name} is logged in to another account now and couldn't load this \
+                 conversation there."
+            ),
+            LostHistory::Unexplained => format!("{agent_name} couldn't load this conversation."),
+        };
+        let description = format!(
+            "{why} Continue in a new thread to bring it along. Messages sent here wait until you \
+             send them anyway, without it."
+        );
+        // A subthread belongs to its task.
+        let continue_button = self
+            .agent_id
+            .clone()
+            .zip(self.store.read(cx).thread(self.thread_id))
+            .filter(|_| !self.is_subthread(cx))
+            .map(|(agent_id, thread)| {
+                let account = thread.account;
+                div()
+                    .debug_selector(|| "lost-history-continue".into())
+                    .child(
+                        ActionButton::new("lost-history-continue", "Continue in New Thread")
+                            .style(ActionStyle::Primary)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.continue_with(agent_id.clone(), AccountChoice::of(account), cx)
+                            })),
+                    )
+            });
+        Some(
+            div()
+                .debug_selector(|| "lost-history-notice".into())
+                .px_2()
+                .pb_2()
+                .child(
+                    Callout::new()
+                        .severity(Severity::Warning)
+                        .title("Conversation not loaded")
+                        .description(description)
+                        .when_some(continue_button, |callout, button| {
+                            callout.actions_slot(button)
+                        }),
                 )
                 .into_any_element(),
         )
@@ -8873,6 +8938,7 @@ impl Render for AgentView {
                     .children(self.render_request_elicitations(cx))
                     .children(self.render_limit_notice(cx))
                     .children(self.render_login_notice(has_rows, cx))
+                    .children(self.render_lost_history_notice(cx))
                     .children(self.render_errors(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
@@ -9622,7 +9688,7 @@ fn summarize_work(entries: &[Entry]) -> String {
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
-    use agentz_protocol::thread::{FailedMessage, QueuedMessage};
+    use agentz_protocol::thread::QueuedMessage;
     use gpui::{TestAppContext, VisualTestContext};
     use projects::{Project, ProjectsSnapshot};
 
@@ -11637,6 +11703,71 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("retry-message").is_none());
+    }
+
+    /// A thread whose conversation didn't load says why over the composer, with Continue in New
+    /// Thread on its own agent and account, and its message waits for Send Anyway.
+    #[gpui::test]
+    fn a_lost_conversation_offers_a_new_thread(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::ContinueThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
+                    _ => None,
+                }
+            });
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Go on".into())], cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.status = ConnectionStatus::Ready;
+                    state.session_restore = Some(SessionRestore::Unavailable);
+                    state.lost_history = Some(LostHistory::AccountChanged);
+                    state.failed_message = Some(FailedMessage::LostHistory);
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("lost-history-notice").is_some());
+
+        click("retry-message", cx);
+        assert!(
+            requests
+                .borrow()
+                .iter()
+                .any(|request| matches!(request, Request::RetryMessage(_)))
+        );
+        click("lost-history-continue", cx);
+        assert!(requests.borrow().iter().any(|request| matches!(
+            request,
+            Request::ContinueThread {
+                thread_id: ThreadId(2),
+                account: AccountChoice::External,
+                ..
+            }
+        )));
+
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.lost_history = None;
+                    state.failed_message = None;
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("lost-history-notice").is_none());
     }
 
     fn login_methods() -> Vec<acp::AuthMethod> {

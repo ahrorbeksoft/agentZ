@@ -187,6 +187,10 @@ pub struct Thread {
     /// The agent's ACP session, so the conversation can be restored after a restart.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// The login the agent reported while that session was in use. A session that doesn't
+    /// load while the agent reports another one was lost to the account change.
+    #[serde(default)]
+    pub session_login: Option<LoginIdentity>,
     /// Set when the thread is archived; archived threads only show in Thread History.
     #[serde(default)]
     pub archived_at: Option<SystemTime>,
@@ -255,6 +259,30 @@ pub struct Thread {
     /// The mentions in [`Thread::unsent_text`], in order, so they come back as chips.
     #[serde(default)]
     pub unsent_mentions: Vec<UnsentMention>,
+}
+
+/// What tells one of an agent's logins from another, from what the agent reports of it: the
+/// account's email or where an API key comes from, or the kind of login alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginIdentity {
+    pub kind: String,
+    /// The email or key source, when the agent says which.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl LoginIdentity {
+    /// Whether `other` is a different login. One the agent reported without its email (Claude
+    /// Agent's CLI check leaves it out at times) can't be told from one with it.
+    pub fn differs_from(&self, other: &LoginIdentity) -> bool {
+        self.kind != other.kind
+            || matches!((&self.key, &other.key), (Some(key), Some(other)) if key != other)
+    }
+
+    /// Whether `other` is this login, saying more about it.
+    pub fn is_completed_by(&self, other: &LoginIdentity) -> bool {
+        !self.differs_from(other) && self.key.is_none() && other.key.is_some()
+    }
 }
 
 /// A mention in a thread's [`Thread::unsent_text`].
@@ -895,6 +923,7 @@ impl ProjectStore {
             last_activity_at: Some(now),
             created_at: Some(now),
             session_id: None,
+            session_login: None,
             archived_at: None,
             pinned_at: None,
             pin_order_key: None,
@@ -1438,6 +1467,17 @@ impl ProjectStore {
             && thread.session_id.as_deref() != Some(session_id.as_str())
         {
             thread.session_id = Some(session_id);
+            // The new session's login comes once the agent reports it.
+            thread.session_login = None;
+            self.changed();
+        }
+    }
+
+    pub fn set_session_login(&mut self, id: ThreadId, login: LoginIdentity) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.session_login.as_ref() != Some(&login)
+        {
+            thread.session_login = Some(login);
             self.changed();
         }
     }

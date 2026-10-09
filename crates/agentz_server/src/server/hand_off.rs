@@ -281,6 +281,11 @@ impl Server {
             if let Some(cwd) = self.projects.thread_folder(thread_id) {
                 thread.set_turn_hook(self.turn_hook(cwd, thread_id));
             }
+            thread.set_session_login(
+                self.projects
+                    .thread(thread_id)
+                    .and_then(|record| record.session_login.clone()),
+            );
             thread.set_attachments(agent_thread::Attachments::for_thread(
                 &self.data_dir,
                 thread_id,

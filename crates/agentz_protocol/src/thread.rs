@@ -312,22 +312,7 @@ impl AuthStatus {
 }
 
 /// What tells one login from another: see [`AuthStatus::identity`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoginIdentity {
-    pub kind: String,
-    /// The email or key source, when the agent says which.
-    #[serde(default)]
-    pub key: Option<String>,
-}
-
-impl LoginIdentity {
-    /// Whether `other` is a different login. One the agent reported without its email (Claude
-    /// Agent's CLI check leaves it out at times) can't be told from one with it.
-    pub fn differs_from(&self, other: &LoginIdentity) -> bool {
-        self.kind != other.kind
-            || matches!((&self.key, &other.key), (Some(key), Some(other)) if key != other)
-    }
-}
+pub use projects::LoginIdentity;
 
 /// How the thread's ACP session was set up when the agent started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +325,15 @@ pub enum SessionRestore {
     ResumedWithoutHistory,
     /// The previous session couldn't be restored, so a new one was started.
     Unavailable,
+}
+
+/// Why the thread's new session is without its conversation ([`ThreadState::lost_history`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LostHistory {
+    /// The agent is logged in to another account than the one the session was used with.
+    AccountChanged,
+    /// The agent didn't say why.
+    Unexplained,
 }
 
 /// Settings applied to new sessions (not to loaded ones), as Zed's per-agent defaults are.
@@ -361,6 +355,10 @@ pub struct ThreadState {
     /// Session modes from agents that predate config options.
     pub modes: Option<acp::SessionModeState>,
     pub session_restore: Option<SessionRestore>,
+    /// The previous session couldn't be restored, so the agent doesn't know the conversation.
+    /// Messages fail ([`FailedMessage::LostHistory`]) rather than go to it, until the user sends
+    /// one anyway ([`crate::Request::RetryMessage`]).
+    pub lost_history: Option<LostHistory>,
     pub permission_requests: Vec<PermissionRequest>,
     pub capabilities: acp::AgentCapabilities,
     /// Whether the agent takes messages into a running turn: the `_session/steering`
@@ -572,6 +570,17 @@ impl ThreadView {
 
     pub fn session_restore(&self) -> Option<SessionRestore> {
         self.state.session_restore
+    }
+
+    pub fn lost_history(&self) -> Option<LostHistory> {
+        self.state.lost_history
+    }
+
+    /// Whether messages waiting to go (queued ones, finished tasks') wait for the user: a
+    /// message failed for the lost conversation, and Send Anyway is theirs to press. Until one
+    /// has failed, the next goes, and fails to be that message.
+    pub fn waits_for_send_anyway(&self) -> bool {
+        self.state.lost_history.is_some() && self.state.failed_message.is_some()
     }
 
     pub fn config_options(&self) -> &[acp::SessionConfigOption] {
@@ -839,6 +848,8 @@ pub enum FailedMessage {
     NeedsLogin,
     /// The agent's turn on it ended with [`ThreadState::turn_error`].
     TurnFailed,
+    /// It would have gone to a session without the conversation ([`ThreadState::lost_history`]).
+    LostHistory,
 }
 
 /// The conversation a thread continues with another agent, sent with its first message

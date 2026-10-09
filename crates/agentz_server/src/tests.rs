@@ -22,7 +22,8 @@ use agentz_protocol::terminal::{
     TerminalSelectionKind, TerminalSelectionUpdate,
 };
 use agentz_protocol::thread::{
-    ConnectionStatus, Entry, FailedMessage, LoginInput, ThreadView, api_key_meta, login_input,
+    ConnectionStatus, Entry, FailedMessage, LoginInput, LostHistory, ThreadView, api_key_meta,
+    login_input,
 };
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -7578,7 +7579,18 @@ impl TestClient {
 /// app to come back, and for the server to come back, and goes once the turn ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn queued_messages_outlive_the_app_and_the_server() {
-    let Some(server) = TestServer::start() else {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    // The new server's agent loads the session.
+    let history_dir = tempfile::tempdir().expect("temp dir");
+    let history = history_dir.path().join("history.json");
+    command.args.push(history.to_string_lossy().into_owned());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command.clone(),
+    ) else {
         return;
     };
     let mut client = server.connect().await;
@@ -7620,7 +7632,8 @@ async fn queued_messages_outlive_the_app_and_the_server() {
     drop(client);
 
     // So does a new server, which sends it once the thread's agent is back.
-    let Some(server) = TestServer::start_with(server.data_dir, server.project_dir) else {
+    let Some(server) = TestServer::start_with_agent(server.data_dir, server.project_dir, command)
+    else {
         return;
     };
     let mut client = server.connect().await;
@@ -7707,6 +7720,151 @@ async fn conversations_outlive_the_server() {
 
     client.ok(Request::DeleteThread(thread_id)).await;
     assert!(!transcript.exists());
+}
+
+/// A thread whose session doesn't load on the account the agent is logged in to now (another
+/// login made in a terminal) doesn't go on without its conversation: its messages, its queue
+/// and other agents' messages wait for the user, who sends anyway or continues in a new thread
+/// with the conversation.
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_that_lost_their_conversation_wait_for_the_user() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let history_dir = tempfile::tempdir().expect("temp dir");
+    let history = history_dir.path().join("history.json");
+    command.args.push(history.to_string_lossy().into_owned());
+    let home = tempfile::tempdir().expect("temp dir");
+    command.env.insert(
+        "MOCK_HOME".into(),
+        home.path().to_string_lossy().into_owned(),
+    );
+    let email = home.path().join("email");
+    std::fs::write(&email, "a@example.com").expect("written");
+    let login = |email: &str| projects::LoginIdentity {
+        kind: "account".into(),
+        key: Some(email.into()),
+    };
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command.clone(),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.wait_until_ready(thread_id).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == "Echo: hello"
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client
+                .project_thread(thread_id)
+                .and_then(|thread| thread.session_login.clone())
+                == Some(login("a@example.com"))
+        })
+        .await;
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+
+    std::fs::write(&email, "b@example.com").expect("written");
+    let Some(server) = TestServer::start_with_agent(server.data_dir, server.project_dir, command)
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    client.subscribe_thread(connection).await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            thread.status() == &ConnectionStatus::Ready
+                && thread.lost_history() == Some(LostHistory::AccountChanged)
+        })
+        .await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("go on"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client.thread(connection).failed_message() == Some(FailedMessage::LostHistory)
+        })
+        .await;
+    client.queue(thread_id, "later").await;
+
+    let Response::ThreadCreated(new_id) = client
+        .ok(Request::ContinueThread {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+            account: AccountChoice::of(None),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let new = ConnectionId::Thread(new_id);
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(new_id),
+            "agentz_thread_send",
+            json!({"threadId": thread_id.0, "message": "are you there?"}),
+        )
+        .await;
+    assert_eq!(code, "thread_not_sendable");
+    client.wait_until_ready(new_id).await;
+    client
+        .ok(Request::Prompt {
+            connection: new,
+            prompt: PromptPart::text("next"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(new);
+            !thread.is_working() && agent_text(thread) == "Echo: next [with agentz://handoff]"
+        })
+        .await;
+    assert_eq!(client.queued_texts(thread_id), ["later"]);
+    assert_eq!(agent_text(client.thread(connection)), "Echo: hello");
+
+    client.ok(Request::RetryMessage(connection)).await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == "Echo: helloEcho: go onEcho: later"
+        })
+        .await;
+    let thread = client.thread(connection);
+    assert_eq!(thread.lost_history(), None);
+    assert_eq!(thread.failed_message(), None);
+    client
+        .wait_until(|client| {
+            client
+                .project_thread(thread_id)
+                .and_then(|thread| thread.session_login.clone())
+                == Some(login("b@example.com"))
+        })
+        .await;
 }
 
 /// Steering, for an agent that can't take a message into its turn: the message goes first and

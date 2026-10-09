@@ -485,6 +485,23 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   own entries straight into the file (`TranscriptRef`), without copying the conversation or
   holding its JSON in memory: with a copy of a long conversation every 2 seconds, the server
   held many times its size, and grew to gigabytes over a day of work.
+- **Lost conversations** (`AgentThread::{session_opened, note_session_login, why_history_lost}`,
+  `ThreadState::lost_history`, `Thread::session_login`, `agent_view.rs`'s
+  `render_lost_history_notice`; feedback entry 23, option B): a thread whose session doesn't
+  load or resume (`SessionRestore::Unavailable`) gets a new one without the conversation, and
+  doesn't go on in it unasked: the message waiting for the session, or the next one the user,
+  the queue or a finished task sends, fails with `FailedMessage::LostHistory` and is marked
+  "Not sent · Send Anyway" (Retry, which sends it to the new session). Queued messages and
+  finished tasks' wait behind it (`ThreadView::waits_for_send_anyway`), and
+  `agentz_thread_send` refuses other agents' messages. A
+  notice over the composer says why, with Continue in New Thread, the thread's own agent and
+  account with the conversation as a handoff. The thread keeps the login the agent reported
+  (`_auth/status_update`, from Claude Agent and Codex) while its session was in use, and when
+  it now reports another one, the notice says the agent is logged in to another account and
+  couldn't load it there (`LostHistory::AccountChanged`), as when the user logs it in to
+  another account in a terminal. A session that loads on the other account (Claude Agent and
+  Codex continue them) goes on as before, and keeps that login from then on. Agents that
+  report no login get the notice without the reason.
 - **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`):
   Zed's message editor. One line, growing with the text to eight, then scrolling. Shift-Enter
   makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's
@@ -596,7 +613,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`FailedMessage::TurnFailed`, its callout "The agent stopped with an error") has the mark too:
   Claude Agent and Codex retry a lost connection themselves, and the prompt fails once they
   give up. The failed message and its error stay across a reload of the agent, and a new
-  message takes its place. The retried reply starts a message of its own.
+  message takes its place. The retried reply starts a message of its own. A message that would
+  go to a session without the conversation fails too, with Send Anyway (see Lost
+  conversations).
 - **Background tasks** (`AgentThread::{apply_background_task_update, stop_background_task}`,
   `AgentView::render_background_tasks_section`; t3code's pending background work, new UI in the
   Agents section's style): Claude Agent reports what it leaves running after a turn (commands

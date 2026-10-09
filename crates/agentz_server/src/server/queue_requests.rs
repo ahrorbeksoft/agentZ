@@ -289,7 +289,8 @@ impl Server {
                 continue;
             };
             // Archived threads take no messages until they're unarchived, and paused ones are
-            // handed to the next server.
+            // handed to the next server. One that lost its conversation sends its first message
+            // only to fail it, for the user's Send Anyway.
             let is_archived = self
                 .projects
                 .thread(thread_id)
@@ -298,6 +299,7 @@ impl Server {
                 || thread.is_paused()
                 || thread.is_working()
                 || *thread.status() != ConnectionStatus::Ready
+                || thread.waits_for_send_anyway()
                 || self.has_waiting_prompt(thread_id)
             {
                 continue;

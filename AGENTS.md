@@ -156,7 +156,9 @@ From Zed's guidelines, which this code follows:
   when, in seconds since the epoch), and a `windows` file there (a JSON array of `label`,
   `used_percent`, `resets_in` and `length`, in seconds) replaces that window with those, for
   several windows at different paces. An `email` file there gives its login that email in place
-  of mock@example.com. An `overage` file in the home (empty, `DroidCore` or
+  of mock@example.com, and a session recorded with a history path (its argument) then loads
+  only for the login that prompted it, as agents keep sessions per account. An `overage` file
+  in the home (empty, `DroidCore` or
   `ExtraUsage`) makes it Droid-like at its limit: the read has Droid's pools, a balance and
   that choice, and with a choice, prompts go on past the limit. A `limit_resets` file (a
   count) gives it Codex's limit resets, which `--usage` with `AGENTZ_LIMIT_RESET_ATTEMPT`

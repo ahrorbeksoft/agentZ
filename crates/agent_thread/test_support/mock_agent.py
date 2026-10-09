@@ -102,6 +102,11 @@ Claude Agent does when asked to, and it refuses a message of "refuse".
 With MOCK_CHILD_PID_FILE set, it starts a long `sleep` as Factory Droid starts a worker for each
 session, and writes its process id to that file.
 
+Given a path as its argument, it records the session's updates there, for `session/load` to
+replay. That history belongs to the login that sent the session's first prompt (its email is
+kept in `<path>.login`), and `session/load` fails with "Resource not found" for another login,
+as agents keep a session with the account it ran on.
+
 With MOCK_SESSIONS_FILE set, it lists the sessions in that file (`session/list`, two to a
 page): a JSON array of ACP session infos, each with an optional "history" of session updates
 that `session/load` replays for it. Listing needs a login, as sessions do.
@@ -302,6 +307,10 @@ if os.environ.get("MOCK_CHILD_PID_FILE"):
 
 # Optional path where conversations are recorded so `session/load` can replay them.
 HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
+# The email of the login whose session the history is, beside it.
+HISTORY_LOGIN_PATH = HISTORY_PATH + ".login" if HISTORY_PATH else None
+# The session opened with `session/new` has had no prompt yet.
+session_is_new = False
 
 LONG_BUILD_OUTPUT = "".join(f"   Compiling page {n}/60\n" for n in range(1, 61))
 # A 1×1 PNG, for the "image" prompt.
@@ -796,6 +805,7 @@ for line in sys.stdin:
     elif method == "session/new":
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)
+        session_is_new = True
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"sessionId": "session-1", "configOptions": config_options()}})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {
@@ -804,6 +814,12 @@ for line in sys.stdin:
                 {"name": "init", "description": "Create an AGENTS.md for this project"},
                 {"name": "compact", "description": "Summarize the conversation to free up context",
                  "input": {"hint": "optional focus"}}]}}})
+    elif (method == "session/load" and not SESSIONS_FILE
+          and read_text(HISTORY_LOGIN_PATH) not in (None, email())):
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "error": {"code": -32002, "message": "Resource not found",
+                        "data": {"details": "No conversation found with session ID: "
+                                            + message["params"]["sessionId"]}}})
     elif method == "session/load":
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)
@@ -855,6 +871,10 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32000, "message": "Authentication required"}})
     elif method == "session/prompt":
+        if session_is_new and HISTORY_LOGIN_PATH:
+            with open(HISTORY_LOGIN_PATH, "w") as file:
+                file.write(email())
+        session_is_new = False
         params = message["params"]
         prompt_text = "".join(block.get("text", "") for block in params["prompt"]
                               if block.get("type", "text") == "text")

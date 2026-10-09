@@ -1464,6 +1464,7 @@ impl Server {
             .clone()
             .filter(|_| !never_prompted)
             .map(acp::SessionId::new);
+        let session_login = thread.session_login.clone();
         if let Some(task) = thread.task.as_ref().filter(|task| task.is_agents_own()) {
             let running = task.outcome.is_none();
             let agent_name = thread
@@ -1544,6 +1545,7 @@ impl Server {
             previous_session,
             Some(self.agent_terminal_host(thread_id)),
         );
+        agent_thread.set_session_login(session_login);
         if let Some(handoff) = continuations::load(&self.data_dir, thread_id)
             .log_err()
             .flatten()
@@ -2068,6 +2070,9 @@ impl Server {
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::SessionStarted(session)) => {
                     self.projects
                         .set_thread_session(thread_id, session.0.to_string())
+                }
+                (ConnectionId::Thread(thread_id), AgentThreadEvent::SessionLogin(login)) => {
+                    self.projects.set_session_login(thread_id, login)
                 }
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::TitleChanged(title)) => self
                     .projects

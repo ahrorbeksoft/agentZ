@@ -322,7 +322,8 @@ impl Server {
                     self.follow_ups.remove(&thread_id);
                     continue;
                 }
-                ConnectionStatus::Ready if !thread.is_working() => {}
+                ConnectionStatus::Ready
+                    if !thread.is_working() && !thread.waits_for_send_anyway() => {}
                 _ => continue,
             }
             let Some(queue) = self.follow_ups.get_mut(&thread_id) else {
@@ -1569,6 +1570,17 @@ impl Server {
                 ));
             }
             _ => {}
+        }
+        if self
+            .threads
+            .get(&thread_id)
+            .is_some_and(|thread| thread.lost_history().is_some())
+        {
+            return Err(failure(
+                "thread_not_sendable",
+                "The thread's agent couldn't load its conversation, and the user decides how it \
+                 goes on.",
+            ));
         }
         let from = caller.creator();
         let delivery = if !self.is_busy(thread_id) {

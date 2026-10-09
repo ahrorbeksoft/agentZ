@@ -29,8 +29,9 @@ use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
     AuthStatus, BackgroundTask, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry,
-    FailedMessage, FileDiff, PendingHandoff, PermissionOption, PermissionRequest, PlanItem,
-    QueuedMessage, SessionDefaults, SessionRestore, ThreadState, ThreadView, ToolCall, TurnTime,
+    FailedMessage, FileDiff, LoginIdentity, LostHistory, PendingHandoff, PermissionOption,
+    PermissionRequest, PlanItem, QueuedMessage, SessionDefaults, SessionRestore, ThreadState,
+    ThreadView, ToolCall, TurnTime,
 };
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -74,6 +75,9 @@ pub enum AgentThreadEvent {
     WorkingChanged(bool),
     /// The ACP session to restore the thread from later: sent once the session has a prompt.
     SessionStarted(acp::SessionId),
+    /// The login the agent reported while that session is in use, to start the thread with
+    /// later ([`AgentThread::set_session_login`]).
+    SessionLogin(LoginIdentity),
     /// The first prompt of a new conversation was sent; useful as a title.
     FirstPrompt(String),
     /// The agent named the session.
@@ -352,6 +356,8 @@ pub struct AgentThread {
     /// Set once the agent is initialized; kept so a session can be (re)opened after logging in.
     connection: Option<ConnectionTo<Agent>>,
     previous_session: Option<acp::SessionId>,
+    /// The login the agent reported while `previous_session` was in use.
+    session_login: Option<LoginIdentity>,
     session: Option<Session>,
     pending_title: Option<String>,
     queued_prompts: Vec<Vec<MessagePart>>,
@@ -743,6 +749,7 @@ impl AgentThread {
             next_elicitation_id: 0,
             connection: None,
             previous_session: None,
+            session_login: None,
             session: None,
             pending_title: None,
             queued_prompts: Vec::new(),
@@ -801,6 +808,13 @@ impl AgentThread {
         self.view.state.sent_times = transcript.sent_times;
         self.entry_changed(0);
         self.has_conversation = true;
+    }
+
+    /// The login the agent reported while the previous session was in use
+    /// ([`AgentThreadEvent::SessionLogin`]), to tell whether a session that doesn't load was
+    /// lost to an account change. Set it right after starting.
+    pub fn set_session_login(&mut self, login: Option<LoginIdentity>) {
+        self.session_login = login;
     }
 
     /// Changes whenever [`Self::transcript`] does, and is `None` while that is.
@@ -948,7 +962,7 @@ impl AgentThread {
                 }
                 if std::mem::take(&mut self.waits_for_login) {
                     self.view.state.status = ConnectionStatus::AuthRequired;
-                    self.queued_prompts_need_login();
+                    self.fail_queued_prompts(FailedMessage::NeedsLogin);
                     return;
                 }
                 // A login session opens an empty session too: it is how the login
@@ -1058,6 +1072,11 @@ impl AgentThread {
                 self.view.state.logged_in = Some(status.is_logged_in());
                 self.emit(AgentThreadEvent::AccountReported(status.clone()));
                 self.view.state.auth_status = Some(status);
+                self.note_session_login();
+                // The agent may report its login only after the session opened.
+                if self.view.state.lost_history.is_some() {
+                    self.view.state.lost_history = Some(self.why_history_lost());
+                }
             }
             MessageKind::LoggedOut(result) => match result {
                 Ok(()) => {
@@ -1747,6 +1766,19 @@ impl AgentThread {
                 if setup.restore == SessionRestore::New && self.opens_session {
                     self.apply_defaults();
                 }
+                // Going on in the new session would have the agent answer without the
+                // conversation, unaware of it, so the user decides how it goes on.
+                self.view.state.lost_history =
+                    (setup.restore == SessionRestore::Unavailable).then(|| self.why_history_lost());
+                if self.view.state.lost_history.is_some() {
+                    // One that failed before (for want of a login, often) would go there too.
+                    if self.view.state.failed_message.is_some() {
+                        self.view.state.failed_message = Some(FailedMessage::LostHistory);
+                    }
+                    self.fail_queued_prompts(FailedMessage::LostHistory);
+                    self.set_working(false);
+                    return;
+                }
                 for prompt in std::mem::take(&mut self.queued_prompts) {
                     self.send_to_agent(prompt);
                 }
@@ -1755,7 +1787,7 @@ impl AgentThread {
                 self.view.state.status = ConnectionStatus::AuthRequired;
                 self.found_logged_out();
                 self.view.state.auth_description = auth_description(&error);
-                self.queued_prompts_need_login();
+                self.fail_queued_prompts(FailedMessage::NeedsLogin);
                 self.set_working(false);
             }
             Err(error) => self.fail(format!("starting a session: {}", error_message(&error))),
@@ -1779,10 +1811,11 @@ impl AgentThread {
         }
     }
 
-    /// The agent asked for a login before its session opened, so the message waiting for the
-    /// session fails, as one the agent asks for a login at does. The user retries it once
-    /// logged in, rather than it going by itself after the login.
-    fn queued_prompts_need_login(&mut self) {
+    /// The message waiting for the session can't go to it: the agent asked for a login before
+    /// its session opened (and the message fails as one the agent asks for a login at does), or
+    /// the session has lost the conversation. The user retries it, rather than it going by
+    /// itself after a login.
+    fn fail_queued_prompts(&mut self, reason: FailedMessage) {
         // Only one waits: the thread works while it does, and takes no other.
         let Some(parts) = self.queued_prompts.pop() else {
             return;
@@ -1793,11 +1826,12 @@ impl AgentThread {
             parts,
             handoff: None,
         });
-        self.message_failed(FailedMessage::NeedsLogin);
+        self.message_failed(reason);
     }
 
     /// Sends the message that didn't get through ([`ThreadState::failed_message`]) again, as it
-    /// went, once the agent is ready for it. The thread shows it once.
+    /// went, once the agent is ready for it. The thread shows it once. One that failed for the
+    /// lost conversation goes to the new session anyway, and so do the messages after it.
     pub fn retry_message(&mut self) {
         if self.view.state.failed_message.is_none()
             || self.view.state.status != ConnectionStatus::Ready
@@ -1808,6 +1842,9 @@ impl AgentThread {
         let Some(message) = self.last_message.take() else {
             return;
         };
+        if self.view.state.failed_message == Some(FailedMessage::LostHistory) {
+            self.view.state.lost_history = None;
+        }
         self.view.state.failed_message = None;
         self.view.state.turn_error = None;
         if message.handoff.is_some() {
@@ -2074,6 +2111,13 @@ impl AgentThread {
         self.view.state.failed_message = None;
         self.last_message = None;
         match self.view.state.status {
+            ConnectionStatus::Ready if self.view.state.lost_history.is_some() => {
+                self.last_message = Some(SentMessage {
+                    parts,
+                    handoff: None,
+                });
+                self.message_failed(FailedMessage::LostHistory);
+            }
             ConnectionStatus::Ready => self.send_to_agent(parts),
             ConnectionStatus::Connecting => {
                 self.queued_prompts.push(parts);
@@ -2203,13 +2247,58 @@ impl AgentThread {
         let Some(session) = &self.session else {
             return;
         };
-        if self.previous_session.as_ref() == Some(&session.session_id) {
-            return;
+        if self.previous_session.as_ref() != Some(&session.session_id) {
+            let session_id = session.session_id.clone();
+            // Later retries should restore this session rather than start another.
+            self.previous_session = Some(session_id.clone());
+            self.session_login = None;
+            self.emit(AgentThreadEvent::SessionStarted(session_id));
         }
-        let session_id = session.session_id.clone();
-        // Later retries should restore this session rather than start another.
-        self.previous_session = Some(session_id.clone());
-        self.emit(AgentThreadEvent::SessionStarted(session_id));
+        self.note_session_login();
+    }
+
+    /// Keeps the login the agent reports while the session to restore is open: an agent that
+    /// goes on with a session on another account (Claude Agent, Codex) uses it there from now.
+    fn note_session_login(&mut self) {
+        let in_use = self
+            .session
+            .as_ref()
+            .is_some_and(|session| self.previous_session.as_ref() == Some(&session.session_id));
+        let Some(status) = self
+            .view
+            .state
+            .auth_status
+            .as_ref()
+            .filter(|status| in_use && status.is_logged_in())
+        else {
+            return;
+        };
+        let login = status.identity();
+        let is_news = self
+            .session_login
+            .as_ref()
+            .is_none_or(|known| known.differs_from(&login) || known.is_completed_by(&login));
+        if is_news {
+            self.session_login = Some(login.clone());
+            self.emit(AgentThreadEvent::SessionLogin(login));
+        }
+    }
+
+    /// Why the previous session didn't load: as far as agentZ can tell, because the agent
+    /// reports another login than the one that session was used with.
+    fn why_history_lost(&self) -> LostHistory {
+        let account_changed = self
+            .session_login
+            .as_ref()
+            .zip(self.view.state.auth_status.as_ref())
+            .is_some_and(|(known, status)| {
+                status.is_logged_in() && known.differs_from(&status.identity())
+            });
+        if account_changed {
+            LostHistory::AccountChanged
+        } else {
+            LostHistory::Unexplained
+        }
     }
 
     /// The message as the agent takes it.
@@ -5048,7 +5137,14 @@ mod tests {
     /// reload, and Retry sends the message again.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_turn_is_retried() {
-        let Some(command) = mock_agent(&[]) else {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        // The reloaded agent loads the session.
+        let Some(command) = mock_agent(&[history_file]) else {
             return;
         };
         let mut thread = start(command, None);
@@ -5449,6 +5545,121 @@ mod tests {
         assert_eq!(
             second.thread.entries()[1],
             Entry::AgentMessage("Echo: hello".into())
+        );
+    }
+
+    /// A session that doesn't load leaves the new one without the conversation: messages fail
+    /// rather than go to an agent that doesn't know it, until the user sends one anyway. When
+    /// the agent is logged in to another account than the session ran on, the thread says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn holds_messages_when_the_conversation_is_lost() {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(mut command) = mock_agent(&[history_file]) else {
+            return;
+        };
+        let home = tempfile::tempdir().expect("temp dir");
+        command.env.insert(
+            "MOCK_HOME".into(),
+            home.path().to_string_lossy().into_owned(),
+        );
+        let email = home.path().join("email");
+        std::fs::write(&email, "a@example.com").expect("written");
+        let session_logins = |thread: &TestThread| -> Vec<LoginIdentity> {
+            thread
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentThreadEvent::SessionLogin(login) => Some(login.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let login = |email: &str| LoginIdentity {
+            kind: "account".into(),
+            key: Some(email.into()),
+        };
+
+        let mut first = start(command.clone(), None);
+        first
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        first.update(|thread| thread.send("hello".into()));
+        first
+            .wait_until(|thread| !thread.is_working() && thread.entries().len() >= 3)
+            .await;
+        assert_eq!(session_logins(&first), [login("a@example.com")]);
+
+        let session = Some(acp::SessionId::new("session-1"));
+        let mut same = start(command.clone(), session.clone());
+        same.update(|thread| thread.set_session_login(Some(login("a@example.com"))));
+        same.wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(same.thread.session_restore(), Some(SessionRestore::Loaded));
+        assert_eq!(same.thread.lost_history(), None);
+        drop(same);
+
+        std::fs::write(&email, "b@example.com").expect("written");
+        let mut other = start(command, session);
+        other.update(|thread| thread.set_session_login(Some(login("a@example.com"))));
+        // Sent while the session opens, it waits for it.
+        other.update(|thread| thread.send("go on".into()));
+        other
+            .wait_until(|thread| {
+                thread.failed_message() == Some(FailedMessage::LostHistory)
+                    && thread.lost_history() == Some(LostHistory::AccountChanged)
+            })
+            .await;
+        assert_eq!(
+            other.thread.session_restore(),
+            Some(SessionRestore::Unavailable)
+        );
+        assert!(!other.thread.is_working());
+        other.update(|thread| thread.send("are you there?".into()));
+        assert_eq!(
+            other.thread.failed_message(),
+            Some(FailedMessage::LostHistory)
+        );
+        assert!(!other.thread.is_working());
+        assert!(session_logins(&other).is_empty());
+
+        other.update(AgentThread::retry_message);
+        other
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && thread
+                        .entries()
+                        .contains(&Entry::AgentMessage("Echo: are you there?".into()))
+            })
+            .await;
+        assert_eq!(other.thread.failed_message(), None);
+        assert_eq!(other.thread.lost_history(), None);
+        assert_eq!(session_logins(&other), [login("b@example.com")]);
+        other.update(|thread| thread.send("next".into()));
+        other
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && thread
+                        .entries()
+                        .contains(&Entry::AgentMessage("Echo: next".into()))
+            })
+            .await;
+        let replies: Vec<&Entry> = other
+            .thread
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, Entry::AgentMessage(_)))
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                &Entry::AgentMessage("Echo: are you there?".into()),
+                &Entry::AgentMessage("Echo: next".into())
+            ]
         );
     }
 
