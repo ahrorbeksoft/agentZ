@@ -529,6 +529,30 @@ pub struct Transcript {
     pub sent_times: Vec<(usize, SystemTime)>,
 }
 
+/// A [`Transcript`] borrowed from its thread, which saves in the same form. The server saves
+/// it every few seconds while the thread works, and copying a long conversation each time
+/// left it holding many times the conversation's size in memory.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TranscriptRef<'a> {
+    pub entries: &'a [Entry],
+    pub plan: &'a [PlanItem],
+    pub finished_turns: &'a [TurnTime],
+    pub prompts_from_agents: &'a [(usize, projects::ThreadCreator)],
+    pub sent_times: &'a [(usize, SystemTime)],
+}
+
+impl From<TranscriptRef<'_>> for Transcript {
+    fn from(transcript: TranscriptRef<'_>) -> Self {
+        Self {
+            entries: transcript.entries.to_vec(),
+            plan: transcript.plan.to_vec(),
+            finished_turns: transcript.finished_turns.to_vec(),
+            prompts_from_agents: transcript.prompts_from_agents.to_vec(),
+            sent_times: transcript.sent_times.to_vec(),
+        }
+    }
+}
+
 /// A thread's agent, handed to another server: the snapshot and the agent's pipes.
 pub struct HandedOffAgent {
     pub snapshot: AgentSnapshot,
@@ -786,13 +810,13 @@ impl AgentThread {
 
     /// The conversation for the server to keep, once the thread has all of it: not while its
     /// session is still replaying it.
-    pub fn transcript(&self) -> Option<Transcript> {
-        self.has_conversation.then(|| Transcript {
-            entries: self.view.entries.clone(),
-            plan: self.view.state.plan.clone(),
-            finished_turns: self.view.state.finished_turns.clone(),
-            prompts_from_agents: self.view.state.prompts_from_agents.clone(),
-            sent_times: self.view.state.sent_times.clone(),
+    pub fn transcript(&self) -> Option<TranscriptRef<'_>> {
+        self.has_conversation.then(|| TranscriptRef {
+            entries: &self.view.entries,
+            plan: &self.view.state.plan,
+            finished_turns: &self.view.state.finished_turns,
+            prompts_from_agents: &self.view.state.prompts_from_agents,
+            sent_times: &self.view.state.sent_times,
         })
     }
 
@@ -5450,7 +5474,8 @@ mod tests {
         first
             .wait_until(|thread| !thread.is_working() && thread.entries().len() >= 3)
             .await;
-        let transcript = first.thread.transcript().expect("the whole conversation");
+        let transcript =
+            Transcript::from(first.thread.transcript().expect("the whole conversation"));
         assert_eq!(transcript.entries, first.thread.entries());
         assert_eq!(transcript.finished_turns.len(), 1);
         assert!(transcript.sent_times.iter().any(|(index, _)| *index == 0));
@@ -5473,7 +5498,10 @@ mod tests {
             Some(SessionRestore::Loaded)
         );
         assert_eq!(second.thread.entries(), kept.entries);
-        assert_eq!(second.thread.transcript(), Some(kept.clone()));
+        assert_eq!(
+            second.thread.transcript().map(Transcript::from),
+            Some(kept.clone())
+        );
 
         second.update(AgentThread::reload);
         second

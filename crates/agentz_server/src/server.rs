@@ -1769,7 +1769,7 @@ impl Server {
             return;
         };
         if !transcript.entries.is_empty()
-            && transcripts::save(&self.data_dir, thread_id, &transcript)
+            && transcripts::save(&self.data_dir, thread_id, transcript)
                 .log_err()
                 .is_none()
         {

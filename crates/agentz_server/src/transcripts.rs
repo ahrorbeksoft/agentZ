@@ -2,9 +2,10 @@
 //! `transcripts/<thread id>.json` so a thread opens with all of its conversation, whatever its
 //! agent replays.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use agent_thread::Transcript;
+use agent_thread::{Transcript, TranscriptRef};
 use anyhow::{Context as _, Result};
 use projects::ThreadId;
 
@@ -14,16 +15,28 @@ fn path(data_dir: &Path, thread_id: ThreadId) -> PathBuf {
         .join(format!("{}.json", thread_id.0))
 }
 
-pub(crate) fn save(data_dir: &Path, thread_id: ThreadId, transcript: &Transcript) -> Result<()> {
+pub(crate) fn save(
+    data_dir: &Path,
+    thread_id: ThreadId,
+    transcript: TranscriptRef<'_>,
+) -> Result<()> {
     let path = path(data_dir, thread_id);
     if let Some(directory) = path.parent() {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
     }
-    let json = serde_json::to_vec(transcript).context("encoding the transcript")?;
     // Written beside it first, so a crash doesn't leave half a conversation.
     let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, json).with_context(|| format!("writing {}", temporary.display()))?;
+    let file = std::fs::File::create(&temporary)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    // Encoded into the file as it goes rather than whole in memory first, for the same reason
+    // as `TranscriptRef`.
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(&mut writer, &transcript).context("encoding the transcript")?;
+    writer
+        .flush()
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    drop(writer);
     std::fs::rename(&temporary, &path).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -76,9 +89,21 @@ mod tests {
         );
         let transcript = Transcript {
             entries: vec![agent_thread::Entry::UserMessage("hello".into())],
+            finished_turns: vec![agent_thread::TurnTime {
+                entries_end: 1,
+                duration: std::time::Duration::from_secs(2),
+            }],
+            sent_times: vec![(0, std::time::SystemTime::UNIX_EPOCH)],
             ..Transcript::default()
         };
-        save(data_dir.path(), thread_id, &transcript).expect("saved");
+        let saved = TranscriptRef {
+            entries: &transcript.entries,
+            plan: &transcript.plan,
+            finished_turns: &transcript.finished_turns,
+            prompts_from_agents: &transcript.prompts_from_agents,
+            sent_times: &transcript.sent_times,
+        };
+        save(data_dir.path(), thread_id, saved).expect("saved");
         assert_eq!(
             load(data_dir.path(), thread_id).expect("readable"),
             Some(transcript)

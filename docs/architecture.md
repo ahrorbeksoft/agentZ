@@ -481,7 +481,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   each thread's conversation in `transcripts/`, saved at most 2 seconds after it changes, when
   its agent stops, and before the server exits or hands off. A thread starts from it, and while
   its session loads the replayed messages, tool calls and plan are dropped. Reload Agent keeps
-  the conversation too. Deleting the thread deletes its transcript.
+  the conversation too. Deleting the thread deletes its transcript. A save encodes the thread's
+  own entries straight into the file (`TranscriptRef`), without copying the conversation or
+  holding its JSON in memory: with a copy of a long conversation every 2 seconds, the server
+  held many times its size, and grew to gigabytes over a day of work.
 - **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`):
   Zed's message editor. One line, growing with the text to eight, then scrolling. Shift-Enter
   makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's
