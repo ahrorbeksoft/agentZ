@@ -259,6 +259,25 @@ what it did along the way. The user doesn't like it and wants it replaced.
 
 - What the new view should be: not given yet, beyond not being stepless.
 
+### A better view of subthreads in threads
+
+When an agent starts a subthread, the thread shows "Started a subthread: <title>" with an Open
+link, and under it the tool's raw JSON (`taskId`, `childThreadId`, `title`, `role`, `status`,
+`workState`, …) above a collapsed Input ([screenshot](backlog/subthread-view.png)). The user
+hates how it looks and wants it replaced.
+
+- What the new view should be: not given yet.
+
+### The message that tells an agent its delegated tasks ended
+
+When delegated tasks end, the parent thread shows a message in the user's place, marked "Sent
+by the agent in "Summarize agent control docs"": "Delegated tasks 282, 283 reached terminal
+states. Use task_status with each taskId to read the results."
+([screenshot](backlog/delegated-tasks-message.png)). The user doesn't want to see it.
+
+- Find a better way to tell the agent its tasks ended. If there isn't one, hide the message
+  from the user.
+
 ## Bugs
 
 ### Open the message queue when a message is queued
