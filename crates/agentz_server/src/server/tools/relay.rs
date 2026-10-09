@@ -4,26 +4,32 @@
 //! there for the combined project's checkout ([`RelayToolCall`]). Without the app open, other
 //! machines are out of reach.
 //!
-//! Threads keep living on their own machine. A task delegated to another machine is an
-//! ordinary thread there, followed with `machine` on the thread tools, since its parent's
-//! lineage can't span two servers.
+//! Threads keep living on their own machine. A task delegated to another machine works in a
+//! thread there whose parent is the delegating thread ([`Task::parent_machine`]), and a
+//! subthread with no agent stands for it under the parent ([`Task::runs_on`]). The parent's
+//! server asks there how it's going while the app is open ([`Server::poll_remote_tasks`]), so
+//! the parent waits for it, hears of its end and cancels it as any task's.
 //!
 //! The Workspaces view's terminals and adding a project need no project, so they reach every
 //! machine the app does: an agent can clone a repository there and add it, and once the app
 //! combines it with the caller's project, the rest of the tools work there too.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use agentz_protocol::agents::AgentId;
 use agentz_protocol::{Event, PeerMachine, Peers, RelayToolCall, ServerMessage, ToolResult};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{BoxFuture, join_all};
-use projects::ProjectId;
+use projects::{ProjectId, RemoteThread, Task, TaskEnd, TaskOutcome, ThreadId};
 use serde_json::{Map, Value, json};
 
-use super::{Arguments, Caller, Continuation, Failure, Outcome, Server, Step, failure, invalid};
+use super::{
+    Arguments, Caller, Continuation, Delegation, Failure, MAX_PROMPT_CHARS, Outcome, Server, Step,
+    failure, invalid,
+};
 use crate::server::ClientId;
 
 /// The tools that take `machine`, run on that machine's checkout of the project, or for
@@ -76,6 +82,28 @@ const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How often the tasks delegated to other machines are asked about there.
+#[cfg(not(test))]
+pub(in crate::server) const REMOTE_TASK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub(in crate::server) const REMOTE_TASK_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A poll that gets no answer is given up on, and asked again next time.
+const REMOTE_TASK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The thread statuses and work states a task on another machine reports with `task_status`.
+const THREAD_STATUSES: [&str; 8] = [
+    "failed",
+    "needs_login",
+    "waiting_for_approval",
+    "waiting_for_input",
+    "running",
+    "queued",
+    "starting",
+    "idle",
+];
+const WORK_STATES: [&str; 2] = ["working", "waiting_for_children"];
+
 /// Codes a relayed failure keeps; others become `orchestration_error`.
 const FAILURE_CODES: [&str; 19] = [
     "account_unavailable",
@@ -107,9 +135,25 @@ pub(in crate::server) struct Relays {
     next_id: u64,
     /// Told when the peers change.
     peer_waiters: Vec<oneshot::Sender<()>>,
+    /// How each task delegated to another machine was doing when last asked, by the
+    /// subthread that stands for it here ([`Task::runs_on`]).
+    remote_tasks: HashMap<ThreadId, RemoteTask>,
+    /// The tasks being asked about now.
+    polling: HashSet<ThreadId>,
+}
+
+/// A task on another machine, as its server last described it.
+#[derive(Clone, Copy)]
+pub(in crate::server) struct RemoteTask {
+    pub(super) thread_status: &'static str,
+    pub(super) work_state: &'static str,
 }
 
 impl Relays {
+    pub(super) fn remote_task(&self, task: ThreadId) -> Option<RemoteTask> {
+        self.remote_tasks.get(&task).copied()
+    }
+
     pub(in crate::server) fn set_peers(&mut self, client: ClientId, peers: Peers) {
         self.peers.retain(|(other, _)| *other != client);
         self.peers.push((client, peers));
@@ -203,7 +247,7 @@ impl Server {
             arguments.insert("agentId".into(), json!(agent_id));
         }
         Some(if name == "delegate_task" {
-            self.delegate_elsewhere(target, arguments)
+            self.delegate_elsewhere(caller, target, arguments)
         } else if name == "agentz_project_add" {
             Ok(self.add_project_elsewhere(caller, target, arguments))
         } else {
@@ -315,75 +359,224 @@ impl Server {
         .boxed()
     }
 
-    /// A task for another machine: an ordinary thread there with the task as its prompt, waited
-    /// for in `wait` mode.
-    fn delegate_elsewhere(&mut self, target: Target, arguments: Map<String, Value>) -> Outcome {
-        let wait = match arguments.get("mode").and_then(Value::as_str) {
-            None | Some("async") => false,
-            Some("wait") => true,
-            Some(mode) => return Err(invalid(format!("Unknown mode {mode}."))),
+    /// A task for another machine: its server starts the task's thread with this thread as its
+    /// parent and this thread's mode, and a subthread here stands for it, followed as any
+    /// task is.
+    fn delegate_elsewhere(
+        &mut self,
+        caller: Caller,
+        target: Target,
+        mut arguments: Map<String, Value>,
+    ) -> Outcome {
+        let parent = self.delegating_parent(caller)?;
+        let delegation = Delegation::new(&Arguments(&arguments))?;
+        if let Some(task) = self.delegated_task(parent, delegation.client_request_id.as_deref()) {
+            return delegation.answer(self, caller, task);
+        }
+        let prompt = Arguments(&arguments)
+            .string("task", MAX_PROMPT_CHARS)?
+            .ok_or_else(|| invalid("task is required."))?
+            .to_string();
+        let this_machine = self
+            .relays
+            .latest()
+            .map(|(_, peers)| peers.this_machine.clone())
+            .unwrap_or_default();
+        let agent_id = arguments
+            .get("agentId")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let (mode, mode_option) = match &agent_id {
+            Some(agent_id) => self.caller_mode(caller, &AgentId::new(agent_id.clone())),
+            None => (None, None),
         };
-        let mut launch = Map::new();
-        for (from, to) in [
-            ("task", "prompt"),
-            ("title", "title"),
-            ("agentId", "agentId"),
-            ("model", "model"),
-            ("workspaceStrategy", "workspaceStrategy"),
-            ("clientRequestId", "clientRequestId"),
-        ] {
-            if let Some(value) = arguments.get(from) {
-                launch.insert(to.into(), value.clone());
-            }
+        // It answers at once; this server does the waiting.
+        arguments.remove("mode");
+        arguments.remove("timeoutMs");
+        arguments.insert("parentThreadId".into(), json!(parent.0));
+        arguments.insert("parentMachine".into(), json!(this_machine));
+        if let Some(mode) = mode {
+            arguments.insert("parentMode".into(), json!(mode.0.to_string()));
         }
-        if !launch.contains_key("prompt") {
-            return Err(invalid("task is required."));
+        if let Some((config_id, value)) = mode_option {
+            arguments.insert(
+                "parentModeOption".into(),
+                json!({"configId": config_id.0.to_string(), "value": value}),
+            );
         }
-        let note = format!(
-            "The task runs as an ordinary thread on {}. Follow it with agentz_thread_wait or \
-             agentz_thread_read, passing machine and threadId.",
-            target.machine
-        );
-        let timeout = arguments.get("timeoutMs").cloned();
-        let (client, machine, path) = (target.client, target.machine.clone(), target.path.clone());
-        let launched = self.relay(target, "agentz_thread_launch", Value::Object(launch));
-        if !wait {
-            return Ok(Step::Background(
-                async move {
-                    let mut launched = launched.await?;
-                    launched["note"] = json!(note);
-                    Ok(launched)
-                }
-                .boxed(),
-            ));
-        }
+        let machine = target.machine.clone();
+        let delegated = self.relay(target, "delegate_task", Value::Object(arguments));
         Ok(Step::Then(
             async move {
-                let launched = launched.await;
+                let delegated = delegated.await;
                 Box::new(move |server: &mut Server| -> Outcome {
-                    let launched = launched?;
-                    let mut wait = json!({"threadId": launched["threadId"].clone()});
-                    if let Some(timeout) = timeout {
-                        wait["timeoutMs"] = timeout;
-                    }
-                    let target = Target {
-                        client,
-                        machine,
-                        path,
+                    let delegated = delegated?;
+                    let thread = delegated["taskId"].as_u64().map(ThreadId).ok_or_else(|| {
+                        failure(
+                            "orchestration_error",
+                            format!("{machine} didn't say which task it started."),
+                        )
+                    })?;
+                    let task = Task {
+                        runs_on: Some(RemoteThread { machine, thread }),
+                        ..delegation.task(parent, prompt)
                     };
-                    let waited = server.relay(target, "agentz_thread_wait", wait);
-                    Ok(Step::Background(
-                        async move {
-                            let mut waited = waited.await?;
-                            waited["note"] = json!(note);
-                            Ok(waited)
-                        }
-                        .boxed(),
-                    ))
+                    let task = server
+                        .projects
+                        .add_subthread(task, agent_id)
+                        .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+                    server.apply_remote_task(task, &delegated);
+                    delegation.answer(server, caller, task)
                 }) as Continuation
             }
             .boxed(),
         ))
+    }
+
+    /// Asks the machines the unfinished tasks delegated there run on how they're going, while
+    /// the app is there to relay. One out of reach is asked again next time.
+    pub(in crate::server) fn poll_remote_tasks(&mut self) {
+        let unfinished: Vec<ThreadId> = self
+            .projects
+            .threads()
+            .iter()
+            .filter(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.runs_on.is_some() && task.outcome.is_none())
+            })
+            .map(|thread| thread.id)
+            .collect();
+        self.relays
+            .remote_tasks
+            .retain(|task, _| unfinished.contains(task));
+        for task in unfinished {
+            if self.relays.polling.contains(&task) {
+                continue;
+            }
+            let Some(Ok((target, thread))) = self.remote_task_target(task) else {
+                continue;
+            };
+            self.relays.polling.insert(task);
+            let status = self.relay(target, "task_status", json!({"taskId": thread.0}));
+            let status = async move {
+                tokio::time::timeout(REMOTE_TASK_POLL_TIMEOUT, status)
+                    .await
+                    .unwrap_or_else(|_| Err(failure("machine_unavailable", "No answer.")))
+            };
+            self.spawn_then(status, move |server, status| {
+                server.relays.polling.remove(&task);
+                match status {
+                    Ok(status) => server.apply_remote_task(task, &status),
+                    // Its thread there was deleted, so it won't end.
+                    Err(failure) if failure.code == "task_not_found" => {
+                        server.end_remote_task(task, TaskEnd::Failed, Some(failure.message))
+                    }
+                    Err(failure) => {
+                        log::debug!(
+                            "couldn't ask how task {} is going: {}",
+                            task.0,
+                            failure.message
+                        )
+                    }
+                }
+            });
+        }
+    }
+
+    /// What the task's machine says of it, there under its own id: its title, model and
+    /// state, and once it's over, its outcome, which ends the subthread here.
+    fn apply_remote_task(&mut self, task: ThreadId, remote: &Value) {
+        if let Some(title) = remote["title"].as_str() {
+            self.projects.rename_thread(task, title.to_string());
+        }
+        if let Some(model) = remote["model"].as_str() {
+            self.projects.set_thread_model(task, model.to_string());
+        }
+        if let Some(end) = remote["status"].as_str().and_then(TaskEnd::parse) {
+            let summary = remote["summary"].as_str().map(String::from);
+            return self.end_remote_task(task, end, summary);
+        }
+        let known = |value: &Value, known: &[&'static str]| {
+            let value = value.as_str()?;
+            known.iter().copied().find(|known| *known == value)
+        };
+        let thread_status = known(&remote["threadStatus"], &THREAD_STATUSES).unwrap_or("running");
+        let work_state = known(&remote["workState"], &WORK_STATES).unwrap_or("working");
+        self.relays.remote_tasks.insert(
+            task,
+            RemoteTask {
+                thread_status,
+                work_state,
+            },
+        );
+        // Its parent shows it working, or asking, as for a subthread here.
+        self.projects.set_thread_working(task, true);
+        self.projects
+            .set_thread_blocked(task, thread_status == "waiting_for_approval");
+        self.projects
+            .set_thread_awaiting_input(task, thread_status == "waiting_for_input");
+    }
+
+    fn end_remote_task(&mut self, task: ThreadId, end: TaskEnd, summary: Option<String>) {
+        self.relays.remote_tasks.remove(&task);
+        self.projects.update_task(task, |task| {
+            task.outcome.get_or_insert(TaskOutcome {
+                end,
+                summary,
+                ended_at: SystemTime::now(),
+            });
+        });
+        self.projects.set_thread_blocked(task, false);
+        self.projects.set_thread_awaiting_input(task, false);
+        self.projects.set_thread_working(task, false);
+    }
+
+    /// Where a task delegated to another machine runs, and its thread there; `None` for a
+    /// task on this machine.
+    fn remote_task_target(&self, task: ThreadId) -> Option<Result<(Target, ThreadId), Failure>> {
+        let thread = self.projects.thread(task)?;
+        let runs_on = thread.runs_on()?;
+        let caller = Caller {
+            project_id: Some(thread.project_id),
+            thread_id: None,
+            relayed: false,
+        };
+        Some(
+            self.relay_target(caller, &runs_on.machine, true)
+                .map(|target| (target, runs_on.thread)),
+        )
+    }
+
+    /// Fails when the task was delegated to a machine out of reach.
+    pub(super) fn reach_remote_task(&self, task: ThreadId) -> Result<(), Failure> {
+        match self.remote_task_target(task) {
+            Some(Err(failure)) => Err(failure),
+            Some(Ok(_)) | None => Ok(()),
+        }
+    }
+
+    /// Cancels the task on the machine it was delegated to, if it was.
+    pub(super) fn cancel_elsewhere(&mut self, task: ThreadId, reason: &str) {
+        let (target, thread) = match self.remote_task_target(task) {
+            None => return,
+            Some(Ok(target)) => target,
+            Some(Err(failure)) => {
+                log::warn!("couldn't cancel task {} there: {}", task.0, failure.message);
+                return;
+            }
+        };
+        let cancelled = self.relay(
+            target,
+            "task_cancel",
+            json!({"taskId": thread.0, "reason": reason}),
+        );
+        self.runtime.spawn(async move {
+            if let Err(failure) = cancelled.await {
+                log::warn!("couldn't cancel task {} there: {}", task.0, failure.message);
+            }
+        });
     }
 
     /// A project added on another machine, and whether the app combined it with the caller's,

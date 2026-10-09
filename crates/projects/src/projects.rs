@@ -294,9 +294,27 @@ pub struct ImportedSession {
 }
 
 impl Thread {
-    /// The thread that delegated this one, for a subthread.
+    /// The thread that delegated this one, for a subthread of a thread on this machine.
     pub fn parent(&self) -> Option<ThreadId> {
-        self.task.as_ref().map(|task| task.parent)
+        self.task
+            .as_ref()
+            .filter(|task| task.parent_machine.is_none())
+            .map(|task| task.parent)
+    }
+
+    /// The thread on another machine that delegated this one ([`Task::parent_machine`]).
+    pub fn remote_parent(&self) -> Option<RemoteThread> {
+        let task = self.task.as_ref()?;
+        Some(RemoteThread {
+            machine: task.parent_machine.clone()?,
+            thread: task.parent,
+        })
+    }
+
+    /// Where the task this thread stands for works, for a task delegated to another machine
+    /// ([`Task::runs_on`]).
+    pub fn runs_on(&self) -> Option<&RemoteThread> {
+        self.task.as_ref()?.runs_on.as_ref()
     }
 
     /// Started in a workspace pane, so listed in the Workspaces section.
@@ -350,6 +368,21 @@ pub struct Task {
     /// agent of its own.
     #[serde(default)]
     pub agent_session: Option<String>,
+    /// Set on a task delegated to another machine: its thread works there, and this one, which
+    /// has no agent of its own, stands for it under the parent.
+    #[serde(default)]
+    pub runs_on: Option<RemoteThread>,
+    /// Set on a task delegated from another machine, by the name the app gives that machine:
+    /// `parent` is a thread there.
+    #[serde(default)]
+    pub parent_machine: Option<String>,
+}
+
+/// A thread on another machine, by the name the app gives that machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteThread {
+    pub machine: String,
+    pub thread: ThreadId,
 }
 
 impl Task {
@@ -392,6 +425,18 @@ impl TaskEnd {
             TaskEnd::Cancelled => "cancelled",
             TaskEnd::Interrupted => "interrupted",
         }
+    }
+
+    /// The end [`Self::as_str`] names.
+    pub fn parse(status: &str) -> Option<Self> {
+        [
+            TaskEnd::Completed,
+            TaskEnd::Failed,
+            TaskEnd::Cancelled,
+            TaskEnd::Interrupted,
+        ]
+        .into_iter()
+        .find(|end| end.as_str() == status)
     }
 }
 
@@ -897,6 +942,22 @@ impl ProjectStore {
             thread.created_by = Some(ThreadCreator::Thread(parent));
             thread.task = Some(task);
             thread.workspace = workspace;
+        }
+        self.changed();
+        Some(id)
+    }
+
+    /// Adds the thread of a task a thread on another machine delegated
+    /// ([`Task::parent_machine`]), in the project's folder.
+    pub fn add_task_from_elsewhere(
+        &mut self,
+        project_id: ProjectId,
+        task: Task,
+        agent_id: Option<String>,
+    ) -> Option<ThreadId> {
+        let id = self.add_thread(project_id, NEW_THREAD_TITLE, agent_id)?;
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+            thread.task = Some(task);
         }
         self.changed();
         Some(id)
@@ -2127,6 +2188,8 @@ mod tests {
             outcome: None,
             delivered: false,
             agent_session: None,
+            runs_on: None,
+            parent_machine: None,
         };
         let child = store.add_subthread(task(parent), None).expect("subthread");
         let grandchild = store.add_subthread(task(child), None).expect("subthread");
@@ -2276,6 +2339,8 @@ mod tests {
                     outcome: None,
                     delivered: false,
                     agent_session: None,
+                    runs_on: None,
+                    parent_machine: None,
                 },
                 None,
             )
@@ -2352,6 +2417,8 @@ mod tests {
                     outcome: None,
                     delivered: false,
                     agent_session: None,
+                    runs_on: None,
+                    parent_machine: None,
                 },
                 None,
             )

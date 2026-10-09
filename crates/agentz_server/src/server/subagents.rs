@@ -78,6 +78,8 @@ impl Server {
                 outcome: None,
                 delivered: false,
                 agent_session: Some(subagent.session.clone()),
+                runs_on: None,
+                parent_machine: None,
             },
             agent_id,
         ) else {

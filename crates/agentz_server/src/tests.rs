@@ -32,7 +32,9 @@ use agentz_protocol::{
     read_message, write_message,
 };
 use futures::FutureExt as _;
-use projects::{ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, WorkspaceKind};
+use projects::{
+    ProjectId, ProjectsSnapshot, RemoteThread, TaskEnd, ThreadCreator, ThreadId, WorkspaceKind,
+};
 use registry::AgentCommand;
 use serde_json::{Value, json};
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
@@ -4316,17 +4318,126 @@ async fn agents_work_on_other_machines_through_the_app() {
     assert!(listed.contains(&(json!("mac"), json!(orchestrator.0))));
     assert_eq!(list["total"], json!(2));
 
-    // A task for another machine runs as an ordinary thread there.
+    // A task for another machine works there in a thread whose parent is this one, in its
+    // mode, and a subthread here stands for it: the parent waits for it as for any task.
+    caller
+        .ok(Request::SetConfigOption {
+            connection,
+            config_id: acp::SessionConfigId::new("mode"),
+            value: acp::SessionConfigOptionValue::value_id("plan"),
+        })
+        .await;
+    caller
+        .wait_until(|client| {
+            config_value(client.thread(connection), "mode").as_deref() == Some("plan")
+        })
+        .await;
     let delegated = caller
         .tool(
             orchestrator,
             "delegate_task",
-            json!({"task": "hi", "mode": "wait", "machine": "devbox"}),
+            json!({"task": "hi", "mode": "wait", "machine": "devbox", "role": "research"}),
         )
         .await;
-    assert_eq!(delegated["lastAgentMessage"], json!("Echo: hi"));
-    assert_eq!(delegated["machine"], json!("devbox"));
-    assert!(delegated["note"].is_string());
+    assert_eq!(delegated["status"], json!("completed"), "{delegated}");
+    assert_eq!(delegated["summary"], json!("Echo: hi"));
+    assert_eq!(delegated["runsOn"]["machine"], json!("devbox"));
+    let task = task_id(&delegated);
+    let task_there = ThreadId(
+        delegated["runsOn"]["threadId"]
+            .as_u64()
+            .expect("its thread there"),
+    );
+    caller
+        .wait_until(|client| client.task(task).is_some_and(|task| task.delivered))
+        .await;
+    let subthread = caller.project_thread(task).expect("the subthread");
+    assert_eq!(subthread.parent(), Some(orchestrator));
+    assert_eq!(subthread.title, "hi");
+    assert_eq!(
+        subthread.runs_on(),
+        Some(&RemoteThread {
+            machine: "devbox".into(),
+            thread: task_there,
+        })
+    );
+    let Response::Session(session) = caller_there.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    caller_there.projects = Some(session.projects);
+    let thread_there = caller_there
+        .project_thread(task_there)
+        .expect("the task's thread there");
+    assert_eq!(thread_there.parent(), None);
+    assert_eq!(
+        thread_there.remote_parent(),
+        Some(RemoteThread {
+            machine: "mac".into(),
+            thread: orchestrator,
+        })
+    );
+    caller_there
+        .subscribe_thread(ConnectionId::Thread(task_there))
+        .await;
+    assert_eq!(
+        config_value(
+            caller_there.thread(ConnectionId::Thread(task_there)),
+            "mode"
+        )
+        .as_deref(),
+        Some("plan")
+    );
+
+    // A task asking there for permission has its subthread here ask, and cancelling it here
+    // cancels it there.
+    let asking = task_id(
+        &caller
+            .tool(
+                orchestrator,
+                "delegate_task",
+                json!({"task": "permission", "machine": "devbox"}),
+            )
+            .await,
+    );
+    caller
+        .wait_until(|client| {
+            client
+                .projects
+                .as_ref()
+                .is_some_and(|projects| projects.blocked_threads.contains(&asking))
+        })
+        .await;
+    let status = caller
+        .tool(orchestrator, "task_status", json!({"taskId": asking.0}))
+        .await;
+    assert_eq!(status["status"], json!("waiting"));
+    assert_eq!(status["threadStatus"], json!("waiting_for_approval"));
+    let asking_there = ThreadId(
+        status["runsOn"]["threadId"]
+            .as_u64()
+            .expect("its thread there"),
+    );
+    let cancel = caller
+        .tool(
+            orchestrator,
+            "task_cancel",
+            json!({"taskId": asking.0, "reason": "Not needed"}),
+        )
+        .await;
+    assert_eq!(cancel["status"], json!("cancel_requested"));
+    caller_there
+        .wait_until(|client| {
+            client
+                .task(asking_there)
+                .and_then(|task| task.outcome.as_ref())
+                .is_some_and(|outcome| outcome.end == TaskEnd::Cancelled)
+        })
+        .await;
+    let status = caller
+        .tool(orchestrator, "task_status", json!({"taskId": asking.0}))
+        .await;
+    assert_eq!(status["status"], json!("cancelled"));
+    assert_eq!(status["summary"], json!("Not needed"));
 
     for (machine, expected) in [
         ("nowhere", "invalid_request"),

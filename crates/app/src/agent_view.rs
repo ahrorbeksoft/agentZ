@@ -169,6 +169,8 @@ pub enum AgentViewEvent {
     Unarchive,
     /// Show another thread: a subthread from the Agents control, or a subthread's parent.
     OpenThread(ThreadId),
+    /// Show a thread on another machine: the parent of a task delegated from there.
+    OpenThreadOn(ThreadKey),
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
     /// The header's project was clicked: a new thread in it, as in t3code.
@@ -632,7 +634,12 @@ impl AgentView {
             if self.blocked_subthreads.contains_key(&thread_id) {
                 continue;
             }
-            let thread = AgentThread::shared(&self.client, thread_id, cx);
+            let Some(subthread) = store.read(cx).thread(thread_id) else {
+                continue;
+            };
+            // A task delegated to another machine asks there.
+            let (client, working_thread) = self.working_thread(subthread, cx);
+            let thread = AgentThread::shared(&client, working_thread, cx);
             let subscription = cx.observe(&thread, |_, _, cx| cx.notify());
             self.blocked_subthreads
                 .insert(thread_id, (thread, subscription));
@@ -676,9 +683,52 @@ impl AgentView {
         }
     }
 
-    /// The thread that delegated this one, for a subthread.
-    fn parent(&self, cx: &App) -> Option<ThreadId> {
-        self.store.clone().read(cx).thread(self.thread_id)?.parent()
+    /// Whether this thread works on a task, delegated by a thread here or on another machine.
+    fn is_subthread(&self, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_some_and(|thread| thread.task.is_some())
+    }
+
+    /// The thread that delegated this one, also from another machine.
+    fn parent(&self, cx: &App) -> Option<ThreadKey> {
+        let thread = self.store.read(cx).thread(self.thread_id)?;
+        if let Some(parent) = thread.parent() {
+            return Some(ThreadKey {
+                machine: self.client.read(cx).machine(),
+                thread: parent,
+            });
+        }
+        let parent = thread.remote_parent()?;
+        Machines::global(cx).read(cx).remote_thread(&parent, cx)
+    }
+
+    /// Shows a thread on this view's machine or another.
+    fn open_thread(&self, key: ThreadKey, cx: &mut Context<Self>) {
+        if key.machine == self.client.read(cx).machine() {
+            cx.emit(AgentViewEvent::OpenThread(key.thread));
+        } else {
+            cx.emit(AgentViewEvent::OpenThreadOn(key));
+        }
+    }
+
+    /// The client of the machine a subthread's task was delegated to and its thread there, or
+    /// this view's client and the subthread itself.
+    fn working_thread(
+        &self,
+        subthread: &projects::Thread,
+        cx: &App,
+    ) -> (Entity<ServerClient>, ThreadId) {
+        subthread
+            .runs_on()
+            .and_then(|runs_on| {
+                let machines = Machines::global(cx);
+                let machines = machines.read(cx);
+                let key = machines.remote_thread(runs_on, cx)?;
+                Some((machines.client(key.machine, cx)?, key.thread))
+            })
+            .unwrap_or_else(|| (self.client.clone(), subthread.id))
     }
 
     /// Opens the Agents list while a subthread runs and folds it once the last one ends, and
@@ -708,10 +758,6 @@ impl AgentView {
             }
         }
 
-        let client = self.client.read(cx);
-        if !client.has_capability(CAPABILITY_THREAD_DIFF) {
-            return;
-        }
         // The agent's own subagents change files in its thread, which counts them.
         for (thread_id, completed_at, _, _) in subthreads
             .into_iter()
@@ -720,9 +766,18 @@ impl AgentView {
             if self.subthread_changes_asked_for.get(&thread_id) == Some(&completed_at) {
                 continue;
             }
+            let Some(subthread) = store.thread(thread_id) else {
+                continue;
+            };
+            // A task delegated to another machine changes files there.
+            let (client, working_thread) = self.working_thread(subthread, cx);
+            let client = client.read(cx);
+            if !client.has_capability(CAPABILITY_THREAD_DIFF) {
+                continue;
+            }
             self.subthread_changes_asked_for
                 .insert(thread_id, completed_at);
-            let request = load_change_stat(client, thread_id);
+            let request = load_change_stat(client, working_thread);
             let load = cx.spawn(async move |this, cx| {
                 let Some(changes) = request.await else {
                     return;
@@ -741,11 +796,15 @@ impl AgentView {
 
     /// Stops a subthread's turn from its row, as its own Stop does.
     fn stop_subthread(&self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let Some(subthread) = self.store.read(cx).thread(thread_id) else {
+            return;
+        };
+        let (client, working_thread) = self.working_thread(subthread, cx);
         let request =
-            self.client
+            client
                 .read(cx)
                 .request(Request::Cancel(agentz_protocol::ConnectionId::Thread(
-                    thread_id,
+                    working_thread,
                 )));
         cx.background_spawn(async move {
             request.await.log_err();
@@ -862,6 +921,16 @@ impl AgentView {
                     .get(&thread_id)
                     .copied()
                     .filter(|changes| changes.files > 0);
+                // A task delegated to another machine says which.
+                let machine = thread.runs_on().map(|runs_on| {
+                    let machines = Machines::global(cx).read(cx);
+                    let icon = machines
+                        .machine_named(&runs_on.machine, cx)
+                        .map_or(IconName::Server, |machine| {
+                            machines.machine_icon(machine, cx)
+                        });
+                    (icon, runs_on.machine.clone())
+                });
                 h_flex()
                     .id(("agent-row", thread_id.0))
                     .debug_selector(move || format!("subthread-row-{}", thread_id.0))
@@ -899,7 +968,32 @@ impl AgentView {
                                         ),
                                     )
                                 },
-                            ),
+                            )
+                            .when_some(machine, |this, (icon, machine)| {
+                                this.child(
+                                    h_flex()
+                                        .debug_selector(move || {
+                                            format!("subthread-row-machine-{}", thread_id.0)
+                                        })
+                                        .flex_none()
+                                        .gap_1()
+                                        .child(
+                                            Label::new("·")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Icon::new(icon)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new(machine)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                            }),
                     )
                     .when(is_agents_own, |this| {
                         this.child(
@@ -1240,7 +1334,11 @@ impl AgentView {
 
     /// Zed's subagent title bar, under the parent's header: the subthread's title and how it
     /// ended, Stop while it runs, and Minimize, which opens the parent.
-    fn render_subthread_title_bar(&self, parent: ThreadId, cx: &mut Context<Self>) -> AnyElement {
+    fn render_subthread_title_bar(
+        &self,
+        parent: Option<ThreadKey>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors();
         let end = self.subthread_end(cx);
         let is_done = end.is_some();
@@ -1319,31 +1417,51 @@ impl AgentView {
                                         ),
                                 )
                             })
-                            .child(
-                                div().debug_selector(|| "minimize-subthread".into()).child(
-                                    IconButton::new("minimize-subthread", IconName::Dash)
-                                        .icon_size(IconSize::Small)
-                                        .tooltip(move |_, cx| {
-                                            Tooltip::for_action_in(
-                                                "Minimize Subthread",
-                                                &OpenParentThread,
-                                                &focus_handle,
-                                                cx,
-                                            )
-                                        })
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(AgentViewEvent::OpenThread(parent))
-                                        })),
-                                ),
-                            ),
+                            .when_some(parent, |this, parent| {
+                                this.child(
+                                    div().debug_selector(|| "minimize-subthread".into()).child(
+                                        IconButton::new("minimize-subthread", IconName::Dash)
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(move |_, cx| {
+                                                Tooltip::for_action_in(
+                                                    "Minimize Subthread",
+                                                    &OpenParentThread,
+                                                    &focus_handle,
+                                                    cx,
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_thread(parent, cx)
+                                            })),
+                                    ),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
     }
 
+    /// How the subthread runs, and where, when it was delegated from another machine.
+    fn subthread_runs(&self, cx: &App) -> String {
+        let is_from_elsewhere = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_some_and(|thread| thread.remote_parent().is_some());
+        if is_from_elsewhere {
+            format!("Runs on its own on {}", self.client.read(cx).label())
+        } else {
+            "Runs on its own".to_string()
+        }
+    }
+
     /// Stands in for the message editor on a subthread, as t3code's `ProviderSubagentBar` does:
     /// what runs it, for how long, and the way back to its parent, whose messages it takes.
-    fn render_subthread_bar(&self, parent: ThreadId, cx: &mut Context<Self>) -> AnyElement {
+    fn render_subthread_bar(
+        &self,
+        parent: Option<ThreadKey>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
         let stored = self.store.read(cx).thread(self.thread_id);
@@ -1358,6 +1476,7 @@ impl AgentView {
             .and_then(|task| task.outcome.as_ref());
         let status = subthread_status(started_at, outcome, SystemTime::now());
         let can_stop = outcome.is_none() && !self.is_agents_own_subagent(cx);
+        let runs = self.subthread_runs(cx);
         let focus_handle = self.focus_handle.clone();
         h_flex()
             .debug_selector(|| "subthread-bar".into())
@@ -1402,11 +1521,10 @@ impl AgentView {
             )
             .child(div().flex_1())
             .child(
-                div().flex_none().child(
-                    Label::new("Runs on its own")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
+                div()
+                    .flex_none()
+                    .debug_selector(|| "subthread-bar-runs".into())
+                    .child(Label::new(runs).size(LabelSize::Small).color(Color::Muted)),
             )
             .when(can_stop, |this| {
                 this.child(
@@ -1424,24 +1542,26 @@ impl AgentView {
                     ),
                 )
             })
-            .child(
-                div().debug_selector(|| "open-parent".into()).child(
-                    Button::new("open-parent", "Open Parent")
-                        .label_size(LabelSize::Small)
-                        .start_icon(Icon::new(IconName::ArrowUpLeft).size(IconSize::XSmall))
-                        .tooltip(move |_, cx| {
-                            Tooltip::for_action_in(
-                                "Open Parent Thread",
-                                &OpenParentThread,
-                                &focus_handle,
-                                cx,
-                            )
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(AgentViewEvent::OpenThread(parent))
-                        })),
-                ),
-            )
+            .when_some(parent, |this, parent| {
+                this.child(
+                    div().debug_selector(|| "open-parent".into()).child(
+                        Button::new("open-parent", "Open Parent")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::ArrowUpLeft).size(IconSize::XSmall))
+                            .tooltip(move |_, cx| {
+                                Tooltip::for_action_in(
+                                    "Open Parent Thread",
+                                    &OpenParentThread,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            })
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.open_thread(parent, cx)),
+                            ),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
@@ -2779,22 +2899,44 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// The thread the header shows: a subthread's parent, whose header it opens under, as
-    /// Zed's subagents do, or else the thread itself.
-    fn header_thread(&self, cx: &App) -> ThreadId {
-        self.parent(cx).unwrap_or(self.thread_id)
+    /// A subthread's parent, whose header it opens under, as Zed's subagents do, and its
+    /// machine's client: the parent may be on another machine.
+    fn header_parent(&self, cx: &App) -> Option<(Entity<ServerClient>, ThreadId)> {
+        let parent = self.parent(cx)?;
+        if parent.machine == self.client.read(cx).machine() {
+            return Some((self.client.clone(), parent.thread));
+        }
+        let client = Machines::global(cx).read(cx).client(parent.machine, cx)?;
+        Some((client, parent.thread))
+    }
+
+    /// The thread the header shows, and its machine's client: a subthread's parent, or else
+    /// the thread itself.
+    fn header_thread(&self, cx: &App) -> (Entity<ServerClient>, ThreadId) {
+        self.header_parent(cx)
+            .unwrap_or_else(|| (self.client.clone(), self.thread_id))
     }
 
     fn header_title(&self, cx: &App) -> SharedString {
-        match self.parent(cx) {
-            Some(parent) => self
-                .store
-                .read(cx)
-                .thread(parent)
-                .map(|thread| SharedString::from(thread.title.clone()))
-                .unwrap_or_default(),
+        match self.header_parent(cx) {
+            Some(_) => self.parent_title(cx),
             None => self.title.clone(),
         }
+    }
+
+    fn parent_title(&self, cx: &App) -> SharedString {
+        self.header_parent(cx)
+            .and_then(|(client, parent)| {
+                let title = client
+                    .read(cx)
+                    .projects()
+                    .read(cx)
+                    .thread(parent)?
+                    .title
+                    .clone();
+                Some(SharedString::from(title))
+            })
+            .unwrap_or_default()
     }
 
     /// The title as the trigger of the thread's menu: Rename, Continue with Another Agent,
@@ -2802,23 +2944,22 @@ impl AgentView {
     /// parent's.
     fn render_title_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.weak_entity();
-        let thread_id = self.header_thread(cx);
-        let store = self.store.clone();
-        let client = self.client.clone();
-        let registry = self.registry.clone();
-        let (current_agent, is_archived) = if thread_id == self.thread_id {
-            (self.agent_id.clone(), self.is_archived)
-        } else {
-            let parent = self.store.read(cx).thread(thread_id);
+        let is_subthread = self.header_parent(cx).is_some();
+        let (client, thread_id) = self.header_thread(cx);
+        let store = client.read(cx).projects().clone();
+        let registry = client.read(cx).registry().clone();
+        let (current_agent, is_archived) = if is_subthread {
+            let parent = store.read(cx).thread(thread_id);
             (
                 parent
                     .and_then(|thread| thread.agent_id.clone())
                     .map(AgentId::new),
                 parent.is_some_and(|thread| thread.archived_at.is_some()),
             )
+        } else {
+            (self.agent_id.clone(), self.is_archived)
         };
-        let in_workspaces = self
-            .store
+        let in_workspaces = store
             .read(cx)
             .thread(thread_id)
             .is_some_and(Thread::in_workspaces);
@@ -3165,15 +3306,14 @@ impl AgentView {
             return;
         }
         let title = self.rename_input.read(cx).text().trim().to_string();
-        let thread_id = self.header_thread(cx);
-        let is_unchanged = self
-            .store
+        let (client, thread_id) = self.header_thread(cx);
+        let store = client.read(cx).projects().clone();
+        let is_unchanged = store
             .read(cx)
             .thread(thread_id)
             .is_none_or(|thread| thread.title == title);
         if !is_unchanged {
-            self.store
-                .update(cx, |store, cx| store.set_custom_title(thread_id, title, cx));
+            store.update(cx, |store, cx| store.set_custom_title(thread_id, title, cx));
         }
     }
 
@@ -3195,14 +3335,15 @@ impl AgentView {
             .agent(&agent_id)
             .map(|agent| agent.name().clone())
             .unwrap_or_else(|| agent_id.0.clone());
-        let thread_id = self.header_thread(cx);
-        let task = self.store.update(cx, |store, cx| {
+        let (client, thread_id) = self.header_thread(cx);
+        let machine = client.read(cx).machine();
+        let task = client.read(cx).projects().clone().update(cx, |store, cx| {
             store.continue_thread(thread_id, agent_id, account, cx)
         });
         self._continuing = cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| match result {
-                Ok(thread_id) => cx.emit(AgentViewEvent::OpenThread(thread_id)),
+                Ok(thread) => this.open_thread(ThreadKey { machine, thread }, cx),
                 Err(error) => {
                     log::error!("couldn't continue the thread: {error:#}");
                     this.continue_error =
@@ -3320,7 +3461,7 @@ impl AgentView {
 
     /// Whether the message is a subthread's first, the task its parent sent.
     fn is_task_message(&self, index: usize, cx: &App) -> bool {
-        self.parent(cx).is_some()
+        self.is_subthread(cx)
             && self
                 .thread
                 .read(cx)
@@ -3338,15 +3479,12 @@ impl AgentView {
         style: MarkdownStyle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let store = self.store.read(cx);
-        let task = store
+        let task = self
+            .store
+            .read(cx)
             .thread(self.thread_id)
             .and_then(|thread| thread.task.clone());
-        let parent_title = task
-            .as_ref()
-            .and_then(|task| store.thread(task.parent))
-            .map(|thread| thread.title.clone())
-            .unwrap_or_default();
+        let parent_title = self.parent_title(cx);
         let role = task.and_then(|task| task.role).map(|role| {
             let mut characters = role.chars();
             match characters.next() {
@@ -5370,7 +5508,7 @@ impl AgentView {
         });
         // A subthread takes only its task.
         let reset_choice = match (reached.continues_at, reached.window.resets_at) {
-            _ if self.parent(cx).is_some() => None,
+            _ if self.is_subthread(cx) => None,
             (Some(_), _) => Some(("Don't Continue".to_string(), false)),
             (None, Some(resets_at)) => {
                 Some((format!("Continue {}", reset_phrase(resets_at, now)), true))
@@ -8552,7 +8690,7 @@ fn render_diff(diff: &FileDiff, (entry, part): (usize, usize), cx: &App) -> AnyE
 
 impl Focusable for AgentView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        if self.parent(cx).is_some() {
+        if self.is_subthread(cx) {
             self.focus_handle.clone()
         } else {
             self.composer.focus_handle(cx)
@@ -8582,7 +8720,7 @@ impl Render for AgentView {
         let needs_login = self.needs_login(cx);
 
         let parent = self.parent(cx);
-        let is_subthread = parent.is_some();
+        let is_subthread = self.is_subthread(cx);
         let is_drawer_full_screen =
             self.drawer_full_screen && self.is_drawer_open && self.drawer.is_some();
         // A thread that never had a session has no history to load, so it shows the new
@@ -8613,8 +8751,8 @@ impl Render for AgentView {
             // Otherwise clicking the conversation would take focus from the message editor.
             .when(is_subthread, |this| this.track_focus(&self.focus_handle))
             .when_some(parent, |this, parent| {
-                this.on_action(cx.listener(move |_, _: &OpenParentThread, _, cx| {
-                    cx.emit(AgentViewEvent::OpenThread(parent))
+                this.on_action(cx.listener(move |this, _: &OpenParentThread, _, cx| {
+                    this.open_thread(parent, cx)
                 }))
             })
             .size_full()
@@ -8635,7 +8773,7 @@ impl Render for AgentView {
                 }),
             )
             .when(!self.is_in_pane, |this| this.child(self.render_toolbar(cx)))
-            .when_some(parent, |this, parent| {
+            .when(is_subthread, |this| {
                 this.child(self.render_subthread_title_bar(parent, cx))
             })
             .when(!is_drawer_full_screen && is_new_thread, |this| {
@@ -8738,7 +8876,7 @@ impl Render for AgentView {
                     .children(self.render_errors(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
-                        if let Some(parent) = self.parent(cx) {
+                        if is_subthread {
                             this.child(self.render_subthread_bar(parent, cx))
                         } else if self.is_archived {
                             this.child(self.render_archived_notice(cx))
@@ -12098,6 +12236,8 @@ mod tests {
                 }),
                 delivered: false,
                 agent_session: None,
+                runs_on: None,
+                parent_machine: None,
             });
             snapshot.threads.push(subthread);
         }
@@ -12265,7 +12405,7 @@ mod tests {
         });
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.header_thread(cx), ThreadId(2));
+            assert_eq!(view.header_thread(cx).1, ThreadId(2));
             assert_eq!(view.header_title(cx).as_ref(), "Spawn some subthreads");
         });
         for selector in [
@@ -12296,6 +12436,214 @@ mod tests {
         assert!(cx.debug_bounds("subthread-title-bar-stop").is_none());
     }
 
+    /// This Mac's [`subthreads_snapshot`], whose 10 was delegated to Devbox 1, where its
+    /// thread is 7, and Devbox 1's, with that thread.
+    fn delegated_snapshots() -> (ProjectsSnapshot, ProjectsSnapshot) {
+        let mut mac = subthreads_snapshot(&[10]);
+        if let Some(task) = mac
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == ThreadId(10))
+            .and_then(|thread| thread.task.as_mut())
+        {
+            task.runs_on = Some(projects::RemoteThread {
+                machine: "Devbox 1".into(),
+                thread: ThreadId(7),
+            });
+        }
+        let mut devbox = snapshot(None);
+        devbox.threads[1].title = "Devbox 1's own thread".into();
+        let mut working = thread(7, Some("devbox-session"));
+        working.title = "Research: UI for child tasks".into();
+        working.task = Some(projects::Task {
+            parent: ThreadId(2),
+            prompt: "Look into it".into(),
+            role: Some("research".into()),
+            client_request_id: None,
+            outcome: None,
+            delivered: false,
+            agent_session: None,
+            runs_on: None,
+            parent_machine: Some("This Mac".into()),
+        });
+        devbox.threads.push(working);
+        (mac, devbox)
+    }
+
+    /// This Mac's and Devbox 1's clients, with [`delegated_snapshots`].
+    fn two_machines(cx: &mut TestAppContext) -> (Entity<ServerClient>, Entity<ServerClient>) {
+        let (mac, devbox) = delegated_snapshots();
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let [mac, devbox] = [
+                (MachineId::Local, "This Mac", mac),
+                (MachineId::Remote(1), "Devbox 1", devbox),
+            ]
+            .map(|(machine, label, snapshot)| {
+                let client = ServerClient::new_for_test(
+                    machine,
+                    label.into(),
+                    SpacesSnapshot::default(),
+                    cx,
+                );
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+                let projects = client.read(cx).projects().clone();
+                projects.update(cx, |store, cx| store.set_snapshot(snapshot, cx));
+                client
+            });
+            crate::machines::init_for_test(vec![mac.clone(), devbox.clone()], cx);
+            (mac, devbox)
+        })
+    }
+
+    fn open_on<'a>(
+        client: &Entity<ServerClient>,
+        thread_id: u64,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<AgentView>, &'a mut VisualTestContext) {
+        let client = client.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let thread_id = ThreadId(thread_id);
+            let thread = AgentThread::shared(&client, thread_id, cx);
+            AgentView::new(
+                thread_id,
+                thread,
+                "New thread".into(),
+                Some(AgentId::new("mock")),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// A task delegated to another machine is a row under its parent that names the machine.
+    /// Its Stop stops its thread there, and opening it opens that thread.
+    #[gpui::test]
+    fn a_task_on_another_machine_is_a_row_naming_it(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+
+        let (mac, devbox) = two_machines(cx);
+        let (view, cx) = open_on(&mac, 2, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Spawn some".into())], cx)
+        });
+        cx.run_until_parked();
+        let requests: Rc<RefCell<Vec<(MachineId, Request)>>> = Rc::default();
+        for client in [&mac, &devbox] {
+            client.update(cx, |client, _| {
+                let machine = client.machine();
+                let requests = requests.clone();
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push((machine, request.clone()));
+                    Some(Response::Ok)
+                });
+            });
+        }
+        assert!(cx.debug_bounds("subthread-row-machine-10").is_some());
+        assert!(cx.debug_bounds("subthread-row-machine-11").is_none());
+
+        let stop = cx.debug_bounds("stop-subthread-row-10").expect("Stop");
+        cx.simulate_click(stop.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let cancels: Vec<(MachineId, Request)> = requests
+            .borrow()
+            .iter()
+            .filter(|(_, request)| matches!(request, Request::Cancel(_)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            cancels,
+            vec![(
+                MachineId::Remote(1),
+                Request::Cancel(agentz_protocol::ConnectionId::Thread(ThreadId(7)))
+            )]
+        );
+
+        // Its permission requests are asked there.
+        let mut blocked = delegated_snapshots().0;
+        blocked.blocked_threads = vec![ThreadId(10)];
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        store.update(cx, |store, cx| store.set_snapshot(blocked, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let (thread, _) = view
+                .blocked_subthreads
+                .get(&ThreadId(10))
+                .expect("followed");
+            let thread = thread.read(cx);
+            assert_eq!(thread.client().read(cx).machine(), MachineId::Remote(1));
+            assert!(
+                devbox
+                    .read(cx)
+                    .thread(agentz_protocol::ConnectionId::Thread(ThreadId(7)))
+                    .is_some()
+            );
+        });
+
+        cx.update(|_, cx| {
+            let machines = Machines::global(cx).read(cx);
+            let stub = ThreadKey {
+                machine: MachineId::Local,
+                thread: ThreadId(10),
+            };
+            let working = ThreadKey {
+                machine: MachineId::Remote(1),
+                thread: ThreadId(7),
+            };
+            assert_eq!(machines.working_thread(stub, cx), working);
+            let parent = ThreadKey {
+                machine: MachineId::Local,
+                thread: ThreadId(2),
+            };
+            assert_eq!(machines.working_thread(parent, cx), parent);
+            // The sidebar marks the parent's thread.
+            assert_eq!(machines.root_thread(working, cx), parent);
+        });
+    }
+
+    /// A task delegated from another machine opens under its parent's header there, and its
+    /// bar says where it runs and goes back to that parent.
+    #[gpui::test]
+    fn a_task_from_another_machine_shows_its_parent_there(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+
+        let (_, devbox) = two_machines(cx);
+        let (view, cx) = open_on(&devbox, 7, cx);
+        view.read_with(cx, |view, cx| {
+            let (client, parent) = view.header_thread(cx);
+            assert_eq!(client.read(cx).machine(), MachineId::Local);
+            assert_eq!(parent, ThreadId(2));
+            assert_eq!(view.header_title(cx).as_ref(), "Spawn some subthreads");
+            assert_eq!(view.parent_title(cx).as_ref(), "Spawn some subthreads");
+            assert_eq!(view.subthread_runs(cx), "Runs on its own on Devbox 1");
+        });
+        for selector in ["subthread-title-bar", "minimize-subthread", "subthread-bar"] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
+        }
+
+        let opened: Rc<RefCell<Vec<ThreadKey>>> = Rc::default();
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
+                if let AgentViewEvent::OpenThreadOn(key) = event {
+                    opened.borrow_mut().push(*key);
+                }
+            })
+            .detach();
+        });
+        let open_parent = cx.debug_bounds("open-parent").expect("Open Parent");
+        cx.simulate_click(open_parent.center(), gpui::Modifiers::none());
+        assert_eq!(
+            *opened.borrow(),
+            vec![ThreadKey {
+                machine: MachineId::Local,
+                thread: ThreadId(2),
+            }]
+        );
+    }
+
     /// [`subthreads_snapshot`], with one of the agent's own subagents (12) that runs or ended.
     fn subagent_snapshot(running: bool) -> ProjectsSnapshot {
         let mut snapshot = subthreads_snapshot(&[]);
@@ -12313,6 +12661,8 @@ mod tests {
             }),
             delivered: true,
             agent_session: Some("subagent-session".into()),
+            runs_on: None,
+            parent_machine: None,
         });
         snapshot.threads.push(subagent);
         snapshot

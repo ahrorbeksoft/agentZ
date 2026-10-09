@@ -1104,6 +1104,19 @@ for `t3_`.
   lets reach nothing of a project). So an agent can open a terminal there, clone the repository
   and add it; when that's the caller's repository, the answer waits up to 10 seconds for the app
   to combine them and says whether it did (`combinedWithThisProject`).
+- **Tasks on another machine** (`delegate_elsewhere`, `delegate_from_elsewhere`):
+  `delegate_task` with `machine` starts the task's thread in that machine's checkout, with the
+  caller's agent and mode (`parentMode`, `parentModeOption`: never broader than the caller's)
+  and the caller as its parent there (`Task::parent_machine`). That thread is no subthread of
+  anything on its machine, whose server announces its end to nobody. Here a subthread with no
+  agent stands for it (`Task::runs_on`), so the task's `taskId` is this machine's, and
+  `task_status` and `task_cancel` take it without `machine`. Every 5 seconds the server asks
+  the task's machine how it's going (`poll_remote_tasks`, with `task_status` there) and copies
+  its title, model and state (working, waiting for approval or input) to the stand-in. Once
+  the task is over there, its outcome ends the stand-in, which the parent then hears of as of
+  any task; a task whose thread there was deleted ends as Failed. `task_cancel` cancels it
+  there. Any thread may delegate there as it may here. It works only while the app is open:
+  without the app, the stand-in waits until the app relays again.
 
 ### Subthreads
 
@@ -1134,6 +1147,13 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   now or its task's `ended_at`), "Runs on its own", Stop, and Open Parent. Ctrl-− (Zed's Go
   Back, on macOS too) runs `agent::OpenParentThread` anywhere in the subthread, which the
   command palette lists there, and both ways back show it in their tooltips.
+- **On another machine** (`Machines::working_thread`, `Machines::root_thread`): a task
+  delegated to another machine is a row in its parent's Agents list like any other, with
+  "· <machine icon> Devbox 1" after its model. Opening it opens its thread on that machine,
+  with the sidebar marking the parent. Its Stop, its changes and its permission requests go to
+  that thread there (`AgentView::working_thread`). That thread opens under its parent's header
+  from the other machine (`header_parent`), and its bar reads "Runs on its own on Devbox 1".
+  Open Parent and Minimize go back to the parent there (`AgentViewEvent::OpenThreadOn`).
 
 ### Agents' own subagents
 

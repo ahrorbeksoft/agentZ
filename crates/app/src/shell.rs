@@ -911,6 +911,8 @@ impl Shell {
     }
 
     fn open_thread(&mut self, thread_id: ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
+        // A task delegated to another machine opens there.
+        let thread_id = self.machines.read(cx).working_thread(thread_id, cx);
         self.settings_page = None;
         if self.view != MainView::Agents {
             self.view = MainView::Agents;
@@ -934,16 +936,7 @@ impl Shell {
         self.active_project = self.project_of(thread_id, cx);
         self.pending_draft = None;
         // A subthread isn't in the sidebar, so its top-level thread is highlighted.
-        let sidebar_thread = ThreadKey {
-            machine: thread_id.machine,
-            thread: self
-                .machines
-                .read(cx)
-                .projects(thread_id.machine, cx)
-                .map_or(thread_id.thread, |store| {
-                    store.read(cx).root_thread(thread_id.thread)
-                }),
-        };
+        let sidebar_thread = self.machines.read(cx).root_thread(thread_id, cx);
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_active_thread(Some(sidebar_thread), cx)
         });
@@ -1138,6 +1131,7 @@ impl Shell {
                     window,
                     cx,
                 ),
+                AgentViewEvent::OpenThreadOn(other) => this.open_thread(*other, window, cx),
                 AgentViewEvent::Confirm(request) => {
                     this.open_confirm_dialog(request.clone(), window, cx)
                 }

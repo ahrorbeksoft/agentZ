@@ -831,6 +831,8 @@ mod tests {
                     outcome: None,
                     delivered: false,
                     agent_session: None,
+                    runs_on: None,
+                    parent_machine: None,
                 },
                 None,
             )

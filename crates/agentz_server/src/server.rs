@@ -463,6 +463,16 @@ impl Server {
                 }
             }
         });
+        let inputs = server.inputs.clone();
+        server.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(tools::REMOTE_TASK_POLL_INTERVAL).await;
+                let poll = Input::Run(Box::new(|server: &mut Server| server.poll_remote_tasks()));
+                if inputs.unbounded_send(poll).is_err() {
+                    break;
+                }
+            }
+        });
         server.refresh_git_heads();
         server.refresh_favicons();
         server.check_external_logins();
@@ -1471,6 +1481,15 @@ impl Server {
                 "This thread runs a terminal, not an agent.",
             ));
         }
+        if let Some(runs_on) = thread.runs_on() {
+            return Ok(AgentThread::failed(
+                "Agent".into(),
+                format!(
+                    "This task runs on {} as thread {} there.",
+                    runs_on.machine, runs_on.thread.0
+                ),
+            ));
+        }
         let Some(agent_id) = thread.agent_id.clone().map(AgentId::new) else {
             return Ok(AgentThread::failed(
                 "Agent".into(),
@@ -2210,6 +2229,14 @@ impl Server {
         self.refresh_new_git_heads();
         self.refresh_new_favicons();
         for (thread_id, thread) in &self.threads {
+            // A task on another machine is as it was there when last asked.
+            if self
+                .projects
+                .thread(*thread_id)
+                .is_some_and(|thread| thread.runs_on().is_some())
+            {
+                continue;
+            }
             self.projects
                 .set_thread_blocked(*thread_id, !thread.state.permission_requests.is_empty());
             self.projects

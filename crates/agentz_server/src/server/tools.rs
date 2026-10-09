@@ -19,7 +19,7 @@ mod relay;
 mod terminals;
 mod workspaces;
 
-pub(super) use relay::Relays;
+pub(super) use relay::{REMOTE_TASK_POLL_INTERVAL, Relays};
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
@@ -33,7 +33,8 @@ use collections::HashMap;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use projects::{
-    AccountId, ProjectId, ProjectStore, Task, TaskEnd, TaskOutcome, Thread, ThreadCreator, ThreadId,
+    AccountId, ProjectId, ProjectStore, RemoteThread, Task, TaskEnd, TaskOutcome, Thread,
+    ThreadCreator, ThreadId,
 };
 use serde_json::{Map, Value, json};
 use util::ResultExt as _;
@@ -366,12 +367,12 @@ impl Server {
             .projects
             .threads()
             .iter()
-            // The agent's own end with its word of them.
+            // The agent's own end with its word of them, and those on other machines as they
+            // end there.
             .filter(|thread| {
-                thread
-                    .task
-                    .as_ref()
-                    .is_some_and(|task| task.outcome.is_none() && !task.is_agents_own())
+                thread.task.as_ref().is_some_and(|task| {
+                    task.outcome.is_none() && !task.is_agents_own() && task.runs_on.is_none()
+                })
             })
             .map(|thread| thread.id)
             .collect();
@@ -425,9 +426,11 @@ impl Server {
             .projects
             .threads()
             .iter()
+            // A parent on another machine hears from its own server, which asks this one.
             .filter_map(|thread| {
                 let task = thread.task.as_ref()?;
-                (task.outcome.is_some() && !task.delivered).then_some((thread.id, task.parent))
+                (task.outcome.is_some() && !task.delivered && task.parent_machine.is_none())
+                    .then_some((thread.id, task.parent))
             })
             .collect();
         for (task, parent) in ended {
@@ -984,19 +987,13 @@ impl Server {
 
         let same_agent_as_caller = caller_thread
             .is_some_and(|thread| thread.agent_id.as_deref() == Some(agent_id.0.as_ref()));
-        let caller_agent_thread = caller
+        let caller_options = caller
             .thread_id
             .and_then(|thread_id| self.threads.get(&thread_id))
-            .filter(|_| same_agent_as_caller);
-        let caller_options = caller_agent_thread
+            .filter(|_| same_agent_as_caller)
             .map(|thread| thread.config_options().to_vec())
             .unwrap_or_default();
-        let mode = caller_agent_thread
-            .and_then(|thread| thread.modes())
-            .map(|modes| modes.current_mode_id.clone());
-        // Agents that put their permission mode in a setting rather than an ACP mode.
-        let mode_option = select_choices(&caller_options, acp::SessionConfigOptionCategory::Mode)
-            .map(|(config_id, _, current)| (config_id, current));
+        let (mode, mode_option) = self.caller_mode(caller, &agent_id);
         // Another account may offer other models (its plan's), so the caller's are its own.
         let same_account_as_caller = caller_thread.is_some_and(|thread| thread.account == account);
         let known_options = if caller_options.is_empty() || !same_account_as_caller {
@@ -1054,6 +1051,34 @@ impl Server {
             mode_option,
             placement: workspace_strategy(arguments)?,
         })
+    }
+
+    /// The calling thread's mode, for a thread of the same agent: a delegated task never gets
+    /// more room than its parent. Some agents put their permission mode in a setting rather
+    /// than an ACP mode.
+    fn caller_mode(
+        &self,
+        caller: Caller,
+        agent_id: &AgentId,
+    ) -> (
+        Option<acp::SessionModeId>,
+        Option<(acp::SessionConfigId, String)>,
+    ) {
+        let Some(thread) = caller.thread_id.and_then(|thread_id| {
+            let stored = self.projects.thread(thread_id)?;
+            (stored.agent_id.as_deref() == Some(agent_id.0.as_ref()))
+                .then(|| self.threads.get(&thread_id))
+                .flatten()
+        }) else {
+            return (None, None);
+        };
+        let mode = thread.modes().map(|modes| modes.current_mode_id.clone());
+        let mode_option = select_choices(
+            thread.config_options(),
+            acp::SessionConfigOptionCategory::Mode,
+        )
+        .map(|(config_id, _, current)| (config_id, current));
+        (mode, mode_option)
     }
 
     /// The account a launched thread runs on: the `account` argument (a listed account's id
@@ -1164,6 +1189,36 @@ impl Server {
     }
 
     fn delegate_task(&mut self, caller: Caller, arguments: &Arguments) -> Outcome {
+        if caller.relayed {
+            return self.delegate_from_elsewhere(caller, arguments);
+        }
+        let parent = self.delegating_parent(caller)?;
+        let delegation = Delegation::new(arguments)?;
+        if let Some(task) = self.delegated_task(parent, delegation.client_request_id.as_deref()) {
+            return delegation.answer(self, caller, task);
+        }
+        let mut spec = self.launch_spec(caller, arguments, "task")?;
+        let Some(prompt) = spec.prompt.clone() else {
+            return Err(invalid("task is required."));
+        };
+        let placement = std::mem::take(&mut spec.placement);
+        self.with_folders(caller, vec![placement], move |server, folders| {
+            let agent_id = spec.agent_id.0.to_string();
+            let task = server
+                .projects
+                .add_subthread(delegation.task(parent, prompt), Some(agent_id))
+                .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+            // Otherwise the task works where its parent does.
+            if let Some(Folder::Chosen(folder)) = folders.into_iter().next() {
+                server.projects.set_thread_workspace(task, folder);
+            }
+            server.start_launched(task, ThreadCreator::Thread(parent), spec);
+            delegation.answer(server, caller, task)
+        })
+    }
+
+    /// The calling thread, which may delegate unless it's a task that has ended.
+    fn delegating_parent(&self, caller: Caller) -> Result<ThreadId, Failure> {
         let Some(parent) = caller.thread_id else {
             return Err(failure(
                 "capability_denied",
@@ -1181,82 +1236,95 @@ impl Server {
                 "This task has ended, so it can't delegate more.",
             ));
         }
-        let wait = match arguments.string("mode", 16)? {
-            None | Some("async") => false,
-            Some("wait") => true,
-            Some(mode) => return Err(invalid(format!("Unknown mode {mode}."))),
+        Ok(parent)
+    }
+
+    /// The parent's earlier task with this `clientRequestId`.
+    fn delegated_task(
+        &self,
+        parent: ThreadId,
+        client_request_id: Option<&str>,
+    ) -> Option<ThreadId> {
+        let client_request_id = client_request_id?;
+        self.projects
+            .subthreads(parent)
+            .into_iter()
+            .find(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .and_then(|task| task.client_request_id.as_deref())
+                    == Some(client_request_id)
+            })
+            .map(|thread| thread.id)
+    }
+
+    /// A task a thread on another machine delegated, relayed by the app: a thread of this
+    /// project whose parent is there ([`Task::parent_machine`]), with the parent's mode. The
+    /// parent's server follows it with `task_status`, so nobody here is told of its end.
+    fn delegate_from_elsewhere(&mut self, caller: Caller, arguments: &Arguments) -> Outcome {
+        let project_id = caller.project()?;
+        let parent = arguments
+            .thread_id("parentThreadId")?
+            .ok_or_else(|| invalid("parentThreadId is required."))?;
+        let parent_machine = arguments
+            .string("parentMachine", 256)?
+            .ok_or_else(|| invalid("parentMachine is required."))?
+            .to_string();
+        let delegation = Delegation::new(arguments)?;
+        let remote_parent = RemoteThread {
+            machine: parent_machine.clone(),
+            thread: parent,
         };
-        let timeout = arguments
-            .number("timeoutMs")?
-            .map_or(DEFAULT_WAIT, Duration::from_millis)
-            .min(MAX_WAIT);
-        let role = match arguments.string("role", 32)? {
-            Some(role) if TASK_ROLES.contains(&role) => Some(role.to_string()),
-            Some(role) => {
-                return Err(invalid(format!(
-                    "Unknown role {role}. Roles: {}.",
-                    TASK_ROLES.join(", ")
-                )));
-            }
-            None => None,
-        };
-        let client_request_id = arguments.string("clientRequestId", 256)?.map(String::from);
-        let existing = client_request_id.as_ref().and_then(|request_id| {
-            self.projects
-                .subthreads(parent)
-                .into_iter()
-                .find(|thread| {
-                    thread
-                        .task
-                        .as_ref()
-                        .and_then(|task| task.client_request_id.as_ref())
-                        == Some(request_id)
+        let existing = delegation
+            .client_request_id
+            .as_deref()
+            .and_then(|request_id| {
+                self.projects.threads().iter().find(|thread| {
+                    thread.remote_parent().as_ref() == Some(&remote_parent)
+                        && thread
+                            .task
+                            .as_ref()
+                            .and_then(|task| task.client_request_id.as_deref())
+                            == Some(request_id)
                 })
-                .map(|thread| thread.id)
-        });
-        let answer = move |server: &mut Server, task: ThreadId| -> Outcome {
-            if wait {
-                server
-                    .wait_for_task(caller, task, false)
-                    .map(|step| match step {
-                        Step::Wait(_) => Step::WaitForTask(task, timeout),
-                        step => step,
-                    })
-            } else {
-                Ok(Step::Done(server.task_result(task, false, false)))
-            }
-        };
+            })
+            .map(|thread| thread.id);
         if let Some(task) = existing {
-            return answer(self, task);
+            return Ok(Step::Done(self.task_result(task, false, false)));
         }
         let mut spec = self.launch_spec(caller, arguments, "task")?;
         let Some(prompt) = spec.prompt.clone() else {
             return Err(invalid("task is required."));
         };
+        if let Some(mode) = arguments.string("parentMode", 256)? {
+            spec.mode = Some(acp::SessionModeId::new(mode.to_string()));
+        }
+        if let Some(option) = arguments.0.get("parentModeOption")
+            && let (Some(config_id), Some(value)) =
+                (option["configId"].as_str(), option["value"].as_str())
+        {
+            spec.mode_option = Some((
+                acp::SessionConfigId::new(config_id.to_string()),
+                value.to_string(),
+            ));
+        }
         let placement = std::mem::take(&mut spec.placement);
         self.with_folders(caller, vec![placement], move |server, folders| {
-            let agent_id = spec.agent_id.0.to_string();
+            let mut task = delegation.task(parent, prompt);
+            task.parent_machine = Some(parent_machine);
             let task = server
                 .projects
-                .add_subthread(
-                    Task {
-                        parent,
-                        prompt,
-                        role,
-                        client_request_id,
-                        outcome: None,
-                        delivered: false,
-                        agent_session: None,
-                    },
-                    Some(agent_id),
-                )
-                .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
-            // Otherwise the task works where its parent does.
+                .add_task_from_elsewhere(project_id, task, Some(spec.agent_id.0.to_string()))
+                .ok_or_else(|| failure("project_not_found", "The project was removed."))?;
             if let Some(Folder::Chosen(folder)) = folders.into_iter().next() {
                 server.projects.set_thread_workspace(task, folder);
             }
-            server.start_launched(task, ThreadCreator::Thread(parent), spec);
-            answer(server, task)
+            server
+                .projects
+                .set_thread_creator(task, ThreadCreator::Command);
+            server.start_launched(task, ThreadCreator::Command, spec);
+            Ok(Step::Done(server.task_result(task, false, false)))
         })
     }
 
@@ -1288,6 +1356,8 @@ impl Server {
                 "status": outcome.end.as_str(),
             })));
         }
+        // One on a machine out of reach would go on there.
+        self.reach_remote_task(task)?;
         self.cancel_task(task, reason);
         Ok(Step::Done(json!({
             "taskId": task.0,
@@ -1312,6 +1382,7 @@ impl Server {
                 (None, true) => "Cancelled by the parent.".to_string(),
                 (_, false) => "Cancelled with the task that delegated it.".to_string(),
             };
+            self.cancel_elsewhere(thread_id, &summary);
             self.projects.update_task(thread_id, |task| {
                 task.outcome = Some(TaskOutcome {
                     end: TaskEnd::Cancelled,
@@ -1336,12 +1407,22 @@ impl Server {
     /// A task the caller delegated.
     fn task(&self, caller: Caller, task: Option<ThreadId>) -> Result<ThreadId, Failure> {
         let task = task.ok_or_else(|| invalid("taskId is required."))?;
-        match self
-            .projects
-            .thread(task)
-            .and_then(|thread| thread.task.as_ref())
-        {
-            Some(delegated) if caller.thread_id == Some(delegated.parent) => Ok(task),
+        let thread = self.projects.thread(task);
+        match thread.and_then(|thread| thread.task.as_ref()) {
+            Some(delegated)
+                if delegated.parent_machine.is_none()
+                    && caller.thread_id == Some(delegated.parent) =>
+            {
+                Ok(task)
+            }
+            // The parent's server follows it, relayed by the app.
+            Some(delegated)
+                if delegated.parent_machine.is_some()
+                    && caller.relayed
+                    && thread.map(|thread| thread.project_id) == caller.project_id =>
+            {
+                Ok(task)
+            }
             _ => Err(failure(
                 "task_not_found",
                 format!("This thread has no task {}.", task.0),
@@ -1353,6 +1434,7 @@ impl Server {
     /// ended task's result counts as delivered to the parent.
     fn task_result(&mut self, task: ThreadId, wait_timed_out: bool, acknowledge: bool) -> Value {
         let (status, work_state) = self.task_status(task);
+        let thread_status = self.task_thread_status(task);
         let Some(thread) = self.projects.thread(task) else {
             return json!({"taskId": task.0, "status": "cancelled"});
         };
@@ -1372,6 +1454,11 @@ impl Server {
             "role": delegated.role,
             "status": status,
             "workState": work_state,
+            "threadStatus": thread_status,
+            "runsOn": delegated.runs_on.as_ref().map(|runs_on| json!({
+                "machine": runs_on.machine,
+                "threadId": runs_on.thread.0,
+            })),
             "hasPendingChildTasks": has_pending_tasks,
             "agentId": thread.agent_id,
             "agentName": thread
@@ -1404,17 +1491,28 @@ impl Server {
         {
             return (outcome.end.as_str(), "result_available");
         }
-        let status = match self.thread_status(task) {
+        let status = match self.task_thread_status(task) {
             "starting" => "queued",
             "waiting_for_approval" | "waiting_for_input" | "needs_login" => "waiting",
             _ => "running",
         };
-        let work_state = if !self.is_busy(task) && self.has_unannounced_tasks(task) {
+        let work_state = if let Some(remote) = self.relays.remote_task(task) {
+            remote.work_state
+        } else if !self.is_busy(task) && self.has_unannounced_tasks(task) {
             "waiting_for_children"
         } else {
             "working"
         };
         (status, work_state)
+    }
+
+    /// The status of the task's thread, as [`Self::thread_status`] has it, there for a task on
+    /// another machine.
+    fn task_thread_status(&self, task: ThreadId) -> &'static str {
+        match self.relays.remote_task(task) {
+            Some(remote) => remote.thread_status,
+            None => self.thread_status(task),
+        }
     }
 
     /// The thread has delegated tasks that are running, or have ended without it hearing.
@@ -1784,18 +1882,85 @@ struct LaunchSpec {
     placement: Placement,
 }
 
+/// What `delegate_task` asks besides the task's thread: how to answer, and the task's role
+/// and idempotency key.
+struct Delegation {
+    /// `mode: wait`: answer once the task ends, or after `timeout`.
+    wait: bool,
+    timeout: Duration,
+    role: Option<String>,
+    client_request_id: Option<String>,
+}
+
+impl Delegation {
+    fn new(arguments: &Arguments) -> Result<Self, Failure> {
+        let wait = match arguments.string("mode", 16)? {
+            None | Some("async") => false,
+            Some("wait") => true,
+            Some(mode) => return Err(invalid(format!("Unknown mode {mode}."))),
+        };
+        let timeout = arguments
+            .number("timeoutMs")?
+            .map_or(DEFAULT_WAIT, Duration::from_millis)
+            .min(MAX_WAIT);
+        let role = match arguments.string("role", 32)? {
+            Some(role) if TASK_ROLES.contains(&role) => Some(role.to_string()),
+            Some(role) => {
+                return Err(invalid(format!(
+                    "Unknown role {role}. Roles: {}.",
+                    TASK_ROLES.join(", ")
+                )));
+            }
+            None => None,
+        };
+        Ok(Self {
+            wait,
+            timeout,
+            role,
+            client_request_id: arguments.string("clientRequestId", 256)?.map(String::from),
+        })
+    }
+
+    fn task(&self, parent: ThreadId, prompt: String) -> Task {
+        Task {
+            parent,
+            prompt,
+            role: self.role.clone(),
+            client_request_id: self.client_request_id.clone(),
+            outcome: None,
+            delivered: false,
+            agent_session: None,
+            runs_on: None,
+            parent_machine: None,
+        }
+    }
+
+    /// The task as it is, or in `wait` mode, once it ends.
+    fn answer(&self, server: &mut Server, caller: Caller, task: ThreadId) -> Outcome {
+        if !self.wait {
+            return Ok(Step::Done(server.task_result(task, false, false)));
+        }
+        let timeout = self.timeout;
+        server
+            .wait_for_task(caller, task, false)
+            .map(|step| match step {
+                Step::Wait(_) => Step::WaitForTask(task, timeout),
+                step => step,
+            })
+    }
+}
+
 /// Ends the tasks that were running when the server last stopped. Their parents are told once
 /// it's running again. The agent's own subagents go on if their agent was handed over, and end
-/// with it otherwise.
+/// with it otherwise; tasks on other machines went on there.
 pub(super) fn interrupt_unfinished_tasks(projects: &mut ProjectStore) {
     let unfinished: Vec<ThreadId> = projects
         .threads()
         .iter()
         .filter(|thread| {
-            thread
-                .task
-                .as_ref()
-                .is_some_and(|task| task.outcome.is_none() && !task.is_agents_own())
+            thread.task.as_ref().is_some_and(|task| {
+                task.outcome.is_none() && !task.is_agents_own() && task.runs_on.is_none()
+            })
         })
         .map(|thread| thread.id)
         .collect();
@@ -2220,7 +2385,7 @@ pub(super) fn definitions() -> Value {
         {
             "name": "delegate_task",
             "title": "Delegate a child task",
-            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows in this thread's Agents control. Prefer mode='async' for long work: when the task ends, this thread gets a message saying so, queued until its turn ends, so end the turn instead of polling. mode='wait' blocks until the task ends or timeoutMs (default 10 minutes) passes; a timeout returns waitTimedOut=true and doesn't cancel the task. Keep the taskId for task_status and task_cancel.",
+            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows in this thread's Agents control. Prefer mode='async' for long work: when the task ends, this thread gets a message saying so, queued until its turn ends, so end the turn instead of polling. mode='wait' blocks until the task ends or timeoutMs (default 10 minutes) passes; a timeout returns waitTimedOut=true and doesn't cancel the task. With machine, the child runs on that machine and still shows under this thread; its taskId is this machine's, so call task_status and task_cancel without machine. Keep the taskId for task_status and task_cancel.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

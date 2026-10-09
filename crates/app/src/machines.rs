@@ -11,7 +11,9 @@ use std::time::SystemTime;
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription};
 pub use projects::project_at;
-use projects::{Project, ProjectId, Thread, ThreadId, ThreadOrder, ThreadSection, order_key};
+use projects::{
+    Project, ProjectId, RemoteThread, Thread, ThreadId, ThreadOrder, ThreadSection, order_key,
+};
 use serde::{Deserialize, Serialize};
 use ui::{IconName, SharedString};
 
@@ -293,6 +295,57 @@ impl Machines {
             .unwrap_or_else(|| "Unknown machine".into())
     }
 
+    /// The machine by the name servers know it by, which is its label ([`Peers`]).
+    pub fn machine_named(&self, name: &str, cx: &App) -> Option<MachineId> {
+        self.clients
+            .iter()
+            .map(|client| client.read(cx))
+            .find(|client| client.label().as_ref() == name)
+            .map(|client| client.machine())
+    }
+
+    /// A thread on another machine, as a server names it.
+    pub fn remote_thread(&self, remote: &RemoteThread, cx: &App) -> Option<ThreadKey> {
+        Some(ThreadKey {
+            machine: self.machine_named(&remote.machine, cx)?,
+            thread: remote.thread,
+        })
+    }
+
+    /// The thread that works for this one: for a task delegated to another machine, its
+    /// thread there, else the thread itself.
+    pub fn working_thread(&self, key: ThreadKey, cx: &App) -> ThreadKey {
+        self.projects(key.machine, cx)
+            .and_then(|store| {
+                let runs_on = store.read(cx).thread(key.thread)?.runs_on()?.clone();
+                self.remote_thread(&runs_on, cx)
+            })
+            .unwrap_or(key)
+    }
+
+    /// The top-level thread a subthread belongs to, also when it was delegated from another
+    /// machine, or the thread itself.
+    pub fn root_thread(&self, key: ThreadKey, cx: &App) -> ThreadKey {
+        let mut key = key;
+        // Bounded, in case two machines' threads name each other as parents.
+        for _ in 0..self.clients.len() {
+            let Some(store) = self.projects(key.machine, cx) else {
+                break;
+            };
+            let store = store.read(cx);
+            key.thread = store.root_thread(key.thread);
+            match store
+                .thread(key.thread)
+                .and_then(Thread::remote_parent)
+                .and_then(|parent| self.remote_thread(&parent, cx))
+            {
+                Some(parent) => key = parent,
+                None => break,
+            }
+        }
+        key
+    }
+
     pub fn is_online(&self, machine: MachineId, cx: &App) -> bool {
         self.client(machine, cx)
             .is_some_and(|client| client.read(cx).is_online())
@@ -405,10 +458,8 @@ impl Machines {
         cx: &mut Context<Self>,
     ) {
         let target = self
-            .clients
-            .iter()
-            .find(|client| client.read(cx).label().as_ref() == call.machine)
-            .cloned();
+            .machine_named(&call.machine, cx)
+            .and_then(|machine| self.client(machine, cx));
         let response = match target {
             // Only to checkouts the server was told of, whatever it asks.
             Some(target)

@@ -1137,6 +1137,9 @@ impl SpacesView {
                                 thread: *other,
                             }))
                         }
+                        AgentViewEvent::OpenThreadOn(other) => {
+                            cx.emit(SpacesViewEvent::OpenThread(*other))
+                        }
                         AgentViewEvent::Confirm(request) => {
                             cx.emit(SpacesViewEvent::Confirm(request.clone()))
                         }
