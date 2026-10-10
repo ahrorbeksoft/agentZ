@@ -570,9 +570,35 @@ pub struct ProjectsSnapshot {
     /// ([`Project::icon_file`]) while it's there, else the one found in its folder (t3code's
     /// favicon scan). Projects without one aren't listed.
     pub favicons: Vec<(ProjectId, PathBuf)>,
+    /// How each project with copies on other machines stands in git, read with the branches.
+    /// Other projects aren't listed.
+    pub copy_statuses: Vec<(ProjectId, CopyStatus)>,
     /// Drawer terminals running a program in front of their shell: thread, terminal number,
     /// program.
     pub drawer_commands: Vec<(ThreadId, u32, String)>,
+}
+
+/// How a project's folder stands in git, as its machine's server reads it, so the copies of a
+/// project on several machines can be told apart where a new thread picks one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyStatus {
+    /// `None` when detached.
+    pub branch: Option<String>,
+    /// The commit checked out, abbreviated.
+    pub commit: Option<String>,
+    /// What the branch tracks, such as `origin/main`.
+    pub upstream: Option<String>,
+    /// Commits ahead of and behind the upstream as of the machine's last fetch: nothing is
+    /// fetched to read them. Without an upstream, ahead counts the commits no remote has.
+    pub ahead: u32,
+    pub behind: u32,
+    /// Files changed or new, and the lines added and removed, not committed.
+    pub changed_files: u32,
+    pub added_lines: u32,
+    pub removed_lines: u32,
+    pub stashes: u32,
+    /// When the repository last fetched, by its `FETCH_HEAD`.
+    pub fetched_at: Option<SystemTime>,
 }
 
 /// The folder a terminal's foreground process works in, and its git branch.
@@ -650,6 +676,8 @@ pub struct ProjectStore {
     git_heads: BTreeMap<PathBuf, GitHead>,
     /// [`ProjectsSnapshot::favicons`]. Not persisted either.
     favicons: BTreeMap<ProjectId, PathBuf>,
+    /// [`ProjectsSnapshot::copy_statuses`]. Not persisted either.
+    copy_statuses: BTreeMap<ProjectId, CopyStatus>,
     /// Drawer terminals running a program in front of their shell. Not persisted either.
     drawer_commands: BTreeMap<(ThreadId, u32), String>,
     /// Counts changes, so the owner can tell whether a call changed anything.
@@ -687,6 +715,7 @@ impl ProjectStore {
             terminal_folders: BTreeMap::new(),
             git_heads: BTreeMap::new(),
             favicons: BTreeMap::new(),
+            copy_statuses: BTreeMap::new(),
             drawer_commands: BTreeMap::new(),
             revision: 0,
             saver: state_path.map(|path| Saver::new(path, "projects-saver")),
@@ -1783,6 +1812,20 @@ impl ProjectStore {
         }
     }
 
+    /// How the project's folder stands in git, for a project with copies on other machines
+    /// ([`ProjectsSnapshot::copy_statuses`]).
+    pub fn copy_status(&self, project: ProjectId) -> Option<&CopyStatus> {
+        self.copy_statuses.get(&project)
+    }
+
+    pub fn set_copy_statuses(&mut self, mut statuses: BTreeMap<ProjectId, CopyStatus>) {
+        statuses.retain(|id, _| self.project(*id).is_some());
+        if self.copy_statuses != statuses {
+            self.copy_statuses = statuses;
+            self.changed();
+        }
+    }
+
     pub fn record_thread_activity(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.last_activity_at = Some(SystemTime::now());
@@ -1837,6 +1880,11 @@ impl ProjectStore {
                 .iter()
                 .map(|(id, path)| (*id, path.clone()))
                 .collect(),
+            copy_statuses: self
+                .copy_statuses
+                .iter()
+                .map(|(id, status)| (*id, status.clone()))
+                .collect(),
             drawer_commands: self
                 .drawer_commands
                 .iter()
@@ -1868,6 +1916,7 @@ impl ProjectStore {
         this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
         this.git_heads = snapshot.git_heads.into_iter().collect();
         this.favicons = snapshot.favicons.into_iter().collect();
+        this.copy_statuses = snapshot.copy_statuses.into_iter().collect();
         this.drawer_commands = snapshot
             .drawer_commands
             .into_iter()

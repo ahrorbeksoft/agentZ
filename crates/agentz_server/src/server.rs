@@ -2,6 +2,7 @@
 
 mod account_requests;
 mod attachment_requests;
+mod copy_reads;
 mod custom_agents;
 mod favicon_reads;
 #[cfg(unix)]
@@ -75,8 +76,9 @@ use tools::{PendingToolCall, ToolResults};
 const MAX_THREAD_TITLE_CHARS: usize = 256;
 /// t3code sweeps every project each minute; lookups that aren't stale are skipped.
 const REPOSITORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-/// How often the branches checked out where projects and threads work, and projects' icons,
-/// are read again, so a change made outside agentZ shows soon.
+/// How often the branches checked out where projects and threads work, projects' icons, and
+/// how combined projects' copies stand in git are read again, so a change made outside agentZ
+/// shows soon.
 const GIT_HEAD_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) type ClientId = u64;
@@ -197,6 +199,7 @@ pub(crate) struct Server {
     /// for each then, so a new project or a new choice is looked at at once.
     favicon_projects: BTreeMap<ProjectId, Option<PathBuf>>,
     reading_favicons: bool,
+    reading_copy_statuses: bool,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     accounts: AccountStore,
@@ -372,6 +375,7 @@ impl Server {
             reading_git_heads: false,
             favicon_projects: BTreeMap::new(),
             reading_favicons: false,
+            reading_copy_statuses: false,
             registry,
             agent_settings,
             accounts,
@@ -483,6 +487,7 @@ impl Server {
                 let refresh = Input::Run(Box::new(|server: &mut Server| {
                     server.refresh_git_heads();
                     server.refresh_favicons();
+                    server.refresh_copy_statuses();
                 }));
                 if inputs.unbounded_send(refresh).is_err() {
                     break;
@@ -1215,6 +1220,8 @@ impl Server {
             Request::SetPeers(peers) => {
                 self.client(client)?;
                 self.relays.set_peers(client, peers);
+                // A project just combined shows how it stands without waiting for the next read.
+                self.refresh_copy_statuses();
                 Ok(Response::Ok)
             }
             Request::RelayToolResult { relay_id, result } => {

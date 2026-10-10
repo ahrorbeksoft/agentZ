@@ -71,7 +71,7 @@ pub fn thread_places(cx: &App) -> Vec<PlaceEntry> {
                 store
                     .read(cx)
                     .project(thread.project_id)
-                    .map(|project| project.name())
+                    .map(|project| machines.project_label(machine, project, cx))
             });
             let detail: SharedString = match (has_remotes, project) {
                 (true, Some(project)) => {

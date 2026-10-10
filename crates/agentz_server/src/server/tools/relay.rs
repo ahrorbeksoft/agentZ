@@ -14,6 +14,7 @@
 //! reach every machine the app does: an agent can clone a repository there and add it, and
 //! once the app combines it with the caller's project, the rest of the tools work there too.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -170,6 +171,16 @@ impl Relays {
         let (sender, receiver) = oneshot::channel();
         self.peer_waiters.push(sender);
         receiver
+    }
+
+    /// The projects any app combines with checkouts on other machines.
+    pub(in crate::server) fn combined_projects(&self) -> BTreeSet<ProjectId> {
+        self.peers
+            .iter()
+            .flat_map(|(_, peers)| &peers.checkouts)
+            .filter(|checkouts| !checkouts.checkouts.is_empty())
+            .map(|checkouts| checkouts.project_id)
+            .collect()
     }
 
     /// The project's checkouts the app combines with it.

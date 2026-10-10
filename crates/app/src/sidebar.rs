@@ -1703,7 +1703,9 @@ impl Sidebar {
                     h_flex().flex_1().min_w_0().children(
                         project
                             .as_ref()
-                            .map(|project| project.name())
+                            .map(|project| {
+                                self.machines.read(cx).project_label(machine, project, cx)
+                            })
                             .or(folder_name.clone())
                             .map(|name| {
                                 Label::new(name)
@@ -1922,10 +1924,12 @@ impl Sidebar {
                             .min_w_0()
                             .gap_1()
                             .children(project.as_ref().map(|project| {
-                                Label::new(project.name())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate()
+                                Label::new(
+                                    self.machines.read(cx).project_label(machine, project, cx),
+                                )
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate()
                             }))
                             .children(
                                 machine_label.map(|(icon, label)| {
@@ -2866,9 +2870,12 @@ impl ThreadDetails {
         };
         let mut rows = Vec::new();
         if let Some((machine, project)) = &self.project {
+            let name = Machines::global(cx)
+                .read(cx)
+                .project_label(*machine, project, cx);
             rows.push(detail_row(
                 render_project_icon(*machine, project, px(12.), cx),
-                Label::new(project.name()).truncate(),
+                Label::new(name).truncate(),
             ));
         }
         let (machine_icon, machine) = &self.machine;

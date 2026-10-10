@@ -58,6 +58,7 @@ use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
+use crate::project_copies::{CopyRow, fetched_line, render_copy_row};
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
@@ -3263,11 +3264,13 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let project_id = project.id;
-        let name = project.name();
+        let machine = self.store.read(cx).machine();
+        let name = Machines::global(cx)
+            .read(cx)
+            .project_label(machine, project, cx);
         let new_thread = cx.listener(move |_, _: &ClickEvent, _, cx| {
             cx.emit(AgentViewEvent::NewThreadInProject(project_id))
         });
-        let machine = self.store.read(cx).machine();
         let icon = render_project_icon(machine, project, px(14.), cx);
         let hover = cx.theme().colors().ghost_element_hover;
         // Shrinks with the title when the header is narrow, so neither takes all the room.
@@ -8305,54 +8308,54 @@ impl AgentView {
         if members.len() < 2 {
             return Some(static_chip("new-thread-machine", icon, label).into_any_element());
         }
-        // Each checkout of the project, and whether the thread can move there.
-        let rows: Vec<(ProjectKey, IconName, SharedString, bool)> = members
+        let current = ProjectKey {
+            machine,
+            project: project_id,
+        };
+        // Each copy of the project, how it stands in git, and whether the thread can move there.
+        let rows: Vec<(ProjectKey, CopyRow)> = members
             .iter()
             .map(|(member_machine, project)| {
-                let mut label = machines.label(*member_machine, cx).to_string();
-                // Two checkouts on one machine are told apart by folder.
-                if members
-                    .iter()
-                    .filter(|(other, _)| other == member_machine)
-                    .count()
-                    > 1
-                {
-                    label = format!("{label} · {}", project.path.display());
-                }
                 let client = machines.client(*member_machine, cx);
-                let is_usable = match &client {
+                let unusable = match &client {
                     Some(client) if client.read(cx).is_online() => {
                         let registry = client.read(cx).registry().read(cx);
                         let is_installed = matches!(
                             registry.install_state(&agent_id),
                             InstallState::Installed { .. }
                         );
-                        if !is_installed {
-                            label = format!("{label} · {agent_name} isn't installed");
-                        }
-                        is_installed
+                        (!is_installed).then(|| format!("{agent_name} isn't installed").into())
                     }
-                    _ => {
-                        label = format!("{label} · offline");
-                        false
-                    }
+                    _ => Some("offline".into()),
                 };
-                (
-                    ProjectKey {
-                        machine: *member_machine,
-                        project: project.id,
-                    },
-                    machines.machine_icon(*member_machine, cx),
-                    label.into(),
-                    is_usable,
-                )
+                let key = ProjectKey {
+                    machine: *member_machine,
+                    project: project.id,
+                };
+                let folder = match member_machine {
+                    MachineId::Local => compact_path(&project.path),
+                    _ => project.path.display().to_string(),
+                };
+                let status = client.and_then(|client| {
+                    client
+                        .read(cx)
+                        .projects()
+                        .read(cx)
+                        .copy_status(project.id)
+                        .cloned()
+                });
+                let row = CopyRow {
+                    machine_icon: machines.machine_icon(*member_machine, cx),
+                    machine: machines.label(*member_machine, cx),
+                    folder: folder.into(),
+                    status,
+                    unusable,
+                    is_current: key == current,
+                };
+                (key, row)
             })
             .collect();
         let chip = picker_chip("new-thread-machine-trigger", icon, label);
-        let current = ProjectKey {
-            machine,
-            project: project_id,
-        };
         let view = cx.weak_entity();
         Some(
             PopoverMenu::new("new-thread-machine")
@@ -8360,22 +8363,38 @@ impl AgentView {
                     let view = view.clone();
                     let rows = rows.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        for (project, icon, label, is_usable) in &rows {
+                        let first = rows.first().and_then(|(_, row)| row.status.clone());
+                        for (project, row) in &rows {
                             let view = view.clone();
                             let project = *project;
-                            menu = menu.item(
-                                ContextMenuEntry::new(label.clone())
-                                    .icon(*icon)
-                                    .icon_color(Color::Muted)
-                                    .toggleable(IconPosition::End, project == current)
-                                    .disabled(!is_usable)
-                                    .handler(move |_, cx| {
+                            let is_usable = row.unusable.is_none();
+                            let row = row.clone();
+                            let first = first.clone();
+                            menu = menu
+                                .custom_entry(
+                                    move |_, _| render_copy_row(&row, first.as_ref()),
+                                    move |_, cx| {
                                         view.update(cx, |view, cx| {
                                             view.change_new_thread_machine(project, cx)
                                         })
                                         .log_err();
-                                    }),
-                            );
+                                    },
+                                )
+                                .selectable(is_usable);
+                        }
+                        let copies: Vec<CopyRow> =
+                            rows.iter().map(|(_, row)| row.clone()).collect();
+                        if let Some(fetched) = fetched_line(&copies, SystemTime::now()) {
+                            menu = menu.separator().custom_row(move |_, _| {
+                                div()
+                                    .max_w(px(330.))
+                                    .child(
+                                        Label::new(fetched.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .into_any_element()
+                            });
                         }
                         menu
                     }))
@@ -8385,6 +8404,12 @@ impl AgentView {
                 .offset(gpui::point(px(0.), px(4.)))
                 .into_any_element(),
         )
+        .map(|menu| {
+            div()
+                .debug_selector(|| "new-thread-machine-picker".into())
+                .child(menu)
+                .into_any_element()
+        })
     }
 
     /// The account the new thread runs on, shown only when its agent has more than one: its
@@ -13477,6 +13502,90 @@ mod tests {
         });
         cx.run_until_parked();
         (view, cx)
+    }
+
+    /// A project on two machines is named as the project picker names it, and New Thread's
+    /// machine picker lists each copy with how it stands in git.
+    #[gpui::test]
+    fn the_machine_picker_lists_each_copy(cx: &mut TestAppContext) {
+        let repository = projects::RepositoryIdentity {
+            canonical_key: "github.com/ahrorbeksoft/fluency.uz".into(),
+            root_path: "/tmp/demo".into(),
+            remote_name: "origin".into(),
+            remote_url: "https://github.com/ahrorbeksoft/fluency.uz.git".into(),
+            display_name: Some("ahrorbeksoft/fluency.uz".into()),
+            owner: Some("ahrorbeksoft".into()),
+            name: Some("fluency.uz".into()),
+        };
+        let copy = |path: &str, branch: &str, behind: u32| {
+            let mut snapshot = snapshot(None);
+            snapshot.projects[0].path = path.into();
+            snapshot.projects[0].repository = Some(repository.clone());
+            snapshot.copy_statuses = vec![(
+                ProjectId(1),
+                projects::CopyStatus {
+                    branch: Some(branch.into()),
+                    upstream: Some(format!("origin/{branch}")),
+                    behind,
+                    ..projects::CopyStatus::default()
+                },
+            )];
+            snapshot
+        };
+        let mac = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let [mac, devbox] = [
+                (MachineId::Local, "This Mac", copy("/tmp/demo", "main", 0)),
+                (
+                    MachineId::Remote(1),
+                    "Devbox 1",
+                    copy("/srv/fluency", "payments", 2),
+                ),
+            ]
+            .map(|(machine, label, snapshot)| {
+                let client = ServerClient::new_for_test(
+                    machine,
+                    label.into(),
+                    SpacesSnapshot::default(),
+                    cx,
+                );
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+                let projects = client.read(cx).projects().clone();
+                projects.update(cx, |store, cx| store.set_snapshot(snapshot, cx));
+                client
+            });
+            crate::machines::init_for_test(vec![mac.clone(), devbox], cx);
+            mac
+        });
+        let (_view, cx) = open_on(&mac, 3, cx);
+        cx.update(|_, cx| {
+            let machines = Machines::global(cx).read(cx);
+            let store = machines.projects(MachineId::Local, cx).expect("This Mac");
+            let project = store
+                .read(cx)
+                .project(ProjectId(1))
+                .cloned()
+                .expect("the project");
+            assert_eq!(
+                machines
+                    .project_label(MachineId::Local, &project, cx)
+                    .as_ref(),
+                "ahrorbeksoft/fluency.uz"
+            );
+        });
+
+        let picker = cx
+            .debug_bounds("new-thread-machine-picker")
+            .expect("the machine picker");
+        cx.simulate_click(picker.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let mac_row = cx
+            .debug_bounds("new-thread-copy-This Mac")
+            .expect("This Mac's copy");
+        let devbox_row = cx
+            .debug_bounds("new-thread-copy-Devbox 1")
+            .expect("Devbox 1's copy");
+        assert!(mac_row.top() < devbox_row.top());
     }
 
     /// A task delegated to another machine is a row under its parent that names the machine.

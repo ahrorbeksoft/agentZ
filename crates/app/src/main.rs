@@ -17,6 +17,7 @@ mod machines;
 mod mention_menu;
 mod new_space_picker;
 mod new_thread_modal;
+mod project_copies;
 mod project_icon_picker;
 mod project_info;
 mod project_store;

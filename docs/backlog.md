@@ -5,14 +5,6 @@ as given, not yet researched. Remove an entry once it's built.
 
 ## Features
 
-### Merge projects across machines
-
-When the same project exists on several machines, show it as one project, not one per machine.
-
-- Learn how t3code does it first (`references/t3code`) and follow that.
-- Add some way to see whether the copies on each machine are in sync (and how they differ if
-  they aren't).
-
 ### Improve the design of agents' requests for user input
 
 Redesign every kind of input an agent can ask the user for, not just one. The example is the

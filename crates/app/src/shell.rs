@@ -1021,7 +1021,10 @@ impl Shell {
             .thread_project(thread.id)
             .and_then(|project| store.project(project));
         let mut body = match project {
-            Some(project) => format!("{} · {caption}", project.name()),
+            Some(project) => format!(
+                "{} · {caption}",
+                machines.project_label(thread_id.machine, project, cx)
+            ),
             None => caption.to_string(),
         };
         if thread_id.machine != MachineId::Local {

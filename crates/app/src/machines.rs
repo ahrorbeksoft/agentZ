@@ -592,6 +592,39 @@ impl Machines {
         groups
     }
 
+    /// The name the project shows under everywhere: its combined project's when it has copies
+    /// on other machines, as the project picker names it, else its own.
+    pub fn project_label(&self, machine: MachineId, project: &Project, cx: &App) -> SharedString {
+        if project.repository.is_none() {
+            return project.name();
+        }
+        let settings = AppSettingsStore::global(cx).read(cx).settings();
+        let projects = self
+            .clients
+            .iter()
+            .flat_map(|client| {
+                let client = client.read(cx);
+                let machine = client.machine();
+                client
+                    .projects()
+                    .read(cx)
+                    .projects()
+                    .iter()
+                    .filter(|project| project.repository.is_some())
+                    .map(move |project| (machine, project.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        build_project_groups(
+            projects,
+            settings.project_grouping,
+            &settings.project_grouping_overrides,
+        )
+        .into_iter()
+        .find(|group| group.contains(machine, project.id))
+        .map_or_else(|| project.name(), |group| group.name())
+    }
+
     /// The machines a group is on, for its badge (t3code's `ProjectEnvironmentBadge`):
     /// nothing when it's only on this Mac.
     pub fn group_machines_label(&self, group: &ProjectGroup, cx: &App) -> Option<SharedString> {

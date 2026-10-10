@@ -800,7 +800,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   user's choice of designs) is "What should we work on?" over the composer, with the agent
   picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
   Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
-  existing one), the machine picker, the account picker and the branch. Changing any of them
+  existing one), the machine picker (each copy of a combined project with how it stands in
+  git, see Project copies in sync), the account picker and the branch. Changing any of them
   replaces the draft with a new one, and the old one leaves the store at once
   (`ProjectStore::delete_thread`), so its row doesn't flash in the thread list until the
   server answers. The account picker (`AgentView::render_account_picker`,
@@ -1440,6 +1441,21 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   or took over 10 seconds) keeps the repository it had, so the project stays combined.
   The project switcher's button and a combined project's row there show the icon of each
   machine it's on, named in the icon's tooltip (`project_switcher::render_machine_icons`).
+  The switcher's name is the project's everywhere (`Machines::project_label`; project copies
+  round topic 1): thread cards, draft rows, the details popover, Go To, the thread header and
+  notifications; each copy keeps its own icon.
+- **Project copies in sync** (`server/copy_reads.rs`, `project_copies.rs`;
+  `design/project-copies/decisions.md`): each server reads how its projects that the app
+  combines with copies elsewhere (`Relays::combined_projects`, from `SetPeers`) stand in git,
+  every 5 seconds with the branches and at once when the peers change: the branch, commit,
+  upstream with ahead and behind (or, tracking nothing, the commits no remote has), uncommitted
+  files and lines, stashes, and when it last fetched (`FETCH_HEAD`'s time), with
+  `GIT_OPTIONAL_LOCKS=0` and no fetch (`projects::CopyStatus`, sent as
+  `ProjectsSnapshot::copy_statuses`). New Thread's machine picker lists each copy as a row:
+  its machine and folder, then "main · → origin/main ↓12 · 3 files +42 −7 · 1 stash", what
+  differs from the first copy in the warning color, and a footer "As of each machine's last
+  fetch: This Mac 2h ago, Devbox 1 3d ago". A copy whose machine is offline or lacks the
+  agent says so and can't be picked.
 - **Machine icons** (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`): detected from
   the hardware, or chosen by clicking the machine's icon in Settings › Machines.
 - **Start at login** (`login_item.rs`): a launch agent that runs `agentz-server start` once.

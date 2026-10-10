@@ -622,7 +622,7 @@ pub(crate) async fn space_git(folder: &Path) -> Option<SpaceGit> {
 }
 
 /// Lines added and removed in `git diff --numstat`; binary files count none.
-fn sum_numstat(numstat: &str) -> (u32, u32) {
+pub(crate) fn sum_numstat(numstat: &str) -> (u32, u32) {
     numstat.lines().fold((0, 0), |(added, removed), line| {
         let mut columns = line.split('\t');
         let count = |column: Option<&str>| column.and_then(|count| count.parse::<u32>().ok());
@@ -645,7 +645,7 @@ pub(crate) fn majority_folder(tab_folders: &[PathBuf]) -> Option<&PathBuf> {
     best.map(|(folder, _)| folder)
 }
 
-fn parse_ahead_behind(output: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_ahead_behind(output: &str) -> Option<(u32, u32)> {
     let mut counts = output.split_whitespace();
     let ahead = counts.next()?.parse().ok()?;
     let behind = counts.next()?.parse().ok()?;

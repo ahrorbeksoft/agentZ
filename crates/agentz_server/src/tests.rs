@@ -3598,6 +3598,73 @@ async fn projects_show_their_branch() {
         .await;
 }
 
+/// A project the app combines with copies on other machines is sent with how it stands in
+/// git, read again with the branches.
+#[tokio::test(flavor = "multi_thread")]
+async fn combined_projects_show_how_their_copy_stands() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = server.project_dir.path();
+    for args in [
+        &["init", "--quiet", "--initial-branch", "main"][..],
+        &["add", "-A"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Start",
+        ],
+    ] {
+        crate::git::git(folder, args, &[]).await.expect("git");
+    }
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(folder).await;
+    let status = move |client: &TestClient| {
+        client
+            .projects
+            .as_ref()?
+            .copy_statuses
+            .iter()
+            .find(|(project, _)| *project == project_id)
+            .map(|(_, status)| status.clone())
+    };
+    assert_eq!(status(&client), None);
+    client
+        .ok(Request::SetPeers(Peers {
+            this_machine: "mac".into(),
+            machines: vec![PeerMachine {
+                name: "devbox".into(),
+                online: true,
+            }],
+            checkouts: vec![PeerCheckouts {
+                project_id,
+                checkouts: vec![PeerCheckout {
+                    machine: "devbox".into(),
+                    path: "/root/project".into(),
+                }],
+            }],
+        }))
+        .await;
+    client
+        .wait_until(|client| {
+            status(client).is_some_and(|status| {
+                status.branch.as_deref() == Some("main") && status.commit.is_some()
+            })
+        })
+        .await;
+    std::fs::write(folder.join("notes.md"), "one\n").expect("write");
+    client
+        .wait_until(|client| status(client).is_some_and(|status| status.changed_files == 1))
+        .await;
+}
+
 /// Each machine's server finds its projects' favicons, and sends one to a client that can't
 /// read it from its own disk.
 #[tokio::test(flavor = "multi_thread")]
