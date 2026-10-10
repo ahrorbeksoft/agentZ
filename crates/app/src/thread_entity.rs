@@ -433,6 +433,24 @@ impl AgentThread {
         self.request(Request::RetryMessage, cx)
     }
 
+    /// Makes the thread's new worktree or pasture again, from the step that failed.
+    pub fn retry_workspace_setup(&mut self, cx: &mut Context<Self>) {
+        self.thread_request(Request::RetryWorkspaceSetup, cx)
+    }
+
+    /// Gives up on the thread's new worktree or pasture: its first message goes to the agent
+    /// in the folder it's in.
+    pub fn use_local(&mut self, cx: &mut Context<Self>) {
+        self.thread_request(Request::UseLocal, cx)
+    }
+
+    /// A request about the thread itself, which a login session has none of.
+    fn thread_request(&self, request: impl FnOnce(ThreadId) -> Request, cx: &App) {
+        if let Some(ConnectionId::Thread(thread_id)) = self.connection {
+            self.client.read(cx).send(request(thread_id), cx);
+        }
+    }
+
     /// Starts this continued thread without the conversation it would have brought.
     pub fn drop_handoff(&mut self, cx: &mut Context<Self>) {
         self.request(Request::DropHandoff, cx)

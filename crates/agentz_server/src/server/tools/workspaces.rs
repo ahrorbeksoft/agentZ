@@ -256,6 +256,8 @@ impl Server {
                 let matching: Vec<&String> = git
                     .branches
                     .iter()
+                    .filter(|branch| !branch.is_remote)
+                    .map(|branch| &branch.name)
                     .filter(|branch| {
                         query
                             .as_ref()

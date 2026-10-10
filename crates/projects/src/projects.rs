@@ -142,6 +142,19 @@ pub struct Workspace {
     pub created_at: SystemTime,
 }
 
+/// A new worktree or pasture for a draft, made as its first message is sent (t3code's thread
+/// setup).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedWorkspace {
+    pub kind: WorkspaceKind,
+    /// What its branch starts from: what the folder has checked out when `None`.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Its branch: a temporary name, renamed after the thread's title, when `None`.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
 /// A project icon picked by the user, as in t3code's project settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -264,6 +277,10 @@ pub struct Thread {
     /// made from that folder's repository, so its draft can go back there.
     #[serde(default)]
     pub started_in: Option<PathBuf>,
+    /// The new worktree or pasture a draft will work in, made from the folder it's in once its
+    /// first message is sent.
+    #[serde(default)]
+    pub planned_workspace: Option<PlannedWorkspace>,
     /// Set on a terminal thread, which runs this instead of an ACP agent.
     #[serde(default)]
     pub terminal: Option<TerminalCommand>,
@@ -989,6 +1006,7 @@ impl ProjectStore {
             task: None,
             workspace: None,
             started_in: None,
+            planned_workspace: None,
             terminal: None,
             continued_from: None,
             is_draft: false,
@@ -1449,6 +1467,30 @@ impl ProjectStore {
         }
     }
 
+    pub fn set_planned_workspace(&mut self, id: ThreadId, plan: Option<PlannedWorkspace>) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.planned_workspace != plan
+        {
+            thread.planned_workspace = plan;
+            self.changed();
+        }
+    }
+
+    /// Records a workspace's branch after it was renamed, in whichever project has it.
+    pub fn set_workspace_branch(&mut self, path: &Path, branch: String) {
+        let workspace = self
+            .projects
+            .iter_mut()
+            .flat_map(|project| project.workspaces.iter_mut())
+            .find(|workspace| workspace.path == path);
+        if let Some(workspace) = workspace
+            && workspace.branch.as_ref() != Some(&branch)
+        {
+            workspace.branch = Some(branch);
+            self.changed();
+        }
+    }
+
     pub fn set_draft(&mut self, id: ThreadId, is_draft: bool) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.is_draft != is_draft
@@ -1521,6 +1563,17 @@ impl ProjectStore {
         {
             thread.session_id = Some(session_id);
             // The new session's login comes once the agent reports it.
+            thread.session_login = None;
+            self.changed();
+        }
+    }
+
+    /// The thread's agent starts a new session next time, as one moved to another folder must.
+    pub fn forget_thread_session(&mut self, id: ThreadId) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.session_id.is_some()
+        {
+            thread.session_id = None;
             thread.session_login = None;
             self.changed();
         }

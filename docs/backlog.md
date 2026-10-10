@@ -5,13 +5,6 @@ as given, not yet researched. Remove an entry once it's built.
 
 ## Features
 
-### More options when creating a worktree or pasture for a new thread
-
-When a new thread gets its own worktree or pasture, offer more choices about how it's created,
-such as picking a branch and checking out from an existing branch.
-
-- Research how t3code does it first (`references/t3code`), then decide what to build.
-
 ### Artifacts: pages agents publish, opened in the browser
 
 Pages an agent publishes from a thread, as Claude Code's artifacts: one self-contained `.html`

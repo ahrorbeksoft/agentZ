@@ -18,8 +18,8 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Context, EventEmitter, Task, WeakEntity};
 use projects::{
-    ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId, ThreadOrder, ThreadSection,
-    UnsentMention, WorkspaceKind,
+    PlannedWorkspace, ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId,
+    ThreadOrder, ThreadSection, UnsentMention, WorkspaceKind,
 };
 use util::ResultExt as _;
 
@@ -472,6 +472,35 @@ impl ProjectStore {
                 Response::RepositoryCheckouts(checkouts) => Some(checkouts),
                 _ => None,
             },
+            cx,
+        )
+    }
+
+    /// `git fetch origin` in the repository `folder` is in, then its branches.
+    pub fn fetch_origin(&self, folder: PathBuf, cx: &App) -> Task<Result<ProjectGit>> {
+        self.request(
+            Request::FetchOrigin(folder),
+            |response| match response {
+                Response::ProjectGit(git) => Some(git),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// Where a draft will work: a new worktree or pasture made as its first message is sent,
+    /// or (`None`) the folder it's in. Shows at once, as the server will have it.
+    pub fn plan_workspace(
+        &mut self,
+        thread_id: ThreadId,
+        plan: Option<PlannedWorkspace>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.store.set_planned_workspace(thread_id, plan.clone());
+        cx.notify();
+        self.request(
+            Request::PlanWorkspace { thread_id, plan },
+            |response| matches!(response, Response::Ok).then_some(()),
             cx,
         )
     }

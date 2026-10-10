@@ -732,6 +732,10 @@ pub struct ThreadState {
     /// What the agent left running in the background, oldest first.
     #[serde(default)]
     pub background_tasks: Vec<BackgroundTask>,
+    /// The thread's worktree or pasture being made, holding its first message until the agent
+    /// starts there.
+    #[serde(default)]
+    pub workspace_setup: Option<crate::workspace::WorkspaceSetup>,
 }
 
 /// A thread's state and entries, with the read API both the server's thread and the clients'
@@ -945,6 +949,10 @@ impl ThreadView {
 
     pub fn pending_handoff(&self) -> Option<&PendingHandoff> {
         self.state.handoff.as_ref()
+    }
+
+    pub fn workspace_setup(&self) -> Option<&crate::workspace::WorkspaceSetup> {
+        self.state.workspace_setup.as_ref()
     }
 
     /// Whether the agent is waiting on the user to answer a request for input.

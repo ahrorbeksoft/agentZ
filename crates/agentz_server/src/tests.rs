@@ -5971,9 +5971,16 @@ async fn threads_work_in_worktrees_and_pastures() {
     };
     assert!(project_git.is_repository);
     assert_eq!(project_git.branch.as_deref(), Some("main"));
-    assert_eq!(project_git.branches, vec!["main".to_string()]);
+    let branch_names: Vec<&str> = project_git
+        .branches
+        .iter()
+        .map(|branch| branch.name.as_str())
+        .collect();
+    assert_eq!(branch_names, vec!["main"]);
+    assert_eq!(project_git.mark(&project_git.branches[0]), Some("current"));
 
-    // A new thread in a new worktree works there, and its turns are checkpointed there.
+    // A new thread in a new worktree works there once its first message makes it, and its
+    // turns are checkpointed there.
     let Response::ThreadCreated(thread) = client
         .ok(Request::CreateThread {
             project_id,
@@ -5989,13 +5996,29 @@ async fn threads_work_in_worktrees_and_pastures() {
     else {
         panic!("expected a thread");
     };
+    let draft = client.project_thread(thread).expect("the draft");
+    assert_eq!(
+        draft.workspace, None,
+        "a draft works in the project's folder"
+    );
+    assert_eq!(
+        draft.planned_workspace.as_ref().map(|plan| plan.kind),
+        Some(WorkspaceKind::Worktree)
+    );
+    client.wait_until_ready(thread).await;
+    client.prompt_and_wait(thread, "write a.txt hi").await;
     let worktree = client
         .project_thread(thread)
         .and_then(|thread| thread.workspace.clone())
         .expect("the thread works in a workspace");
     assert!(worktree.ends_with("feature"), "{}", worktree.display());
-    client.wait_until_ready(thread).await;
-    client.prompt_and_wait(thread, "write a.txt hi").await;
+    assert_eq!(client.user_messages(thread), vec!["write a.txt hi"]);
+    assert!(
+        client
+            .thread(ConnectionId::Thread(thread))
+            .workspace_setup()
+            .is_none()
+    );
     assert!(worktree.join("a.txt").exists());
     assert!(!repository.join("a.txt").exists());
     let diff = client.thread_diff(thread, DiffScope::All).await;
@@ -6358,13 +6381,20 @@ async fn threads_started_in_panes_work_in_any_folder() {
     assert_eq!(capabilities["projectId"], Value::Null);
     assert_eq!(capabilities["projectPath"], json!(src));
 
-    // Or in a new worktree of the folder's repository, which is the project's.
+    // Or in a new worktree of the folder's repository, which is the project's, made with its
+    // first message.
     let Response::ThreadCreated(in_worktree) = client.ok(create(src.clone(), new_worktree())).await
     else {
         panic!("expected a thread");
     };
+    let draft = client.project_thread(in_worktree).expect("the draft");
+    assert_eq!(draft.workspace.as_ref(), Some(&src));
+    assert!(draft.planned_workspace.is_some());
+    client.wait_until_ready(in_worktree).await;
+    client.prompt_and_wait(in_worktree, "hello").await;
     let thread = client.project_thread(in_worktree).expect("the thread");
     let worktree = thread.workspace.clone().expect("a worktree");
+    assert_ne!(worktree, src);
     assert_eq!(thread.started_in.as_ref(), Some(&src));
     assert!(worktree.join("src/main.rs").exists());
     let project = |client: &TestClient| {
@@ -8642,4 +8672,213 @@ async fn titles_threads_their_agent_does_not_name() {
             .provider,
         TitleProvider::Claude
     );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn new_workspaces_are_made_as_the_first_message_is_sent() {
+    use agentz_protocol::title_generation::{TitleGeneration, TitleProvider};
+    use agentz_protocol::workspace::{SetupStepKind, SetupStepState};
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let (_clis, search_path) = fake_title_clis("Login Redirect Fix");
+    let Some(server) = TestServer::start_with_config(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        None,
+        Some(search_path),
+    ) else {
+        return;
+    };
+    // The project is a clone of origin, which a teammate pushes to.
+    let remotes = tempfile::tempdir().expect("temp dir");
+    let upstream = remotes.path().join("upstream");
+    let origin = remotes.path().join("origin.git");
+    std::fs::create_dir_all(&upstream).expect("a folder");
+    git(&upstream, &["init", "-q", "-b", "main"]).await;
+    git(&upstream, &["config", "user.name", "Test"]).await;
+    git(&upstream, &["config", "user.email", "test@example.com"]).await;
+    std::fs::write(upstream.join("README.md"), "one\n").expect("a file");
+    git(&upstream, &["add", "."]).await;
+    git(&upstream, &["commit", "-q", "-m", "first"]).await;
+    let origin_path = origin.to_string_lossy().into_owned();
+    git(
+        remotes.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &upstream.to_string_lossy(),
+            &origin_path,
+        ],
+    )
+    .await;
+    let repository = std::fs::canonicalize(server.project_dir.path()).expect("a resolved path");
+    git(&repository, &["clone", "-q", &origin_path, "."]).await;
+
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let settings = TitleGeneration {
+        enabled: true,
+        ..TitleGeneration::default()
+    };
+    client
+        .ok(Request::SetTitleGeneration(settings.clone()))
+        .await;
+    client
+        .wait_until(|client| {
+            client.events.iter().any(|event| match event {
+                Event::TitleGeneration(state) => state
+                    .providers
+                    .iter()
+                    .any(|info| info.provider == TitleProvider::Codex && info.installed),
+                _ => false,
+            })
+        })
+        .await;
+    let project_id = client.add_project(&repository).await;
+
+    // origin's branches follow the local ones, and Fetch brings a teammate's.
+    let Response::ProjectGit(listed) = client.ok(Request::ProjectGit(project_id)).await else {
+        panic!("expected the project's git");
+    };
+    let names = |listed: &agentz_protocol::workspace::ProjectGit| -> Vec<String> {
+        listed
+            .branches
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect()
+    };
+    assert_eq!(names(&listed), vec!["main", "origin/main"]);
+    assert!(listed.has_origin);
+    git(&upstream, &["checkout", "-q", "-b", "teammate"]).await;
+    git(
+        &upstream,
+        &["commit", "-q", "--allow-empty", "-m", "theirs"],
+    )
+    .await;
+    git(&upstream, &["checkout", "-q", "main"]).await;
+    git(&upstream, &["push", "-q", &origin_path, "teammate"]).await;
+    let Response::ProjectGit(listed) = client.ok(Request::FetchOrigin(repository.clone())).await
+    else {
+        panic!("expected the project's git");
+    };
+    assert!(names(&listed).contains(&"origin/teammate".to_string()));
+    assert_eq!(listed.branch.as_deref(), Some("main"));
+
+    // main moves on at origin. A thread from origin/main fetches it first, then checks it
+    // out, as its first message goes; its branch is named after its title.
+    std::fs::write(upstream.join("NEWS.md"), "news\n").expect("a file");
+    git(&upstream, &["add", "."]).await;
+    git(&upstream, &["commit", "-q", "-m", "news"]).await;
+    git(&upstream, &["push", "-q", &origin_path, "main"]).await;
+    let new_thread = |base: &str| Request::CreateThread {
+        project_id,
+        agent_id: AgentId::new("mock"),
+        workspace: WorkspaceChoice::New {
+            kind: WorkspaceKind::Worktree,
+            base: Some(base.into()),
+            branch: None,
+        },
+        account: Default::default(),
+    };
+    let Response::ThreadCreated(thread_id) = client.ok(new_thread("origin/main")).await else {
+        panic!("expected a thread");
+    };
+    let connection = ConnectionId::Thread(thread_id);
+    client.wait_until_ready(thread_id).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("fix the login redirect"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client.user_messages(thread_id).len() == 1
+                && !client.thread(connection).is_working()
+                && client.thread(connection).workspace_setup().is_none()
+        })
+        .await;
+    let worktree = client
+        .project_thread(thread_id)
+        .and_then(|thread| thread.workspace.clone())
+        .expect("the thread works in a worktree");
+    assert!(
+        worktree.join("NEWS.md").exists(),
+        "origin's main was fetched"
+    );
+    client
+        .wait_until(|client| {
+            client
+                .projects
+                .as_ref()
+                .and_then(|projects| projects.projects.iter().find(|p| p.id == project_id))
+                .and_then(|project| project.workspaces.iter().find(|w| w.path == worktree))
+                .and_then(|workspace| workspace.branch.as_deref())
+                == Some("agentz/login-redirect-fix")
+        })
+        .await;
+    assert_eq!(
+        git(&worktree, &["branch", "--show-current"]).await.trim(),
+        "agentz/login-redirect-fix"
+    );
+
+    // A base origin doesn't have fails at its fetch, and waits for Retry or Use Local.
+    let Response::ThreadCreated(failing) = client.ok(new_thread("origin/missing")).await else {
+        panic!("expected a thread");
+    };
+    let connection = ConnectionId::Thread(failing);
+    client.wait_until_ready(failing).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+    let is_failed = move |client: &TestClient| {
+        client
+            .thread(connection)
+            .workspace_setup()
+            .is_some_and(|setup| setup.is_failed())
+    };
+    client.wait_until(is_failed).await;
+    let setup = client
+        .thread(connection)
+        .workspace_setup()
+        .cloned()
+        .expect("the setup");
+    assert_eq!(setup.base, "origin/missing");
+    assert_eq!(setup.message, "hello");
+    assert_eq!(setup.steps[0].kind, SetupStepKind::Fetch);
+    assert_eq!(setup.steps[0].state, SetupStepState::Failed);
+    assert_eq!(setup.steps[1].state, SetupStepState::Waiting);
+    assert!(
+        client
+            .request(Request::Prompt {
+                connection,
+                prompt: PromptPart::text("again"),
+            })
+            .await
+            .is_err(),
+        "the first message is still waiting"
+    );
+    client.ok(Request::RetryWorkspaceSetup(failing)).await;
+    client.wait_until(move |client| !is_failed(client)).await;
+    client.wait_until(is_failed).await;
+    client.ok(Request::UseLocal(failing)).await;
+    client
+        .wait_until(|client| {
+            client.user_messages(failing) == vec!["hello"]
+                && !client.thread(connection).is_working()
+        })
+        .await;
+    let thread = client.project_thread(failing).expect("the thread");
+    assert_eq!(thread.workspace, None);
+    assert_eq!(thread.planned_workspace, None);
+    assert!(client.thread(connection).workspace_setup().is_none());
 }

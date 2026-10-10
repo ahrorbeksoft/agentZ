@@ -4,6 +4,7 @@ mod agent_login;
 mod agent_view;
 mod app_settings;
 mod attachment_image;
+mod branch_picker;
 mod command_palette;
 mod confirm_dialog;
 mod controls;
@@ -156,6 +157,7 @@ fn init_for_test(cx: &mut App) {
     terminal_view::init(cx);
     terminal_thread_view::init(cx);
     new_space_picker::init(cx);
+    branch_picker::init(cx);
     spaces_view::init(cx);
     bind_keys(cx);
 }
@@ -245,6 +247,7 @@ fn main() {
             project_switcher::init(cx);
             new_thread_modal::init(cx);
             new_space_picker::init(cx);
+            branch_picker::init(cx);
             spaces_view::init(cx);
             add_project_modal::init(cx);
             worktree_modal::init(cx);

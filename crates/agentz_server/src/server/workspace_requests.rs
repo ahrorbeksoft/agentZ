@@ -106,6 +106,19 @@ impl Server {
                     },
                 );
             }
+            Request::FetchOrigin(folder) => {
+                let data_dir = self.data_dir.clone();
+                self.spawn_then(
+                    async move {
+                        workspaces::fetch_origin(&folder).await?;
+                        let root = workspaces::main_checkout(&folder).await?;
+                        let mut git = workspaces::project_git(&root, &data_dir).await;
+                        git.branch = workspaces::current_branch(&folder).await.ok().flatten();
+                        anyhow::Ok(git)
+                    },
+                    move |server, git| server.respond(client, id, git.map(Response::ProjectGit)),
+                );
+            }
             Request::CreateWorkspace {
                 folder,
                 kind,
@@ -160,6 +173,18 @@ impl Server {
         new: NewThread,
         workspace: WorkspaceChoice,
     ) {
+        // An agent's draft starts in the project's folder, and its first message makes the
+        // new workspace (`workspace_setup`).
+        if let (NewThread::Agent(..), Some(plan)) = (&new, workspace.plan())
+            && project_id != ProjectId::WORKSPACES
+        {
+            let result = self
+                .create_thread_in(project_id, new, None)
+                .inspect(|thread_id| {
+                    self.projects.set_planned_workspace(*thread_id, Some(plan));
+                });
+            return self.respond(client, id, result.map(Response::ThreadCreated));
+        }
         match self.prepare_workspace(project_id, workspace) {
             Ok(PreparedWorkspace::Ready(folder)) => {
                 let result = self.create_thread_in(project_id, new, folder);
@@ -208,25 +233,25 @@ impl Server {
                 anyhow::Ok(thread_id)
             }
         };
+        let plan = workspace.plan();
         let path = match workspace {
-            WorkspaceChoice::Checkout => folder,
+            WorkspaceChoice::Checkout | WorkspaceChoice::New { .. } => folder,
             WorkspaceChoice::Existing(path) => path,
-            WorkspaceChoice::New { kind, base, branch } => {
-                let data_dir = self.data_dir.clone();
-                return self.spawn_then(
-                    async move {
-                        workspaces::create_from(&folder, kind, base, branch, data_dir).await
-                    },
-                    move |server, created| {
-                        let result = created.and_then(|(repo, workspace)| {
-                            let path = server.adopt_repository_workspace(&repo, workspace);
-                            start(server, path)
-                        });
-                        server.respond(client, id, result.map(Response::ThreadCreated));
-                    },
-                );
-            }
         };
+        // Its first message makes the new workspace from `folder` (`workspace_setup`).
+        if let Some(plan) = plan {
+            return self.spawn_then(
+                async move { workspaces::main_checkout(&path).await.map(|_| path) },
+                move |server, path| {
+                    let result = path.and_then(|path| {
+                        let thread_id = start(server, path)?;
+                        server.projects.set_planned_workspace(thread_id, Some(plan));
+                        anyhow::Ok(thread_id)
+                    });
+                    server.respond(client, id, result.map(Response::ThreadCreated));
+                },
+            );
+        }
         let result = if path.is_dir() {
             start(self, path)
         } else {
@@ -238,7 +263,11 @@ impl Server {
     /// Records a worktree or pasture made from a repository as one of the workspaces of the
     /// project at the repository's main checkout, if there's one, for its threads. Returns its
     /// folder.
-    fn adopt_repository_workspace(&mut self, repo: &Path, workspace: Workspace) -> PathBuf {
+    pub(super) fn adopt_repository_workspace(
+        &mut self,
+        repo: &Path,
+        workspace: Workspace,
+    ) -> PathBuf {
         let project_id = self
             .projects
             .projects()
@@ -290,6 +319,7 @@ impl Server {
                     data_dir: self.data_dir.clone(),
                     base,
                     branch,
+                    submodules: true,
                 };
                 Ok(PreparedWorkspace::Create(workspaces::create(new).boxed()))
             }

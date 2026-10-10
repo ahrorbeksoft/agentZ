@@ -73,6 +73,7 @@ impl Server {
                     }
                     // Kept as the automatic title, so it never replaces the user's own.
                     server.projects.rename_thread(thread_id, title);
+                    server.name_branch_after_title(thread_id);
                 }
                 Err(error) => {
                     log::warn!(

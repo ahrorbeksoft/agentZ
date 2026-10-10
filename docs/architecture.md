@@ -839,8 +839,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
   Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
   existing one), the machine picker (each copy of a combined project with how it stands in
-  git, see Project copies in sync), the account picker and the branch. Changing any of them
-  replaces the draft with a new one, and the old one leaves the store at once
+  git, see Project copies in sync), the account picker and the branch, which reads "From main"
+  for a new worktree or pasture (see Worktrees and pastures). A new worktree or pasture is
+  only the draft's plan until its first message (`Request::PlanWorkspace`). Changing anything
+  else replaces the draft with a new one, and the old one leaves the store at once
   (`ProjectStore::delete_thread`), so its row doesn't flash in the thread list until the
   server answers. The account picker (`AgentView::render_account_picker`,
   §12 of the accounts round) shows only while the agent lists more than one account: the
@@ -1415,9 +1417,25 @@ t3code's workspace model, herdr's folder layout and safe removal, cow's pastures
 - A thread works in its project's checkout, a **worktree** (`git worktree add -b agentz/<id>`,
   submodules recursive), or a **pasture**: cow's `create` (`clonefile(2)` on macOS skipping build
   folders, `cp --reflink` or a full copy on Linux, git fixes, runtime-file cleanup, `.cow.json`
-  `post_clone`, rollback on failure).
+  `post_clone`, rollback on failure), then switched to its base, leaving out uncommitted
+  changes that don't fit it.
 - `workspaces.rs` makes, removes and syncs them; `server/workspace_requests.rs` handles the
   requests. Paths are canonicalized (`/private/tmp`).
+- **A new thread's** (the new-workspace round, t3code's branch toolbar and thread setup): the
+  draft records the plan (`Thread::planned_workspace`: kind, base) and the strip's "From main"
+  (`AgentView::render_base_picker`) opens the branch list (`branch_picker.rs`): a search, the
+  local branches with t3code's marks (current, default, worktree), then origin's after a
+  divider (`ProjectGit::branches`), and Fetch (`Request::FetchOrigin`, `git fetch origin`). It
+  starts from what the folder has checked out. Sending the first message makes it
+  (`server/workspace_setup.rs`): the message waits in `ThreadState::workspace_setup` while
+  the steps run (a fetch of an origin base, check out or copy, submodules), shown as the user's
+  message and a card of steps with their times; then the thread moves there and the agent
+  gets the message. Messages sent meanwhile queue. A failed step shows its error with Retry
+  (`Request::RetryWorkspaceSetup`, from that step) and Use Local (`Request::UseLocal`, the
+  message goes to the folder the draft is in). Its temporary branch is renamed after the
+  thread's title once it has one (`workspaces::branch_for_title`, t3code's), unless the name
+  is taken. Existing branches are worked on only in the worktree that has them, and agents'
+  threads (`create_threads`) get theirs at once.
 - **Pastures** sync from the project (temporary remote, rebase or merge, abort on conflict) and
   bring their branch back (cow's `sync` and `extract`).
 - **Handoff** (`agentz_workspace_handoff`) moves a thread after its turn: the agent restarts in the
@@ -1634,7 +1652,8 @@ since a thread's workspace is its checkout.
   and in a git repository (a project or not) New Worktree… and Open Worktree… (herdr's worktree overlays, `worktree_modal.rs`). New Worktree names the branch
   (herdr's generated `agentz/<adjective>-<noun>-<hex>` by default) and makes a worktree or a
   pasture of the repository's main checkout from what the workspace has checked out, or a
-  branch picked in the dialog, which also says where it will be made (the server's data
+  branch picked in its From list (New Thread's, `branch_picker.rs`, origin's branches and
+  Fetch too); the dialog also says where it will be made (the server's data
   folder, `RepositoryCheckouts::data_dir`) (`Request::CreateWorkspace`, no thread in it; a
   project's is recorded as its workspace). Open
   Worktree… lists the repository's other checkouts (`Request::RepositoryCheckouts`: `git worktree
@@ -1643,8 +1662,9 @@ since a thread's workspace is its checkout.
   Workspaces thread (`ProjectId::WORKSPACES`, `Request::CreateWorkspacesThread`), working where
   the pane is (its shell's current folder, else the workspace's), in no project. Under its
   composer the folder is a chip (`AgentView::render_folder_picker`); in git it's a menu of
-  Current checkout, New worktree and New pasture, made from the folder's repository
-  (`workspaces::create_from`; a project's is recorded as its workspace), and the thread
+  Current checkout, New worktree and New pasture, planned and made from the folder's
+  repository with the first message, as a project's new thread's are (a project's is
+  recorded as its workspace), and the thread
   remembers the folder it was started in (`Thread::started_in`). It has no Terminal starter or
   machine picker. Closing the pane keeps the thread, and the pane menu's Show Thread lists it.
   The server's tools treat its folder as a project's path (`orchestrator_capabilities` has no

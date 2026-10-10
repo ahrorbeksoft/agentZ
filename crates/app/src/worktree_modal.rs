@@ -4,6 +4,7 @@
 //! shell there.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentz_protocol::workspace::{Checkout, PastureSupport, RepositoryCheckouts};
@@ -14,10 +15,10 @@ use gpui::{
 use projects::WorkspaceKind;
 use text_input::{TextInput, TextInputEvent};
 use ui::{
-    CommonAnimationExt as _, ContextMenu, ListItem, ListItemSpacing, PopoverMenu,
-    WithScrollbar as _, prelude::*,
+    CommonAnimationExt as _, ListItem, ListItemSpacing, PopoverMenu, WithScrollbar as _, prelude::*,
 };
 
+use crate::branch_picker::{BranchPicker, FetchOrigin};
 use crate::machines::{MachineId, Machines, project_at};
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
@@ -510,11 +511,30 @@ impl WorktreeModal {
     /// checkout goes.
     fn render_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let border_variant = cx.theme().colors().border_variant;
-        let branches = self
+        let git = self
             .checkouts()
-            .map(|repository| repository.git.branches.clone())
+            .map(|repository| repository.git.clone())
             .unwrap_or_default();
+        let base = self.base_branch();
         let this = cx.entity().downgrade();
+        let fetch: Option<FetchOrigin> = self.projects.clone().map(|projects| {
+            let this = this.clone();
+            let folder = self.folder.clone();
+            Rc::new(move |cx: &mut App| {
+                let fetched = projects.read(cx).fetch_origin(folder.clone(), cx);
+                let this = this.clone();
+                cx.spawn(async move |cx| {
+                    let git = fetched.await?;
+                    this.update(cx, |this, cx| {
+                        if let Some(Ok(repository)) = &mut this.repository {
+                            repository.git = git.clone();
+                            cx.notify();
+                        }
+                    })?;
+                    Ok(git)
+                })
+            }) as FetchOrigin
+        });
         h_flex()
             .px_3()
             .py_1()
@@ -527,34 +547,40 @@ impl WorktreeModal {
                     .color(Color::Muted),
             )
             .child(
-                PopoverMenu::new("worktree-modal-base")
-                    .trigger(
-                        Button::new("worktree-modal-base-button", self.base_branch())
-                            .label_size(LabelSize::Small)
-                            .end_icon(
-                                Icon::new(IconName::ChevronDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                    .menu(move |window, cx| {
-                        let this = this.clone();
-                        let branches = branches.clone();
-                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            for branch in &branches {
-                                let this = this.clone();
-                                let choice = branch.clone();
-                                menu = menu.entry(branch.clone(), None, move |_, cx| {
-                                    this.update(cx, |this, cx| {
-                                        this.base = Some(choice.clone());
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                });
-                            }
-                            menu
-                        }))
-                    }),
+                div().debug_selector(|| "worktree-modal-base".into()).child(
+                    PopoverMenu::new("worktree-modal-base")
+                        .trigger(
+                            Button::new("worktree-modal-base-button", base.clone())
+                                .label_size(LabelSize::Small)
+                                .end_icon(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .menu(move |window, cx| {
+                            let this = this.clone();
+                            let git = git.clone();
+                            let base = base.clone();
+                            let fetch = fetch.clone();
+                            Some(cx.new(|cx| {
+                                BranchPicker::new(
+                                    git,
+                                    base,
+                                    fetch,
+                                    move |branch, _, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.base = Some(branch);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            }))
+                        }),
+                ),
             )
             .child(
                 div()
@@ -803,6 +829,65 @@ mod tests {
         });
         let branch = modal.read_with(cx, |modal, cx| modal.input.read(cx).text().clone());
         assert!(branch.starts_with(BRANCH_PREFIX), "{branch}");
+    }
+
+    /// New Worktree's From lists the repository's branches, origin's too, as New Thread's
+    /// does.
+    #[gpui::test]
+    fn new_worktree_starts_from_a_branch_picked(cx: &mut TestAppContext) {
+        use agentz_protocol::workspace::GitBranch;
+
+        init_machine(cx);
+        let (modal, cx) = cx.add_window_view(|window, cx| {
+            WorktreeModal::new(
+                MACHINE,
+                PathBuf::from("/repo/main"),
+                "main".into(),
+                WorktreeModalMode::New,
+                window,
+                cx,
+            )
+        });
+        let branch = |name: &str, is_remote: bool| GitBranch {
+            name: name.into(),
+            is_remote,
+            is_checked_out: name == "main",
+        };
+        modal.update(cx, |modal, cx| {
+            modal.set_repository(
+                Ok(RepositoryCheckouts {
+                    git: ProjectGit {
+                        is_repository: true,
+                        branch: Some("main".into()),
+                        default_branch: Some("main".into()),
+                        has_origin: true,
+                        branches: vec![branch("main", false), branch("origin/release", true)],
+                        ..Default::default()
+                    },
+                    checkouts: vec![checkout("/repo/main", "main", None)],
+                    data_dir: "~/.agentz".to_string(),
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(modal.read_with(cx, |modal, _| modal.base_branch()), "main");
+        let base = cx
+            .debug_bounds("worktree-modal-base")
+            .expect("From is shown");
+        cx.simulate_click(base.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("branch-picker").is_some());
+        let release = cx
+            .debug_bounds("branch-origin/release")
+            .expect("origin's branches are listed");
+        cx.simulate_click(release.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("branch-picker").is_none());
+        assert_eq!(
+            modal.read_with(cx, |modal, _| modal.base_branch()),
+            "origin/release"
+        );
     }
 
     #[test]

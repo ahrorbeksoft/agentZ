@@ -7,11 +7,13 @@
 //!   git fixed up and runtime files removed, undone if any step fails. cow's `sync`, `extract
 //!   --branch` and `remove` move work between a pasture and its project.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use agentz_protocol::workspace::{
-    Checkout, PastureSupport, ProjectGit, RepositoryCheckouts, WorkspaceRemoval,
+    Checkout, GitBranch, PastureSupport, ProjectGit, RepositoryCheckouts, WorkspaceRemoval,
+    remote_branch,
 };
 use anyhow::{Context as _, Result, anyhow};
 use projects::{Workspace, WorkspaceKind};
@@ -26,6 +28,12 @@ const BUILD_ARTIFACT_DIRS: &[&str] = &["target", ".build", "DerivedData", ".turb
 /// Runtime files a cloned project would otherwise appear to have open (cow).
 const RUNTIME_FILE_EXTENSIONS: &[&str] = &["pid", "sock", "socket"];
 const BRANCH_PREFIX: &str = "agentz/";
+/// A fetch that hangs (a remote that's down, a login it waits for) gives up after this.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// t3code's limit for a branch name made from a title.
+const MAX_TITLE_BRANCH_CHARS: usize = 64;
+/// Paths given to one git command at a time, well within the system's argument limit.
+const PATHS_PER_COMMAND: usize = 200;
 
 pub(crate) struct NewWorkspace {
     pub kind: WorkspaceKind,
@@ -34,6 +42,8 @@ pub(crate) struct NewWorkspace {
     pub data_dir: PathBuf,
     pub base: Option<String>,
     pub branch: Option<String>,
+    /// Fills its submodules too; otherwise [`init_submodules`] does, as a step of its own.
+    pub submodules: bool,
 }
 
 /// Makes a worktree or pasture of the project on a new branch.
@@ -62,7 +72,7 @@ pub(crate) async fn create(new: NewWorkspace) -> Result<Workspace> {
     .with_context(|| format!("there's no branch or commit `{base}`"))?;
     let branch = match new.branch.filter(|branch| !branch.trim().is_empty()) {
         Some(branch) => branch.trim().to_string(),
-        None => format!("{BRANCH_PREFIX}{}", short_id()),
+        None => temporary_branch(),
     };
     git(repo, &["check-ref-format", "--branch", &branch], &[])
         .await
@@ -121,6 +131,13 @@ pub(crate) async fn create(new: NewWorkspace) -> Result<Workspace> {
             }
         }
     }
+    // Best effort: a submodule that can't be fetched mustn't cost the thread its workspace
+    // (t3code).
+    if new.submodules
+        && let Err(error) = init_submodules(&path).await
+    {
+        log::warn!("submodules in {} are empty: {error:#}", path.display());
+    }
     Ok(Workspace {
         kind: new.kind,
         path,
@@ -132,19 +149,54 @@ pub(crate) async fn create(new: NewWorkspace) -> Result<Workspace> {
 
 async fn create_worktree(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
     let path_arg = path.to_string_lossy();
+    // Without `--no-track`, a branch from `origin/main` would push to origin's `main`.
     git(
         repo,
-        &["worktree", "add", "-b", branch, &path_arg, base],
+        &[
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            &path_arg,
+            base,
+        ],
         &[],
     )
     .await?;
-    // `git worktree add` leaves submodules empty. Best effort: a submodule that can't be
-    // fetched mustn't cost the thread its worktree (t3code).
-    if path.join(".gitmodules").exists()
-        && let Err(error) = git(path, &["submodule", "update", "--init", "--recursive"], &[]).await
-    {
-        log::warn!("submodules in {} are empty: {error:#}", path.display());
+    Ok(())
+}
+
+/// `git worktree add` leaves submodules empty, and a pasture's switch may leave them behind.
+pub(crate) async fn init_submodules(path: &Path) -> Result<()> {
+    if !has_submodules(path) {
+        return Ok(());
     }
+    git(path, &["submodule", "update", "--init", "--recursive"], &[]).await?;
+    Ok(())
+}
+
+pub(crate) fn has_submodules(folder: &Path) -> bool {
+    folder.join(".gitmodules").exists()
+}
+
+/// `git fetch origin`, for the branch list's Fetch. The branches origin deleted go too.
+pub(crate) async fn fetch_origin(folder: &Path) -> Result<()> {
+    fetch(folder, &["fetch", "--prune", "--no-tags", "origin"]).await
+}
+
+/// Brings `origin/<branch>` up to date before a workspace starts from it.
+pub(crate) async fn fetch_base(folder: &Path, branch: &str) -> Result<()> {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    fetch(folder, &["fetch", "--no-tags", "origin", &refspec]).await
+}
+
+async fn fetch(folder: &Path, args: &[&str]) -> Result<()> {
+    // Nobody can answer a login prompt for the server.
+    let fetching = git(folder, args, &[("GIT_TERMINAL_PROMPT", "0")]);
+    tokio::time::timeout(FETCH_TIMEOUT, fetching)
+        .await
+        .map_err(|_| anyhow!("fetching from origin took too long"))??;
     Ok(())
 }
 
@@ -171,13 +223,59 @@ async fn create_pasture(repo: &Path, path: &Path, branch: &str, base: &str) -> R
     // The clone has the source's remote-tracking refs, so `git checkout origin/main` could
     // otherwise create a local branch shadowing them (cow).
     git(path, &["config", "--local", "checkout.guess", "false"], &[]).await?;
-    git(path, &["checkout", "-b", branch, base], &[]).await?;
+    switch_copy(path, branch, base).await?;
 
     remove_runtime_files(path).await?;
     let config = repo.join(".cow.json");
     if config.exists() {
         run_cow_config(path, &config).await?;
     }
+    Ok(())
+}
+
+/// Puts a pasture's copy on a new branch from `base`. git carries the copy's uncommitted
+/// changes over when they fit the base; the ones to files the base changes are left out, as
+/// are untracked files where the base has files, so the switch goes through.
+async fn switch_copy(path: &Path, branch: &str, base: &str) -> Result<()> {
+    let switch = ["checkout", "-q", "--no-track", "-b", branch, base];
+    let Err(error) = git(path, &switch, &[]).await else {
+        return Ok(());
+    };
+    let differing = git(
+        path,
+        &["diff", "--name-only", "--no-renames", "-z", "HEAD", base],
+        &[],
+    )
+    .await
+    .map_err(|_| error)?;
+    let in_head: HashSet<String> = git(path, &["ls-tree", "-r", "-z", "--name-only", "HEAD"], &[])
+        .await?
+        .split('\0')
+        .map(str::to_string)
+        .collect();
+    let (restored, added): (Vec<&str>, Vec<&str>) = differing
+        .split('\0')
+        .filter(|file| !file.is_empty())
+        .partition(|file| in_head.contains(*file));
+    for files in restored.chunks(PATHS_PER_COMMAND) {
+        let mut args = vec!["checkout", "-q", "HEAD", "--"];
+        args.extend(files);
+        git(path, &args, &[]).await?;
+    }
+    for files in added.chunks(PATHS_PER_COMMAND) {
+        let mut args = vec!["rm", "-q", "--cached", "--ignore-unmatch", "--"];
+        args.extend(files);
+        git(path, &args, &[]).await?;
+        for file in files {
+            let file = path.join(file);
+            if file.is_file() || file.is_symlink() {
+                tokio::fs::remove_file(&file)
+                    .await
+                    .with_context(|| format!("removing {}", file.display()))?;
+            }
+        }
+    }
+    git(path, &switch, &[]).await?;
     Ok(())
 }
 
@@ -510,6 +608,25 @@ pub(crate) async fn create_from(
     branch: Option<String>,
     data_dir: PathBuf,
 ) -> Result<(PathBuf, Workspace)> {
+    let (repo, base) = repository_and_base(folder, base).await?;
+    let workspace = create(NewWorkspace {
+        kind,
+        repo: repo.clone(),
+        data_dir,
+        base: Some(base),
+        branch,
+        submodules: true,
+    })
+    .await?;
+    Ok((repo, workspace))
+}
+
+/// The main checkout of the repository `folder` is in, and what a new branch starts from:
+/// `base`, or what `folder` has checked out (its commit when it's detached).
+pub(crate) async fn repository_and_base(
+    folder: &Path,
+    base: Option<String>,
+) -> Result<(PathBuf, String)> {
     anyhow::ensure!(
         is_repository(folder).await,
         "{} isn't in a git repository",
@@ -526,15 +643,86 @@ pub(crate) async fn create_from(
                 .to_string(),
         },
     };
-    let workspace = create(NewWorkspace {
-        kind,
-        repo: repo.clone(),
-        data_dir,
-        base: Some(base),
-        branch,
-    })
-    .await?;
-    Ok((repo, workspace))
+    Ok((repo, base))
+}
+
+/// Renames a workspace's branch `from` to `to`, unless `to` is taken in it or (for a pasture's
+/// own repository) in the project: then it keeps `from`. Returns whether it was renamed.
+pub(crate) async fn rename_branch(
+    repo: &Path,
+    workspace: &Path,
+    from: &str,
+    to: &str,
+) -> Result<bool> {
+    if from == to
+        || git(workspace, &["check-ref-format", "--branch", to], &[])
+            .await
+            .is_err()
+    {
+        return Ok(false);
+    }
+    let reference = format!("refs/heads/{to}");
+    for folder in [workspace, repo] {
+        let taken = git(
+            folder,
+            &["rev-parse", "--verify", "--quiet", &reference],
+            &[],
+        )
+        .await
+        .is_ok();
+        if taken {
+            return Ok(false);
+        }
+    }
+    git(workspace, &["branch", "-m", from, to], &[]).await?;
+    Ok(true)
+}
+
+/// A branch named after a thread's title (t3code's `sanitizeBranchFragment`), under the
+/// server's prefix: `agentz/fix-checkout-rounding`.
+pub(crate) fn branch_for_title(title: &str) -> String {
+    let is_edge = |character: char| "./_-".contains(character);
+    let unquoted: String = title
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| !"'\"`".contains(*character))
+        .collect();
+    let unquoted =
+        unquoted.trim_matches(|character: char| is_edge(character) || character.is_whitespace());
+    let mut fragment = String::new();
+    for character in unquoted.chars() {
+        let character = if character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || "/_-".contains(character)
+        {
+            character
+        } else {
+            '-'
+        };
+        // Runs of dashes or slashes become one.
+        if "-/".contains(character) && fragment.ends_with(character) {
+            continue;
+        }
+        fragment.push(character);
+    }
+    let fragment: String = fragment
+        .trim_matches(is_edge)
+        .chars()
+        .take(MAX_TITLE_BRANCH_CHARS)
+        .collect();
+    let fragment = fragment.trim_end_matches(is_edge);
+    let fragment = if fragment.is_empty() {
+        "update"
+    } else {
+        fragment
+    };
+    format!("{BRANCH_PREFIX}{fragment}")
+}
+
+/// The name the server gives a new workspace's branch until it can name it after its thread.
+pub(crate) fn temporary_branch() -> String {
+    format!("{BRANCH_PREFIX}{}", short_id())
 }
 
 /// The repository `folder` is in, with what `folder` has checked out, and its checkouts:
@@ -615,7 +803,37 @@ pub(crate) async fn project_git(repo: &Path, data_dir: &Path) -> ProjectGit {
         return ProjectGit::default();
     }
     let branch = current_branch(repo).await.ok().flatten();
-    let branches = local_branches(repo).await.unwrap_or_default();
+    let local = local_branches(repo).await.unwrap_or_default();
+    let remote = origin_branches(repo).await.unwrap_or_default();
+    let checked_out: HashSet<String> = worktrees(repo)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|checkout| checkout.branch)
+        .collect();
+    let has_origin = git(repo, &["remote", "get-url", "origin"], &[])
+        .await
+        .is_ok();
+    let default_branch = match origin_default_branch(repo).await {
+        Some(branch) => Some(branch),
+        None => ["main", "master"]
+            .into_iter()
+            .find(|name| local.iter().any(|branch| branch == name))
+            .map(str::to_string),
+    };
+    let branches = local
+        .into_iter()
+        .map(|name| GitBranch {
+            is_checked_out: checked_out.contains(&name),
+            name,
+            is_remote: false,
+        })
+        .chain(remote.into_iter().map(|name| GitBranch {
+            name,
+            is_remote: true,
+            is_checked_out: false,
+        }))
+        .collect();
     let pastures = if repo.join(".git").is_dir() {
         pasture_support(repo, data_dir).await
     } else {
@@ -626,24 +844,56 @@ pub(crate) async fn project_git(repo: &Path, data_dir: &Path) -> ProjectGit {
     ProjectGit {
         is_repository: true,
         branch,
+        default_branch,
+        has_origin,
         branches,
         pastures,
     }
 }
 
 pub(crate) async fn local_branches(repo: &Path) -> Result<Vec<String>> {
+    branches_under(repo, "refs/heads").await
+}
+
+/// origin's branches (`origin/main`), most recently committed first, without `origin/HEAD`.
+async fn origin_branches(repo: &Path) -> Result<Vec<String>> {
+    Ok(branches_under(repo, "refs/remotes/origin")
+        .await?
+        .into_iter()
+        .filter(|name| name != "origin/HEAD" && name != "origin")
+        .collect())
+}
+
+async fn branches_under(repo: &Path, prefix: &str) -> Result<Vec<String>> {
     let output = git(
         repo,
         &[
             "for-each-ref",
             "--sort=-committerdate",
             "--format=%(refname:short)",
-            "refs/heads",
+            prefix,
         ],
         &[],
     )
     .await?;
     Ok(output.lines().map(str::to_string).collect())
+}
+
+/// The branch `origin/HEAD` points at, as a clone sets it: `main`.
+async fn origin_default_branch(repo: &Path) -> Option<String> {
+    let output = git(
+        repo,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+        &[],
+    )
+    .await
+    .ok()?;
+    remote_branch(output.trim()).map(str::to_string)
 }
 
 pub(crate) async fn current_branch(folder: &Path) -> Result<Option<String>> {
@@ -875,6 +1125,7 @@ prunable gitdir file points to non-existent location
             data_dir: data_dir.clone(),
             base: None,
             branch: Some("feature/login".into()),
+            submodules: true,
         })
         .await
         .expect("creates");
@@ -901,6 +1152,7 @@ prunable gitdir file points to non-existent location
             data_dir: data_dir.clone(),
             base: None,
             branch: Some("feature/login".into()),
+            submodules: true,
         })
         .await;
         assert!(taken.is_err(), "the branch exists");
@@ -949,6 +1201,7 @@ prunable gitdir file points to non-existent location
             data_dir: data_dir.clone(),
             base: Some("main".into()),
             branch: None,
+            submodules: true,
         })
         .await
         .expect("creates");
@@ -1029,6 +1282,208 @@ prunable gitdir file points to non-existent location
             "# Pasture\n"
         );
         assert!(run(&pasture, &["status", "--porcelain"]).await.is_empty());
+    }
+
+    #[test]
+    fn branches_are_named_after_titles_as_t3code_names_them() {
+        assert_eq!(
+            branch_for_title("Fix the login redirect!"),
+            "agentz/fix-the-login-redirect"
+        );
+        assert_eq!(
+            branch_for_title("  \"Quoted\" title / API  "),
+            "agentz/quoted-title-/-api"
+        );
+        assert_eq!(branch_for_title("Émoji 🚀 time"), "agentz/moji-time");
+        assert_eq!(branch_for_title("…"), "agentz/update");
+        let long = branch_for_title(&"word ".repeat(30));
+        assert_eq!(long.len(), "agentz/".len() + 64);
+        let cut_at_a_dash = branch_for_title(&format!("{}-tail", "a".repeat(63)));
+        assert_eq!(cut_at_a_dash, format!("agentz/{}", "a".repeat(63)));
+    }
+
+    #[tokio::test]
+    async fn origin_branches_follow_local_ones_and_are_fetched() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let upstream = repository(root.path()).await;
+        let origin = root.path().join("origin.git");
+        let project = root.path().join("project");
+        run(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &upstream.to_string_lossy(),
+                &origin.to_string_lossy(),
+            ],
+        )
+        .await;
+        run(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                &origin.to_string_lossy(),
+                &project.to_string_lossy(),
+            ],
+        )
+        .await;
+        run(&project, &["branch", "-q", "local-only"]).await;
+        let data_dir = root.path().join("data");
+
+        let listed = project_git(&project, &data_dir).await;
+        assert!(listed.has_origin);
+        assert_eq!(listed.default_branch.as_deref(), Some("main"));
+        let branches: Vec<(&str, Option<&str>)> = listed
+            .branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), listed.mark(branch)))
+            .collect();
+        assert_eq!(
+            branches
+                .iter()
+                .filter(|(_, mark)| *mark == Some("remote"))
+                .count(),
+            1
+        );
+        assert!(branches.contains(&("main", Some("current"))));
+        assert!(branches.contains(&("local-only", None)));
+        assert_eq!(branches.last(), Some(&("origin/main", Some("remote"))));
+
+        // A teammate pushes a branch and a commit to main.
+        run(&upstream, &["checkout", "-q", "-b", "teammate"]).await;
+        run(
+            &upstream,
+            &["commit", "-q", "--allow-empty", "-m", "theirs"],
+        )
+        .await;
+        run(&upstream, &["checkout", "-q", "main"]).await;
+        std::fs::write(upstream.join("NEWS.md"), "news\n").expect("write");
+        run(&upstream, &["add", "NEWS.md"]).await;
+        run(&upstream, &["commit", "-q", "-m", "news"]).await;
+        let origin_path = origin.to_string_lossy();
+        run(&upstream, &["push", "-q", &origin_path, "teammate", "main"]).await;
+
+        fetch_base(&project, "main").await.expect("fetches main");
+        let listed = project_git(&project, &data_dir).await;
+        assert!(
+            !listed
+                .branches
+                .iter()
+                .any(|branch| branch.name == "origin/teammate"),
+            "only main was fetched"
+        );
+        let workspace = create(NewWorkspace {
+            kind: WorkspaceKind::Worktree,
+            repo: project.clone(),
+            data_dir: data_dir.clone(),
+            base: Some("origin/main".into()),
+            branch: None,
+            submodules: true,
+        })
+        .await
+        .expect("creates");
+        assert!(workspace.path.join("NEWS.md").exists());
+        let upstream_branch = git(
+            &workspace.path,
+            &["rev-parse", "--abbrev-ref", "@{upstream}"],
+            &[],
+        )
+        .await;
+        assert!(upstream_branch.is_err(), "it doesn't track origin's main");
+
+        fetch_origin(&project).await.expect("fetches");
+        let listed = project_git(&project, &data_dir).await;
+        assert!(
+            listed
+                .branches
+                .iter()
+                .any(|branch| branch.name == "origin/teammate" && branch.is_remote)
+        );
+        assert!(listed.branches.iter().any(|branch| branch.name
+            == workspace.branch.clone().expect("a branch")
+            && listed.mark(branch) == Some("worktree")));
+    }
+
+    #[tokio::test]
+    async fn branches_are_renamed_unless_the_name_is_taken() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let repo = repository(root.path()).await;
+        let data_dir = root.path().join("data");
+        let new = || NewWorkspace {
+            kind: WorkspaceKind::Worktree,
+            repo: repo.clone(),
+            data_dir: data_dir.clone(),
+            base: None,
+            branch: None,
+            submodules: true,
+        };
+        let first = create(new()).await.expect("creates");
+        let second = create(new()).await.expect("creates");
+        let temporary = second.branch.clone().expect("a branch");
+        assert!(temporary.starts_with("agentz/"));
+        let renamed = rename_branch(
+            &repo,
+            &first.path,
+            &first.branch.clone().expect("a branch"),
+            "agentz/fix-login",
+        )
+        .await
+        .expect("renames");
+        assert!(renamed);
+        assert_eq!(
+            current_branch(&first.path)
+                .await
+                .expect("branch")
+                .as_deref(),
+            Some("agentz/fix-login")
+        );
+        let renamed = rename_branch(&repo, &second.path, &temporary, "agentz/fix-login")
+            .await
+            .expect("checks");
+        assert!(!renamed, "the name is taken");
+        assert_eq!(
+            current_branch(&second.path).await.expect("branch"),
+            Some(temporary)
+        );
+    }
+
+    #[tokio::test]
+    async fn copies_switch_to_their_base_leaving_out_what_does_not_fit() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let repo = repository(root.path()).await;
+        run(&repo, &["checkout", "-q", "-b", "other"]).await;
+        std::fs::write(repo.join("README.md"), "# Other\n").expect("write");
+        std::fs::write(repo.join("added.txt"), "theirs\n").expect("write");
+        run(&repo, &["add", "-A"]).await;
+        run(&repo, &["commit", "-q", "-m", "other"]).await;
+        run(&repo, &["checkout", "-q", "main"]).await;
+        // A copy of a project with changes that don't fit `other`, and one that does.
+        std::fs::write(repo.join("README.md"), "# Mine\n").expect("write");
+        std::fs::write(repo.join("added.txt"), "mine\n").expect("write");
+        std::fs::write(repo.join(".gitignore"), ".env\n").expect("write");
+
+        switch_copy(&repo, "agentz/copy", "other")
+            .await
+            .expect("switches");
+        assert_eq!(
+            current_branch(&repo).await.expect("branch").as_deref(),
+            Some("agentz/copy")
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).expect("read"),
+            "# Other\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("added.txt")).expect("read"),
+            "theirs\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".gitignore")).expect("read"),
+            ".env\n",
+            "a change that fits is kept"
+        );
     }
 
     #[test]

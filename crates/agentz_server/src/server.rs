@@ -22,6 +22,7 @@ mod title_requests;
 mod tools;
 mod usage_reads;
 mod workspace_requests;
+mod workspace_setup;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -183,6 +184,11 @@ pub(crate) struct Server {
     pending_tool_calls: Vec<PendingToolCall>,
     /// Messages waiting for the threads they mention to load.
     pending_prompts: Vec<prompt_requests::PendingPrompt>,
+    /// First messages waiting for their thread's new worktree or pasture.
+    workspace_setups: HashMap<ThreadId, workspace_setup::SetupRun>,
+    /// Threads whose new workspace's branch is renamed after their title once they have one,
+    /// with the workspace.
+    branches_to_name: HashMap<ThreadId, PathBuf>,
     /// The connections of messages whose files and images are being read, one for each.
     reading_prompts: Vec<ConnectionId>,
     /// The messages the user queued for each thread.
@@ -359,6 +365,8 @@ impl Server {
             moving_threads: HashMap::default(),
             pending_tool_calls: Vec::new(),
             pending_prompts: Vec::new(),
+            workspace_setups: HashMap::default(),
+            branches_to_name: HashMap::default(),
             reading_prompts: Vec::new(),
             queues,
             tool_results: ToolResults::default(),
@@ -731,6 +739,7 @@ impl Server {
                     | Request::CreateWorkspacesThread { .. }
                     | Request::ProjectGit(_)
                     | Request::RepositoryCheckouts(_)
+                    | Request::FetchOrigin(_)
                     | Request::CreateWorkspace { .. }
                     | Request::RemoveWorkspace { .. }
                     | Request::SyncWorkspace { .. }
@@ -957,6 +966,9 @@ impl Server {
             } => Ok(Response::ThreadCreated(
                 self.continue_thread(thread_id, agent_id, account)?,
             )),
+            Request::PlanWorkspace { thread_id, plan } => self.plan_workspace(thread_id, plan),
+            Request::RetryWorkspaceSetup(thread_id) => self.retry_workspace_setup(thread_id),
+            Request::UseLocal(thread_id) => self.use_local(thread_id),
             Request::DropHandoff(connection) => {
                 self.update_thread(connection, AgentThread::drop_handoff)?;
                 Ok(Response::Ok)
@@ -1247,6 +1259,7 @@ impl Server {
             | Request::CreateWorkspacesThread { .. }
             | Request::ProjectGit(_)
             | Request::RepositoryCheckouts(_)
+            | Request::FetchOrigin(_)
             | Request::CreateWorkspace { .. }
             | Request::RemoveWorkspace { .. }
             | Request::SyncWorkspace { .. }
@@ -1618,6 +1631,7 @@ impl Server {
         agent_thread.set_attachments(Attachments::for_thread(&self.data_dir, thread_id));
         let (queued_messages, steering) = self.queues.state(thread_id);
         agent_thread.set_queued_messages(queued_messages, steering);
+        agent_thread.set_workspace_setup(self.workspace_setup(thread_id));
         agent_thread.set_defaults(self.account_settings(&agent_id, account).session_defaults());
         if let Some(key_login) = self.key_login(&agent_id, account) {
             agent_thread.set_key_method(acp::AuthMethodId::new(key_login.method));
@@ -1696,6 +1710,8 @@ impl Server {
         let threads = self.projects.thread_and_subthreads(thread_id);
         for thread_id in &threads {
             self.draft_due.remove(thread_id);
+            self.branches_to_name.remove(thread_id);
+            self.drop_workspace_setup(*thread_id);
             continuations::remove(&self.data_dir, *thread_id).log_err();
             transcripts::remove(&self.data_dir, *thread_id).log_err();
             self.saved_transcripts.remove(thread_id);
@@ -2121,6 +2137,7 @@ impl Server {
                     self.projects
                         .rename_thread(thread_id, thread_title_from_prompt(&title));
                     self.agent_titled_thread(thread_id);
+                    self.name_branch_after_title(thread_id);
                 }
                 // Its first message, sent or queued, makes a draft a thread.
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::FirstPrompt(title)) => {

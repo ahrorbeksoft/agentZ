@@ -50,6 +50,17 @@ impl Server {
                 "a subthread only takes its task; message its parent instead"
             ));
         }
+        if let ConnectionId::Thread(thread_id) = connection {
+            self.refuse_during_setup(thread_id)?;
+            let plan = self
+                .projects
+                .thread(thread_id)
+                .and_then(|thread| thread.planned_workspace.clone());
+            if let Some(plan) = plan {
+                self.set_up_workspace(thread_id, plan, prompt)?;
+                return Ok(Response::Ok);
+            }
+        }
         if prompt
             .iter()
             .all(|part| matches!(part, PromptPart::Text(_)))
@@ -109,14 +120,15 @@ impl Server {
         Ok(())
     }
 
-    /// Whether a message to the thread waits for the threads it mentions, or for its files and
-    /// images to be read.
+    /// Whether a message to the thread waits for the threads it mentions, for its files and
+    /// images to be read, or for the thread's new workspace.
     pub(super) fn has_waiting_prompt(&self, thread_id: ThreadId) -> bool {
         let connection = ConnectionId::Thread(thread_id);
         self.pending_prompts
             .iter()
             .any(|pending| pending.connection == connection)
             || self.reading_prompts.contains(&connection)
+            || self.has_workspace_setup(thread_id)
     }
 
     /// Sends the waiting messages whose mentioned threads have loaded, or that waited long

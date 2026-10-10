@@ -32,8 +32,8 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use projects::{
-    ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId, ThreadOrder, ThreadSection,
-    UnsentMention, WorkspaceKind,
+    PlannedWorkspace, ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId,
+    ThreadOrder, ThreadSection, UnsentMention, WorkspaceKind,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -342,6 +342,22 @@ pub enum Request {
     /// The repository a folder is in, and its checkouts: [`Response::RepositoryCheckouts`].
     /// Any repository, a project or not.
     RepositoryCheckouts(PathBuf),
+    /// `git fetch origin` in the repository `folder` is in, then its branches as
+    /// [`Response::ProjectGit`], with `branch` what `folder` has checked out.
+    FetchOrigin(PathBuf),
+    /// Where a draft will work: a new worktree or pasture made as its first message is sent,
+    /// or (`None`) the folder it's in. Only for a draft in its project's folder, or a
+    /// Workspaces draft in the folder it was started in.
+    PlanWorkspace {
+        thread_id: ThreadId,
+        plan: Option<PlannedWorkspace>,
+    },
+    /// Makes the thread's worktree or pasture again, from the step that failed
+    /// ([`thread::ThreadState::workspace_setup`]).
+    RetryWorkspaceSetup(ThreadId),
+    /// Gives up on the thread's new worktree or pasture: its first message goes to the agent
+    /// in the folder it's in.
+    UseLocal(ThreadId),
     /// A worktree or pasture of the repository `folder` is in, on a new branch, with no thread
     /// in it yet: [`Response::WorkspaceCreated`] with its folder. A project's is recorded as one
     /// of its workspaces.

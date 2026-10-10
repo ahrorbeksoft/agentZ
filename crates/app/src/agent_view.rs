@@ -24,7 +24,10 @@ use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, LostHistory, ModeSwitch,
     PermissionOption, PlanItem, SessionRestore, ToolAnswer, ToolCall, without_handoff,
 };
-use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
+use agentz_protocol::workspace::{
+    PastureSupport, ProjectGit, SetupStepKind, SetupStepState, WorkspaceChoice, WorkspaceSetup,
+    remote_branch,
+};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
 use collections::{HashMap, HashSet};
 use gpui::{
@@ -35,7 +38,9 @@ use gpui::{
     Stateful, Subscription, Task, Window, anchored, canvas, deferred, img, list, pulsating_between,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
-use projects::{ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind};
+use projects::{
+    PlannedWorkspace, ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind,
+};
 use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, Chip, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
@@ -57,6 +62,7 @@ use crate::attachment_image::{
     AttachmentImage, ImagePreviewTooltip, ImageViewer, MessagePiece, ViewedImage, is_loading,
     message_pieces, render_hover_preview, without_image_links,
 };
+use crate::branch_picker::{BranchPicker, FetchOrigin};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
@@ -2276,7 +2282,12 @@ impl AgentView {
         // Messages typed while the agent works wait in the queue the server keeps, which
         // sends them one at a time as each turn ends, like Zed's.
         let thread = self.thread.read(cx);
-        if thread.is_working() || !thread.state.queued_messages.is_empty() {
+        // The first message waits for the thread's new worktree or pasture; the next ones
+        // wait behind it.
+        if thread.is_working()
+            || !thread.state.queued_messages.is_empty()
+            || thread.workspace_setup().is_some()
+        {
             self.queue_expanded = true;
             self.thread
                 .update(cx, |thread, cx| thread.queue_message(prompt, cx));
@@ -2899,7 +2910,8 @@ impl AgentView {
     /// call or from subthreads, requests for input, and the working indicator.
     fn render_tail_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let entry_count = self.thread.read(cx).entries().len();
-        let mut rows = self.render_continuations(cx);
+        let mut rows = self.render_workspace_setup(cx);
+        rows.extend(self.render_continuations(cx));
         let orphans: Vec<(acp::ToolCallId, String)> = self
             .thread
             .read(cx)
@@ -2963,6 +2975,144 @@ impl AgentView {
             rows.push(generating);
         }
         rows
+    }
+
+    /// A first message waiting for the thread's new worktree or pasture: the message, then
+    /// the steps making it (t3code's thread setup), with Retry and Use Local once one fails.
+    fn render_workspace_setup(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(setup) = self.thread.read(cx).workspace_setup().cloned() else {
+            return Vec::new();
+        };
+        let message = v_flex().pt_3().pb_1().px_5().w_full().items_end().child(
+            div()
+                .max_w(relative(0.8))
+                .px_3()
+                .py_2()
+                .rounded_xl()
+                .bg(user_message_background(cx))
+                .text_ui(cx)
+                .child(setup.message.clone()),
+        );
+        let steps = setup.steps.iter().map(|step| {
+            let (icon, color) = match step.state {
+                SetupStepState::Done => (
+                    Icon::new(IconName::Check)
+                        .size(IconSize::XSmall)
+                        .color(Color::Success)
+                        .into_any_element(),
+                    Color::Muted,
+                ),
+                SetupStepState::Running => (
+                    Icon::new(IconName::LoadCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2)
+                        .into_any_element(),
+                    Color::Default,
+                ),
+                SetupStepState::Waiting => (
+                    Icon::new(IconName::Circle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Placeholder)
+                        .into_any_element(),
+                    Color::Placeholder,
+                ),
+                SetupStepState::Failed => (
+                    Icon::new(IconName::XCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error)
+                        .into_any_element(),
+                    Color::Error,
+                ),
+            };
+            h_flex()
+                .h(px(22.))
+                .gap_2()
+                .child(icon)
+                .child(
+                    Label::new(setup_step_label(&setup, step.kind, step.state))
+                        .size(LabelSize::Small)
+                        .color(color),
+                )
+                .children(step.took.map(|took| {
+                    Label::new(format_duration(took))
+                        .size(LabelSize::Small)
+                        .color(Color::Placeholder)
+                }))
+        });
+        let failure = setup.error.clone().map(|error| {
+            v_flex()
+                .pt_1()
+                .gap_1p5()
+                .child(Label::new(error).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .debug_selector(|| "workspace-setup-retry".into())
+                                .child(
+                                    Button::new("workspace-setup-retry", "Retry")
+                                        .style(ButtonStyle::Outlined)
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.thread.update(cx, |thread, cx| {
+                                                thread.retry_workspace_setup(cx)
+                                            });
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "workspace-setup-use-local".into())
+                                .child(
+                                    Button::new("workspace-setup-use-local", "Use Local")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.thread
+                                                .update(cx, |thread, cx| thread.use_local(cx));
+                                        })),
+                                ),
+                        ),
+                )
+        });
+        let card = div().px_5().py_1p5().child(
+            v_flex()
+                .debug_selector(|| "workspace-setup".into())
+                .w(px(360.))
+                .max_w_full()
+                .px_3()
+                .py_2p5()
+                .gap_0p5()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().editor_background)
+                .child(
+                    h_flex()
+                        .mb_1()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(workspace_icon(setup.kind))
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(new_workspace_label(setup.kind))
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::MEDIUM),
+                        )
+                        .child(
+                            Label::new(format!("from {}", setup.base))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+                .children(steps)
+                .children(failure),
+        );
+        vec![message.into_any_element(), card.into_any_element()]
     }
 
     /// The entries of the user's own messages: the turns the turn rail goes between.
@@ -9617,9 +9767,25 @@ impl AgentView {
                 .children(self.render_account_picker(cx))
                 .into_any_element(),
         };
-        let branch = self.thread_branch(cx).map(|(branch, _, folder)| {
+        let branch = match self.planned_workspace(cx) {
+            Some(plan) if self.replacing.is_none() => Some(self.render_base_picker(plan, cx)),
+            _ => self.render_new_thread_branch(cx),
+        };
+        h_flex()
+            .w_full()
+            .justify_between()
+            .gap_2()
+            .child(left)
+            .children(branch)
+            .into_any_element()
+    }
+
+    /// The branch the draft's folder has checked out.
+    fn render_new_thread_branch(&self, cx: &App) -> Option<AnyElement> {
+        self.thread_branch(cx).map(|(branch, _, folder)| {
             h_flex()
                 .id("new-thread-branch")
+                .debug_selector(|| "new-thread-branch".into())
                 .min_w_0()
                 .h(px(22.))
                 .px_1p5()
@@ -9636,14 +9802,84 @@ impl AgentView {
                         .truncate(),
                 )
                 .tooltip(Tooltip::text(folder.display().to_string()))
-        });
-        h_flex()
-            .w_full()
-            .justify_between()
-            .gap_2()
-            .child(left)
-            .children(branch)
+                .into_any_element()
+        })
+    }
+
+    /// What a planned worktree or pasture starts from, "From main", opening the branch list
+    /// (t3code's branch toolbar).
+    fn render_base_picker(&self, plan: PlannedWorkspace, cx: &mut Context<Self>) -> AnyElement {
+        let git = self.draft_git.clone().unwrap_or_default();
+        let base = match &plan.base {
+            Some(base) => base.clone(),
+            None if self.draft_git.is_some() => git.default_base(),
+            None => self
+                .thread_branch(cx)
+                .map(|(branch, _, _)| branch.to_string())
+                .unwrap_or_else(|| "HEAD".into()),
+        };
+        let fetch = self.fetch_origin(cx);
+        let chip = picker_chip(
+            "new-thread-base-trigger",
+            Icon::new(IconName::GitBranch),
+            format!("From {base}").into(),
+        );
+        let view = cx.weak_entity();
+        let menu = PopoverMenu::new("new-thread-base")
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let git = git.clone();
+                let base = base.clone();
+                let fetch = fetch.clone();
+                Some(cx.new(|cx| {
+                    BranchPicker::new(
+                        git,
+                        base,
+                        fetch,
+                        move |branch, _, cx| {
+                            view.update(cx, |view, cx| view.change_new_thread_base(branch, cx))
+                                .log_err();
+                        },
+                        window,
+                        cx,
+                    )
+                }))
+            })
+            .trigger_with_tooltip(chip, Tooltip::text("What the Branch Starts From"))
+            .anchor(gpui::Anchor::TopRight)
+            .offset(gpui::point(px(0.), px(4.)));
+        div()
+            .debug_selector(|| "new-thread-base".into())
+            .min_w_0()
+            .child(menu)
             .into_any_element()
+    }
+
+    /// Fetch in the branch list: `git fetch origin` in the draft's folder, whose branches the
+    /// list and the strip then show.
+    fn fetch_origin(&self, cx: &Context<Self>) -> Option<FetchOrigin> {
+        let folder = {
+            let store = self.store.read(cx);
+            let thread = store.thread(self.thread_id)?;
+            match thread.starting_folder() {
+                Some(folder) if thread.in_workspaces() => folder.clone(),
+                _ => store.project(thread.project_id)?.path.clone(),
+            }
+        };
+        let store = self.store.clone();
+        let view = cx.weak_entity();
+        Some(Rc::new(move |cx: &mut App| {
+            let fetched = store.read(cx).fetch_origin(folder.clone(), cx);
+            let view = view.clone();
+            cx.spawn(async move |cx| {
+                let git = fetched.await?;
+                view.update(cx, |view, cx| {
+                    view.draft_git = Some(git.clone());
+                    cx.notify();
+                })?;
+                Ok(git)
+            })
+        }))
     }
 
     /// Where the new thread works: the project's own folder, a new worktree or pasture, or
@@ -9653,9 +9889,14 @@ impl AgentView {
         let current = store
             .thread(self.thread_id)
             .and_then(|thread| thread.workspace.clone());
-        let (icon, label) = match store.thread_workspace(self.thread_id) {
-            Some(workspace) => (workspace_icon(workspace.kind), workspace.kind.label()),
-            None => (IconName::Folder, "Local"),
+        let planned = store
+            .thread(self.thread_id)
+            .and_then(|thread| thread.planned_workspace.as_ref())
+            .map(|plan| plan.kind);
+        let (icon, label) = match (planned, store.thread_workspace(self.thread_id)) {
+            (Some(kind), _) => (workspace_icon(kind), new_workspace_label(kind)),
+            (None, Some(workspace)) => (workspace_icon(workspace.kind), workspace.kind.label()),
+            (None, None) => (IconName::Folder, "Local"),
         };
         let existing: Vec<(PathBuf, WorkspaceKind, SharedString)> = {
             store
@@ -9690,7 +9931,7 @@ impl AgentView {
         }
         let chip = picker_chip("new-thread-checkout-trigger", Icon::new(icon), label.into());
         let view = cx.weak_entity();
-        PopoverMenu::new("new-thread-checkout")
+        let menu = PopoverMenu::new("new-thread-checkout")
             .menu(move |window, cx| {
                 let view = view.clone();
                 let current = current.clone();
@@ -9711,13 +9952,20 @@ impl AgentView {
                             ContextMenuEntry::new("Local checkout")
                                 .icon(IconName::Folder)
                                 .icon_color(Color::Muted)
-                                .toggleable(IconPosition::End, current.is_none())
+                                .toggleable(
+                                    IconPosition::End,
+                                    current.is_none() && planned.is_none(),
+                                )
                                 .handler(choose(WorkspaceChoice::Checkout)),
                         )
                         .item(
                             ContextMenuEntry::new("New worktree")
                                 .icon(workspace_icon(WorkspaceKind::Worktree))
                                 .icon_color(Color::Muted)
+                                .toggleable(
+                                    IconPosition::End,
+                                    planned == Some(WorkspaceKind::Worktree),
+                                )
                                 .disabled(!is_repository)
                                 .handler(choose(WorkspaceChoice::New {
                                     kind: WorkspaceKind::Worktree,
@@ -9729,6 +9977,10 @@ impl AgentView {
                             ContextMenuEntry::new("New pasture")
                                 .icon(workspace_icon(WorkspaceKind::Pasture))
                                 .icon_color(Color::Muted)
+                                .toggleable(
+                                    IconPosition::End,
+                                    planned == Some(WorkspaceKind::Pasture),
+                                )
                                 .disabled(!is_repository || pasture_unsupported)
                                 .handler(choose(WorkspaceChoice::New {
                                     kind: WorkspaceKind::Pasture,
@@ -9753,7 +10005,10 @@ impl AgentView {
             })
             .trigger_with_tooltip(chip, Tooltip::text("Where the Thread Works"))
             .anchor(gpui::Anchor::TopLeft)
-            .offset(gpui::point(px(0.), px(4.)))
+            .offset(gpui::point(px(0.), px(4.)));
+        div()
+            .debug_selector(|| "new-thread-checkout-menu".into())
+            .child(menu)
             .into_any_element()
     }
 
@@ -9768,11 +10023,18 @@ impl AgentView {
             return div().into_any_element();
         };
         let in_starting_folder = thread.started_in.is_none();
-        let icon = store
-            .thread_workspace(self.thread_id)
-            .filter(|_| !in_starting_folder)
-            .map_or(IconName::Folder, |workspace| workspace_icon(workspace.kind));
-        let label: SharedString = compact_path(&folder).into();
+        let planned = thread.planned_workspace.as_ref().map(|plan| plan.kind);
+        let icon = match planned {
+            Some(kind) => workspace_icon(kind),
+            None => store
+                .thread_workspace(self.thread_id)
+                .filter(|_| !in_starting_folder)
+                .map_or(IconName::Folder, |workspace| workspace_icon(workspace.kind)),
+        };
+        let label: SharedString = match planned {
+            Some(kind) => new_workspace_label(kind).into(),
+            None => compact_path(&folder).into(),
+        };
         let tooltip = folder.display().to_string();
         // Offered only once the folder is known to be in git.
         let is_repository = self.draft_git.as_ref().is_some_and(|git| git.is_repository);
@@ -9806,13 +10068,20 @@ impl AgentView {
                             ContextMenuEntry::new("Current checkout")
                                 .icon(IconName::Folder)
                                 .icon_color(Color::Muted)
-                                .toggleable(IconPosition::End, in_starting_folder)
+                                .toggleable(
+                                    IconPosition::End,
+                                    in_starting_folder && planned.is_none(),
+                                )
                                 .handler(choose(WorkspaceChoice::Checkout)),
                         )
                         .item(
                             ContextMenuEntry::new("New worktree")
                                 .icon(workspace_icon(WorkspaceKind::Worktree))
                                 .icon_color(Color::Muted)
+                                .toggleable(
+                                    IconPosition::End,
+                                    planned == Some(WorkspaceKind::Worktree),
+                                )
                                 .handler(choose(WorkspaceChoice::New {
                                     kind: WorkspaceKind::Worktree,
                                     base: None,
@@ -9823,6 +10092,10 @@ impl AgentView {
                             ContextMenuEntry::new("New pasture")
                                 .icon(workspace_icon(WorkspaceKind::Pasture))
                                 .icon_color(Color::Muted)
+                                .toggleable(
+                                    IconPosition::End,
+                                    planned == Some(WorkspaceKind::Pasture),
+                                )
                                 .disabled(pasture_unsupported)
                                 .handler(choose(WorkspaceChoice::New {
                                     kind: WorkspaceKind::Pasture,
@@ -10099,6 +10372,13 @@ impl AgentView {
         let Some(thread) = store.thread(self.thread_id) else {
             return WorkspaceChoice::Checkout;
         };
+        if let Some(plan) = &thread.planned_workspace {
+            return WorkspaceChoice::New {
+                kind: plan.kind,
+                base: plan.base.clone(),
+                branch: plan.branch.clone(),
+            };
+        }
         match &thread.workspace {
             Some(_) if thread.in_workspaces() && thread.started_in.is_none() => {
                 WorkspaceChoice::Checkout
@@ -10137,9 +10417,46 @@ impl AgentView {
         self.replace_new_thread(project, starter, workspace, AccountChoice::Default, cx);
     }
 
+    /// The new worktree or pasture the draft will work in, made with its first message.
+    fn planned_workspace(&self, cx: &App) -> Option<PlannedWorkspace> {
+        self.store
+            .read(cx)
+            .thread(self.thread_id)?
+            .planned_workspace
+            .clone()
+    }
+
+    /// Whether the draft works in the folder it was made in, where a new worktree or pasture
+    /// is planned rather than made.
+    fn draft_in_own_folder(&self, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_some_and(|thread| match &thread.workspace {
+                None => true,
+                Some(_) => thread.in_workspaces() && thread.started_in.is_none(),
+            })
+    }
+
     fn change_new_thread_checkout(&mut self, workspace: WorkspaceChoice, cx: &mut Context<Self>) {
         if workspace == self.current_workspace_choice(cx) {
             return;
+        }
+        // Until the first message, a new worktree or pasture is only the draft's plan.
+        if self.draft_in_own_folder(cx) {
+            let planned = self.planned_workspace(cx);
+            match workspace {
+                WorkspaceChoice::Checkout => return self.plan_new_workspace(None, cx),
+                WorkspaceChoice::New { kind, branch, .. } => {
+                    if planned.as_ref().is_some_and(|plan| plan.kind == kind) {
+                        return;
+                    }
+                    let base = planned.and_then(|plan| plan.base);
+                    let plan = PlannedWorkspace { kind, base, branch };
+                    return self.plan_new_workspace(Some(plan), cx);
+                }
+                WorkspaceChoice::Existing(_) => {}
+            }
         }
         let (Some(project), Some(agent_id)) = (self.current_project(cx), self.agent_id.clone())
         else {
@@ -10147,6 +10464,33 @@ impl AgentView {
         };
         let account = self.current_account_choice(cx);
         self.replace_new_thread(project, Starter::Agent(agent_id), workspace, account, cx);
+    }
+
+    fn change_new_thread_base(&mut self, base: String, cx: &mut Context<Self>) {
+        let Some(mut plan) = self.planned_workspace(cx) else {
+            return;
+        };
+        plan.base = Some(base);
+        self.plan_new_workspace(Some(plan), cx);
+    }
+
+    fn plan_new_workspace(&mut self, plan: Option<PlannedWorkspace>, cx: &mut Context<Self>) {
+        let thread_id = self.thread_id;
+        let planned = self
+            .store
+            .update(cx, |store, cx| store.plan_workspace(thread_id, plan, cx));
+        self.replace_error = None;
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = planned.await {
+                this.update(cx, |this, cx| {
+                    this.replace_error = Some(format!("{error:#}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     /// The thread moves to the project's checkout on another machine, in its own folder there,
@@ -10237,12 +10581,7 @@ impl AgentView {
             .thread(self.thread_id)
             .filter(|thread| thread.in_workspaces())
             .and_then(|thread| thread.starting_folder().cloned());
-        self.replacing = Some(match &workspace {
-            WorkspaceChoice::New { kind, .. } => {
-                format!("Making a {}…", kind.label().to_lowercase()).into()
-            }
-            _ => "Starting…".into(),
-        });
+        self.replacing = Some("Starting…".into());
         self.replace_error = None;
         cx.notify();
         let created = store.update(cx, |store, cx| match (starter, continued_from) {
@@ -10697,6 +11036,50 @@ fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike 
                     .color(Color::Muted),
             ),
         )
+}
+
+/// A setup step as it stands: "Fetch main from origin", "Fetching…", "Fetched…".
+fn setup_step_label(setup: &WorkspaceSetup, kind: SetupStepKind, state: SetupStepState) -> String {
+    let base = remote_branch(&setup.base).unwrap_or(&setup.base);
+    let (waiting, running, done, failed) = match (kind, setup.kind) {
+        (SetupStepKind::Fetch, _) => (
+            format!("Fetch {base} from origin"),
+            format!("Fetching {base} from origin"),
+            format!("Fetched {base} from origin"),
+            format!("Couldn't fetch {base} from origin"),
+        ),
+        (SetupStepKind::CheckOut, WorkspaceKind::Worktree) => (
+            "Check out".to_string(),
+            "Checking out".to_string(),
+            "Checked out".to_string(),
+            "Couldn't check out".to_string(),
+        ),
+        (SetupStepKind::CheckOut, WorkspaceKind::Pasture) => (
+            "Copy the project".to_string(),
+            "Copying the project".to_string(),
+            "Copied the project".to_string(),
+            "Couldn't copy the project".to_string(),
+        ),
+        (SetupStepKind::Submodules, _) => (
+            "Submodules".to_string(),
+            "Updating submodules".to_string(),
+            "Updated submodules".to_string(),
+            "Couldn't update submodules".to_string(),
+        ),
+    };
+    match state {
+        SetupStepState::Waiting => waiting,
+        SetupStepState::Running => running,
+        SetupStepState::Done => done,
+        SetupStepState::Failed => failed,
+    }
+}
+
+fn new_workspace_label(kind: WorkspaceKind) -> &'static str {
+    match kind {
+        WorkspaceKind::Worktree => "New worktree",
+        WorkspaceKind::Pasture => "New pasture",
+    }
 }
 
 /// A picker's chip when there's nothing else to pick.
@@ -12455,6 +12838,173 @@ mod tests {
         assert!(cx.debug_bounds("new-thread-folder-menu").is_some());
     }
 
+    fn click_on(selector: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is shown"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// A draft in its project's folder only plans its new worktree, from what's checked out
+    /// unless another branch is picked in its From list, where Fetch brings origin's new
+    /// ones. Local checkout drops the plan.
+    #[gpui::test]
+    fn a_new_worktree_is_planned_from_the_branch_picked(cx: &mut TestAppContext) {
+        use agentz_protocol::workspace::GitBranch;
+        use std::cell::RefCell;
+
+        let (view, cx) = open(1, false, cx);
+        let branch = |name: &str, is_remote: bool| GitBranch {
+            name: name.into(),
+            is_remote,
+            is_checked_out: name == "login-fix",
+        };
+        let git = ProjectGit {
+            is_repository: true,
+            branch: Some("login-fix".into()),
+            default_branch: Some("main".into()),
+            has_origin: true,
+            branches: vec![
+                branch("login-fix", false),
+                branch("main", false),
+                branch("origin/main", true),
+            ],
+            ..Default::default()
+        };
+        let mut fetched = git.clone();
+        fetched.branches.push(branch("origin/teammate", true));
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::PlanWorkspace { .. } => Some(Response::Ok),
+                    Request::FetchOrigin(_) => Some(Response::ProjectGit(fetched.clone())),
+                    _ => None,
+                }
+            });
+        });
+        view.update(cx, |view, cx| {
+            view.draft_git = Some(git);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread-base").is_none());
+        let planned = |base: Option<&str>| Request::PlanWorkspace {
+            thread_id: ThreadId(1),
+            plan: Some(PlannedWorkspace {
+                kind: WorkspaceKind::Worktree,
+                base: base.map(str::to_string),
+                branch: None,
+            }),
+        };
+
+        click_on("new-thread-checkout-menu", cx);
+        click_on("MENU_ITEM-New worktree", cx);
+        assert_eq!(*requests.borrow(), vec![planned(None)]);
+        let base = cx
+            .debug_bounds("new-thread-base")
+            .expect("From shows for the new worktree");
+        let checkout = cx
+            .debug_bounds("new-thread-checkout-menu")
+            .expect("the checkout picker stays");
+        assert!(checkout.right() < base.left());
+
+        click_on("new-thread-base", cx);
+        assert!(cx.debug_bounds("branch-picker").is_some());
+        assert!(cx.debug_bounds("branch-origin/teammate").is_none());
+        click_on("branch-picker-fetch", cx);
+        assert!(
+            requests
+                .borrow()
+                .contains(&Request::FetchOrigin("/tmp/demo".into()))
+        );
+        click_on("branch-origin/teammate", cx);
+        assert!(cx.debug_bounds("branch-picker").is_none());
+        assert_eq!(
+            requests.borrow().last(),
+            Some(&planned(Some("origin/teammate")))
+        );
+        // The fetched branches stay for the next time it opens.
+        click_on("new-thread-base", cx);
+        assert!(cx.debug_bounds("branch-origin/teammate").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        click_on("new-thread-checkout-menu", cx);
+        click_on("MENU_ITEM-Local checkout", cx);
+        assert_eq!(
+            requests.borrow().last(),
+            Some(&Request::PlanWorkspace {
+                thread_id: ThreadId(1),
+                plan: None,
+            })
+        );
+        assert!(cx.debug_bounds("new-thread-base").is_none());
+    }
+
+    /// While its worktree is made, the first message shows above the steps making it, and
+    /// messages typed meanwhile wait in the queue. A failed step offers Retry and Use Local.
+    #[gpui::test]
+    fn a_first_message_waits_for_its_new_worktree(cx: &mut TestAppContext) {
+        let (view, cx) = open(1, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let mut setup = WorkspaceSetup::new(
+            WorkspaceKind::Worktree,
+            "origin/main".into(),
+            "Fix the login".into(),
+            false,
+        );
+        assert_eq!(
+            setup
+                .steps
+                .iter()
+                .map(|step| setup_step_label(&setup, step.kind, step.state))
+                .collect::<Vec<_>>(),
+            ["Fetch main from origin", "Check out"]
+        );
+        setup.steps[0].state = SetupStepState::Done;
+        setup.steps[0].took = Some(Duration::from_millis(1200));
+        setup.steps[1].state = SetupStepState::Running;
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.workspace_setup = Some(setup.clone()), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread").is_none());
+        assert!(cx.debug_bounds("workspace-setup").is_some());
+        assert!(cx.debug_bounds("workspace-setup-retry").is_none());
+
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("Then the docs");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let queued = sent(&client, cx);
+        assert!(queued.iter().any(|request| matches!(request,
+            Request::QueueMessage { prompt, .. } if *prompt == PromptPart::text("Then the docs"))));
+        assert!(
+            !queued
+                .iter()
+                .any(|request| matches!(request, Request::Prompt { .. }))
+        );
+
+        setup.steps[1].state = SetupStepState::Failed;
+        setup.error = Some("fatal: invalid reference: origin/main".into());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.workspace_setup = Some(setup), cx)
+        });
+        cx.run_until_parked();
+        click_on("workspace-setup-retry", cx);
+        click_on("workspace-setup-use-local", cx);
+        let sent = sent(&client, cx);
+        assert!(sent.contains(&Request::RetryWorkspaceSetup(ThreadId(1))));
+        assert!(sent.contains(&Request::UseLocal(ThreadId(1))));
+    }
+
     /// With two accounts, the strip under the composer shows the draft's account, and picking
     /// another makes the draft again on it. Another checkout keeps the account; another agent
     /// takes its own account for new threads.
@@ -12499,6 +13049,7 @@ mod tests {
                 requests.borrow_mut().push(request.clone());
                 match request {
                     Request::CreateThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
+                    Request::PlanWorkspace { .. } => Some(Response::Ok),
                     _ => None,
                 }
             });
@@ -12547,7 +13098,7 @@ mod tests {
             WorkspaceChoice::Checkout
         )));
 
-        // A draft on Work keeps it in a new worktree.
+        // A draft on Work only plans its new worktree, and stays on Work.
         let store = view.read_with(cx, |view, _| view.store.clone());
         let mut on_work = snapshot(Some("Fix the login"));
         on_work.threads[0].account = Some(work);
@@ -12563,10 +13114,26 @@ mod tests {
             view.change_new_thread_checkout(worktree.clone(), cx)
         });
         cx.run_until_parked();
+        let plan = PlannedWorkspace {
+            kind: WorkspaceKind::Worktree,
+            base: None,
+            branch: None,
+        };
+        assert_eq!(
+            *requests.borrow(),
+            vec![Request::PlanWorkspace {
+                thread_id: ThreadId(1),
+                plan: Some(plan),
+            }]
+        );
+        // Another account makes the draft again with its plan.
+        requests.borrow_mut().clear();
+        click("new-thread-account", cx);
+        click("new-thread-account-external", cx);
         assert!(
             requests
                 .borrow()
-                .contains(&created(AccountChoice::Account(work), worktree.clone()))
+                .contains(&created(AccountChoice::External, worktree.clone()))
         );
         // The draft it was made again from is deleted; this view stands for it again.
         store.update(cx, |store, cx| store.set_snapshot(on_work.clone(), cx));

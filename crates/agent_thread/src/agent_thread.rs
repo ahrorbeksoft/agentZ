@@ -858,6 +858,15 @@ impl AgentThread {
         self.view.state.steering_queued = steering;
     }
 
+    /// The thread's new worktree or pasture being made, which its owner does, for clients to
+    /// see.
+    pub fn set_workspace_setup(
+        &mut self,
+        setup: Option<agentz_protocol::workspace::WorkspaceSetup>,
+    ) {
+        self.view.state.workspace_setup = setup;
+    }
+
     /// Keeps an image the agent sent, for a message to link to.
     fn keep_image(&self, mime_type: &str, data: &str) -> Option<AttachmentId> {
         let attachments = self.attachments.as_ref()?;
