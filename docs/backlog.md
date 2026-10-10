@@ -5,15 +5,6 @@ as given, not yet researched. Remove an entry once it's built.
 
 ## Features
 
-### Improve the design of agents' requests for user input
-
-Redesign every kind of input an agent can ask the user for, not just one. The example is the
-question form ([screenshot](backlog/agent-question-form.png)): the "Claude Agent is asking" card
-with the question, options with descriptions, an "Other" text field, and Decline / Submit.
-Agents can show other kinds of input too, and all of them need the same improvement.
-
-- What to improve: not given yet.
-
 ### More options when creating a worktree or pasture for a new thread
 
 When a new thread gets its own worktree or pasture, offer more choices about how it's created,

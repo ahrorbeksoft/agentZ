@@ -129,7 +129,8 @@ From Zed's guidelines, which this code follows:
   `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>`, `delete <path>` and
   `tool-call <json>` (tool calls as given, as any agent would send them) script different
   turns (see its docstring), and `network-error` fails its first turn as a lost connection
-  does. `background-task [seconds]` leaves a command running
+  does. `question` and `questions` ask as Claude Agent's AskUserQuestion does, `plan` asks
+  to approve a plan, `run-tests` asks to run a command, and `page` asks to open a page. `background-task [seconds]` leaves a command running
   as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
   once it ends. `subagents [seconds]` runs two subagents at once in sessions of their own, as
   Claude Agent does with AIR's native subagent sessions (`subagents permission` has the first

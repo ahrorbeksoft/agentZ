@@ -26,13 +26,13 @@ use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use agentz_protocol::agents::select_offers;
 use agentz_protocol::attachments::AttachmentId;
-use agentz_protocol::thread::login_code;
 pub use agentz_protocol::thread::{
     AuthStatus, BackgroundTask, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry,
     FailedMessage, FileDiff, LoginIdentity, LostHistory, PendingHandoff, PermissionOption,
     PermissionRequest, PlanItem, QueuedMessage, SessionDefaults, SessionRestore, ThreadState,
-    ThreadView, ToolCall, TurnTime,
+    ThreadView, ToolAnswer, ToolCall, TurnTime,
 };
+use agentz_protocol::thread::{form_answer, login_code};
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
@@ -699,6 +699,7 @@ impl AgentThread {
             started_at: Some(SystemTime::now()),
             duration: None,
             subthread: Some(subthread),
+            answer: None,
         }));
     }
 
@@ -1049,6 +1050,7 @@ impl AgentThread {
                             // The session was open when a prompt asked for the login.
                             self.view.state.status = ConnectionStatus::Ready;
                             self.view.state.logged_in = Some(true);
+                            self.send_message_that_needed_login();
                         } else {
                             self.open_session();
                         }
@@ -1790,6 +1792,7 @@ impl AgentThread {
                 for prompt in std::mem::take(&mut self.queued_prompts) {
                     self.send_to_agent(prompt);
                 }
+                self.send_message_that_needed_login();
             }
             Err(error) if is_auth_required(&error) => {
                 self.view.state.status = ConnectionStatus::AuthRequired;
@@ -1819,10 +1822,18 @@ impl AgentThread {
         }
     }
 
+    /// Once the agent takes messages again after a login, the message that failed for want of
+    /// it goes by itself, as if the user pressed Retry.
+    fn send_message_that_needed_login(&mut self) {
+        if self.view.state.failed_message == Some(FailedMessage::NeedsLogin) {
+            self.retry_message();
+        }
+    }
+
     /// The message waiting for the session can't go to it: the agent asked for a login before
     /// its session opened (and the message fails as one the agent asks for a login at does), or
-    /// the session has lost the conversation. The user retries it, rather than it going by
-    /// itself after a login.
+    /// the session has lost the conversation. It's marked failed until the user logs in, and
+    /// then goes ([`Self::send_message_that_needed_login`]), or until they retry it.
     fn fail_queued_prompts(&mut self, reason: FailedMessage) {
         // Only one waits: the thread works while it does, and takes no other.
         let Some(parts) = self.queued_prompts.pop() else {
@@ -2657,6 +2668,18 @@ impl AgentThread {
         tool_call_id: &acp::ToolCallId,
         option_id: acp::PermissionOptionId,
     ) {
+        // A subagent's tool call is in its subthread, which has no answer to show.
+        let chosen = self
+            .view
+            .permission_request(tool_call_id)
+            .filter(|request| request.subagent_card.is_none())
+            .and_then(|request| request.options.iter().find(|option| option.id == option_id))
+            .cloned();
+        if let Some(option) = chosen
+            && let Some(tool_call) = self.tool_call_mut(tool_call_id)
+        {
+            tool_call.answer = Some(ToolAnswer::Chose(option));
+        }
         self.view
             .state
             .permission_requests
@@ -2695,6 +2718,26 @@ impl AgentThread {
         };
         let ElicitationResponder { responder, .. } = self.elicitation_responders.remove(index);
         let accepted = matches!(action, acp::ElicitationAction::Accept(_));
+        let answered = self
+            .view
+            .state
+            .elicitations
+            .iter()
+            .find(|elicitation| elicitation.id == id)
+            .and_then(|elicitation| {
+                let acp::ElicitationMode::Form(form) = &elicitation.request.mode else {
+                    return None;
+                };
+                Some((
+                    elicitation.tool_call_id()?.clone(),
+                    form_answer(&form.requested_schema, &action)?,
+                ))
+            });
+        if let Some((tool_call_id, answer)) = answered
+            && let Some(tool_call) = self.tool_call_mut(&tool_call_id)
+        {
+            tool_call.answer = Some(answer);
+        }
         self.view.state.elicitations.retain_mut(|elicitation| {
             if elicitation.id != id {
                 return true;
@@ -3106,6 +3149,7 @@ impl AgentThread {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         };
         self.tool_content(tool_call.content).apply_to(&mut entry);
         let live = self.view.state.status == ConnectionStatus::Ready;
@@ -3113,6 +3157,7 @@ impl AgentThread {
             entry.started_at = existing.started_at;
             entry.duration = existing.duration;
             entry.subthread = existing.subthread;
+            entry.answer = existing.answer.take();
             note_end(&mut entry);
             *existing = entry;
         } else {
@@ -3146,6 +3191,7 @@ impl AgentThread {
                 started_at: None,
                 duration: None,
                 subthread: None,
+                answer: None,
             };
             if let Some(content) = content {
                 content.apply_to(&mut entry);
@@ -5047,20 +5093,17 @@ mod tests {
             thread.thread.failed_message(),
             Some(FailedMessage::NeedsLogin)
         );
+        // Logging in sends it.
         thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
-        thread
-            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
-            .await;
-        thread.update(AgentThread::retry_message);
         thread
             .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
             .await;
     }
 
     /// A message the agent asks for a login at, as Claude Agent asks in a session it opened
-    /// logged out, fails. Once logged in, Retry sends it, and the thread shows it once.
+    /// logged out, fails. Once logged in, it goes by itself, and the thread shows it once.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_message_that_needed_a_login_is_retried_after_one() {
+    async fn a_message_that_needed_a_login_is_sent_after_one() {
         let Some(mut command) = mock_agent(&[]) else {
             return;
         };
@@ -5093,25 +5136,14 @@ mod tests {
 
         thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
         thread
-            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
-            .await;
-        // Logging in doesn't send it by itself.
-        assert_eq!(
-            thread.thread.failed_message(),
-            Some(FailedMessage::NeedsLogin)
-        );
-        assert_eq!(agent_text(&thread.thread), "");
-
-        thread.update(AgentThread::retry_message);
-        assert_eq!(thread.thread.failed_message(), None);
-        thread
             .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
             .await;
+        assert_eq!(thread.thread.failed_message(), None);
         assert_eq!(user_messages(&thread.thread), ["hello"]);
     }
 
     /// A message sent while the session opens fails when the agent asks for a login to open
-    /// it, as one it asks at does, rather than going by itself once the user has logged in.
+    /// it, as one it asks at does, and goes once the user has logged in.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_message_waiting_for_a_session_fails_when_it_needs_a_login() {
         let Some(mut command) = mock_agent(&[]) else {
@@ -5139,11 +5171,6 @@ mod tests {
         );
 
         thread.update(|thread| thread.authenticate(acp::AuthMethodId::new("mock-login"), None));
-        thread
-            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
-            .await;
-        assert!(!thread.thread.is_working());
-        thread.update(AgentThread::retry_message);
         thread
             .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
             .await;
@@ -5317,6 +5344,106 @@ mod tests {
             agent_text(&thread.thread),
             r#"Form: accept {"name": "Ada", "times": 2}"#
         );
+    }
+
+    fn tool_call_answer(thread: &ThreadView, title: &str) -> Option<ToolAnswer> {
+        thread.entries().iter().find_map(|entry| match entry {
+            Entry::ToolCall(tool_call) if tool_call.title == title => tool_call.answer.clone(),
+            _ => None,
+        })
+    }
+
+    /// Claude Agent's question, a form tied to its "Asking for your input" tool call: the
+    /// answer stays on the tool call, naming the question by its header, as the user's choice
+    /// and their own words.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_questions_answer_stays_on_its_tool_call() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("question".into()));
+        thread
+            .wait_until(|thread| !thread.elicitations().is_empty())
+            .await;
+        let elicitation = thread.thread.elicitations()[0].clone();
+        assert!(elicitation.tool_call_id().is_some());
+        let content: std::collections::BTreeMap<_, _> = [
+            (
+                "question_0".to_string(),
+                acp::ElicitationContentValue::String("Design round first (Recommended)".into()),
+            ),
+            (
+                "question_0_custom".to_string(),
+                acp::ElicitationContentValue::String("keep Zed's icons".into()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        thread.update(|thread| {
+            thread.respond_to_elicitation(
+                elicitation.id,
+                acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new().content(content),
+                ),
+            )
+        });
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert_eq!(
+            tool_call_answer(&thread.thread, "Asking for your input"),
+            Some(ToolAnswer::Answered {
+                asked: Some("Approach".into()),
+                answers: vec!["Design round first, keep Zed's icons".into()],
+            })
+        );
+    }
+
+    /// The permission option chosen stays on its tool call, and a No ends it failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permissions_answer_stays_on_its_tool_call() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        for (option, kind) in [
+            ("allow-with-updates", acp::PermissionOptionKind::AllowAlways),
+            ("reject", acp::PermissionOptionKind::RejectOnce),
+        ] {
+            thread.update(|thread| thread.send("run-tests".into()));
+            thread
+                .wait_until(|thread| !thread.state.permission_requests.is_empty())
+                .await;
+            let tool_call_id = thread.thread.state.permission_requests[0]
+                .tool_call_id
+                .clone();
+            thread.update(|thread| {
+                thread.respond_to_permission(&tool_call_id, acp::PermissionOptionId::new(option))
+            });
+            thread.wait_until(|thread| !thread.is_working()).await;
+            let tool_call = thread
+                .thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::ToolCall(tool_call) if tool_call.id == tool_call_id => Some(tool_call),
+                    _ => None,
+                })
+                .expect("the tool call");
+            let Some(ToolAnswer::Chose(chosen)) = &tool_call.answer else {
+                panic!("expected a choice, got {:?}", tool_call.answer);
+            };
+            assert_eq!(chosen.kind, kind);
+            assert_eq!(
+                tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied),
+                tool_call.status == acp::ToolCallStatus::Failed
+            );
+        }
     }
 
     /// New sessions start with the agent's saved defaults, against `test_support/mock_agent.py`.

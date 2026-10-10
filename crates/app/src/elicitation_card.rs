@@ -1,21 +1,25 @@
 //! A request for input from an agent (ACP's `elicitation/create`): a form to fill in, or a URL
 //! to open. The fields, validation and the URL's safety checks are ported from Zed's
 //! `agent_ui::conversation_view::elicitation`; the card is agentZ's: who's asking, the fields
-//! with their labels above them, and Decline beside Submit or Open.
+//! with their labels above them, and Decline beside Submit or Open
+//! (`design/agent-input/decisions.md`). An agent's own questions show one at a time.
 
 use std::collections::BTreeMap;
 
 use agent_client_protocol::schema::v1 as acp;
-use agentz_protocol::thread::Elicitation;
+use agentz_protocol::thread::{Elicitation, form_questions, recommended_choice};
 use collections::{HashMap, HashSet};
-use gpui::{AnyElement, App, Context, Entity, KeyBinding, SharedString, Window, div};
+use gpui::{
+    AnyElement, App, Context, Entity, Focusable as _, KeyBinding, SharedString, Subscription,
+    Window, div,
+};
 use text_input::TextInput;
 use ui::{Tooltip, prelude::*};
 
 use crate::agent_login::login_elicitation;
 use crate::controls::{
-    ActionButton, ActionStyle, CONTROL_TEXT_SIZE, field_label, key_hint, link_host, on_fill_color,
-    spinner, text_field,
+    ActionButton, ActionStyle, CONTROL_TEXT_SIZE, copy_to_clipboard, field_label, key_hint,
+    link_host, on_fill_color, spinner, text_field,
 };
 use crate::thread_entity::AgentThread;
 
@@ -74,6 +78,17 @@ pub struct ElicitationCard {
     elicitation: Elicitation,
     requester_name: SharedString,
     form: Option<FormState>,
+    /// The agent's own questions (Claude Agent's), each a field with choices and the field
+    /// for an answer of the user's own: `(field, other)`.
+    questions: Option<Vec<(String, String)>>,
+    /// The question shown, of several.
+    step: usize,
+    /// The "Other" fields opened from their folded line.
+    opened_others: HashSet<String>,
+    /// The URL's whole address, folded behind its host.
+    shows_address: bool,
+    /// Text fields check what's in them as they lose focus, from the first render on.
+    _blur_subscriptions: Option<Vec<Subscription>>,
 }
 
 impl ElicitationCard {
@@ -83,16 +98,43 @@ impl ElicitationCard {
         requester_name: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
-        let form = match &elicitation.request.mode {
-            acp::ElicitationMode::Form(mode) => Some(FormState::new(&mode.requested_schema, cx)),
-            _ => None,
+        let (form, questions) = match &elicitation.request.mode {
+            acp::ElicitationMode::Form(mode) => {
+                let schema = &mode.requested_schema;
+                let questions = form_questions(schema).map(|questions| {
+                    questions
+                        .into_iter()
+                        .map(|question| (question.field.to_string(), question.other.to_string()))
+                        .collect()
+                });
+                (Some(FormState::new(schema, cx)), questions)
+            }
+            _ => (None, None),
         };
         Self {
             thread,
             elicitation,
             requester_name,
             form,
+            questions,
+            step: 0,
+            opened_others: HashSet::default(),
+            shows_address: false,
+            _blur_subscriptions: None,
         }
+    }
+
+    /// Whether the agent waits on it: not yet answered, or a page not yet opened.
+    pub fn is_waiting(&self) -> bool {
+        !self.elicitation.opened
+    }
+
+    /// Whether it asks the agent's own questions for this tool call, and they wait for an
+    /// answer.
+    pub fn asks_questions_for(&self, tool_call_id: &acp::ToolCallId) -> bool {
+        self.is_waiting()
+            && self.questions.is_some()
+            && self.elicitation.tool_call_id() == Some(tool_call_id)
     }
 
     /// Whether it belongs to a request rather than the conversation: a login asking for a
@@ -125,10 +167,89 @@ impl ElicitationCard {
                 cx,
             ),
             Err(errors) => {
+                // Back to the first question with a problem, when it's not the one shown.
+                if let Some(step) = self.questions.as_ref().and_then(|questions| {
+                    questions.iter().position(|(field, other)| {
+                        errors.contains_key(field) || errors.contains_key(other)
+                    })
+                }) {
+                    self.step = step;
+                }
                 form.errors = errors;
                 cx.notify();
             }
         }
+    }
+
+    /// Whether the question shown is the last, or the form isn't asked a question at a time.
+    fn is_last_step(&self) -> bool {
+        self.questions
+            .as_ref()
+            .is_none_or(|questions| self.step + 1 >= questions.len())
+    }
+
+    /// Enter and the foot's button: the next question, or Submit on the last.
+    fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.is_last_step() {
+            self.submit(cx);
+        } else {
+            self.step += 1;
+            cx.notify();
+        }
+    }
+
+    /// Checks a text field as it loses focus, so a wrong value says why before Submit. An
+    /// empty one waits for Submit to say it's required.
+    fn check_field(&mut self, name: &str, cx: &mut Context<Self>) {
+        let (Some(form), acp::ElicitationMode::Form(mode)) =
+            (&mut self.form, &self.elicitation.request.mode)
+        else {
+            return;
+        };
+        let is_empty = matches!(
+            form.fields.get(name),
+            Some(Field::Text(input)) if input.read(cx).text().trim().is_empty()
+        );
+        if is_empty {
+            return;
+        }
+        let error = form
+            .validate(&mode.requested_schema, cx)
+            .err()
+            .and_then(|mut errors| errors.remove(name));
+        match error {
+            Some(error) => {
+                form.errors.insert(name.to_string(), error);
+            }
+            None => {
+                form.errors.remove(name);
+            }
+        }
+        cx.notify();
+    }
+
+    fn watch_blurs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._blur_subscriptions.is_some() {
+            return;
+        }
+        let inputs: Vec<(String, Entity<TextInput>)> = self
+            .form
+            .iter()
+            .flat_map(|form| &form.fields)
+            .filter_map(|(name, field)| match field {
+                Field::Text(input) => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .collect();
+        let subscriptions = inputs
+            .into_iter()
+            .map(|(name, input)| {
+                cx.on_blur(&input.focus_handle(cx), window, move |this, _, cx| {
+                    this.check_field(&name, cx)
+                })
+            })
+            .collect();
+        self._blur_subscriptions = Some(subscriptions);
     }
 
     /// Zed's Open: opening the URL accepts it, and the card waits for the agent to say the
@@ -162,6 +283,9 @@ impl ElicitationCard {
             return div().into_any_element();
         };
         let schema = &mode.requested_schema;
+        if let Some(questions) = &self.questions {
+            return self.render_question(schema, form, questions, window, cx);
+        }
         v_flex()
             .gap_4()
             .when(
@@ -185,12 +309,225 @@ impl ElicitationCard {
             )
             .children(schema.properties.iter().filter_map(|(name, property)| {
                 let field = form.fields.get(name)?;
-                Some(self.render_field(name, property, field, form.errors.get(name), window, cx))
+                let is_required = schema
+                    .required
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(name);
+                Some(self.render_field(
+                    name,
+                    property,
+                    field,
+                    is_required,
+                    form.errors.get(name),
+                    window,
+                    cx,
+                ))
             }))
             .into_any_element()
     }
 
+    /// One of the agent's own questions: which it is of several, with Back, then the
+    /// question, its header, its choices, and "Other…" folded until it's clicked.
+    fn render_question(
+        &self,
+        schema: &acp::ElicitationSchema,
+        form: &FormState,
+        questions: &[(String, String)],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = self.elicitation.id;
+        let Some((name, other)) = questions.get(self.step) else {
+            return div().into_any_element();
+        };
+        let (Some(property), Some(field)) = (schema.properties.get(name), form.fields.get(name))
+        else {
+            return div().into_any_element();
+        };
+        let count = questions.len();
+        let error = form.errors.get(name);
+        let stepper = (count > 1).then(|| {
+            h_flex()
+                .gap_2()
+                .when(self.step > 0, |this| {
+                    this.child(
+                        h_flex()
+                            .id(("elicitation-back", id))
+                            .debug_selector(move || format!("elicitation-back-{id}"))
+                            .gap_1()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step = this.step.saturating_sub(1);
+                                cx.notify();
+                            }))
+                            .child(
+                                Icon::new(IconName::ChevronLeft)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new("Back")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .debug_selector(move || format!("elicitation-step-{id}"))
+                        .child(
+                            Label::new(format!("{} of {count}", self.step + 1))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+        });
+        // Of several, each question is its field's description; one alone is the message.
+        let question = (count > 1)
+            .then(|| property_description(property))
+            .flatten()
+            .map(|question| {
+                Label::new(question).size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE)))
+            });
+        v_flex()
+            .gap_3()
+            .children(stepper)
+            .children(question)
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(field_label(property_title(name, property)))
+                    .child(self.render_control(name, property, field, error, window, cx))
+                    .children(error.map(|error| {
+                        Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error)
+                    })),
+            )
+            .children(self.render_other(schema, form, other, window, cx))
+            .into_any_element()
+    }
+
+    /// The field for an answer of the user's own: a folded "Other…" line until it's clicked
+    /// or has something in it.
+    fn render_other(
+        &self,
+        schema: &acp::ElicitationSchema,
+        form: &FormState,
+        name: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = self.elicitation.id;
+        let property = schema.properties.get(name)?;
+        let Some(Field::Text(input)) = form.fields.get(name) else {
+            return None;
+        };
+        let error = form.errors.get(name);
+        let is_open = self.opened_others.contains(name)
+            || !input.read(cx).text().is_empty()
+            || error.is_some();
+        let title = property_title(name, property);
+        if !is_open {
+            let name = name.to_string();
+            let input = input.clone();
+            return Some(
+                h_flex()
+                    .id(SharedString::from(format!("elicitation-other-{id}-{name}")))
+                    .debug_selector({
+                        let name = name.clone();
+                        move || format!("elicitation-other-{id}-{name}")
+                    })
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.opened_others.insert(name.clone());
+                        window.focus(&input.focus_handle(cx), cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("{title}…"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+        Some(
+            v_flex()
+                .gap_1p5()
+                .child(field_label(title))
+                .children(property_description(property).map(|description| {
+                    Label::new(description)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                }))
+                .child(text_field(input, error.is_some(), window, cx))
+                .children(error.map(|error| {
+                    Label::new(error.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Error)
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_field(
+        &self,
+        name: &str,
+        property: &acp::ElicitationPropertySchema,
+        field: &Field,
+        is_required: bool,
+        error: Option<&SharedString>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = self.elicitation.id;
+        let title = property_title(name, property);
+        let description = property_description(property).map(|description| {
+            Label::new(description)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+        });
+        let error_label = error.map(|error| {
+            let selector = format!("elicitation-error-{id}-{name}");
+            div().debug_selector(move || selector).child(
+                Label::new(error.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Error),
+            )
+        });
+        let control = {
+            let selector = format!("elicitation-field-{id}-{name}");
+            div()
+                .debug_selector(move || selector)
+                .child(self.render_control(name, property, field, error, window, cx))
+        };
+        // A checkbox has its label beside it.
+        let label = (!matches!(field, Field::Boolean(_))).then(|| {
+            h_flex()
+                .child(field_label(title))
+                .when(is_required, |this| this.child(required_mark(name)))
+        });
+        v_flex()
+            .gap_1p5()
+            .children(label)
+            .children(description)
+            .child(control)
+            .children(error_label)
+            .into_any_element()
+    }
+
+    /// A field's control: a checkbox with its label, a text field, or its choices. A choice of
+    /// one of the agent's questions goes on to the next question.
+    fn render_control(
         &self,
         name: &str,
         property: &acp::ElicitationPropertySchema,
@@ -199,45 +536,38 @@ impl ElicitationCard {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let title = property_title(name, property);
-        let description = property_description(property).map(|description| {
-            Label::new(description)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-        });
-        let error_label = error.map(|error| {
-            Label::new(error.clone())
-                .size(LabelSize::Small)
-                .color(Color::Error)
-        });
         let id = self.elicitation.id;
-
-        let control = match field {
+        match field {
             Field::Boolean(value) => {
                 let next_value = !*value;
                 let field_name = name.to_string();
-                return v_flex()
-                    .gap_1()
+                let is_required = match &self.elicitation.request.mode {
+                    acp::ElicitationMode::Form(mode) => mode
+                        .requested_schema
+                        .required
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|required| required == name),
+                    _ => false,
+                };
+                h_flex()
+                    .id(SharedString::from(format!("elicitation-bool-{id}-{name}")))
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(form) = &mut this.form {
+                            form.set(&field_name, Field::Boolean(next_value));
+                            cx.notify();
+                        }
+                    }))
+                    .child(check_box(*value, error.is_some(), cx))
                     .child(
-                        h_flex()
-                            .id(SharedString::from(format!("elicitation-bool-{id}-{name}")))
-                            .gap_2()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(form) = &mut this.form {
-                                    form.set(&field_name, Field::Boolean(next_value));
-                                    cx.notify();
-                                }
-                            }))
-                            .child(check_box(*value, error.is_some(), cx))
-                            .child(
-                                Label::new(title)
-                                    .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
-                            ),
+                        Label::new(property_title(name, property))
+                            .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
                     )
-                    .children(description)
-                    .children(error_label)
-                    .into_any_element();
+                    .when(is_required, |this| this.child(required_mark(name)))
+                    .into_any_element()
             }
             Field::Text(input) => text_field(input, error.is_some(), window, cx).into_any_element(),
             Field::SingleSelect(selected) => {
@@ -257,12 +587,19 @@ impl ElicitationCard {
                             )),
                             radio(is_selected, error.is_some(), cx),
                             option,
+                            cx,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(form) = &mut this.form {
                                 form.set(&field_name, Field::SingleSelect(Some(value.clone())));
-                                cx.notify();
                             }
+                            let is_question = this.questions.as_ref().is_some_and(|questions| {
+                                questions.iter().any(|(field, _)| field == &field_name)
+                            });
+                            if is_question && !this.is_last_step() {
+                                this.step += 1;
+                            }
+                            cx.notify();
                         }))
                     }))
                     .into_any_element()
@@ -284,6 +621,7 @@ impl ElicitationCard {
                             )),
                             check_box(is_selected, error.is_some(), cx),
                             option,
+                            cx,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(form) = &mut this.form {
@@ -294,38 +632,29 @@ impl ElicitationCard {
                     }))
                     .into_any_element()
             }
-        };
-
-        v_flex()
-            .gap_1p5()
-            .child(field_label(title))
-            .children(description)
-            .child(control)
-            .children(error_label)
-            .into_any_element()
+        }
     }
 
-    /// Where the page is, so it can be checked before opening it: its host, a warning when an
-    /// internationalized address could imitate another, and the whole address, wrapped.
-    fn render_url(&self, url: &str, cx: &App) -> AnyElement {
+    /// Where the page is, so it can be checked before opening it: its host, large, a warning
+    /// when an internationalized address could imitate another, and the whole address, wrapped,
+    /// behind "Show address".
+    fn render_url(&self, url: &str, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
+        let id = self.elicitation.id;
+        let shows_address = self.shows_address;
         v_flex()
-            .gap_3()
+            .gap_2()
             .when_some(url_host(url), |this, (host, decoded_host)| {
                 this.child(
                     h_flex()
-                        .gap_1p5()
+                        .debug_selector(move || format!("elicitation-host-{id}"))
+                        .gap_2()
                         .child(
                             Icon::new(IconName::Lock)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                                .size(IconSize::Small)
+                                .color(Color::Success),
                         )
-                        .child(
-                            Label::new("Opens")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(Label::new(host).size(LabelSize::Small)),
+                        .child(Label::new(host).size(LabelSize::Large)),
                 )
                 .when_some(decoded_host, |this, decoded_host| {
                     this.child(
@@ -349,20 +678,54 @@ impl ElicitationCard {
                 })
             })
             .child(
-                h_flex()
-                    .min_w_0()
-                    .flex_wrap()
-                    .px(px(10.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.editor_background)
-                    .font_buffer(cx)
-                    .text_size(rems_from_px(12_f32))
-                    .text_color(colors.text_muted)
-                    .children(display_url_segments(url)),
+                h_flex().child(
+                    h_flex()
+                        .id(("elicitation-show-address", id))
+                        .debug_selector(move || format!("elicitation-show-address-{id}"))
+                        .gap_1()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.shows_address = !this.shows_address;
+                            cx.notify();
+                        }))
+                        .child(
+                            Label::new(if shows_address {
+                                "Hide address"
+                            } else {
+                                "Show address"
+                            })
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Icon::new(if shows_address {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        ),
+                ),
             )
+            .when(shows_address, |this| {
+                this.child(
+                    h_flex()
+                        .debug_selector(move || format!("elicitation-address-{id}"))
+                        .min_w_0()
+                        .flex_wrap()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.editor_background)
+                        .font_buffer(cx)
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(colors.text_muted)
+                        .children(display_url_segments(url)),
+                )
+            })
             .into_any_element()
     }
 
@@ -384,19 +747,36 @@ impl ElicitationCard {
                 cx.listener(|this, _, _, cx| this.respond(acp::ElicitationAction::Decline, cx)),
             );
         let Some(url) = url else {
+            let is_last_step = self.is_last_step();
+            // Submit stays dim until every required field has something in it.
+            let lacks_required = match (&self.form, &self.elicitation.request.mode) {
+                (Some(form), acp::ElicitationMode::Form(mode)) => {
+                    form.lacks_required(&mode.requested_schema, cx)
+                }
+                _ => false,
+            };
             return footer
-                .child(
-                    h_flex().flex_1().gap_1().child(key_hint("⏎", cx)).child(
+                .child(h_flex().flex_1().gap_1().when(is_last_step, |this| {
+                    this.child(key_hint("⏎", cx)).child(
                         Label::new("to submit")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
-                    ),
-                )
+                    )
+                }))
                 .child(decline)
                 .child(
-                    ActionButton::new(("elicitation-submit", id), "Submit")
-                        .style(ActionStyle::Primary)
-                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                    div()
+                        .debug_selector(move || format!("elicitation-submit-{id}"))
+                        .child(if is_last_step {
+                            ActionButton::new(("elicitation-submit", id), "Submit")
+                                .style(ActionStyle::Primary)
+                                .disabled(lacks_required)
+                                .on_click(cx.listener(|this, _, _, cx| this.submit(cx)))
+                        } else {
+                            ActionButton::new(("elicitation-submit", id), "Next")
+                                .style(ActionStyle::Primary)
+                                .on_click(cx.listener(|this, _, _, cx| this.confirm(cx)))
+                        }),
                 )
                 .into_any_element();
         };
@@ -422,8 +802,17 @@ impl ElicitationCard {
         }
         let open_label = link_host(&url).map_or("Open".to_string(), |host| format!("Open {host}"));
         footer
-            .justify_end()
             .child(decline)
+            .child(div().flex_1())
+            .child(
+                div()
+                    .debug_selector(move || format!("elicitation-copy-link-{id}"))
+                    .child(
+                        ActionButton::new(("elicitation-copy-link", id), "Copy link")
+                            .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
+                            .on_click(move |_, _, cx| copy_to_clipboard(&url, cx)),
+                    ),
+            )
             .child(
                 ActionButton::new(("elicitation-open", id), open_label)
                     .style(ActionStyle::Primary)
@@ -436,28 +825,43 @@ impl ElicitationCard {
 
 impl Render for ElicitationCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.watch_blurs(window, cx);
         let border = cx.theme().colors().border;
         let background = cx.theme().colors().panel_background;
         let id = self.elicitation.id;
         let is_url = self.elicitation.url().is_some();
         let is_opened = self.elicitation.opened;
+        // A page's card says in its title who sends you there and why, in the agent's words.
         let title = if is_url {
-            format!("{} wants you to open a page", self.requester_name)
+            one_line(&self.elicitation.request.message)
         } else {
             format!("{} is asking", self.requester_name)
         };
-        let body = v_flex().px(px(14.)).pb(px(14.)).gap_3().child(
-            Label::new(self.elicitation.request.message.clone())
-                .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
-        );
+        // Of several questions, each step shows its own.
+        let asks_one_at_a_time = self
+            .questions
+            .as_ref()
+            .is_some_and(|questions| questions.len() > 1);
+        let body =
+            v_flex()
+                .px(px(14.))
+                .pb(px(14.))
+                .gap_3()
+                .when(!is_url && !asks_one_at_a_time, |this| {
+                    this.child(
+                        Label::new(self.elicitation.request.message.clone())
+                            .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
+                    )
+                });
         let body = match &self.elicitation.request.mode {
             acp::ElicitationMode::Form(mode) => body.child(self.render_form(mode, window, cx)),
             acp::ElicitationMode::Url(mode) => body.child(self.render_url(&mode.url, cx)),
             _ => body,
         };
         v_flex()
+            .debug_selector(move || format!("elicitation-card-{id}"))
             .key_context(KEY_CONTEXT)
-            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.submit(cx)))
+            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.confirm(cx)))
             .w_full()
             .rounded(px(8.))
             .border_1()
@@ -471,7 +875,7 @@ impl Render for ElicitationCard {
                     .gap_2()
                     .child(
                         Icon::new(if is_url {
-                            IconName::ArrowUpRight
+                            IconName::ToolWeb
                         } else {
                             IconName::Chat
                         })
@@ -518,14 +922,20 @@ fn choice_group(options: &[ChoiceOption]) -> gpui::Div {
     }
 }
 
-/// A choice's control beside its label and description.
+/// A choice's control beside its label and description. The one the agent suggests ("…
+/// (Recommended)") has a tag instead.
 fn choice(
     id: SharedString,
     control: AnyElement,
     option: &ChoiceOption,
+    cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
+    let (label, is_recommended) = recommended_choice(&option.label);
+    let accent = cx.theme().colors().text_accent;
+    let selector = id.to_string();
     h_flex()
         .id(id)
+        .debug_selector(move || selector)
         .items_start()
         .gap_2()
         .cursor_pointer()
@@ -535,8 +945,24 @@ fn choice(
                 .min_w_0()
                 .gap_0p5()
                 .child(
-                    Label::new(option.label.clone())
-                        .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Label::new(label.to_string())
+                                .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
+                        )
+                        .when(is_recommended, |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .rounded(px(4.))
+                                    .bg(accent.opacity(0.15))
+                                    .text_size(rems_from_px(11_f32))
+                                    .text_color(accent)
+                                    .child("Recommended"),
+                            )
+                        }),
                 )
                 .children(option.description.clone().map(|description| {
                     Label::new(description)
@@ -544,6 +970,18 @@ fn choice(
                         .color(Color::Muted)
                 })),
         )
+}
+
+/// The red star after a required field's label.
+fn required_mark(name: &str) -> impl IntoElement {
+    let name = name.to_string();
+    div()
+        .debug_selector(move || format!("elicitation-required-{name}"))
+        .child(Label::new(" *").size(LabelSize::Small).color(Color::Error))
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn radio(is_selected: bool, is_invalid: bool, cx: &App) -> AnyElement {
@@ -680,6 +1118,21 @@ impl FormState {
     fn set(&mut self, name: &str, field: Field) {
         self.fields.insert(name.to_string(), field);
         self.errors.remove(name);
+    }
+
+    /// Whether a required field is still empty.
+    fn lacks_required(&self, schema: &acp::ElicitationSchema, cx: &App) -> bool {
+        schema
+            .required
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|name| match self.fields.get(name) {
+                Some(Field::Text(input)) => input.read(cx).text().trim().is_empty(),
+                Some(Field::SingleSelect(value)) => value.is_none(),
+                Some(Field::MultiSelect(values)) => values.is_empty(),
+                Some(Field::Boolean(_)) | None => false,
+            })
     }
 
     fn toggle(&mut self, name: &str, value: &str) {

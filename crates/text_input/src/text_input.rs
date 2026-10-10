@@ -384,6 +384,10 @@ impl TextInput {
         cx.notify();
     }
 
+    pub fn placeholder(&self) -> &SharedString {
+        &self.placeholder
+    }
+
     /// The text, chips included as their text.
     pub fn text(&self) -> &SharedString {
         &self.content

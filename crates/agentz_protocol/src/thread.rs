@@ -95,6 +95,43 @@ pub struct ToolCall {
     /// The subthread one of the agent's own subagents works in: this is its card.
     #[serde(default)]
     pub subthread: Option<projects::ThreadId>,
+    /// What the user answered when the tool asked them something: its permission, or the
+    /// form it asked them to fill in.
+    #[serde(default)]
+    pub answer: Option<ToolAnswer>,
+}
+
+/// The user's answer to a tool call's request, kept on the tool call so the thread shows it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ToolAnswer {
+    /// The permission option they chose.
+    Chose(PermissionOption),
+    /// They filled in its form. `asked` names its questions by their headers, for an agent's
+    /// own questions (Claude Agent's), and `answers` is what they gave, one per question or
+    /// field, in the form's order.
+    Answered {
+        asked: Option<String>,
+        answers: Vec<String>,
+    },
+    /// They declined its form.
+    Declined { asked: Option<String> },
+}
+
+impl ToolAnswer {
+    /// The headers of the questions it answered, when the tool only asked them.
+    pub fn asked(&self) -> Option<&str> {
+        match self {
+            ToolAnswer::Answered { asked, .. } | ToolAnswer::Declined { asked } => asked.as_deref(),
+            ToolAnswer::Chose(_) => None,
+        }
+    }
+
+    pub fn is_denied(&self) -> bool {
+        matches!(self, ToolAnswer::Chose(option) if matches!(
+            option.kind,
+            acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways
+        ))
+    }
 }
 
 impl ToolCall {
@@ -265,6 +302,184 @@ impl Elicitation {
             acp::ElicitationMode::Url(url) => Some(&url.url),
             _ => None,
         }
+    }
+
+    /// The tool call it asks for, when it belongs to one.
+    pub fn tool_call_id(&self) -> Option<&acp::ToolCallId> {
+        match self.request.scope() {
+            acp::ElicitationScope::Session(scope) => scope.tool_call_id.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// One of an agent's own questions in a form: a field with choices, and the field after it
+/// for an answer of the user's own ("Other").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormQuestion<'a> {
+    pub field: &'a str,
+    pub other: &'a str,
+}
+
+/// The form's questions, when it asks nothing else, as Claude Agent's AskUserQuestion does:
+/// fields with choices, each with its own "Other" field. `None` for any other form, such as
+/// an MCP server's.
+pub fn form_questions(schema: &acp::ElicitationSchema) -> Option<Vec<FormQuestion<'_>>> {
+    let mut questions = Vec::new();
+    for (name, property) in &schema.properties {
+        if other_field_of(schema, name, property).is_some() {
+            continue;
+        }
+        let has_choices = match property {
+            acp::ElicitationPropertySchema::String(string) => {
+                string.one_of.is_some() || string.enum_values.is_some()
+            }
+            acp::ElicitationPropertySchema::Array(_) => true,
+            _ => false,
+        };
+        if !has_choices {
+            return None;
+        }
+        let other = schema.properties.iter().find_map(|(other_name, other)| {
+            (other_field_of(schema, other_name, other) == Some(name.as_str()))
+                .then_some(other_name.as_str())
+        })?;
+        questions.push(FormQuestion { field: name, other });
+    }
+    (!questions.is_empty()).then_some(questions)
+}
+
+/// The question a text field gives an answer of the user's own for, as Claude Agent marks it
+/// for JetBrains AIR (`_meta.jetbrains.air.customAnswer`) and names it (`question_0_custom`
+/// after `question_0`).
+pub fn other_field_of<'a>(
+    schema: &'a acp::ElicitationSchema,
+    name: &'a str,
+    property: &'a acp::ElicitationPropertySchema,
+) -> Option<&'a str> {
+    let acp::ElicitationPropertySchema::String(string) = property else {
+        return None;
+    };
+    if string.one_of.is_some() || string.enum_values.is_some() {
+        return None;
+    }
+    let marked = string
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("jetbrains"))
+        .and_then(|jetbrains| jetbrains.pointer("/air/customAnswer/questionId"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|question| schema.properties.get_key_value(question))
+        .map(|(question, _)| question.as_str());
+    marked.or_else(|| {
+        let question = name.strip_suffix("_custom")?;
+        schema
+            .properties
+            .get_key_value(question)
+            .map(|(question, _)| question.as_str())
+    })
+}
+
+/// A form field's title, or its name when it has none.
+pub fn property_title<'a>(schema: &'a acp::ElicitationSchema, name: &'a str) -> &'a str {
+    let title = match schema.properties.get(name) {
+        Some(acp::ElicitationPropertySchema::String(schema)) => schema.title.as_deref(),
+        Some(acp::ElicitationPropertySchema::Number(schema)) => schema.title.as_deref(),
+        Some(acp::ElicitationPropertySchema::Integer(schema)) => schema.title.as_deref(),
+        Some(acp::ElicitationPropertySchema::Boolean(schema)) => schema.title.as_deref(),
+        Some(acp::ElicitationPropertySchema::Array(schema)) => schema.title.as_deref(),
+        _ => None,
+    };
+    title.unwrap_or(name)
+}
+
+/// What the user's answer to a form records on the tool call that asked it: `None` when they
+/// cancelled it, which isn't an answer.
+pub fn form_answer(
+    schema: &acp::ElicitationSchema,
+    action: &acp::ElicitationAction,
+) -> Option<ToolAnswer> {
+    let questions = form_questions(schema);
+    let asked = questions.as_ref().map(|questions| {
+        questions
+            .iter()
+            .map(|question| property_title(schema, question.field))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    let content = match action {
+        acp::ElicitationAction::Accept(accept) => accept.content.clone().unwrap_or_default(),
+        acp::ElicitationAction::Decline => return Some(ToolAnswer::Declined { asked }),
+        _ => return None,
+    };
+    let value_text = |name: &str| -> Option<String> {
+        let property = schema.properties.get(name);
+        let text = match content.get(name)? {
+            acp::ElicitationContentValue::String(value) => choice_title(property, value),
+            acp::ElicitationContentValue::Integer(value) => value.to_string(),
+            acp::ElicitationContentValue::Number(value) => value.to_string(),
+            acp::ElicitationContentValue::Boolean(value) => {
+                if *value { "Yes" } else { "No" }.to_string()
+            }
+            acp::ElicitationContentValue::StringArray(values) => values
+                .iter()
+                .map(|value| choice_title(property, value))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => return None,
+        };
+        (!text.trim().is_empty()).then_some(text)
+    };
+    let answers = match &questions {
+        Some(questions) => questions
+            .iter()
+            .filter_map(|question| {
+                let parts: Vec<String> = [question.field, question.other]
+                    .into_iter()
+                    .filter_map(value_text)
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(", "))
+            })
+            .collect(),
+        None => schema
+            .properties
+            .keys()
+            .filter_map(|name| {
+                Some(format!(
+                    "{}: {}",
+                    property_title(schema, name),
+                    value_text(name)?
+                ))
+            })
+            .collect(),
+    };
+    Some(ToolAnswer::Answered { asked, answers })
+}
+
+/// A choice as the form names it, rather than by its value.
+fn choice_title(property: Option<&acp::ElicitationPropertySchema>, value: &str) -> String {
+    let options = match property {
+        Some(acp::ElicitationPropertySchema::String(schema)) => schema.one_of.as_deref(),
+        Some(acp::ElicitationPropertySchema::Array(schema)) => match &schema.items {
+            acp::MultiSelectItems::Titled(items) => Some(items.options.as_slice()),
+            _ => None,
+        },
+        _ => None,
+    };
+    options
+        .and_then(|options| options.iter().find(|option| option.value == value))
+        .map_or_else(
+            || value.to_string(),
+            |option| recommended_choice(&option.title).0.to_string(),
+        )
+}
+
+/// A choice's title without the " (Recommended)" Claude Agent adds to the one it suggests,
+/// and whether it had it.
+pub fn recommended_choice(title: &str) -> (&str, bool) {
+    match title.strip_suffix("(Recommended)") {
+        Some(title) => (title.trim_end(), true),
+        None => (title, false),
     }
 }
 
@@ -1199,6 +1414,7 @@ mod tests {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         })
     }
 

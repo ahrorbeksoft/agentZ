@@ -20,8 +20,8 @@ use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, LostHistory, PlanItem,
-    SessionRestore, ToolCall, without_handoff,
+    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, LostHistory, PermissionOption,
+    PlanItem, SessionRestore, ToolAnswer, ToolCall, without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
@@ -49,7 +49,9 @@ use crate::mention_menu::{
 };
 
 use crate::agent_icons::agent_icon;
-use crate::agent_login::{AgentLogin, LoginDialog, LoginLayout};
+use crate::agent_login::{
+    AgentLogin, LoginDialog, LoginLayout, method_button_label, method_description,
+};
 use crate::attachment_image::{
     AttachmentImage, ImagePreviewTooltip, ImageViewer, MessagePiece, ViewedImage, is_loading,
     message_pieces, render_hover_preview, without_image_links,
@@ -92,6 +94,12 @@ gpui::actions!(
         AcceptSlashCommand,
         /// Opens the thread that delegated the open subthread.
         OpenParentThread,
+        /// Answers the first permission request waiting with its first "allow once" choice.
+        AllowOnce,
+        /// Answers the first permission request waiting with its first "always allow" choice.
+        AllowAlways,
+        /// Answers the first permission request waiting with its first "reject once" choice.
+        RejectOnce,
     ]
 );
 /// Matches Zed's default `agent.max_content_width`.
@@ -233,6 +241,20 @@ pub fn init(cx: &mut App) {
         // macOS too, as in Zed.
         KeyBinding::new("ctrl--", OpenParentThread, Some(THREAD_KEY_CONTEXT)),
     ]);
+    // Zed's keys for answering a permission request.
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-y", AllowOnce, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new("cmd-alt-y", AllowAlways, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new("cmd-alt-z", RejectOnce, Some(THREAD_KEY_CONTEXT)),
+        ]);
+    } else {
+        cx.bind_keys([
+            KeyBinding::new("shift-alt-a", AllowOnce, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new("shift-alt-q", AllowAlways, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new("shift-alt-x", RejectOnce, Some(THREAD_KEY_CONTEXT)),
+        ]);
+    }
     crate::attachment_image::init(cx);
 }
 
@@ -1320,6 +1342,7 @@ impl AgentView {
         let mut subthreads: Vec<(&ThreadId, &(Entity<AgentThread>, Subscription))> =
             self.blocked_subthreads.iter().collect();
         subthreads.sort_by_key(|(thread_id, _)| **thread_id);
+        let first_request = self.first_permission_request(cx);
         let mut cards = Vec::new();
         for (thread_id, (thread, _)) in subthreads {
             let thread_id = *thread_id;
@@ -1332,40 +1355,24 @@ impl AgentView {
             for (request_index, request) in
                 thread.read(cx).state.permission_requests.iter().enumerate()
             {
-                let mut buttons = Vec::new();
-                for (option_index, option) in request.options.iter().enumerate() {
-                    let icon = match option.kind {
-                        acp::PermissionOptionKind::AllowOnce => Icon::new(IconName::Check)
-                            .size(IconSize::XSmall)
-                            .color(Color::Success),
-                        acp::PermissionOptionKind::AllowAlways => Icon::new(IconName::CheckDouble)
-                            .size(IconSize::XSmall)
-                            .color(Color::Success),
-                        _ => Icon::new(IconName::Close)
-                            .size(IconSize::XSmall)
-                            .color(Color::Error),
-                    };
+                let shows_keys = first_request.as_ref().is_some_and(|(first_thread, first)| {
+                    first_thread == thread && first == &request.tool_call_id
+                });
+                let buttons = {
                     let thread = thread.clone();
                     let tool_call_id = request.tool_call_id.clone();
-                    let option_id = option.id.clone();
-                    buttons.push(
-                        Button::new(
-                            SharedString::from(format!(
-                                "subthread-permission-{}-{request_index}-{option_index}",
-                                thread_id.0
-                            )),
-                            option.name.clone(),
-                        )
-                        .start_icon(icon)
-                        .label_size(LabelSize::Small)
-                        .on_click(move |_, _, cx| {
-                            let option_id = option_id.clone();
+                    self.permission_option_buttons(
+                        &format!("subthread-permission-{}-{request_index}", thread_id.0),
+                        &request.options,
+                        shows_keys,
+                        move |option_id, cx| {
                             thread.update(cx, |thread, cx| {
                                 thread.respond_to_permission(&tool_call_id, option_id, cx)
                             });
-                        }),
-                    );
-                }
+                        },
+                        cx,
+                    )
+                };
                 cards.push(
                     v_flex()
                         .my_1p5()
@@ -1913,11 +1920,12 @@ impl AgentView {
                     self.sync_markdown((index, 0), text, cx);
                 }
                 Entry::ToolCall(tool_call) => {
-                    // A subagent's text is its report, which it writes in markdown.
-                    let is_subagent =
-                        matches!(ToolCallKind::of(tool_call), ToolCallKind::Subagent(_));
+                    // A subagent's text is its report, and a plan to approve is the plan, both
+                    // written in markdown.
+                    let is_markdown = is_plan(tool_call)
+                        || matches!(ToolCallKind::of(tool_call), ToolCallKind::Subagent(_));
                     for (part, text) in tool_call.text.iter().enumerate() {
-                        let text = if is_subagent {
+                        let text = if is_markdown {
                             Cow::Borrowed(text.as_str())
                         } else {
                             as_code_block(text)
@@ -2099,7 +2107,12 @@ impl AgentView {
 
     fn sync_composer_placeholder(&mut self, cx: &mut Context<Self>) {
         let placeholder: SharedString = if self.needs_login(cx) {
-            format!("Log in to {} to send a message", self.agent_name(cx)).into()
+            // The message that asked for the login goes by itself once logged in.
+            if self.thread.read(cx).failed_message() == Some(FailedMessage::NeedsLogin) {
+                "Your message is sent once you're logged in".into()
+            } else {
+                format!("Log in to {} to send a message", self.agent_name(cx)).into()
+            }
         } else {
             COMPOSER_PLACEHOLDER.into()
         };
@@ -2804,6 +2817,45 @@ impl AgentView {
                 rows.push(element);
             }
         }
+        // The agent's own subagents ask here too, each card naming the subagent that asks.
+        let subagent_requests: Vec<(acp::ToolCallId, String, String)> = {
+            let thread = self.thread.read(cx);
+            thread
+                .state
+                .permission_requests
+                .iter()
+                .filter_map(|request| {
+                    let card = request.subagent_card.as_ref()?;
+                    let description = thread.entries().iter().find_map(|entry| match entry {
+                        Entry::ToolCall(tool_call) if &tool_call.id == card => {
+                            match ToolCallKind::of(tool_call) {
+                                ToolCallKind::Subagent(subagent) => Some(subagent.description),
+                                _ => Some(tool_call.title.clone()),
+                            }
+                        }
+                        _ => None,
+                    })?;
+                    Some((
+                        request.tool_call_id.clone(),
+                        request.title.clone(),
+                        description,
+                    ))
+                })
+                .collect()
+        };
+        for (offset, (tool_call_id, title, asker)) in subagent_requests.iter().enumerate() {
+            let index = entry_count + orphans.len() + offset;
+            if let Some(card) =
+                self.render_permission_card(index, tool_call_id, title, Some(asker), cx)
+            {
+                rows.push(
+                    card.debug_selector(move || format!("subagent-permission-{offset}"))
+                        .my_1p5()
+                        .mx_5()
+                        .into_any_element(),
+                );
+            }
+        }
         rows.extend(self.render_subthread_permissions(cx));
         rows.extend(
             self.elicitation_cards
@@ -2840,19 +2892,121 @@ impl AgentView {
         cx.notify();
     }
 
+    /// The row of the first request in the conversation waiting on the user: a permission's
+    /// tool call, or the tail, where the other requests show.
+    fn waiting_row(&self, cx: &App) -> Option<usize> {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let tail = entries.len() + 1;
+        let permissions = thread.state.permission_requests.iter().map(|request| {
+            entries
+                .iter()
+                .position(|entry| {
+                    request.subagent_card.is_none()
+                        && matches!(entry, Entry::ToolCall(tool_call) if tool_call.id == request.tool_call_id)
+                })
+                .map_or(tail, |index| index + 1)
+        });
+        let elsewhere = (!self.blocked_subthreads.is_empty()
+            || self.elicitation_cards.iter().any(|card| {
+                let card = card.read(cx);
+                card.is_waiting() && !card.is_for_request()
+            }))
+        .then_some(tail);
+        permissions.chain(elsewhere).min()
+    }
+
+    /// Whether the conversation's first request waiting on the user is out of view: above it,
+    /// or below it.
+    fn waiting_out_of_view(list_state: &ListState, row: Option<usize>) -> Option<bool> {
+        let row = row?;
+        if list_state.item_is_below_viewport(row) == Some(true) {
+            Some(false)
+        } else if list_state.item_is_above_viewport(row) == Some(true) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// While a request waits out of view, a pill over the composer that scrolls to it.
+    fn render_waiting_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let row = self.waiting_row(cx);
+        let is_above = Self::waiting_out_of_view(&self.list_state, row)?;
+        let warning = cx.theme().status().warning;
+        let background = cx
+            .theme()
+            .colors()
+            .panel_background
+            .blend(warning.opacity(0.16));
+        Some(
+            h_flex()
+                .absolute()
+                .bottom_2()
+                .left_0()
+                .right_0()
+                .justify_center()
+                .child(
+                    h_flex()
+                        .id("waiting-pill")
+                        .debug_selector(|| "waiting-pill".into())
+                        .h(px(26.))
+                        .px_3()
+                        .gap_1p5()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(warning.opacity(0.4))
+                        .bg(background)
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(warning)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(row) = this.waiting_row(cx) {
+                                // Following the end would take it back down at once.
+                                this.list_state.pause_following_tail();
+                                this.list_state.scroll_to_reveal_item(row);
+                                cx.notify();
+                            }
+                        }))
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                        .child(format!("{} is waiting for you", self.agent_name(cx)))
+                        .child(
+                            Icon::new(if is_above {
+                                IconName::ArrowUp
+                            } else {
+                                IconName::ArrowDown
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Measures the conversation, whose width places the turn rail, and draws it again when
     /// that changes, or when the rows laid out after the rail was drawn put other turns in
-    /// view (as after a jump to a turn whose rows weren't measured yet).
+    /// view (as after a jump to a turn whose rows weren't measured yet), or move the request
+    /// waiting on the user into view or out of it.
     fn render_conversation_measure(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let drawn_width = self.conversation_width;
         let turns = self.user_turns(cx);
         let list_state = self.list_state.clone();
         let drawn_turns = TurnsInView::of(&list_state, &turns);
+        let waiting_row = self.waiting_row(cx);
+        let drawn_waiting = Self::waiting_out_of_view(&list_state, waiting_row);
         canvas(
             move |bounds, window, cx| {
                 let width = bounds.size.width;
-                if width != drawn_width || TurnsInView::of(&list_state, &turns) != drawn_turns {
+                if width != drawn_width
+                    || TurnsInView::of(&list_state, &turns) != drawn_turns
+                    || Self::waiting_out_of_view(&list_state, waiting_row) != drawn_waiting
+                {
                     window.defer(cx, move |_, cx| {
                         view.update(cx, |view, cx| {
                             view.conversation_width = width;
@@ -4243,22 +4397,29 @@ impl AgentView {
             .clone()
             .filter(|&index| self.awaits_confirmation(index, cx))
             .collect();
+        // A tool call asking the agent's own questions has no row while its card shows them.
+        let is_asking = |index: usize| {
+            matches!(&entries[index], Entry::ToolCall(tool_call)
+                if self.is_asking_questions(tool_call, cx))
+        };
         let entry = match awaiting.as_slice() {
             [] => run
                 .clone()
                 .rev()
                 .find(|&index| match &entries[index] {
-                    Entry::ToolCall(tool_call) => matches!(
-                        tool_call.status,
-                        acp::ToolCallStatus::InProgress | acp::ToolCallStatus::Pending
-                    ),
+                    Entry::ToolCall(tool_call) => {
+                        matches!(
+                            tool_call.status,
+                            acp::ToolCallStatus::InProgress | acp::ToolCallStatus::Pending
+                        ) && !is_asking(index)
+                    }
                     Entry::AgentThought(_) => index == last,
                     _ => false,
                 })
                 .or_else(|| {
                     run.clone()
                         .rev()
-                        .find(|&index| !matches!(entries[index], Entry::Plan))
+                        .find(|&index| !matches!(entries[index], Entry::Plan) && !is_asking(index))
                 })?,
             [entry] => *entry,
             // One line can't hold several requests' buttons, so the rows show.
@@ -4480,12 +4641,35 @@ impl AgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // While its card asks the agent's own questions, the card is their one title.
+        if live_run.is_none() && self.is_asking_questions(tool_call, cx) {
+            return div().into_any_element();
+        }
+        // Once answered, a row that asked questions names them.
+        let asked;
+        let names_questions = tool_call
+            .answer
+            .as_ref()
+            .and_then(ToolAnswer::asked)
+            .is_some();
+        let tool_call = match tool_call.answer.as_ref().and_then(ToolAnswer::asked) {
+            Some(questions) => {
+                asked = ToolCall {
+                    title: format!("Asked: {questions}"),
+                    ..tool_call.clone()
+                };
+                &asked
+            }
+            None => tool_call,
+        };
         let colors = cx.theme().colors();
         let failed = matches!(tool_call.status, acp::ToolCallStatus::Failed);
         let in_progress = matches!(
             tool_call.status,
             acp::ToolCallStatus::InProgress | acp::ToolCallStatus::Pending
         );
+        let denied = !in_progress && tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
+        let is_plan = is_plan(tool_call);
         let needs_confirmation = self
             .thread
             .read(cx)
@@ -4555,7 +4739,13 @@ impl AgentView {
                     .w(px(24.))
                     .flex_none()
                     .justify_center()
-                    .child(tool_call_icon(tool_call, &kind, cx)),
+                    .child(if names_questions {
+                        Icon::new(IconName::CircleHelp)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(work_row_color(cx)))
+                    } else {
+                        tool_call_icon(tool_call, &kind, cx)
+                    }),
             )
             .child(self.render_tool_call_label(
                 tool_call,
@@ -4606,11 +4796,15 @@ impl AgentView {
                         .with_rotate_animation(2),
                 )
             })
-            .when(failed, |this| {
+            .when(failed || denied, |this| {
                 this.child(
-                    Label::new("Failed")
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
+                    div()
+                        .debug_selector(move || format!("tool-call-status-{index}"))
+                        .child(
+                            Label::new(if denied { "Denied" } else { "Failed" })
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        ),
                 )
             })
             .when(is_openable, |this| {
@@ -4659,9 +4853,19 @@ impl AgentView {
                     }
                 }
                 for part in 0..tool_call.text.len() {
-                    let style = tool_output_style(is_execute, window, cx);
+                    // A plan reads as the agent's own words, as Zed shows a tool's content.
+                    let style = if is_plan {
+                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+                    } else {
+                        tool_output_style(is_execute, window, cx)
+                    };
                     if let Some(markdown) = self.markdown((index, part + 1), style, cx) {
-                        output.push(div().text_xs().child(markdown).into_any_element());
+                        output.push(
+                            div()
+                                .when(!is_plan, |this| this.text_xs())
+                                .child(markdown)
+                                .into_any_element(),
+                        );
                     }
                 }
                 for image_index in 0..tool_call.images.len() {
@@ -4670,6 +4874,7 @@ impl AgentView {
                 // As in Zed, a tool call with an image shows only the image.
                 let shows_input = !is_execute
                     && !is_edit
+                    && !is_plan
                     && tool_call.images.is_empty()
                     && tool_call.raw_input.is_some()
                     && !matches!(kind, ToolCallKind::ToolSearch(_));
@@ -4678,6 +4883,11 @@ impl AgentView {
                 }
             }
         }
+        let answer_line = tool_call
+            .answer
+            .as_ref()
+            .filter(|_| !needs_confirmation)
+            .map(|answer| render_answer_line(index, answer, cx));
         let details = (!output.is_empty()).then(|| {
             with_scrollbar(
                 v_flex()
@@ -4699,6 +4909,7 @@ impl AgentView {
         v_flex()
             .mx_5()
             .child(row)
+            .children(answer_line)
             .children(details)
             .children(self.render_permission_buttons(index, &tool_call.id, cx))
             .into_any_element()
@@ -4736,12 +4947,16 @@ impl AgentView {
         });
         let is_stopped = matches!(end, Some(TaskEnd::Cancelled | TaskEnd::Interrupted));
         let failed = !is_stopped && matches!(tool_call.status, acp::ToolCallStatus::Failed);
-        // A native subagent's step asks it in the thread, at the subagent's card.
-        let request = self
+        // A native subagent's step asks at the end of the thread, and its row says it waits.
+        let is_waiting = self
             .thread
             .read(cx)
             .subagent_permission_request(&tool_call.id)
-            .or_else(|| self.thread.read(cx).permission_request(&tool_call.id))
+            .is_some();
+        let request = self
+            .thread
+            .read(cx)
+            .permission_request(&tool_call.id)
             .map(|request| (request.tool_call_id.clone(), request.title.clone()));
         // A subthread's opens to its steps, which are only known once it's followed.
         let has_content = subthread.is_some()
@@ -4813,7 +5028,21 @@ impl AgentView {
                         div()
                             .debug_selector(move || format!("subagent-type-{index}"))
                             .child(subagent_tag(kind, cx))
-                    })),
+                    }))
+                    .when(is_waiting, |this| {
+                        let warning = cx.theme().status().warning;
+                        this.child(
+                            div()
+                                .debug_selector(move || format!("subagent-waiting-{index}"))
+                                .flex_none()
+                                .px(px(6.))
+                                .rounded(px(4.))
+                                .bg(warning.opacity(0.12))
+                                .text_size(rems_from_px(11_f32))
+                                .text_color(warning)
+                                .child("Waiting for you"),
+                        )
+                    }),
             )
             .when_some(subthread, |this, thread_id| {
                 this.child(
@@ -4885,9 +5114,8 @@ impl AgentView {
                 )
             });
 
-        // The step that asks is the one it's on, so the request takes the step's place.
         let permission = request.and_then(|(tool_call_id, title)| {
-            let card = self.render_permission_card(index, &tool_call_id, &title, cx)?;
+            let card = self.render_permission_card(index, &tool_call_id, &title, None, cx)?;
             Some(card.ml(px(30.)).my_1().into_any_element())
         });
         let details = match subthread {
@@ -4895,6 +5123,8 @@ impl AgentView {
             Some(thread_id) if is_open => {
                 Some(self.render_subagent_preview(index, tool_call, thread_id, &steps, window, cx))
             }
+            // "Waiting for you" stands in for its step.
+            Some(_) if is_waiting => None,
             // While it runs, the step it's on.
             Some(_) => steps
                 .iter()
@@ -5337,36 +5567,27 @@ impl AgentView {
     ) -> Option<AnyElement> {
         let request = self.thread.read(cx).permission_request(tool_call_id)?;
         let options = request.options.clone();
-        let mut buttons = Vec::new();
-        for (option_index, option) in options.into_iter().enumerate() {
-            let icon = match option.kind {
-                acp::PermissionOptionKind::AllowOnce => Icon::new(IconName::Check)
-                    .size(IconSize::XSmall)
-                    .color(Color::Success),
-                acp::PermissionOptionKind::AllowAlways => Icon::new(IconName::CheckDouble)
-                    .size(IconSize::XSmall)
-                    .color(Color::Success),
-                _ => Icon::new(IconName::Close)
-                    .size(IconSize::XSmall)
-                    .color(Color::Error),
-            };
+        let shows_keys = self
+            .first_permission_request(cx)
+            .is_some_and(|(thread, first)| thread == self.thread && &first == tool_call_id);
+        let buttons = {
             let tool_call_id = tool_call_id.clone();
-            let option_id = option.id.clone();
-            buttons.push(
-                Button::new(
-                    SharedString::from(format!("permission-{index}-{option_index}")),
-                    option.name,
-                )
-                .start_icon(icon)
-                .label_size(LabelSize::Small)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let option_id = option_id.clone();
-                    this.thread.update(cx, |thread, cx| {
-                        thread.respond_to_permission(&tool_call_id, option_id, cx)
-                    });
-                })),
-            );
-        }
+            let view = cx.entity().downgrade();
+            self.permission_option_buttons(
+                &format!("permission-{index}"),
+                &options,
+                shows_keys,
+                move |option_id, cx| {
+                    view.update(cx, |this, cx| {
+                        this.thread.update(cx, |thread, cx| {
+                            thread.respond_to_permission(&tool_call_id, option_id, cx)
+                        })
+                    })
+                    .ok();
+                },
+                cx,
+            )
+        };
         Some(
             v_flex()
                 .debug_selector(|| format!("permission-buttons-{index}"))
@@ -5380,6 +5601,96 @@ impl AgentView {
         )
     }
 
+    /// A request's choices as Zed draws them: a check for once, a double check for always, a
+    /// red × for no. On the first request waiting, the first choice of each of those kinds
+    /// shows its key.
+    fn permission_option_buttons(
+        &self,
+        id_prefix: &str,
+        options: &[PermissionOption],
+        shows_keys: bool,
+        choose: impl Fn(acp::PermissionOptionId, &mut App) + Clone + 'static,
+        cx: &App,
+    ) -> Vec<Button> {
+        let focus_handle = self.focus_handle(cx);
+        let mut keyed_kinds = Vec::new();
+        options
+            .iter()
+            .enumerate()
+            .map(|(option_index, option)| {
+                let icon = match option.kind {
+                    acp::PermissionOptionKind::AllowOnce => Icon::new(IconName::Check)
+                        .size(IconSize::XSmall)
+                        .color(Color::Success),
+                    acp::PermissionOptionKind::AllowAlways => Icon::new(IconName::CheckDouble)
+                        .size(IconSize::XSmall)
+                        .color(Color::Success),
+                    _ => Icon::new(IconName::Close)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error),
+                };
+                let key_binding = permission_action(option.kind)
+                    .filter(|_| shows_keys && !keyed_kinds.contains(&option.kind))
+                    .map(|action| {
+                        keyed_kinds.push(option.kind);
+                        ui::KeyBinding::for_action_in(action, &focus_handle, cx)
+                            .size(rems_from_px(10_f32))
+                    });
+                let option_id = option.id.clone();
+                let choose = choose.clone();
+                Button::new(
+                    SharedString::from(format!("{id_prefix}-{option_index}")),
+                    option.name.clone(),
+                )
+                .start_icon(icon)
+                .label_size(LabelSize::Small)
+                .key_binding(key_binding)
+                .on_click(move |_, _, cx| choose(option_id.clone(), cx))
+            })
+            .collect()
+    }
+
+    /// The permission request Zed's keys answer: the thread's first, or else the first of a
+    /// subthread that waits here.
+    fn first_permission_request(&self, cx: &App) -> Option<(Entity<AgentThread>, acp::ToolCallId)> {
+        if let Some(request) = self.thread.read(cx).state.permission_requests.first() {
+            return Some((self.thread.clone(), request.tool_call_id.clone()));
+        }
+        let mut subthreads: Vec<(&ThreadId, &(Entity<AgentThread>, Subscription))> =
+            self.blocked_subthreads.iter().collect();
+        subthreads.sort_by_key(|(thread_id, _)| **thread_id);
+        subthreads.into_iter().find_map(|(_, (thread, _))| {
+            let request = thread.read(cx).state.permission_requests.first()?;
+            Some((thread.clone(), request.tool_call_id.clone()))
+        })
+    }
+
+    /// Zed's AllowOnce, AllowAlways and RejectOnce: the first request's first choice of that
+    /// kind.
+    fn answer_first_request(&mut self, kind: acp::PermissionOptionKind, cx: &mut Context<Self>) {
+        let Some((thread, tool_call_id)) = self.first_permission_request(cx) else {
+            cx.propagate();
+            return;
+        };
+        let option_id = thread
+            .read(cx)
+            .permission_request(&tool_call_id)
+            .and_then(|request| request.options.iter().find(|option| option.kind == kind))
+            .map(|option| option.id.clone());
+        if let Some(option_id) = option_id {
+            thread.update(cx, |thread, cx| {
+                thread.respond_to_permission(&tool_call_id, option_id, cx)
+            });
+        }
+    }
+
+    /// Whether a card shows the agent's own questions for this tool call, waiting for answers.
+    fn is_asking_questions(&self, tool_call: &ToolCall, cx: &App) -> bool {
+        self.elicitation_cards
+            .iter()
+            .any(|card| card.read(cx).asks_questions_for(&tool_call.id))
+    }
+
     /// A permission request whose tool call never arrived as its own entry.
     fn render_orphan_permission(
         &self,
@@ -5388,16 +5699,18 @@ impl AgentView {
         title: &str,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let card = self.render_permission_card(index, tool_call_id, title, cx)?;
+        let card = self.render_permission_card(index, tool_call_id, title, None, cx)?;
         Some(card.my_1p5().ml_5().mr_5().into_any_element())
     }
 
-    /// A permission request as a card of its own: its title, then its buttons.
+    /// A permission request as a card of its own: its title, then its buttons. One of the
+    /// agent's own subagents' names the subagent (`asker`) before its step.
     fn render_permission_card(
         &self,
         index: usize,
         tool_call_id: &acp::ToolCallId,
         title: &str,
+        asker: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let buttons = self.render_permission_buttons(index, tool_call_id, cx)?;
@@ -5415,6 +5728,7 @@ impl AgentView {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         };
         let (kind, sentence) = self.tool_call_kind(&tool_call, cx);
         Some(
@@ -5429,6 +5743,18 @@ impl AgentView {
                         h_flex()
                             .px_1()
                             .min_h(px(24.))
+                            .gap_1()
+                            .when_some(asker, |this, asker| {
+                                this.child(
+                                    div()
+                                        .min_w_0()
+                                        .max_w(relative(0.5))
+                                        .truncate()
+                                        .text_size(rems_from_px(13_f32))
+                                        .text_color(cx.theme().colors().text_muted)
+                                        .child(format!("{} ·", one_line(asker))),
+                                )
+                            })
                             .child(self.render_tool_call_label(
                                 &tool_call,
                                 &kind,
@@ -6072,12 +6398,51 @@ impl AgentView {
         )
     }
 
-    /// After a message, the agent's login is a line over the composer, whose Log In… opens it
-    /// in a dialog, as t3code's banner sends you to setup.
+    /// After a message, the agent's login is a line over the composer offering each of its
+    /// ways to log in, as Zed's "Authentication Required" callout does: the first one filled,
+    /// at the end. Each opens the login dialog on its step.
     fn render_login_notice(&self, has_rows: bool, cx: &Context<Self>) -> Option<AnyElement> {
         if !has_rows || !self.needs_login(cx) {
             return None;
         }
+        let agent_name = self.agent_name(cx);
+        let methods = self.thread.read(cx).auth_methods().to_vec();
+        let buttons = methods
+            .into_iter()
+            .enumerate()
+            .rev()
+            .map(|(method_index, method)| {
+                let id = method.id().0.to_string();
+                let description = method_description(&method, &agent_name);
+                let selector = format!("login-notice-method-{id}");
+                div()
+                    .id(SharedString::from(format!("login-notice-method-{id}")))
+                    .debug_selector(move || selector)
+                    .when_some(description, |this, description| {
+                        this.tooltip(Tooltip::text(description))
+                    })
+                    .child(
+                        ActionButton::new(
+                            SharedString::from(format!("login-notice-button-{id}")),
+                            method_button_label(&method),
+                        )
+                        .style(if method_index == 0 {
+                            ActionStyle::Primary
+                        } else {
+                            ActionStyle::Outline
+                        })
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.open_login_dialog(window, cx);
+                                if let Some((dialog, _)) = &this.login_dialog {
+                                    let method = method.clone();
+                                    dialog
+                                        .update(cx, |dialog, cx| dialog.choose(method, window, cx));
+                                }
+                            },
+                        )),
+                    )
+            });
         Some(
             div()
                 .debug_selector(|| "login-notice".into())
@@ -6086,16 +6451,8 @@ impl AgentView {
                 .child(
                     Callout::new()
                         .severity(Severity::Info)
-                        .title(format!("{} needs a login", self.agent_name(cx)))
-                        .actions_slot(
-                            div().debug_selector(|| "open-login-dialog".into()).child(
-                                ActionButton::new("open-login-dialog", "Log In…")
-                                    .style(ActionStyle::Primary)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_login_dialog(window, cx)
-                                    })),
-                            ),
-                        ),
+                        .title(format!("{agent_name} needs a login to answer"))
+                        .actions_slot(h_flex().gap_1().flex_wrap().children(buttons)),
                 )
                 .into_any_element(),
         )
@@ -9373,6 +9730,15 @@ impl Render for AgentView {
                     this.open_thread(parent, cx)
                 }))
             })
+            .on_action(cx.listener(|this, _: &AllowOnce, _, cx| {
+                this.answer_first_request(acp::PermissionOptionKind::AllowOnce, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AllowAlways, _, cx| {
+                this.answer_first_request(acp::PermissionOptionKind::AllowAlways, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RejectOnce, _, cx| {
+                this.answer_first_request(acp::PermissionOptionKind::RejectOnce, cx)
+            }))
             .size_full()
             .bg(panel_background)
             .when(!self.is_in_pane, |this| {
@@ -9413,6 +9779,7 @@ impl Render for AgentView {
                                 }
                             }))
                             .when(!has_rows, |this| this.pt_2().pb_4())
+                            .relative()
                             .items_center()
                             .when(has_rows, |this| {
                                 this.child(
@@ -9428,6 +9795,7 @@ impl Render for AgentView {
                                 )
                                 .child(self.render_conversation_measure(cx))
                                 .children(self.render_turn_rail(window, cx))
+                                .children(self.render_waiting_pill(cx))
                                 .vertical_scrollbar_for(
                                     &self.list_state,
                                     window,
@@ -9920,6 +10288,110 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
                 .size(LabelSize::Small)
                 .color(Color::Deleted),
         )
+}
+
+/// A plan the agent asks to approve, as Claude Agent's ExitPlanMode is: a change of mode
+/// showing the plan, which is markdown.
+fn is_plan(tool_call: &ToolCall) -> bool {
+    matches!(tool_call.kind, acp::ToolKind::SwitchMode) && !tool_call.text.is_empty()
+}
+
+/// Zed's key for a kind of permission choice.
+fn permission_action(kind: acp::PermissionOptionKind) -> Option<&'static dyn gpui::Action> {
+    match kind {
+        acp::PermissionOptionKind::AllowOnce => Some(&AllowOnce),
+        acp::PermissionOptionKind::AllowAlways => Some(&AllowAlways),
+        acp::PermissionOptionKind::RejectOnce => Some(&RejectOnce),
+        _ => None,
+    }
+}
+
+/// The dim line under a tool call's row saying how the user answered it, with its mark.
+fn render_answer_line(index: usize, answer: &ToolAnswer, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    let (icon, color, said, answers) = match answer {
+        ToolAnswer::Chose(option) => {
+            let (icon, said) = chosen_words(option);
+            (icon, Color::Muted, said, None)
+        }
+        ToolAnswer::Answered { answers, .. } => (
+            IconName::Check,
+            Color::Accent,
+            "You answered:".to_string(),
+            Some(answers.join("; ")),
+        ),
+        ToolAnswer::Declined { .. } => (
+            IconName::Close,
+            Color::Muted,
+            "You declined".to_string(),
+            None,
+        ),
+    };
+    h_flex()
+        .debug_selector(move || format!("tool-call-answer-{index}"))
+        .ml(px(30.))
+        .pb_1()
+        .gap_1p5()
+        .min_w_0()
+        .text_size(rems_from_px(12_f32))
+        .text_color(colors.text_placeholder)
+        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+        .child(div().flex_none().child(said))
+        .children(answers.map(|answers| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(colors.text_muted)
+                .child(answers)
+        }))
+        .into_any_element()
+}
+
+/// What choosing a permission option did, in words: the plain choices by what they do
+/// ("You allowed it once"), the always-allow ones by what they allow from now on, and any
+/// other by its name.
+fn chosen_words(option: &PermissionOption) -> (IconName, String) {
+    let name = option.name.trim().trim_end_matches('.');
+    let plain = name.to_lowercase();
+    match option.kind {
+        acp::PermissionOptionKind::AllowOnce
+            if matches!(
+                plain.as_str(),
+                "yes" | "allow" | "allow once" | "yes, allow once" | "approve" | "ok"
+            ) =>
+        {
+            (IconName::Check, "You allowed it once".to_string())
+        }
+        acp::PermissionOptionKind::AllowAlways => {
+            let subject = plain
+                .find("don't ask again for ")
+                .or_else(|| plain.find("don’t ask again for "))
+                .and_then(|start| name.get(start..))
+                .and_then(|rest| rest.split_once(" for "))
+                .map(|(_, subject)| subject.trim());
+            match subject {
+                Some(subject) => (
+                    IconName::CheckDouble,
+                    format!("You allowed {subject} from now on"),
+                ),
+                None if matches!(
+                    plain.as_str(),
+                    "allow always" | "always allow" | "yes, always" | "always"
+                ) =>
+                {
+                    (
+                        IconName::CheckDouble,
+                        "You allowed it from now on".to_string(),
+                    )
+                }
+                None => (IconName::CheckDouble, format!("You chose: {name}")),
+            }
+        }
+        acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
+            (IconName::Close, "You denied it".to_string())
+        }
+        _ => (IconName::Check, format!("You chose: {name}")),
+    }
 }
 
 /// A tool call's icon: a read's or an edit's file's own type's icon, as Zed's edit cards show;
@@ -11652,6 +12124,7 @@ mod tests {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         })
     }
 
@@ -11715,6 +12188,7 @@ mod tests {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         });
         thread.update(cx, |thread, cx| {
             thread.set_entries_for_test(vec![Entry::UserMessage("Edit it".into()), edit], cx)
@@ -11738,6 +12212,7 @@ mod tests {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         })
     }
 
@@ -11903,6 +12378,7 @@ mod tests {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         })
     }
 
@@ -12675,9 +13151,10 @@ mod tests {
         assert!(cx.debug_bounds("login-back").is_none());
     }
 
-    /// After a message, the login is a line over the composer, whose Log In… opens it in a
-    /// dialog, and the message that didn't go is marked under it. Logged in, the dialog says
-    /// as whom, with Done, and only the mark stays.
+    /// After a message, the login is a line over the composer offering each way to log in,
+    /// the first filled and last, and the message that didn't go is marked under it. Each
+    /// opens the login dialog on its step. Logged in, the dialog says as whom, with Done, and
+    /// only the mark stays.
     #[gpui::test]
     fn a_login_after_a_message_opens_in_a_dialog(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -12702,22 +13179,35 @@ mod tests {
             "it doesn't open by itself"
         );
 
-        click("open-login-dialog", cx);
+        let first = cx
+            .debug_bounds("login-notice-method-login")
+            .expect("the first way to log in");
+        let other = cx
+            .debug_bounds("login-notice-method-key")
+            .expect("the other way to log in");
+        assert!(other.right() <= first.left(), "the first one comes last");
+        let placeholder = view.read_with(cx, |view, cx| {
+            view.composer.read(cx).placeholder().to_string()
+        });
+        assert_eq!(placeholder, "Your message is sent once you're logged in");
+
+        click("login-notice-method-key", cx);
         assert!(cx.debug_bounds("login-dialog").is_some());
+        assert!(
+            cx.debug_bounds("login-dialog-log-in").is_some(),
+            "it opens on the key's step"
+        );
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(cx.debug_bounds("login-dialog").is_none());
 
-        click("open-login-dialog", cx);
-        click("login-method-key", cx);
-        assert!(cx.debug_bounds("login-dialog-log-in").is_some());
+        click("login-notice-method-key", cx);
         click("login-dialog-back", cx);
         assert!(cx.debug_bounds("login-method-key").is_some());
         click("login-dialog-cancel", cx);
         assert!(cx.debug_bounds("login-dialog").is_none());
 
-        click("open-login-dialog", cx);
-        click("login-method-login", cx);
+        click("login-notice-method-login", cx);
         assert!(authenticated_with(&client, "login", cx));
         assert!(cx.debug_bounds("login-dialog-back").is_some());
         thread.update(cx, |thread, cx| {
@@ -13754,6 +14244,7 @@ mod tests {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         }
     }
 
@@ -13861,8 +14352,8 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(*opened.borrow(), vec![ThreadId(12), ThreadId(12)]);
 
-        // A step that asks for permission asks at its subagent's card, not after the
-        // conversation.
+        // A step that asks for permission asks at the end of the thread, naming the subagent,
+        // and the subagent's row says it waits in place of its step.
         thread.update(cx, |thread, cx| {
             thread.set_permission_requests_for_test(
                 vec![agentz_protocol::thread::PermissionRequest {
@@ -13880,12 +14371,14 @@ mod tests {
         });
         cx.run_until_parked();
         let row = cx.debug_bounds("tool-call-row-2").expect("Claude's row");
-        let buttons = cx
-            .debug_bounds("permission-buttons-2")
-            .expect("the buttons at the card");
-        assert!(row.bottom() <= buttons.top());
-        assert!(cx.debug_bounds("permission-buttons-3").is_none());
-        assert!(cx.debug_bounds("subagent-preview-2").is_none());
+        let card = cx
+            .debug_bounds("subagent-permission-0")
+            .expect("the request at the end");
+        assert!(row.bottom() <= card.top());
+        assert!(cx.debug_bounds("permission-buttons-2").is_none());
+        assert!(cx.debug_bounds("permission-buttons-3").is_some());
+        assert!(cx.debug_bounds("subagent-waiting-2").is_some());
+        assert!(cx.debug_bounds("subagent-step-2").is_none());
     }
 
     /// The Agents list shows the agent's own subagent while it runs, by the agent's name and with
@@ -13958,6 +14451,520 @@ mod tests {
             );
         });
         assert!(cx.debug_bounds("subthread-title-bar").is_none());
+    }
+
+    /// Claude Agent's choices for running `npm test`.
+    fn run_tests_options() -> Vec<agentz_protocol::thread::PermissionOption> {
+        [
+            ("allow-once", "Yes", acp::PermissionOptionKind::AllowOnce),
+            (
+                "allow-with-updates",
+                "Yes, and don't ask again for npm test commands",
+                acp::PermissionOptionKind::AllowAlways,
+            ),
+            ("reject", "No", acp::PermissionOptionKind::RejectOnce),
+        ]
+        .into_iter()
+        .map(
+            |(id, name, kind)| agentz_protocol::thread::PermissionOption {
+                id: acp::PermissionOptionId::new(id),
+                name: name.into(),
+                kind,
+            },
+        )
+        .collect()
+    }
+
+    fn permission_responses(
+        client: &Entity<ServerClient>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<String> {
+        sent(client, cx)
+            .iter()
+            .filter_map(|request| match request {
+                Request::RespondToPermission { option_id, .. } => Some(option_id.0.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn run_tests_call(
+        status: acp::ToolCallStatus,
+        answer: Option<agentz_protocol::thread::PermissionOption>,
+    ) -> Entry {
+        let mut entry = work("run-1", acp::ToolKind::Execute, None);
+        if let Entry::ToolCall(tool_call) = &mut entry {
+            tool_call.title = "npm test".into();
+            tool_call.status = status;
+            tool_call.answer = answer.map(ToolAnswer::Chose);
+        }
+        entry
+    }
+
+    /// Zed's keys answer the first permission request while the thread has focus. Once it's
+    /// answered, a dim line under the row says what was chosen, and a No marks it "Denied".
+    #[gpui::test]
+    fn permissions_answer_from_the_keyboard_and_say_what_was_chosen(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    run_tests_call(acp::ToolCallStatus::Pending, None),
+                ],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+            thread.set_permission_requests_for_test(
+                vec![agentz_protocol::thread::PermissionRequest {
+                    tool_call_id: acp::ToolCallId::new("run-1"),
+                    title: "npm test".into(),
+                    options: run_tests_options(),
+                    subagent_card: None,
+                }],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("permission-buttons-1").is_some());
+        assert!(cx.debug_bounds("tool-call-answer-1").is_none());
+
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-alt-y"
+        } else {
+            "shift-alt-q"
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-alt-z"
+        } else {
+            "shift-alt-x"
+        });
+        assert_eq!(
+            permission_responses(&client, cx),
+            vec!["allow-with-updates", "reject"]
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_requests_for_test(Vec::new(), cx);
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    run_tests_call(
+                        acp::ToolCallStatus::Completed,
+                        Some(run_tests_options()[1].clone()),
+                    ),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("permission-buttons-1").is_none());
+        let row = cx.debug_bounds("tool-call-row-1").expect("the row");
+        let answer = cx.debug_bounds("tool-call-answer-1").expect("the answer");
+        assert!(row.bottom() <= answer.top());
+        assert!(cx.debug_bounds("tool-call-status-1").is_none());
+
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Run the tests".into()),
+                    run_tests_call(
+                        acp::ToolCallStatus::Failed,
+                        Some(run_tests_options()[2].clone()),
+                    ),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-status-1").is_some());
+        assert!(cx.debug_bounds("tool-call-answer-1").is_some());
+
+        // With no request, the keys go on to whatever else has them.
+        thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-y"
+        } else {
+            "shift-alt-a"
+        });
+        assert_eq!(permission_responses(&client, cx).len(), 2);
+    }
+
+    #[test]
+    fn answers_say_what_the_choice_did() {
+        let said = |name: &str, kind| {
+            chosen_words(&agentz_protocol::thread::PermissionOption {
+                id: acp::PermissionOptionId::new("option"),
+                name: name.into(),
+                kind,
+            })
+            .1
+        };
+        use acp::PermissionOptionKind::{AllowAlways, AllowOnce, RejectOnce};
+        assert_eq!(said("Yes", AllowOnce), "You allowed it once");
+        assert_eq!(said("Allow once", AllowOnce), "You allowed it once");
+        assert_eq!(
+            said(
+                "Yes, and don't ask again for npm test commands",
+                AllowAlways
+            ),
+            "You allowed npm test commands from now on"
+        );
+        assert_eq!(
+            said("Allow always", AllowAlways),
+            "You allowed it from now on"
+        );
+        assert_eq!(
+            said("Yes, and use auto mode", AllowAlways),
+            "You chose: Yes, and use auto mode"
+        );
+        assert_eq!(
+            said("Yes, manually approve edits", AllowOnce),
+            "You chose: Yes, manually approve edits"
+        );
+        assert_eq!(said("No, keep planning", RejectOnce), "You denied it");
+    }
+
+    /// A plan to approve shows rendered under its row, with no Input, until it's answered;
+    /// then it folds into the row, which opens to it again.
+    #[gpui::test]
+    fn a_plan_shows_under_its_row_until_answered(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let plan = |answer: Option<agentz_protocol::thread::PermissionOption>| {
+            let mut entry = work("plan-1", acp::ToolKind::SwitchMode, None);
+            if let Entry::ToolCall(tool_call) = &mut entry {
+                tool_call.title = "Approve Plan".into();
+                tool_call.status = if answer.is_some() {
+                    acp::ToolCallStatus::Completed
+                } else {
+                    acp::ToolCallStatus::Pending
+                };
+                tool_call.text = vec!["## Port the icon picker\n\n1. Copy it.".into()];
+                tool_call.raw_input = Some("```json\n{\"plan\": \"…\"}\n```".into());
+                tool_call.answer = answer.map(ToolAnswer::Chose);
+            }
+            entry
+        };
+        let options = vec![
+            agentz_protocol::thread::PermissionOption {
+                id: acp::PermissionOptionId::new("exit-plan-auto"),
+                name: "Yes, and use auto mode".into(),
+                kind: acp::PermissionOptionKind::AllowAlways,
+            },
+            agentz_protocol::thread::PermissionOption {
+                id: acp::PermissionOptionId::new("reject"),
+                name: "No, keep planning".into(),
+                kind: acp::PermissionOptionKind::RejectOnce,
+            },
+        ];
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Plan it".into()), plan(None)], cx);
+            thread.set_permission_requests_for_test(
+                vec![agentz_protocol::thread::PermissionRequest {
+                    tool_call_id: acp::ToolCallId::new("plan-1"),
+                    title: "Approve Plan".into(),
+                    options: options.clone(),
+                    subagent_card: None,
+                }],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+        assert!(cx.debug_bounds("tool-call-input-1").is_none());
+        assert!(cx.debug_bounds("permission-buttons-1").is_some());
+
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_requests_for_test(Vec::new(), cx);
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Plan it".into()),
+                    plan(Some(options[0].clone())),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1").is_none());
+        assert!(cx.debug_bounds("tool-call-answer-1").is_some());
+        click("tool-call-row-1", cx);
+        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+        assert!(cx.debug_bounds("tool-call-input-1").is_none());
+    }
+
+    /// Claude Agent's two questions, as it asks them for JetBrains AIR.
+    fn questions_elicitation(tool_call_id: &str) -> agentz_protocol::thread::Elicitation {
+        let request = serde_json::from_value(serde_json::json!({
+            "mode": "form",
+            "sessionId": "session",
+            "toolCallId": tool_call_id,
+            "message": "Please answer the following questions.",
+            "requestedSchema": {"type": "object", "properties": {
+                "question_0": {
+                    "type": "string",
+                    "title": "Test runner",
+                    "description": "Which test runner should the tests use?",
+                    "oneOf": [
+                        {"const": "Vitest", "title": "Vitest (Recommended)"},
+                        {"const": "Jest", "title": "Jest"},
+                    ],
+                },
+                "question_0_custom": {"type": "string", "title": "Other"},
+                "question_1": {
+                    "type": "array",
+                    "title": "Cases",
+                    "description": "Which cases should the tests cover?",
+                    "items": {"anyOf": [
+                        {"const": "Empty cart", "title": "Empty cart"},
+                        {"const": "Rounding", "title": "Rounding"},
+                    ]},
+                },
+                "question_1_custom": {"type": "string", "title": "Other"},
+            }},
+        }))
+        .expect("Claude Agent's questions");
+        agentz_protocol::thread::Elicitation {
+            id: 1,
+            request,
+            opened: false,
+        }
+    }
+
+    /// The agent's own questions show in their card alone, one at a time: the tool call that
+    /// asks has no row while they wait, a choice of one goes on to the next question, and
+    /// the last one's button is Submit. Answered, the row is "Asked: …" with the answers
+    /// under it.
+    #[gpui::test]
+    fn questions_ask_one_at_a_time(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let ask = |answer: Option<ToolAnswer>| {
+            let mut entry = work("ask-1", acp::ToolKind::Other, None);
+            if let Entry::ToolCall(tool_call) = &mut entry {
+                tool_call.title = "Asking for your input".into();
+                tool_call.status = if answer.is_some() {
+                    acp::ToolCallStatus::Completed
+                } else {
+                    acp::ToolCallStatus::Pending
+                };
+                tool_call.answer = answer;
+            }
+            entry
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![Entry::UserMessage("Write the tests".into()), ask(None)],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+            thread.update_state_for_test(
+                |state| state.elicitations = vec![questions_elicitation("ask-1")],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("elicitation-card-1").is_some());
+        assert!(
+            cx.debug_bounds("tool-call-row-1").is_none(),
+            "the card is the questions' one title"
+        );
+        assert!(cx.debug_bounds("elicitation-step-1").is_some());
+        assert!(cx.debug_bounds("elicitation-back-1").is_none());
+        assert!(
+            cx.debug_bounds("elicitation-other-1-question_0_custom")
+                .is_some()
+        );
+
+        click("elicitation-select-1-question_0-Jest", cx);
+        assert!(cx.debug_bounds("elicitation-back-1").is_some());
+        assert!(
+            cx.debug_bounds("elicitation-multi-1-question_1-Rounding")
+                .is_some()
+        );
+        click("elicitation-back-1", cx);
+        assert!(
+            cx.debug_bounds("elicitation-select-1-question_0-Jest")
+                .is_some()
+        );
+        click("elicitation-select-1-question_0-Jest", cx);
+        click("elicitation-multi-1-question_1-Rounding", cx);
+        click("elicitation-submit-1", cx);
+        let content = sent(&client, cx).iter().find_map(|request| match request {
+            Request::RespondToElicitation {
+                action: acp::ElicitationAction::Accept(accept),
+                ..
+            } => accept.content.clone(),
+            _ => None,
+        });
+        let content = content.expect("the answers are sent");
+        assert_eq!(content.len(), 2, "{content:?}");
+
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.elicitations.clear(), cx);
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Write the tests".into()),
+                    ask(Some(ToolAnswer::Answered {
+                        asked: Some("Test runner, Cases".into()),
+                        answers: vec!["Jest".into(), "Rounding".into()],
+                    })),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-row-1").is_some());
+        assert!(cx.debug_bounds("tool-call-answer-1").is_some());
+    }
+
+    fn show_elicitation(
+        thread: &Entity<AgentThread>,
+        request: serde_json::Value,
+        cx: &mut VisualTestContext,
+    ) {
+        let request = serde_json::from_value(request).expect("an elicitation");
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Go".into())], cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.elicitations = vec![agentz_protocol::thread::Elicitation {
+                        id: 1,
+                        request,
+                        opened: false,
+                    }]
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    fn elicitation_answers(client: &Entity<ServerClient>, cx: &mut VisualTestContext) -> usize {
+        sent(client, cx)
+            .iter()
+            .filter(|request| matches!(request, Request::RespondToElicitation { .. }))
+            .count()
+    }
+
+    /// A required field's label ends in a red *, Submit does nothing until each is filled,
+    /// and a wrong value says why as its field loses focus.
+    #[gpui::test]
+    fn a_forms_required_fields_are_marked(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        show_elicitation(
+            &thread,
+            serde_json::json!({
+                "mode": "form",
+                "sessionId": "session",
+                "message": "Details for the issue",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "title": "Title"},
+                        "estimate": {"type": "integer", "title": "Estimate"},
+                    },
+                    "required": ["title"],
+                },
+            }),
+            cx,
+        );
+        // Only an active window's fields lose focus.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("elicitation-required-title").is_some());
+        assert!(cx.debug_bounds("elicitation-required-estimate").is_none());
+        click("elicitation-submit-1", cx);
+        assert_eq!(elicitation_answers(&client, cx), 0);
+
+        click("elicitation-field-1-estimate", cx);
+        cx.simulate_input("soon");
+        assert!(cx.debug_bounds("elicitation-error-1-estimate").is_none());
+        click("elicitation-field-1-title", cx);
+        assert!(
+            cx.debug_bounds("elicitation-error-1-estimate").is_some(),
+            "the estimate says why as it loses focus"
+        );
+        assert!(cx.debug_bounds("elicitation-error-1-title").is_none());
+        cx.simulate_input("Ship it");
+        click("elicitation-submit-1", cx);
+        assert_eq!(elicitation_answers(&client, cx), 0, "the estimate is wrong");
+
+        click("elicitation-field-1-estimate", cx);
+        cx.simulate_keystrokes("backspace backspace backspace backspace");
+        cx.simulate_input("3");
+        click("elicitation-submit-1", cx);
+        assert_eq!(elicitation_answers(&client, cx), 1);
+    }
+
+    /// A page to open shows its host first, its whole address behind Show address, and
+    /// Copy link beside Open.
+    #[gpui::test]
+    fn a_page_to_open_shows_its_host_first(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let url = "https://linear.app/oauth/authorize?client_id=8f3c2a&state=Zk2q";
+        show_elicitation(
+            &thread,
+            serde_json::json!({
+                "mode": "url",
+                "sessionId": "session",
+                "elicitationId": "linear-1",
+                "url": url,
+                "message": "linear needs you to sign in to Linear and allow access.",
+            }),
+            cx,
+        );
+        assert!(cx.debug_bounds("elicitation-host-1").is_some());
+        assert!(cx.debug_bounds("elicitation-address-1").is_none());
+        click("elicitation-show-address-1", cx);
+        assert!(cx.debug_bounds("elicitation-address-1").is_some());
+        click("elicitation-show-address-1", cx);
+        assert!(cx.debug_bounds("elicitation-address-1").is_none());
+        click("elicitation-copy-link-1", cx);
+        let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(copied.as_deref(), Some(url));
+    }
+
+    /// While a request waits out of view, a pill over the composer says the agent waits for
+    /// the user, and takes the conversation to it.
+    #[gpui::test]
+    fn a_request_out_of_view_has_a_pill_to_it(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let mut entries = vec![
+            Entry::UserMessage("Run the tests".into()),
+            run_tests_call(acp::ToolCallStatus::Pending, None),
+        ];
+        for line in 0..60 {
+            entries.push(Entry::AgentMessage(format!(
+                "Line {line} of what the agent wrote while it waited."
+            )));
+        }
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(entries, cx);
+            thread.set_permission_requests_for_test(
+                vec![agentz_protocol::thread::PermissionRequest {
+                    tool_call_id: acp::ToolCallId::new("run-1"),
+                    title: "npm test".into(),
+                    options: run_tests_options(),
+                    subagent_card: None,
+                }],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("permission-buttons-1").is_none());
+        click("waiting-pill", cx);
+        assert!(cx.debug_bounds("permission-buttons-1").is_some());
+        assert!(cx.debug_bounds("waiting-pill").is_none());
     }
 
     #[test]

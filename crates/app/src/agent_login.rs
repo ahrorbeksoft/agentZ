@@ -1337,6 +1337,18 @@ impl LoginDialog {
         }
     }
 
+    /// Opens on the method's step, as when it's picked in the dialog: the thread's login line
+    /// offers its methods as buttons.
+    pub(crate) fn choose(
+        &mut self,
+        method: acp::AuthMethod,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.login
+            .update(cx, |login, cx| login.choose(method, window, cx));
+    }
+
     /// Cancel, Escape and a click beside it: a login under way stops with it.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         if self.thread.read(cx).status() == &ConnectionStatus::AuthRequired {
@@ -1599,8 +1611,19 @@ fn method_icon(method: &acp::AuthMethod) -> IconName {
     }
 }
 
+/// A method as a button: its name, with "…" when it asks for something before it logs in.
+pub(crate) fn method_button_label(method: &acp::AuthMethod) -> String {
+    match login_input(method) {
+        LoginInput::ApiKey | LoginInput::Gateway => format!("{}…", method.name()),
+        LoginInput::Nothing => method.name().to_string(),
+    }
+}
+
 /// The agent's description of the method, or what a terminal method does when it gives none.
-fn method_description(method: &acp::AuthMethod, agent_name: &SharedString) -> Option<String> {
+pub(crate) fn method_description(
+    method: &acp::AuthMethod,
+    agent_name: &SharedString,
+) -> Option<String> {
     if let Some(description) = method.description().filter(|text| !text.trim().is_empty()) {
         return Some(description.to_string());
     }

@@ -604,15 +604,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   code font, "Edited" and the path (or "Edited N files") with +added −removed, or the agent's
   title with the thread folder stripped, always on one line (`one_line`: newlines and runs of
   spaces become one space, as t3code's truncated rows show a multi-line command, and a
-  command's `\`-newline continuations too); a spinner while it runs, "Failed" when it fails, a
-  chevron on hover. Every row starts closed and a click opens its output beside it (diffs,
+  command's `\`-newline continuations too); a spinner while it runs, "Failed" when it fails
+  ("Denied" when the user said no to it), a chevron on hover. Every row starts closed and a click opens its output beside it (diffs,
   terminals, text, images), up to 24 rems tall, with the input as JSON behind a small "Input"
   line at its end (Zed's "View Raw Input"), left out for commands, edits and calls with an
   image; its code blocks wrap long lines (t3code). A call awaiting permission stays open. Every
   tool's text shows as it was printed, as one code block in the buffer font (`as_code_block`):
   Claude fences some of it, but most agents send it bare, and as markdown a `git diff` lost its
   lines and indentation, its `---` became a dash and its `-` lines bullets. A subagent's report
-  is the one text still drawn as markdown. Rows are
+  and a plan to approve are the texts still drawn as markdown. Rows are
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
   from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
   "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
@@ -926,11 +926,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   what the agent said, else "Every thread with <agent> shares the login." or with several
   accounts the thread's (topic 3 B, Zed's description), then the rows or the step. After a
   message (topic 1 C), the thread shows only a line over the composer, "<agent> needs a
-  login" with Log In… (`AgentView::render_login_notice`), which opens `LoginDialog` over the
-  thread, titled "Log in to <agent>": the rows, the step, then "Logged in as …" with Done. It
-  doesn't open by itself, and Escape, Cancel or the backdrop close it, ending a login under
-  way. While logged out, the thread's composer is dimmed, says "Log in to <agent> to send a
-  message", and doesn't send.
+  login to answer" with each of the agent's ways to log in as a button, the first filled and
+  last, as Zed's "Authentication Required" callout has them (`AgentView::render_login_notice`,
+  `design/agent-input/` topic 9). Each opens `LoginDialog` over the thread on its step
+  (`LoginDialog::choose`), titled "Log in to <agent>": the step, Back to the rows, then
+  "Logged in as …" with Done. It doesn't open by itself, and Escape, Cancel or the backdrop
+  close it, ending a login under way. While logged out, the thread's composer is dimmed, says
+  "Log in to <agent> to send a message" (or "Your message is sent once you're logged in" when
+  one failed for the login), and doesn't send. Once the agent takes messages again, the
+  message that failed for the login goes by itself
+  (`AgentThread::send_message_that_needed_login`).
 - **The account** (`agentz_protocol::thread::AuthStatus`): Claude Agent and Codex report their
   login, unasked, with `_auth/status_update` (the account's email, plan and how it's logged
   in). The Account card shows it, or "Logged in" with the method agentZ logged in with.
@@ -1111,11 +1116,35 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   and session id) shows "In agentZ" with Open. Sessions outside every project are only
   counted, since a thread belongs to a project. Opening an imported thread loads its session,
   which replays the conversation.
-- **Requests for input** (`elicitation_card.rs`, Zed's checks for ACP's `elicitation/create`): a
-  card in the thread for a form (text, numbers, a choice, checkboxes) with Decline and Submit,
-  or a page to open, named by its host, with a warning for non-ASCII hosts. An opened page
-  stays as "Waiting for you to finish in your browser" until the agent sends
+- **Requests for input** (`elicitation_card.rs`, Zed's checks for ACP's `elicitation/create`,
+  picked in `design/agent-input/`): a card in the thread for a form (text, numbers, a choice,
+  checkboxes) with Decline and Submit, or a page to open. A required field's label ends in a
+  red *, Submit stays dim until each is filled (`FormState::lacks_required`), and a text field
+  says what's wrong as it loses focus (`ElicitationCard::check_field`). The agent's own
+  questions (Claude Agent's AskUserQuestion, as it asks JetBrains AIR:
+  `agentz_protocol::thread::form_questions`, each a field with choices followed by its "Other"
+  field) go one at a time, with "1 of 2" and Back: a choice of one goes on to the next, several
+  take Next, and the last one's button is Submit. A choice's " (Recommended)" is a tag, and
+  Other is a folded "Other…" line. While the card asks them, the tool call that asks has no
+  row (`AgentView::is_asking_questions`). A page's card is titled with the agent's message on
+  one line, then its host large with a lock (a warning for non-ASCII hosts), the whole
+  address behind Show address, and Decline, Copy link and "Open <host>". An opened page stays
+  as "Waiting for you to finish in your browser" until the agent sends
   `elicitation/complete`. × cancels.
+- **Answers** (`ToolCall::answer`, `ToolAnswer`, `agentz_protocol::thread::form_answer`): the
+  permission option chosen, or the form answered or declined, stays on the tool call that
+  asked, and a dim line under its row says it (`render_answer_line`, `chosen_words`): "You
+  allowed it once", "You allowed npm test commands from now on" (from a "don't ask again
+  for …" choice), "You denied it", "You chose: <name>" for other choices, "You answered: …".
+  A question's row turns to "Asked: <headers>", and a No marks the row "Denied". A plan to
+  approve (`is_plan`: a mode switch with text, as Claude Agent's ExitPlanMode is) shows as
+  markdown under its row with no Input while it asks, and folds into the row once answered.
+- **Keys and the pill** (Zed's `AllowOnce`, `AllowAlways`, `RejectOnce`: ⌘Y, ⌘⌥Y, ⌘⌥Z on
+  macOS, Alt-Shift-A/Q/X elsewhere): while the thread has focus they answer the first
+  request waiting (`AgentView::answer_first_request`), and the first choice of each kind
+  shows its key. While a request is out of view, a pill over the composer says "<agent> is
+  waiting for you" with an arrow toward it, and scrolls to it (`render_waiting_pill`,
+  `waiting_row`).
 - **Controls** (`controls.rs`): the login, account and input-request surfaces' buttons with a
   solid accent or red fill, fields with a focus ring, avatars, icon tiles and code boxes,
   where `ui`'s styles fall short.
@@ -1276,14 +1305,16 @@ Picked in `design/agent-subagents/`; Zed's subagent card (`render_subagent_card`
   ends with the subagent, with its report and how long it ran (`end_subagent_card`). The
   agent hears of the end itself, so the parent isn't told (`delivered`); subagents still
   running when the agent stops, or at shutdown, end as Interrupted
-  (`end_orphaned_subagents`). A subagent's permission request is asked in the parent, at its
-  card (`PermissionRequest::subagent_card`), while its tool call goes to the subthread.
+  (`end_orphaned_subagents`). A subagent's permission request is asked in the parent, at the
+  end of the thread as the agent's own would be, its card naming the subagent ("<description>
+  · Edit .env") (`PermissionRequest::subagent_card`), while its tool call goes to the
+  subthread.
 - **The row** (`AgentView::render_subagent`, `tool_calls::SubagentCall`): any subagent call
   (one with a subthread, or whose input has a `subagent_type`, as Factory Droid's Task has) is
   a row of its own, not folded into a run of work: a bot icon, the description, the type as a
   tag, Open for a subthread, and a spinner, or the time and a check ("Failed", "Stopped") once
-  done. While a subthread's runs, the step it's on shows under it; a permission request takes
-  the step's place.
+  done. While a subthread's runs, the step it's on shows under it; while it waits on a
+  permission, "Waiting for you" takes the step's place.
 - **Opened**: a subthread's shows Zed's preview (`render_subagent_preview`, following the
   subthread with `sync_subagent_threads`): its last 8 steps, fading at the top when there are
   more, its report, and a strip that opens the subthread ("Make Subagent Full Screen").

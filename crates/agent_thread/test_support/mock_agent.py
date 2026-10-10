@@ -85,7 +85,15 @@ So are resource links (their URIs) and images (their MIME types). With MOCK_IMAG
 takes images. A prompt of "image" shows an image in a tool call's output and in its reply.
 
 A prompt of "form" asks the client to fill in a form (a session elicitation) and replies
-"Form: <action> <content as JSON>".
+"Form: <action> <content as JSON>". "question" and "questions" ask one question and two, as
+Claude Agent's AskUserQuestion does for JetBrains AIR (an "Asking for your input" tool call,
+then a form tied to it, each question followed by its "Other" field), and reply "Answer:
+<action> <content as JSON>". "plan" asks to approve a plan as Claude Agent does (a permission
+request on an "Approve Plan" tool call showing the plan, with its five choices; "Exited Plan
+Mode" once allowed) and replies "Plan: <option>", and "run-tests" asks to run `npm test` with
+Claude Agent's Yes, "Yes, and don't ask again for npm test commands" and No, replying "Ran:
+<option>". A No fails the tool call. "page" has an MCP tool ask the client to open a page
+(a URL elicitation tied to its tool call) and replies "Page: <action>".
 
 It supports `session/close`, and with MOCK_CLOSED_FILE set, notes each closed session there.
 
@@ -689,6 +697,86 @@ def ask_form(session_id):
     return f"Form: {answer.get('action')} {json.dumps(answer.get('content'), sort_keys=True)}"
 
 
+QUESTIONS = {
+    "question": [
+        {"header": "Approach", "question": "How should I port the icon picker?",
+         "options": [("Design round first (Recommended)",
+                      "Mock it on the board, then build what you pick."),
+                     ("Port it as is", "Copy Zed's picker without changes.")]},
+    ],
+    "questions": [
+        {"header": "Test runner", "question": "Which test runner should the tests use?",
+         "options": [("Vitest", "Already used by src/cart: fast, runs in watch mode."),
+                     ("Jest", "What the rest of the app uses.")]},
+        {"header": "Cases", "question": "Which cases should the tests cover?", "multi": True,
+         "options": [("Empty cart", ""), ("Discounts", "Percent and fixed amounts."),
+                     ("Rounding", "Totals that end in half a cent."), ("Currencies", "")]},
+    ],
+}
+
+
+def ask_questions(request_id, session_id, questions):
+    """Asks as Claude Agent's AskUserQuestion does for JetBrains AIR: a tool call, then a form
+    tied to it, each question's choices followed by an "Other" field for an answer of one's
+    own."""
+    call_id = f"ask-{request_id}"
+    update(session_id, {"sessionUpdate": "tool_call", "toolCallId": call_id,
+                        "title": "Asking for your input", "kind": "other", "status": "pending",
+                        "content": [{"type": "content", "content": {
+                            "type": "text", "text": question["question"]}}
+                            for question in questions]})
+    single = len(questions) == 1
+    properties = {}
+    for index, question in enumerate(questions):
+        options = [{"const": label, "title": label, **({"description": description}
+                                                        if description else {})}
+                   for label, description in question["options"]]
+        field = {"title": question["header"]}
+        if not single:
+            field["description"] = question["question"]
+        if question.get("multi"):
+            field.update({"type": "array", "items": {"anyOf": options}})
+        else:
+            field.update({"type": "string", "oneOf": options})
+        properties[f"question_{index}"] = field
+        properties[f"question_{index}_custom"] = {
+            "type": "string", "title": "Other",
+            "description": "Type your own answer, or add a note to the option you chose "
+                           "above (optional).",
+            "_meta": {"jetbrains": {"air": {"customAnswer": {
+                "questionId": f"question_{index}", "isCustomAnswer": True}}}}}
+    answer = client_request("elicitation/create", {
+        "mode": "form", "sessionId": session_id, "toolCallId": call_id,
+        "message": questions[0]["question"] if single else "Please answer the following questions.",
+        "requestedSchema": {"type": "object", "properties": properties}})
+    update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                        "status": "completed"})
+    return f"Answer: {answer.get('action')} {json.dumps(answer.get('content'), sort_keys=True)}"
+
+
+PLAN = ("## Port the icon picker\n\n1. Copy Zed's `IconPicker` into `crates/app`.\n"
+        "2. Show it from the project's **Change Icon…** item.\n3. Keep the last icon picked.")
+
+
+def ask_permission(request_id, session_id, tool_call, options, title_when_done=None):
+    """Shows the tool call, asks permission for it as Claude Agent does, and ends it as the
+    choice says: done, or failed for a No."""
+    update(session_id, {"sessionUpdate": "tool_call", "status": "pending", **tool_call})
+    answer = client_request("session/request_permission", {
+        "sessionId": session_id, "toolCall": {"toolCallId": tool_call["toolCallId"]},
+        "options": [{"optionId": option_id, "name": name, "kind": kind}
+                    for option_id, name, kind in options]})
+    chosen = (answer.get("outcome") or {}).get("optionId", "cancelled")
+    allowed = any(option_id == chosen and kind.startswith("allow")
+                  for option_id, _, kind in options)
+    done = {"sessionUpdate": "tool_call_update", "toolCallId": tool_call["toolCallId"],
+            "status": "completed" if allowed else "failed"}
+    if allowed and title_when_done:
+        done["title"] = title_when_done
+    update(session_id, done)
+    return chosen
+
+
 def run_in_terminal(session_id, command):
     created = client_request("terminal/create", {"sessionId": session_id, "command": command,
                                                  "outputByteLimit": 10000})
@@ -947,6 +1035,52 @@ for line in sys.stdin:
         elif prompt_text == "form":
             reply = ask_form(params["sessionId"])
             update(params["sessionId"], text_chunk("agent_message_chunk", reply))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text in QUESTIONS:
+            reply = ask_questions(message["id"], params["sessionId"], QUESTIONS[prompt_text])
+            update(params["sessionId"], text_chunk("agent_message_chunk", reply))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "plan":
+            chosen = ask_permission(message["id"], params["sessionId"], {
+                "toolCallId": f"plan-{message['id']}", "title": "Approve Plan",
+                "kind": "switch_mode", "rawInput": {"plan": PLAN},
+                "content": [{"type": "content", "content": {"type": "text", "text": PLAN}}]}, [
+                ("exit-plan-clear-auto", "Yes, clear context (34% used) and use auto mode",
+                 "allow_always"),
+                ("exit-plan-auto", "Yes, and use auto mode", "allow_always"),
+                ("exit-plan-bypass", "Yes, and bypass permissions", "allow_always"),
+                ("exit-plan-default", "Yes, manually approve edits", "allow_once"),
+                ("reject", "No, keep planning", "reject_once")], "Exited Plan Mode")
+            update(params["sessionId"], text_chunk("agent_message_chunk", f"Plan: {chosen}"))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "run-tests":
+            chosen = ask_permission(message["id"], params["sessionId"], {
+                "toolCallId": f"run-{message['id']}", "title": "npm test", "kind": "execute",
+                "rawInput": {"command": "npm test"}}, [
+                ("allow-once", "Yes", "allow_once"),
+                ("allow-with-updates", "Yes, and don't ask again for npm test commands",
+                 "allow_always"),
+                ("reject", "No", "reject_once")])
+            update(params["sessionId"], text_chunk("agent_message_chunk", f"Ran: {chosen}"))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "page":
+            session_id = params["sessionId"]
+            call_id = f"page-{message['id']}"
+            update(session_id, {"sessionUpdate": "tool_call", "toolCallId": call_id,
+                                "title": "mcp__linear__list_issues", "kind": "other",
+                                "status": "in_progress"})
+            answer = client_request("elicitation/create", {
+                "mode": "url", "sessionId": session_id, "toolCallId": call_id,
+                "elicitationId": f"linear-{message['id']}",
+                "url": "https://linear.app/oauth/authorize?client_id=8f3c2a&redirect_uri="
+                       "http%3A%2F%2F127.0.0.1%3A33418%2Fcallback&scope=read%2Cwrite&state=Zk2q",
+                "message": "linear needs you to sign in to Linear and allow access."})
+            if answer.get("action") == "accept":
+                send({"jsonrpc": "2.0", "method": "elicitation/complete",
+                      "params": {"elicitationId": f"linear-{message['id']}"}})
+            update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                                "status": "completed"})
+            update(session_id, text_chunk("agent_message_chunk", f"Page: {answer.get('action')}"))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "background":
             update(params["sessionId"], text_chunk("agent_message_chunk", "Working in the background"))

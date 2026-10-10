@@ -1072,6 +1072,7 @@ mod tests {
             started_at: None,
             duration: None,
             subthread: None,
+            answer: None,
         }
     }
 

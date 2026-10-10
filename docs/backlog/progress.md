@@ -42,7 +42,7 @@ Each round's `decisions.md` is its spec. A built round's backlog entry is remove
 |---|---|---|
 | Subscription timeline | `design/subscription-timeline/` (15 topics) | yes, Settings › Usage |
 | Merge projects across machines | `design/project-copies/` (5) | yes, one name and New Thread's machine picker |
-| Agents' requests for user input | `design/agent-input/` (13) | |
+| Agents' requests for user input | `design/agent-input/` (13) | yes, every request in its tool call's row, keys and the pill |
 | Every kind of tool call | `design/tool-calls-2/` (20) and `design/agentz-tools/` | |
 | Subagents and subthreads in threads | `design/agentz-tools/` (13) | |
 | More options for a new thread's worktree or pasture | `design/new-workspace/` (11) | |
