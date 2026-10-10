@@ -1,0 +1,116 @@
+{
+  "topics": {
+    "permission": {
+      "pick": null,
+      "picks": [],
+      "none": true,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "shows": {
+      "pick": null,
+      "picks": [],
+      "none": true,
+      "comments": {},
+      "note": "keep it as is",
+      "also": [],
+      "decided": true
+    },
+    "deny": {
+      "pick": "D",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "plan": {
+      "pick": "D",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "question": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "questions": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "form": {
+      "pick": null,
+      "picks": [
+        "B"
+      ],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "url": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "login": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "answered": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "elsewhere": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "keys": {
+      "pick": null,
+      "picks": [
+        "A"
+      ],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "waiting": {
+      "pick": null,
+      "picks": [
+        "A"
+      ],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-10T08:50:51.753Z"
+}
