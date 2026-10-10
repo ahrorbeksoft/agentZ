@@ -14,3 +14,8 @@ text.
 
 On Linux, Ctrl-, does nothing while a terminal has focus; it should open Settings as it does
 elsewhere.
+
+### Stop doesn't stop some ACP agents' turns
+
+Stop doesn't work on some ACP agents: Factory Droid's turn, for one, doesn't stop at all. Find a
+more reliable way to stop a session's turn.
