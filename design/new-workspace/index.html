@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>New Worktrees Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="new-workspace" data-title="New worktrees and pastures">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · New worktrees and pastures <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>From the backlog: “When a new thread gets its own worktree or pasture, offer more choices about how it’s created, such as picking a branch and checking out from an existing branch. Research how t3code does it first, then decide what to build.”</p>
+<p>How t3code does it: its workspace menu has Current checkout, New worktree and Previous worktree. With New worktree picked, the branch under the composer reads “From main” and opens a searchable list of local and remote branches, marked current, default, worktree or remote, defaulting to the repository’s default branch. A Start from origin switch there fetches the base first. Typing a pull request’s number offers to check it out, in the project or a worktree. The branch gets a temporary name, renamed after the first message (a prefix, a model-picked one, or custom instructions in Settings). The worktree is made when the message is sent, with its steps shown. Settings has the default for new threads, Start from origin and Submodules.</p>
+<p>agentZ today makes a thread’s worktree or pasture the moment it’s picked, from whatever the project has checked out, on agentz/&lt;id&gt;. The Workspaces view’s New Worktree… dialog already has a name and a From picker. t3code doesn’t check out an existing branch in a new worktree (it reuses a worktree that has it), so that topic’s options are agentZ’s own. The mocks use the storefront project (main, checkout-flow in a worktree, fix-login, redesign-cart, and origin’s payments).</p>`;
+</script>
+<script src="mock-new-workspace.js"></script>
+<script src="topics-new-workspace.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

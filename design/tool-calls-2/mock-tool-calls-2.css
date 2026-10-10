@@ -1,0 +1,10 @@
+/* The tool-calls-2 round's own pieces: the running spinner and t3code's shine. */
+.m .t2-spin svg { animation: t2-spin 2s linear infinite; }
+@keyframes t2-spin { to { transform: rotate(360deg); } }
+.m .t2-shine {
+  background: linear-gradient(90deg, #8b909c 0%, #8b909c 35%, #dce0e5 50%, #8b909c 65%, #8b909c 100%);
+  background-size: 300% 100%; background-position: 60% 0;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: t2-shine 2.2s linear infinite;
+}
+@keyframes t2-shine { from { background-position: 100% 0; } to { background-position: 0% 0; } }
