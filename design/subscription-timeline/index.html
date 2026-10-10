@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subscription Timeline Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="mock-timeline.css">
+</head>
+<body data-area="subscription-timeline" data-title="Subscription timeline">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Subscription timeline <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>From the backlog: “Add a timeline for subscriptions like the one in CLIProxyAPI’s management UI.” Studied in CLIProxyAPI’s management center (Cli-Proxy-API-Management-Center, its Quota page’s QuotaTimeline and quotaTimelineModel).</p>
+<p>How CLIProxyAPI does it: under its quota cards, a “Quota windows” chart answers when each credential’s quota comes back, and whether they all come back at once. Each credential is a lane; across two weeks (a cell a day, starting on Sunday) each lane draws its longest window as bars: the current one filled with what’s used and labeled “48% · 10/14 18:00”, the ones before it faded, the ones after it dashed. A line marks now. A Weekly and 5-hour switch zooms to three days (a cell per 6 hours) and the 5-hour windows; ‹ Today › moves a week or a day at a time. Codex’s limit resets show as amber ticks where they expire. A legend and a sentence explain the bars.</p>
+<p>In agentZ, every account’s read already has what this needs: each window’s name, how much is used, when it resets and how long it runs. Today Settings › Usage shows a table per agent (a row per account, a cell per window, colored by pace), and the Account tab the same for one agent. The demo is This Mac on Thursday, October 9, 14:20: Claude Agent with two accounts, Codex with one and a limit reset, Factory Droid with four, and Devin with one that hasn’t been used. The mocks are JetBrains Dark at the app’s sizes; the screenshots are today’s app with the mock agent’s three accounts.</p>`;
+</script>
+<script src="mock-timeline.js"></script>
+<script src="topics-timeline.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
