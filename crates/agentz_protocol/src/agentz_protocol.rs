@@ -488,6 +488,13 @@ pub enum Request {
         id: AttachmentId,
         thumbnail: bool,
     },
+    /// An image file on the thread's machine that its agent's markdown names or a tool read,
+    /// as t3code serves a message's media files: absolute, from `~`, or in the folder the
+    /// thread works in: [`Response::AttachmentData`].
+    ImageFile {
+        thread_id: ThreadId,
+        path: String,
+    },
     /// Keeps a file from the client's machine on the server's, for a thread whose agent can't
     /// reach the client's files (one on another machine): [`Response::UploadedFile`] with
     /// where it's kept.

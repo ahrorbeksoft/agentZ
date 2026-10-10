@@ -79,7 +79,8 @@ thread (`DrawableProvider`) and skips a present when none is ready, and `gpui_ma
 retries it on the next display tick (`present_skipped`). Zed waits in `nextDrawable` on the main
 thread; fullscreen, while a spinner or shimmer redraws every frame, that wait took most of each
 frame and made scrolling lag (zed-industries/zed#7940). Keep this when updating those crates.
-`gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
+`markdown`'s `MarkdownElement::image_renderer` lets the thread draw markdown images its own way
+(see Images). `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
 on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,
 so an open tool call's output raced the conversation.
 
@@ -784,8 +785,17 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   `without_image_links`) show as 100 × 75 thumbnails cropped to fill, two to a row: the
   user's above its text, the agent's where they are in its reply. A tool call with an image
   starts open, the image under its row at most 384 px wide and tall, in a thin border; its
-  row is measured again once the image loads (`remeasure_loaded_tool_images`), since its
-  height is known only then. Composer chips show their thumbnail on hover
+  row is measured again once the image loads (`remeasure_loaded_images`), since its
+  height is known only then. A finished read of an image file that gave back only text
+  (Factory Droid's say "[Image: image/png]") keeps the file it read as the read's image
+  (`AgentThread::keep_read_image`). Markdown images in messages, thoughts and tool output
+  load as t3code's `classifyMarkdownImageSource` sorts them (`classify_markdown_image`):
+  `http(s)` from the web, `agentz://attachment/` links from the store, and any other path
+  (absolute, `~`, `file://`, or relative to the folder the thread works in) from the thread's
+  machine (`Request::ImageFile`, image types only, up to 32 MiB). The markdown crate's
+  `image_renderer` (added for this) draws them as t3code does: at their own size up to
+  480 px, in a thin border, a 16:9 slot while loading (its row measured again once it's
+  loaded), "Image unavailable · alt" for one that can't load. Composer chips show their thumbnail on hover
   (`ImagePreviewTooltip`, and `HoveredImage` for an `@Image` link in a thought). Every image
   has a zoom-in cursor (`CursorStyle::ZoomIn`, added to GPUI) and a click opens the original
   in t3code's viewer over the window (`ImageViewer`): the image fit to the window over a dark

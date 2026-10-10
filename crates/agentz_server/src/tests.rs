@@ -8529,6 +8529,57 @@ async fn images_are_kept_for_the_thread() {
     };
     assert_eq!(original.mime_type, "image/png");
 
+    // A read of an image that gives back only text, as Droid's do, shows the file it read.
+    let cart = server.project_dir.path().join("cart.png");
+    std::fs::write(&cart, &png).expect("written");
+    let read = json!({
+        "title": "Read cart.png",
+        "kind": "read",
+        "locations": [{"path": cart}],
+        "content": [{"type": "content", "content": {
+            "type": "text",
+            "text": "Image file: cart.png\n[Image: image/png]",
+        }}],
+    });
+    client
+        .prompt_and_wait(thread_id, &format!("tool-call {read}"))
+        .await;
+    let (read_images, read_sizes) = client
+        .thread(connection)
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::ToolCall(tool_call) if tool_call.title == "Read cart.png" => {
+                Some((tool_call.images.clone(), tool_call.image_sizes.clone()))
+            }
+            _ => None,
+        })
+        .expect("the read");
+    assert_eq!(
+        read_images,
+        [AttachmentId::for_image(&png, "image/png").expect("an id")]
+    );
+    assert_eq!(
+        read_sizes
+            .iter()
+            .map(|size| size.map(|size| (size.width, size.height)))
+            .collect::<Vec<_>>(),
+        [Some((1200, 600))]
+    );
+
+    // A reply's markdown names image files by their path in the thread's folder.
+    let Response::AttachmentData(file) = client
+        .ok(Request::ImageFile {
+            thread_id,
+            path: "cart.png".into(),
+        })
+        .await
+    else {
+        panic!("expected the image file");
+    };
+    assert_eq!(file.mime_type, "image/png");
+    assert_eq!(base64.decode(file.data).expect("base64"), png);
+
     // Only well-formed ids name an image, and deleting the thread forgets its images.
     let attachments = server
         .data_dir

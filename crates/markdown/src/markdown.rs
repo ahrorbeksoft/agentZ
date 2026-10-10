@@ -1710,6 +1710,17 @@ pub enum AutoscrollBehavior {
     Controlled(ScrollHandle),
 }
 
+/// An image in the markdown, for [`MarkdownElement::image_renderer`].
+pub struct MarkdownImage {
+    pub source: ImageSource,
+    pub dest_url: SharedString,
+    pub alt_text: Option<SharedString>,
+    /// Where the image starts in the markdown's source.
+    pub source_offset: usize,
+}
+
+type ImageRenderer = Rc<dyn Fn(MarkdownImage, &mut Window, &mut App) -> AnyElement>;
+
 pub struct MarkdownElement {
     markdown: Entity<Markdown>,
     style: MarkdownStyle,
@@ -1722,6 +1733,7 @@ pub struct MarkdownElement {
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     on_mermaid_zoom: Option<MermaidZoomCallback>,
     image_resolver: Option<Box<dyn Fn(&str, &App) -> Option<ImageSource>>>,
+    image_renderer: Option<ImageRenderer>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
     /// Test-only hook to observe the laid-out text when this element is
@@ -1749,6 +1761,7 @@ impl MarkdownElement {
             on_checkbox_toggle: None,
             on_mermaid_zoom: None,
             image_resolver: None,
+            image_renderer: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
             #[cfg(test)]
@@ -1852,6 +1865,15 @@ impl MarkdownElement {
         self
     }
 
+    /// Draws the images that aren't inside a link, in place of the plain image.
+    pub fn image_renderer(
+        mut self,
+        renderer: impl Fn(MarkdownImage, &mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.image_renderer = Some(Rc::new(renderer));
+        self
+    }
+
     pub fn show_root_block_markers(mut self) -> Self {
         self.show_root_block_markers = true;
         self
@@ -1915,12 +1937,26 @@ impl MarkdownElement {
         alt_text: Option<SharedString>,
         width: Option<DefiniteLength>,
         height: Option<DefiniteLength>,
+        window: &mut Window,
+        cx: &mut App,
     ) {
         let enclosing_link_url = (builder.link_depth > 0)
             .then(|| builder.rendered_links.last())
             .flatten()
             .map(|link| link.destination_url.clone());
         let fallback_opens_image_url = enclosing_link_url.is_none();
+        if enclosing_link_url.is_none()
+            && let Some(render) = &self.image_renderer
+        {
+            let image = MarkdownImage {
+                source,
+                dest_url,
+                alt_text,
+                source_offset: range.start,
+            };
+            builder.push_image_child(render(image, window, cx));
+            return;
+        }
 
         let image_element = {
             let image_start = range.start;
@@ -2688,6 +2724,8 @@ impl Element for MarkdownElement {
                                     alt_text,
                                     None,
                                     None,
+                                    window,
+                                    cx,
                                 );
                             } else if let Some(source) = self
                                 .image_resolver
@@ -2703,6 +2741,8 @@ impl Element for MarkdownElement {
                                     alt_text,
                                     None,
                                     None,
+                                    window,
+                                    cx,
                                 );
                             }
                         }
@@ -2855,7 +2895,13 @@ impl Element for MarkdownElement {
                         MarkdownTag::HtmlBlock => {
                             builder.push_div(div(), range, markdown_end);
                             if let Some(block) = parsed_markdown.html_blocks.get(&range.start) {
-                                self.render_html_block(block, &mut builder, markdown_end, cx);
+                                self.render_html_block(
+                                    block,
+                                    &mut builder,
+                                    markdown_end,
+                                    window,
+                                    cx,
+                                );
                                 handled_html_block = true;
                             }
                         }

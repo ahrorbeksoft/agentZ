@@ -3145,8 +3145,16 @@ impl AgentThread {
                     _ => None,
                 },
             ),
-            acp::SessionUpdate::ToolCall(tool_call) => self.upsert_tool_call(tool_call),
-            acp::SessionUpdate::ToolCallUpdate(update) => self.apply_tool_call_update(update),
+            acp::SessionUpdate::ToolCall(tool_call) => {
+                let id = tool_call.tool_call_id.clone();
+                self.upsert_tool_call(tool_call);
+                self.keep_read_image(&id);
+            }
+            acp::SessionUpdate::ToolCallUpdate(update) => {
+                let id = update.tool_call_id.clone();
+                self.apply_tool_call_update(update);
+                self.keep_read_image(&id);
+            }
             acp::SessionUpdate::Plan(plan) => {
                 self.view.state.plan = plan
                     .entries
@@ -3364,6 +3372,59 @@ impl AgentThread {
                     .map_or_else(|| "`@Image`".to_string(), |id| id.markdown_link()),
             ),
             _ => None,
+        }
+    }
+
+    /// A finished read of an image file that gave back only text, as Factory Droid's do
+    /// ("[Image: image/png]"): the file is kept for the thread, as the image the read gave.
+    fn keep_read_image(&mut self, id: &acp::ToolCallId) {
+        let Some(attachments) = &self.attachments else {
+            return;
+        };
+        let read_path = self
+            .view
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::ToolCall(tool_call)
+                    if &tool_call.id == id
+                        && tool_call.kind == acp::ToolKind::Read
+                        && tool_call.status == acp::ToolCallStatus::Completed
+                        && tool_call.images.is_empty() =>
+                {
+                    match tool_call.locations.as_slice() {
+                        [path] => Some(path.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            });
+        let Some(path) = read_path.map(|path| self.view.state.cwd.join(path)) else {
+            return;
+        };
+        let Some(mime_type) = agentz_protocol::attachments::image_type_of_path(&path) else {
+            return;
+        };
+        let kept = std::fs::metadata(&path)
+            .and_then(|metadata| {
+                if metadata.len() > agentz_protocol::attachments::MAX_ATTACHMENT_SIZE as u64 {
+                    return Err(std::io::Error::other("too large to show"));
+                }
+                std::fs::read(&path)
+            })
+            .with_context(|| format!("reading {}", path.display()))
+            .and_then(|bytes| Ok((attachments.add(mime_type, &bytes)?, image_size(&bytes))));
+        let (image, size) = match kept {
+            Ok(kept) => kept,
+            Err(error) => {
+                log::warn!("failed to keep an image the agent read: {error:#}");
+                return;
+            }
+        };
+        if let Some(tool_call) = self.tool_call_mut(id) {
+            tool_call.images.push(image);
+            tool_call.image_sizes.push(size);
         }
     }
 

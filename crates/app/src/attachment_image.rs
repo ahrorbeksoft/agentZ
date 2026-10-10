@@ -1,6 +1,6 @@
-//! Images kept by a thread's server ([`agentz_protocol::attachments`]), fetched from it to show:
-//! a thumbnail on hover, and the original in a viewer over the whole window, as t3code's
-//! expanded image preview.
+//! Images kept by a thread's server ([`agentz_protocol::attachments`]) and image files on its
+//! machine, fetched from it to show: a thumbnail on hover, and the original in a viewer over the
+//! whole window, as t3code's expanded image preview.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -12,9 +12,9 @@ use anyhow::{Context as _, anyhow};
 use base64::Engine as _;
 use gpui::{
     App, Asset, Bounds, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable,
-    ImageCacheError, ImageFormat, ImageSource, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PinchEvent, Point, RenderImage, ScrollWheelEvent, Size, Stateful,
-    Window, img, point, size,
+    ImageCacheError, ImageFormat, ImageSource, ImgResourceLoader, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Point, RenderImage, Resource,
+    ScrollWheelEvent, SharedUri, Size, Stateful, Window, img, point, size,
 };
 use projects::ThreadId;
 use text_input::{CHIP_IMAGE_PREVIEW_SIZE, FittedImage, image_size};
@@ -83,24 +83,108 @@ impl AttachmentImage {
     }
 
     fn source(&self, thumbnail: bool) -> ImageSource {
-        let request = AttachmentRequest {
-            image: self.clone(),
+        image_source(AttachmentRequest {
+            machine: self.machine,
+            thread_id: self.thread_id,
+            image: RequestedImage::Attachment(self.id.clone()),
             thumbnail,
-        };
-        ImageSource::Custom(Arc::new(move |window, cx| {
-            let result = window.use_asset::<AttachmentLoader>(&request, cx)?;
-            match result {
-                Ok(image) => Some(Ok(image)),
-                Err(failure) => {
-                    // Asked for while the machine was offline: asked for again once it's back.
-                    if failure.while_offline && is_online(request.image.machine, cx) {
-                        cx.remove_asset::<AttachmentLoader>(&request);
-                    }
-                    Some(Err(failure.error))
-                }
-            }
-        }))
+        })
     }
+}
+
+/// An image file on a thread's machine, which its agent's markdown names or a tool read:
+/// absolute, from `~`, or in the folder the thread works in ([`Request::ImageFile`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FileImage {
+    pub machine: MachineId,
+    pub thread_id: ThreadId,
+    pub path: String,
+}
+
+impl FileImage {
+    pub fn original(&self) -> ImageSource {
+        image_source(AttachmentRequest {
+            machine: self.machine,
+            thread_id: self.thread_id,
+            image: RequestedImage::File(self.path.clone()),
+            thumbnail: false,
+        })
+    }
+}
+
+fn image_source(request: AttachmentRequest) -> ImageSource {
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        let result = window.use_asset::<AttachmentLoader>(&request, cx)?;
+        match result {
+            Ok(image) => Some(Ok(image)),
+            Err(failure) => {
+                // Asked for while the machine was offline: asked for again once it's back.
+                if failure.while_offline && is_online(request.machine, cx) {
+                    cx.remove_asset::<AttachmentLoader>(&request);
+                }
+                Some(Err(failure.error))
+            }
+        }
+    }))
+}
+
+/// A web image, loaded as `img` loads it, but as a custom source, so its size can be read
+/// once it's loaded ([`text_input::image_size`]).
+pub(crate) fn web_image(uri: String) -> ImageSource {
+    let resource = Resource::Uri(SharedUri::from(uri));
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        window.use_asset::<ImgResourceLoader>(&resource, cx)
+    }))
+}
+
+/// Where a markdown image's bytes come from, as t3code's `classifyMarkdownImageSource` sorts
+/// them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MarkdownImageSource {
+    Web(String),
+    Attachment(AttachmentId),
+    /// A path on the thread's machine, absolute, from `~`, or in the thread's folder.
+    File(String),
+}
+
+/// Where the image a markdown image names is: on the web, kept for the thread, or a file on
+/// its machine. Anything else (another scheme, a fragment) isn't an image to load.
+pub(crate) fn classify_markdown_image(source: &str) -> Option<MarkdownImageSource> {
+    let source = source.trim();
+    if source.is_empty() || source.starts_with('#') || source.starts_with('?') {
+        return None;
+    }
+    let lowercase = source.to_ascii_lowercase();
+    if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
+        return Some(MarkdownImageSource::Web(source.to_string()));
+    }
+    if source.starts_with("//") {
+        return Some(MarkdownImageSource::Web(format!("https:{source}")));
+    }
+    if let Some(id) = AttachmentId::from_uri(source) {
+        return Some(MarkdownImageSource::Attachment(id));
+    }
+    if lowercase.starts_with("file:") {
+        let path = url::Url::parse(source).ok()?.to_file_path().ok()?;
+        return Some(MarkdownImageSource::File(
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    let path = source.split(['?', '#']).next().unwrap_or_default();
+    let path = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    let has_scheme = path.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|character: char| character.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+.-".contains(character))
+    });
+    if path.is_empty() || has_scheme {
+        return None;
+    }
+    Some(MarkdownImageSource::File(path))
 }
 
 /// Whether the image is still being fetched, so its size isn't known yet.
@@ -193,8 +277,25 @@ pub(crate) fn without_image_links(text: &str) -> (Cow<'_, str>, Vec<AttachmentId
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AttachmentRequest {
-    image: AttachmentImage,
+    machine: MachineId,
+    thread_id: ThreadId,
+    image: RequestedImage,
     thumbnail: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RequestedImage {
+    Attachment(AttachmentId),
+    File(String),
+}
+
+impl RequestedImage {
+    fn name(&self) -> &str {
+        match self {
+            RequestedImage::Attachment(id) => id.as_str(),
+            RequestedImage::File(path) => path,
+        }
+    }
 }
 
 /// An image a server couldn't send, and whether its machine was offline when it was asked
@@ -205,7 +306,8 @@ pub(crate) struct LoadFailure {
     pub while_offline: bool,
 }
 
-/// Fetches an image from its thread's server ([`Request::Attachment`]) and decodes it.
+/// Fetches an image from its thread's server ([`Request::Attachment`], [`Request::ImageFile`])
+/// and decodes it.
 enum AttachmentLoader {}
 
 impl Asset for AttachmentLoader {
@@ -216,19 +318,22 @@ impl Asset for AttachmentLoader {
         source: Self::Source,
         cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
-        let client = Machines::global(cx)
-            .read(cx)
-            .client(source.image.machine, cx);
+        let client = Machines::global(cx).read(cx).client(source.machine, cx);
         let while_offline = !client
             .as_ref()
             .is_some_and(|client| client.read(cx).is_online());
-        let response = client.map(|client| {
-            client.read(cx).request(Request::Attachment {
-                thread_id: source.image.thread_id,
-                id: source.image.id.clone(),
+        let request = match &source.image {
+            RequestedImage::Attachment(id) => Request::Attachment {
+                thread_id: source.thread_id,
+                id: id.clone(),
                 thumbnail: source.thumbnail,
-            })
-        });
+            },
+            RequestedImage::File(path) => Request::ImageFile {
+                thread_id: source.thread_id,
+                path: path.clone(),
+            },
+        };
+        let response = client.map(|client| client.read(cx).request(request));
         let svg_renderer = cx.svg_renderer();
         async move {
             let image = async {
@@ -247,7 +352,7 @@ impl Asset for AttachmentLoader {
             image.map_err(|error| {
                 log::error!(
                     "failed to load the image {}: {error:#}",
-                    source.image.id.as_str()
+                    source.image.name()
                 );
                 LoadFailure {
                     error: error.into(),
@@ -915,6 +1020,48 @@ mod tests {
         assert_eq!(rest, "The sidebar is cut off.");
         assert_eq!(images, [first, second]);
         assert_eq!(without_image_links("Plain"), ("Plain".into(), Vec::new()));
+    }
+
+    #[test]
+    fn markdown_images_load_from_the_web_or_the_threads_machine() {
+        use MarkdownImageSource::*;
+        let file = |path: &str| Some(File(path.to_string()));
+        assert_eq!(
+            classify_markdown_image("https://example.com/a.png"),
+            Some(Web("https://example.com/a.png".into()))
+        );
+        assert_eq!(
+            classify_markdown_image("//example.com/a.png"),
+            Some(Web("https://example.com/a.png".into()))
+        );
+        assert_eq!(
+            classify_markdown_image(&id("a").uri()),
+            Some(Attachment(id("a")))
+        );
+        assert_eq!(
+            classify_markdown_image("shots/cart.png"),
+            file("shots/cart.png")
+        );
+        assert_eq!(
+            classify_markdown_image("./my%20cart.png?raw=1#top"),
+            file("./my cart.png")
+        );
+        assert_eq!(
+            classify_markdown_image("/tmp/cart.png"),
+            file("/tmp/cart.png")
+        );
+        assert_eq!(classify_markdown_image("~/cart.png"), file("~/cart.png"));
+        assert_eq!(
+            classify_markdown_image("file:///tmp/my%20cart.png"),
+            file("/tmp/my cart.png")
+        );
+        assert_eq!(classify_markdown_image("mailto:someone@example.com"), None);
+        assert_eq!(
+            classify_markdown_image("data:image/png;base64,broken"),
+            None
+        );
+        assert_eq!(classify_markdown_image("#top"), None);
+        assert_eq!(classify_markdown_image(""), None);
     }
 
     /// A blank image of this many pixels, as the viewer has one once it's loaded.

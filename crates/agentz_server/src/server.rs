@@ -772,6 +772,7 @@ impl Server {
                 request:
                     request @ (Request::AddAttachment { .. }
                     | Request::Attachment { .. }
+                    | Request::ImageFile { .. }
                     | Request::UploadFile { .. }),
             } => self.attachment_request(client, id, request),
             Input::Respond { client, id, result } => {
@@ -1048,6 +1049,7 @@ impl Server {
             | Request::ClearQueue(_)) => self.queue_request(request),
             Request::AddAttachment { .. }
             | Request::Attachment { .. }
+            | Request::ImageFile { .. }
             | Request::UploadFile { .. } => Err(anyhow!("attachments are handled separately")),
             Request::RespondToPermission {
                 connection,

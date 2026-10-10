@@ -38,9 +38,12 @@ use gpui::{
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, FollowMode, FontWeight, Hsla, ImageSource, KeyBinding, ListAlignment,
     ListOffset, ListState, MouseMoveEvent, ObjectFit, Pixels, Point, PromptLevel, ScrollHandle,
-    Stateful, Subscription, Task, Window, anchored, canvas, deferred, img, list, pulsating_between,
+    Stateful, Subscription, Task, WeakEntity, Window, anchored, canvas, deferred, img, list,
+    pulsating_between,
 };
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
+use markdown::{
+    Markdown, MarkdownElement, MarkdownFont, MarkdownImage, MarkdownOptions, MarkdownStyle,
+};
 use projects::{
     PlannedWorkspace, ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind,
 };
@@ -62,8 +65,9 @@ use crate::agent_login::{
     AgentLogin, LoginDialog, LoginLayout, method_button_label, method_description,
 };
 use crate::attachment_image::{
-    AttachmentImage, ImagePreviewTooltip, ImageViewer, MessagePiece, ViewedImage, is_loading,
-    message_pieces, render_hover_preview, without_image_links,
+    AttachmentImage, FileImage, ImagePreviewTooltip, ImageViewer, MarkdownImageSource,
+    MessagePiece, ViewedImage, classify_markdown_image, is_loading, message_pieces,
+    render_hover_preview, web_image, without_image_links,
 };
 use crate::branch_picker::{BranchPicker, FetchOrigin};
 use crate::confirm_dialog::ConfirmRequest;
@@ -202,6 +206,11 @@ const MESSAGE_IMAGE_SIZE: gpui::Size<Pixels> = gpui::Size {
     width: px(100.),
     height: px(75.),
 };
+/// The most an image in a message's markdown takes, t3code's 30rem.
+const MARKDOWN_IMAGE_SIZE: gpui::Size<Pixels> = gpui::Size {
+    width: px(480.),
+    height: px(480.),
+};
 
 // The turn rail, t3code's timeline minimap: a strip for each of the user's messages in the
 // gutter left of the conversation's text, with Previous and Next turn above and below it.
@@ -272,6 +281,14 @@ pub fn init(cx: &mut App) {
 
 /// Identifies one rendered piece of markdown: an entry, and which part of it.
 type MarkdownKey = (usize, usize);
+/// Where an image is in its entry's row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ImagePlace {
+    /// A tool call's image, by its index.
+    Tool(usize),
+    /// An image in one of the entry's markdowns, by where it starts in it.
+    Markdown { part: usize, offset: usize },
+}
 /// The [`MarkdownKey`] part holding a tool call's raw input.
 const RAW_INPUT_PART: usize = usize::MAX;
 /// The [`MarkdownKey`] part holding the summary of the subthread a `delegate_task` call
@@ -442,9 +459,10 @@ pub struct AgentView {
     /// Tool calls the user opened or closed, relative to their default (those with images
     /// open, others closed).
     toggled_tool_calls: HashSet<acp::ToolCallId>,
-    /// Tool calls' images drawn while they were still loading, by their entry and place: their
-    /// rows are measured again once they're there, since their size wasn't known.
-    loading_tool_images: RefCell<HashMap<(usize, usize), ImageSource>>,
+    /// Images drawn while they were still loading, by their entry and place in it: their rows
+    /// are measured again once they're there, since their size wasn't known. Markdown draws
+    /// its images after the view has rendered, so it's shared with it.
+    loading_images: Rc<RefCell<HashMap<(usize, ImagePlace), ImageSource>>>,
     /// Tool calls whose input the user opened under their output.
     expanded_tool_inputs: HashSet<acp::ToolCallId>,
     /// Folded runs of work the user opened, by their first entry.
@@ -698,7 +716,7 @@ impl AgentView {
             markdowns: HashMap::default(),
             _markdown_subscriptions: Vec::new(),
             toggled_tool_calls: HashSet::default(),
-            loading_tool_images: RefCell::default(),
+            loading_images: Rc::default(),
             expanded_tool_inputs: HashSet::default(),
             opened_runs: HashSet::default(),
             synced_working: false,
@@ -8901,9 +8919,10 @@ impl AgentView {
             .attachment_image(tool_call.images[image_index].clone(), cx)
             .thumbnail();
         if is_loading(&thumbnail, window, cx) {
-            self.loading_tool_images
-                .borrow_mut()
-                .insert((entry_index, image_index), thumbnail.clone());
+            self.loading_images.borrow_mut().insert(
+                (entry_index, ImagePlace::Tool(image_index)),
+                thumbnail.clone(),
+            );
         }
         let images = tool_call.images.clone();
         let file_name: Option<SharedString> = tool_calls::file_path(tool_call)
@@ -9127,11 +9146,11 @@ impl AgentView {
         }
     }
 
-    /// Measures again the rows whose tool call images were drawn before they loaded. A row
+    /// Measures again the rows whose images were drawn before they loaded. A row
     /// above the view keeps the height it was measured at, and the conversation would jump as
     /// it scrolls into view. The view is told when each image it drew has loaded.
-    fn remeasure_loaded_tool_images(&mut self, window: &mut Window, cx: &mut App) {
-        let mut loading = self.loading_tool_images.borrow_mut();
+    fn remeasure_loaded_images(&mut self, window: &mut Window, cx: &mut App) {
+        let mut loading = self.loading_images.borrow_mut();
         if loading.is_empty() {
             return;
         }
@@ -9237,9 +9256,47 @@ impl AgentView {
         let markdown = self.markdowns.get(&key)?;
         let hovered = cx.weak_entity();
         let clicked = cx.weak_entity();
+        let viewer = cx.weak_entity();
         let list_state = self.list_state.clone();
+        let loading_images = self.loading_images.clone();
+        let machine = self.client.read(cx).machine();
+        let thread_id = self.thread_id;
         Some(
             MarkdownElement::new(markdown.clone(), style)
+                .image_resolver(move |dest_url, _| {
+                    Some(match classify_markdown_image(dest_url)? {
+                        MarkdownImageSource::Web(uri) => web_image(uri),
+                        MarkdownImageSource::Attachment(id) => AttachmentImage {
+                            machine,
+                            thread_id,
+                            id,
+                        }
+                        .original(),
+                        MarkdownImageSource::File(path) => FileImage {
+                            machine,
+                            thread_id,
+                            path,
+                        }
+                        .original(),
+                    })
+                })
+                .image_renderer(move |image, window, cx| {
+                    let (entry_index, part) = key;
+                    let place = ImagePlace::Markdown {
+                        part,
+                        offset: image.source_offset,
+                    };
+                    let loaded = match &image.source {
+                        ImageSource::Custom(load) => load(window, cx).map(|result| result.is_ok()),
+                        _ => Some(true),
+                    };
+                    if loaded.is_none() {
+                        loading_images
+                            .borrow_mut()
+                            .insert((entry_index, place), image.source.clone());
+                    }
+                    render_markdown_image(key, image, loaded, viewer.clone(), cx)
+                })
                 // A zoomed diagram grows or shrinks its message, which would otherwise pull
                 // the conversation back to its bottom.
                 .on_mermaid_zoom(move |_, _| list_state.pause_following_tail())
@@ -12133,7 +12190,7 @@ impl Render for AgentView {
         if let Some((images, index)) = self.pending_image_viewer.take() {
             self.open_image_viewer(images, index, window, cx);
         }
-        self.remeasure_loaded_tool_images(window, cx);
+        self.remeasure_loaded_images(window, cx);
         self.sync_mention_query(cx);
         let menu_open = self.mention_query.is_some() || !self.matching_commands(cx).is_empty();
         self.composer
@@ -12354,6 +12411,92 @@ fn tool_output_style(is_terminal_tool: bool, window: &Window, cx: &App) -> Markd
     style.code_block.margin.top = Some(gpui::Length::Definite(px(0.).into()));
     style.code_block.margin.bottom = Some(gpui::Length::Definite(px(0.).into()));
     style
+}
+
+/// An image in a message's markdown as t3code draws one: at its own size up to 30rem, in a
+/// thin border, opening whole in the viewer on click. While it loads it holds a 16:9 slot, and
+/// one that can't load is a chip saying so.
+fn render_markdown_image(
+    key: MarkdownKey,
+    image: MarkdownImage,
+    loaded: Option<bool>,
+    view: WeakEntity<AgentView>,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let name = format!("markdown-image-{}-{}-{}", key.0, key.1, image.source_offset);
+    let alt_text = image.alt_text.filter(|alt| !alt.trim().is_empty());
+    match loaded {
+        Some(false) => {
+            let label = match &alt_text {
+                Some(alt) => format!("Image unavailable · {alt}"),
+                None => "Image unavailable".to_string(),
+            };
+            h_flex()
+                .debug_selector(move || name)
+                .mr_1()
+                .mb_1()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.element_background)
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .into_any_element()
+        }
+        None => div()
+            .debug_selector(move || name)
+            .mr_1()
+            .mb_1()
+            .w(MARKDOWN_IMAGE_SIZE.width)
+            .max_w_full()
+            .h(MARKDOWN_IMAGE_SIZE.width * (9. / 16.))
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.element_background)
+            .into_any_element(),
+        Some(true) => {
+            let file_name = Path::new(image.dest_url.as_ref())
+                .file_name()
+                .map(|name| SharedString::from(name.to_string_lossy().into_owned()));
+            let viewed = ViewedImage {
+                source: image.source.clone(),
+                name: alt_text.or(file_name).unwrap_or_else(|| "Image".into()),
+            };
+            div()
+                .id(SharedString::from(name.clone()))
+                .debug_selector(move || name)
+                .mr_1()
+                .mb_1()
+                .max_w_full()
+                .rounded_lg()
+                .border_1()
+                .border_color(colors.border_variant)
+                .overflow_hidden()
+                .cursor_zoom_in()
+                .child(
+                    FittedImage::new(image.source, MARKDOWN_IMAGE_SIZE).map_image(|image| {
+                        image
+                            .max_w_full()
+                            .object_fit(ObjectFit::Contain)
+                            .rounded(px(7.))
+                    }),
+                )
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.view_images(vec![viewed.clone()], 0, cx))
+                        .ok();
+                })
+                .into_any_element()
+        }
+    }
 }
 
 /// A tool's output is shown as it was printed. Claude fences some of it as code, but most
@@ -16338,12 +16481,12 @@ mod tests {
     fn serve_image(client: &Entity<ServerClient>, png: &'static str, cx: &mut VisualTestContext) {
         client.update(cx, |client, _| {
             client.answer_for_test(move |request| match request {
-                Request::Attachment { .. } => Some(Response::AttachmentData(
-                    agentz_protocol::attachments::AttachmentData {
+                Request::Attachment { .. } | Request::ImageFile { .. } => Some(
+                    Response::AttachmentData(agentz_protocol::attachments::AttachmentData {
                         mime_type: "image/png".into(),
                         data: png.into(),
-                    },
-                )),
+                    }),
+                ),
                 Request::AddAttachment { .. } => Some(Response::Attachment(image_id())),
                 _ => None,
             })
@@ -16938,6 +17081,54 @@ mod tests {
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-image-1-0").is_none());
+    }
+
+    /// An image the agent's markdown names by its path loads from the thread's machine, as
+    /// t3code shows a message's media files: at its own size up to 30rem, opening whole in the
+    /// viewer under its alt text. One that isn't there says so.
+    #[gpui::test]
+    fn a_markdown_image_loads_from_the_threads_machine(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        // Only the file it names, at the path it names it by, is there.
+        client.update(cx, |client, _| {
+            client.answer_for_test(|request| match request {
+                Request::ImageFile { path, .. } if path == "shots/cart.png" => Some(
+                    Response::AttachmentData(agentz_protocol::attachments::AttachmentData {
+                        mime_type: "image/png".into(),
+                        data: TALL_PNG.into(),
+                    }),
+                ),
+                _ => None,
+            })
+        });
+        let reply = "Here it is:\n\n![The cart](shots/cart.png)\n\n![Gone](missing.png)";
+        assert_eq!(reply.find("!["), Some(13));
+        assert_eq!(reply.find("![Gone"), Some(42));
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Show me".into()),
+                    Entry::AgentMessage(reply.into()),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let image = cx.debug_bounds("markdown-image-1-0-13").expect("the image");
+        // 100 by 2000 pixels, fitted into 480, in a one-pixel border.
+        assert_eq!(image.size, gpui::size(px(26.), px(482.)));
+
+        // One that can't load says so, in a line.
+        let missing = cx
+            .debug_bounds("markdown-image-1-0-42")
+            .expect("the missing image");
+        assert!(missing.size.height < px(40.), "{missing:?}");
+
+        cx.simulate_click(image.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(viewer_caption(&view, cx).as_deref(), Some("The cart"));
     }
 
     /// What the open image viewer's caption says.

@@ -97,6 +97,20 @@ pub fn is_image_type(mime_type: &str) -> bool {
     IMAGE_TYPES.iter().any(|(_, known)| *known == mime_type)
 }
 
+/// The type of the image a file is, by its extension, for a type agentZ keeps.
+pub fn image_type_of_path(path: &std::path::Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let extension = match extension.as_str() {
+        "jpeg" => "jpg",
+        "tif" => "tiff",
+        other => other,
+    };
+    IMAGE_TYPES
+        .iter()
+        .find(|(known, _)| *known == extension)
+        .map(|(_, mime_type)| *mime_type)
+}
+
 /// The hex SHA-256 of the bytes.
 pub fn content_hash(bytes: &[u8]) -> String {
     use sha2::Digest as _;
@@ -137,5 +151,15 @@ mod tests {
         assert!(AttachmentId::parse("../../etc/passwd.png").is_none());
         assert!(AttachmentId::parse(&format!("{}.png", &HASH[1..])).is_none());
         assert!(serde_json::from_value::<AttachmentId>("../secret.png".into()).is_err());
+    }
+
+    #[test]
+    fn image_files_are_known_by_their_extension() {
+        let type_of = |path: &str| image_type_of_path(std::path::Path::new(path));
+        assert_eq!(type_of("shots/cart.PNG"), Some("image/png"));
+        assert_eq!(type_of("/tmp/photo.jpeg"), Some("image/jpeg"));
+        assert_eq!(type_of("scan.tif"), Some("image/tiff"));
+        assert_eq!(type_of("notes.md"), None);
+        assert_eq!(type_of("png"), None);
     }
 }
