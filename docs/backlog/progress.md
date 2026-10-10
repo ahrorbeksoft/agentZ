@@ -1,68 +1,69 @@
 # Backlog progress
 
-State of the backlog implementation session, stopped at the user's request before it
-finished. Everything not committed to `main` is on the branch `wip/backlog`, which may not
-compile: workers were stopped mid-change. Read this before continuing; remove entries from
-`backlog.md` once their work is verified, and delete this file when the backlog is done.
+State of the backlog session. Every entry in `backlog.md` that needed no picks is built and
+on `main`, and its entry is removed. Every entry left there is a UI change, so it has a round
+on the design board waiting for the user's picks. Delete this file once those are built.
 
 ## Built and on main
 
-Each was committed by its worker with tests run; the orchestrator never re-verified them end
-to end, so check them before removing their entries from `backlog.md`:
+Checked together on `main` after the last of them: `cargo fmt --all --check`, the clippy
+command from AGENTS.md with no warnings, and the tests from AGENTS.md (with `--no-fail-fast`).
+The only failures are four terminal tests in `agentz_server` that fail on Linux on this
+machine and also failed before this session: `paused_terminals_are_adopted_with_their_process_and_screen`,
+`terminal_agents_turns_are_checkpointed`, `terminal_panes_show_their_agents` and
+`terminal_threads_show_their_agents_state`. A fifth, `runs_commands_and_reports_their_output_and_exit`,
+failed once under load ("$ one" for "one") and passed five times alone. The built app was
+also run against a scratch server with the mock agent: a message sent during a permission
+request opened the queue, a command's output with `---`, `- **…**` and `#` lines showed
+verbatim, MCP Servers listed agentz as Built-in and on, accounts seeded without colors got
+three different ones, and a thread card's agent icon sat on its account's color. Machine
+icons in the project picker need a second machine and were checked only by their test.
 
 - `91fec52` Open the message queue when a message is queued (bug)
-- `2b18572` Show tool output as it was printed, not as markdown (+ `6579db5` architecture)
-- `4b29738` List agentZ's own MCP server in Settings › MCP Servers
+- `2b18572` Show tool output as it was printed, not as markdown
+- `4b29738` List agentZ's own MCP server in Settings › MCP Servers. The entry's "maybe a
+  skill that explains it" isn't built: agentZ ships no skills of its own today.
 - `a936e5c` Give every account a color, so threads on different accounts look apart
 - `cf82be1` Show machine icons instead of machine names in the project picker
+- `5a48c3d` Scrollbars in threads and every area in them that scrolls
+- `8466218` Thread titles from an installed CLI (Codex, Claude or agy), Settings › General
+- `b9c2da5` t3code's turn rail (Previous / Next turn), and the delegated tasks' notice hidden
+- `7bfd6a5` The thread list no longer flashes when a draft's account or agent changes (bug)
+- `b96194a` Mermaid diagrams in threads, as Zed draws them
+- `dd4a22b` The project icon picker, as t3code's, with Zed's icons only (the user's choice:
+  no Lucide)
 
-## In progress, on the branch wip/backlog
+## Design rounds waiting for picks
 
-- **Thread titles from an installed CLI** (`agentz_protocol/title_generation.rs`,
-  `agentz_server/title_generation.rs`, `server/title_requests.rs`, tests, protocol wiring):
-  most of the server side is written; the Settings UI and end-to-end tests weren't confirmed.
-- **Thread view** (`agent_view.rs`, ~340 lines): some of scrollbars in threads, Previous /
-  Next turn navigation, and hiding the "Delegated tasks … reached terminal states" message.
-  Which of these are complete isn't recorded; diff the branch and test.
-- **Sidebar** (`sidebar.rs`, ~50 lines): the thread list flash on account change was being
-  worked on; whether it's a fix or an investigation aid isn't recorded.
-- **Design rounds** (topics drafted, none reviewed by the user, no `decisions.md` generated
-  yet — run `node design/board/decisions.js <round>` after finishing each):
-  - `design/tool-calls-2/` — agents' own tool calls by kind: topics complete (667 lines).
-  - `design/agentz-tools/` — agentZ's MCP tools, subthreads, subagents, delegated-tasks
-    notice: topics complete, screenshots taken.
-  - `design/agent-input/` — agents' requests for input: topics complete
-    (`topics-permissions.js`), 16 current-state screenshots, but `index.html` missing.
-  - `design/project-copies/` — project copies in sync across machines: index, topics,
-    screenshots done.
-  - `design/new-workspace/` — options for new worktrees/pastures: only the current-state
-    screenshots; topics not written.
-  - `design/artifacts/` — artifacts UI: topics complete (408 lines).
+Each has today's screenshots beside it and a generated `decisions.md` with nothing decided.
+Build each round from its `decisions.md` once the user picks.
 
-## Not started
+| Backlog entry | Round |
+|---|---|
+| Merge projects across machines | `design/project-copies/` (5 topics) |
+| Agents' requests for user input | `design/agent-input/` (13) |
+| Subscription timeline | `design/subscription-timeline/` (15) |
+| More options for a new thread's worktree or pasture | `design/new-workspace/` (11) |
+| Artifacts | `design/artifacts/` (14) |
+| Chats | `design/chats/` (14) |
+| Storage settings | `design/storage/` (13) |
+| Subagents and subthreads in threads | `design/agentz-tools/` (13) |
+| Every kind of tool call | `design/tool-calls-2/` (20) and `design/agentz-tools/` |
 
-- Mermaid diagrams in threads (port from Zed; research notes are in `backlog.md`).
-- Project icon picker as in t3code (needs the Lucide-or-not decision in `backlog.md`).
-- Design rounds for Chats and for Storage settings (a worker was launched and stopped
-  immediately; nothing exists).
-- Design round for the subscription timeline (CLIProxyAPI's management UI must be studied
-  first; it's not in `references/`).
-- Building everything the design rounds cover, once the user picks.
+## Notes for the next agent
 
-## How the session worked, for the next agent
-
-- Backlog entries that need no input were built by workers in parallel, each committing and
-  pushing on its own; UI changes got design rounds per AGENTS.md. Several workers shared this
-  working tree at once with disjoint file areas, `rustfmt <files>` instead of `cargo fmt
-  --all`, and never `cargo clean` (target/ was cleaned once at the start).
-- Screenshot harness for "today" images: `/tmp/az-shot/` (`start.sh`, `drive.sh`, `shot.sh`,
-  `stop.sh`, README.md, verified end to end) with frozen binaries in `/tmp/az-baseline/`.
-  `/tmp` is tmpfs: both are gone after a reboot and would need to be rebuilt from AGENTS.md's
-  Testing section. Use one Xvfb display per worker (92–96 were used).
-- Design boards were served per worker on ports 4481–4485 (`python3 design/server.py <port>`,
-  detached) and checked with headless Chromium at
+- The branch `wip/backlog` (also on origin) holds the interrupted first session's work. All of
+  it was redone or finished on `main`, so it's only history now; it hasn't been deleted.
+- Known and not fixed: on Linux, GPUI's fallback delete prompt cuts off its detail text, and
+  Ctrl-, doesn't open Settings while a terminal has focus.
+- Screenshot harness for "today" images: `/tmp/az-shot/` (README.md there), with
+  `AZ_MOCK_ACCOUNTS`, `AZ_PRE_LAUNCH` and `AZ_MORE_PROJECTS` for accounts and projects. `/tmp`
+  is tmpfs, so it's gone after a reboot and would need rebuilding from AGENTS.md's Testing
+  section.
+- Rounds are checked with headless Chromium at
   `/root/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome` (`--headless=new
-  --no-sandbox`). The board for the user runs on the default port 4477.
+  --no-sandbox`) against `python3 design/server.py <port>`; the board for the user runs on the
+  default port 4477.
 - The safety rules from AGENTS.md apply in full: the user's real server runs from `~/.agentz`
   (never stop it, never run `agentz-server` subcommands without a scratch `AGENTZ_DATA_DIR`,
   never `pkill -f agentz`), and never prompt real agents — the mock agent only.
