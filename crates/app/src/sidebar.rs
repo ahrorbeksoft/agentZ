@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::agent_icons::agent_icon;
 use crate::agent_view::TOOLBAR_HEIGHT;
+use crate::app_settings::AppSettingsStore;
 use crate::controls::{AgentIcon, account_fill_color};
 use crate::machines::{
     MachineId, Machines, ProjectKey, Scope, ThreadKey, by_latest_activity, project_at,
@@ -33,7 +34,7 @@ use ui::{
 
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_switcher::compact_path;
-use crate::{NewThread, OpenSettings};
+use crate::{NewChat, NewThread, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -47,6 +48,8 @@ pub(crate) const ARCHIVED_ROW_HEIGHT: Pixels = px(36.);
 /// behind "Show more".
 const ARCHIVED_INITIAL_COUNT: usize = 10;
 const ARCHIVED_PAGE_COUNT: usize = 25;
+/// Chats open with the latest few, and page the rest as Archived does.
+const CHATS_INITIAL_COUNT: usize = 5;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -88,6 +91,7 @@ impl ThreadCheckout {
 /// The shelves of one-line rows under the thread cards.
 #[derive(Clone, Copy, PartialEq)]
 enum Shelf {
+    Chats,
     Shells,
     Workspaces,
     Archived,
@@ -328,6 +332,7 @@ pub struct Sidebar {
     search_index: usize,
     search_scroll: ScrollHandle,
     archived_shown: usize,
+    chats_shown: usize,
     /// Whether the Shells shelf is open. This window's alone.
     shells_expanded: bool,
     /// The thread whose details popover is showing, after hovering it for a moment.
@@ -359,6 +364,8 @@ impl Sidebar {
                 this.apply_rename(cx)
             }),
             cx.observe(&machines, |_, _, cx| cx.notify()),
+            // Turning chats on or off in Settings › General.
+            cx.observe(&AppSettingsStore::global(cx), |_, _, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
                 this.search_index = 0;
                 this.search_scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -383,6 +390,7 @@ impl Sidebar {
             search_index: 0,
             search_scroll: ScrollHandle::new(),
             archived_shown: ARCHIVED_INITIAL_COUNT,
+            chats_shown: CHATS_INITIAL_COUNT,
             shells_expanded: true,
             details_thread: None,
             details_delay: None,
@@ -492,13 +500,21 @@ impl Sidebar {
         self.search.read(cx).text().trim().to_lowercase()
     }
 
-    /// t3code's search results: every matching thread, active, then shells, then Workspaces
-    /// threads, then archived, in one list.
+    /// t3code's search results: every matching thread, active (with the chats among them by
+    /// when they last did something), then shells, then Workspaces threads, then archived, in
+    /// one list.
     fn search_results(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let query = self.search_query(cx);
         let machines = self.machines.read(cx);
-        machines
-            .active_threads(cx)
+        let mut active = machines.active_threads(cx);
+        for chat in machines.chat_threads(cx) {
+            let at = active
+                .iter()
+                .position(|(_, thread)| thread.last_activity_at < chat.1.last_activity_at)
+                .unwrap_or(active.len());
+            active.insert(at, chat);
+        }
+        active
             .into_iter()
             .chain(machines.shell_threads(cx))
             .chain(machines.workspaces_threads(cx))
@@ -630,7 +646,8 @@ impl Sidebar {
         store.project(project_id).cloned()
     }
 
-    /// The row's project icon, or a folder's for a Workspaces thread outside every project.
+    /// The row's project icon, a folder's for a Workspaces thread outside every project, or
+    /// the chat icon.
     fn render_row_icon(
         &self,
         machine: MachineId,
@@ -638,6 +655,9 @@ impl Sidebar {
         project: Option<&Project>,
         cx: &App,
     ) -> AnyElement {
+        if thread.is_chat() {
+            return render_chat_icon();
+        }
         if project.is_none() && thread.in_workspaces() {
             return render_folder_icon();
         }
@@ -704,7 +724,8 @@ impl Sidebar {
     }
 
     /// Pin or Unpin, Rename, Archive or Unarchive, the pasture's actions, Project Settings, and
-    /// Delete, each with its icon. A Workspaces thread's has Rename, Move to Threads and Delete.
+    /// Delete, each with its icon. A Workspaces thread's has Rename, Move to Threads and Delete,
+    /// and a chat's Pin or Unpin, Rename and Delete: chats aren't archived.
     fn thread_menu(
         &self,
         machine: MachineId,
@@ -726,6 +747,7 @@ impl Sidebar {
         };
         let title = SharedString::from(thread.title.clone());
         let in_workspaces = thread.in_workspaces();
+        let is_chat = thread.is_chat();
         // `None` for the threads that aren't pinned: shells, agent CLIs and Workspaces threads.
         let is_pinned = thread.can_pin().then(|| thread.is_pinned());
         let checkout = self.thread_checkout(machine, thread, cx);
@@ -836,6 +858,14 @@ impl Sidebar {
                             .icon_color(Color::Muted)
                             .handler(rename),
                     );
+                if is_chat {
+                    return menu.separator().item(
+                        ContextMenuEntry::new("Delete…")
+                            .icon(IconName::Trash)
+                            .icon_color(Color::Muted)
+                            .handler(delete),
+                    );
+                }
                 if in_workspaces {
                     let sidebar = sidebar.clone();
                     return menu
@@ -1981,6 +2011,8 @@ impl Sidebar {
         count: usize,
         is_expanded: bool,
         tone: HeaderTone,
+        // A button between the rule and the chevron, such as Chats' New Chat.
+        button: Option<AnyElement>,
         on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2005,6 +2037,7 @@ impl Sidebar {
                 .color(color),
             )
             .child(div().flex_1().min_w_2().h_px().bg(rule_color))
+            .children(button)
             .child(
                 Icon::new(if is_expanded {
                     IconName::ChevronUp
@@ -2033,6 +2066,7 @@ impl Sidebar {
     ) -> AnyElement {
         let is_archived = shelf == Shelf::Archived;
         let is_shell = shelf == Shelf::Shells;
+        let is_chat = shelf == Shelf::Chats;
         let colors = cx.theme().colors();
         let hover_background = colors.ghost_element_hover;
         let selected_background = colors.ghost_element_selected;
@@ -2067,6 +2101,7 @@ impl Sidebar {
         }
         .map(|time| format_relative_time(time, SystemTime::now()));
         let prefix = match shelf {
+            Shelf::Chats => "chat",
             Shelf::Shells => "shell",
             Shelf::Workspaces => "workspaces",
             Shelf::Archived => "archived",
@@ -2128,6 +2163,13 @@ impl Sidebar {
         let group_name =
             SharedString::from(format!("{prefix}-row-{}-{}", machine.slug(), thread.id.0));
         let title = SharedString::from(thread.title.clone());
+        // A chat that's working or waiting for the user reads at full strength, with its
+        // state's dot before the time.
+        let busy_status = is_chat
+            .then(|| store.read(cx).thread_status(thread.id))
+            .flatten()
+            .filter(|status| *status != ThreadStatus::Completed);
+        let is_quiet = !is_active && busy_status.is_none();
         let store = store.clone();
 
         let main_line = h_flex()
@@ -2138,7 +2180,7 @@ impl Sidebar {
             .child(
                 div()
                     .flex_none()
-                    .when(!is_active, |this| {
+                    .when(is_quiet, |this| {
                         this.opacity(0.4)
                             .group_hover(group_name.clone(), |this| this.opacity(1.))
                     })
@@ -2150,7 +2192,11 @@ impl Sidebar {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Label::new(title.clone()).color(Color::Muted).truncate())
+                    .child(
+                        Label::new(title.clone())
+                            .when(busy_status.is_none(), |label| label.color(Color::Muted))
+                            .truncate(),
+                    )
                     .into_any_element()
             })
             .when(running.is_some() && !is_renaming, |row| {
@@ -2165,6 +2211,14 @@ impl Sidebar {
                                 .weight(FontWeight::MEDIUM)
                                 .color(Color::Accent),
                         ),
+                )
+            })
+            .when_some(busy_status.filter(|_| !is_renaming), |row, status| {
+                row.child(
+                    div()
+                        .debug_selector(move || format!("chat-state-{}", thread_id.thread.0))
+                        .flex_none()
+                        .child(render_status_dot(status, cx)),
                 )
             })
             .when_some(
@@ -2270,9 +2324,77 @@ impl Sidebar {
         .into_any_element()
     }
 
+    /// The Chats shelf, first at the bottom while chats are on: its header with New Chat,
+    /// and open, the latest chats a page at a time.
+    fn render_chats_shelf(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if !Machines::chats_enabled(cx) {
+            return Vec::new();
+        }
+        let machines = self.machines.read(cx);
+        let chats = machines.chat_threads(cx);
+        let is_expanded = machines.chats_expanded(cx);
+        let new_chat = IconButton::new("new-chat", IconName::Plus)
+            .icon_size(IconSize::XSmall)
+            .icon_color(Color::Muted)
+            .tooltip(|_, cx| Tooltip::for_action("New Chat", &NewChat, cx))
+            .on_click(|_, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(Box::new(NewChat), cx);
+            })
+            .into_any_element();
+        let mut rows = vec![Self::render_shelf_header(
+            "chats-shelf-toggle",
+            "Chats",
+            chats.len(),
+            is_expanded,
+            HeaderTone::Muted,
+            Some(new_chat),
+            |this, cx| {
+                // Kept by this Mac's server, as Archived's is.
+                if let Some(store) = this.store(MachineId::Local, cx) {
+                    store.update(cx, |store, cx| store.toggle_chats_expanded(cx));
+                }
+            },
+            cx,
+        )];
+        if is_expanded {
+            let hidden_count = chats.len().saturating_sub(self.chats_shown);
+            for (machine, thread) in chats.into_iter().take(self.chats_shown) {
+                if let Some(store) = self.store(machine, cx) {
+                    rows.push(self.render_slim_row(&store, thread, Shelf::Chats, None, cx));
+                }
+            }
+            if hidden_count > 0 {
+                rows.push(self.render_show_more(
+                    "show-more-chats",
+                    hidden_count,
+                    |this| this.chats_shown += ARCHIVED_PAGE_COUNT,
+                    cx,
+                ));
+            }
+        }
+        rows
+    }
+
     fn render_show_more_archived(&self, hidden_count: usize, cx: &mut Context<Self>) -> AnyElement {
+        self.render_show_more(
+            "show-more-archived",
+            hidden_count,
+            |this| this.archived_shown += ARCHIVED_PAGE_COUNT,
+            cx,
+        )
+    }
+
+    fn render_show_more(
+        &self,
+        id: &'static str,
+        hidden_count: usize,
+        show_more: impl Fn(&mut Self) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         h_flex()
-            .id("show-more-archived")
+            .id(id)
+            .debug_selector(move || id.into())
             .h(ARCHIVED_ROW_HEIGHT)
             .px_2p5()
             .gap_2p5()
@@ -2291,8 +2413,8 @@ impl Sidebar {
                 ))
                 .color(Color::Muted),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.archived_shown += ARCHIVED_PAGE_COUNT;
+            .on_click(cx.listener(move |this, _, _, cx| {
+                show_more(this);
                 cx.notify();
             }))
             .into_any_element()
@@ -2305,16 +2427,25 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("Delete “{title}”?"),
-            Some("The thread and its conversation will be removed. This can't be undone."),
-            &["Delete", "Cancel"],
-            cx,
-        );
         let Some(store) = self.store(thread_id.machine, cx) else {
             return;
         };
+        let is_chat = store
+            .read(cx)
+            .thread(thread_id.thread)
+            .is_some_and(Thread::is_chat);
+        let detail = if is_chat {
+            "The chat and its conversation will be removed. This can't be undone."
+        } else {
+            "The thread and its conversation will be removed. This can't be undone."
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete “{title}”?"),
+            Some(detail),
+            &["Delete", "Cancel"],
+            cx,
+        );
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(0) {
                 store.update(cx, |store, cx| store.delete_thread(thread_id.thread, cx));
@@ -2463,7 +2594,12 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_threads(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_threads(
+        &self,
+        has_projects: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         self.archived_top.set(None);
         // While searching, t3code swaps the list for the matching threads.
         if !self.search_query(cx).is_empty() {
@@ -2505,9 +2641,13 @@ impl Sidebar {
                             .h_8()
                             .px_2p5()
                             .child(
-                                Label::new("No threads yet")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Placeholder),
+                                Label::new(if has_projects {
+                                    "No threads yet"
+                                } else {
+                                    "No projects yet"
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Placeholder),
                             )
                             .into_any_element(),
                     );
@@ -2561,7 +2701,7 @@ impl Sidebar {
             }
         }
 
-        let mut shelf = Vec::new();
+        let mut shelf = self.render_chats_shelf(cx);
         // Terminal threads running no agent CLI. One that starts an agent becomes a thread
         // card, and comes back here when it ends.
         let shells = self.machines.read(cx).shell_threads(cx);
@@ -2572,6 +2712,7 @@ impl Sidebar {
                 shells.len(),
                 self.shells_expanded,
                 HeaderTone::Muted,
+                None,
                 |this, cx| {
                     this.shells_expanded = !this.shells_expanded;
                     cx.notify();
@@ -2596,6 +2737,7 @@ impl Sidebar {
                 workspaces_threads.len(),
                 is_expanded,
                 HeaderTone::Muted,
+                None,
                 |this, cx| {
                     // Kept by this Mac's server, as Archived's is.
                     if let Some(store) = this.store(MachineId::Local, cx) {
@@ -2633,6 +2775,7 @@ impl Sidebar {
                 archived_count,
                 is_archived_expanded,
                 archive_tone.unwrap_or(HeaderTone::Muted),
+                None,
                 |this, cx| {
                     // Kept by this Mac's server, like the thread order.
                     if let Some(store) = this.store(MachineId::Local, cx) {
@@ -2781,8 +2924,9 @@ impl Render for Sidebar {
                 cx.listener(|this, _, _, cx| this.drop_thread(cx)),
             )
             .child(self.render_header(cx))
-            .child(if has_projects {
-                self.render_threads(window, cx)
+            // Chats need no project.
+            .child(if has_projects || Machines::chats_enabled(cx) {
+                self.render_threads(has_projects, window, cx)
             } else {
                 self.render_empty_state().into_any_element()
             })
@@ -3623,6 +3767,77 @@ mod view_tests {
         assert!(!shown("workspaces-row-3", cx));
     }
 
+    /// A chat, last active `minutes_ago` minutes ago.
+    fn chat(id: u64, minutes_ago: u64) -> Thread {
+        let mut thread = thread(id, false, None);
+        thread.project_id = ProjectId::CHATS;
+        thread.last_activity_at = Some(SystemTime::now() - Duration::from_secs(minutes_ago * 60));
+        thread
+    }
+
+    #[gpui::test]
+    fn chats_list_in_their_shelf_the_latest_five_first(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let shown =
+            |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
+        let mut project_thread = thread(1, false, None);
+        project_thread.last_activity_at = Some(SystemTime::now() - Duration::from_secs(150));
+        let mut threads = vec![project_thread];
+        threads.extend((2..=8).map(|id| chat(id, id)));
+        show(&store, threads, cx);
+
+        // Not among the cards. Open at first, with the five latest and Show 2 more.
+        assert!(shown("thread-card-1", cx));
+        assert!(!shown("thread-card-2", cx));
+        assert!(shown("chats-shelf-toggle", cx));
+        assert!(shown("chat-row-2", cx));
+        assert!(shown("chat-row-6", cx));
+        assert!(!shown("chat-row-7", cx));
+        let show_more = bounds(cx, "show-more-chats").center();
+        cx.simulate_click(show_more, Modifiers::none());
+        assert!(shown("chat-row-8", cx));
+
+        // Search finds them among the threads, by when they were last active.
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .search
+                .update(cx, |search, cx| search.set_text("Thread", cx))
+        });
+        cx.run_until_parked();
+        let order: Vec<u64> = sidebar.read_with(cx, |sidebar, cx| {
+            sidebar
+                .search_results(cx)
+                .into_iter()
+                .map(|(_, thread)| thread.id.0)
+                .collect()
+        });
+        assert_eq!(order, vec![2, 1, 3, 4, 5, 6, 7, 8]);
+        assert!(shown("search-result-2", cx));
+
+        // Turned off, they're hidden everywhere and kept.
+        let set_chats = |chats: bool, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                    store.update(|settings| settings.chats = chats, cx)
+                })
+            });
+            cx.run_until_parked();
+        };
+        set_chats(false, cx);
+        assert!(!shown("search-result-2", cx));
+        assert!(shown("search-result-1", cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .search
+                .update(cx, |search, cx| search.set_text("", cx))
+        });
+        cx.run_until_parked();
+        assert!(!shown("chats-shelf-toggle", cx));
+        assert!(!shown("chat-row-2", cx));
+        set_chats(true, cx);
+        assert!(shown("chat-row-2", cx));
+    }
+
     #[gpui::test]
     fn drafts_list_above_threads_once_something_is_typed(cx: &mut TestAppContext) {
         let (sidebar, store, cx) = new_sidebar(cx);
@@ -4140,6 +4355,19 @@ pub(crate) fn repository_branch(
 }
 
 /// A folder outside every project, in a slot as wide as a project's icon so names line up.
+pub(crate) fn render_chat_icon() -> AnyElement {
+    h_flex()
+        .size_4()
+        .flex_none()
+        .justify_center()
+        .child(
+            Icon::new(IconName::Chat)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
 pub(crate) fn render_folder_icon() -> AnyElement {
     h_flex()
         .size_4()

@@ -143,6 +143,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off, and whether agentZ's own `agentz` server is on |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
+| `chats/<date>-<first words>-<id>/` | server | Each chat's folder, made with its first message and removed with the chat |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
 | `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
 | `settings.json` | app | Theme, saved machines, sidebar and terminal preferences, saved layouts |
@@ -214,7 +215,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   names them ("workspaces: split right") with their keys. A list's and a text field's own
   keys (`menu`, `text_input`) are left out. The chosen one runs where the palette was opened.
 - **Go To** (`go_to_picker.rs`; `SpacesView::places`, `go_to_picker::thread_places`): Cmd-P
-  lists the workspaces, tabs and panes, and the Agents view's threads, the view on screen's
+  lists the workspaces, tabs and panes, and the Agents view's threads and chats, the view on screen's
   first, filtered by name or where they are (a pane's workspace and tab). Choosing one shows
   it in its view and focuses it. The palette, Go To, the shortcut sheet and Save Layout are the
   shell's overlays (`Shell::overlay`): each one's key closes it, one replaces another, and
@@ -313,8 +314,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   a thread of the project its folder is in, still working there, and outside every project
   first asks "Add “~/docs” as a project?". Search finds them, and labels them and archived
   threads in faint text.
+- **Chats shelf** (`Sidebar::render_chats_shelf`, `Machines::chat_threads`; `design/chats/`
+  topics 1 to 4): every machine's chats (see Chats), the first shelf at the bottom, with a +
+  for New Chat on its header. It starts open and is remembered by this Mac's server
+  (`Request::ToggleChatsExpanded`), showing the five latest, then Show N more. A row is one
+  line, as Archived's: the chat icon, the title and its last activity, muted, except a chat
+  that's working or waiting for the user, at full strength with its state's dot. Pinned ones
+  lead. The row menu is Pin, Rename and Delete…: chats aren't archived. Search lists chats
+  among the threads, by last activity, with the chat icon.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
-  combining repositories), Appearance (Zed's theme modes), Notifications (sounds and system
+  chats, combining repositories), Appearance (Zed's theme modes), Notifications (sounds and system
   notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, and a page
   per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines
@@ -589,7 +598,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   composer. Other copied files become mentions. On another machine's thread a file is sent to
   that machine first (`Request::UploadFile`, kept in the thread's `attachments/…/files/`) and
   the mention names the copy there; a folder can't be, so it goes as its path. Paste as Plain
-  Text pastes only text.
+  Text pastes only text. A chat's @ lists Projects, every project's Threads and its own Files
+  (see Chats).
 - **Sending mentions** (`PromptPart`, `agent_thread::MessagePart`): a message goes as its parts
   in order. The server reads a mentioned file (up to 1 MB of text) and takes a mentioned
   thread's conversation (`thread::mentioned_thread`, the handoff's summary), starting its agent
@@ -767,7 +777,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   branch with its worktree or pasture icon, the changes as +added −removed (the Diff icon when
   none), Terminal, and "⋯" with the agent's options. A workspace pane keeps its own header with
   the same buttons. A Workspaces thread has its folder (icon and name, the path in its
-  tooltip) where the project goes, and no Archive.
+  tooltip) where the project goes, and no Archive. A chat has Chat there (a click starts
+  another), and only "⋯" at the right: no branch, changes or Terminal, and no Archive.
 - **Continue with another agent** (`agentz_protocol::thread::handoff`, `Request::ContinueThread`,
   `server/workspace_requests.rs`, `continuations.rs`; t3code's context handoff, Zed's New Thread
   from Summary): a thread keeps its agent, since each agent replays only its own sessions.
@@ -831,11 +842,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   accounts' limits in its account picker instead.
 - **New Thread** (`Shell::new_thread`, `Shell::start_draft`, `new_thread_modal.rs`; t3code's
   `useHandleNewThread`, the user's choice): opens a draft right away in the shown project, or
-  asks which project first when several are shown (the modal is only that picker). It reuses
+  asks which project first when several are shown (the modal is only that picker, with Chat
+  first while chats are on). It reuses
   the open draft of that project and workspace while nothing is typed in it, and otherwise
   starts one with the agent of the machine's newest thread (else the first installed; with
   none, Settings › Agents opens). The new thread screen (`AgentView::render_new_thread`, the
-  user's choice of designs) is "What should we work on?" over the composer, with the agent
+  user's choice of designs) is a headline over the composer: t3code's "What should we build in
+  storefront?" (`AgentView::render_new_thread_headline`, chats round topic 5), whose project
+  opens a menu of Chat, the projects shown and Add Project… that makes the draft again there,
+  keeping what's typed, with "or start a chat" under it; a Workspaces draft's is "What should
+  we work on?" and a continuation's "Continue “title”". The composer has the agent
   picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
   Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
   existing one), the machine picker (each copy of a combined project with how it stands in
@@ -1191,6 +1207,42 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Background turns** (`agentz_server`, herdr): agents keep working when the app quits; the app
   reattaches with a snapshot, then live events.
 
+### Chats
+
+Threads for general conversation, outside every project: t3code's threads without a project,
+as picked in `design/chats/`.
+
+- **What a chat is** (`ProjectId::CHATS`, `Thread::is_chat`, `ProjectStore::chats`): a thread
+  under a reserved project id that no project list shows, so it has everything a thread has
+  (agents, accounts, models, images, queued messages, subthreads). It can be pinned, but not
+  archived. The Chats shelf lists them (see Window, sidebar and settings).
+- **Starting one** (`Shell::new_chat`, the `NewChat` action on Cmd-Alt-N and in the command
+  palette; `new_thread_modal.rs`): also the shelf's +, Chat first in New thread in…, and the
+  new thread headline's menu and "or start a chat" (see New Thread). New Chat starts on this
+  machine; a draft made a chat stays on its machine.
+- **The new chat screen**: "What do you want to talk about?", and under the composer the
+  machine (`AgentView::render_chat_machine_picker`: every machine, while there are several)
+  and the account. No checkout or branch, and no Terminal in the agent picker.
+- **Its folder** (`server/chats.rs`): ACP's `session/new` needs one, so a draft's agent opens
+  in `chats/`, and the first message makes the chat's own (`chats/<date>-<first
+  words>-<id>`, named as t3code names its folders) and starts the agent again there. The
+  folder is never shown. Deleting the chat removes it, unless a thread continuing the chat
+  still works there. No checkpoints are taken.
+- **@ in a chat** (`mention_menu::find_mentions` with projects; `AgentView::{mentionable_projects,
+  chat_mentionable_threads, mention_remote_thread}`): Projects, then Threads of every project
+  on every machine with the project's name (and the machine's, for another machine's), then
+  Files in the chat's folder. A project on the chat's machine goes as its folder, one on
+  another machine as text naming it, its machine and path. Another machine's thread goes as
+  its conversation, which the app fetches there (`Request::MentionedThread`,
+  `PromptPart::Conversation`).
+- **agentZ's tools** (`server/tools.rs`'s `CHAT_TOOLS`): reading every project's threads,
+  diffs and workspaces, and delegated tasks, terminals and commands in its own folder; nothing
+  that starts or changes a project's thread. On other machines, through the app, only the
+  reading ones (`CHAT_RELAYED_TOOLS`, run there as `ToolCaller::RelayedChat`).
+- **The setting** (`AppSettings::chats`, Settings › General › Chats, on by default): while
+  it's off, the Chats shelf, New Chat, Chat in the pickers and chats in search and Go To are
+  gone. Chats are kept, and one that's working finishes its turn.
+
 ### Attention states and notifications
 
 herdr's states, t3code's labels and colors, Zed's notifications and sound, herdr's two sounds.
@@ -1262,7 +1314,8 @@ for `t3_`.
   (`ThreadState::task_notices`) and not shown, so the agent's next turn just follows. The
   Workspaces view's panes belong to no project, so any thread may list, open and type into
   them, as the user can, run commands, which can do no more than typing into a pane, and add a
-  project, which runs nothing; removing projects and closing panes stay with the user.
+  project, which runs nothing; removing projects and closing panes stay with the user. A chat
+  has no project: see Chats for what it may call.
 - **Across machines** (`tools/relay.rs`): calls naming another machine go through the app, which
   reaches every machine, so they work only while the app is open. The app runs them there as
   `ToolCaller::Relayed`, which never relays again: `agentz_thread_list`'s first page asks every

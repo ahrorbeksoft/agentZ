@@ -209,11 +209,18 @@ impl Server {
             .number("limit")?
             .unwrap_or(DEFAULT_BRANCH_LIMIT)
             .clamp(1, 1_000) as usize;
-        let root = self.caller_project_path(caller.project()?)?;
+        // A chat names the project, having none.
+        let project_id = match caller.is_chat() {
+            true => self
+                .chat_project(arguments, true)?
+                .ok_or_else(|| invalid("projectId is required."))?,
+            false => caller.project()?,
+        };
+        let root = self.caller_project_path(project_id)?;
         let data_dir = self.data_dir.clone();
         let workspaces: Vec<(Workspace, Vec<ThreadId>)> = self
             .projects
-            .project(caller.project()?)
+            .project(project_id)
             .map(|project| {
                 project
                     .workspaces

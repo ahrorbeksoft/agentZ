@@ -58,11 +58,31 @@ pub struct PlaceEntry {
     pub section: SharedString,
 }
 
-/// The Agents view's threads, as its sidebar lists them.
+/// The Agents view's threads, then its chats, as its sidebar lists them.
 pub fn thread_places(cx: &App) -> Vec<PlaceEntry> {
     let machines = Machines::global(cx);
     let machines = machines.read(cx);
     let has_remotes = machines.has_remotes();
+    let chats = machines
+        .chat_threads(cx)
+        .into_iter()
+        .map(|(machine, thread)| {
+            let detail = if has_remotes {
+                machines.label(machine, cx)
+            } else {
+                SharedString::default()
+            };
+            PlaceEntry {
+                place: Place::Thread(ThreadKey {
+                    machine,
+                    thread: thread.id,
+                }),
+                icon: PlaceIcon::Icon(thread_agent_icon(machine, &thread, Color::Muted, cx)),
+                label: thread.title.into(),
+                detail,
+                section: "Chats".into(),
+            }
+        });
     machines
         .active_threads(cx)
         .into_iter()
@@ -91,6 +111,7 @@ pub fn thread_places(cx: &App) -> Vec<PlaceEntry> {
                 section: "Threads".into(),
             }
         })
+        .chain(chats)
         .collect()
 }
 

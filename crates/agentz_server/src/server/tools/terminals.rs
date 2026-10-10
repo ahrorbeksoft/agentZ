@@ -17,7 +17,7 @@ use agentz_protocol::spaces::{
 };
 use agentz_protocol::terminal::{TerminalCommand, TerminalInput, TerminalKey};
 use agentz_protocol::terminal_keys::{Keystroke, key_bytes};
-use projects::ThreadId;
+use projects::{ProjectId, ThreadId};
 use serde_json::{Value, json};
 
 use super::workspaces::{Folder, Placement, workspace_strategy};
@@ -58,7 +58,11 @@ impl Server {
                 .projects
                 .threads()
                 .iter()
-                .filter(|thread| thread.project_id == project_id)
+                // A chat's are those it opened, and its own drawer.
+                .filter(|thread| match caller.is_chat() {
+                    true => self.chat_owns(caller, thread),
+                    false => thread.project_id == project_id,
+                })
                 .filter_map(|thread| {
                     let key = if thread.terminal.is_some() {
                         TerminalKey::Thread(thread.id)
@@ -101,10 +105,17 @@ impl Server {
             }
             return self.start_pane_terminal(place, command);
         }
-        let project_id = caller.project()?;
+        // A chat's terminal is a shell in its folder: chats are only conversations.
+        let project_id = match caller.project()? {
+            ProjectId::CHATS => ProjectId::WORKSPACES,
+            project_id => project_id,
+        };
         self.with_folders(caller, vec![placement], move |server, folders| {
             let folder = match folders.into_iter().next() {
                 Some(Folder::Chosen(folder)) => folder,
+                Some(Folder::Default) | None if caller.is_chat() => caller
+                    .thread_id
+                    .and_then(|thread_id| server.projects.thread_folder(thread_id)),
                 // Where the caller works, so what it runs sees its changes.
                 Some(Folder::Default) | None => caller
                     .thread_id
@@ -314,6 +325,17 @@ impl Server {
             .or(caller.thread_id)
             .ok_or_else(|| invalid("threadId is required outside a thread."))?;
         let thread_id = self.target(caller, Some(thread_id))?;
+        if caller.is_chat()
+            && !self
+                .projects
+                .thread(thread_id)
+                .is_some_and(|thread| self.chat_owns(caller, thread))
+        {
+            return Err(failure(
+                "capability_denied",
+                "A chat reaches only the terminals it opened.",
+            ));
+        }
         let key = terminal_key(
             thread_id,
             self.projects

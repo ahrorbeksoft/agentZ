@@ -238,6 +238,10 @@ impl ProjectStore {
         self.send(Request::ToggleWorkspacesExpanded, cx)
     }
 
+    pub fn toggle_chats_expanded(&mut self, cx: &mut Context<Self>) {
+        self.send(Request::ToggleChatsExpanded, cx)
+    }
+
     /// Makes a Workspaces thread one of the project its folder is in, adding the folder as a
     /// project when it's in none.
     pub fn move_to_agents(&mut self, id: ThreadId, cx: &mut Context<Self>) -> Task<Result<()>> {

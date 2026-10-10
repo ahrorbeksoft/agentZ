@@ -282,6 +282,7 @@ pub enum Request {
     SetThreadOrder(ThreadOrder),
     ToggleArchivedExpanded,
     ToggleWorkspacesExpanded,
+    ToggleChatsExpanded,
 
     /// Answered with [`Response::ThreadCreated`], once its workspace is ready.
     CreateThread {
@@ -494,6 +495,10 @@ pub enum Request {
     /// The files and folders of the folder a thread works in, for its composer's @-mentions:
     /// [`Response::Files`].
     ListFiles(ThreadId),
+    /// A thread's conversation as a mention of it sends it ([`thread::mentioned_thread`]), for
+    /// a message on another machine, which gets it as [`PromptPart::Conversation`]:
+    /// [`Response::Conversation`]. A thread whose agent isn't running starts to load it.
+    MentionedThread(ThreadId),
     /// The icon file chosen for a project, or else the one the server found in its folder
     /// ([`projects::ProjectsSnapshot::favicons`]), for a client on another machine, which can't
     /// read it: [`Response::ProjectFavicon`].
@@ -803,6 +808,9 @@ pub struct RelayToolCall {
     /// `None` when the project isn't there, for the tools that work without one: the
     /// Workspaces view's terminals and adding a project.
     pub path: Option<PathBuf>,
+    /// From a chat, which reads every project's threads there ([`ToolCaller::RelayedChat`]).
+    #[serde(default)]
+    pub from_chat: bool,
     pub name: String,
     pub arguments: serde_json::Value,
 }
@@ -819,6 +827,13 @@ pub enum PromptPart {
     Thread(ThreadId),
     /// A pasted image, kept for the thread ([`Request::AddAttachment`]).
     Image(AttachmentId),
+    /// A thread on another machine, which goes along as its conversation, read there by the
+    /// client ([`Request::MentionedThread`]).
+    Conversation {
+        uri: String,
+        title: String,
+        text: String,
+    },
 }
 
 impl PromptPart {
@@ -874,6 +889,9 @@ pub enum ToolCaller {
     /// ([`RelayToolCall`]), or no project for one that needs none. It runs here only:
     /// relaying it on would let two machines pass a call back and forth forever.
     Relayed(Option<PathBuf>),
+    /// A chat's call relayed from another machine ([`RelayToolCall::from_chat`]): it reads any
+    /// project's threads, diffs and workspaces here, and changes nothing. Not relayed on either.
+    RelayedChat,
 }
 
 /// A tool's answer: its result, or for a failure `{"code", "message"}` with t3code's failure
@@ -930,6 +948,11 @@ pub enum Response {
     ProjectFavicon(String),
     /// Where the server keeps a file sent with [`Request::UploadFile`].
     UploadedFile(PathBuf),
+    /// [`Request::MentionedThread`]'s answer.
+    Conversation {
+        title: String,
+        text: String,
+    },
     /// The titles of the threads whose turns are running.
     TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.

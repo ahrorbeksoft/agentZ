@@ -132,7 +132,40 @@ impl Caller {
             None => ThreadCreator::Command,
         }
     }
+
+    /// A chat, or a chat's call relayed from another machine ([`ToolCaller::RelayedChat`]).
+    fn is_chat(self) -> bool {
+        self.project_id == Some(ProjectId::CHATS)
+    }
 }
+
+/// What a chat may call: reading every project's threads, diffs and workspaces, and delegated
+/// tasks, terminals and commands in its own folder. Nothing that starts or changes a thread.
+const CHAT_TOOLS: [&str; 14] = [
+    "orchestrator_capabilities",
+    "agentz_thread_list",
+    "agentz_thread_read",
+    "agentz_thread_diff",
+    "agentz_workspace_list",
+    "delegate_task",
+    "task_status",
+    "task_cancel",
+    "agentz_terminal_list",
+    "agentz_terminal_start",
+    "agentz_terminal_send",
+    "agentz_terminal_read",
+    "agentz_terminal_wait",
+    "agentz_command_run",
+];
+
+/// What a chat may call on other machines, which have no folder of its own.
+pub(super) const CHAT_RELAYED_TOOLS: [&str; 5] = [
+    "orchestrator_capabilities",
+    "agentz_thread_list",
+    "agentz_thread_read",
+    "agentz_thread_diff",
+    "agentz_workspace_list",
+];
 
 /// A typed failure, with t3code's `OrchestratorMcpFailure` codes.
 #[derive(Debug)]
@@ -506,6 +539,13 @@ impl Server {
                 )
             })?,
             ToolCaller::Thread(thread_id) => *thread_id,
+            ToolCaller::RelayedChat => {
+                return Ok(Caller {
+                    project_id: Some(ProjectId::CHATS),
+                    thread_id: None,
+                    relayed: true,
+                });
+            }
             ToolCaller::Relayed(None) => {
                 return Ok(Caller {
                     project_id: None,
@@ -570,6 +610,21 @@ impl Server {
             Value::Null => &empty,
             _ => return Err(invalid("The arguments must be an object.")),
         });
+        let allowed = if caller.relayed {
+            CHAT_RELAYED_TOOLS.as_slice()
+        } else {
+            CHAT_TOOLS.as_slice()
+        };
+        if caller.is_chat() && !allowed.contains(&name) {
+            return Err(failure(
+                "capability_denied",
+                format!(
+                    "A chat reads the threads, diffs and workspaces of every project, and runs \
+                     delegated tasks, terminals and commands in its own folder; {name} isn't \
+                     open to it."
+                ),
+            ));
+        }
         if !caller.relayed
             && let Some(outcome) = self.relay_if_elsewhere(caller, name, &arguments)
         {
@@ -676,6 +731,18 @@ impl Server {
                     .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
                 (None, None, folder)
             }
+            // A chat's own folder, or where chats' folders are for one on another machine.
+            None if caller.is_chat() => {
+                let folder = match caller.thread_id {
+                    Some(thread_id) => self.projects.thread_folder(thread_id),
+                    None => self
+                        .projects
+                        .chats_folder()
+                        .map(std::path::Path::to_path_buf),
+                }
+                .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+                (None, None, folder)
+            }
             None => return Err(failure("orchestration_error", "The project was removed.")),
         };
         let caller_thread = caller
@@ -721,11 +788,35 @@ impl Server {
                 entry
             })
             .collect();
+        let chat = caller.is_chat().then(|| {
+            let projects: Vec<Value> = self
+                .projects
+                .projects()
+                .iter()
+                .map(|project| {
+                    json!({
+                        "projectId": project.id.0,
+                        "name": project.name().to_string(),
+                        "path": project.path,
+                    })
+                })
+                .collect();
+            json!({
+                "note": "This thread is a chat, outside every project, working in a folder of \
+                         its own. It can list and read the threads, diffs and workspaces of \
+                         every project (pass projectId to agentz_thread_list and \
+                         agentz_workspace_list; pass machine for another machine's), delegate \
+                         tasks, and run terminals and commands in its folder. It can't start, \
+                         message or change other threads.",
+                "projects": projects,
+            })
+        });
         Ok(Step::Done(json!({
             "currentThreadId": caller.thread_id.map(|thread_id| thread_id.0),
             "projectId": project_id,
             "projectName": project_name,
             "projectPath": project_path,
+            "chat": chat,
             "agentId": caller_agent,
             "agentName": caller_agent_name,
             "model": caller_thread.and_then(|thread| thread.model.clone()),
@@ -751,7 +842,12 @@ impl Server {
     }
 
     fn thread_list(&self, caller: Caller, arguments: &Arguments) -> Outcome {
-        let project_id = caller.project()?;
+        // A chat lists every project's threads, or one project's.
+        let project_id = if caller.is_chat() {
+            self.chat_project(arguments, false)?
+        } else {
+            Some(caller.project()?)
+        };
         let statuses = match arguments.array("statuses")? {
             Some(statuses) => Some(
                 statuses
@@ -779,7 +875,11 @@ impl Server {
             .projects
             .threads()
             .iter()
-            .filter(|thread| thread.project_id == project_id && thread.task.is_none())
+            .filter(|thread| match project_id {
+                Some(project_id) => thread.project_id == project_id,
+                None => self.projects.project(thread.project_id).is_some(),
+            })
+            .filter(|thread| thread.task.is_none())
             .filter(|thread| thread.archived_at.is_some() == archived)
             .filter(|thread| {
                 title_contains
@@ -802,7 +902,7 @@ impl Server {
             .collect();
         let next_cursor = (cursor + page.len() < total).then_some(cursor + page.len());
         Ok(Step::Done(json!({
-            "projectId": project_id.0,
+            "projectId": project_id.map(|project_id| project_id.0),
             "currentThreadId": caller.thread_id.map(|thread_id| thread_id.0),
             "threads": page,
             "nextCursor": next_cursor,
@@ -1811,8 +1911,58 @@ impl Server {
         ))
     }
 
-    /// A thread the caller may manage: one in its project.
+    /// The project a chat's call names with `projectId`, which `required` calls must.
+    fn chat_project(
+        &self,
+        arguments: &Arguments,
+        required: bool,
+    ) -> Result<Option<ProjectId>, Failure> {
+        match arguments.number("projectId")? {
+            Some(id) => {
+                let project = self.projects.project(ProjectId(id)).ok_or_else(|| {
+                    failure(
+                        "project_not_found",
+                        format!("There is no project {id} on this machine."),
+                    )
+                })?;
+                Ok(Some(project.id))
+            }
+            None if required => Err(invalid(
+                "projectId is required in a chat, which belongs to no project.",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether the chat making the call started the thread: itself, its tasks, and the
+    /// terminals it opened.
+    fn chat_owns(&self, caller: Caller, thread: &Thread) -> bool {
+        let Some(chat) = caller.thread_id else {
+            return false;
+        };
+        thread.id == chat
+            || thread.parent() == Some(chat)
+            || thread.created_by == Some(ThreadCreator::Thread(chat))
+    }
+
+    /// A thread the caller may manage: one in its project. A chat reads any project's, and
+    /// manages its own tasks.
     fn target(&self, caller: Caller, thread_id: Option<ThreadId>) -> Result<ThreadId, Failure> {
+        if caller.is_chat() {
+            let thread_id = thread_id.ok_or_else(|| invalid("threadId is required."))?;
+            return match self.projects.thread(thread_id) {
+                Some(thread)
+                    if self.projects.project(thread.project_id).is_some()
+                        || self.chat_owns(caller, thread) =>
+                {
+                    Ok(thread_id)
+                }
+                _ => Err(failure(
+                    "thread_not_found",
+                    format!("There is no thread {} in any project.", thread_id.0),
+                )),
+            };
+        }
         let project_id = caller.project()?;
         let thread_id = thread_id.ok_or_else(|| invalid("threadId is required."))?;
         // Threads of other projects are reported as missing, so they can't be probed for.
@@ -1861,6 +2011,18 @@ impl Server {
     }
 
     fn thread_summary(&self, caller: Caller, thread: &projects::Thread) -> Value {
+        let mut summary = self.project_thread_summary(caller, thread);
+        // A chat's list spans projects.
+        if caller.is_chat()
+            && let Some(project) = self.projects.project(thread.project_id)
+        {
+            summary["projectId"] = json!(project.id.0);
+            summary["projectName"] = json!(project.name().to_string());
+        }
+        summary
+    }
+
+    fn project_thread_summary(&self, caller: Caller, thread: &projects::Thread) -> Value {
         json!({
             "threadId": thread.id.0,
             "title": thread.title,

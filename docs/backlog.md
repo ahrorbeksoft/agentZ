@@ -81,41 +81,6 @@ Notes from the discussion (not decided):
   SwiftUI and Compose previews, Flutter goldens) and build a kit in the project's look.
 - The UI parts start on the design board, as every UI change does.
 
-### Chats: threads for general conversation, outside every project
-
-Chats are for general conversation, not for work in a project. They have their own group in
-the sidebar, like the Workspaces and Archived shelves, and never belong to a project.
-
-- **Everything a thread has:** agents, accounts, models, images, files, queued messages,
-  subthreads and the rest of a thread's features.
-- **Mentions instead of links:** a chat can mention projects, threads and files with @, as a
-  thread mentions files and threads today. A chat isn't linked to projects or threads for good
-  (considered and left out).
-- **Artifacts:** chats publish artifacts as threads do (see Artifacts above).
-- **A setting turns chats off**, for users who don't want them. What happens to existing chats
-  while it's off isn't decided.
-
-Notes from the research (not decided):
-
-- **t3code's threads without a project** (`references/t3code`, `docs/user/thread-sidebar.md`,
-  "Start without a project") are the closest: each works in its own folder under
-  `~/.t3/scratch`, named after the date, the first words of its first message and a short id;
-  deleting the thread keeps the folder and the agent's files; branch, worktree and diff
-  controls are hidden since the folder isn't a Git repository; it starts on the current
-  machine and can move to another before its first message. Inside, they belong to a hidden
-  Scratch project on each machine, and `t3_thread_launch` starts one with `scratch: true`.
-- **A chat still needs a folder:** ACP's `session/new` takes a `cwd`, so each chat would get one
-  of its own in the data folder, as in t3code. It runs on one machine.
-- **What changes in agentZ:** `Thread::project_id` is required today, so either it becomes
-  optional or chats sit under a hidden project per machine, as t3code's do. The @ menu lists
-  only the thread folder's files and the project's other threads; a chat needs projects and
-  every project's threads in it. A mentioned thread's conversation is already sent
-  (`thread::mentioned_thread`). A mentioned project would go as its folder.
-- **Agent tools:** the thread tools work only in the caller's project (agent control's
-  policy). Which ones a chat's agent gets isn't decided.
-- **Hidden in a chat:** worktrees, pastures, diffs, branches and project scripts.
-- The UI parts start on the design board, as every UI change does.
-
 ### Storage settings: what agentZ keeps on disk, and deleting it
 
 A settings page (name not decided: Storage or similar) that lists what agentZ produces on disk,

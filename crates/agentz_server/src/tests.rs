@@ -7042,6 +7042,122 @@ async fn mentions_go_to_the_agent() {
     assert!(listing.entries.iter().any(|entry| entry.path == "notes.md"));
 }
 
+/// A chat works in a folder of its own, made with its first message and removed with the
+/// chat. Its agent reads every project's threads, and starts or changes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn chats_work_in_their_own_folder_and_read_every_project() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread).await;
+    client.prompt_and_wait(thread, "hello there").await;
+
+    let chat = client.create_thread_in(ProjectId::CHATS).await;
+    client.wait_until_ready(chat).await;
+    assert!(
+        client
+            .project_thread(chat)
+            .is_some_and(|chat| chat.is_chat() && chat.workspace.is_none())
+    );
+    client.prompt_and_wait(chat, "What is a Pin?").await;
+    let folder = client
+        .project_thread(chat)
+        .and_then(|chat| chat.workspace.clone())
+        .expect("the chat's folder");
+    assert_eq!(
+        folder.parent(),
+        Some(server.data_dir.path().join("chats").as_path())
+    );
+    let name = folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert!(
+        name.ends_with(&format!("-what-is-a-pin-{}", chat.0)),
+        "{name}"
+    );
+    assert!(folder.is_dir());
+    client
+        .wait_until(|client| {
+            agent_text(client.thread(ConnectionId::Thread(chat))).contains("What is a Pin?")
+        })
+        .await;
+
+    let list = client.tool(chat, "agentz_thread_list", json!({})).await;
+    let listed: Vec<(u64, String)> = list["threads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|thread| {
+            (
+                thread["threadId"].as_u64().unwrap_or_default(),
+                thread["projectName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    let project_name = server
+        .project_dir
+        .path()
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert_eq!(listed, [(thread.0, project_name)], "projects' threads only");
+    let read = client
+        .tool(chat, "agentz_thread_read", json!({"threadId": thread.0}))
+        .await;
+    assert_eq!(read["items"][0]["text"], json!("hello there"));
+    let denied = client
+        .tool_failure(
+            ToolCaller::Thread(chat),
+            "agentz_thread_send",
+            json!({"threadId": thread.0, "message": "hi"}),
+        )
+        .await;
+    assert_eq!(denied, "capability_denied");
+    let hidden = client
+        .tool_failure(
+            ToolCaller::Thread(thread),
+            "agentz_thread_read",
+            json!({"threadId": chat.0}),
+        )
+        .await;
+    assert_eq!(
+        hidden, "thread_not_found",
+        "a project's thread can't read a chat"
+    );
+
+    // A message on another machine mentions a thread here with the conversation read here.
+    let Response::Conversation { title, text } = client.ok(Request::MentionedThread(thread)).await
+    else {
+        panic!("expected the thread's conversation");
+    };
+    assert_eq!(title, "hello there");
+    assert!(text.contains("hello there"), "{text}");
+
+    client.ok(Request::ArchiveThread(chat)).await;
+    assert!(
+        client
+            .project_thread(chat)
+            .is_some_and(|chat| chat.archived_at.is_none()),
+        "chats aren't archived"
+    );
+    client.ok(Request::DeleteThread(chat)).await;
+    tokio::time::timeout(TIMEOUT, async {
+        while folder.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the chat's folder is removed with it");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn agents_run_commands_in_server_terminals() {
     let Some(server) = TestServer::start() else {

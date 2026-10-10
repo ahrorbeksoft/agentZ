@@ -1,6 +1,6 @@
 //! New Thread's project picker, for when several projects are shown. As in t3code, New Thread
 //! then opens a draft in the chosen project, whose screen picks the agent, the checkout and the
-//! machine.
+//! machine. Chat comes first while chats are on, as t3code's No project does.
 
 use crate::machines::{GroupKey, MachineId, Machines, ProjectKey};
 use gpui::{
@@ -27,12 +27,19 @@ pub fn init(cx: &mut App) {
 pub enum NewThreadModalEvent {
     /// The checkout to start a draft in: the chosen project's, on the machine used last.
     ProjectChosen(ProjectKey),
+    ChatChosen,
+}
+
+#[derive(Clone)]
+enum Row {
+    Chat,
+    Project(GroupKey),
 }
 
 pub struct NewThreadModal {
     machines: Entity<Machines>,
     search: Entity<TextInput>,
-    project_rows: Vec<GroupKey>,
+    rows: Vec<Row>,
     selected_index: usize,
     scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -62,7 +69,7 @@ impl NewThreadModal {
         let mut this = Self {
             machines,
             search,
-            project_rows: Vec::new(),
+            rows: Vec::new(),
             selected_index: 0,
             scroll_handle: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -83,7 +90,8 @@ impl NewThreadModal {
                 || (machine != MachineId::Local
                     && machines.label(machine, cx).to_lowercase().contains(&query))
         };
-        self.project_rows = machines
+        let offers_chat = Machines::chats_enabled(cx) && "chat".contains(query.as_str());
+        let projects = machines
             .visible_groups(cx)
             .into_iter()
             .filter(|group| {
@@ -94,16 +102,18 @@ impl NewThreadModal {
                         .iter()
                         .any(|(machine, project)| member_matches(*machine, project))
             })
-            .map(|group| group.key)
+            .map(|group| Row::Project(group.key));
+        self.rows = offers_chat
+            .then_some(Row::Chat)
+            .into_iter()
+            .chain(projects)
             .collect();
-        self.selected_index = self
-            .selected_index
-            .min(self.project_rows.len().saturating_sub(1));
+        self.selected_index = self.selected_index.min(self.rows.len().saturating_sub(1));
         cx.notify();
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        let count = self.project_rows.len();
+        let count = self.rows.len();
         if count > 0 {
             self.selected_index = (self.selected_index + 1) % count;
             self.scroll_handle.scroll_to_item(self.selected_index);
@@ -117,7 +127,7 @@ impl NewThreadModal {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let count = self.project_rows.len();
+        let count = self.rows.len();
         if count > 0 {
             self.selected_index = self.selected_index.checked_sub(1).unwrap_or(count - 1);
             self.scroll_handle.scroll_to_item(self.selected_index);
@@ -126,8 +136,10 @@ impl NewThreadModal {
     }
 
     fn confirm(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(key) = self.project_rows.get(self.selected_index).cloned() {
-            self.choose_group(key, cx);
+        match self.rows.get(self.selected_index).cloned() {
+            Some(Row::Chat) => cx.emit(NewThreadModalEvent::ChatChosen),
+            Some(Row::Project(key)) => self.choose_group(key, cx),
+            None => {}
         }
     }
 
@@ -144,6 +156,39 @@ impl NewThreadModal {
 
     fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
+    }
+
+    /// Chat, above the projects (and a rule): a thread outside every project.
+    fn render_chat_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let has_projects = self.rows.len() > 1;
+        let item = ListItem::new(("new-thread-project", index))
+            .inset(true)
+            .spacing(ListItemSpacing::Sparse)
+            .toggle_state(index == self.selected_index)
+            .start_slot(
+                Icon::new(IconName::Chat)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .child(div().flex_none().child(Label::new("Chat")))
+                    .child(
+                        Label::new("outside every project")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(NewThreadModalEvent::ChatChosen)));
+        v_flex()
+            .debug_selector(|| "new-thread-chat".into())
+            .child(item)
+            .when(has_projects, |row| {
+                row.child(div().my_1().h_px().bg(cx.theme().colors().border_variant))
+            })
+            .into_any_element()
     }
 
     fn render_project_row(
@@ -210,13 +255,13 @@ impl NewThreadModal {
 impl Render for NewThreadModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border_variant = cx.theme().colors().border_variant;
-        let rows: Vec<AnyElement> = self
-            .project_rows
-            .clone()
-            .into_iter()
-            .enumerate()
-            .map(|(index, project)| self.render_project_row(index, project, cx))
-            .collect();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, row) in self.rows.clone().into_iter().enumerate() {
+            match row {
+                Row::Chat => rows.push(self.render_chat_row(index, cx)),
+                Row::Project(key) => rows.push(self.render_project_row(index, key, cx)),
+            }
+        }
         let empty_state = rows.is_empty().then(|| {
             div()
                 .p_3()
@@ -263,5 +308,90 @@ impl Render for NewThreadModal {
                     )
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use agentz_protocol::spaces::SpacesSnapshot;
+    use gpui::TestAppContext;
+    use projects::{Project, ProjectId, ProjectsSnapshot};
+
+    use super::{NewThreadModal, NewThreadModalEvent};
+    use crate::machines::{MachineId, ProjectKey};
+    use crate::server_client::ServerClient;
+
+    fn project(id: u64, path: &str) -> Project {
+        Project {
+            id: ProjectId(id),
+            path: path.into(),
+            custom_name: None,
+            icon: None,
+            workspaces: Vec::new(),
+            repository: None,
+        }
+    }
+
+    /// Chat comes first, so Enter starts one. Typing leaves it out unless it matches.
+    #[gpui::test]
+    fn chat_comes_before_the_projects(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| client.set_online_for_test(cx));
+            let projects = client.read(cx).projects().clone();
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![project(1, "/tmp/demo"), project(2, "/tmp/api")],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            super::init(cx);
+        });
+        let (modal, cx) = cx.add_window_view(NewThreadModal::new);
+        let chosen: Rc<RefCell<Vec<Option<ProjectKey>>>> = Rc::default();
+        cx.update(|_, cx| {
+            let chosen = chosen.clone();
+            cx.subscribe(&modal, move |_, event: &NewThreadModalEvent, _| {
+                chosen.borrow_mut().push(match event {
+                    NewThreadModalEvent::ProjectChosen(project) => Some(*project),
+                    NewThreadModalEvent::ChatChosen => None,
+                })
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread-chat").is_some());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(*chosen.borrow(), vec![None]);
+
+        cx.simulate_input("api");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread-chat").is_none());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            chosen.borrow().last(),
+            Some(&Some(ProjectKey {
+                machine: MachineId::Local,
+                project: ProjectId(2),
+            }))
+        );
+
+        cx.simulate_keystrokes("backspace backspace backspace");
+        cx.simulate_input("ch");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread-chat").is_some());
     }
 }

@@ -126,6 +126,8 @@ pub struct AppSettings {
     /// Thoughts show open in threads: Zed's `thinking_display` as `always_expanded`, where
     /// otherwise it's `always_collapsed`.
     pub show_thinking: bool,
+    /// Chats show in the sidebar, New Chat and search. Off, they're hidden and kept.
+    pub chats: bool,
     pub play_sound_when_finished: PlaySound,
     /// When a permission request or a question arrives. Always by default, as herdr plays its
     /// request sound: it needs an answer either way.
@@ -158,6 +160,7 @@ impl Default for AppSettings {
             is_sidebar_hidden: false,
             use_modifier_to_send: false,
             show_thinking: false,
+            chats: true,
             play_sound_when_finished: PlaySound::WhenInAnotherThread,
             play_sound_when_input_needed: PlaySound::Always,
             sound_volume: 1.,

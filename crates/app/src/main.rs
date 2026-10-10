@@ -73,6 +73,8 @@ actions!(
         ToggleProjectSwitcher,
         /// Starts a new thread in the selected project.
         NewThread,
+        /// Starts a chat: a thread outside every project, on this machine.
+        NewChat,
         /// Opens the settings page.
         OpenSettings,
         /// Shows or hides the open thread's changes.
@@ -182,6 +184,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-o", OpenFolder, context),
         KeyBinding::new("secondary-alt-o", ToggleProjectSwitcher, context),
         KeyBinding::new("secondary-n", NewThread, context),
+        // t3code's mod+alt+n.
+        KeyBinding::new("secondary-alt-n", NewChat, context),
         KeyBinding::new("secondary-,", OpenSettings, context),
         KeyBinding::new("secondary-d", ToggleDiff, context),
         // Zed's key for its left dock.

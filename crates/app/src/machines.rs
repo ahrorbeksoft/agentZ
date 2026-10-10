@@ -461,6 +461,12 @@ impl Machines {
             .machine_named(&call.machine, cx)
             .and_then(|machine| self.client(machine, cx));
         let response = match target {
+            // A chat's calls only read, which the target's server holds them to.
+            Some(target) if call.from_chat => target.read(cx).request(Request::CallTool {
+                caller: ToolCaller::RelayedChat,
+                name: call.name,
+                arguments: call.arguments,
+            }),
             // Only to checkouts the server was told of, whatever it asks.
             Some(target)
                 if source
@@ -751,6 +757,56 @@ impl Machines {
             .projects()
             .read(cx)
             .workspaces_expanded()
+    }
+
+    pub fn chats_expanded(&self, cx: &App) -> bool {
+        self.clients[0]
+            .read(cx)
+            .projects()
+            .read(cx)
+            .chats_expanded()
+    }
+
+    /// Settings › General's Chats: while it's off, chats are hidden and kept.
+    pub fn chats_enabled(cx: &App) -> bool {
+        AppSettingsStore::global(cx).read(cx).settings().chats
+    }
+
+    /// Every machine's chats for the Chats shelf, while chats are on: the pinned ones in the
+    /// order the user gave them, then the rest in the thread order. Drafts and subthreads
+    /// aren't listed.
+    pub fn chat_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
+        if !Self::chats_enabled(cx) {
+            return Vec::new();
+        }
+        let mut threads = self.threads_where(cx, |_, thread| {
+            thread.is_chat() && thread.task.is_none() && !thread.is_draft
+        });
+        let order = self.thread_order(cx);
+        threads.sort_by(|(a_machine, a), (b_machine, b)| {
+            let placement = match (a.is_pinned(), b.is_pinned()) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (true, true) => order_key::compare(
+                    (a.pin_order_key.as_deref(), a.pinned_at),
+                    (b.pin_order_key.as_deref(), b.pinned_at),
+                    false,
+                ),
+                (false, false) => match order {
+                    ThreadOrder::LastActivity => {
+                        return by_latest_activity((*a_machine, a), (*b_machine, b));
+                    }
+                    ThreadOrder::Created => b
+                        .created_at
+                        .or(b.last_activity_at)
+                        .cmp(&a.created_at.or(a.last_activity_at)),
+                },
+            };
+            placement
+                .then(b_machine.cmp(a_machine))
+                .then(b.id.cmp(&a.id))
+        });
+        threads
     }
 
     /// Unarchived top-level threads of the visible projects: the pinned ones in the order the

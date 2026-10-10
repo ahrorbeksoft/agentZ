@@ -29,6 +29,10 @@ impl ProjectId {
     /// listed in the sidebar's Workspaces section rather than among the project's threads.
     /// Each works in its [`Thread::workspace`], any folder on its machine.
     pub const WORKSPACES: ProjectId = ProjectId(u64::MAX);
+    /// Where chats belong (t3code's threads with no project): conversations outside every
+    /// project, listed in the sidebar's Chats shelf. Each works in a folder of its own in the
+    /// data directory, made with its first message ([`ProjectStore::set_chats_folder`]).
+    pub const CHATS: ProjectId = ProjectId(u64::MAX - 1);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -390,20 +394,27 @@ impl Thread {
         self.project_id == ProjectId::WORKSPACES
     }
 
+    /// A chat ([`ProjectId::CHATS`]), listed in the Chats shelf.
+    pub fn is_chat(&self) -> bool {
+        self.project_id == ProjectId::CHATS
+    }
+
     pub fn is_pinned(&self) -> bool {
         self.pinned_at.is_some()
     }
 
-    /// Listed among the threads, where the user can arrange it: not a subthread, a draft or a
-    /// Workspaces thread, which have places of their own.
+    /// Listed among the threads, where the user can arrange it: not a subthread, a draft, a
+    /// Workspaces thread or a chat, which have places of their own.
     pub fn can_arrange(&self) -> bool {
-        self.task.is_none() && !self.is_draft && !self.in_workspaces()
+        self.task.is_none() && !self.is_draft && !self.in_workspaces() && !self.is_chat()
     }
 
-    /// An agent thread the user can pin. Terminal threads aren't: a shell can't, and an agent
-    /// CLI running in one only arranges among the rest.
+    /// An agent thread the user can pin: one among the threads, or a chat, which leads the
+    /// Chats shelf while pinned. Terminal threads aren't: a shell can't, and an agent CLI
+    /// running in one only arranges among the rest.
     pub fn can_pin(&self) -> bool {
-        self.can_arrange() && self.terminal.is_none()
+        let is_listed_chat = self.is_chat() && self.task.is_none() && !self.is_draft;
+        (self.can_arrange() || is_listed_chat) && self.terminal.is_none()
     }
 
     /// For a Workspaces thread, the folder it was started in, which may differ from the
@@ -565,6 +576,7 @@ pub struct ProjectsSnapshot {
     pub thread_order: ThreadOrder,
     pub archived_expanded: bool,
     pub workspaces_expanded: bool,
+    pub chats_collapsed: bool,
     pub working_threads: Vec<ThreadId>,
     /// Threads waiting for the user to answer a permission request.
     pub blocked_threads: Vec<ThreadId>,
@@ -662,6 +674,8 @@ struct PersistedState {
     archived_expanded: bool,
     #[serde(default)]
     workspaces_expanded: bool,
+    #[serde(default)]
+    chats_collapsed: bool,
 }
 
 pub struct ProjectStore {
@@ -674,6 +688,11 @@ pub struct ProjectStore {
     archived_expanded: bool,
     /// Whether the sidebar's Workspaces section is open.
     workspaces_expanded: bool,
+    /// Whether the sidebar's Chats shelf is closed. It starts open.
+    chats_collapsed: bool,
+    /// Where a chat works until its first message makes its own folder: the folder those are
+    /// made in. Set by the server, which knows its data directory. Not persisted.
+    chats_folder: Option<PathBuf>,
     /// Threads whose agent is currently running. Not persisted: nothing is running after a
     /// restart.
     working_threads: HashSet<ThreadId>,
@@ -723,6 +742,8 @@ impl ProjectStore {
             thread_order: state.thread_order,
             archived_expanded: state.archived_expanded,
             workspaces_expanded: state.workspaces_expanded,
+            chats_collapsed: state.chats_collapsed,
+            chats_folder: None,
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
             awaiting_input_threads: HashSet::default(),
@@ -747,7 +768,9 @@ impl ProjectStore {
             this.next_id = this.next_id.max(highest_id + 1);
         }
         this.threads.retain(|thread| {
-            thread.in_workspaces() || this.projects.iter().any(|p| p.id == thread.project_id)
+            thread.in_workspaces()
+                || thread.is_chat()
+                || this.projects.iter().any(|p| p.id == thread.project_id)
         });
         if let ProjectScope::Project(id) = this.scope
             && this.project(id).is_none()
@@ -808,6 +831,45 @@ impl ProjectStore {
     pub fn toggle_workspaces_expanded(&mut self) {
         self.workspaces_expanded = !self.workspaces_expanded;
         self.changed();
+    }
+
+    pub fn chats_expanded(&self) -> bool {
+        !self.chats_collapsed
+    }
+
+    pub fn toggle_chats_expanded(&mut self) {
+        self.chats_collapsed = !self.chats_collapsed;
+        self.changed();
+    }
+
+    /// Where chats' own folders are made, and where a chat works until it has one.
+    pub fn set_chats_folder(&mut self, folder: PathBuf) {
+        self.chats_folder = Some(folder);
+    }
+
+    pub fn chats_folder(&self) -> Option<&Path> {
+        self.chats_folder.as_deref()
+    }
+
+    /// The chats listed in the Chats shelf, in the current [`ThreadOrder`] with the pinned ones
+    /// first. Drafts and subthreads aren't listed.
+    pub fn chats(&self) -> Vec<&Thread> {
+        let mut chats: Vec<&Thread> = self
+            .threads
+            .iter()
+            .filter(|thread| thread.is_chat() && thread.task.is_none() && !thread.is_draft)
+            .collect();
+        match self.thread_order {
+            ThreadOrder::LastActivity => chats.sort_by(|a, b| {
+                b.last_activity_at
+                    .cmp(&a.last_activity_at)
+                    .then(b.id.cmp(&a.id))
+            }),
+            ThreadOrder::Created => chats.sort_by_key(|thread| std::cmp::Reverse(thread.id)),
+        }
+        // Stable, so each part keeps the order above.
+        chats.sort_by_key(|thread| !thread.is_pinned());
+        chats
     }
 
     /// Unarchived threads of every visible project, in the current [`ThreadOrder`].
@@ -977,7 +1039,7 @@ impl ProjectStore {
         title: impl Into<String>,
         agent_id: Option<String>,
     ) -> Option<ThreadId> {
-        if project_id != ProjectId::WORKSPACES {
+        if project_id != ProjectId::WORKSPACES && project_id != ProjectId::CHATS {
             self.project(project_id)?;
         }
         let id = ThreadId(self.allocate_id());
@@ -1194,9 +1256,11 @@ impl ProjectStore {
         threads
     }
 
+    /// Chats aren't archived: they're kept in the Chats shelf until deleted.
     pub fn archive_thread(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.archived_at.is_none()
+            && !thread.is_chat()
         {
             thread.archived_at = Some(SystemTime::now());
             // As t3code's settling does, so a thread brought back starts over among the rest.
@@ -1419,11 +1483,13 @@ impl ProjectStore {
         self.changed();
     }
 
-    /// Where the thread's agent works: its workspace, or its project's folder.
+    /// Where the thread's agent works: its workspace, or its project's folder. A chat without a
+    /// folder of its own yet works in [`ProjectStore::chats_folder`].
     pub fn thread_folder(&self, id: ThreadId) -> Option<PathBuf> {
         let thread = self.thread(id)?;
         match &thread.workspace {
             Some(path) => Some(path.clone()),
+            None if thread.is_chat() => self.chats_folder.clone(),
             None => Some(self.project(thread.project_id)?.path.clone()),
         }
     }
@@ -1904,6 +1970,7 @@ impl ProjectStore {
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
             workspaces_expanded: self.workspaces_expanded,
+            chats_collapsed: self.chats_collapsed,
             working_threads,
             blocked_threads,
             awaiting_input_threads,
@@ -1957,6 +2024,7 @@ impl ProjectStore {
                 thread_order: snapshot.thread_order,
                 archived_expanded: snapshot.archived_expanded,
                 workspaces_expanded: snapshot.workspaces_expanded,
+                chats_collapsed: snapshot.chats_collapsed,
             },
             None,
         );
@@ -2011,6 +2079,7 @@ impl ProjectStore {
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
             workspaces_expanded: self.workspaces_expanded,
+            chats_collapsed: self.chats_collapsed,
         });
     }
 }
@@ -2606,6 +2675,62 @@ mod tests {
         let thread = store.thread(in_docs).expect("thread");
         assert_eq!(thread.workspace, None, "works in the project's own folder");
         assert_eq!(store.thread_folder(in_docs), Some(outside));
+    }
+
+    #[test]
+    fn chats_are_kept_apart_from_projects_and_never_archived() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let chats_folder = dir.path().join("chats");
+        let mut store = ProjectStore::load(Some(state_path.clone()));
+        store.set_chats_folder(chats_folder.clone());
+        let project = store.add_project(dir.path().join("storefront"));
+        let thread = store
+            .add_thread(project, "Fix the cart", None)
+            .expect("thread");
+        let older = store
+            .add_thread(ProjectId::CHATS, "Async Rust", None)
+            .expect("chat");
+        let newer = store
+            .add_thread(ProjectId::CHATS, "Trip ideas", None)
+            .expect("chat");
+        let draft = store
+            .add_thread(ProjectId::CHATS, NEW_THREAD_TITLE, None)
+            .expect("chat");
+        store.set_draft(draft, true);
+
+        assert!(store.thread(older).is_some_and(Thread::is_chat));
+        assert_eq!(
+            store
+                .active_threads()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![thread],
+            "not among the threads"
+        );
+        let chats = |store: &ProjectStore| store.chats().iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(chats(&store), vec![newer, older], "drafts aren't listed");
+
+        // Until its first message, a chat works where its folder will be made.
+        assert_eq!(store.thread_folder(older), Some(chats_folder.clone()));
+        let own = chats_folder.join("2026-01-01-async-rust-1");
+        store.set_thread_workspace(older, Some(own.clone()));
+        assert_eq!(store.thread_folder(older), Some(own));
+
+        store.archive_thread(older);
+        assert!(store.thread(older).is_some_and(|t| t.archived_at.is_none()));
+        assert!(store.thread(older).is_some_and(Thread::can_pin));
+        store.pin_thread(older, None).expect("pin");
+        assert_eq!(chats(&store), vec![older, newer], "pinned ones lead");
+
+        // They outlive a restart, and so does a closed shelf, which starts open.
+        assert!(store.chats_expanded());
+        store.toggle_chats_expanded();
+        drop(store);
+        let store = ProjectStore::load(Some(state_path));
+        assert_eq!(chats(&store), vec![older, newer]);
+        assert!(!store.chats_expanded());
     }
 
     #[test]

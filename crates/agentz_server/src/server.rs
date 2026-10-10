@@ -2,6 +2,7 @@
 
 mod account_requests;
 mod attachment_requests;
+mod chats;
 mod copy_reads;
 mod custom_agents;
 mod favicon_reads;
@@ -184,6 +185,7 @@ pub(crate) struct Server {
     pending_tool_calls: Vec<PendingToolCall>,
     /// Messages waiting for the threads they mention to load.
     pending_prompts: Vec<prompt_requests::PendingPrompt>,
+    pending_mention_reads: Vec<prompt_requests::PendingMentionRead>,
     /// First messages waiting for their thread's new worktree or pasture.
     workspace_setups: HashMap<ThreadId, workspace_setup::SetupRun>,
     /// Threads whose new workspace's branch is renamed after their title once they have one,
@@ -307,6 +309,7 @@ impl Server {
     ) -> Self {
         let data_dir = config.data_dir;
         let mut projects = ProjectStore::load(Some(data_dir.join("state.json")));
+        projects.set_chats_folder(data_dir.join("chats"));
         tools::interrupt_unfinished_tasks(&mut projects);
         let agent_settings = AgentSettingsStore::load(
             Some(data_dir.join("agents").join("settings.json")),
@@ -365,6 +368,7 @@ impl Server {
             moving_threads: HashMap::default(),
             pending_tool_calls: Vec::new(),
             pending_prompts: Vec::new(),
+            pending_mention_reads: Vec::new(),
             workspace_setups: HashMap::default(),
             branches_to_name: HashMap::default(),
             reading_prompts: Vec::new(),
@@ -706,6 +710,11 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::MentionedThread(thread_id),
+            } => self.read_mentioned_thread(client, id, thread_id),
+            Input::Request {
+                client,
+                id,
                 request: Request::ProjectFavicon(project_id),
             } => self.project_favicon(client, id, project_id),
             Input::Request {
@@ -904,6 +913,10 @@ impl Server {
             }
             Request::ToggleWorkspacesExpanded => {
                 self.projects.toggle_workspaces_expanded();
+                Ok(Response::Ok)
+            }
+            Request::ToggleChatsExpanded => {
+                self.projects.toggle_chats_expanded();
                 Ok(Response::Ok)
             }
             Request::MoveToAgents(thread_id) => {
@@ -1212,6 +1225,7 @@ impl Server {
                 Err(anyhow!("using a limit reset is handled separately"))
             }
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
+            Request::MentionedThread(_) => Err(anyhow!("mentioned threads are read separately")),
             Request::ProjectFavicon(_) => Err(anyhow!("favicons are handled separately")),
             Request::ProjectImageFiles(_) => {
                 Err(anyhow!("listing image files is handled separately"))
@@ -1705,8 +1719,13 @@ impl Server {
 
     /// Removes the thread, its subthreads, and what they kept: their transcripts, checkpoints,
     /// attachments, queued messages, and any conversation waiting to go with a first message.
-    /// Their agents stop with the next changes.
+    /// A chat's folder goes too. Their agents stop with the next changes.
     fn delete_thread(&mut self, thread_id: ThreadId) {
+        let chat_folder = self
+            .projects
+            .thread(thread_id)
+            .filter(|thread| thread.is_chat() && thread.task.is_none())
+            .and_then(|thread| thread.workspace.clone());
         let threads = self.projects.thread_and_subthreads(thread_id);
         for thread_id in &threads {
             self.draft_due.remove(thread_id);
@@ -1720,6 +1739,9 @@ impl Server {
         self.delete_attachments(threads.clone());
         self.delete_checkpoints(threads);
         self.projects.delete_thread(thread_id);
+        if let Some(folder) = chat_folder {
+            self.remove_chat_folder(folder);
+        }
     }
 
     /// A thread the user starts is a draft until its first message, and is removed once they

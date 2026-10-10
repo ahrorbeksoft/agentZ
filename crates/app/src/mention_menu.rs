@@ -6,14 +6,17 @@ use std::path::PathBuf;
 use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::{FileListing, PromptPart};
 use gpui::{AnyElement, App, SharedString};
-use projects::{Mentioned, ThreadId};
+use projects::{Mentioned, Project, ThreadId};
 use ui::{ListItem, ListItemSpacing, prelude::*};
 
+use crate::machines::MachineId;
+use crate::project_info::render_project_icon;
 use crate::project_switcher::fuzzy_match;
 
 /// The most of each group the menu lists.
 const MAX_FILES: usize = 8;
 const MAX_THREADS: usize = 5;
+const MAX_PROJECTS: usize = 5;
 
 /// What a chip in the composer stands for.
 #[derive(Clone)]
@@ -23,6 +26,14 @@ pub(crate) enum Mention {
     Thread(ThreadId),
     /// An image kept by the thread's server.
     Image(AttachmentId),
+    /// A thread on another machine, as the app read its conversation there.
+    Conversation {
+        uri: String,
+        title: String,
+        text: String,
+    },
+    /// A project on another machine, in words: the agent reaches it with agentZ's tools.
+    Text(String),
 }
 
 impl Mention {
@@ -31,16 +42,24 @@ impl Mention {
             Mention::Path(path) => PromptPart::Path(path.clone()),
             Mention::Thread(thread_id) => PromptPart::Thread(*thread_id),
             Mention::Image(id) => PromptPart::Image(id.clone()),
+            Mention::Conversation { uri, title, text } => PromptPart::Conversation {
+                uri: uri.clone(),
+                title: title.clone(),
+                text: text.clone(),
+            },
+            Mention::Text(text) => PromptPart::Text(text.clone()),
         }
     }
 
-    /// How a composer draft keeps it ([`projects::Thread::unsent_mentions`]).
-    pub(crate) fn target(&self) -> Mentioned {
-        match self {
+    /// How a composer draft keeps it ([`projects::Thread::unsent_mentions`]). Another
+    /// machine's thread or project stays in the draft as its name.
+    pub(crate) fn target(&self) -> Option<Mentioned> {
+        Some(match self {
             Mention::Path(path) => Mentioned::Path(path.clone()),
             Mention::Thread(thread_id) => Mentioned::Thread(*thread_id),
             Mention::Image(id) => Mentioned::Image(id.as_str().to_string()),
-        }
+            Mention::Conversation { .. } | Mention::Text(_) => return None,
+        })
     }
 
     pub(crate) fn from_target(target: &Mentioned) -> Option<Self> {
@@ -89,22 +108,34 @@ pub(crate) fn mention_query(text: &str, cursor: usize) -> Option<MentionQuery> {
 
 /// A thread @ can mention.
 pub(crate) struct MentionableThread {
+    pub machine: MachineId,
     pub id: ThreadId,
     pub title: SharedString,
-    /// When it last did something, as the menu shows it.
-    pub time: SharedString,
+    /// When it last did something, or in a chat its project, as the menu shows it.
+    pub detail: SharedString,
+}
+
+/// A project a chat's @ can mention, on any machine.
+pub(crate) struct MentionableProject {
+    pub machine: MachineId,
+    pub project: Project,
+    pub name: SharedString,
+    /// The machine it's on, when that's not the chat's.
+    pub detail: SharedString,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MentionTarget {
     /// Relative to the file listing's root.
-    Path {
-        path: String,
-        is_dir: bool,
-    },
+    Path { path: String, is_dir: bool },
     Thread {
+        machine: MachineId,
         id: ThreadId,
         title: SharedString,
+    },
+    Project {
+        machine: MachineId,
+        project: Project,
     },
 }
 
@@ -116,15 +147,36 @@ pub(crate) struct MentionMatch {
 }
 
 /// What a query finds: files whose name matches before those whose path does, the most
-/// compact matches first; then threads, the latest first.
+/// compact matches first; then threads, the latest first. A chat's (with `projects`) lists
+/// projects first, then threads, then the files in its own folder.
 pub(crate) fn find_mentions(
     query: &str,
     kind: MentionKind,
     files: Option<&FileListing>,
     threads: &[MentionableThread],
+    projects: Option<&[MentionableProject]>,
 ) -> Vec<MentionMatch> {
     let query = query.to_lowercase();
     let mut found = Vec::new();
+    if kind == MentionKind::Any
+        && let Some(projects) = projects
+    {
+        found.extend(
+            projects
+                .iter()
+                .filter(|project| fuzzy_match(&query, &project.name).is_some())
+                .take(MAX_PROJECTS)
+                .map(|project| MentionMatch {
+                    target: MentionTarget::Project {
+                        machine: project.machine,
+                        project: project.project.clone(),
+                    },
+                    label: project.name.clone(),
+                    detail: project.detail.clone(),
+                }),
+        );
+    }
+    let mut files_found = Vec::new();
     if kind != MentionKind::Threads
         && let Some(files) = files
     {
@@ -157,7 +209,7 @@ pub(crate) fn find_mentions(
                 Some((folder, name)) => (folder.to_string(), name.to_string()),
                 None => (String::new(), entry.path.clone()),
             };
-            found.push(MentionMatch {
+            files_found.push(MentionMatch {
                 target: MentionTarget::Path {
                     path: entry.path.clone(),
                     is_dir: entry.is_dir,
@@ -167,6 +219,9 @@ pub(crate) fn find_mentions(
             });
         }
     }
+    if projects.is_none() {
+        found.append(&mut files_found);
+    }
     if kind != MentionKind::Files {
         found.extend(
             threads
@@ -175,20 +230,24 @@ pub(crate) fn find_mentions(
                 .take(MAX_THREADS)
                 .map(|thread| MentionMatch {
                     target: MentionTarget::Thread {
+                        machine: thread.machine,
                         id: thread.id,
                         title: thread.title.clone(),
                     },
                     label: thread.title.clone(),
-                    detail: thread.time.clone(),
+                    detail: thread.detail.clone(),
                 }),
         );
     }
+    found.append(&mut files_found);
     found
 }
 
 pub(crate) fn target_icon(target: &MentionTarget) -> IconName {
     match target {
-        MentionTarget::Path { is_dir: true, .. } => IconName::Folder,
+        MentionTarget::Path { is_dir: true, .. } | MentionTarget::Project { .. } => {
+            IconName::Folder
+        }
         MentionTarget::Path { .. } => IconName::File,
         MentionTarget::Thread { .. } => IconName::Thread,
     }
@@ -215,22 +274,28 @@ pub(crate) fn render_mention_menu(
         let group = match found.target {
             MentionTarget::Path { .. } => "Files",
             MentionTarget::Thread { .. } => "Threads",
+            MentionTarget::Project { .. } => "Projects",
         };
         if last_group != Some(group) {
             items.push(header(group).into_any_element());
             last_group = Some(group);
         }
         let on_click = on_click.clone();
+        let icon = match &found.target {
+            MentionTarget::Project { machine, project } => {
+                render_project_icon(*machine, project, px(14.), cx)
+            }
+            target => Icon::new(target_icon(target))
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        };
         items.push(
             ListItem::new(("mention", index))
                 .inset(true)
                 .spacing(ListItemSpacing::Dense)
                 .toggle_state(index == selected)
-                .start_slot(
-                    Icon::new(target_icon(&found.target))
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
+                .start_slot(icon)
                 .child(
                     h_flex()
                         .w_full()
@@ -318,17 +383,57 @@ mod tests {
             .collect(),
         };
         let threads = [MentionableThread {
+            machine: MachineId::Local,
             id: ThreadId(4),
             title: "Order totals report".into(),
-            time: "2d".into(),
+            detail: "2d".into(),
         }];
-        let found = find_mentions("tot", MentionKind::Any, Some(&files), &threads);
+        let found = find_mentions("tot", MentionKind::Any, Some(&files), &threads, None);
         let labels: Vec<&str> = found.iter().map(|found| found.label.as_ref()).collect();
         assert_eq!(
             labels,
             ["totals", "total.ts", "readme.md", "Order totals report"]
         );
-        let only_threads = find_mentions("tot", MentionKind::Threads, Some(&files), &threads);
+        let only_threads = find_mentions("tot", MentionKind::Threads, Some(&files), &threads, None);
         assert_eq!(only_threads.len(), 1);
+    }
+
+    #[test]
+    fn a_chat_lists_projects_then_threads_then_its_files() {
+        let files = FileListing {
+            root: "/chats/a".into(),
+            entries: vec![FileEntry {
+                path: "store-notes.md".into(),
+                is_dir: false,
+            }],
+        };
+        let threads = [MentionableThread {
+            machine: MachineId::Remote(1),
+            id: ThreadId(4),
+            title: "Stock levels".into(),
+            detail: "api · Devbox 1".into(),
+        }];
+        let projects = [MentionableProject {
+            machine: MachineId::Local,
+            project: Project {
+                id: projects::ProjectId(1),
+                path: "/code/storefront".into(),
+                custom_name: None,
+                icon: None,
+                workspaces: Vec::new(),
+                repository: None,
+            },
+            name: "storefront".into(),
+            detail: "".into(),
+        }];
+        let found = find_mentions(
+            "st",
+            MentionKind::Any,
+            Some(&files),
+            &threads,
+            Some(&projects),
+        );
+        let labels: Vec<&str> = found.iter().map(|found| found.label.as_ref()).collect();
+        assert_eq!(labels, ["storefront", "Stock levels", "store-notes.md"]);
     }
 }

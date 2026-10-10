@@ -173,10 +173,15 @@ impl Server {
         new: NewThread,
         workspace: WorkspaceChoice,
     ) {
+        if project_id == ProjectId::CHATS && matches!(new, NewThread::Terminal(_)) {
+            let error = anyhow!("a chat is a conversation with an agent, not a terminal");
+            return self.respond(client, id, Err(error));
+        }
         // An agent's draft starts in the project's folder, and its first message makes the
         // new workspace (`workspace_setup`).
         if let (NewThread::Agent(..), Some(plan)) = (&new, workspace.plan())
             && project_id != ProjectId::WORKSPACES
+            && project_id != ProjectId::CHATS
         {
             let result = self
                 .create_thread_in(project_id, new, None)
@@ -296,6 +301,25 @@ impl Server {
             };
             anyhow::ensure!(path.is_dir(), "{} was removed", path.display());
             return Ok(PreparedWorkspace::Ready(Some(path)));
+        }
+        // A chat's folder is made with its first message (`chats`); one continuing a chat
+        // works in that chat's.
+        if project_id == ProjectId::CHATS {
+            let root = self
+                .projects
+                .chats_folder()
+                .context("chats have no folder")?;
+            std::fs::create_dir_all(root)
+                .with_context(|| format!("creating {}", root.display()))?;
+            return match choice {
+                WorkspaceChoice::Checkout => Ok(PreparedWorkspace::Ready(None)),
+                WorkspaceChoice::Existing(path) if path.parent() == Some(root) && path.is_dir() => {
+                    Ok(PreparedWorkspace::Ready(Some(path)))
+                }
+                _ => Err(anyhow!(
+                    "a chat works in a folder of its own, which its first message makes"
+                )),
+            };
         }
         let repo = self.project_path(project_id)?;
         match choice {

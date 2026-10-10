@@ -222,6 +222,8 @@ struct Target {
     machine: String,
     /// The project's checkout there; `None` for [`MACHINE_TOOLS`] on a machine without it.
     path: Option<PathBuf>,
+    /// A chat's call, which needs no project there ([`RelayToolCall::from_chat`]).
+    from_chat: bool,
 }
 
 impl Server {
@@ -240,10 +242,13 @@ impl Server {
         if self.relays.is_this_machine(machine) || machine.eq_ignore_ascii_case("this machine") {
             return None;
         }
-        if !RELAYED_TOOLS.contains(&name) {
+        if !RELAYED_TOOLS.contains(&name)
+            || (caller.is_chat() && !super::CHAT_RELAYED_TOOLS.contains(&name))
+        {
             return Some(Err(invalid(format!("{name} only works on this machine."))));
         }
-        let target = match self.relay_target(caller, machine, !MACHINE_TOOLS.contains(&name)) {
+        let needs_project = !MACHINE_TOOLS.contains(&name) && !caller.is_chat();
+        let target = match self.relay_target(caller, machine, needs_project) {
             Ok(target) => target,
             Err(failure) => return Some(Err(failure)),
         };
@@ -337,6 +342,7 @@ impl Server {
             client,
             machine: known.name.clone(),
             path,
+            from_chat: caller.is_chat(),
         })
     }
 
@@ -359,6 +365,7 @@ impl Server {
                 relay_id,
                 machine: target.machine.clone(),
                 path: target.path,
+                from_chat: target.from_chat,
                 name: name.to_string(),
                 arguments,
             })),
@@ -683,19 +690,37 @@ impl Server {
         };
         let local = with_machine(local, &this_machine);
         let is_first_page = arguments.0.get("cursor").is_none_or(|cursor| cursor == 0);
-        let others: Vec<String> = self
-            .relays
-            .checkouts(caller.project_id)
-            .map(|checkouts| {
-                let mut machines: Vec<String> = Vec::new();
-                for checkout in &checkouts.checkouts {
-                    if !machines.contains(&checkout.machine) {
-                        machines.push(checkout.machine.clone());
+        // A chat's list spans every machine's projects, unless it names one here.
+        let others: Vec<String> = if caller.is_chat() {
+            if arguments.0.contains_key("projectId") {
+                Vec::new()
+            } else {
+                self.relays
+                    .latest()
+                    .map(|(_, peers)| {
+                        peers
+                            .machines
+                            .iter()
+                            .filter(|machine| machine.online)
+                            .map(|machine| machine.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        } else {
+            self.relays
+                .checkouts(caller.project_id)
+                .map(|checkouts| {
+                    let mut machines: Vec<String> = Vec::new();
+                    for checkout in &checkouts.checkouts {
+                        if !machines.contains(&checkout.machine) {
+                            machines.push(checkout.machine.clone());
+                        }
                     }
-                }
-                machines
-            })
-            .unwrap_or_default();
+                    machines
+                })
+                .unwrap_or_default()
+        };
         if !is_first_page || others.is_empty() {
             return Step::Done(local);
         }
@@ -708,7 +733,7 @@ impl Server {
             .clamp(1, 100) as usize;
         let mut lists = Vec::new();
         for machine in others {
-            let list = match self.relay_target(caller, &machine, true) {
+            let list = match self.relay_target(caller, &machine, !caller.is_chat()) {
                 Ok(target) => self.relay(
                     target,
                     "agentz_thread_list",
@@ -788,6 +813,15 @@ impl Server {
                 })
             })
             .collect();
+        if caller.is_chat() {
+            capabilities["features"]["otherMachines"] = json!(
+                "agentz_thread_list without projectId lists the threads of every machine's \
+                 projects, each with its machine. Pass machine to agentz_thread_read, \
+                 agentz_thread_diff and agentz_workspace_list (with that machine's projectId) \
+                 to read there, and to orchestrator_capabilities for that machine's projects."
+            );
+            return;
+        }
         capabilities["features"]["otherMachines"] = json!(
             "Tools that take machine run on that machine's checkout of this project. Pass machine \
              to orchestrator_capabilities for its agents. Run one-off commands there with \

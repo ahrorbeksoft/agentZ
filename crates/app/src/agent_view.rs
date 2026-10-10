@@ -50,8 +50,8 @@ use ui::{
 use util::ResultExt as _;
 
 use crate::mention_menu::{
-    Mention, MentionKind, MentionMatch, MentionQuery, MentionTarget, MentionableThread,
-    find_mentions, mention_query, render_mention_menu, target_icon,
+    Mention, MentionKind, MentionMatch, MentionQuery, MentionTarget, MentionableProject,
+    MentionableThread, find_mentions, mention_query, render_mention_menu, target_icon,
 };
 
 use crate::agent_icons::agent_icon;
@@ -89,7 +89,7 @@ use crate::tool_calls::{
 use crate::usage_limits::{
     LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, tightest_window,
 };
-use crate::{ToggleDiff, ToggleTerminalDrawer};
+use crate::{NewChat, OpenFolder, ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
 const RENAME_KEY_CONTEXT: &str = "ThreadHeaderRename";
@@ -303,6 +303,53 @@ pub enum AgentViewEvent {
         agent_id: AgentId,
         add_account: bool,
     },
+}
+
+/// A project in the menu of a new thread's headline: where picking it moves the draft (`None`
+/// while every machine it's on is offline), shown as the sidebar shows it.
+#[derive(Clone)]
+struct HeadlineProject {
+    target: Option<ProjectKey>,
+    icon_machine: MachineId,
+    icon_project: projects::Project,
+    name: SharedString,
+    is_current: bool,
+}
+
+impl HeadlineProject {
+    fn render(&self, cx: &App) -> AnyElement {
+        let color = if self.target.is_some() {
+            Color::Default
+        } else {
+            Color::Disabled
+        };
+        let name = self.name.clone();
+        h_flex()
+            .debug_selector(move || format!("headline-project-{name}"))
+            .w_full()
+            .min_w(px(200.))
+            .gap_2()
+            .child(render_project_icon(
+                self.icon_machine,
+                &self.icon_project,
+                px(14.),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(self.name.clone()).color(color).truncate()),
+            )
+            .child(div().flex_none().w(px(14.)).when(self.is_current, |slot| {
+                slot.child(
+                    Icon::new(IconName::Check)
+                        .size(IconSize::Small)
+                        .color(Color::Accent),
+                )
+            }))
+            .into_any_element()
+    }
 }
 
 /// What a new thread is made again to run, from its agent picker.
@@ -1814,6 +1861,10 @@ impl AgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A chat's folder, where its terminals would run, is never shown.
+        if self.is_chat(cx) && !self.is_drawer_open {
+            return;
+        }
         if self.is_drawer_open {
             self.is_drawer_open = false;
             self.drawer_full_screen = false;
@@ -2406,7 +2457,7 @@ impl AgentView {
         }
         let image = Arc::new(gpui::Image::from_bytes(format, bytes));
         let preview = ChipPreview::Image(ImageSource::Image(image.clone()));
-        let chip = self.insert_pending_chip("Image", IconName::Image, preview, cx);
+        let chip = self.insert_pending_chip(None, "Image", IconName::Image, preview, cx);
         let client = self.client.clone();
         let thread_id = self.thread_id;
         let upload = cx.spawn(async move |this, cx| {
@@ -2441,7 +2492,7 @@ impl AgentView {
     /// Sends a file of this Mac to the thread's machine, and mentions where it's kept there.
     fn upload_file(&mut self, path: PathBuf, label: String, cx: &mut Context<Self>) {
         let preview = ChipPreview::Text(compact_path(&path).into());
-        let chip = self.insert_pending_chip(&label, IconName::File, preview, cx);
+        let chip = self.insert_pending_chip(None, &label, IconName::File, preview, cx);
         let client = self.client.clone();
         let thread_id = self.thread_id;
         let upload = cx.spawn(async move |this, cx| {
@@ -2484,9 +2535,11 @@ impl AgentView {
         self.uploads.insert(chip, upload);
     }
 
-    /// A chip whose mention follows once what it mentions is uploaded.
+    /// A chip whose mention follows once what it mentions is uploaded, in place of `range` (or
+    /// the selection).
     fn insert_pending_chip(
         &mut self,
+        range: Option<std::ops::Range<usize>>,
         label: &str,
         icon: IconName,
         preview: ChipPreview,
@@ -2494,7 +2547,7 @@ impl AgentView {
     ) -> ChipId {
         let copy_text: SharedString = format!("@{label}").into();
         let chip = self.composer.update(cx, |composer, cx| {
-            composer.insert_chip(None, label, icon.path().into(), preview, copy_text, cx)
+            composer.insert_chip(range, label, icon.path().into(), preview, copy_text, cx)
         });
         self.mention_kind = MentionKind::Any;
         cx.notify();
@@ -2612,24 +2665,38 @@ impl AgentView {
             return;
         }
         self.files_changed = false;
-        if self.mention_query.as_ref().map(|query| query.at) != query.as_ref().map(|query| query.at)
+        let is_chat = self.is_chat(cx);
+        let is_new_query = self.mention_query.as_ref().map(|query| query.at)
+            != query.as_ref().map(|query| query.at);
+        if is_new_query
             || self.mention_query.as_ref().map(|query| &query.query)
                 != query.as_ref().map(|query| &query.query)
         {
             self.mention_index = 0;
+        }
+        // A chat's folder is made with its first message and filled by its agent, so each @
+        // lists it again.
+        if is_chat && is_new_query && !self.files_loading {
+            self.files = None;
         }
         self.mention_query = query;
         if self.files.is_none() && !self.files_loading {
             self.load_files(cx);
         }
         let threads = self.mentionable_threads(cx);
+        let projects = is_chat.then(|| self.mentionable_projects(cx));
         let query = self
             .mention_query
             .as_ref()
             .map(|query| query.query.clone())
             .unwrap_or_default();
-        self.mention_matches =
-            find_mentions(&query, self.mention_kind, self.files.as_ref(), &threads);
+        self.mention_matches = find_mentions(
+            &query,
+            self.mention_kind,
+            self.files.as_ref(),
+            &threads,
+            projects.as_deref(),
+        );
     }
 
     fn load_files(&mut self, cx: &mut Context<Self>) {
@@ -2660,8 +2727,13 @@ impl AgentView {
         });
     }
 
-    /// The project's other agent threads, the latest first.
+    /// The project's other agent threads, the latest first. A chat's are every project's on
+    /// every machine.
     fn mentionable_threads(&self, cx: &App) -> Vec<MentionableThread> {
+        if self.is_chat(cx) {
+            return self.chat_mentionable_threads(cx);
+        }
+        let machine = self.client.read(cx).machine();
         let store = self.store.read(cx);
         let Some(project_id) = store.thread(self.thread_id).map(|thread| thread.project_id) else {
             return Vec::new();
@@ -2682,15 +2754,96 @@ impl AgentView {
         threads
             .into_iter()
             .map(|thread| MentionableThread {
+                machine,
                 id: thread.id,
                 title: thread.title.clone().into(),
-                time: thread
+                detail: thread
                     .last_activity_at
                     .map(|time| crate::sidebar::format_relative_time(time, now))
                     .unwrap_or_default()
                     .into(),
             })
             .collect()
+    }
+
+    /// Every project's agent threads on the machines online, the latest first, each with its
+    /// project's name, and its machine's when that's not the chat's.
+    fn chat_mentionable_threads(&self, cx: &App) -> Vec<MentionableThread> {
+        let own_machine = self.client.read(cx).machine();
+        let machines = Machines::global(cx).read(cx);
+        let mut threads: Vec<(MachineId, Thread, SharedString)> = Vec::new();
+        for client in machines.clients() {
+            let client = client.read(cx);
+            let machine = client.machine();
+            if !client.is_online() {
+                continue;
+            }
+            let store = client.projects().read(cx);
+            for thread in store.threads() {
+                let listed = thread.terminal.is_none()
+                    && !thread.is_draft
+                    && thread.task.is_none()
+                    && thread.archived_at.is_none();
+                let Some(project) = store.project(thread.project_id).filter(|_| listed) else {
+                    continue;
+                };
+                let name = machines.project_label(machine, project, cx);
+                let detail = if machine == own_machine {
+                    name
+                } else {
+                    format!("{name} · {}", machines.label(machine, cx)).into()
+                };
+                threads.push((machine, thread.clone(), detail));
+            }
+        }
+        threads.sort_by_key(|(_, thread, _)| std::cmp::Reverse(thread.last_activity_at));
+        threads
+            .into_iter()
+            .map(|(machine, thread, detail)| MentionableThread {
+                machine,
+                id: thread.id,
+                title: thread.title.into(),
+                detail,
+            })
+            .collect()
+    }
+
+    /// Every project on the machines online, for a chat: this machine's first.
+    fn mentionable_projects(&self, cx: &App) -> Vec<MentionableProject> {
+        let own_machine = self.client.read(cx).machine();
+        let machines = Machines::global(cx).read(cx);
+        let mut projects = Vec::new();
+        for client in machines.clients() {
+            let client = client.read(cx);
+            let machine = client.machine();
+            if !client.is_online() {
+                continue;
+            }
+            let detail: SharedString = if machine == own_machine {
+                SharedString::default()
+            } else {
+                machines.label(machine, cx)
+            };
+            for project in client.projects().read(cx).projects() {
+                projects.push(MentionableProject {
+                    machine,
+                    project: project.clone(),
+                    name: machines.project_label(machine, project, cx),
+                    detail: detail.clone(),
+                });
+            }
+        }
+        projects.sort_by_key(|project| project.machine != own_machine);
+        projects
+    }
+
+    /// A chat ([`projects::ProjectId::CHATS`]): it has no project, its agent's folder isn't
+    /// shown, and nothing in it touches a checkout.
+    fn is_chat(&self, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .thread(self.thread_id)
+            .is_some_and(Thread::is_chat)
     }
 
     fn accept_mention(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2713,8 +2866,33 @@ impl AgentView {
                 let preview = ChipPreview::Text(compact_path(&path).into());
                 (Mention::Path(path), preview)
             }
-            MentionTarget::Thread { id, title } => {
+            MentionTarget::Thread { machine, id, title }
+                if *machine != self.client.read(cx).machine() =>
+            {
+                self.mention_query = None;
+                self.mention_remote_thread(*machine, *id, title.clone(), query.at..cursor, cx);
+                return;
+            }
+            MentionTarget::Thread { id, title, .. } => {
                 (Mention::Thread(*id), ChipPreview::Text(title.clone()))
+            }
+            MentionTarget::Project { machine, project } => {
+                let preview = if *machine == MachineId::Local {
+                    compact_path(&project.path)
+                } else {
+                    project.path.display().to_string()
+                };
+                let mention = if *machine == self.client.read(cx).machine() {
+                    Mention::Path(project.path.clone())
+                } else {
+                    let machine = Machines::global(cx).read(cx).label(*machine, cx);
+                    Mention::Text(format!(
+                        "{} (a project on {machine}, at {})",
+                        found.label,
+                        project.path.display()
+                    ))
+                };
+                (mention, ChipPreview::Text(preview.into()))
             }
         };
         self.mention_query = None;
@@ -2726,6 +2904,43 @@ impl AgentView {
             mention,
             cx,
         );
+    }
+
+    /// Another machine's thread, which this one's server can't read: its chip waits for the
+    /// app to read the conversation there, as an upload's does.
+    fn mention_remote_thread(
+        &mut self,
+        machine: MachineId,
+        thread_id: ThreadId,
+        title: SharedString,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let preview = ChipPreview::Text(title.clone());
+        let chip = self.insert_pending_chip(Some(range), &title, IconName::Thread, preview, cx);
+        let request = Machines::global(cx)
+            .read(cx)
+            .client(machine, cx)
+            .map(|client| client.read(cx).request(Request::MentionedThread(thread_id)));
+        let upload = cx.spawn(async move |this, cx| {
+            let result = async {
+                let request = request.ok_or_else(|| anyhow::anyhow!("the machine was removed"))?;
+                match request.await? {
+                    Response::Conversation { title, text } => Ok(Mention::Conversation {
+                        uri: format!("agentz://thread/{}/{}", machine.slug(), thread_id.0),
+                        title,
+                        text,
+                    }),
+                    response => Err(anyhow::anyhow!("unexpected response: {response:?}")),
+                }
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.upload_finished(chip, result, "Couldn't read the thread", cx)
+            })
+            .log_err();
+        });
+        self.uploads.insert(chip, upload);
     }
 
     /// The + button's kinds: types `@`, narrowed to files or threads.
@@ -3627,14 +3842,15 @@ impl AgentView {
     /// which opens the thread's menu (a double-click renames it in place). The branch and the
     /// thread's buttons follow.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_chat = self.is_chat(cx);
         let store = self.store.read(cx);
         let project = store
             .thread(self.thread_id)
             .and_then(|thread| store.project(thread.project_id))
             .cloned();
-        // A Workspaces thread has no project: its folder stands in.
-        let folder = project
-            .is_none()
+        // A Workspaces thread has no project: its folder stands in. A chat's folder is never
+        // shown.
+        let folder = (project.is_none() && !is_chat)
             .then(|| store.thread_folder(self.thread_id))
             .flatten();
         let title = if self.renaming {
@@ -3649,13 +3865,50 @@ impl AgentView {
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            .when(is_chat, |toolbar| toolbar.child(self.render_chat_crumb(cx)))
             .children(project.map(|project| self.render_project_crumb(&project, cx)))
             .children(folder.map(render_folder_crumb))
             // From the title's own width, so a narrow header shrinks it and the project's name
             // together.
             .child(h_flex().flex_auto().min_w_0().child(title))
-            .children(self.render_branch(cx))
-            .child(self.render_toolbar_buttons(cx))
+            .when(!is_chat, |toolbar| toolbar.children(self.render_branch(cx)))
+            .child(self.render_toolbar_buttons(is_chat, cx))
+    }
+
+    /// Chat where a thread's project is; a click starts another chat, as the project starts
+    /// a thread.
+    fn render_chat_crumb(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hover = cx.theme().colors().ghost_element_hover;
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id("thread-header-chat")
+                    .debug_selector(|| "thread-header-chat".into())
+                    .gap_1p5()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(
+                        Icon::new(IconName::Chat)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Chat")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(|_, cx| Tooltip::for_action("New Chat", &NewChat, cx))
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                        cx.emit(AgentViewEvent::NewThreadInProject(ProjectId::CHATS))
+                    })),
+            )
+            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+            .into_any_element()
     }
 
     fn render_project_crumb(
@@ -3764,10 +4017,11 @@ impl AgentView {
         } else {
             (self.agent_id.clone(), self.is_archived)
         };
-        let in_workspaces = store
+        // Workspaces threads and chats aren't archived.
+        let can_archive = store
             .read(cx)
             .thread(thread_id)
-            .is_some_and(Thread::in_workspaces);
+            .is_some_and(|thread| !thread.in_workspaces() && !thread.is_chat());
         // A draft has no conversation to continue, and its agent picker changes the agent.
         let is_draft = self.is_draft(cx);
         let title = self.header_title(cx);
@@ -3970,7 +4224,7 @@ impl AgentView {
                         );
                     }
                     menu.separator()
-                        .when(!in_workspaces, |menu| {
+                        .when(can_archive, |menu| {
                             menu.item(
                                 ContextMenuEntry::new(if is_archived {
                                     "Unarchive"
@@ -4160,8 +4414,11 @@ impl AgentView {
         });
     }
 
-    /// The changes, terminal and agent options buttons.
-    fn render_toolbar_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The changes, terminal and agent options buttons; a chat's agent options alone.
+    fn render_toolbar_buttons(&self, is_chat: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        if is_chat {
+            return h_flex().child(self.render_agent_options(cx));
+        }
         h_flex()
             .gap_1p5()
             .child(render_changes_button(self.changes, self.is_diff_open))
@@ -8459,6 +8716,16 @@ impl AgentView {
                         Mention::Image(id.clone()),
                     )
                 }
+                PromptPart::Conversation { uri, title, text } => (
+                    title.clone(),
+                    IconName::Thread,
+                    ChipPreview::Text(title.clone().into()),
+                    Mention::Conversation {
+                        uri: uri.clone(),
+                        title: title.clone(),
+                        text: text.clone(),
+                    },
+                ),
                 PromptPart::Text(_) => continue,
             };
             self.insert_mention(None, &label, icon, preview, mention, cx);
@@ -8480,6 +8747,7 @@ impl AgentView {
                 ),
                 PromptPart::Thread(thread_id) => format!("@{}", self.thread_title(*thread_id, cx)),
                 PromptPart::Image(_) => "@Image".to_string(),
+                PromptPart::Conversation { title, .. } => format!("@{title}"),
             })
             .collect()
     }
@@ -9585,10 +9853,7 @@ impl AgentView {
     /// where the thread works. Until the first message, the agent, checkout and machine can
     /// still change.
     fn render_new_thread(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let headline: SharedString = match self.continued_title(cx) {
-            Some(title) => format!("Continue “{title}”").into(),
-            None => "What should we work on?".into(),
-        };
+        let headline = self.render_new_thread_headline(cx);
         let screen = v_flex()
             .id("new-thread")
             .debug_selector(|| "new-thread".into())
@@ -9604,13 +9869,7 @@ impl AgentView {
                     .w_full()
                     .max_w(NEW_THREAD_WIDTH)
                     .gap_6()
-                    .child(
-                        div()
-                            .text_center()
-                            .text_2xl()
-                            .text_color(cx.theme().colors().text)
-                            .child(headline),
-                    )
+                    .child(headline)
                     .child(
                         v_flex()
                             .gap_2()
@@ -9630,15 +9889,209 @@ impl AgentView {
         .into_any_element()
     }
 
+    /// The new thread's headline. A project's draft names its project, as t3code's
+    /// `DraftHeroHeadline` does: the name opens a menu that moves the draft to a chat or
+    /// another project, and "or start a chat" sits under it. A chat asks what to talk about.
+    fn render_new_thread_headline(&self, cx: &mut Context<Self>) -> AnyElement {
+        let headline = v_flex()
+            .debug_selector(|| "new-thread-headline".into())
+            .items_center()
+            .gap_1()
+            .text_center()
+            .text_2xl()
+            .text_color(cx.theme().colors().text);
+        if let Some(title) = self.continued_title(cx) {
+            return headline
+                .child(format!("Continue “{title}”"))
+                .into_any_element();
+        }
+        if self.is_chat(cx) {
+            return headline
+                .child("What do you want to talk about?")
+                .into_any_element();
+        }
+        let project = {
+            let store = self.store.read(cx);
+            store
+                .thread(self.thread_id)
+                .filter(|thread| !thread.in_workspaces() && !self.is_in_pane)
+                .and_then(|thread| store.project(thread.project_id))
+                .cloned()
+        };
+        let Some(project) = project else {
+            return headline.child("What should we work on?").into_any_element();
+        };
+        let offers_chat = Machines::chats_enabled(cx);
+        headline
+            .child(
+                h_flex()
+                    .justify_center()
+                    .child("What should we build in")
+                    .child(
+                        div()
+                            .debug_selector(|| "new-thread-project".into())
+                            .ml_2()
+                            .child(self.render_headline_project_menu(&project, offers_chat, cx)),
+                    )
+                    .child("?"),
+            )
+            .when(offers_chat, |headline| {
+                headline.child(self.render_start_chat_link(cx))
+            })
+            .into_any_element()
+    }
+
+    /// The headline's project, opening Chat, the projects shown and Add Project….
+    fn render_headline_project_menu(
+        &self,
+        project: &projects::Project,
+        offers_chat: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let machines = Machines::global(cx).read(cx);
+        let machine = self.store.read(cx).machine();
+        let name = machines.project_label(machine, project, cx);
+        let current_group = machines
+            .group_of(machine, project.id, cx)
+            .map(|group| group.key);
+        // A project on the draft's machine stays there, on its account.
+        let rows: Vec<HeadlineProject> = machines
+            .visible_groups(cx)
+            .into_iter()
+            .filter_map(|group| {
+                let (icon_machine, icon_project) = group.primary()?;
+                let target = group
+                    .members
+                    .iter()
+                    .find(|(member_machine, _)| *member_machine == machine)
+                    .map(|(_, member)| ProjectKey {
+                        machine,
+                        project: member.id,
+                    })
+                    .filter(|_| machines.is_online(machine, cx))
+                    .or_else(|| machines.new_thread_member(&group, cx));
+                Some(HeadlineProject {
+                    target,
+                    icon_machine,
+                    icon_project: icon_project.clone(),
+                    name: group.name(),
+                    is_current: current_group.as_ref() == Some(&group.key),
+                })
+            })
+            .collect();
+        let muted = cx.theme().colors().text_muted;
+        let trigger = ButtonLike::new("new-thread-project-trigger")
+            .style(ButtonStyle::Subtle)
+            .height(px(36.).into())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .max_w(px(320.))
+                            .truncate()
+                            .border_b_1()
+                            .border_dashed()
+                            .border_color(muted)
+                            .child(name.clone()),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    ),
+            );
+        let view = cx.weak_entity();
+        PopoverMenu::new("new-thread-project")
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let rows = rows.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if offers_chat {
+                        let view = view.clone();
+                        menu = menu
+                            .item(
+                                ContextMenuEntry::new("Chat")
+                                    .icon(IconName::Chat)
+                                    .icon_color(Color::Muted)
+                                    .handler(move |_, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.change_new_thread_to_chat(cx)
+                                        })
+                                        .log_err();
+                                    }),
+                            )
+                            .separator();
+                    }
+                    for row in &rows {
+                        let view = view.clone();
+                        let target = row.target;
+                        let row = row.clone();
+                        menu = menu
+                            .custom_entry(
+                                move |_, cx| row.render(cx),
+                                move |_, cx| {
+                                    if let Some(target) = target {
+                                        view.update(cx, |view, cx| {
+                                            view.change_new_thread_project(target, cx)
+                                        })
+                                        .log_err();
+                                    }
+                                },
+                            )
+                            .selectable(target.is_some());
+                    }
+                    if !rows.is_empty() {
+                        menu = menu.separator();
+                    }
+                    menu.item(
+                        ContextMenuEntry::new("Add Project…")
+                            .icon(IconName::FolderOpen)
+                            .icon_color(Color::Muted)
+                            .handler(|window, cx| window.dispatch_action(Box::new(OpenFolder), cx)),
+                    )
+                }))
+            })
+            .trigger_with_tooltip(trigger, Tooltip::text(name))
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)))
+            .into_any_element()
+    }
+
+    /// Under a project draft's headline: the draft made again as a chat, keeping what's typed.
+    fn render_start_chat_link(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let muted = colors.text_muted;
+        h_flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("new-thread-start-chat")
+                    .debug_selector(|| "new-thread-start-chat".into())
+                    .text_ui_sm(cx)
+                    .text_color(colors.text_placeholder)
+                    .border_b_1()
+                    .border_dashed()
+                    .border_color(colors.text_placeholder)
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(muted))
+                    .child("or start a chat")
+                    .tooltip(|_, cx| Tooltip::for_action("Start a Chat", &NewChat, cx))
+                    .on_click(cx.listener(|this, _, _, cx| this.change_new_thread_to_chat(cx))),
+            )
+            .into_any_element()
+    }
+
     /// The agent, in the new thread's composer: a menu of the machine's installed agents.
     fn render_agent_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.weak_entity();
         let registry = self.registry.clone();
         let current_agent = self.agent_id.clone();
-        // A continuation brings a conversation, which only an agent can take, and a Workspaces
-        // draft sits in a workspace, beside its shells.
-        let offers_terminal =
-            self.thread.read(cx).pending_handoff().is_none() && !self.in_workspaces(cx);
+        // A continuation brings a conversation, which only an agent can take, a Workspaces
+        // draft sits in a workspace, beside its shells, and a chat has no folder to open one in.
+        let offers_terminal = self.thread.read(cx).pending_handoff().is_none()
+            && !self.in_workspaces(cx)
+            && !self.is_chat(cx);
         PopoverMenu::new("new-thread-agent")
             .menu(move |window, cx| {
                 let agents: Vec<(AgentId, SharedString)> = {
@@ -9760,6 +10213,11 @@ impl AgentView {
                 .child(self.render_folder_picker(cx))
                 .children(self.render_account_picker(cx))
                 .into_any_element(),
+            None if self.is_chat(cx) => h_flex()
+                .gap_1()
+                .children(self.render_chat_machine_picker(cx))
+                .children(self.render_account_picker(cx))
+                .into_any_element(),
             None => h_flex()
                 .gap_1()
                 .child(self.render_checkout_picker(cx))
@@ -9768,6 +10226,7 @@ impl AgentView {
                 .into_any_element(),
         };
         let branch = match self.planned_workspace(cx) {
+            _ if self.is_chat(cx) => None,
             Some(plan) if self.replacing.is_none() => Some(self.render_base_picker(plan, cx)),
             _ => self.render_new_thread_branch(cx),
         };
@@ -10240,6 +10699,87 @@ impl AgentView {
         })
     }
 
+    /// A chat's machine: any machine, as a chat starts on this one and can move before its
+    /// first message.
+    fn render_chat_machine_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let machines = Machines::global(cx).read(cx);
+        if !machines.has_remotes() || self.is_in_pane {
+            return None;
+        }
+        let machine = self.store.read(cx).machine();
+        let agent_id = self.agent_id.clone()?;
+        let agent_name = self.agent_name(cx);
+        let rows: Vec<(MachineId, CopyRow)> = machines
+            .clients()
+            .iter()
+            .map(|client| {
+                let client = client.read(cx);
+                let member_machine = client.machine();
+                let unusable = if client.is_online() {
+                    let is_installed = matches!(
+                        client.registry().read(cx).install_state(&agent_id),
+                        InstallState::Installed { .. }
+                    );
+                    (!is_installed).then(|| format!("{agent_name} isn't installed").into())
+                } else {
+                    Some("offline".into())
+                };
+                let row = CopyRow {
+                    machine_icon: machines.machine_icon(member_machine, cx),
+                    machine: machines.label(member_machine, cx),
+                    folder: SharedString::default(),
+                    status: None,
+                    unusable,
+                    is_current: member_machine == machine,
+                };
+                (member_machine, row)
+            })
+            .collect();
+        let chip = picker_chip(
+            "new-thread-machine-trigger",
+            Icon::new(machines.machine_icon(machine, cx)),
+            machines.label(machine, cx),
+        );
+        let view = cx.weak_entity();
+        let menu = PopoverMenu::new("new-thread-machine")
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let rows = rows.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for (machine, row) in &rows {
+                        let view = view.clone();
+                        let chats = ProjectKey {
+                            machine: *machine,
+                            project: ProjectId::CHATS,
+                        };
+                        let is_usable = row.unusable.is_none();
+                        let row = row.clone();
+                        menu = menu
+                            .custom_entry(
+                                move |_, _| render_copy_row(&row, None),
+                                move |_, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.change_new_thread_machine(chats, cx)
+                                    })
+                                    .log_err();
+                                },
+                            )
+                            .selectable(is_usable);
+                    }
+                    menu
+                }))
+            })
+            .trigger_with_tooltip(chip, Tooltip::text("Machine"))
+            .anchor(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(0.), px(4.)));
+        Some(
+            div()
+                .debug_selector(|| "new-thread-machine-picker".into())
+                .child(menu)
+                .into_any_element(),
+        )
+    }
+
     /// The account the new thread runs on, shown only when its agent has more than one: its
     /// avatar and name, with a menu of the accounts, their plans and the windows closest to
     /// running out, then Add Account… and Manage Accounts….
@@ -10511,6 +11051,40 @@ impl AgentView {
         );
     }
 
+    /// The draft moves to another project, or out of every project into a chat, keeping what's
+    /// typed, as t3code's headline retargets its draft. On its own machine it keeps its
+    /// account.
+    fn change_new_thread_project(&mut self, project: ProjectKey, cx: &mut Context<Self>) {
+        let Some(current) = self.current_project(cx) else {
+            return;
+        };
+        if project == current {
+            return;
+        }
+        if project.machine != current.machine {
+            return self.change_new_thread_machine(project, cx);
+        }
+        let Some(agent_id) = self.agent_id.clone() else {
+            return;
+        };
+        let account = self.current_account_choice(cx);
+        self.replace_new_thread(
+            project,
+            Starter::Agent(agent_id),
+            WorkspaceChoice::Checkout,
+            account,
+            cx,
+        );
+    }
+
+    fn change_new_thread_to_chat(&mut self, cx: &mut Context<Self>) {
+        let chats = ProjectKey {
+            machine: self.store.read(cx).machine(),
+            project: ProjectId::CHATS,
+        };
+        self.change_new_thread_project(chats, cx);
+    }
+
     /// `account` being `None` for the External one.
     fn change_new_thread_account(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
         let current = self
@@ -10653,10 +11227,10 @@ impl AgentView {
             text.push_str(&content[index..chip.range.start]);
             let start = text.len();
             text.push_str(&chip.copy_text);
-            if let Some(mention) = self.mentions.get(&chip.id) {
+            if let Some(target) = self.mentions.get(&chip.id).and_then(Mention::target) {
                 mentions.push(UnsentMention {
                     range: start..text.len(),
-                    target: mention.target(),
+                    target,
                 });
             }
             index = chip.range.end;
@@ -12836,6 +13410,101 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("new-thread-folder").is_none());
         assert!(cx.debug_bounds("new-thread-folder-menu").is_some());
+    }
+
+    /// The demo snapshot with a second project and a chat draft (5).
+    fn snapshot_with_chat() -> ProjectsSnapshot {
+        let mut snapshot = snapshot(Some("Fix the login"));
+        snapshot.projects.push(Project {
+            id: ProjectId(2),
+            path: "/tmp/api".into(),
+            custom_name: None,
+            icon: None,
+            workspaces: Vec::new(),
+            repository: None,
+        });
+        let mut chat = thread(5, None);
+        chat.project_id = ProjectId::CHATS;
+        chat.is_draft = true;
+        snapshot.threads.push(chat);
+        snapshot
+    }
+
+    /// A project's draft names its project in its headline. The name's menu, and "or start a
+    /// chat" under it, make the draft again in another project or as a chat.
+    #[gpui::test]
+    fn a_drafts_headline_moves_it_to_a_chat_or_another_project(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+
+        let (view, cx) = open_in(snapshot_with_chat(), 1, false, cx);
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::CreateThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
+                    _ => None,
+                }
+            });
+        });
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        let created_in = |project: ProjectId, requests: &RefCell<Vec<Request>>| {
+            requests.borrow().iter().any(|request| {
+                matches!(request, Request::CreateThread { project_id, .. } if *project_id == project)
+            })
+        };
+
+        click_on("new-thread-start-chat", cx);
+        assert!(created_in(ProjectId::CHATS, &requests));
+
+        store.update(cx, |store, cx| store.set_snapshot(snapshot_with_chat(), cx));
+        cx.run_until_parked();
+        requests.borrow_mut().clear();
+        click_on("new-thread-project", cx);
+        assert!(cx.debug_bounds("MENU_ITEM-Chat").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Add Project…").is_some());
+        click_on("headline-project-api", cx);
+        assert!(created_in(ProjectId(2), &requests));
+
+        // Its own project makes nothing.
+        store.update(cx, |store, cx| store.set_snapshot(snapshot_with_chat(), cx));
+        cx.run_until_parked();
+        requests.borrow_mut().clear();
+        click_on("new-thread-project", cx);
+        click_on("headline-project-demo", cx);
+        assert!(requests.borrow().is_empty());
+
+        // Off, chats aren't offered.
+        cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(|settings| settings.chats = false, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread-start-chat").is_none());
+    }
+
+    /// A chat asks what to talk about. It has no project to pick, no checkout or branch, and
+    /// its header has Chat where the project is, and no Changes or Terminal.
+    #[gpui::test]
+    fn a_chat_has_no_project_or_checkout(cx: &mut TestAppContext) {
+        let (view, cx) = open_in(snapshot_with_chat(), 5, false, cx);
+        assert!(cx.debug_bounds("new-thread-headline").is_some());
+        assert!(cx.debug_bounds("new-thread-project").is_none());
+        assert!(cx.debug_bounds("new-thread-start-chat").is_none());
+        assert!(cx.debug_bounds("new-thread-checkout-menu").is_none());
+        assert!(cx.debug_bounds("new-thread-branch").is_none());
+        assert!(cx.debug_bounds("thread-header-chat").is_some());
+        assert!(cx.debug_bounds("thread-header-project").is_none());
+        assert!(cx.debug_bounds("thread-header-folder").is_none());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
+            })
+        });
+        assert!(view.read_with(cx, |view, _| !view.is_drawer_open));
     }
 
     fn click_on(selector: &'static str, cx: &mut VisualTestContext) {

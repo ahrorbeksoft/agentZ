@@ -46,7 +46,7 @@ Each round's `decisions.md` is its spec. A built round's backlog entry is remove
 | Every kind of tool call | `design/tool-calls-2/` (20) and `design/agentz-tools/` | yes, agents' own tools, ToolSearch and other MCP servers' tools (tool-calls-2); agentZ's own tools say what came of them and open to it in words (agentz-tools) |
 | Subagents and subthreads in threads | `design/agentz-tools/` (13) | yes, Zed's subagent card for delegated subthreads and running Claude Agent subagents, Droid's Task report first |
 | More options for a new thread's worktree or pasture | `design/new-workspace/` (11) | yes, "From main" with t3code's branch list and Fetch, made as the first message is sent with its steps shown, the branch named after the thread |
-| Chats | `design/chats/` (14) | |
+| Chats | `design/chats/` (14) | yes, the Chats shelf, New Chat, Chat in the pickers and the headline, a chat's screen, header, folder, @ menu and tools, and the setting |
 | Storage settings | `design/storage/` (13) | |
 | Artifacts | `design/artifacts/` (14) | |
 

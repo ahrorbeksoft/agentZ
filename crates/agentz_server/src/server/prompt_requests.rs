@@ -1,6 +1,6 @@
 //! Messages to agents with what the user mentioned in them (Zed's mentions): files and folders
-//! of the thread's machine, other threads' conversations and pasted images, and the files @ can
-//! mention.
+//! of the thread's machine, other threads' conversations (read here, or by the app on another
+//! machine) and pasted images, and the files @ can mention.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -31,6 +31,15 @@ pub(super) struct PendingPrompt {
     deadline: Instant,
 }
 
+/// A [`agentz_protocol::Request::MentionedThread`] waiting for the thread to load its
+/// conversation.
+pub(super) struct PendingMentionRead {
+    client: ClientId,
+    id: u64,
+    thread_id: ThreadId,
+    deadline: Instant,
+}
+
 impl Server {
     /// Sends a message to a thread's agent ([`agentz_protocol::Request::Prompt`]), or into the
     /// turn it's working on.
@@ -52,6 +61,7 @@ impl Server {
         }
         if let ConnectionId::Thread(thread_id) = connection {
             self.refuse_during_setup(thread_id)?;
+            self.give_chat_its_folder(thread_id, &prompt)?;
             let plan = self
                 .projects
                 .thread(thread_id)
@@ -131,10 +141,65 @@ impl Server {
             || self.has_workspace_setup(thread_id)
     }
 
+    /// Answers with a thread's conversation once it has loaded, for a message on another
+    /// machine.
+    pub(super) fn read_mentioned_thread(&mut self, client: ClientId, id: u64, thread_id: ThreadId) {
+        let is_agent_thread = self
+            .projects
+            .thread(thread_id)
+            .is_some_and(|thread| thread.terminal.is_none());
+        if !is_agent_thread {
+            return self.respond(client, id, Err(anyhow!("the mentioned thread is gone")));
+        }
+        if !self.threads.contains_key(&thread_id) {
+            match self.start_thread(thread_id) {
+                Ok(thread) => {
+                    self.threads.insert(thread_id, thread);
+                }
+                Err(error) => return self.respond(client, id, Err(error)),
+            }
+        }
+        let deadline = Instant::now() + MENTIONED_THREADS_TIMEOUT;
+        self.pending_mention_reads.push(PendingMentionRead {
+            client,
+            id,
+            thread_id,
+            deadline,
+        });
+        self.wake_at(deadline);
+        self.send_changes();
+    }
+
     /// Sends the waiting messages whose mentioned threads have loaded, or that waited long
-    /// enough.
+    /// enough, and the conversations read for other machines.
     pub(super) fn send_waiting_prompts(&mut self) {
         let now = Instant::now();
+        for pending in std::mem::take(&mut self.pending_mention_reads) {
+            let is_loading = self
+                .threads
+                .get(&pending.thread_id)
+                .is_some_and(|thread| *thread.status() == ConnectionStatus::Connecting);
+            if is_loading && now < pending.deadline {
+                self.pending_mention_reads.push(pending);
+                continue;
+            }
+            let result = match self.mentioned_thread(pending.thread_id) {
+                MessagePart::Thread { title, text, .. } => {
+                    Ok(Response::Conversation { title, text })
+                }
+                _ => Err(anyhow!("the mentioned thread is gone")),
+            };
+            let result = result.map_err(|error| agentz_protocol::ErrorResponse {
+                message: format!("{error:#}"),
+            });
+            self.send(
+                pending.client,
+                agentz_protocol::ServerMessage::Response {
+                    id: pending.id,
+                    result,
+                },
+            );
+        }
         for pending in std::mem::take(&mut self.pending_prompts) {
             if let ConnectionId::Thread(thread_id) = pending.connection
                 && self.projects.thread(thread_id).is_none()
@@ -172,6 +237,9 @@ impl Server {
                 PromptPart::Thread(thread_id) => UnreadPart::Read(self.mentioned_thread(thread_id)),
                 PromptPart::Image(id) => UnreadPart::Image(id),
                 PromptPart::Path(path) => UnreadPart::Path(path),
+                PromptPart::Conversation { uri, title, text } => {
+                    UnreadPart::Read(MessagePart::Thread { uri, title, text })
+                }
             })
             .collect();
         self.reading_prompts.push(connection);
@@ -243,6 +311,15 @@ impl Server {
         let Some(root) = self.projects.thread_folder(thread_id) else {
             return self.respond(client, id, Err(anyhow::anyhow!("no such thread")));
         };
+        // Until its first message, a chat has no folder of its own: the one it would list holds
+        // every chat's.
+        let is_chat_without_folder = self
+            .projects
+            .thread(thread_id)
+            .is_some_and(|thread| thread.is_chat() && thread.workspace.is_none());
+        if is_chat_without_folder {
+            return self.respond(client, id, Ok(Response::Files(FileListing::default())));
+        }
         self.spawn_then(
             async move {
                 tokio::task::spawn_blocking(move || list_files(root, |_| true))

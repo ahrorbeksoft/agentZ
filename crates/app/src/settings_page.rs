@@ -1057,6 +1057,7 @@ impl SettingsPage {
                 ],
                 cx,
             ),
+            render_section("Chats", vec![self.render_chats_row(cx)], cx),
             render_section(
                 "Thread titles",
                 self.render_title_generation_rows(window, cx),
@@ -1118,6 +1119,25 @@ impl SettingsPage {
                     let enabled = *state == ToggleState::Selected;
                     app_settings.update(cx, |store, cx| {
                         store.update(|settings| settings.show_thinking = enabled, cx)
+                    })
+                })
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    fn render_chats_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = self.app_settings.read(cx).settings().chats;
+        let app_settings = self.app_settings.clone();
+        render_row(
+            "Chats",
+            "Threads for general conversation, outside every project, in their own group in \
+             the sidebar.",
+            Switch::new("chats", enabled.into())
+                .on_click(move |state, _, cx| {
+                    let enabled = *state == ToggleState::Selected;
+                    app_settings.update(cx, |store, cx| {
+                        store.update(|settings| settings.chats = enabled, cx)
                     })
                 })
                 .into_any_element(),

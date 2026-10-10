@@ -13,7 +13,7 @@ use gpui::{
     FocusHandle, Focusable, Hsla, MouseButton, PathPromptOptions, Subscription, SystemNotification,
     Task, Window, WindowControlArea,
 };
-use projects::{Thread, ThreadId};
+use projects::{ProjectId, Thread, ThreadId};
 use theme::ThemeColors;
 use ui::{ButtonLike, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -42,8 +42,8 @@ use crate::welcome::{Section, SectionButton, render_welcome};
 use crate::window_decorations::{self, RoundedTopCorners as _, Side};
 use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
-    GoTo, NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleCommandPalette, ToggleDiff,
-    ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer,
+    GoTo, NewChat, NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleCommandPalette,
+    ToggleDiff, ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer,
 };
 
 pub const KEY_CONTEXT: &str = "Shell";
@@ -446,6 +446,15 @@ impl Shell {
     /// thread.
     fn latest_thread_in(&self, project: ProjectKey, cx: &App) -> Option<ThreadKey> {
         let machines = self.machines.read(cx);
+        if project.project == ProjectId::CHATS {
+            return machines
+                .chat_threads(cx)
+                .first()
+                .map(|(machine, thread)| ThreadKey {
+                    machine: *machine,
+                    thread: thread.id,
+                });
+        }
         let group = machines.group_of(project.machine, project.project, cx)?;
         machines
             .active_threads(cx)
@@ -503,6 +512,22 @@ impl Shell {
         }
     }
 
+    /// A chat draft on this machine, as t3code's New Chat opens a thread with no project.
+    fn new_chat(&mut self, _: &NewChat, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_chat(MachineId::Local, window, cx);
+    }
+
+    fn start_chat(&mut self, machine: MachineId, window: &mut Window, cx: &mut Context<Self>) {
+        if !Machines::chats_enabled(cx) {
+            return;
+        }
+        let chats = ProjectKey {
+            machine,
+            project: ProjectId::CHATS,
+        };
+        self.start_draft(chats, None, window, cx);
+    }
+
     fn open_new_thread_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let modal = cx.new(|cx| NewThreadModal::new(window, cx));
         let subscriptions = vec![
@@ -513,6 +538,10 @@ impl Shell {
                 NewThreadModalEvent::ProjectChosen(project) => {
                     this.dismiss_modal(window, cx);
                     this.start_draft(*project, None, window, cx);
+                }
+                NewThreadModalEvent::ChatChosen => {
+                    this.dismiss_modal(window, cx);
+                    this.start_chat(MachineId::Local, window, cx);
                 }
             }),
         ];
@@ -598,9 +627,13 @@ impl Shell {
         let project = match landing {
             DraftLanding::In(project)
                 if machines.is_online(project.machine, cx)
-                    && machines
-                        .projects(project.machine, cx)
-                        .is_some_and(|store| store.read(cx).project(project.project).is_some()) =>
+                    && if project.project == ProjectId::CHATS {
+                        Machines::chats_enabled(cx)
+                    } else {
+                        machines
+                            .projects(project.machine, cx)
+                            .is_some_and(|store| store.read(cx).project(project.project).is_some())
+                    } =>
             {
                 Some(project)
             }
@@ -802,10 +835,14 @@ impl Shell {
         self.sync_diff_panel(cx);
     }
 
-    /// Shows the active thread's changes when they're wanted, and tells the views.
+    /// Shows the active thread's changes when they're wanted, and tells the views. A chat has
+    /// none to show.
     fn sync_diff_panel(&mut self, cx: &mut Context<Self>) {
-        let thread_id = self.active_thread.filter(|_| {
-            self.show_diff && self.settings_page.is_none() && self.view == MainView::Agents
+        let thread_id = self.active_thread.filter(|key| {
+            self.show_diff
+                && self.settings_page.is_none()
+                && self.view == MainView::Agents
+                && !self.thread(*key, cx).is_some_and(|thread| thread.is_chat())
         });
         match thread_id {
             Some(key) => {
@@ -2054,6 +2091,9 @@ impl Render for Shell {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::new_thread))
+            .when(Machines::chats_enabled(cx), |shell| {
+                shell.on_action(cx.listener(Self::new_chat))
+            })
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_sidebar))
             // The Agents view's title bar and thread, which Workspaces doesn't show, so the
