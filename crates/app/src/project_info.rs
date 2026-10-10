@@ -1,7 +1,7 @@
-//! What t3code's sidebar shows about a project besides its name: an icon (the project's
-//! favicon, or a colored monogram when it has none). Each machine's server finds its projects'
-//! favicons (`projects::ProjectStore::favicon`), as it reads the branches checked out
-//! (`projects::ProjectStore::git_head`).
+//! What t3code's sidebar shows about a project besides its name: an icon (one picked for it,
+//! its favicon, or a colored monogram when it has neither). Each machine's server finds its
+//! projects' icon files (`projects::ProjectStore::favicon`), as it reads the branches checked
+//! out (`projects::ProjectStore::git_head`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -131,8 +131,9 @@ fn image_format(bytes: &[u8]) -> anyhow::Result<ImageFormat> {
     })
 }
 
-/// The icon picked in the project's settings, else its favicon, else t3code's monogram tile
-/// (also shown while an image loads, and when it fails to).
+/// The icon, emoji or monogram picked in the project's settings, else its icon file (the one
+/// picked, or the favicon found), else t3code's monogram tile (also shown while an image
+/// loads, and when it fails to).
 pub fn render_project_icon(
     machine: MachineId,
     project: &Project,
@@ -142,30 +143,27 @@ pub fn render_project_icon(
     let name = project.name();
     let is_light = cx.theme().appearance().is_light();
     let font_family = theme::theme_settings(cx).buffer_font(cx).family.clone();
-    let (text, color, image) = match &project.icon {
+    match &project.icon {
+        Some(ProjectIcon::Icon { name: icon, color }) => {
+            if let Ok(icon) = icon.parse::<IconName>() {
+                let color =
+                    named_color(color, cx).unwrap_or_else(|| monogram_color(&name, is_light));
+                return render_icon(icon, color, size).into_any_element();
+            }
+        }
+        Some(ProjectIcon::Emoji { emoji }) => {
+            return render_emoji(emoji.clone().into(), size).into_any_element();
+        }
         Some(ProjectIcon::Monogram { text, color }) => {
-            let color = MONOGRAM_COLORS
-                .iter()
-                .find(|(name, _, _)| name == color)
-                .map(|(_, light, dark)| rgb(if is_light { *light } else { *dark }).into())
-                .unwrap_or_else(|| monogram_color(&name, is_light));
-            let text: String = text.chars().take(2).collect();
-            return render_monogram(text.to_uppercase().into(), color, font_family, size)
+            let color = named_color(color, cx).unwrap_or_else(|| monogram_color(&name, is_light));
+            return render_monogram(monogram_text(text).into(), color, font_family, size)
                 .into_any_element();
         }
-        Some(ProjectIcon::Image { path }) => (
-            monogram(&name),
-            monogram_color(&name, is_light),
-            Some(ImageSource::from(path.clone())),
-        ),
-        None => (
-            monogram(&name),
-            monogram_color(&name, is_light),
-            favicon(machine, project.id, cx),
-        ),
-    };
-    let text = SharedString::from(text);
-    let Some(image) = image else {
+        Some(ProjectIcon::Image { .. }) | None => {}
+    }
+    let text = SharedString::from(monogram(&name));
+    let color = monogram_color(&name, is_light);
+    let Some(image) = favicon(machine, project.id, cx) else {
         return render_monogram(text, color, font_family, size).into_any_element();
     };
     let placeholder =
@@ -179,8 +177,41 @@ pub fn render_project_icon(
         .into_any_element()
 }
 
+/// One of the app's icons in its color, filling the space as t3code's Lucide icons do.
+pub fn render_icon(icon: IconName, color: Hsla, size: Pixels) -> Div {
+    div()
+        .size(size)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(icon)
+                .size(IconSize::Custom(rems_from_px(f32::from(size))))
+                .color(Color::Custom(color)),
+        )
+}
+
+/// An emoji at 80% of the space's height, as t3code sets one.
+pub fn render_emoji(emoji: SharedString, size: Pixels) -> Div {
+    div()
+        .size(size)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(size * 0.8)
+        .line_height(size)
+        .child(emoji)
+}
+
+/// A monogram's letters as its tile shows them.
+pub fn monogram_text(text: &str) -> String {
+    text.chars().take(2).collect::<String>().to_uppercase()
+}
+
 /// t3code draws the monogram on a 16px tile with 8.25px text and a 25% corner radius.
-fn render_monogram(
+pub fn render_monogram(
     text: SharedString,
     color: Hsla,
     font_family: SharedString,
@@ -268,6 +299,14 @@ pub fn monogram_swatch(light: u32, dark: u32, cx: &App) -> Hsla {
     .into()
 }
 
+/// One of [`MONOGRAM_COLORS`], by its name, in the current theme's shade.
+pub fn named_color(name: &str, cx: &App) -> Option<Hsla> {
+    MONOGRAM_COLORS
+        .iter()
+        .find(|(color, _, _)| *color == name)
+        .map(|(_, light, dark)| monogram_swatch(*light, *dark, cx))
+}
+
 fn monogram_color(name: &str, is_light: bool) -> Hsla {
     let (_, light, dark) = MONOGRAM_COLORS
         .get(monogram_color_index(name))
@@ -309,23 +348,22 @@ mod tests {
     /// A 1 by 1 pixel PNG.
     const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
-    struct ProjectIcons(Vec<MachineId>);
+    /// Project 1's icon on each machine, picked as given.
+    struct ProjectIcons(Vec<(MachineId, Option<ProjectIcon>)>);
 
     impl Render for ProjectIcons {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let project = Project {
-                id: ProjectId(1),
-                path: "/srv/demo".into(),
-                custom_name: None,
-                icon: None,
-                workspaces: Vec::new(),
-                repository: None,
-            };
-            h_flex().children(
-                self.0
-                    .iter()
-                    .map(|machine| render_project_icon(*machine, &project, px(16.), cx)),
-            )
+            h_flex().children(self.0.iter().map(|(machine, icon)| {
+                let project = Project {
+                    id: ProjectId(1),
+                    path: "/srv/demo".into(),
+                    custom_name: None,
+                    icon: icon.clone(),
+                    workspaces: Vec::new(),
+                    repository: None,
+                };
+                render_project_icon(*machine, &project, px(16.), cx)
+            }))
         }
     }
 
@@ -371,11 +409,63 @@ mod tests {
             crate::machines::init_for_test(vec![local, remote], cx);
             (local_requests, remote_requests)
         });
-        let (_view, cx) = cx.add_window_view(|_, _| ProjectIcons(vec![MachineId::Local, remote]));
+        let (_view, cx) =
+            cx.add_window_view(|_, _| ProjectIcons(vec![(MachineId::Local, None), (remote, None)]));
         cx.run_until_parked();
         assert!(local_requests.borrow().is_empty());
         assert_eq!(
             *remote_requests.borrow(),
+            vec![Request::ProjectFavicon(ProjectId(1))]
+        );
+    }
+
+    /// An icon, emoji or monogram picked is drawn as it is. A file picked is the icon file
+    /// its server resolved, fetched as a favicon is, and so is an icon this build doesn't have.
+    #[gpui::test]
+    fn picked_icons_come_before_the_icon_file(cx: &mut TestAppContext) {
+        let remote = MachineId::Remote(1);
+        let requests = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let (local, _) = client_with_favicon(MachineId::Local, cx);
+            let (remote_client, requests) = client_with_favicon(remote, cx);
+            crate::machines::init_for_test(vec![local, remote_client], cx);
+            requests
+        });
+        let drawn = [
+            ProjectIcon::Icon {
+                name: "git_branch".into(),
+                color: "teal".into(),
+            },
+            ProjectIcon::Emoji {
+                emoji: "🚀".into()
+            },
+            ProjectIcon::Monogram {
+                text: "q7".into(),
+                color: "rose".into(),
+            },
+        ];
+        let (view, cx) = cx.add_window_view(move |_, _| {
+            ProjectIcons(drawn.map(|icon| (remote, Some(icon))).into())
+        });
+        cx.run_until_parked();
+        assert!(requests.borrow().is_empty());
+
+        let fetched = [
+            ProjectIcon::Image {
+                path: "assets/logo.png".into(),
+            },
+            ProjectIcon::Icon {
+                name: "no_such_icon".into(),
+                color: "teal".into(),
+            },
+        ];
+        view.update(cx, |view, cx| {
+            view.0 = fetched.map(|icon| (remote, Some(icon))).into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *requests.borrow(),
             vec![Request::ProjectFavicon(ProjectId(1))]
         );
     }

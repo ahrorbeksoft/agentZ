@@ -44,11 +44,14 @@ reqwest_client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
+strum.workspace = true
 text_input.workspace = true
 theme.workspace = true
 theme_json.workspace = true
 tokio.workspace = true
 ui.workspace = true
+unicode-properties.workspace = true
+unicode-segmentation.workspace = true
 url.workspace = true
 util.workspace = true
 

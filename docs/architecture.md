@@ -231,6 +231,13 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   order, then the icon an `index.html` or a root route declares, inside the project's folder.
   The app shows this Mac's from disk and fetches another machine's from its server
   (`Request::ProjectFavicon`), with the monogram while it loads or when there's none.
+  Settings' Project Icon row chooses one as t3code's `ProjectIconPickerDialog` and
+  `ProjectFaviconPickerDialog` do (`project_icon_picker.rs`): an icon (Zed's, by `IconName`,
+  popular ones first, searchable) or monogram with one of 18 colors, an emoji, or an image file
+  in the project (`Request::ProjectImageFiles`, fuzzy searched) or, on This Mac, anywhere (Open
+  in Finder). `ProjectIcon` keeps the choice: a file inside the folder as a relative path, so
+  every copy uses its own, any other as an absolute one, which only This Mac's copies take.
+  The server serves a chosen file that exists before the favicon it finds.
 - **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons (the machine's only
   mark on a card, Disconnected while it's offline; draft rows name it), the thread's own
   branch with a worktree or pasture marker, its subthreads' count by a people icon (accent
@@ -323,7 +330,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Mac's). With more than one copy, the Usage page's machine dropdown sits beside the title,
   listing each copy's machine with its icon and a check on the one shown, two copies on one
   machine told apart by folder ("This Mac · ~/projects/agentZ-2", `copy_label`). Project
-  (Name, Icon, Monogram, from the group's first copy) and Repository apply to every copy;
+  (Name and Project Icon, from the group's first copy) and Repository apply to every copy;
   then a section titled with the chosen copy's machine holds its Folder and Grouping, then its
   Checkouts and Danger. A combined project's Danger is "Remove from <machine>", which removes
   only that copy, after which the page shows the next one (`SettingsPage::project_copies`,

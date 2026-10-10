@@ -3637,6 +3637,60 @@ async fn projects_show_their_favicon() {
     );
 }
 
+/// An image file in the project, chosen for its icon, comes before the favicon found, as
+/// long as it's there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chosen_icon_file_comes_before_the_favicon() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = server.project_dir.path();
+    std::fs::create_dir_all(folder.join("public")).expect("a folder");
+    std::fs::write(folder.join("public/favicon.svg"), "<svg/>").expect("written");
+    std::fs::create_dir_all(folder.join("assets")).expect("a folder");
+    std::fs::write(folder.join("assets/Logo.PNG"), "png").expect("written");
+    std::fs::write(folder.join("assets/notes.txt"), "text").expect("written");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(folder).await;
+    let favicon = |client: &TestClient| {
+        let projects = client.projects.as_ref()?;
+        projects
+            .favicons
+            .iter()
+            .find(|(id, _)| *id == project_id)
+            .map(|(_, path)| path.clone())
+    };
+    client
+        .wait_until(|client| favicon(client) == Some(folder.join("public/favicon.svg")))
+        .await;
+
+    let Response::Files(listing) = client.ok(Request::ProjectImageFiles(project_id)).await else {
+        panic!("not a listing");
+    };
+    let mut images: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    images.sort();
+    assert_eq!(images, ["assets/Logo.PNG", "public/favicon.svg"]);
+
+    let choose = |path: &str| Request::SetProjectIcon {
+        project_id,
+        icon: Some(projects::ProjectIcon::Image { path: path.into() }),
+    };
+    client.ok(choose("assets/Logo.PNG")).await;
+    client
+        .wait_until(|client| favicon(client) == Some(folder.join("assets/Logo.PNG")))
+        .await;
+    // A chosen file that's gone gives the favicon back.
+    client.ok(choose("assets/missing.png")).await;
+    client
+        .wait_until(|client| favicon(client) == Some(folder.join("public/favicon.svg")))
+        .await;
+}
+
 impl TestClient {
     async fn add_project(&mut self, path: &std::path::Path) -> ProjectId {
         match self

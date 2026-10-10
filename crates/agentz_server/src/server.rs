@@ -193,8 +193,9 @@ pub(crate) struct Server {
     /// The folders whose branches were last read, so a new one is read at once.
     git_head_folders: BTreeSet<PathBuf>,
     reading_git_heads: bool,
-    /// The projects whose folders were last looked in for an icon, so a new one is at once.
-    favicon_projects: BTreeSet<ProjectId>,
+    /// The projects whose folders were last looked in for an icon, with the icon file chosen
+    /// for each then, so a new project or a new choice is looked at at once.
+    favicon_projects: BTreeMap<ProjectId, Option<PathBuf>>,
     reading_favicons: bool,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
@@ -369,7 +370,7 @@ impl Server {
             repository_checks: RepositoryChecks::default(),
             git_head_folders: BTreeSet::new(),
             reading_git_heads: false,
-            favicon_projects: BTreeSet::new(),
+            favicon_projects: BTreeMap::new(),
             reading_favicons: false,
             registry,
             agent_settings,
@@ -694,6 +695,11 @@ impl Server {
                 id,
                 request: Request::ProjectFavicon(project_id),
             } => self.project_favicon(client, id, project_id),
+            Input::Request {
+                client,
+                id,
+                request: Request::ProjectImageFiles(project_id),
+            } => self.project_image_files(client, id, project_id),
             Input::Request {
                 client,
                 id,
@@ -1190,6 +1196,9 @@ impl Server {
             }
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
             Request::ProjectFavicon(_) => Err(anyhow!("favicons are handled separately")),
+            Request::ProjectImageFiles(_) => {
+                Err(anyhow!("listing image files is handled separately"))
+            }
 
             Request::Shutdown => {
                 self.stopping = true;

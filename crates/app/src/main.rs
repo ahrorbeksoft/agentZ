@@ -17,6 +17,7 @@ mod machines;
 mod mention_menu;
 mod new_space_picker;
 mod new_thread_modal;
+mod project_icon_picker;
 mod project_info;
 mod project_store;
 mod project_switcher;
@@ -251,6 +252,7 @@ fn main() {
             command_palette::init(cx);
             go_to_picker::init(cx);
             save_layout_modal::init(cx);
+            project_icon_picker::init(cx);
             agent_view::init(cx);
             agent_login::init(cx);
             elicitation_card::init(cx);

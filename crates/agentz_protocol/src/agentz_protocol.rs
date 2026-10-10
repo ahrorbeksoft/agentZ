@@ -478,10 +478,13 @@ pub enum Request {
     /// The files and folders of the folder a thread works in, for its composer's @-mentions:
     /// [`Response::Files`].
     ListFiles(ThreadId),
-    /// The icon file the server found in a project's folder
+    /// The icon file chosen for a project, or else the one the server found in its folder
     /// ([`projects::ProjectsSnapshot::favicons`]), for a client on another machine, which can't
     /// read it: [`Response::ProjectFavicon`].
     ProjectFavicon(ProjectId),
+    /// The image files in a project's folder, to choose its icon from: [`Response::Files`],
+    /// files only.
+    ProjectImageFiles(ProjectId),
     RespondToPermission {
         connection: ConnectionId,
         tool_call_id: acp::ToolCallId,

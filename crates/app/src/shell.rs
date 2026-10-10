@@ -136,6 +136,10 @@ enum OverlayKind {
     CommandPalette,
     GoTo,
     SaveLayout,
+    /// A project's Choose icon, from its settings.
+    ProjectIcon,
+    /// A project's Choose file, from its settings.
+    ProjectIconFile,
 }
 
 struct Overlay {
@@ -871,6 +875,18 @@ impl Shell {
                         SettingsPageEvent::OpenDialog(dialog) => {
                             this.open_account_dialog(dialog.clone(), window, cx)
                         }
+                        SettingsPageEvent::ChooseIcon(picker) => this.open_settings_overlay(
+                            OverlayKind::ProjectIcon,
+                            picker.clone(),
+                            window,
+                            cx,
+                        ),
+                        SettingsPageEvent::ChooseIconFile(picker) => this.open_settings_overlay(
+                            OverlayKind::ProjectIconFile,
+                            picker.clone(),
+                            window,
+                            cx,
+                        ),
                     });
                 self.settings_page = Some((page.clone(), subscription));
                 page
@@ -1249,6 +1265,24 @@ impl Shell {
             _subscription: subscription,
         });
         cx.notify();
+    }
+
+    /// A dialog the settings page made, which gives focus back to the page as it closes.
+    fn open_settings_overlay<V: Render + EventEmitter<DismissEvent>>(
+        &mut self,
+        kind: OverlayKind,
+        view: Entity<V>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.make_room_for(kind, window, cx) {
+            return;
+        }
+        let previous_focus = self
+            .settings_page
+            .as_ref()
+            .map(|(page, _)| page.focus_handle(cx));
+        self.open_overlay(kind, view, previous_focus, window, cx);
     }
 
     fn overlay_kind(&self) -> Option<OverlayKind> {
@@ -1971,7 +2005,10 @@ impl Render for Shell {
         let is_dialog = self.machine_modal.is_some()
             || self.confirm_dialog.is_some()
             || self.account_dialog.is_some()
-            || self.overlay_kind() == Some(OverlayKind::SaveLayout);
+            || matches!(
+                self.overlay_kind(),
+                Some(OverlayKind::SaveLayout | OverlayKind::ProjectIcon)
+            );
         // Beside the thread, or filling its area when full screen.
         let diff_panel = self.diff_panel.clone();
         let is_diff_full_screen = self.diff_full_screen && diff_panel.is_some();

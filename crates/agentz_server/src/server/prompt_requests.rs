@@ -233,7 +233,7 @@ impl Server {
         };
         self.spawn_then(
             async move {
-                tokio::task::spawn_blocking(move || list_files(root))
+                tokio::task::spawn_blocking(move || list_files(root, |_| true))
                     .await
                     .context("listing the files")?
             },
@@ -282,9 +282,9 @@ async fn mentioned_path(path: PathBuf) -> MessagePart {
     MessagePart::File { path, contents }
 }
 
-/// The folder's files and folders, as git would show them: gitignored ones and `.git` left
-/// out.
-fn list_files(root: PathBuf) -> Result<FileListing> {
+/// The folder's files and folders that `keep` keeps, as git would show them: gitignored ones
+/// and `.git` left out.
+pub(super) fn list_files(root: PathBuf, keep: impl Fn(&FileEntry) -> bool) -> Result<FileListing> {
     let mut entries = Vec::new();
     let walker = ignore::WalkBuilder::new(&root)
         .hidden(false)
@@ -297,10 +297,14 @@ fn list_files(root: PathBuf) -> Result<FileListing> {
         let Some(path) = relative_path(&root, entry.path()) else {
             continue;
         };
-        entries.push(FileEntry {
+        let entry = FileEntry {
             path,
             is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
-        });
+        };
+        if !keep(&entry) {
+            continue;
+        }
+        entries.push(entry);
         if entries.len() >= FileListing::LIMIT {
             break;
         }
@@ -332,7 +336,7 @@ mod tests {
         std::fs::write(root.path().join("src/cart/total.ts"), "").expect("a file");
         std::fs::write(root.path().join("debug.log"), "").expect("a file");
         std::fs::write(root.path().join(".gitignore"), "*.log\n").expect("a file");
-        let listing = list_files(root.path().to_path_buf()).expect("a listing");
+        let listing = list_files(root.path().to_path_buf(), |_| true).expect("a listing");
         let mut paths: Vec<(&str, bool)> = listing
             .entries
             .iter()

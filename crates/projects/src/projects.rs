@@ -96,6 +96,15 @@ impl Project {
     pub fn folder_name(&self) -> SharedString {
         project_name(&self.path)
     }
+
+    /// The image file chosen for its icon, on its machine.
+    pub fn icon_file(&self) -> Option<PathBuf> {
+        match &self.icon {
+            // An absolute path replaces the folder it's joined to.
+            Some(ProjectIcon::Image { path }) => Some(self.path.join(path)),
+            _ => None,
+        }
+    }
 }
 
 /// How a [`Workspace`] shares the project's repository.
@@ -137,10 +146,24 @@ pub struct Workspace {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProjectIcon {
+    /// One of the app's icons (Zed's), by its snake_case name, in the named color.
+    Icon {
+        name: String,
+        color: String,
+    },
+    Emoji {
+        emoji: String,
+    },
     /// Up to two letters on a tile of the named color.
-    Monogram { text: String, color: String },
-    /// An image file anywhere on disk.
-    Image { path: PathBuf },
+    Monogram {
+        text: String,
+        color: String,
+    },
+    /// An image file on the project's machine: relative to the project's folder when it's
+    /// inside it, so each copy of a combined project finds its own.
+    Image {
+        path: PathBuf,
+    },
 }
 
 /// A thread's title until its first prompt names it.
@@ -543,8 +566,9 @@ pub struct ProjectsSnapshot {
     /// folders, their worktrees and pastures, and Workspaces threads' folders. Folders outside
     /// git have none.
     pub git_heads: Vec<(PathBuf, GitHead)>,
-    /// The icon file each project's server found in its folder (t3code's favicon scan).
-    /// Projects without one aren't listed.
+    /// The icon file of each project on its server's machine: the one chosen
+    /// ([`Project::icon_file`]) while it's there, else the one found in its folder (t3code's
+    /// favicon scan). Projects without one aren't listed.
     pub favicons: Vec<(ProjectId, PathBuf)>,
     /// Drawer terminals running a program in front of their shell: thread, terminal number,
     /// program.
@@ -624,7 +648,7 @@ pub struct ProjectStore {
     terminal_folders: BTreeMap<ThreadId, TerminalFolder>,
     /// The branches of [`ProjectStore::git_head_folders`]. Not persisted either.
     git_heads: BTreeMap<PathBuf, GitHead>,
-    /// The icon files found in projects' folders. Not persisted either.
+    /// [`ProjectsSnapshot::favicons`]. Not persisted either.
     favicons: BTreeMap<ProjectId, PathBuf>,
     /// Drawer terminals running a program in front of their shell. Not persisted either.
     drawer_commands: BTreeMap<(ThreadId, u32), String>,
@@ -1745,7 +1769,7 @@ impl ProjectStore {
         }
     }
 
-    /// The icon file its server found in the project's folder, if any.
+    /// The project's icon file on its server's machine, if any ([`ProjectsSnapshot::favicons`]).
     pub fn favicon(&self, project: ProjectId) -> Option<&Path> {
         self.favicons.get(&project).map(PathBuf::as_path)
     }

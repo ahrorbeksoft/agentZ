@@ -60,9 +60,8 @@ use crate::controls::{
 };
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machine_icon_picker::MachineIconPicker;
-use crate::project_info::{
-    MONOGRAM_COLORS, automatic_monogram, monogram_swatch, render_project_icon, workspace_icon,
-};
+use crate::project_icon_picker::{ProjectIconPicker, ProjectImagePicker};
+use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
@@ -129,6 +128,10 @@ pub enum SettingsPageEvent {
     OpenThread(ThreadKey),
     /// Show an account's dialog, in the shell's modal layer.
     OpenDialog(Entity<AccountDialog>),
+    /// Show a project's Choose icon dialog, in the shell's modal layer.
+    ChooseIcon(Entity<ProjectIconPicker>),
+    /// Show a project's Choose file picker, in the shell's modal layer.
+    ChooseIconFile(Entity<ProjectImagePicker>),
 }
 
 /// An agent's account dialog: an account's whole card, opened from its line, or Add Account
@@ -210,7 +213,6 @@ pub struct SettingsPage {
     /// The open project's copies as last seen, so removing the one shown shows the next.
     project_copies: Vec<ProjectKey>,
     name_input: Entity<TextInput>,
-    monogram_input: Entity<TextInput>,
     /// The machine whose agents Settings › Agents shows.
     agents_machine: MachineId,
     /// The machine whose thread titles Settings › General shows.
@@ -255,7 +257,6 @@ impl SettingsPage {
         let machines = Machines::global(cx);
         let app_settings = AppSettingsStore::global(cx);
         let name_input = cx.new(|cx| TextInput::new("", cx));
-        let monogram_input = cx.new(|cx| TextInput::new("", cx));
         let mut subscriptions = vec![
             cx.observe(&machines, |this, _, cx| {
                 if let Section::Project(key) = this.section {
@@ -309,12 +310,6 @@ impl SettingsPage {
                     }
                 }
             }),
-            cx.subscribe(&monogram_input, |this, input, _: &TextInputEvent, cx| {
-                let text = input.read(cx).text().trim().to_string();
-                if !text.is_empty() {
-                    this.set_monogram(Some(text), None, cx);
-                }
-            }),
         ];
         let agent_search = cx.new(|cx| TextInput::new("Search agents…", cx));
         subscriptions.push(
@@ -330,7 +325,6 @@ impl SettingsPage {
             section: Section::General,
             project_copies: Vec::new(),
             name_input,
-            monogram_input,
             agents_machine: MachineId::Local,
             titles_machine: MachineId::Local,
             agent_search,
@@ -466,12 +460,12 @@ impl SettingsPage {
         cx.notify();
     }
 
-    /// Gives the project's group the icon. An image is a file on this Mac, so only this
-    /// Mac's checkouts take it.
+    /// Gives the project's group the icon. An image inside the project is in every copy; one
+    /// outside it was picked on this Mac, so only this Mac's checkouts take it.
     fn set_group_icon(&self, key: ProjectKey, icon: Option<ProjectIcon>, cx: &mut App) {
-        let is_image = matches!(icon, Some(ProjectIcon::Image { .. }));
+        let is_outside = matches!(&icon, Some(ProjectIcon::Image { path }) if path.is_absolute());
         for (member, project) in self.group_members(key, cx) {
-            if project.icon == icon || (is_image && member.machine != MachineId::Local) {
+            if project.icon == icon || (is_outside && member.machine != MachineId::Local) {
                 continue;
             }
             if let Some(store) = self.machines.read(cx).projects(member.machine, cx) {
@@ -534,41 +528,75 @@ impl SettingsPage {
                     input.set_placeholder(project.folder_name(), cx);
                     input.set_text(project.custom_name.clone().unwrap_or_default(), cx);
                 });
-                let text = match &project.icon {
-                    Some(ProjectIcon::Monogram { text, .. }) => text.clone(),
-                    _ => String::new(),
-                };
-                let (automatic_text, _) = automatic_monogram(&project.name());
-                self.monogram_input.update(cx, |input, cx| {
-                    input.set_placeholder(automatic_text, cx);
-                    input.set_text(text, cx);
-                });
             }
         }
         cx.notify();
     }
 
-    /// Switches the project to a monogram, keeping whichever of its letters and color aren't
-    /// being changed.
-    fn set_monogram(&mut self, text: Option<String>, color: Option<&str>, cx: &mut Context<Self>) {
-        let Section::Project(key) = self.section else {
-            return;
-        };
+    /// t3code's Choose icon: an icon, an emoji or a monogram for the whole project.
+    fn open_icon_picker(&mut self, key: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
         let Some((_, project)) = self.shared_copy(key, cx) else {
             return;
         };
-        let (automatic_text, automatic_color) = automatic_monogram(&project.name());
-        let (current_text, current_color) = match &project.icon {
-            Some(ProjectIcon::Monogram { text, color }) => (text.clone(), color.clone()),
-            _ => (automatic_text, automatic_color.to_string()),
-        };
-        let icon = ProjectIcon::Monogram {
-            text: text.unwrap_or(current_text),
-            color: color.map_or(current_color, str::to_string),
-        };
-        self.set_group_icon(key, Some(icon), cx);
+        let page = cx.weak_entity();
+        let name = self.project_name(key, cx);
+        let picker = cx.new(|cx| {
+            ProjectIconPicker::new(
+                project.icon.as_ref(),
+                &name,
+                move |icon, _, cx| {
+                    page.update(cx, |page, cx| page.set_group_icon(key, Some(icon), cx))
+                        .log_err();
+                },
+                window,
+                cx,
+            )
+        });
+        cx.emit(SettingsPageEvent::ChooseIcon(picker));
     }
 
+    /// t3code's Choose file: an image file in the project, as its machine lists them, or, for
+    /// this Mac's copies, any file.
+    fn open_image_picker(&mut self, key: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((shared_key, _)) = self.shared_copy(key, cx) else {
+            return;
+        };
+        let Some(client) = self.machines.read(cx).client(shared_key.machine, cx) else {
+            return;
+        };
+        let has_local_copy = self
+            .group_members(key, cx)
+            .iter()
+            .any(|(copy, _)| copy.machine == MachineId::Local);
+        let page = cx.weak_entity();
+        let on_pick_external = has_local_copy.then(|| {
+            let page = page.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                page.update(cx, |page, cx| page.choose_icon_file(key, cx))
+                    .log_err();
+            }) as Rc<dyn Fn(&mut Window, &mut App)>
+        });
+        let name = self.project_name(key, cx);
+        let picker = cx.new(|cx| {
+            ProjectImagePicker::new(
+                &client,
+                shared_key.project,
+                name,
+                move |path, _, cx| {
+                    page.update(cx, |page, cx| {
+                        page.set_group_icon(key, Some(ProjectIcon::Image { path }), cx)
+                    })
+                    .log_err();
+                },
+                on_pick_external,
+                window,
+                cx,
+            )
+        });
+        cx.emit(SettingsPageEvent::ChooseIconFile(picker));
+    }
+
+    /// Picks any file on this Mac for the project's icon.
     fn choose_icon_file(&mut self, key: ProjectKey, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -7068,20 +7096,15 @@ impl SettingsPage {
             .first()
             .cloned()
             .unwrap_or_else(|| (key, project.clone()));
-        let has_local_copy = copies
-            .iter()
-            .any(|(copy, _)| copy.machine == MachineId::Local);
+        // t3code's descriptions.
         let icon_description: SharedString = match &shared.icon {
             None => "Automatic: the project's favicon, or a monogram.".into(),
-            Some(ProjectIcon::Monogram { text, color }) => {
-                format!("Monogram · {text} · {color}").into()
-            }
+            Some(ProjectIcon::Icon { name, color }) => format!("{name} · {color}").into(),
+            Some(ProjectIcon::Emoji { emoji }) => emoji.clone().into(),
+            Some(ProjectIcon::Monogram { text, color }) => format!("{text} · {color}").into(),
             Some(ProjectIcon::Image { path }) => path.display().to_string().into(),
         };
-        let current_color = match &shared.icon {
-            Some(ProjectIcon::Monogram { color, .. }) => Some(color.clone()),
-            _ => None,
-        };
+        let has_icon = copies.iter().any(|(_, copy)| copy.icon.is_some());
         let input_box = |input: Entity<TextInput>, width: Pixels| {
             div()
                 .w(width)
@@ -7095,59 +7118,47 @@ impl SettingsPage {
                 .bg(colors.editor_background)
                 .child(input)
         };
-        let swatches = h_flex()
-            .flex_wrap()
-            .gap_1()
-            .children(MONOGRAM_COLORS.iter().map(|(name, light, dark)| {
-                let is_current = current_color.as_deref() == Some(*name);
-                let color = monogram_swatch(*light, *dark, cx);
+        let icon_controls = h_flex()
+            .gap_2()
+            .child(
                 div()
-                    .id(SharedString::from(format!("monogram-color-{name}")))
-                    .size(px(18.))
-                    .rounded_full()
-                    .cursor_pointer()
-                    .bg(color)
-                    .border_2()
-                    .border_color(if is_current {
-                        colors.text
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .tooltip(Tooltip::text(*name))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.set_monogram(None, Some(name), cx)),
-                    )
-            }));
-        let icon_controls =
-            h_flex()
-                .gap_2()
-                .child(render_project_icon(
-                    shared_key.machine,
-                    &shared,
-                    px(24.),
-                    cx,
-                ))
-                // The picker shows this Mac's files, which only this Mac's copies can use.
-                .when(has_local_copy, |this| {
-                    this.child(
-                        Button::new("choose-icon-file", "Choose File…")
-                            .style(ButtonStyle::Outlined)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.choose_icon_file(shared_key, cx)
-                            })),
-                    )
-                })
-                .when(shared.icon.is_some(), |this| {
-                    this.child(
+                    .debug_selector(|| "project-icon".into())
+                    .child(render_project_icon(
+                        shared_key.machine,
+                        &shared,
+                        px(24.),
+                        cx,
+                    )),
+            )
+            .child(
+                div().debug_selector(|| "choose-icon".into()).child(
+                    Button::new("choose-icon", "Choose icon")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_icon_picker(shared_key, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                div().debug_selector(|| "choose-icon-file".into()).child(
+                    Button::new("choose-icon-file", "Choose file")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_image_picker(shared_key, window, cx)
+                        })),
+                ),
+            )
+            .when(has_icon, |this| {
+                this.child(
+                    div().debug_selector(|| "reset-icon".into()).child(
                         Button::new("reset-icon", "Reset")
                             .style(ButtonStyle::Subtle)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.monogram_input
-                                    .update(cx, |input, cx| input.set_text("", cx));
-                                this.set_group_icon(shared_key, None, cx);
+                                this.set_group_icon(shared_key, None, cx)
                             })),
-                    )
-                });
+                    ),
+                )
+            });
         let machine_label = self.machines.read(cx).label(key.machine, cx);
         let mut copy_rows = vec![render_row(
             "Folder",
@@ -7210,20 +7221,9 @@ impl SettingsPage {
                     cx,
                 ),
                 render_row(
-                    "Icon",
+                    "Project icon",
                     icon_description,
                     icon_controls.into_any_element(),
-                    cx,
-                ),
-                render_row(
-                    "Monogram",
-                    "Letters and a color for a custom monogram icon.",
-                    v_flex()
-                        .items_end()
-                        .gap_2()
-                        .child(input_box(self.monogram_input.clone(), px(64.)))
-                        .child(div().w(px(256.)).child(swatches))
-                        .into_any_element(),
                     cx,
                 ),
             ],
@@ -10981,6 +10981,79 @@ mod tests {
             })
         );
         assert!(cx.debug_bounds("project-copy-local-2").is_some());
+    }
+
+    /// The icon chosen is the whole project's, a file inside it too; a file picked outside it
+    /// is on This Mac, so only This Mac's copies take it.
+    #[gpui::test]
+    fn a_project_icon_is_every_copy_s(cx: &mut TestAppContext) {
+        let (local, devbox) = machines_with_copies(cx);
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let this_mac = ProjectKey {
+            machine: MachineId::Local,
+            project: ProjectId(1),
+        };
+        page.update_in(cx, |page, window, cx| {
+            page.show_project(this_mac, window, cx)
+        });
+        cx.run_until_parked();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.subscribe(&page, move |_, event: &SettingsPageEvent, _| match event {
+                SettingsPageEvent::ChooseIcon(_) => opened.borrow_mut().push("icon"),
+                SettingsPageEvent::ChooseIconFile(_) => opened.borrow_mut().push("file"),
+                _ => {}
+            })
+            .detach()
+        });
+        for button in ["choose-icon", "choose-icon-file"] {
+            let bounds = cx.debug_bounds(button).expect("the icon can be chosen");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        }
+        assert_eq!(*opened.borrow(), ["icon", "file"]);
+
+        let icons = |client: &Entity<ServerClient>, cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter_map(|request| match request {
+                        Request::SetProjectIcon { project_id, icon } => Some((project_id, icon)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let rocket = Some(ProjectIcon::Emoji {
+            emoji: "🚀".into()
+        });
+        let inside = Some(ProjectIcon::Image {
+            path: "public/logo.png".into(),
+        });
+        let outside = Some(ProjectIcon::Image {
+            path: "/Users/me/logo.png".into(),
+        });
+        for icon in [&rocket, &inside, &outside] {
+            page.update(cx, |page, cx| {
+                page.set_group_icon(this_mac, icon.clone(), cx)
+            });
+        }
+        assert_eq!(
+            icons(&local, cx),
+            [
+                (ProjectId(1), rocket.clone()),
+                (ProjectId(2), rocket.clone()),
+                (ProjectId(1), inside.clone()),
+                (ProjectId(2), inside.clone()),
+                (ProjectId(1), outside.clone()),
+                (ProjectId(2), outside),
+            ]
+        );
+        assert_eq!(
+            icons(&devbox, cx),
+            [(ProjectId(1), rocket), (ProjectId(1), inside)]
+        );
     }
 
     #[test]
