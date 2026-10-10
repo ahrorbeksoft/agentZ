@@ -47,7 +47,7 @@ Each round's `decisions.md` is its spec. A built round's backlog entry is remove
 | Subagents and subthreads in threads | `design/agentz-tools/` (13) | yes, Zed's subagent card for delegated subthreads and running Claude Agent subagents, Droid's Task report first |
 | More options for a new thread's worktree or pasture | `design/new-workspace/` (11) | yes, "From main" with t3code's branch list and Fetch, made as the first message is sent with its steps shown, the branch named after the thread |
 | Chats | `design/chats/` (14) | yes, the Chats shelf, New Chat, Chat in the pickers and the headline, a chat's screen, header, folder, @ menu and tools, and the setting |
-| Storage settings | `design/storage/` (13) | |
+| Storage settings | `design/storage/` (13) | yes, Settings › Storage: the total and its bar, chats, threads by project, worktrees and pastures, agents, Node.js and logs, kept measured by each server, with Delete and Clear |
 | Artifacts | `design/artifacts/` (14) | |
 
 ## Notes for the next agent

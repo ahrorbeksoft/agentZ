@@ -15,6 +15,7 @@ use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
+use agentz_protocol::storage::{Storage, StorageCache};
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::title_generation::{TitleGeneration, TitleGenerationState};
 use agentz_protocol::{
@@ -115,6 +116,8 @@ pub struct ServerClient {
     machine_icon: MachineIcon,
     /// How the machine titles threads whose agent doesn't, and the CLIs it found for it.
     title_generation: TitleGenerationState,
+    /// What agentZ keeps on the machine, as its server last measured it.
+    storage: Storage,
     /// Open threads and login sessions, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
@@ -166,6 +169,7 @@ impl ServerClient {
                 unseen_panes: BTreeSet::new(),
                 machine_icon: MachineIcon::default(),
                 title_generation: TitleGenerationState::default(),
+                storage: Storage::default(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
@@ -570,6 +574,28 @@ impl ServerClient {
         self.set_title_generation(state, cx);
     }
 
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    fn set_storage(&mut self, storage: Storage, cx: &mut Context<Self>) {
+        if storage != self.storage {
+            self.storage = storage;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_storage_for_test(&mut self, storage: Storage, cx: &mut Context<Self>) {
+        self.set_storage(storage, cx);
+    }
+
+    /// Settings › Storage's Delete or Clear for what isn't a thread or a checkout.
+    pub fn clear_storage(&self, cache: StorageCache, cx: &App) -> Task<Result<()>> {
+        let response = self.request(Request::ClearStorage(cache));
+        cx.background_spawn(async move { response.await.map(|_| ()) })
+    }
+
     /// Chooses the machine's icon, for every client of its server. Choosing what was
     /// detected clears the choice, as t3code's picker does, so detection keeps deciding.
     pub fn choose_machine_icon(&self, kind: MachineKind, cx: &App) {
@@ -780,6 +806,7 @@ impl ServerClient {
         self.set_spaces(session.spaces, cx);
         self.set_machine_icon_state(session.machine_icon, cx);
         self.set_title_generation(session.title_generation, cx);
+        self.set_storage(session.storage, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }
@@ -806,6 +833,7 @@ impl ServerClient {
                     | Event::Spaces(_)
                     | Event::MachineIcon(_)
                     | Event::TitleGeneration(_)
+                    | Event::Storage(_)
             )
         {
             queued.push(event);
@@ -823,6 +851,7 @@ impl ServerClient {
             Event::Spaces(spaces) => self.set_spaces(spaces, cx),
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::TitleGeneration(state) => self.set_title_generation(state, cx),
+            Event::Storage(storage) => self.set_storage(storage, cx),
             Event::Thread { connection, update } => {
                 if let Some(thread) = self.threads.get(&connection).and_then(|t| t.upgrade()) {
                     thread.update(cx, |thread, cx| thread.apply_update(update, cx));

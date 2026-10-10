@@ -158,6 +158,37 @@ impl ConfirmRequest {
             on_confirm: Rc::new(on_confirm),
         }
     }
+
+    /// Settings › Storage's trash on a row: what goes and its size, deleted for good
+    /// (design/storage §10).
+    pub fn delete_storage(
+        title: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+        on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            icon: IconName::Trash,
+            title: title.into(),
+            message: message.into(),
+            confirm_label: "Delete".into(),
+            on_confirm: Rc::new(on_confirm),
+        }
+    }
+
+    /// Settings › Storage's Clear on the registry's cache or the server's log.
+    pub fn clear_storage(
+        title: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+        on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            icon: IconName::Eraser,
+            title: title.into(),
+            message: message.into(),
+            confirm_label: "Clear".into(),
+            on_confirm: Rc::new(on_confirm),
+        }
+    }
 }
 
 pub struct ConfirmDialog {

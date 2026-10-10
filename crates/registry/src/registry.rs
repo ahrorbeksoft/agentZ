@@ -272,14 +272,43 @@ impl AgentRegistryStore {
         if self.is_fetching {
             return;
         }
+        self.fetch(false);
+    }
 
+    /// Deletes the cached list and icons, and fetches them again at once, so agents keep their
+    /// icons. The agents installed stay.
+    pub fn clear_cache(&mut self) {
+        self.fetch(true);
+    }
+
+    fn fetch(&mut self, clear_cache: bool) {
         self.is_fetching = true;
         self.fetch_error = None;
         self.last_refresh = Some(Instant::now());
 
         let http_client = self.http_client.clone();
         let registry_dir = self.registry_dir.clone();
+        let cache_paths = self.cache_paths();
         self.spawn(async move {
+            if clear_cache {
+                tokio::task::spawn_blocking(move || {
+                    for path in cache_paths {
+                        let removed = if path.is_dir() {
+                            std::fs::remove_dir_all(&path)
+                        } else {
+                            std::fs::remove_file(&path)
+                        };
+                        match removed {
+                            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                                log::error!("removing {}: {error}", path.display())
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .log_err();
+            }
             let agents = match fetch_registry_index(http_client.clone()).await {
                 Ok(data) => {
                     build_registry_agents(
@@ -369,6 +398,50 @@ impl AgentRegistryStore {
             .unwrap_or_default();
             MessageKind::Uninstalled(installed_versions)
         });
+    }
+
+    /// The agents installed now.
+    pub fn installed(&self) -> impl Iterator<Item = &AgentId> {
+        self.installed_versions.keys()
+    }
+
+    /// Where an installed agent's files are: a binary agent's in `<id>/<version>`, an npm
+    /// agent's in `npx/<id>`.
+    pub fn agent_folders(&self, id: &AgentId) -> [PathBuf; 2] {
+        [
+            self.registry_dir.join(&*id.0),
+            self.registry_dir.join(NPX_DIR_NAME).join(&*id.0),
+        ]
+    }
+
+    /// The cached list of agents and their icons.
+    pub fn cache_paths(&self) -> [PathBuf; 2] {
+        [
+            self.registry_dir.join("registry.json"),
+            self.registry_dir.join("icons"),
+        ]
+    }
+
+    /// Where Node.js is downloaded when the machine has none new enough.
+    pub fn node_dir(&self) -> &Path {
+        self.node_runtime.dir()
+    }
+
+    /// An npm package, which runs on Node.js.
+    pub fn is_npm_agent(&self, id: &AgentId) -> bool {
+        matches!(self.agent(id), Some(RegistryAgent::Npx(_)))
+    }
+
+    /// Whether npm agents run on the downloaded Node.js rather than the machine's own.
+    pub fn uses_downloaded_node(&self) -> bool {
+        self.node_runtime.uses_download()
+    }
+
+    /// Deletes the downloaded Node.js. The next npm agent to start or install downloads it
+    /// again.
+    pub fn delete_downloaded_node(&self) -> BoxFuture<'static, Result<()>> {
+        let node_runtime = self.node_runtime.clone();
+        async move { node_runtime.delete_download().await }.boxed()
     }
 
     /// Builds the command that starts an installed agent.

@@ -8998,3 +8998,121 @@ async fn new_workspaces_are_made_as_the_first_message_is_sent() {
     assert_eq!(thread.planned_workspace, None);
     assert!(client.thread(connection).workspace_setup().is_none());
 }
+
+impl TestClient {
+    /// What the server last said it keeps.
+    fn storage(&self) -> Option<&agentz_protocol::storage::Storage> {
+        self.events.iter().rev().find_map(|event| match event {
+            Event::Storage(storage) => Some(storage),
+            _ => None,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_is_measured_and_freed() {
+    use agentz_protocol::storage::StorageCache;
+
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let data_dir = server.data_dir.path();
+    let log = data_dir.join("logs").join("server.log");
+    std::fs::create_dir_all(log.parent().expect("a folder")).expect("folder");
+    std::fs::write(&log, "started\n").expect("log");
+    // A pasture its project no longer keeps, whose commits origin has.
+    let origin = server.project_dir.path();
+    git(origin, &["init", "-q", "-b", "main"]).await;
+    std::fs::write(origin.join("README.md"), "hello\n").expect("write");
+    git(origin, &["add", "-A"]).await;
+    git(
+        origin,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "Start",
+        ],
+    )
+    .await;
+    let pastures = data_dir.join("pastures").join("storefront");
+    std::fs::create_dir_all(&pastures).expect("folder");
+    git(
+        &pastures,
+        &["clone", "-q", &origin.to_string_lossy(), "old-search"],
+    )
+    .await;
+    let pasture = std::fs::canonicalize(pastures.join("old-search")).expect("resolved");
+
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    assert!(!session.storage.measured);
+    client
+        .wait_until(|client| client.storage().is_some_and(|storage| storage.measured))
+        .await;
+    let storage = client.storage().expect("measured").clone();
+    assert_eq!(storage.server_log, 8);
+    let left = storage
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.path == pasture)
+        .expect("the pasture");
+    assert_eq!(
+        (left.kind, left.project_id, left.repository.as_str()),
+        (WorkspaceKind::Pasture, None, "storefront")
+    );
+    assert!(!left.has_changes() && left.bytes > 0);
+
+    // A thread's conversation counts once it has one.
+    let thread_id = client.create_thread(&server).await;
+    client
+        .subscribe_thread(ConnectionId::Thread(thread_id))
+        .await;
+    client.prompt_and_wait(thread_id, "hello").await;
+    client
+        .wait_until(|client| {
+            client
+                .storage()
+                .and_then(|storage| storage.thread(thread_id))
+                .is_some_and(|thread| thread.bytes > 0)
+        })
+        .await;
+    client.ok(Request::DeleteThread(thread_id)).await;
+    assert!(
+        client
+            .storage()
+            .is_some_and(|storage| storage.thread(thread_id).is_none())
+    );
+
+    client
+        .ok(Request::ClearStorage(StorageCache::ServerLog))
+        .await;
+    assert_eq!(std::fs::metadata(&log).expect("the log").len(), 0);
+    assert_eq!(client.storage().map(|storage| storage.server_log), Some(0));
+    // Nothing was downloaded, so there's nothing to delete.
+    client.ok(Request::ClearStorage(StorageCache::Node)).await;
+
+    let Response::WorkspaceRemoval(removal) = client
+        .ok(Request::RemoveWorkspace {
+            path: pasture.clone(),
+            force: false,
+        })
+        .await
+    else {
+        panic!("expected a removal");
+    };
+    assert_eq!(removal, WorkspaceRemoval::Removed);
+    assert!(!pasture.exists());
+    assert!(client.storage().is_some_and(|storage| {
+        storage
+            .checkouts
+            .iter()
+            .all(|checkout| checkout.path != pasture)
+    }));
+}

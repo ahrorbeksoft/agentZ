@@ -1,11 +1,11 @@
 //! The settings page, laid out like t3code's: a list of sections on the left (General,
-//! Appearance, Notifications, Agents, Usage, Skills, MCP Servers, Machines, then one entry per
-//! project) and
-//! the chosen section's rows on the right.
+//! Appearance, Notifications, Agents, Usage, Skills, MCP Servers, Machines, Storage, then one
+//! entry per project) and the chosen section's rows on the right.
 
 mod accounts_menu;
 mod mcp_servers;
 mod skills;
+mod storage;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -182,6 +182,7 @@ enum Section {
     Skills,
     McpServers,
     Machines,
+    Storage,
     /// A project's page, showing the copy given: the project combines its checkouts on every
     /// machine, and its page's machine picker moves between them.
     Project(ProjectKey),
@@ -237,6 +238,7 @@ pub struct SettingsPage {
     mcp_servers_page: mcp_servers::McpServersPage,
     /// Why deleting or switching an MCP server failed.
     mcp_server_error: Option<SharedString>,
+    storage_page: storage::StoragePage,
     nav_scroll: ScrollHandle,
     /// The open section's rows, a list as Zed's settings pages are: laying out a page whole
     /// made each frame of a scroll slow (taffy measures every row again at each level of
@@ -344,6 +346,7 @@ impl SettingsPage {
             adding_skill: None,
             mcp_servers_page: mcp_servers::McpServersPage::List,
             mcp_server_error: None,
+            storage_page: storage::StoragePage::default(),
             nav_scroll: ScrollHandle::new(),
             content_list: ListState::new(0, ListAlignment::Top, px(0.)).measure_all(),
             content_scroll_top: ListOffset::default(),
@@ -522,6 +525,7 @@ impl SettingsPage {
         self.skill_error = None;
         self.mcp_servers_page = mcp_servers::McpServersPage::List;
         self.mcp_server_error = None;
+        self.storage_page.error = None;
         if section == Section::Agents {
             self.registry(cx)
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
@@ -870,6 +874,13 @@ impl SettingsPage {
                 Section::Machines,
                 cx,
             ),
+            self.render_nav_item(
+                "Storage",
+                Some(IconName::DatabaseZap),
+                None,
+                Section::Storage,
+                cx,
+            ),
         ];
         let fixed_count = items.len();
         let mut project_items = Vec::with_capacity(projects.len());
@@ -990,6 +1001,7 @@ impl SettingsPage {
             Section::Skills => "settings-nav-skills".into(),
             Section::McpServers => "settings-nav-mcp-servers".into(),
             Section::Machines => "settings-nav-machines".into(),
+            Section::Storage => "settings-nav-storage".into(),
             Section::Project(key) => format!(
                 "settings-nav-project-{}-{}",
                 key.machine.slug(),
@@ -6786,6 +6798,7 @@ impl SettingsPage {
         }
         self.skill_error = None;
         self.mcp_server_error = None;
+        self.storage_page.error = None;
         self.registry(cx)
             .update(cx, |registry, cx| registry.refresh_if_stale(cx));
         cx.notify();
@@ -8741,6 +8754,10 @@ impl SettingsPage {
                 self.render_mcp_servers(window, cx),
             ),
             Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
+            Section::Storage => (
+                self.render_storage_header(window, cx),
+                self.render_storage(cx),
+            ),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (
                     self.render_project_header(key, window, cx),

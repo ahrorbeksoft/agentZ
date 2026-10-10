@@ -351,12 +351,13 @@ fn open_log(path: &Path) -> Result<std::fs::File> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let too_large = std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_LOG_SIZE);
+    // Always appended to, so Settings › Storage's Clear can empty it while the server writes.
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_LOG_SIZE) {
+        std::fs::File::create(path).with_context(|| format!("emptying {}", path.display()))?;
+    }
     std::fs::OpenOptions::new()
         .create(true)
-        .append(!too_large)
-        .write(true)
-        .truncate(too_large)
+        .append(true)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))
 }

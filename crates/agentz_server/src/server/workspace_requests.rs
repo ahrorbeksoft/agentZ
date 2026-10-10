@@ -495,10 +495,33 @@ impl Server {
             .as_ref()
             .map(|(project_id, _, _)| *project_id);
         let removing = path.clone();
+        let pastures = self
+            .data_dir
+            .join(workspaces::folder_name(WorkspaceKind::Pasture));
         self.spawn_then(
             async move {
                 let (repo, workspace) = match project_workspace {
                     Some((_, repo, workspace)) => (repo, workspace),
+                    // A Workspaces thread's pasture, or a removed project's, which is a
+                    // repository of its own.
+                    None if is_inside(&removing, &pastures).await => {
+                        if !force && workspaces::has_unpushed_commits(&removing).await {
+                            return Ok(WorkspaceRemoval::NeedsConfirmation(
+                                "This pasture has commits no remote has. Removing it loses \
+                                 them."
+                                    .to_string(),
+                            ));
+                        }
+                        let workspace = Workspace {
+                            kind: WorkspaceKind::Pasture,
+                            path: removing.clone(),
+                            branch: None,
+                            base: None,
+                            created_at: SystemTime::now(),
+                        };
+                        // Its own commits were checked above.
+                        (removing, workspace)
+                    }
                     None => {
                         let repo = workspaces::main_checkout(&removing).await?;
                         anyhow::ensure!(
@@ -523,6 +546,10 @@ impl Server {
                     if let Some(project_id) = project_id {
                         server.projects.remove_workspace(project_id, &path);
                     }
+                    server
+                        .storage
+                        .checkouts
+                        .retain(|checkout| checkout.path != path);
                     // Their agents would be left in a deleted folder.
                     for thread_id in server.projects.threads_in_folder(&path) {
                         server.stop_agent(thread_id);
@@ -595,5 +622,16 @@ impl Server {
         self.spawn_then(work, move |server, result| {
             server.respond(client, id, result.map(Response::Message))
         });
+    }
+}
+
+/// Whether `path` is in `folder`, both resolved.
+async fn is_inside(path: &Path, folder: &Path) -> bool {
+    match (
+        tokio::fs::canonicalize(path).await,
+        tokio::fs::canonicalize(folder).await,
+    ) {
+        (Ok(path), Ok(folder)) => path != folder && path.starts_with(&folder),
+        _ => false,
     }
 }

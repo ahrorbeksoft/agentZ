@@ -23,6 +23,7 @@ mod repositories;
 mod server;
 mod skills;
 mod spaces;
+mod storage;
 mod terminal_programs;
 mod terminals;
 mod title_generation;

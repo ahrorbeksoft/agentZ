@@ -97,6 +97,36 @@ impl NodeRuntime {
         }
     }
 
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Whether the Node.js found is the downloaded one, or one is being looked for (and may be
+    /// downloaded) right now.
+    pub(crate) fn uses_download(&self) -> bool {
+        match self.found.try_lock() {
+            Ok(found) => matches!(*found, Some(Node::Managed { .. })),
+            Err(_) => true,
+        }
+    }
+
+    /// Deletes the downloaded Node.js, which is downloaded again when it's next needed.
+    pub(crate) async fn delete_download(&self) -> Result<()> {
+        // Held throughout, so no agent starts on it or downloads it meanwhile.
+        let mut found = self.found.lock().await;
+        if matches!(*found, Some(Node::Managed { .. })) {
+            *found = None;
+        }
+        let dir = self.dir.clone();
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await?;
+        match removed {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("removing {}", self.dir.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Call once the login-shell `PATH` is loaded, or a system Node may be missed.
     pub(crate) async fn node(&self) -> Result<Node> {
         let mut found = self.found.lock().await;

@@ -93,10 +93,7 @@ pub(crate) async fn create(new: NewWorkspace) -> Result<Workspace> {
         .is_err(),
         "the branch `{branch}` already exists; choose another name"
     );
-    let folder = match new.kind {
-        WorkspaceKind::Worktree => "worktrees",
-        WorkspaceKind::Pasture => "pastures",
-    };
+    let folder = folder_name(new.kind);
     let repo_name = repo
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -995,14 +992,14 @@ async fn pasture_support(repo: &Path, data_dir: &Path) -> PastureSupport {
     }
 }
 
-async fn head_commit(folder: &Path) -> Option<String> {
+pub(crate) async fn head_commit(folder: &Path) -> Option<String> {
     let output = git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"], &[])
         .await
         .ok()?;
     Some(output.trim().to_string())
 }
 
-async fn has_commit(repo: &Path, commit: &str) -> bool {
+pub(crate) async fn has_commit(repo: &Path, commit: &str) -> bool {
     git(
         repo,
         &["cat-file", "-e", &format!("{commit}^{{commit}}")],
@@ -1010,6 +1007,28 @@ async fn has_commit(repo: &Path, commit: &str) -> bool {
     )
     .await
     .is_ok()
+}
+
+/// For a pasture no project keeps, whose project can't say which commits are its own: those no
+/// remote has.
+pub(crate) async fn has_unpushed_commits(folder: &Path) -> bool {
+    git(
+        folder,
+        &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+        &[],
+    )
+    .await
+    .ok()
+    .and_then(|count| count.trim().parse::<u32>().ok())
+    .is_some_and(|count| count > 0)
+}
+
+/// The data folder's folder for the kind, which keeps one folder per repository.
+pub(crate) fn folder_name(kind: WorkspaceKind) -> &'static str {
+    match kind {
+        WorkspaceKind::Worktree => "worktrees",
+        WorkspaceKind::Pasture => "pastures",
+    }
 }
 
 async fn conflicted_files(folder: &Path) -> Vec<String> {

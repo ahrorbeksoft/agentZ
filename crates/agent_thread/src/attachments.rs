@@ -22,6 +22,10 @@ impl Attachments {
         }
     }
 
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// The threads that have attachments kept, by their folders in `data_dir`.
     pub fn threads_with_attachments(data_dir: &Path) -> Vec<ThreadId> {
         let Ok(entries) = std::fs::read_dir(data_dir.join("attachments")) else {

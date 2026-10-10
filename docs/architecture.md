@@ -132,6 +132,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `queues.json` | server | Each thread's queued messages, and whether the first one steers |
 | `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turn times |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
+| `handoffs/<thread id>.json` | server | The conversation a thread continued with another agent starts with, written for it by agentZ |
 | `agents/settings.json` | server | Per-agent env, defaults and known options: the External account's |
 | `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, last login check and last identity and limits read, its account for new threads, and the same for the External account |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
@@ -324,8 +325,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   among the threads, by last activity, with the chat icon.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
   chats, combining repositories), Appearance (Zed's theme modes), Notifications (sounds and system
-  notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, and a page
-  per project (below). As in Zed's settings, a page is a `list` of its header and sections
+  notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, Storage,
+  and a page per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines
   are rows of their own: a frame lays out only the rows in view, each on its own. Laid out whole, a page of
   nested flex columns took taffy a measure of each label twice per column around it, and an
@@ -507,6 +508,31 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   removes a skill's link from the accounts it's kept off, and `start_thread` leaves the
   server out of their sessions (`McpServer::reaches`). Adding, creating or deleting a skill
   forgets its choices.
+- **Settings › Storage** (`settings_page/storage.rs`, `agentz_server::storage`,
+  `server/storage_reads.rs`; `design/storage/`, macOS's Storage settings for the top): what
+  agentZ keeps on the machine. "agentZ uses 1.2 GB on This Mac" and the data folder lead, over
+  a bar with a color for each kind and a legend with their sizes. Then a group for each kind,
+  its rows biggest first: Chats (one line each: the chat or archive icon, title, size, last
+  used), Threads by project (a row per project, with Workspaces threads under Workspaces,
+  opening to its five biggest threads, then Show more), Worktrees and pastures (the branch,
+  then "shop · Worktree · Its thread finished 3 hours ago": working, finished, archived,
+  deleted, or the changes that keep it), Agents (each installed agent's size, uninstalled on
+  the Agents page, and the registry's cache) and Node.js and logs (downloaded Node.js and the
+  server's log). A thread's size counts its subthreads' conversations, images, uploaded files
+  and handoffs, and a chat's folder. Hovering a row shows a trash button that asks first
+  (`ConfirmRequest::delete_storage`, with the size and what goes) and deletes as the sidebar
+  and Workspaces view do (`Request::DeleteThread`, `Request::RemoveWorkspace` without
+  `force`). A working thread or chat, a checkout whose thread works, and one with uncommitted
+  files or a pasture's own commits are listed with a Working or Has changes tag and no trash.
+  Node.js has Delete (off while a running agent uses it) and the cache and log have Clear
+  (`Request::ClearStorage`). Nothing is deleted on its own. With more than one machine, the
+  Agents page's machine picker sits in the header. The server measures as `du` does, on a
+  blocking thread (`storage::measure`), only while an app is subscribed: threads again at most
+  every 5 seconds after they change, worktrees, pastures and agents every 5 minutes or when
+  an agent is installed or removed, and sends it in the session snapshot and `Event::Storage`.
+  Worktrees and pastures left in `worktrees/` and `pastures/` by a removed project are listed
+  too; without `force`, the server won't remove a left pasture with commits on no remote, as
+  it won't a project's.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
   Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
 

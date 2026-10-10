@@ -17,6 +17,7 @@ mod queue_requests;
 mod session_requests;
 mod skill_requests;
 mod space_requests;
+mod storage_reads;
 mod subagents;
 mod terminal_requests;
 mod title_requests;
@@ -41,6 +42,7 @@ use agentz_protocol::agents::{
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, McpServer};
 use agentz_protocol::skills::Skill;
+use agentz_protocol::storage::Storage;
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::title_generation::TitleGenerationState;
 use agentz_protocol::{
@@ -208,6 +210,9 @@ pub(crate) struct Server {
     favicon_projects: BTreeMap<ProjectId, Option<PathBuf>>,
     reading_favicons: bool,
     reading_copy_statuses: bool,
+    /// What agentZ keeps on the machine, as last measured, for Settings › Storage.
+    storage: Storage,
+    storage_reads: storage_reads::StorageReads,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     accounts: AccountStore,
@@ -265,6 +270,7 @@ pub(crate) struct Server {
     mcp_servers_sent: Vec<McpServer>,
     machine_icon_sent: MachineIcon,
     title_generation_sent: TitleGenerationState,
+    storage_sent: Storage,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
     /// When each draft no client has open is removed, unless something is typed in it (see
@@ -388,6 +394,8 @@ impl Server {
             favicon_projects: BTreeMap::new(),
             reading_favicons: false,
             reading_copy_statuses: false,
+            storage: Storage::default(),
+            storage_reads: storage_reads::StorageReads::default(),
             registry,
             agent_settings,
             accounts,
@@ -413,6 +421,7 @@ impl Server {
             machine_icon,
             title_generation_sent: title_generation.clone(),
             title_generation,
+            storage_sent: Storage::default(),
             title_generation_path: config.title_generation_path,
             agent_titled_threads: HashSet::default(),
             generated_titles: HashSet::default(),
@@ -501,6 +510,16 @@ impl Server {
                     server.refresh_favicons();
                     server.refresh_copy_statuses();
                 }));
+                if inputs.unbounded_send(refresh).is_err() {
+                    break;
+                }
+            }
+        });
+        let inputs = server.inputs.clone();
+        server.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(storage_reads::STORAGE_CHECK_INTERVAL).await;
+                let refresh = Input::Run(Box::new(|server: &mut Server| server.refresh_storage()));
                 if inputs.unbounded_send(refresh).is_err() {
                     break;
                 }
@@ -730,6 +749,11 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::ClearStorage(cache),
+            } => self.clear_storage(client, id, cache),
+            Input::Request {
+                client,
+                id,
                 request:
                     request @ (Request::AddAttachment { .. }
                     | Request::Attachment { .. }
@@ -795,6 +819,8 @@ impl Server {
             Input::Registry(message) => {
                 self.registry.handle(message);
                 self.registry_changed = true;
+                // Installed, removed, or the registry's list fetched again.
+                self.storage_reads.agents_due = true;
             }
             Input::Shutdown => self.stopping = true,
             // The waiting calls are checked once this batch is handled.
@@ -835,6 +861,7 @@ impl Server {
                 if first {
                     self.refresh_usage();
                 }
+                self.refresh_storage();
                 Ok(Response::Session(SessionSnapshot {
                     projects: self.projects.snapshot(),
                     registry: self.registry_snapshot(),
@@ -845,6 +872,7 @@ impl Server {
                     spaces: self.spaces.snapshot(),
                     machine_icon: self.machine_icon.clone(),
                     title_generation: self.title_generation.clone(),
+                    storage: self.storage.clone(),
                 }))
             }
             Request::SubscribeThread(connection) => {
@@ -1227,6 +1255,7 @@ impl Server {
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
             Request::MentionedThread(_) => Err(anyhow!("mentioned threads are read separately")),
             Request::ProjectFavicon(_) => Err(anyhow!("favicons are handled separately")),
+            Request::ClearStorage(_) => Err(anyhow!("clearing storage is handled separately")),
             Request::ProjectImageFiles(_) => {
                 Err(anyhow!("listing image files is handled separately"))
             }
@@ -1739,6 +1768,7 @@ impl Server {
         self.delete_attachments(threads.clone());
         self.delete_checkpoints(threads);
         self.projects.delete_thread(thread_id);
+        self.forget_thread_storage();
         if let Some(folder) = chat_folder {
             self.remove_chat_folder(folder);
         }
@@ -2411,6 +2441,12 @@ impl Server {
         if self.title_generation != self.title_generation_sent {
             self.title_generation_sent = self.title_generation.clone();
             self.broadcast(Event::TitleGeneration(self.title_generation.clone()));
+        }
+        self.refresh_storage();
+        self.update_node_in_use();
+        if self.storage != self.storage_sent {
+            self.storage_sent = self.storage.clone();
+            self.broadcast(Event::Storage(self.storage.clone()));
         }
 
         for connection in std::mem::take(&mut self.changed_connections) {

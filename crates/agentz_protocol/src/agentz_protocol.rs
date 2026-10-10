@@ -20,6 +20,7 @@ pub mod layout;
 pub mod mcp_servers;
 pub mod skills;
 pub mod spaces;
+pub mod storage;
 pub mod terminal;
 pub mod terminal_keys;
 pub mod thread;
@@ -51,6 +52,7 @@ use crate::diff::{DiffScope, ThreadDiff};
 use crate::mcp_servers::McpServer;
 use crate::skills::{Skill, SkillFile};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
+use crate::storage::{Storage, StorageCache};
 use crate::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalMatches,
 };
@@ -724,6 +726,11 @@ pub enum Request {
         archived: bool,
     },
 
+    /// Settings › Storage's Delete or Clear. Refused for Node.js while an agent runs on it.
+    /// Threads are deleted with [`Request::DeleteThread`], checkouts with
+    /// [`Request::RemoveWorkspace`].
+    ClearStorage(StorageCache),
+
     /// Ends the server, its agents and terminals.
     Shutdown,
     /// Starts the server binary installed now and hands it the terminals, which keep running
@@ -981,6 +988,9 @@ pub struct SessionSnapshot {
     pub machine_icon: MachineIcon,
     #[serde(default)]
     pub title_generation: title_generation::TitleGenerationState,
+    /// What agentZ keeps on the machine, as last measured.
+    #[serde(default)]
+    pub storage: Storage,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -994,6 +1004,7 @@ pub enum Event {
     Spaces(SpacesSnapshot),
     MachineIcon(MachineIcon),
     TitleGeneration(title_generation::TitleGenerationState),
+    Storage(Storage),
     Thread {
         connection: ConnectionId,
         update: ThreadUpdate,

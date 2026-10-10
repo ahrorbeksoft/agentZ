@@ -9,7 +9,7 @@ use agentz_protocol::thread::PendingHandoff;
 use anyhow::{Context as _, Result};
 use projects::ThreadId;
 
-fn path(data_dir: &Path, thread_id: ThreadId) -> PathBuf {
+pub(crate) fn path(data_dir: &Path, thread_id: ThreadId) -> PathBuf {
     data_dir
         .join("handoffs")
         .join(format!("{}.json", thread_id.0))
