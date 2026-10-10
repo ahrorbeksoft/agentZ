@@ -73,6 +73,7 @@ use crate::usage_limits::{
     is_resetting, render_balance, render_extra_usage, render_limit_cell, render_limit_resets,
     render_limit_windows,
 };
+use crate::usage_timeline::{TimelineAgent, TimelineZoom, UsageTimeline};
 
 const KEY_CONTEXT: &str = "SettingsPage";
 const ACCOUNT_RENAME_KEY_CONTEXT: &str = "AccountRename";
@@ -215,6 +216,10 @@ pub struct SettingsPage {
     name_input: Entity<TextInput>,
     /// The machine whose agents Settings › Agents shows.
     agents_machine: MachineId,
+    usage_timeline_zoom: TimelineZoom,
+    /// The Usage timeline's tracks' width when last drawn, which says whose bars fit their
+    /// words.
+    usage_timeline_width: Pixels,
     /// The machine whose thread titles Settings › General shows.
     titles_machine: MachineId,
     agent_search: Entity<TextInput>,
@@ -326,6 +331,8 @@ impl SettingsPage {
             project_copies: Vec::new(),
             name_input,
             agents_machine: MachineId::Local,
+            usage_timeline_zoom: TimelineZoom::default(),
+            usage_timeline_width: px(488.),
             titles_machine: MachineId::Local,
             agent_search,
             updating: Default::default(),
@@ -6423,11 +6430,22 @@ impl SettingsPage {
             .collect();
         agents.sort_by_key(|agent| agent.name().to_lowercase());
         let now = SystemTime::now();
-        let sections: Vec<AnyElement> = agents
+        let mut timeline_agents = Vec::new();
+        let mut sections: Vec<AnyElement> = agents
             .iter()
             .filter_map(|agent| {
                 let table = UsageTable::new(account_entries(&client.read(cx).accounts(agent.id())));
-                (!table.rows.is_empty()).then(|| self.render_usage_agent(agent, &table, now, cx))
+                if table.rows.is_empty() {
+                    return None;
+                }
+                let section = self.render_usage_agent(agent, &table, now, cx);
+                timeline_agents.push(TimelineAgent {
+                    id: agent.id().clone(),
+                    name: agent.name().clone(),
+                    icon: agent_icon(agent.id(), cx),
+                    accounts: table.rows,
+                });
+                Some(section)
             })
             .collect();
         if sections.is_empty() {
@@ -6437,7 +6455,53 @@ impl SettingsPage {
                     .into_any_element(),
             ];
         }
+        sections.push(self.render_usage_timeline(&timeline_agents, now, cx));
         sections
+    }
+
+    /// Every account's windows side by side, after the tables (subscription timeline round).
+    fn render_usage_timeline(
+        &self,
+        agents: &[TimelineAgent],
+        now: SystemTime,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let page = cx.entity().downgrade();
+        let on_zoom = Rc::new(move |zoom, _: &mut Window, cx: &mut App| {
+            page.update(cx, |page, cx| {
+                page.usage_timeline_zoom = zoom;
+                cx.notify();
+            })
+            .log_err();
+        });
+        let page = cx.entity().downgrade();
+        let on_track_width = Rc::new(move |width, _: &mut Window, cx: &mut App| {
+            page.update(cx, |page, cx| {
+                page.usage_timeline_width = width;
+                cx.notify();
+            })
+            .log_err();
+        });
+        let page = cx.entity().downgrade();
+        let machine = self.agents_machine;
+        let on_open = Rc::new(
+            move |agent_id: &AgentId, window: &mut Window, cx: &mut App| {
+                page.update(cx, |page, cx| {
+                    page.show_agent_accounts(machine, agent_id, false, window, cx)
+                })
+                .log_err();
+            },
+        );
+        UsageTimeline {
+            agents,
+            zoom: self.usage_timeline_zoom,
+            track_width: self.usage_timeline_width,
+            now,
+            on_zoom,
+            on_open,
+            on_track_width,
+        }
+        .render(cx)
     }
 
     /// An agent's card: a column per window, an "All N accounts" row with what's left across
@@ -10499,6 +10563,142 @@ mod tests {
                     .is_some_and(|panel| panel.tab == AgentTab::Account)
             );
         });
+    }
+
+    /// Under the tables, the timeline has a lane per account under its agent, drawing its
+    /// longest window that fits two weeks, a tick where its limit reset expires, and a lane
+    /// for an account with no window counting down. 5-hour draws only the 5-hour windows, and
+    /// a lane opens its account on the agent's page.
+    #[gpui::test]
+    fn the_usage_timeline_has_a_lane_per_account(cx: &mut TestAppContext) {
+        let hour = Duration::from_secs(3600);
+        let installed = InstallState::Installed {
+            version: "2.0.0".into(),
+            update_available: false,
+        };
+        let support = AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            reads_usage: true,
+            ..AccountSupport::default()
+        };
+        let mut mock_listing = listing("mock", "Mock", installed.clone());
+        mock_listing.accounts = Some(support.clone());
+        let mut codex_listing = listing("codex", "Codex", installed);
+        codex_listing.accounts = Some(support);
+        let status = |windows: Vec<LimitWindow>| AccountStatus {
+            windows,
+            ..AccountStatus::default()
+        };
+        let mut unused_weekly = limit("Weekly", 0., hour, 168 * hour);
+        unused_weekly.resets_at = None;
+        let mock_accounts = AgentAccounts {
+            accounts: vec![
+                account(
+                    1,
+                    Some("Work"),
+                    Some(status(vec![
+                        limit("5-hour", 30., 2 * hour, 5 * hour),
+                        limit("Weekly", 56., 72 * hour, 168 * hour),
+                        limit("Monthly", 20., 400 * hour, 720 * hour),
+                    ])),
+                ),
+                account(2, Some("Side"), Some(status(vec![unused_weekly]))),
+            ],
+            last_id: 2,
+            ..AgentAccounts::default()
+        };
+        let codex_accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    limit_resets: Some(LimitResets {
+                        available: 1,
+                        next_expires_at: Some(SystemTime::now() + 100 * hour),
+                    }),
+                    ..status(vec![limit("Weekly", 19., 120 * hour, 168 * hour)])
+                },
+                read_at: SystemTime::now(),
+            }),
+            ..AgentAccounts::default()
+        };
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing, codex_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            client.update(cx, |client, cx| {
+                client.set_accounts_for_test(
+                    [
+                        (AgentId::new("mock"), mock_accounts),
+                        (AgentId::new("codex"), codex_accounts),
+                    ]
+                    .into(),
+                    cx,
+                );
+            });
+            crate::machines::init_for_test(vec![client], cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1100.), px(4000.)));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Usage, window, cx)
+        });
+        cx.run_until_parked();
+
+        let timeline = cx.debug_bounds("usage-timeline").expect("the timeline");
+        let table = cx.debug_bounds("usage-mock").expect("Mock's table");
+        assert!(timeline.top() > table.bottom());
+        // Codex sorts first, as its table does.
+        let codex = cx
+            .debug_bounds("timeline-codex-external")
+            .expect("Codex's lane");
+        let work = cx.debug_bounds("timeline-mock-1").expect("Work's lane");
+        let side = cx.debug_bounds("timeline-mock-2").expect("Side's lane");
+        assert!(codex.top() < work.top() && work.top() < side.top());
+        assert!(cx.debug_bounds("timeline-mock-1-current").is_some());
+        assert!(
+            cx.debug_bounds("timeline-codex-external-limit-reset")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("timeline-mock-2-idle").is_some());
+        assert!(cx.debug_bounds("usage-timeline-legend").is_some());
+
+        let zoom = cx
+            .debug_bounds("usage-timeline-zoom")
+            .expect("the zoom switch");
+        let five_hour = gpui::point(zoom.right() - px(20.), zoom.center().y);
+        cx.simulate_click(five_hour, gpui::Modifiers::none());
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.usage_timeline_zoom, TimelineZoom::FiveHour)
+        });
+        let work = cx
+            .debug_bounds("timeline-mock-1")
+            .expect("Work's 5-hour lane");
+        assert!(cx.debug_bounds("timeline-codex-external").is_none());
+        assert!(cx.debug_bounds("timeline-mock-2").is_none());
+
+        cx.simulate_click(
+            gpui::point(work.left() + px(40.), work.center().y),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert_eq!(agent_page_id(&page, cx).as_deref(), Some("mock"));
     }
 
     #[gpui::test]

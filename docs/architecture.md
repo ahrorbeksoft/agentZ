@@ -430,6 +430,20 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   `UsageLimitsPooled`), and the title says "N accounts". Clicking a row opens the agent's
   Account tab (`show_agent_accounts`). With more than one machine, the Agents page's machine
   picker sits in the header.
+- **The limit timeline** (`usage_timeline.rs`, CLIProxyAPI's quota chart;
+  `design/subscription-timeline/decisions.md`): under the Usage page's tables, "Limit windows"
+  from today, two weeks a day a cell (Weekly) or three days six hours a cell (5-hour, only
+  windows five hours long). A row with each agent's icon and name, then a lane per account in
+  the tables' order: its avatar, name, plan and the drawn window, which is its longest window
+  that fits (`lane_window`; Droid's Monthly is left to the table). The current window is a bar
+  from when it opened to its reset, filled from the left with what's used and colored by pace
+  (`usage_limits::pace`), labeled "13% left · resets in 2d 18h" (above it when it's too
+  narrow); the ones to come follow it back to back, dashed, in the accent. A vertical line is
+  now. A Codex account's limit resets put a yellow tick where the first expires. An account
+  with no window counting down says "All left · no window counting down". The current bar's
+  tooltip has the window's times, when it runs out at this pace and the projection; clicking
+  a lane opens the account, as the rows do. A legend and a sentence on what a bar is close it.
+  The tracks' width is measured each frame (a canvas) so labels know whether they fit.
 - **Settings › Skills** (`settings_page/skills.rs`, `agentz_server::skills`,
   `server/skill_requests.rs`; Zed's Skills page and Create a Skill form, accounts topics 17
   and 18): agentZ's own skills on the machine, folders with a `SKILL.md` in `skills/` in its

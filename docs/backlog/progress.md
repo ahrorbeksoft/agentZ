@@ -1,8 +1,9 @@
 # Backlog progress
 
 State of the backlog session. Every entry in `backlog.md` that needed no picks is built and
-on `main`, and its entry is removed. Every entry left there is a UI change, so it has a round
-on the design board waiting for the user's picks. Delete this file once those are built.
+on `main`, and its entry is removed. Every entry left there is a UI change with a round on the
+design board, all of them decided (`56cfa31`), and they're being built one round at a time.
+Delete this file once those are built.
 
 ## Built and on main
 
@@ -33,22 +34,21 @@ icons in the project picker need a second machine and were checked only by their
 - `dd4a22b` The project icon picker, as t3code's, with Zed's icons only (the user's choice:
   no Lucide)
 
-## Design rounds waiting for picks
+## Design rounds, decided and built in this order
 
-Each has today's screenshots beside it and a generated `decisions.md` with nothing decided.
-Build each round from its `decisions.md` once the user picks.
+Each round's `decisions.md` is its spec. A built round's backlog entry is removed.
 
-| Backlog entry | Round |
-|---|---|
-| Merge projects across machines | `design/project-copies/` (5 topics) |
-| Agents' requests for user input | `design/agent-input/` (13) |
-| Subscription timeline | `design/subscription-timeline/` (15) |
-| More options for a new thread's worktree or pasture | `design/new-workspace/` (11) |
-| Artifacts | `design/artifacts/` (14) |
-| Chats | `design/chats/` (14) |
-| Storage settings | `design/storage/` (13) |
-| Subagents and subthreads in threads | `design/agentz-tools/` (13) |
-| Every kind of tool call | `design/tool-calls-2/` (20) and `design/agentz-tools/` |
+| Backlog entry | Round | Built |
+|---|---|---|
+| Subscription timeline | `design/subscription-timeline/` (15 topics) | yes, Settings › Usage |
+| Merge projects across machines | `design/project-copies/` (5) | |
+| Agents' requests for user input | `design/agent-input/` (13) | |
+| Every kind of tool call | `design/tool-calls-2/` (20) and `design/agentz-tools/` | |
+| Subagents and subthreads in threads | `design/agentz-tools/` (13) | |
+| More options for a new thread's worktree or pasture | `design/new-workspace/` (11) | |
+| Chats | `design/chats/` (14) | |
+| Storage settings | `design/storage/` (13) | |
+| Artifacts | `design/artifacts/` (14) | |
 
 ## Notes for the next agent
 

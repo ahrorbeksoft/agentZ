@@ -41,6 +41,7 @@ mod terminal_view;
 mod thread_entity;
 mod tool_calls;
 mod usage_limits;
+mod usage_timeline;
 mod welcome;
 mod window_decorations;
 mod worktree_modal;

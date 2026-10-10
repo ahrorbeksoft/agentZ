@@ -22,11 +22,6 @@ Agents can show other kinds of input too, and all of them need the same improvem
 
 - What to improve: not given yet.
 
-### Subscription timeline, as in CLIProxyAPI's management UI
-
-Add a timeline for subscriptions like the one in CLIProxyAPI's management UI. That UI isn't in
-`references/`, so study it in CLIProxyAPI itself before building.
-
 ### More options when creating a worktree or pasture for a new thread
 
 When a new thread gets its own worktree or pasture, offer more choices about how it's created,
