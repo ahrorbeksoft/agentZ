@@ -22,7 +22,7 @@ on freesound.org, CC0).
 ```
 agentz (GPUI app, a client)
   ├─ unix socket ─────────────────────────────────────► agentz-server  (this Mac)
-  └─ ssh <host> ~/.agentz/server/<ver>/agentz-server proxy
+  └─ ssh <host> ~/.agentz/server/agentz-server proxy
                     └─ stdio ⇄ unix socket ───────────► agentz-server  (remote Mac/Linux)
 
 agent (ACP) ─stdio MCP─► agentz-server mcp-bridge ─unix socket─► agentz-server  (same machine)
@@ -1632,7 +1632,8 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
 
 - **Connecting** (`agentz_client/src/ssh.rs`, `machines.rs`, `server_client.rs`): OpenSSH with
   `BatchMode` and a shared ControlMaster; `uname -sm`; the server uploaded to
-  `~/.agentz/server/<version>/` (skipped when the SHA-256 matches; streamed in chunks with
+  `~/.agentz/server/`, one path for every version as herdr's install is, since a server hands
+  off to the binary at its own path (skipped when the SHA-256 matches; streamed in chunks with
   its progress shown on the machine's row, and given up only when it stops moving for a minute); `proxy` over stdio. States:
   Online, Reconnecting (backoff to 2 minutes), Attention (the error and the command to run).
 - **Linux servers**: static musl from `cargo zigbuild`, stripped (about 7 MB; 48 MB unstripped).

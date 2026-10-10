@@ -1,7 +1,7 @@
 //! Reaching `agentz-server` on another machine over SSH, the way herdr reaches its remote
 //! hosts: OpenSSH in batch mode with a shared control master, the server binary uploaded to
-//! `~/.agentz/server/<version>/`, and `agentz-server proxy` carrying the connection over the
-//! session's stdin and stdout.
+//! `~/.agentz/server/`, and `agentz-server proxy` carrying the connection over the session's
+//! stdin and stdout.
 //!
 //! Nothing secret is stored. Authentication stays with OpenSSH: keys, the agent and
 //! `~/.ssh/config`.
@@ -35,6 +35,10 @@ const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
 /// Covers starting the server on the other end, which loads the login shell's environment.
 const PROXY_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const STDERR_LIMIT: usize = 16 * 1024;
+/// Where the server is installed, quoted for the remote shell with `$HOME` left to it. One
+/// path for every version, as herdr installs: a server hands off to the binary at the path it
+/// runs from, so a newer version installed beside it would never take over.
+const INSTALL_DIRECTORY: &str = "\"$HOME\"/.agentz/server";
 /// OpenSSH's limit on a unix socket path, which the control path must fit once `%C` expands.
 const MAX_CONTROL_PATH_LENGTH: usize = 103;
 /// The length of `%C` once expanded, plus the `.` and 16 characters OpenSSH appends for the
@@ -319,11 +323,10 @@ impl Ssh {
         String::from_utf8(output).context("the remote command printed invalid UTF-8")
     }
 
-    /// The machine's platform, and the hash of the server already installed for `version`, in
-    /// one round trip.
-    /// The machine's platform, and the hash and size of the server installed there.
-    async fn probe(&self, version: &str) -> Result<(RemotePlatform, Option<(String, u64)>)> {
-        let directory = install_directory(version);
+    /// The machine's platform, and the hash and size of the server installed there, in one
+    /// round trip.
+    async fn probe(&self) -> Result<(RemotePlatform, Option<(String, u64)>)> {
+        let directory = INSTALL_DIRECTORY;
         let output = self
             .run(&format!(
                 "uname -s; uname -m\n\
@@ -346,12 +349,11 @@ impl Ssh {
     /// Reports how much of it ssh has taken as it goes.
     async fn install(
         &self,
-        version: &str,
         binary: Vec<u8>,
         hash: &str,
         on_progress: &(dyn Fn(UploadProgress) + Send + Sync),
     ) -> Result<()> {
-        let directory = install_directory(version);
+        let directory = INSTALL_DIRECTORY;
         // `cat` ends the same way when ssh is cut off as when the upload is done, so what
         // arrived is checked before it's put in place.
         let script = format!(
@@ -433,8 +435,8 @@ impl Ssh {
 
     /// Starts `agentz-server proxy` on the machine, which starts the server if it isn't
     /// running, and returns the session as a byte stream once the proxy is about to run.
-    async fn proxy(&self, version: &str) -> Result<SshStream> {
-        let script = format!("exec {}/agentz-server proxy", install_directory(version));
+    async fn proxy(&self) -> Result<SshStream> {
+        let script = format!("exec {INSTALL_DIRECTORY}/agentz-server proxy");
         let mut child = self
             .command(&remote_script(&script))
             .stdin(Stdio::piped())
@@ -681,7 +683,7 @@ async fn connect_inner(
     client_kind: ClientKind,
     on_upload_progress: &(dyn Fn(UploadProgress) + Send + Sync),
 ) -> Result<Connected> {
-    let (platform, installed) = ssh.probe(version).await?;
+    let (platform, installed) = ssh.probe().await?;
     let path = server_binary(platform)?;
     let binary = tokio::fs::read(&path)
         .await
@@ -693,10 +695,9 @@ async fn connect_inner(
             "installing agentz-server {version} for {platform} on {}",
             ssh.target()
         );
-        ssh.install(version, binary, &hash, on_upload_progress)
-            .await?;
+        ssh.install(binary, &hash, on_upload_progress).await?;
     }
-    let stream = ssh.proxy(version).await?;
+    let stream = ssh.proxy().await?;
     let (connection, events) = Connection::new(
         &tokio::runtime::Handle::current(),
         stream,
@@ -725,16 +726,6 @@ fn finished_output(output: std::process::Output) -> Result<Vec<u8>> {
         bail!("{}", failure_message(&output.status, &output.stderr));
     }
     discard_preamble(&output.stdout)
-}
-
-/// `~/.agentz/server/<version>`, quoted for the remote shell with `$HOME` left to it.
-fn install_directory(version: &str) -> String {
-    let version = version.replace(|character: char| !is_version_character(character), "_");
-    format!("\"$HOME\"/.agentz/server/{version}")
-}
-
-fn is_version_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || "._+-".contains(character)
 }
 
 /// The command ssh gives the user's login shell: `/bin/sh` running the script after the
@@ -918,17 +909,5 @@ mod tests {
         assert!(host_key.needs_attention);
         assert!(host_key.hint.expect("hint").contains("ssh devbox1"));
         assert!(classify("unsupported remote platform: FreeBSD amd64").needs_attention);
-    }
-
-    #[test]
-    fn keeps_versions_safe_for_the_shell() {
-        assert_eq!(
-            install_directory("0.1.0+dev"),
-            "\"$HOME\"/.agentz/server/0.1.0+dev"
-        );
-        assert_eq!(
-            install_directory("1;rm -rf"),
-            "\"$HOME\"/.agentz/server/1_rm_-rf"
-        );
     }
 }

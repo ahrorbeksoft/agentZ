@@ -57,6 +57,15 @@ async fn connect(
     ssh: &Ssh,
     server_binary: impl FnOnce(RemotePlatform) -> anyhow::Result<PathBuf>,
 ) -> Session {
+    connect_as(ssh, VERSION, server_binary).await
+}
+
+/// Connects as an app of `version` does.
+async fn connect_as(
+    ssh: &Ssh,
+    version: &str,
+    server_binary: impl FnOnce(RemotePlatform) -> anyhow::Result<PathBuf>,
+) -> Session {
     let progress = std::sync::Mutex::new(Vec::new());
     let Connected {
         connection,
@@ -64,7 +73,7 @@ async fn connect(
         is_outdated,
     } = tokio::time::timeout(
         TIMEOUT,
-        agentz_client::ssh::connect(ssh, VERSION, server_binary, ClientKind::App, |update| {
+        agentz_client::ssh::connect(ssh, version, server_binary, ClientKind::App, |update| {
             progress.lock().expect("not poisoned").push(update)
         }),
     )
@@ -110,6 +119,16 @@ fn server_binary(platform: RemotePlatform) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(env!("CARGO_BIN_EXE_agentz-server")))
 }
 
+/// The server with a byte appended: it runs the same, but its hash differs.
+fn newer_server(directory: &Path) -> PathBuf {
+    let newer = directory.join("agentz-server-newer");
+    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_agentz-server")).expect("reads the server");
+    bytes.push(0);
+    std::fs::write(&newer, bytes).expect("writes the newer server");
+    std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    newer
+}
+
 /// An install an older client left cut short, recorded with the whole binary's hash, is
 /// uploaded again rather than run.
 #[tokio::test(flavor = "multi_thread")]
@@ -120,7 +139,7 @@ async fn replaces_an_install_cut_short() {
         .prefix("azssh")
         .tempdir_in("/tmp")
         .expect("data dir");
-    let installed = home.join(".agentz/server").join(VERSION);
+    let installed = home.join(".agentz/server");
     std::fs::create_dir_all(&installed).expect("install dir");
     let binary = std::fs::read(env!("CARGO_BIN_EXE_agentz-server")).expect("reads the server");
     std::fs::write(installed.join("agentz-server"), &binary[..binary.len() / 2])
@@ -166,7 +185,7 @@ async fn connects_installs_and_reconnects_over_ssh() {
     let connected = connect(&ssh, server_binary).await;
     assert!(!connected.is_outdated);
     let connection = connected.connection;
-    let installed = home.join(".agentz/server").join(VERSION);
+    let installed = home.join(".agentz/server");
     assert!(installed.join("agentz-server").is_file());
     let hash = std::fs::read_to_string(installed.join("agentz-server.sha256")).expect("hash");
     assert_eq!(hash.trim().len(), 64);
@@ -206,11 +225,7 @@ async fn connects_installs_and_reconnects_over_ssh() {
     drop(connection);
 
     // A newer binary is installed, but the running server stays until it's stopped.
-    let newer = scratch.path().join("agentz-server-newer");
-    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_agentz-server")).expect("reads the server");
-    bytes.push(0);
-    std::fs::write(&newer, bytes).expect("writes the newer server");
-    std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let newer = newer_server(scratch.path());
     let newer_binary = |_: RemotePlatform| Ok(newer.clone());
     let connected = connect(&ssh, newer_binary).await;
     assert!(connected.is_outdated);
@@ -243,6 +258,50 @@ async fn connects_installs_and_reconnects_over_ssh() {
             .expect("fails");
     assert!(error.needs_attention, "{error:?}");
     assert!(error.hint.is_some());
+}
+
+/// An app of a newer version installs its server where the running one came from, so Update
+/// Server hands off to it rather than to the running server's own binary.
+#[tokio::test(flavor = "multi_thread")]
+async fn hands_off_to_a_newer_version() {
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let home = scratch.path().join("home");
+    std::fs::create_dir(&home).expect("home");
+    let data_dir = tempfile::Builder::new()
+        .prefix("azssh")
+        .tempdir_in("/tmp")
+        .expect("data dir");
+    let program = fake_ssh(scratch.path(), &home, data_dir.path());
+    let ssh = Ssh::with_program(program, "devbox").expect("valid target");
+
+    let connected = connect_as(&ssh, "0.1.0", server_binary).await;
+    let old_pid = connected.connection.welcome().pid;
+    drop(connected.connection);
+
+    let newer = newer_server(scratch.path());
+    let newer_binary = |_: RemotePlatform| Ok(newer.clone());
+    let connected = connect_as(&ssh, "0.2.0", newer_binary).await;
+    assert!(connected.is_outdated);
+    assert_eq!(connected.connection.welcome().pid, old_pid);
+    let response = connected
+        .connection
+        .request(Request::HandOff {
+            stop_running_turns: false,
+        })
+        .await
+        .expect("hands off");
+    assert_eq!(response, Response::Ok);
+    // The old server closes the session as it exits.
+    tokio::time::timeout(TIMEOUT, connected.events_drained)
+        .await
+        .expect("in time")
+        .expect("drains the events");
+
+    let connected = connect_as(&ssh, "0.2.0", newer_binary).await;
+    assert!(!connected.is_outdated);
+    assert!(!connected.uploaded);
+    assert_ne!(connected.connection.welcome().pid, old_pid);
+    shut_down(connected).await;
 }
 
 /// Against a real machine, with the Linux servers from `tooling/build-remote-servers.sh`:

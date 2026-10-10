@@ -53,7 +53,7 @@ rm -rf /Applications/agentZ.app
 rm -rf ~/.local/agentz.app ~/.local/bin/agentz ~/.local/share/applications/dev.agentz.agentZ.desktop
 
 # A machine the app reached over SSH
-for server in ~/.agentz/server/*/agentz-server; do "$server" stop; done
+~/.agentz/server/agentz-server stop
 rm -rf ~/.agentz/server
 ```
 
