@@ -21,8 +21,9 @@ sessions, a step every 0.2 seconds (or the seconds given), and ends each with
 `subagent_state_update`; to others, each is one completed call with its report. "subagents
 permission" has the first ask for permission in its session first. "droid-task [seconds]" runs
 a subagent as Factory Droid does: a "Task" tool call, with its type, description, complexity and
-prompt as input, that completes with the report after half a second (or the seconds given). A
-prompt of "slow" streams
+prompt as input, that completes with the report after half a second (or the seconds given);
+"droid-task background" sends it to the background, so it ends at once with Droid's notice
+that it was launched. A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
 word at a time, 500 ms apart, then replies. "write <path> <text>"
 writes the text and a newline to the file, relative to the session's folder, and
@@ -573,25 +574,31 @@ def run_subagents(request_id, session_id, pause, asks_permission):
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
-def run_droid_task(request_id, session_id, seconds):
-    """A subagent as Factory Droid runs it: a tool call, with no steps of its own."""
+def run_droid_task(request_id, session_id, seconds, background=False):
+    """A subagent as Factory Droid runs it: a tool call, with no steps of its own. One it
+    doesn't wait for ends at once, with only the notice that it was launched."""
     call_id = f"task-{request_id}"
     update(session_id, {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Task",
                         "kind": "other", "status": "in_progress",
                         "rawInput": {"subagent_type": "worker",
                                      "description": "Build subthreads round picks",
-                                     "await": True, "complexity": "heavy",
+                                     "await": not background, "complexity": "heavy",
                                      "prompt": "Build what the user picked in the Subthreads "
                                                "design round. Read "
                                                "design/subthreads/decisions.md first."}})
     time.sleep(seconds)
+    if background:
+        report = f"Task launched in background.\ntask_id: bg-{request_id}"
+    else:
+        report = ("Built the seven picks in `design/subthreads/decisions.md`. "
+                  "`cargo test -p app` passes.")
     update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
                         "status": "completed",
                         "content": [{"type": "content", "content": {
-                            "type": "text",
-                            "text": "Built the seven picks in `design/subthreads/decisions.md`. "
-                                    "`cargo test -p app` passes."}}]})
-    update(session_id, text_chunk("agent_message_chunk", "The worker is done."))
+                            "type": "text", "text": report}}]})
+    update(session_id, text_chunk("agent_message_chunk",
+                                  "The worker runs on its own." if background
+                                  else "The worker is done."))
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
@@ -1141,6 +1148,8 @@ for line in sys.stdin:
             argument = prompt_text.split(" ", 1)[1] if " " in prompt_text else ""
             pause = 0.2 if argument in ("", "permission") else float(argument)
             run_subagents(message["id"], params["sessionId"], pause, argument == "permission")
+        elif prompt_text == "droid-task background":
+            run_droid_task(message["id"], params["sessionId"], 0, background=True)
         elif prompt_text == "droid-task" or prompt_text.startswith("droid-task "):
             seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 0.5
             run_droid_task(message["id"], params["sessionId"], seconds)

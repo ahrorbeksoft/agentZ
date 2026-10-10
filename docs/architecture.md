@@ -644,7 +644,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   mark and say what they did (`OwnTool::sentence`): "Started a subthread:" and its title
   (looked up by thread id, never another machine's), "Starting a subthread…" while running,
   the base form when failed, and rows that made a subthread, thread or terminal end in "Open".
-  A folded run counts them ("Started 3 subthreads"), first. Their titles come from
+  A folded run counts them ("Started 3 subthreads"), first. Picked in `design/agentz-tools/`,
+  a done row says what came of it after the sentence, dimmer (`OwnTool::result`: "3 agents",
+  "2 threads", "Done in 2m 14s", "Exit 0 · 14s", "Pasture on agentz/brave-otter", or +12 −1
+  for a thread's changes), and a terminal's says what was typed ("Typed `npm test ⏎` into …",
+  `Sentence::object`). Opened, it shows what came back in words (`OwnTool::view`,
+  `render_own_view`): threads one a line with a dot for their state, agent, model, status and
+  when; a command's or terminal's output as printed, in the code font; a workspace in a
+  sentence and its folder; each agent with its models; a thread's changed files with +/−. The
+  JSON stays behind Input. Their titles come from
   `agentz_protocol::mcp_servers::AGENTZ_TOOLS`, which a server test keeps equal to its
   definitions. A ToolSearch names the tools it loaded ("Loaded Create issue, List issues and
   Add comment", cut off with "…", their server dimmer when they share one) or says "Searched
@@ -1317,6 +1325,16 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   that thread there (`AgentView::working_thread`). That thread opens under its parent's header
   from the other machine (`header_parent`), and its bar reads "Runs on its own on Devbox 1".
   Open Parent and Minimize go back to the parent there (`AgentViewEvent::OpenThreadOn`).
+- **Where it started** (`render_delegated_card`, `render_subthread_card`; picked in
+  `design/agentz-tools/`): a `delegate_task` call that started a subthread on this machine
+  (`ToolCallKind::delegated_subthread`, kept by entry in `delegated_subthreads`) is Zed's
+  subagent card in place of its row: a spinner, check, cross or faint circle (dashed once it
+  failed or stopped), the title, "· model", the files it changed and Stop while it runs. A
+  running one shows the step it's on inside and the strip that opens it full screen
+  (`sync_subagent_threads` follows it while it runs and while it's open). Opened, it shows
+  Zed's preview of its work (`render_subagent_work`): its last 8 steps, its summary once it
+  ended (`TaskOutcome::summary` as markdown, `SUMMARY_PART`) and the strip. Each call is its
+  own card, and a finished run folds them as it folds every row.
 
 ### Agents' own subagents
 
@@ -1343,13 +1361,20 @@ Picked in `design/agent-subagents/`; Zed's subagent card (`render_subagent_card`
   (one with a subthread, or whose input has a `subagent_type`, as Factory Droid's Task has) is
   a row of its own, not folded into a run of work: a bot icon, the description, the type as a
   tag, Open for a subthread, and a spinner, or the time and a check ("Failed", "Stopped") once
-  done. While a subthread's runs, the step it's on shows under it; while it waits on a
-  permission, "Waiting for you" takes the step's place.
+  done. One sent to the background (`SubagentCall::in_background`: `await: false`,
+  `run_in_background`, or Droid's "Task launched in background" notice) says "In the
+  background" instead, since its call ended as it started.
+- **At work in a subthread** (picked in `design/agentz-tools/`): Zed's card while it runs
+  (`render_subthread_card`): a spinner, the description, its type when the agent says, no
+  Stop (the agent runs it), the step it's on inside, and the strip that opens it full screen.
+  While it waits on a permission, "Waiting for you" in its header takes the step's place.
+  Once it ends, it's the row again.
 - **Opened**: a subthread's shows Zed's preview (`render_subagent_preview`, following the
   subthread with `sync_subagent_threads`): its last 8 steps, fading at the top when there are
   more, its report, and a strip that opens the subthread ("Make Subagent Full Screen").
-  Droid's, which has no steps, shows "Task" with its options as tags and its prompt, "Report",
-  and Input (`render_subagent_task`).
+  Droid's, which has no steps, shows its report, then a "Task" line that opens its options as
+  tags and its prompt, as Input opens JSON (`render_subagent_task`). A background one, whose
+  report is only the launch notice, and one still running open to their task.
 - **Its subthread** opens as agentZ's own do, with no Stop in its title bar or bar: the agent
   runs it. The Agents list and the sidebar's count show it only while it runs
   (`Task::is_listed`), with "Claude Agent’s" in place of the model and Stop.

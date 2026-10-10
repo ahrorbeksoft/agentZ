@@ -136,7 +136,8 @@ From Zed's guidelines, which this code follows:
   as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
   once it ends. `subagents [seconds]` runs two subagents at once in sessions of their own, as
   Claude Agent does with AIR's native subagent sessions (`subagents permission` has the first
-  ask for permission), and `droid-task [seconds]` runs one as Factory Droid's Task call does.
+  ask for permission), and `droid-task [seconds]` runs one as Factory Droid's Task call does
+  (`droid-task background` sends it to the background, as Droid's Task with `await: false`).
   With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
   `MOCK_BROWSER_OPEN` too, a browser login that runs `xdg-open` and waits on a `127.0.0.1`

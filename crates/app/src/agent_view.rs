@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -75,8 +76,9 @@ use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
 use crate::tool_calls::{
-    self, ActionLabel, AgentAction, CallState, Grep, GrepFile, LabelPart, OwnTool, Sentence,
-    SubagentCall, SubjectStyle, ToolCallKind, WebHit,
+    self, ActionLabel, AgentAction, CallState, Grep, GrepFile, LabelPart, OwnPart, OwnResult,
+    OwnTool, Sentence, SpanStyle, SubagentCall, SubjectStyle, ThreadLine, ThreadState,
+    ToolCallKind, WebHit,
 };
 use crate::usage_limits::{
     LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, tightest_window,
@@ -263,6 +265,9 @@ pub fn init(cx: &mut App) {
 type MarkdownKey = (usize, usize);
 /// The [`MarkdownKey`] part holding a tool call's raw input.
 const RAW_INPUT_PART: usize = usize::MAX;
+/// The [`MarkdownKey`] part holding the summary of the subthread a `delegate_task` call
+/// started.
+const SUMMARY_PART: usize = usize::MAX - 1;
 
 pub enum AgentViewEvent {
     Unarchive,
@@ -441,9 +446,11 @@ pub struct AgentView {
     background_tasks_expanded: bool,
     /// Subthreads at any depth waiting for a permission answer, which is given here (t3code).
     blocked_subthreads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
-    /// The subthreads of the agent's own subagents whose cards show their steps: those still
-    /// running, and those opened.
+    /// The subthreads whose cards show their steps, the agent's own subagents' and those
+    /// `delegate_task` started: those still running, and those opened.
     subagent_threads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
+    /// The subthreads `delegate_task` calls started, by the call's entry.
+    delegated_subthreads: BTreeMap<usize, ThreadId>,
     /// The thread's terminals (t3code's drawer). Kept while hidden, so its layout stays.
     drawer: Option<(Entity<TerminalDrawer>, Subscription)>,
     is_drawer_open: bool,
@@ -550,6 +557,7 @@ impl AgentView {
             cx.observe(&store, |this, _, cx| {
                 this.sync_blocked_subthreads(cx);
                 this.sync_agents_section(cx);
+                this.sync_delegated_cards(cx);
                 this.load_changed_files(false, cx);
                 this.follow_discarded_unsent_text(cx);
                 cx.notify();
@@ -672,6 +680,7 @@ impl AgentView {
             background_tasks_expanded: true,
             blocked_subthreads: HashMap::default(),
             subagent_threads: HashMap::default(),
+            delegated_subthreads: BTreeMap::new(),
             drawer: None,
             is_drawer_open: false,
             drawer_height: DRAWER_HEIGHT,
@@ -759,10 +768,9 @@ impl AgentView {
     /// Follows the subthreads whose subagents' cards show their steps, as Zed's subagent cards
     /// follow their threads: while one runs, and while its card is open.
     fn sync_subagent_threads(&mut self, cx: &mut Context<Self>) {
-        let shown: Vec<(usize, ThreadId)> = self
-            .thread
-            .read(cx)
-            .entries()
+        let entries = self.thread.read(cx).entries();
+        let store = self.store.read(cx);
+        let mut shown: Vec<(usize, ThreadId)> = entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| match entry {
@@ -775,13 +783,33 @@ impl AgentView {
                 _ => None,
             })
             .collect();
+        // A subthread `delegate_task` started runs on after the call has ended.
+        shown.extend(
+            self.delegated_subthreads
+                .iter()
+                .filter(|(index, thread_id)| {
+                    let is_running = store
+                        .thread(**thread_id)
+                        .and_then(|thread| thread.task.as_ref())
+                        .is_some_and(|task| task.outcome.is_none());
+                    let is_open = matches!(entries.get(**index), Some(Entry::ToolCall(tool_call))
+                        if self.toggled_tool_calls.contains(&tool_call.id));
+                    is_running || is_open
+                })
+                .map(|(index, thread_id)| (*index, *thread_id)),
+        );
         self.subagent_threads
             .retain(|thread_id, _| shown.iter().any(|(_, shown)| shown == thread_id));
         for (index, thread_id) in shown {
             if self.subagent_threads.contains_key(&thread_id) {
                 continue;
             }
-            let thread = AgentThread::shared(&self.client, thread_id, cx);
+            // A task delegated to another machine works there.
+            let (client, working_thread) = match self.store.read(cx).thread(thread_id) {
+                Some(subthread) => self.working_thread(subthread, cx),
+                None => (self.client.clone(), thread_id),
+            };
+            let thread = AgentThread::shared(&client, working_thread, cx);
             // Its card's height follows the subagent's steps, also while it's above the view.
             let row = index + 1;
             let subscription = cx.observe(&thread, move |this, _, cx| {
@@ -790,6 +818,42 @@ impl AgentView {
             });
             self.subagent_threads
                 .insert(thread_id, (thread, subscription));
+        }
+    }
+
+    /// Follows the subthreads `delegate_task` started as they run and end: their cards show
+    /// the step each is on, and its summary once it's done.
+    fn sync_delegated_cards(&mut self, cx: &mut Context<Self>) {
+        if self.delegated_subthreads.is_empty() {
+            return;
+        }
+        self.sync_delegated_summaries(cx);
+        for index in self.delegated_subthreads.keys() {
+            self.list_state.remeasure_items(index + 1..index + 2);
+        }
+        self.sync_subagent_threads(cx);
+    }
+
+    /// The summary of each subthread `delegate_task` started, as markdown, once it has ended.
+    fn sync_delegated_summaries(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let summaries: Vec<(usize, String)> = self
+            .delegated_subthreads
+            .iter()
+            .filter_map(|(index, thread_id)| {
+                let summary = store
+                    .thread(*thread_id)?
+                    .task
+                    .as_ref()?
+                    .outcome
+                    .as_ref()?
+                    .summary
+                    .clone()?;
+                Some((*index, summary))
+            })
+            .collect();
+        for (index, summary) in summaries {
+            self.sync_markdown((index, SUMMARY_PART), &summary, cx);
         }
     }
 
@@ -1845,6 +1909,8 @@ impl AgentView {
             self.list_state.splice(entry_count + 1..previous + 1, 0);
             self.synced_revisions.truncate(entry_count);
             self.opened_runs.clear();
+            self.delegated_subthreads
+                .retain(|index, _| *index < entry_count);
         }
         let mut changed = Vec::new();
         for (index, revision) in revisions.iter().enumerate() {
@@ -1883,6 +1949,9 @@ impl AgentView {
             }
         }
         self.synced_revisions = revisions;
+        if !changed.is_empty() {
+            self.sync_delegated_summaries(cx);
+        }
         // As a turn starts or ends, its runs of work open or fold.
         let is_working = self.thread.read(cx).is_working();
         if is_working != self.synced_working {
@@ -1921,6 +1990,7 @@ impl AgentView {
 
     fn sync_entry(&mut self, index: usize, entry: &Entry, cx: &mut Context<Self>) {
         {
+            self.delegated_subthreads.remove(&index);
             match entry {
                 // An agent may replay a continued thread's first message with what it brought.
                 Entry::UserMessage(text) => {
@@ -1941,6 +2011,9 @@ impl AgentView {
                     // A subagent's text is its report, a plan to approve is the plan, and a
                     // fetch's and findings' are notes, all written in markdown.
                     let kind = ToolCallKind::of(tool_call);
+                    if let Some(subthread) = kind.delegated_subthread() {
+                        self.delegated_subthreads.insert(index, subthread);
+                    }
                     let is_markdown = is_plan(tool_call)
                         || matches!(kind, ToolCallKind::Subagent(_))
                         || matches!(
@@ -4716,6 +4789,13 @@ impl AgentView {
             .read(cx)
             .permission_request(&tool_call.id)
             .is_some();
+        if live_run.is_none()
+            && !needs_confirmation
+            && let Some(subthread) = self.delegated_subthreads.get(&index).copied()
+            && let Some(card) = self.render_delegated_card(index, tool_call, subthread, window, cx)
+        {
+            return card;
+        }
         // The plan bar shows the to-do list, so its updates have no row, as in Zed.
         if live_run.is_none() && tool_calls::is_hidden(tool_call) && !needs_confirmation {
             return div().into_any_element();
@@ -4824,6 +4904,19 @@ impl AgentView {
             _ => None,
         };
         let opens = sentence.as_ref().and_then(|sentence| sentence.opens);
+        // What came of one of agentZ's tools, after its sentence; one that made something has
+        // Open instead.
+        let result = match &kind {
+            ToolCallKind::Own {
+                tool,
+                arguments,
+                output: Some(output),
+            } if opens.is_none() && CallState::of_call(tool_call) == CallState::Done => {
+                let duration = tool_call.duration.map(format_duration);
+                tool.result(arguments, output, duration.as_deref())
+            }
+            _ => None,
+        };
         // A new file only adds lines and a deleted one only removes them.
         let stat = match &action {
             AgentAction::Created { .. } if added > 0 => Some(
@@ -4888,6 +4981,22 @@ impl AgentView {
             )
             .child(self.render_tool_call_label(tool_call, &kind, sentence.as_ref(), &action, cx))
             .children(stat.map(|stat| div().flex_none().child(stat)))
+            .when_some(result, |this, result| {
+                let element = div()
+                    .flex_none()
+                    .debug_selector(move || format!("tool-call-result-{index}"));
+                this.child(match result {
+                    OwnResult::Words(words) => element
+                        .max_w(px(260.))
+                        .truncate()
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(colors.text_placeholder)
+                        .child(one_line(&words)),
+                    OwnResult::Changes { added, removed } => {
+                        element.child(diff_stat(added as usize, removed as usize))
+                    }
+                })
+            })
             .when_some(found, |this, found| {
                 this.child(
                     div()
@@ -5108,10 +5217,27 @@ impl AgentView {
             _ => None,
         };
 
+        // agentZ's own tools say what came back in words; one that failed says why, as printed.
+        let own_view = match kind {
+            ToolCallKind::Own {
+                tool,
+                arguments,
+                output: Some(output),
+            } if CallState::of_call(tool_call) == CallState::Done => {
+                Some(tool.view(arguments, output))
+            }
+            _ => None,
+        };
+
         let mut output = Vec::new();
-        match view {
-            Some(view) => output.push(view),
-            None => {
+        match (own_view, view) {
+            (Some(parts), _) => {
+                if !parts.is_empty() {
+                    output.push(self.render_own_view(index, parts, folder.as_deref(), cx));
+                }
+            }
+            (None, Some(view)) => output.push(view),
+            (None, None) => {
                 for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
                     output.push(self.render_file_diff(
                         diff,
@@ -5188,6 +5314,133 @@ impl AgentView {
             );
         }
         output
+    }
+
+    /// What one of agentZ's tools gave back, in words (`design/agentz-tools`, topic 4): lines
+    /// in the row's gray with names brighter, threads with a dot for how they're doing and
+    /// when they were last active, and what a command printed in the code font.
+    fn render_own_view(
+        &self,
+        index: usize,
+        parts: Vec<OwnPart>,
+        folder: Option<&Path>,
+        cx: &App,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let status = cx.theme().status();
+        let now = SystemTime::now();
+        let span = |span: tool_calls::Span| {
+            // Short words never shrink, so a line truncates in its names and paths.
+            let is_short = span.text.chars().count() <= 16;
+            div()
+                .map(|this| {
+                    if is_short {
+                        this.flex_none()
+                    } else {
+                        this.min_w_0().truncate()
+                    }
+                })
+                .map(|this| match span.style {
+                    SpanStyle::Bright => this.text_color(colors.text_muted),
+                    SpanStyle::Plain => this,
+                    SpanStyle::Dim => this.text_color(colors.text_placeholder),
+                    SpanStyle::Code => this.font_buffer(cx),
+                    SpanStyle::Error => this.text_color(status.error),
+                })
+                .child(one_line(&span.text))
+        };
+        let thread = |line: ThreadLine| {
+            let dot = div().size(px(6.)).flex_none().rounded_full();
+            let dot = match line.state {
+                ThreadState::Working => dot.bg(colors.text_accent),
+                ThreadState::Waiting => dot.bg(status.warning),
+                ThreadState::Failed => dot.bg(status.error),
+                ThreadState::Idle => dot.border_1().border_color(colors.text_placeholder),
+            };
+            let at = line
+                .at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| crate::sidebar::format_relative_time(SystemTime::from(at), now));
+            let details = line
+                .details
+                .iter()
+                .map(|detail| format!("· {detail}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            h_flex()
+                .min_w_0()
+                .gap_2()
+                .child(dot)
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(colors.text_muted)
+                        .child(one_line(&line.title)),
+                )
+                .when(!details.is_empty(), |this| {
+                    this.child(div().min_w_0().truncate().child(details))
+                })
+                .child(div().flex_1())
+                .children(at.map(|at| {
+                    div()
+                        .flex_none()
+                        .text_color(colors.text_placeholder)
+                        .child(at)
+                }))
+        };
+        v_flex()
+            .debug_selector(move || format!("tool-call-words-{index}"))
+            .px(px(10.))
+            .py(px(6.))
+            .gap_0p5()
+            .text_size(rems_from_px(12_f32))
+            .line_height(rems_from_px(20_f32))
+            .text_color(work_row_color(cx))
+            .children(parts.into_iter().map(|part| {
+                match part {
+                    OwnPart::Line(spans) => h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .children(spans.into_iter().map(span))
+                        .into_any_element(),
+                    OwnPart::Thread(line) => thread(line).into_any_element(),
+                    OwnPart::Printed(text) => div()
+                        .font_buffer(cx)
+                        .line_height(rems_from_px(17_f32))
+                        .text_color(colors.text_muted)
+                        .child(text)
+                        .into_any_element(),
+                    OwnPart::Prose(text) => div()
+                        .text_size(rems_from_px(13_f32))
+                        .text_color(colors.text_muted)
+                        .child(text)
+                        .into_any_element(),
+                    OwnPart::File {
+                        path,
+                        added,
+                        removed,
+                    } => h_flex()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_buffer(cx)
+                                .text_color(colors.text_muted)
+                                .child(tool_calls::display_path(&path, folder)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .child(diff_stat(added as usize, removed as usize)),
+                        )
+                        .into_any_element(),
+                }
+            }))
+            .into_any_element()
     }
 
     /// One file's change in an edit: a header with its icon, its path, the lines it added and
@@ -5486,6 +5739,7 @@ impl AgentView {
         });
         let is_stopped = matches!(end, Some(TaskEnd::Cancelled | TaskEnd::Interrupted));
         let failed = !is_stopped && matches!(tool_call.status, acp::ToolCallStatus::Failed);
+        let is_in_background = subagent.in_background && !is_running && !failed;
         // A native subagent's step asks at the end of the thread, and its row says it waits.
         let is_waiting = self
             .thread
@@ -5504,20 +5758,32 @@ impl AgentView {
             || tool_call.raw_input.is_some();
         let is_openable = has_content && request.is_none();
         let is_open = is_openable && self.toggled_tool_calls.contains(&tool_call.id);
-        let steps: Vec<ToolCall> = subthread
-            .and_then(|thread_id| self.subagent_threads.get(&thread_id))
-            .map(|(thread, _)| {
-                thread
-                    .read(cx)
-                    .entries()
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        Entry::ToolCall(step) if !tool_calls::is_hidden(step) => Some(step.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            })
+        let steps = subthread
+            .map(|thread_id| self.subagent_steps(thread_id, cx))
             .unwrap_or_default();
+        // At work in a subthread, it's Zed's card; once it ends, the row again.
+        if let Some(subthread) = subthread.filter(|_| is_running) {
+            let question = request.and_then(|(tool_call_id, title)| {
+                let card = self.render_permission_card(index, &tool_call_id, &title, None, cx)?;
+                Some(card.my_1().into_any_element())
+            });
+            let card = SubthreadCard {
+                subthread,
+                title: one_line(&subagent.description),
+                meta: subagent.kind.clone(),
+                state: CardState::Running,
+                changes: None,
+                can_stop: false,
+                is_waiting,
+                question,
+            };
+            let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+            let report = (0..tool_call.text.len())
+                .filter_map(|part| self.markdown((index, part + 1), style.clone(), cx))
+                .map(IntoElement::into_any_element)
+                .collect();
+            return self.render_subthread_card(index, tool_call, card, report, cx);
+        }
         let row_group = SharedString::from(format!("tool-call-row-{index}"));
         let toggle = {
             let tool_call_id = tool_call.id.clone();
@@ -5613,7 +5879,18 @@ impl AgentView {
                         .with_rotate_animation(2),
                 )
             })
-            .when(!is_running, |this| {
+            // Sent to the background, it ended as it started: it says so instead.
+            .when(is_in_background, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .debug_selector(move || format!("subagent-background-{index}"))
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(colors.text_placeholder)
+                        .child("In the background"),
+                )
+            })
+            .when(!is_running && !is_in_background, |this| {
                 this.children(duration.map(|duration| {
                     div()
                         .flex_none()
@@ -5662,22 +5939,7 @@ impl AgentView {
             Some(thread_id) if is_open => {
                 Some(self.render_subagent_preview(index, tool_call, thread_id, &steps, window, cx))
             }
-            // "Waiting for you" stands in for its step.
-            Some(_) if is_waiting => None,
-            // While it runs, the step it's on.
-            Some(_) => steps
-                .iter()
-                .rev()
-                .find(|step| step.is_running())
-                .or(steps.last())
-                .filter(|_| is_running)
-                .map(|step| {
-                    div()
-                        .debug_selector(move || format!("subagent-step-{index}"))
-                        .ml(px(30.))
-                        .child(self.render_subagent_step(step, false, cx))
-                        .into_any_element()
-                }),
+            Some(_) => None,
             None if is_open => {
                 Some(self.render_subagent_task(index, tool_call, &subagent, window, cx))
             }
@@ -5690,8 +5952,8 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// Zed's preview of a subagent's work: its last steps, fading at the top when there are
-    /// more, its report once it's done, and a strip that opens its subthread.
+    /// Zed's preview of a subagent's work under its row: its last steps, fading at the top
+    /// when there are more, its report once it's done, and a strip that opens its subthread.
     fn render_subagent_preview(
         &self,
         index: usize,
@@ -5701,18 +5963,13 @@ impl AgentView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        const MAX_PREVIEW_STEPS: usize = 8;
         let colors = cx.theme().colors();
         let border = Self::tool_card_border_color(cx);
-        let shown = &steps[steps.len().saturating_sub(MAX_PREVIEW_STEPS)..];
-        let is_cut = shown.len() < steps.len();
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let report: Vec<AnyElement> = (0..tool_call.text.len())
             .filter_map(|part| self.markdown((index, part + 1), style.clone(), cx))
             .map(IntoElement::into_any_element)
             .collect();
-        let has_steps = !shown.is_empty();
-        let has_report = !report.is_empty();
         v_flex()
             .debug_selector(move || format!("subagent-preview-{index}"))
             .ml(px(30.))
@@ -5722,69 +5979,390 @@ impl AgentView {
             .border_color(border)
             .bg(colors.editor_background)
             .overflow_hidden()
-            .when(has_steps, |this| {
-                this.child(
-                    div()
-                        .relative()
-                        .p_1()
-                        .children(
-                            shown
-                                .iter()
-                                .map(|step| self.render_subagent_step(step, true, cx)),
-                        )
-                        .when(is_cut, |this| {
-                            this.child(div().absolute().inset_0().size_full().bg(
-                                gpui::linear_gradient(
-                                    180.,
-                                    gpui::linear_color_stop(colors.editor_background, 0.),
-                                    gpui::linear_color_stop(
-                                        colors.editor_background.opacity(0.),
-                                        0.3,
-                                    ),
-                                ),
-                            ))
-                        }),
-                )
-            })
-            .when(has_report, |this| {
-                this.child(
-                    div()
-                        .debug_selector(move || format!("subagent-report-{index}"))
-                        .px_3()
-                        .py_2()
-                        .when(has_steps, |this| this.border_t_1().border_color(border))
-                        .text_ui(cx)
-                        .children(report),
-                )
-            })
-            .child(
-                h_flex()
-                    .id(("subagent-full-screen", index))
-                    .debug_selector(move || format!("subagent-full-screen-{index}"))
-                    .py_1()
-                    .w_full()
-                    .justify_center()
-                    .when(has_steps || has_report, |this| {
+            .children(self.render_subagent_work(index, subthread, steps, report, false, cx))
+            .into_any_element()
+    }
+
+    /// What Zed's subagent card shows of the work once it's opened: the last 8 steps, fading
+    /// at the top when there are more, the report once it's done, and the strip that opens
+    /// the subthread. Below a card's header, each part is set off by a line.
+    fn render_subagent_work(
+        &self,
+        index: usize,
+        subthread: ThreadId,
+        steps: &[ToolCall],
+        report: Vec<AnyElement>,
+        below_header: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        const MAX_PREVIEW_STEPS: usize = 8;
+        let colors = cx.theme().colors();
+        let border = Self::tool_card_border_color(cx);
+        let shown = &steps[steps.len().saturating_sub(MAX_PREVIEW_STEPS)..];
+        let is_cut = shown.len() < steps.len();
+        let has_steps = !shown.is_empty();
+        let has_report = !report.is_empty();
+        let mut parts = Vec::new();
+        if has_steps {
+            parts.push(
+                div()
+                    .debug_selector(move || format!("subagent-steps-{index}"))
+                    .relative()
+                    .p_1()
+                    .when(below_header, |this| this.border_t_1().border_color(border))
+                    .children(shown.iter().map(|step| self.render_subagent_step(step, cx)))
+                    .when(is_cut, |this| {
+                        this.child(div().absolute().inset_0().size_full().bg(
+                            gpui::linear_gradient(
+                                180.,
+                                gpui::linear_color_stop(colors.editor_background, 0.),
+                                gpui::linear_color_stop(colors.editor_background.opacity(0.), 0.3),
+                            ),
+                        ))
+                    })
+                    .into_any_element(),
+            );
+        }
+        if has_report {
+            parts.push(
+                div()
+                    .debug_selector(move || format!("subagent-report-{index}"))
+                    .px_3()
+                    .py_2()
+                    .when(has_steps || below_header, |this| {
                         this.border_t_1().border_color(border)
                     })
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.element_hover))
-                    .child(
-                        Icon::new(IconName::Maximize)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .tooltip(Tooltip::text("Make Subagent Full Screen"))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(AgentViewEvent::OpenThread(subthread))
-                    })),
+                    .text_ui(cx)
+                    .children(report)
+                    .into_any_element(),
+            );
+        }
+        parts.push(self.render_full_screen_strip(
+            index,
+            subthread,
+            has_steps || has_report || below_header,
+            cx,
+        ));
+        parts
+    }
+
+    /// Zed's strip at the bottom of a subagent's card, which opens its subthread.
+    fn render_full_screen_strip(
+        &self,
+        index: usize,
+        subthread: ThreadId,
+        has_border: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let border = Self::tool_card_border_color(cx);
+        h_flex()
+            .id(("subagent-full-screen", index))
+            .debug_selector(move || format!("subagent-full-screen-{index}"))
+            .py_1()
+            .w_full()
+            .justify_center()
+            .when(has_border, |this| this.border_t_1().border_color(border))
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.element_hover))
+            .child(
+                Icon::new(IconName::Maximize)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .tooltip(Tooltip::text("Make Subagent Full Screen"))
+            .on_click(
+                cx.listener(move |_, _, _, cx| cx.emit(AgentViewEvent::OpenThread(subthread))),
             )
             .into_any_element()
     }
 
-    /// A subagent's step in its card: the step's own row, as the subthread shows it. Under a
-    /// running card's row, `spins` is false: the row's spinner already says it runs.
-    fn render_subagent_step(&self, step: &ToolCall, spins: bool, cx: &App) -> AnyElement {
+    /// The steps of a subthread whose card shows them, once it's followed
+    /// ([`Self::sync_subagent_threads`]).
+    fn subagent_steps(&self, subthread: ThreadId, cx: &App) -> Vec<ToolCall> {
+        self.subagent_threads
+            .get(&subthread)
+            .map(|(thread, _)| {
+                thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        Entry::ToolCall(step) if !tool_calls::is_hidden(step) => Some(step.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A subthread a `delegate_task` call started, as Zed's subagent card
+    /// (`design/agentz-tools`, topics 7 and 8): its state, title, model and the files it
+    /// changed, with Stop while it runs.
+    fn render_delegated_card(
+        &self,
+        index: usize,
+        tool_call: &ToolCall,
+        subthread: ThreadId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let thread = self.store.read(cx).thread(subthread)?;
+        let end = thread
+            .task
+            .as_ref()?
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.end);
+        let (title, model) = (thread.title.clone(), thread.model.clone());
+        let state = match end {
+            None => CardState::Running,
+            Some(TaskEnd::Completed) => CardState::Done,
+            Some(TaskEnd::Failed) => CardState::Failed,
+            Some(TaskEnd::Cancelled | TaskEnd::Interrupted) => CardState::Stopped,
+        };
+        let card = SubthreadCard {
+            subthread,
+            title,
+            meta: model,
+            state,
+            changes: self
+                .subthread_changes
+                .get(&subthread)
+                .copied()
+                .filter(|changes| changes.files > 0),
+            can_stop: true,
+            is_waiting: self.blocked_subthreads.contains_key(&subthread),
+            question: None,
+        };
+        let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let report: Vec<AnyElement> = self
+            .markdown((index, SUMMARY_PART), style, cx)
+            .filter(|_| end.is_some())
+            .map(IntoElement::into_any_element)
+            .into_iter()
+            .collect();
+        Some(self.render_subthread_card(index, tool_call, card, report, cx))
+    }
+
+    /// Zed's subagent card for a subthread at work: a bordered card whose header has a
+    /// spinner, a check, a cross or a faint circle, the title, "· model", the files it
+    /// changed, and Stop while it runs. While it runs, the step it's on shows inside, and a
+    /// strip at the bottom opens it full screen; opened, it shows Zed's preview of its work.
+    fn render_subthread_card(
+        &self,
+        index: usize,
+        tool_call: &ToolCall,
+        card: SubthreadCard,
+        report: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let (editor_background, element_hover, icon_disabled) = (
+            colors.editor_background,
+            colors.element_hover,
+            colors.icon_disabled,
+        );
+        let border = Self::tool_card_border_color(cx);
+        let SubthreadCard {
+            subthread,
+            title,
+            meta,
+            state,
+            changes,
+            can_stop,
+            is_waiting,
+            question,
+        } = card;
+        let is_running = state == CardState::Running;
+        let is_open = self.toggled_tool_calls.contains(&tool_call.id);
+        let steps = self.subagent_steps(subthread, cx);
+        let header_group = SharedString::from(format!("subthread-card-header-{index}"));
+        let title_size = LabelSize::Custom(rems_from_px(13_f32));
+        let status = match state {
+            CardState::Running => SpinnerLabel::new()
+                .size(LabelSize::Small)
+                .into_any_element(),
+            CardState::Done => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+            CardState::Failed => div()
+                .id(("subthread-card-status", index))
+                .child(
+                    Icon::new(IconName::Close)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
+                )
+                .tooltip(Tooltip::text("Subthread Failed"))
+                .into_any_element(),
+            CardState::Stopped => div()
+                .id(("subthread-card-status", index))
+                .child(
+                    Icon::new(IconName::Circle)
+                        .size(IconSize::Small)
+                        .color(Color::Custom(icon_disabled.opacity(0.5))),
+                )
+                .tooltip(Tooltip::text("Subthread Stopped"))
+                .into_any_element(),
+        };
+        let toggle = {
+            let tool_call_id = tool_call.id.clone();
+            cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                if !this.toggled_tool_calls.remove(&tool_call_id) {
+                    this.toggled_tool_calls.insert(tool_call_id.clone());
+                }
+                this.sync_subagent_threads(cx);
+                cx.notify();
+            })
+        };
+        let header = h_flex()
+            .group(header_group.clone())
+            .h_8()
+            .p_1()
+            .w_full()
+            .gap_1()
+            .bg(Self::tool_card_header_bg(cx))
+            .child(
+                h_flex()
+                    .id(("subthread-card-title", index))
+                    .debug_selector(move || format!("subthread-card-title-{index}"))
+                    .px_1()
+                    .min_w_0()
+                    .flex_1()
+                    .h_full()
+                    .gap_1p5()
+                    .rounded_sm()
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(element_hover))
+                    .on_click(toggle)
+                    .child(h_flex().w_4().flex_none().justify_center().child(status))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .child(Label::new(title).size(title_size).truncate()),
+                    )
+                    .children(meta.map(|meta| {
+                        div().flex_none().child(
+                            Label::new(format!("· {meta}"))
+                                .size(title_size)
+                                .color(Color::Muted),
+                        )
+                    }))
+                    .children(changes.map(|changes| {
+                        let files = if changes.files == 1 {
+                            "— 1 file changed".to_string()
+                        } else {
+                            format!("— {} files changed", changes.files)
+                        };
+                        h_flex()
+                            .debug_selector(move || format!("subthread-card-changes-{index}"))
+                            .flex_none()
+                            .gap_1p5()
+                            .child(Label::new(files).size(title_size).color(Color::Muted))
+                            .child(diff_stat(changes.additions, changes.deletions))
+                    }))
+                    .when(is_waiting, |this| {
+                        let warning = cx.theme().status().warning;
+                        this.child(
+                            div()
+                                .debug_selector(move || format!("subagent-waiting-{index}"))
+                                .flex_none()
+                                .px(px(6.))
+                                .rounded(px(4.))
+                                .bg(warning.opacity(0.12))
+                                .text_size(rems_from_px(11_f32))
+                                .text_color(warning)
+                                .child("Waiting for you"),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div().flex_none().visible_on_hover(header_group).child(
+                            Icon::new(if is_open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        ),
+                    ),
+            )
+            .when(is_running && can_stop, |this| {
+                this.child(
+                    div()
+                        .debug_selector(move || format!("subthread-card-stop-{index}"))
+                        .child(
+                            IconButton::new(("subthread-card-stop", index), IconName::Stop)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Error)
+                                .tooltip(Tooltip::text("Stop Subthread"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.stop_subthread(subthread, cx);
+                                })),
+                        ),
+                )
+            });
+        let question = question.map(|question| {
+            div()
+                .px_1()
+                .border_t_1()
+                .border_color(border)
+                .child(question)
+                .into_any_element()
+        });
+        let body: Vec<AnyElement> = if is_open {
+            question
+                .into_iter()
+                .chain(self.render_subagent_work(index, subthread, &steps, report, true, cx))
+                .collect()
+        } else if is_running {
+            // While it runs, the step it's on; "Waiting for you" stands in for it.
+            let step = steps
+                .iter()
+                .rev()
+                .find(|step| step.is_running())
+                .or(steps.last())
+                .filter(|_| !is_waiting)
+                .map(|step| {
+                    div()
+                        .debug_selector(move || format!("subagent-step-{index}"))
+                        .px_1()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(self.render_subagent_step(step, cx))
+                        .into_any_element()
+                });
+            step.into_iter()
+                .chain(question)
+                .chain([self.render_full_screen_strip(index, subthread, true, cx)])
+                .collect()
+        } else {
+            question.into_iter().collect()
+        };
+        let has_ended_badly = matches!(state, CardState::Failed | CardState::Stopped);
+        v_flex()
+            .mx_5()
+            .child(
+                v_flex()
+                    .debug_selector(move || format!("subthread-card-{index}"))
+                    .my_1()
+                    .rounded_md()
+                    .border_1()
+                    .when(has_ended_badly, |this| this.border_dashed())
+                    .border_color(border)
+                    .bg(editor_background)
+                    .overflow_hidden()
+                    .child(header)
+                    .children(body),
+            )
+            .into_any_element()
+    }
+
+    /// A subagent's step in its card: the step's own row, as the subthread shows it.
+    fn render_subagent_step(&self, step: &ToolCall, cx: &App) -> AnyElement {
         let (kind, sentence) = self.tool_call_kind(step, cx);
         let action = tool_call_action(step, &kind, false);
         let is_running = step.is_running();
@@ -5800,7 +6378,7 @@ impl AgentView {
                     .child(tool_call_icon(step, &kind, &action, cx)),
             )
             .child(self.render_tool_call_label(step, &kind, sentence.as_ref(), &action, cx))
-            .when(is_running && spins, |this| {
+            .when(is_running, |this| {
                 this.child(
                     Icon::new(IconName::LoadCircle)
                         .size(IconSize::XSmall)
@@ -5811,9 +6389,10 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// An opened subagent that reports no steps (Factory Droid's): "Task" with its options as
-    /// tags and its prompt as text, then "Report" with its report once it's done, and "Input"
-    /// for the JSON.
+    /// An opened subagent that reports no steps (Factory Droid's): its report, then "Task", a
+    /// line that opens its options as tags and its prompt as text, as "Input" opens JSON. One
+    /// sent to the background came back with only the agent's notice that it was, and one
+    /// still at work with nothing yet, so they open to their task.
     fn render_subagent_task(
         &self,
         index: usize,
@@ -5823,30 +6402,28 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let heading = |text: &'static str| {
-            div()
-                .flex_none()
-                .text_size(rems_from_px(12_f32))
-                .text_color(colors.text_placeholder)
-                .child(text)
-        };
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let report: Vec<AnyElement> = (0..tool_call.text.len())
+            .filter(|_| !subagent.in_background)
             .filter_map(|part| self.markdown((index, part + 1), style.clone(), cx))
             .map(IntoElement::into_any_element)
             .collect();
+        let has_report = !report.is_empty();
+        let is_task_open = !has_report || self.expanded_tool_inputs.contains(&tool_call.id);
         let task = subagent.prompt.clone().map(|prompt| {
             v_flex()
                 .debug_selector(move || format!("subagent-task-{index}"))
                 .gap_1()
-                .child(
-                    h_flex().gap_2().child(heading("Task")).children(
-                        subagent
-                            .options
-                            .iter()
-                            .map(|option| subagent_tag(option.clone(), cx)),
-                    ),
-                )
+                .when(!subagent.options.is_empty(), |this| {
+                    this.child(
+                        h_flex().gap_2().children(
+                            subagent
+                                .options
+                                .iter()
+                                .map(|option| subagent_tag(option.clone(), cx)),
+                        ),
+                    )
+                })
                 .child(
                     div()
                         .text_size(rems_from_px(13_f32))
@@ -5855,16 +6432,51 @@ impl AgentView {
                         .child(prompt),
                 )
         });
-        let report = (!report.is_empty()).then(|| {
-            v_flex()
+        let report = has_report.then(|| {
+            div()
                 .debug_selector(move || format!("subagent-report-{index}"))
-                .gap_1()
-                .child(heading("Report"))
-                .child(div().text_ui(cx).children(report))
+                .text_ui(cx)
+                .children(report)
         });
-        let input = tool_call
-            .raw_input
-            .is_some()
+        let task_line = (has_report && task.is_some()).then(|| {
+            let toggle = {
+                let tool_call_id = tool_call.id.clone();
+                cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                    if !this.expanded_tool_inputs.remove(&tool_call_id) {
+                        this.expanded_tool_inputs.insert(tool_call_id.clone());
+                    }
+                    cx.notify();
+                })
+            };
+            h_flex().child(
+                h_flex()
+                    .id(("subagent-task-toggle", index))
+                    .debug_selector(move || format!("subagent-task-toggle-{index}"))
+                    .h(px(20.))
+                    .px_0p5()
+                    .gap_1()
+                    .rounded_xs()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .on_click(toggle)
+                    .child(
+                        Label::new("Task")
+                            .size(LabelSize::Small)
+                            .color(Color::Placeholder),
+                    )
+                    .child(
+                        Icon::new(if is_task_open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    ),
+            )
+        });
+        // Without a prompt to show, what it was given is its input.
+        let input = (task.is_none() && tool_call.raw_input.is_some())
             .then(|| self.render_tool_input(index, &tool_call.id, window, cx));
         with_scrollbar(
             v_flex()
@@ -5874,8 +6486,9 @@ impl AgentView {
                 .overflow_y_scroll()
                 .py_1()
                 .gap_2()
-                .children(task)
                 .children(report)
+                .children(task_line)
+                .children(task.filter(|_| is_task_open))
                 .children(input),
             div().ml(px(30.)),
             format!("tool-call-output-{}", tool_call.id),
@@ -6019,21 +6632,26 @@ impl AgentView {
                         .child(div().min_w_0().truncate().child(sentence.verb.clone()))
                         .into_any_element();
                 };
+                let subject_element = |subject: &tool_calls::Subject| {
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .map(|this| match subject.style {
+                            SubjectStyle::Title => this.text_color(colors.text_muted),
+                            SubjectStyle::Code => {
+                                this.font_buffer(cx).text_size(rems_from_px(12_f32))
+                            }
+                            SubjectStyle::Plain => this,
+                        })
+                        .child(one_line(&subject.text))
+                };
                 label
                     .child(div().flex_none().child(sentence.verb.clone()))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .map(|this| match subject.style {
-                                SubjectStyle::Title => this.text_color(colors.text_muted),
-                                SubjectStyle::Code => {
-                                    this.font_buffer(cx).text_size(rems_from_px(12_f32))
-                                }
-                                SubjectStyle::Plain => this,
-                            })
-                            .child(one_line(&subject.text)),
-                    )
+                    .child(subject_element(subject))
+                    .when_some(sentence.object.as_ref(), |this, (joint, object)| {
+                        this.child(div().flex_none().child(joint.clone()))
+                            .child(subject_element(object))
+                    })
                     .into_any_element()
             }
             (ToolCallKind::ToolSearch(search), _) => label
@@ -11436,6 +12054,29 @@ fn draws_row(entry: &Entry) -> bool {
     }
 }
 
+/// A subthread's state, as Zed's subagent card shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardState {
+    Running,
+    Done,
+    Failed,
+    Stopped,
+}
+
+/// What a subthread's card shows in its header, and a question its call asks.
+struct SubthreadCard {
+    subthread: ThreadId,
+    title: String,
+    /// The model it runs on, or the type of the agent's own subagent.
+    meta: Option<String>,
+    state: CardState,
+    changes: Option<ChangeStat>,
+    /// The agent runs its own subagents, so only the subthreads agentZ runs have Stop.
+    can_stop: bool,
+    is_waiting: bool,
+    question: Option<AnyElement>,
+}
+
 /// The running turn's last run of work, folded into the row of one of its entries.
 #[derive(Clone, Debug, PartialEq)]
 struct LiveLine {
@@ -13149,6 +13790,127 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("tool-call-output-2").is_none());
         assert!(cx.debug_bounds("tool-call-input-2").is_none());
+    }
+
+    /// agentZ's tools say what came of them after their sentence, and open to it in words,
+    /// with the JSON behind "Input" (`design/agentz-tools`, topics 2 and 4).
+    #[gpui::test]
+    fn agentzs_tools_say_what_came_back_in_words(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("What's going on?".into()),
+                    mcp_call(
+                        "agentz___agentz_thread_list",
+                        "{}",
+                        r#"{"threads": [{"threadId": 412, "title": "Fix flaky login test",
+                            "status": "running", "agentName": "Claude Agent",
+                            "lastActivityAt": "2025-10-09T18:02:11Z"}]}"#,
+                    ),
+                    Entry::AgentMessage("One thread.".into()),
+                    mcp_call(
+                        "agentz___agentz_command_run",
+                        r#"{"command": "cargo test"}"#,
+                        r#"{"exitCode": 0, "output": "running 2 tests\ntest result: ok\n"}"#,
+                    ),
+                    Entry::AgentMessage("They pass.".into()),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        for selector in ["tool-call-result-1", "tool-call-result-3"] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
+        }
+        click("tool-call-row-1", cx);
+        let words = cx.debug_bounds("tool-call-words-1").expect("the words");
+        let input = cx.debug_bounds("tool-call-input-1").expect("Input");
+        assert!(words.bottom() <= input.top());
+        assert!(cx.debug_bounds("tool-call-input-json-1").is_none());
+    }
+
+    /// A subthread `delegate_task` started is Zed's subagent card where it started
+    /// (`design/agentz-tools`, topics 7 and 8): with Stop and the step it's on while it runs,
+    /// and the files it changed once it's done, opening to its summary.
+    #[gpui::test]
+    fn a_delegated_subthread_is_zeds_card_where_it_started(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+
+        let (view, cx) = open_in(subthreads_snapshot(&[10]), 2, false, cx);
+        let opened = opened_threads(&view, cx);
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                Some(Response::Ok)
+            });
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Delegate it".into()),
+                    mcp_call(
+                        "agentz___delegate_task",
+                        r#"{"task": "Look into it", "title": "Research"}"#,
+                        r#"{"taskId": 10, "childThreadId": 10}"#,
+                    ),
+                    Entry::AgentMessage("It's on it.".into()),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        for selector in [
+            "subthread-card-1",
+            "subthread-card-stop-1",
+            "subagent-full-screen-1",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
+        }
+        assert!(cx.debug_bounds("tool-call-row-1").is_none());
+        click("subthread-card-stop-1", cx);
+        assert!(requests.borrow().contains(&Request::Cancel(
+            agentz_protocol::ConnectionId::Thread(ThreadId(10))
+        )));
+        assert!(opened.borrow().is_empty());
+
+        let mut ended = subthreads_snapshot(&[]);
+        if let Some(outcome) = ended
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == ThreadId(10))
+            .and_then(|thread| thread.task.as_mut())
+            .and_then(|task| task.outcome.as_mut())
+        {
+            outcome.summary = Some("The **child tasks** need a card.".into());
+        }
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        store.update(cx, |store, cx| store.set_snapshot(ended, cx));
+        view.update(cx, |view, cx| {
+            view.subthread_changes.insert(
+                ThreadId(10),
+                ChangeStat {
+                    files: 2,
+                    additions: 12,
+                    deletions: 3,
+                },
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subthread-card-changes-1").is_some());
+        for selector in ["subthread-card-stop-1", "subagent-full-screen-1"] {
+            assert!(cx.debug_bounds(selector).is_none(), "{selector} is hidden");
+        }
+        click("subthread-card-title-1", cx);
+        assert!(cx.debug_bounds("subagent-report-1").is_some());
+        click("subagent-full-screen-1", cx);
+        assert_eq!(*opened.borrow(), vec![ThreadId(10)]);
     }
 
     fn completed_call(
@@ -15298,9 +16060,11 @@ mod tests {
         )
     }
 
-    /// The agent's own subagents are rows of their own, with their type and how long they ran:
-    /// Droid's opens to its task and report, and Claude Agent's, which works in a subthread,
-    /// shows the step it's on, ends in Open, and opens to Zed's preview of its work.
+    /// The agent's own subagents are rows of their own, with their type and how long they ran.
+    /// Droid's opens to its report, its task behind "Task", and one sent to the background
+    /// says so and opens to its task. Claude Agent's works in a subthread: while it runs it's
+    /// Zed's card, with the step it's on and the strip that opens it full screen, opening to
+    /// Zed's preview of its work; once it ends, it's a row ending in Open again.
     #[gpui::test]
     fn subagents_are_rows_of_their_own(cx: &mut TestAppContext) {
         let (view, cx) = open_in(subagent_snapshot(true), 2, false, cx);
@@ -15339,71 +16103,108 @@ mod tests {
         );
         droid.text = vec!["Built the seven picks.".into()];
         droid.duration = Some(Duration::from_secs(252));
-        let mut claude = subagent_call(
-            "subagent:subagent-session",
-            "Find where the login view is drawn",
-            acp::ToolCallStatus::InProgress,
+        let mut background = subagent_call("task-2", "Task", acp::ToolCallStatus::Completed);
+        background.raw_input = Some(
+            "{\"subagent_type\": \"worker\", \"description\": \"Review the picks\", \
+             \"await\": false, \"prompt\": \"Review what was built.\"}"
+                .into(),
         );
-        claude.subthread = Some(ThreadId(12));
+        background.text = vec!["Task launched in background.\ntask_id: 7".into()];
+        background.duration = Some(Duration::from_millis(448));
+        let claude = |status: acp::ToolCallStatus| {
+            let mut claude = subagent_call(
+                "subagent:subagent-session",
+                "Find where the login view is drawn",
+                status,
+            );
+            claude.subthread = Some(ThreadId(12));
+            claude.duration = Some(Duration::from_secs(41));
+            claude.text = vec!["It's drawn in `agent_login.rs`.".into()];
+            claude
+        };
         let thread = view.read_with(cx, |view, _| view.thread.clone());
-        thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(
-                vec![
-                    Entry::UserMessage("Build it".into()),
-                    Entry::ToolCall(droid),
-                    Entry::ToolCall(claude),
-                ],
-                cx,
-            )
-        });
-        cx.run_until_parked();
+        let set_entries = |claude: ToolCall, cx: &mut VisualTestContext| {
+            thread.update(cx, |thread, cx| {
+                thread.set_entries_for_test(
+                    vec![
+                        Entry::UserMessage("Build it".into()),
+                        Entry::ToolCall(droid.clone()),
+                        Entry::ToolCall(claude),
+                        Entry::ToolCall(background.clone()),
+                    ],
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+        };
+        set_entries(claude(acp::ToolCallStatus::InProgress), cx);
 
-        // Each has a row: they don't fold into a run of work.
+        // Each has a row or a card: they don't fold into a run of work.
         assert!(cx.debug_bounds("work-run-1").is_none());
         for selector in [
             "tool-call-row-1",
             "subagent-type-1",
             "subagent-time-1",
-            "tool-call-row-2",
-            "tool-call-open-2",
+            "subthread-card-2",
             "subagent-step-2",
+            "subagent-full-screen-2",
+            "subagent-background-3",
         ] {
             assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
         }
-        assert!(cx.debug_bounds("subagent-type-2").is_none());
-        assert!(cx.debug_bounds("subagent-time-2").is_none());
+        // The agent runs it, so it has no Stop.
+        for selector in [
+            "tool-call-row-2",
+            "tool-call-open-2",
+            "subthread-card-stop-2",
+            "subagent-time-3",
+        ] {
+            assert!(cx.debug_bounds(selector).is_none(), "{selector} is hidden");
+        }
 
         let droid_row = cx.debug_bounds("tool-call-row-1").expect("Droid's row");
         cx.simulate_click(droid_row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        for selector in ["subagent-task-1", "subagent-report-1", "tool-call-input-1"] {
-            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
-        }
-
-        let open = cx.debug_bounds("tool-call-open-2").expect("Open");
-        cx.simulate_click(open.center(), gpui::Modifiers::none());
+        let report = cx.debug_bounds("subagent-report-1").expect("its report");
+        let toggle = cx.debug_bounds("subagent-task-toggle-1").expect("Task");
+        assert!(report.bottom() <= toggle.top());
+        assert!(cx.debug_bounds("subagent-task-1").is_none());
+        assert!(cx.debug_bounds("tool-call-input-1").is_none());
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        assert_eq!(*opened.borrow(), vec![ThreadId(12)]);
-        assert!(cx.debug_bounds("subagent-preview-2").is_none());
+        let task = cx.debug_bounds("subagent-task-1").expect("its task");
+        assert!(toggle.bottom() <= task.top());
 
-        let claude_row = cx.debug_bounds("tool-call-row-2").expect("Claude's row");
-        // Its title, away from Open.
-        cx.simulate_click(
-            gpui::point(claude_row.left() + px(40.), claude_row.center().y),
-            gpui::Modifiers::none(),
-        );
+        let background_row = cx
+            .debug_bounds("tool-call-row-3")
+            .expect("the background one's row");
+        cx.simulate_click(background_row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("subagent-preview-2").is_some());
-        assert!(cx.debug_bounds("subagent-step-2").is_none());
+        assert!(cx.debug_bounds("subagent-task-3").is_some());
+        assert!(cx.debug_bounds("subagent-report-3").is_none());
+        assert!(cx.debug_bounds("subagent-task-toggle-3").is_none());
+
         let full_screen = cx
             .debug_bounds("subagent-full-screen-2")
             .expect("the strip");
         cx.simulate_click(full_screen.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        assert_eq!(*opened.borrow(), vec![ThreadId(12), ThreadId(12)]);
+        assert_eq!(*opened.borrow(), vec![ThreadId(12)]);
+
+        let title = cx
+            .debug_bounds("subthread-card-title-2")
+            .expect("the card's title");
+        cx.simulate_click(title.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subagent-steps-2").is_some());
+        assert!(cx.debug_bounds("subagent-step-2").is_none());
+        assert!(cx.debug_bounds("subagent-full-screen-2").is_some());
+        cx.simulate_click(title.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subagent-steps-2").is_none());
 
         // A step that asks for permission asks at the end of the thread, naming the subagent,
-        // and the subagent's row says it waits in place of its step.
+        // and the subagent's card says it waits in place of its step.
         thread.update(cx, |thread, cx| {
             thread.set_permission_requests_for_test(
                 vec![agentz_protocol::thread::PermissionRequest {
@@ -15420,15 +16221,38 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        let row = cx.debug_bounds("tool-call-row-2").expect("Claude's row");
-        let card = cx
+        let card = cx.debug_bounds("subthread-card-2").expect("Claude's card");
+        let request = cx
             .debug_bounds("subagent-permission-0")
             .expect("the request at the end");
-        assert!(row.bottom() <= card.top());
+        assert!(card.bottom() <= request.top());
         assert!(cx.debug_bounds("permission-buttons-2").is_none());
-        assert!(cx.debug_bounds("permission-buttons-3").is_some());
+        assert!(cx.debug_bounds("permission-buttons-4").is_some());
         assert!(cx.debug_bounds("subagent-waiting-2").is_some());
         assert!(cx.debug_bounds("subagent-step-2").is_none());
+        thread.update(cx, |thread, cx| {
+            thread.set_permission_requests_for_test(Vec::new(), cx)
+        });
+
+        // Once it ends, it's the row again, with its time, a check and Open.
+        set_entries(claude(acp::ToolCallStatus::Completed), cx);
+        for selector in ["tool-call-row-2", "tool-call-open-2", "subagent-time-2"] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
+        }
+        assert!(cx.debug_bounds("subthread-card-2").is_none());
+        let open = cx.debug_bounds("tool-call-open-2").expect("Open");
+        cx.simulate_click(open.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), vec![ThreadId(12), ThreadId(12)]);
+        let claude_row = cx.debug_bounds("tool-call-row-2").expect("Claude's row");
+        // Its title, away from Open.
+        cx.simulate_click(
+            gpui::point(claude_row.left() + px(40.), claude_row.center().y),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subagent-preview-2").is_some());
+        assert!(cx.debug_bounds("subagent-report-2").is_some());
     }
 
     /// The Agents list shows the agent's own subagent while it runs, by the agent's name and with

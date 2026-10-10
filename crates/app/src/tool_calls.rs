@@ -65,6 +65,26 @@ impl ToolCallKind {
             output: tool_call.text.iter().find_map(|text| json_in(text)),
         }
     }
+
+    /// The subthread a `delegate_task` call started, once it has. Another machine's thread ids
+    /// aren't this one's.
+    pub fn delegated_subthread(&self) -> Option<ThreadId> {
+        let Self::Own {
+            tool: OwnTool::DelegateTask,
+            arguments,
+            output: Some(output),
+        } = self
+        else {
+            return None;
+        };
+        if arguments
+            .get("machine")
+            .is_some_and(|machine| !machine.is_null())
+        {
+            return None;
+        }
+        thread_id_in(output.get("childThreadId")).or_else(|| thread_id_in(output.get("taskId")))
+    }
 }
 
 /// One of the agent's own subagents: Claude Agent's, which work in a subthread of their own and
@@ -82,6 +102,9 @@ pub struct SubagentCall {
     pub options: Vec<String>,
     /// The subthread it works in.
     pub subthread: Option<ThreadId>,
+    /// Whether it was sent to run in the background, so the call ended as it started and
+    /// what came back is only the agent's notice that it did.
+    pub in_background: bool,
 }
 
 impl SubagentCall {
@@ -93,6 +116,7 @@ impl SubagentCall {
                 prompt: None,
                 options: Vec::new(),
                 subthread: Some(subthread),
+                in_background: false,
             });
         }
         if !may_be_subagent(tool_call) {
@@ -106,6 +130,14 @@ impl SubagentCall {
             .filter(|(key, _)| !matches!(key.as_str(), "subagent_type" | "description" | "prompt"))
             .filter_map(|(_, value)| text_in(Some(value)))
             .collect();
+        // Droid's Task answers one it doesn't wait for with "Task launched in background.",
+        // its id, and how it reports.
+        let in_background = input.get("await").and_then(Value::as_bool) == Some(false)
+            || input.get("run_in_background").and_then(Value::as_bool) == Some(true)
+            || tool_call
+                .text
+                .first()
+                .is_some_and(|text| text.trim_start().starts_with("Task launched in background"));
         Some(Self {
             description: text_in(input.get("description"))
                 .unwrap_or_else(|| tool_call.title.trim().to_string()),
@@ -113,6 +145,7 @@ impl SubagentCall {
             prompt: text_in(input.get("prompt")),
             options,
             subthread: None,
+            in_background,
         })
     }
 }
@@ -328,6 +361,7 @@ impl OwnTool {
             present: present.to_string(),
             past: past.to_string(),
         };
+        let mut object = None;
         let (verbs, subject, opens) = match self {
             Self::Capabilities => (
                 verbs(
@@ -547,11 +581,22 @@ impl OwnTool {
                     .map(Subject::code),
                 opened("threadId"),
             ),
-            Self::TerminalSend => (
-                verbs("Type into", "Typing into", "Typed into"),
-                terminal(),
-                None,
-            ),
+            // What was typed comes first: "Typed `npm test ⏎` into this thread's terminal".
+            Self::TerminalSend => match typed(arguments) {
+                Some(typed) => {
+                    object = terminal().map(|terminal| ("into".to_string(), terminal));
+                    (
+                        verbs("Type", "Typing", "Typed"),
+                        Some(Subject::code(typed)),
+                        None,
+                    )
+                }
+                None => (
+                    verbs("Type into", "Typing into", "Typed into"),
+                    terminal(),
+                    None,
+                ),
+            },
             Self::TerminalRead => (verbs("Read", "Reading", "Read"), terminal(), None),
             Self::TerminalWait => (
                 verbs("Wait for", "Waiting for", "Waited for"),
@@ -585,7 +630,404 @@ impl OwnTool {
         Sentence {
             verb,
             subject,
+            object,
             opens: opens.filter(|_| state == CallState::Done),
+        }
+    }
+
+    /// What came of a finished call, after its sentence and dimmer (`design/agentz-tools`,
+    /// topic 2): "8 threads", "Done in 2m 14s", "Exit 0 · 14s", or the lines a thread changed.
+    /// Calls that made a thread or a terminal have Open instead, and those that only did
+    /// something have nothing to add. `duration` is how long the call took, in words.
+    pub fn result(
+        self,
+        arguments: &Value,
+        output: &Value,
+        duration: Option<&str>,
+    ) -> Option<OwnResult> {
+        let words = |text: String| Some(OwnResult::Words(text));
+        let count = |key: &str| output.get(key).and_then(Value::as_array).map(Vec::len);
+        match self {
+            Self::Capabilities => words(counted(count("agents")?, "agent", "agents")),
+            Self::ThreadList => {
+                let total = output
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .map(|total| total as usize)
+                    .or_else(|| count("threads"))?;
+                words(counted(total, "thread", "threads"))
+            }
+            Self::ThreadRead => {
+                let items = count("items")?;
+                match text_in(arguments.get("view")).as_deref() {
+                    Some("activity") => words(counted(items, "item", "items")),
+                    _ => words(counted(items, "message", "messages")),
+                }
+            }
+            Self::CreateThreads => {
+                let titles: Vec<String> = output
+                    .get("threads")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(|thread| text_in(thread.get("title")))
+                    .collect();
+                // One thread opens instead.
+                if titles.len() < 2 {
+                    return None;
+                }
+                let mut shown = titles[..2].join(", ");
+                if titles.len() > 2 {
+                    shown.push_str(&format!(", {} more", titles.len() - 2));
+                }
+                words(shown)
+            }
+            Self::ThreadWait => {
+                if output.get("timedOut").and_then(Value::as_bool) == Some(true) {
+                    return words("Still working".to_string());
+                }
+                if text_in(output.get("turnError")).is_some() {
+                    return words("Failed".to_string());
+                }
+                match text_in(output.get("status")).as_deref() {
+                    Some("idle") => words(match duration {
+                        Some(duration) => format!("Done in {duration}"),
+                        None => "Done".to_string(),
+                    }),
+                    Some(status) => words(capitalized(thread_status(status).0)),
+                    None => None,
+                }
+            }
+            Self::ThreadDiff => {
+                let files = output.get("files").and_then(Value::as_array)?;
+                if files.is_empty() {
+                    return words("No changes".to_string());
+                }
+                let lines = |key: &str| {
+                    files
+                        .iter()
+                        .filter_map(|file| file.get(key).and_then(Value::as_u64))
+                        .sum()
+                };
+                Some(OwnResult::Changes {
+                    added: lines("additions"),
+                    removed: lines("deletions"),
+                })
+            }
+            Self::TaskStatus => {
+                let status = text_in(output.get("status"))?;
+                if status == "running"
+                    && text_in(output.get("workState")).as_deref() == Some("waiting_for_children")
+                {
+                    return words("Waiting for its subthreads".to_string());
+                }
+                words(capitalized(thread_status(&status).0))
+            }
+            Self::WorkspaceStatus => {
+                let kind = workspace_kind(&text_in(output.get("kind"))?);
+                words(match text_in(output.get("branch")) {
+                    Some(branch) => format!("{kind} on {branch}"),
+                    None => kind,
+                })
+            }
+            Self::WorkspaceList => {
+                if output.get("isRepository").and_then(Value::as_bool) == Some(false) {
+                    return words("Not a git repository".to_string());
+                }
+                let more = output.get("hasMoreBranches").and_then(Value::as_bool) == Some(true);
+                let branches = count("branches")?;
+                let branches = if more {
+                    format!("{branches}+ branches")
+                } else {
+                    counted(branches, "branch", "branches")
+                };
+                let workspaces = counted(count("workspaces")?, "workspace", "workspaces");
+                words(format!("{branches}, {workspaces}"))
+            }
+            // The server says how it synced: "Rebased the pasture onto …", "Merged …".
+            Self::WorkspaceSync => {
+                let message = text_in(output.get("message"))?;
+                ["Rebased", "Merged"]
+                    .into_iter()
+                    .find(|word| message.starts_with(word))
+                    .and_then(|word| words(word.to_string()))
+            }
+            Self::TerminalList => words(counted(count("terminals")?, "terminal", "terminals")),
+            Self::TerminalRead => {
+                let text = output.get("text").and_then(Value::as_str)?;
+                words(counted(printed_lines(text), "line", "lines"))
+            }
+            Self::TerminalWait => {
+                if output.get("matched").and_then(Value::as_bool) == Some(true) {
+                    return words("Matched".to_string());
+                }
+                if output.get("timedOut").and_then(Value::as_bool) == Some(true) {
+                    return words("Timed out".to_string());
+                }
+                exit_words(output).and_then(words)
+            }
+            Self::CommandRun => {
+                let ended = if output.get("timedOut").and_then(Value::as_bool) == Some(true) {
+                    "Timed out".to_string()
+                } else {
+                    exit_words(output)?
+                };
+                words(match duration {
+                    Some(duration) => format!("{ended} · {duration}"),
+                    None => ended,
+                })
+            }
+            Self::ProjectAdd => text_in(output.get("name")).and_then(words),
+            Self::ThreadLaunch
+            | Self::ThreadSend
+            | Self::ThreadInterrupt
+            | Self::ThreadUpdate
+            | Self::ThreadOrganize
+            | Self::DelegateTask
+            | Self::WorkspaceHandoff
+            | Self::WorkspaceBringBack
+            | Self::TaskCancel
+            | Self::TerminalStart
+            | Self::TerminalSend => None,
+        }
+    }
+
+    /// What an opened row shows of what came back, in words (`design/agentz-tools`, topic 4):
+    /// threads one a line with their agent, model, status and when; what a command or a
+    /// terminal printed, as printed; a workspace in a sentence and its folder; each agent with
+    /// its models. Empty when there's nothing to say beyond the input.
+    pub fn view(self, arguments: &Value, output: &Value) -> Vec<OwnPart> {
+        let threads = |key: &str| -> Vec<OwnPart> {
+            output
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|threads| {
+                    threads
+                        .iter()
+                        .filter_map(ThreadLine::of)
+                        .map(OwnPart::Thread)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let printed = |key: &str| {
+            output
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|text| text.trim_end_matches(['\n', ' ']))
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| OwnPart::Printed(text.to_string()))
+        };
+        let folder = |key: &str| {
+            text_in(output.get(key)).map(|folder| OwnPart::Line(vec![Span::dim(folder)]))
+        };
+        match self {
+            Self::Capabilities => output
+                .get("agents")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|agent| {
+                    let name = text_in(agent.get("name"))?;
+                    let models: Vec<String> = agent
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|model| {
+                            text_in(model.get("name")).or_else(|| text_in(model.get("id")))
+                        })
+                        .collect();
+                    let mut spans = vec![Span::bright(name)];
+                    if !models.is_empty() {
+                        spans.push(Span::plain(models.join(", ")));
+                    }
+                    Some(OwnPart::Line(spans))
+                })
+                .collect(),
+            Self::ThreadList | Self::CreateThreads => {
+                let threads = threads("threads");
+                if threads.is_empty() && self == Self::ThreadList {
+                    return vec![OwnPart::Line(vec![Span::plain("No threads")])];
+                }
+                threads
+            }
+            Self::ThreadLaunch => ThreadLine::of(output)
+                .map(OwnPart::Thread)
+                .into_iter()
+                .collect(),
+            Self::ThreadRead => {
+                let mut parts: Vec<OwnPart> = output
+                    .get("thread")
+                    .and_then(ThreadLine::of)
+                    .map(OwnPart::Thread)
+                    .into_iter()
+                    .collect();
+                for item in output
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let kind = text_in(item.get("type"));
+                    let (who, text) = match kind.as_deref() {
+                        Some("user_message") => ("User", text_in(item.get("text"))),
+                        Some("agent_message") => ("Agent", text_in(item.get("text"))),
+                        Some("plan") => ("Plan", text_in(item.get("text"))),
+                        Some("thought") => ("Thought", text_in(item.get("text"))),
+                        _ => ("Tool call", text_in(item.get("title"))),
+                    };
+                    if let Some(text) = text {
+                        parts.push(OwnPart::Line(vec![Span::dim(who), Span::plain(text)]));
+                    }
+                }
+                parts
+            }
+            Self::ThreadSend => text_in(arguments.get("message"))
+                .map(OwnPart::Prose)
+                .into_iter()
+                .collect(),
+            Self::ThreadWait => {
+                let mut parts: Vec<OwnPart> = text_in(output.get("lastAgentMessage"))
+                    .map(OwnPart::Prose)
+                    .into_iter()
+                    .collect();
+                parts.extend(
+                    text_in(output.get("turnError"))
+                        .map(|error| OwnPart::Line(vec![Span::error(error)])),
+                );
+                parts
+            }
+            Self::ThreadInterrupt => {
+                let mut said = match text_in(output.get("status")).as_deref() {
+                    Some("interrupt_requested") => "Its turn was stopped".to_string(),
+                    Some("no_active_run") => "It wasn't working".to_string(),
+                    _ => return Vec::new(),
+                };
+                match output.get("droppedQueuedMessages").and_then(Value::as_u64) {
+                    Some(1) => said.push_str(", and its queued message was dropped"),
+                    Some(dropped) if dropped > 1 => {
+                        said.push_str(&format!(", and its {dropped} queued messages were dropped"))
+                    }
+                    _ => {}
+                }
+                vec![OwnPart::Line(vec![Span::plain(format!("{said}."))])]
+            }
+            Self::ThreadDiff => output
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|file| {
+                    Some(OwnPart::File {
+                        path: text_in(file.get("path"))?,
+                        added: file.get("additions").and_then(Value::as_u64).unwrap_or(0),
+                        removed: file.get("deletions").and_then(Value::as_u64).unwrap_or(0),
+                    })
+                })
+                .collect(),
+            Self::DelegateTask | Self::TaskStatus => {
+                let mut parts: Vec<OwnPart> = ThreadLine::of(output)
+                    .map(OwnPart::Thread)
+                    .into_iter()
+                    .collect();
+                parts.extend(text_in(output.get("summary")).map(OwnPart::Prose));
+                parts
+            }
+            Self::WorkspaceStatus => {
+                let Some(kind) = text_in(output.get("kind")) else {
+                    return Vec::new();
+                };
+                let mut spans = vec![Span::plain(workspace_kind(&kind))];
+                if let Some(branch) = text_in(output.get("branch")) {
+                    spans.push(Span::plain("on"));
+                    spans.push(Span::code(branch));
+                }
+                if let Some(base) = text_in(output.get("baseRef")) {
+                    spans.push(Span::plain("from"));
+                    spans.push(Span::code(base));
+                }
+                let mut parts = vec![OwnPart::Line(spans)];
+                parts.extend(folder("folder"));
+                parts
+            }
+            Self::WorkspaceList => {
+                if output.get("isRepository").and_then(Value::as_bool) == Some(false) {
+                    return vec![OwnPart::Line(vec![Span::plain("Not a git repository")])];
+                }
+                let mut parts: Vec<OwnPart> = output
+                    .get("workspaces")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|workspace| {
+                        let mut spans = vec![Span::plain(workspace_kind(&text_in(
+                            workspace.get("kind"),
+                        )?))];
+                        if let Some(branch) = text_in(workspace.get("branch")) {
+                            spans.push(Span::plain("on"));
+                            spans.push(Span::code(branch));
+                        }
+                        spans.extend(text_in(workspace.get("path")).map(Span::dim));
+                        Some(OwnPart::Line(spans))
+                    })
+                    .collect();
+                let branches: Vec<String> = output
+                    .get("branches")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|branch| text_in(branch.get("name")))
+                    .collect();
+                if !branches.is_empty() {
+                    parts.push(OwnPart::Line(vec![
+                        Span::dim("Branches"),
+                        Span::code(branches.join(", ")),
+                    ]));
+                }
+                parts
+            }
+            Self::WorkspaceHandoff => {
+                let Some(kind) = text_in(output.get("kind")) else {
+                    return Vec::new();
+                };
+                let mut spans = vec![Span::plain(format!("A new {kind}"))];
+                if let Some(branch) = text_in(output.get("branch")) {
+                    spans.push(Span::plain("on"));
+                    spans.push(Span::code(branch));
+                }
+                let mut parts = vec![OwnPart::Line(spans)];
+                parts.extend(folder("workspacePath"));
+                parts
+            }
+            Self::WorkspaceSync | Self::WorkspaceBringBack => text_in(output.get("message"))
+                .map(|message| OwnPart::Line(code_spans(&message)))
+                .into_iter()
+                .collect(),
+            Self::TerminalList => output
+                .get("terminals")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(terminal_line)
+                .collect(),
+            Self::TerminalStart => terminal_line(output).into_iter().collect(),
+            Self::TerminalRead | Self::TerminalWait => printed("text").into_iter().collect(),
+            Self::CommandRun => printed("output").into_iter().collect(),
+            Self::ProjectAdd => {
+                let Some(name) = text_in(output.get("name")) else {
+                    return Vec::new();
+                };
+                let mut spans = vec![Span::bright(name)];
+                if output.get("alreadyAdded").and_then(Value::as_bool) == Some(true) {
+                    spans.push(Span::dim("already added"));
+                }
+                let mut parts = vec![OwnPart::Line(spans)];
+                parts.extend(folder("path"));
+                parts
+            }
+            Self::ThreadUpdate | Self::ThreadOrganize | Self::TaskCancel | Self::TerminalSend => {
+                Vec::new()
+            }
         }
     }
 
@@ -736,7 +1178,265 @@ struct Verbs {
 pub struct Sentence {
     pub verb: String,
     pub subject: Option<Subject>,
+    /// A second part after the subject, with the word that joins it: "into" and the terminal
+    /// typed into.
+    pub object: Option<(String, Subject)>,
     pub opens: Option<ThreadId>,
+}
+
+/// What came of one of agentZ's tools, after its sentence ([`OwnTool::result`]).
+#[derive(Debug, PartialEq)]
+pub enum OwnResult {
+    Words(String),
+    /// The lines a thread changed.
+    Changes {
+        added: u64,
+        removed: u64,
+    },
+}
+
+/// A part of what an opened row of agentZ's tools shows ([`OwnTool::view`]).
+#[derive(Debug, PartialEq)]
+pub enum OwnPart {
+    /// A line of words, cut to the row's width.
+    Line(Vec<Span>),
+    Thread(ThreadLine),
+    /// What a command or a terminal printed, in the code font.
+    Printed(String),
+    /// A message, as written.
+    Prose(String),
+    /// A file a thread changed, with its lines added and removed.
+    File {
+        path: String,
+        added: u64,
+        removed: u64,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Span {
+    pub text: String,
+    pub style: SpanStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanStyle {
+    /// A name, brighter than the line.
+    Bright,
+    Plain,
+    /// Where something is, dimmer than the line.
+    Dim,
+    /// A branch or a command, in the code font.
+    Code,
+    Error,
+}
+
+impl Span {
+    fn styled(text: impl Into<String>, style: SpanStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+
+    fn bright(text: impl Into<String>) -> Self {
+        Self::styled(text, SpanStyle::Bright)
+    }
+
+    fn plain(text: impl Into<String>) -> Self {
+        Self::styled(text, SpanStyle::Plain)
+    }
+
+    fn dim(text: impl Into<String>) -> Self {
+        Self::styled(text, SpanStyle::Dim)
+    }
+
+    fn code(text: impl Into<String>) -> Self {
+        Self::styled(text, SpanStyle::Code)
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self::styled(text, SpanStyle::Error)
+    }
+}
+
+/// A thread or a subthread as agentZ's tools describe it: its title, then its agent, model and
+/// status in words, and when it was last active or ended.
+#[derive(Debug, PartialEq)]
+pub struct ThreadLine {
+    pub title: String,
+    pub details: Vec<String>,
+    pub state: ThreadState,
+    /// An RFC 3339 time.
+    pub at: Option<String>,
+}
+
+/// How a thread is doing, for the dot before its title.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadState {
+    Working,
+    Waiting,
+    Failed,
+    Idle,
+}
+
+impl ThreadLine {
+    /// A thread's summary, or a delegated task's result.
+    fn of(thread: &Value) -> Option<Self> {
+        let title = text_in(thread.get("title"))?;
+        let (status, state) = match text_in(thread.get("status")) {
+            Some(status) => {
+                let (words, state) = thread_status(&status);
+                (Some(words.to_string()), state)
+            }
+            None => (None, ThreadState::Idle),
+        };
+        let details = [
+            text_in(thread.get("agentName")),
+            text_in(thread.get("model")),
+            status,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Some(Self {
+            title,
+            details,
+            state,
+            at: text_in(thread.get("lastActivityAt")).or_else(|| text_in(thread.get("endedAt"))),
+        })
+    }
+}
+
+/// A thread's or a delegated task's status, as agentZ's tools give it, in words.
+fn thread_status(status: &str) -> (&str, ThreadState) {
+    match status {
+        "running" => ("working", ThreadState::Working),
+        "starting" => ("starting", ThreadState::Working),
+        "queued" => ("queued", ThreadState::Working),
+        "waiting" => ("waiting", ThreadState::Waiting),
+        "waiting_for_approval" => ("waiting for approval", ThreadState::Waiting),
+        "waiting_for_input" => ("waiting for input", ThreadState::Waiting),
+        "needs_login" => ("needs a login", ThreadState::Failed),
+        "failed" => ("failed", ThreadState::Failed),
+        "completed" => ("done", ThreadState::Idle),
+        "cancelled" | "cancel_requested" => ("cancelled", ThreadState::Idle),
+        "interrupted" => ("interrupted", ThreadState::Idle),
+        "idle" => ("idle", ThreadState::Idle),
+        status => (status, ThreadState::Idle),
+    }
+}
+
+/// A workspace's kind, as `agentz_workspace_status` and `agentz_workspace_list` name it.
+fn workspace_kind(kind: &str) -> String {
+    match kind {
+        "pasture" => "Pasture".to_string(),
+        "worktree" => "Worktree".to_string(),
+        "checkout" => "The project's checkout".to_string(),
+        kind => capitalized(kind),
+    }
+}
+
+/// A terminal as `agentz_terminal_list` and `agentz_terminal_start` describe it: what runs in
+/// it, or its thread or pane, then how it's doing and its folder.
+fn terminal_line(terminal: &Value) -> Option<OwnPart> {
+    let name = match text_in(terminal.get("command")) {
+        Some(command) => Span::code(command),
+        None => match text_in(terminal.get("threadTitle")) {
+            Some(title) => Span::bright(title),
+            None => {
+                let workspace = text_in(terminal.get("workspace"))?;
+                let tab = text_in(terminal.get("tab"));
+                Span::bright(match tab {
+                    Some(tab) => format!("{workspace}, {tab}"),
+                    None => workspace,
+                })
+            }
+        },
+    };
+    let status = match text_in(terminal.get("status")).as_deref() {
+        Some("running") => Some("running".to_string()),
+        Some("exited") => exit_words(terminal).map(|words| words.to_lowercase()),
+        Some("not_started") => Some("not started".to_string()),
+        Some("closed") => Some("closed".to_string()),
+        _ => None,
+    };
+    let mut spans = vec![name];
+    spans.extend(status.map(Span::plain));
+    spans.extend(text_in(terminal.get("folder")).map(Span::dim));
+    Some(OwnPart::Line(spans))
+}
+
+/// How a process ended, from its `exitCode` or `signal`: "Exit 0", "SIGKILL".
+fn exit_words(output: &Value) -> Option<String> {
+    match output.get("exitCode").and_then(Value::as_i64) {
+        Some(code) => Some(format!("Exit {code}")),
+        None => text_in(output.get("signal")),
+    }
+}
+
+/// A message with code in backticks, as the server writes them, in spans. Its last period
+/// goes, as a line's spans are set apart.
+fn code_spans(message: &str) -> Vec<Span> {
+    message
+        .trim_end()
+        .trim_end_matches('.')
+        .split('`')
+        .enumerate()
+        .filter(|(_, text)| !text.trim().is_empty())
+        .map(|(index, text)| {
+            if index % 2 == 1 {
+                Span::code(text)
+            } else {
+                Span::plain(text.trim())
+            }
+        })
+        .collect()
+}
+
+/// How many lines a terminal's text has, without the empty ones at its end.
+fn printed_lines(text: &str) -> usize {
+    text.trim_end().lines().count()
+}
+
+/// What `agentz_terminal_send` typed: its text, then its keys, with Enter as ⏎.
+fn typed(arguments: &Value) -> Option<String> {
+    let key = |name: &str| match name.trim().to_ascii_lowercase().as_str() {
+        "enter" | "return" => "⏎".to_string(),
+        _ => name.trim().to_string(),
+    };
+    let mut parts: Vec<String> = text_in(arguments.get("text")).into_iter().collect();
+    parts.extend(
+        arguments
+            .get("keys")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(key),
+    );
+    if arguments.get("submit").and_then(Value::as_bool) == Some(true) {
+        parts.push("⏎".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// "1 thread", "8 threads".
+fn counted(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
+    }
+}
+
+fn capitalized(text: &str) -> String {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -2114,10 +2814,14 @@ mod tests {
     }
 
     fn sentence_text(sentence: &Sentence) -> String {
-        match &sentence.subject {
+        let mut text = match &sentence.subject {
             Some(subject) => format!("{} {}", sentence.verb, subject.text),
             None => sentence.verb.clone(),
+        };
+        if let Some((joint, object)) = &sentence.object {
+            text.push_str(&format!(" {joint} {}", object.text));
         }
+        text
     }
 
     #[test]
@@ -2223,7 +2927,17 @@ mod tests {
             ),
             (
                 OwnTool::TerminalSend,
-                json!({"text": "q"}),
+                json!({"text": "npm test", "submit": true}),
+                "Typed npm test ⏎ into this thread's terminal",
+            ),
+            (
+                OwnTool::TerminalSend,
+                json!({"keys": ["ctrl-c"], "threadId": 20}),
+                "Typed ctrl-c into npm run dev",
+            ),
+            (
+                OwnTool::TerminalSend,
+                json!({}),
                 "Typed into this thread's terminal",
             ),
             (
@@ -2273,6 +2987,261 @@ mod tests {
         assert_eq!(OwnTool::DelegateTask.fold_label(3), "Started 3 subthreads");
         assert_eq!(OwnTool::TerminalStart.fold_label(1), "Started a terminal");
         assert_eq!(OwnTool::CreateThreads.fold_group(), OwnTool::ThreadLaunch);
+    }
+
+    #[test]
+    fn agentzs_tools_say_what_came_of_them() {
+        let words = |text: &str| Some(OwnResult::Words(text.to_string()));
+        let result = |tool: OwnTool, arguments: Value, output: Value| {
+            tool.result(&arguments, &output, Some("2m 14s"))
+        };
+        let cases = [
+            (
+                OwnTool::ThreadList,
+                json!({}),
+                json!({"threads": [{"threadId": 1}], "total": 8}),
+                words("8 threads"),
+            ),
+            (
+                OwnTool::Capabilities,
+                json!({}),
+                json!({"agents": [{"name": "Claude Agent"}]}),
+                words("1 agent"),
+            ),
+            (
+                OwnTool::ThreadRead,
+                json!({"threadId": 4}),
+                json!({"thread": {}, "items": [{}, {}, {}]}),
+                words("3 messages"),
+            ),
+            (
+                OwnTool::CreateThreads,
+                json!({}),
+                json!({"threads": [{"title": "Fix flaky login test"},
+                                   {"title": "Checkout flow review"}, {"title": "Docs"}]}),
+                words("Fix flaky login test, Checkout flow review, 1 more"),
+            ),
+            (
+                OwnTool::ThreadWait,
+                json!({}),
+                json!({"status": "idle", "timedOut": false}),
+                words("Done in 2m 14s"),
+            ),
+            (
+                OwnTool::ThreadWait,
+                json!({}),
+                json!({"status": "running", "timedOut": true}),
+                words("Still working"),
+            ),
+            (
+                OwnTool::ThreadWait,
+                json!({}),
+                json!({"status": "waiting_for_approval", "timedOut": false}),
+                words("Waiting for approval"),
+            ),
+            (
+                OwnTool::ThreadDiff,
+                json!({}),
+                json!({"files": [{"additions": 10, "deletions": 1},
+                                 {"additions": 2, "deletions": 2}]}),
+                Some(OwnResult::Changes {
+                    added: 12,
+                    removed: 3,
+                }),
+            ),
+            (
+                OwnTool::TaskStatus,
+                json!({}),
+                json!({"status": "running", "workState": "working"}),
+                words("Working"),
+            ),
+            (
+                OwnTool::TaskStatus,
+                json!({}),
+                json!({"status": "completed", "workState": "result_available"}),
+                words("Done"),
+            ),
+            (
+                OwnTool::WorkspaceStatus,
+                json!({}),
+                json!({"kind": "pasture", "branch": "agentz/brave-otter"}),
+                words("Pasture on agentz/brave-otter"),
+            ),
+            (
+                OwnTool::WorkspaceList,
+                json!({}),
+                json!({"isRepository": true, "branches": [{}, {}, {}, {}, {}, {}],
+                       "workspaces": [{}, {}]}),
+                words("6 branches, 2 workspaces"),
+            ),
+            (
+                OwnTool::WorkspaceSync,
+                json!({}),
+                json!({"message": "Rebased the pasture onto the project's `main`."}),
+                words("Rebased"),
+            ),
+            (
+                OwnTool::TerminalList,
+                json!({}),
+                json!({"terminals": [{}, {}, {}]}),
+                words("3 terminals"),
+            ),
+            (
+                OwnTool::TerminalRead,
+                json!({}),
+                json!({"text": "one\ntwo\n\n"}),
+                words("2 lines"),
+            ),
+            (
+                OwnTool::TerminalWait,
+                json!({}),
+                json!({"status": "exited", "exitCode": 0, "matched": false, "timedOut": false}),
+                words("Exit 0"),
+            ),
+            (
+                OwnTool::CommandRun,
+                json!({}),
+                json!({"exitCode": 0, "timedOut": false, "output": ""}),
+                words("Exit 0 · 2m 14s"),
+            ),
+            (
+                OwnTool::ProjectAdd,
+                json!({}),
+                json!({"name": "storefront", "path": "/src/storefront"}),
+                words("storefront"),
+            ),
+            // Tools that made something open it instead, and others only did something.
+            (
+                OwnTool::ThreadLaunch,
+                json!({}),
+                json!({"threadId": 4, "title": "Fix"}),
+                None,
+            ),
+            (
+                OwnTool::ThreadSend,
+                json!({}),
+                json!({"delivery": "queued"}),
+                None,
+            ),
+        ];
+        for (tool, arguments, output, expected) in cases {
+            assert_eq!(result(tool, arguments, output), expected, "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn agentzs_tools_open_to_what_came_back_in_words() {
+        let listed = OwnTool::ThreadList.view(
+            &json!({}),
+            &json!({"threads": [
+                {"threadId": 412, "title": "Fix flaky login test", "status": "running",
+                 "agentName": "Claude Agent", "model": "Opus 4.1",
+                 "lastActivityAt": "2025-10-09T18:02:11Z"},
+                {"threadId": 398, "title": "Checkout flow review", "status": "idle",
+                 "agentName": "Factory Droid", "model": null},
+            ]}),
+        );
+        assert_eq!(
+            listed,
+            vec![
+                OwnPart::Thread(ThreadLine {
+                    title: "Fix flaky login test".into(),
+                    details: vec!["Claude Agent".into(), "Opus 4.1".into(), "working".into()],
+                    state: ThreadState::Working,
+                    at: Some("2025-10-09T18:02:11Z".into()),
+                }),
+                OwnPart::Thread(ThreadLine {
+                    title: "Checkout flow review".into(),
+                    details: vec!["Factory Droid".into(), "idle".into()],
+                    state: ThreadState::Idle,
+                    at: None,
+                }),
+            ]
+        );
+        assert_eq!(
+            OwnTool::CommandRun.view(
+                &json!({"command": "cargo test"}),
+                &json!({"exitCode": 0, "output": "running 2 tests\ntest result: ok\n"}),
+            ),
+            vec![OwnPart::Printed("running 2 tests\ntest result: ok".into())]
+        );
+        assert_eq!(
+            OwnTool::WorkspaceStatus.view(
+                &json!({}),
+                &json!({"kind": "pasture", "branch": "agentz/brave-otter", "baseRef": "main",
+                        "folder": "/data/pastures/storefront/brave-otter"}),
+            ),
+            vec![
+                OwnPart::Line(vec![
+                    Span::plain("Pasture"),
+                    Span::plain("on"),
+                    Span::code("agentz/brave-otter"),
+                    Span::plain("from"),
+                    Span::code("main"),
+                ]),
+                OwnPart::Line(vec![Span::dim("/data/pastures/storefront/brave-otter")]),
+            ]
+        );
+        assert_eq!(
+            OwnTool::Capabilities.view(
+                &json!({}),
+                &json!({"agents": [{"name": "Claude Agent", "models": [
+                    {"id": "opus", "name": "Opus 4.1"}, {"id": "sonnet", "name": "Sonnet 4.5"}]}]}),
+            ),
+            vec![OwnPart::Line(vec![
+                Span::bright("Claude Agent"),
+                Span::plain("Opus 4.1, Sonnet 4.5"),
+            ])]
+        );
+        assert_eq!(
+            OwnTool::WorkspaceSync.view(
+                &json!({}),
+                &json!({"message": "Rebased the pasture onto the project's `main`."}),
+            ),
+            vec![OwnPart::Line(vec![
+                Span::plain("Rebased the pasture onto the project's"),
+                Span::code("main"),
+            ])]
+        );
+        // Renaming says it all in its row: only its input is left.
+        assert!(
+            OwnTool::ThreadUpdate
+                .view(
+                    &json!({"title": "x"}),
+                    &json!({"threadId": 1, "title": "x"})
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_task_sent_to_the_background_is_known() {
+        let task = |input: Value, report: &str| {
+            let mut call = tool_call("Task", Some(input), Some(report));
+            call.kind = acp::ToolKind::Other;
+            SubagentCall::of(&call).map(|subagent| subagent.in_background)
+        };
+        assert_eq!(
+            task(
+                json!({"subagent_type": "worker", "description": "Build", "prompt": "x"}),
+                "Built it."
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            task(
+                json!({"subagent_type": "explorer", "description": "Trace", "prompt": "x"}),
+                "Task launched in background.\ntask_id: 2a17"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            task(
+                json!({"subagent_type": "explorer", "description": "Trace", "await": false}),
+                ""
+            ),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2390,6 +3359,7 @@ mod tests {
                 prompt: Some("Build what the user picked.".into()),
                 options: vec!["heavy".into()],
                 subthread: None,
+                in_background: false,
             }
         );
 
