@@ -19,3 +19,8 @@ elsewhere.
 
 Stop doesn't work on some ACP agents: Factory Droid's turn, for one, doesn't stop at all. Find a
 more reliable way to stop a session's turn.
+
+### The thread header shrinks the project's name too much
+
+With a long thread title, the header's project name shrinks to a few letters ("agentZ" shows
+as "age…"). Project names shouldn't shrink this much.
