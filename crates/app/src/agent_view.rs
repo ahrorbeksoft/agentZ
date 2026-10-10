@@ -20,8 +20,8 @@ use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, LostHistory, PermissionOption,
-    PlanItem, SessionRestore, ToolAnswer, ToolCall, without_handoff,
+    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, LostHistory, ModeSwitch,
+    PermissionOption, PlanItem, SessionRestore, ToolAnswer, ToolCall, without_handoff,
 };
 use agentz_protocol::workspace::{PastureSupport, ProjectGit, WorkspaceChoice};
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
@@ -75,7 +75,8 @@ use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
 use crate::tool_calls::{
-    self, CallState, ListedTool, OwnTool, Sentence, SubagentCall, SubjectStyle, ToolCallKind,
+    self, ActionLabel, AgentAction, CallState, Grep, GrepFile, LabelPart, OwnTool, Sentence,
+    SubagentCall, SubjectStyle, ToolCallKind, WebHit,
 };
 use crate::usage_limits::{
     LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, tightest_window,
@@ -269,6 +270,9 @@ pub enum AgentViewEvent {
     OpenThread(ThreadId),
     /// Show a thread on another machine: the parent of a task delegated from there.
     OpenThreadOn(ThreadKey),
+    /// A tool call's file header's Open: show this thread's changes to the file in the diff
+    /// panel.
+    OpenDiffFile(PathBuf),
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
     /// The header's project was clicked: a new thread in it, as in t3code.
@@ -1854,6 +1858,20 @@ impl AgentView {
             let is_new = self.synced_revisions.get(index).is_none();
             self.sync_entry(index, &entry, cx);
             self.list_state.remeasure_items(index + 1..index + 2);
+            // A tool call that changed the agent's mode leaves its run, splitting it in two.
+            if !is_new
+                && matches!(&entry, Entry::ToolCall(tool_call) if tool_call.mode_switch.is_some())
+            {
+                let entries = self.thread.read(cx).entries();
+                for neighbor in [index.checked_sub(1), Some(index + 1)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(run) = work_run(entries, neighbor) {
+                        self.list_state.remeasure_items(run.start + 1..run.end + 1);
+                    }
+                }
+            }
             // A message after a run of work folds the run, also while the turn goes on.
             if is_new
                 && !is_work(&entry)
@@ -1920,10 +1938,15 @@ impl AgentView {
                     self.sync_markdown((index, 0), text, cx);
                 }
                 Entry::ToolCall(tool_call) => {
-                    // A subagent's text is its report, and a plan to approve is the plan, both
-                    // written in markdown.
+                    // A subagent's text is its report, a plan to approve is the plan, and a
+                    // fetch's and findings' are notes, all written in markdown.
+                    let kind = ToolCallKind::of(tool_call);
                     let is_markdown = is_plan(tool_call)
-                        || matches!(ToolCallKind::of(tool_call), ToolCallKind::Subagent(_));
+                        || matches!(kind, ToolCallKind::Subagent(_))
+                        || matches!(
+                            tool_call_action(tool_call, &kind, false),
+                            AgentAction::Fetch { .. } | AgentAction::Findings { .. }
+                        );
                     for (part, text) in tool_call.text.iter().enumerate() {
                         let text = if is_markdown {
                             Cow::Borrowed(text.as_str())
@@ -4282,8 +4305,11 @@ impl AgentView {
                     })
                     .into_any_element()
             }
-            Entry::ToolCall(tool_call) if !is_work(entry) => {
+            Entry::ToolCall(tool_call) if tool_calls::is_subagent(tool_call) => {
                 self.render_subagent(index, tool_call, window, cx)
+            }
+            Entry::ToolCall(tool_call) if !is_work(entry) => {
+                self.render_tool_call(index, tool_call, None, window, cx)
             }
             Entry::AgentThought(_) | Entry::ToolCall(_) | Entry::Plan => {
                 self.render_work_entry(index, entry, is_last, window, cx)
@@ -4412,6 +4438,7 @@ impl AgentView {
                             tool_call.status,
                             acp::ToolCallStatus::InProgress | acp::ToolCallStatus::Pending
                         ) && !is_asking(index)
+                            && !tool_calls::is_hidden(tool_call)
                     }
                     Entry::AgentThought(_) => index == last,
                     _ => false,
@@ -4419,7 +4446,7 @@ impl AgentView {
                 .or_else(|| {
                     run.clone()
                         .rev()
-                        .find(|&index| !matches!(entries[index], Entry::Plan) && !is_asking(index))
+                        .find(|&index| draws_row(&entries[index]) && !is_asking(index))
                 })?,
             [entry] => *entry,
             // One line can't hold several requests' buttons, so the rows show.
@@ -4470,7 +4497,22 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let color = work_row_color(cx);
-        let summary = summarize_work(&self.thread.read(cx).entries()[run.clone()]);
+        let entries = &self.thread.read(cx).entries()[run.clone()];
+        let summary = summarize_work(entries);
+        let tool_calls = entries.iter().filter_map(|entry| match entry {
+            Entry::ToolCall(tool_call) => Some(tool_call),
+            _ => None,
+        });
+        let failed = tool_calls
+            .clone()
+            .filter(|tool_call| did_fail(tool_call))
+            .count();
+        let (added, removed) = tool_calls
+            .flat_map(|tool_call| &tool_call.diffs)
+            .map(FileDiff::line_counts)
+            .fold((0, 0), |(added, removed), (more_added, more_removed)| {
+                (added + more_added, removed + more_removed)
+            });
         let start = run.start;
         let toggle =
             cx.listener(move |this, _: &gpui::ClickEvent, _, cx| this.toggle_run(run.clone(), cx));
@@ -4507,7 +4549,28 @@ impl AgentView {
                             .text_size(rems_from_px(13_f32))
                             .text_color(color)
                             .child(summary),
-                    ),
+                    )
+                    .when(failed > 0, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .debug_selector(move || format!("work-run-failed-{start}"))
+                                .child(
+                                    Label::new(format!("{failed} failed"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Error),
+                                ),
+                        )
+                    })
+                    .when(added + removed > 0, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .debug_selector(move || format!("work-run-stat-{start}"))
+                                .ml_1()
+                                .child(diff_stat(added, removed)),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -4633,6 +4696,9 @@ impl AgentView {
             .into_any_element()
     }
 
+    /// A tool call's row (`design/tool-calls-2/decisions.md`): what it did, in the same words for
+    /// every agent. Opened, the row becomes the header of a card holding what it read, ran or
+    /// wrote, as Zed draws an opened tool call.
     fn render_tool_call(
         &self,
         index: usize,
@@ -4645,44 +4711,56 @@ impl AgentView {
         if live_run.is_none() && self.is_asking_questions(tool_call, cx) {
             return div().into_any_element();
         }
-        // Once answered, a row that asked questions names them.
-        let asked;
-        let names_questions = tool_call
-            .answer
-            .as_ref()
-            .and_then(ToolAnswer::asked)
-            .is_some();
-        let tool_call = match tool_call.answer.as_ref().and_then(ToolAnswer::asked) {
-            Some(questions) => {
-                asked = ToolCall {
-                    title: format!("Asked: {questions}"),
-                    ..tool_call.clone()
-                };
-                &asked
-            }
-            None => tool_call,
-        };
-        let colors = cx.theme().colors();
-        let failed = matches!(tool_call.status, acp::ToolCallStatus::Failed);
-        let in_progress = matches!(
-            tool_call.status,
-            acp::ToolCallStatus::InProgress | acp::ToolCallStatus::Pending
-        );
-        let denied = !in_progress && tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
-        let is_plan = is_plan(tool_call);
         let needs_confirmation = self
             .thread
             .read(cx)
             .permission_request(&tool_call.id)
             .is_some();
+        // The plan bar shows the to-do list, so its updates have no row, as in Zed.
+        if live_run.is_none() && tool_calls::is_hidden(tool_call) && !needs_confirmation {
+            return div().into_any_element();
+        }
+        let is_running = tool_call.is_running();
+        let denied = !is_running && tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
+        let is_plan = is_plan(tool_call);
+        // Once answered, a row that asked questions names them, and an approved plan says so.
+        let names_questions = tool_call
+            .answer
+            .as_ref()
+            .and_then(ToolAnswer::asked)
+            .is_some();
+        let is_approved_plan = is_plan
+            && !needs_confirmation
+            && !denied
+            && (tool_call.answer.is_some() || tool_call.mode_switch.is_some());
+        let renamed;
+        let tool_call = match tool_call.answer.as_ref().and_then(ToolAnswer::asked) {
+            Some(questions) => {
+                renamed = ToolCall {
+                    title: format!("Asked: {questions}"),
+                    ..tool_call.clone()
+                };
+                &renamed
+            }
+            None if is_approved_plan => {
+                renamed = ToolCall {
+                    title: "Approved the plan".to_string(),
+                    ..tool_call.clone()
+                };
+                &renamed
+            }
+            None => tool_call,
+        };
+        let is_stopped =
+            tool_call.stopped && !matches!(tool_call.status, acp::ToolCallStatus::Completed);
+        let failed = did_fail(tool_call);
         let is_execute = matches!(tool_call.kind, acp::ToolKind::Execute);
         let (kind, sentence) = self.tool_call_kind(tool_call, cx);
-        let listed_tools = match &kind {
-            ToolCallKind::ToolSearch(search) => search.tools.as_slice(),
-            _ => &[],
-        };
-        let has_content = match &kind {
-            ToolCallKind::ToolSearch(_) => !listed_tools.is_empty() || !tool_call.text.is_empty(),
+        let action = tool_call_action(tool_call, &kind, names_questions);
+        let has_content = match (&kind, &action) {
+            (ToolCallKind::ToolSearch(_), _) => false,
+            // What a read got is the file, so it doesn't open, unless it's an image.
+            (_, AgentAction::Read { .. }) => !tool_call.images.is_empty(),
             _ => {
                 !tool_call.text.is_empty()
                     || !tool_call.diffs.is_empty()
@@ -4703,6 +4781,31 @@ impl AgentView {
                 (added + more_added, removed + more_removed)
             },
         );
+        let terminals: Vec<Entity<Terminal>> = tool_call
+            .terminals
+            .iter()
+            .filter_map(|terminal_id| self.tool_terminals.get(terminal_id))
+            .map(|view| view.read(cx).terminal().clone())
+            .collect();
+        let exit_code = terminals
+            .iter()
+            .find_map(|terminal| terminal.read(cx).frame()?.exited.as_ref()?.code)
+            .map(i64::from)
+            .or_else(|| tool_calls::exit_code(tool_call).map(i64::from));
+        let exited_badly = exit_code.is_some_and(|code| code != 0);
+
+        let output = if is_open && has_content && !is_plan {
+            self.render_tool_output(index, tool_call, &kind, &action, window, cx)
+        } else {
+            Vec::new()
+        };
+        let plan = (is_plan && is_open)
+            .then(|| self.render_plan_card(index, tool_call, window, cx))
+            .flatten();
+        let buttons = self.render_permission_buttons(index, &tool_call.id, !is_plan, cx);
+        let is_card = !is_plan && (!output.is_empty() || buttons.is_some());
+        let is_command_card = is_card && is_execute;
+
         let row_group = SharedString::from(format!("tool-call-row-{index}"));
         let toggle = {
             let tool_call_id = tool_call.id.clone();
@@ -4721,6 +4824,41 @@ impl AgentView {
             _ => None,
         };
         let opens = sentence.as_ref().and_then(|sentence| sentence.opens);
+        // A new file only adds lines and a deleted one only removes them.
+        let stat = match &action {
+            AgentAction::Created { .. } if added > 0 => Some(
+                Label::new(format!("+{added}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Created)
+                    .into_any_element(),
+            ),
+            AgentAction::Deleted { .. } if added == 0 && removed > 0 => Some(
+                Label::new(format!("−{removed}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Deleted)
+                    .into_any_element(),
+            ),
+            _ if added + removed > 0 => Some(diff_stat(added, removed).into_any_element()),
+            _ => None,
+        };
+        // An opened command's header says its exit code in place of "Failed".
+        let status = if is_running {
+            None
+        } else if denied {
+            Some(("Denied", Color::Muted))
+        } else if is_stopped {
+            Some(("Stopped", Color::Muted))
+        } else if failed && !(is_command_card && exited_badly) {
+            Some(("Failed", Color::Error))
+        } else {
+            None
+        };
+        let command_details = if is_command_card {
+            self.render_command_details(index, tool_call, &terminals, exit_code, cx)
+        } else {
+            Vec::new()
+        };
+        let colors = cx.theme().colors();
         let row = h_flex()
             .id(("tool-call-row", index))
             .debug_selector(|| format!("tool-call-row-{index}"))
@@ -4728,7 +4866,8 @@ impl AgentView {
             .min_h(px(24.))
             .gap_1p5()
             .px_0p5()
-            .rounded_md()
+            .when(is_card, |this| this.pr_1())
+            .when(!is_card, |this| this.rounded_md())
             .when(is_openable, |this| {
                 this.cursor_pointer()
                     .hover(|style| style.bg(colors.ghost_element_hover))
@@ -4744,19 +4883,11 @@ impl AgentView {
                             .size(IconSize::Small)
                             .color(Color::Custom(work_row_color(cx)))
                     } else {
-                        tool_call_icon(tool_call, &kind, cx)
+                        tool_call_icon(tool_call, &kind, &action, cx)
                     }),
             )
-            .child(self.render_tool_call_label(
-                tool_call,
-                &kind,
-                sentence.as_ref(),
-                in_progress,
-                cx,
-            ))
-            .when(added + removed > 0, |this| {
-                this.child(div().flex_none().child(diff_stat(added, removed)))
-            })
+            .child(self.render_tool_call_label(tool_call, &kind, sentence.as_ref(), &action, cx))
+            .children(stat.map(|stat| div().flex_none().child(stat)))
             .when_some(found, |this, found| {
                 this.child(
                     div()
@@ -4788,7 +4919,8 @@ impl AgentView {
                         ),
                 )
             })
-            .when(in_progress, |this| {
+            .children(command_details)
+            .when(is_running, |this| {
                 this.child(
                     Icon::new(IconName::LoadCircle)
                         .size(IconSize::XSmall)
@@ -4796,15 +4928,12 @@ impl AgentView {
                         .with_rotate_animation(2),
                 )
             })
-            .when(failed || denied, |this| {
+            .when_some(status, |this, (word, color)| {
                 this.child(
                     div()
+                        .flex_none()
                         .debug_selector(move || format!("tool-call-status-{index}"))
-                        .child(
-                            Label::new(if denied { "Denied" } else { "Failed" })
-                                .size(LabelSize::Small)
-                                .color(Color::Error),
-                        ),
+                        .child(Label::new(word).size(LabelSize::Small).color(color)),
                 )
             })
             .when(is_openable, |this| {
@@ -4820,21 +4949,174 @@ impl AgentView {
                     ),
                 )
             });
+        let answer_line = tool_call
+            .answer
+            .as_ref()
+            .filter(|_| !needs_confirmation)
+            .map(|answer| render_answer_line(index, answer, cx));
 
-        // What it read, ran or wrote, under the row past its icon, scrolling past 24rem. The
-        // input waits behind "Input" at its end, as Zed's "View Raw Input" does.
+        let border = Self::tool_card_border_color(cx);
+        let content = if is_card {
+            // Images are as tall as they may be already, so their card shows them whole.
+            let has_images = !tool_call.images.is_empty();
+            let body = (!output.is_empty()).then(|| {
+                let terminal_background = cx.theme().colors().terminal_background;
+                with_scrollbar(
+                    v_flex()
+                        .id(("tool-call-output", index))
+                        .debug_selector(|| format!("tool-call-output-{index}"))
+                        .when(!has_images, |this| this.max_h(rems(24.)))
+                        .overflow_y_scroll()
+                        .children(output),
+                    div()
+                        .border_t_1()
+                        .border_color(border)
+                        .when(is_execute, |this| this.bg(terminal_background)),
+                    format!("tool-call-output-{}", tool_call.id),
+                    ScrollAxes::Vertical,
+                    window,
+                    cx,
+                )
+            });
+            let colors = cx.theme().colors();
+            // A command that failed gets Zed's dashed red border.
+            let is_failed_command = is_command_card && (failed || exited_badly);
+            v_flex()
+                .debug_selector(|| format!("tool-call-card-{index}"))
+                .my_1()
+                .rounded_md()
+                .border_1()
+                .map(|this| {
+                    if is_failed_command {
+                        this.border_dashed()
+                            .border_color(cx.theme().status().error.opacity(0.6))
+                    } else {
+                        this.border_color(border)
+                    }
+                })
+                .bg(colors.editor_background)
+                .overflow_hidden()
+                .child(
+                    v_flex()
+                        .bg(Self::tool_card_header_bg(cx))
+                        .child(row)
+                        .children(answer_line),
+                )
+                .children(body)
+                .children(buttons)
+                .into_any_element()
+        } else {
+            v_flex()
+                .child(row)
+                .children(answer_line)
+                .children(plan)
+                .children(buttons.map(|buttons| div().ml(px(30.)).child(buttons)))
+                .into_any_element()
+        };
+
+        v_flex()
+            .mx_5()
+            .child(content)
+            .children(
+                tool_call
+                    .mode_switch
+                    .as_ref()
+                    .map(|switch| render_mode_switch(index, switch, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// What an opened tool call shows in its card, each part reaching the card's edges: an
+    /// edit's diffs, a new or deleted file's lines, a search's matches, a web search's pages, a
+    /// command's terminal, or else what the tool sent back, as printed. "Input" at its end opens
+    /// the JSON the agent passed, as Zed's "View Raw Input" does.
+    fn render_tool_output(
+        &self,
+        index: usize,
+        tool_call: &ToolCall,
+        kind: &ToolCallKind,
+        action: &AgentAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let prose_border = cx.theme().colors().border;
+        let is_execute = matches!(tool_call.kind, acp::ToolKind::Execute);
+        let is_edit = matches!(tool_call.kind, acp::ToolKind::Edit) || !tool_call.diffs.is_empty();
+        let folder = self.store.read(cx).thread_folder(self.thread_id);
+        let text = || tool_calls::output_text(tool_call);
+        let key = |part: &str| format!("tool-{part}-{}", tool_call.id);
+        // A view of what it made or found, when its output reads as one.
+        let view = match action {
+            AgentAction::Created { .. } => tool_call.diffs.first().map(|diff| {
+                render_file_lines(
+                    index,
+                    diff.new_text.lines(),
+                    diff.start_line.unwrap_or(1),
+                    false,
+                    key("file"),
+                    window,
+                    cx,
+                )
+            }),
+            AgentAction::Deleted { .. } => tool_call
+                .diffs
+                .first()
+                .and_then(|diff| diff.old_text.as_deref())
+                .map(|old_text| {
+                    render_file_lines(index, old_text.lines(), 1, true, key("file"), window, cx)
+                }),
+            AgentAction::Grep(grep) => text()
+                .and_then(|text| tool_calls::grep_files(&text, grep.path.as_deref()))
+                .filter(|files| !files.is_empty())
+                .map(|files| {
+                    render_found_files(
+                        index,
+                        &files,
+                        Some(grep),
+                        folder.as_deref(),
+                        &key("matches"),
+                        window,
+                        cx,
+                    )
+                }),
+            AgentAction::Glob(_) => text()
+                .map(|text| tool_calls::glob_paths(&text))
+                .filter(|paths| !paths.is_empty())
+                .map(|paths| {
+                    let files: Vec<GrepFile> = paths
+                        .into_iter()
+                        .map(|path| GrepFile {
+                            path,
+                            lines: Vec::new(),
+                            count: None,
+                        })
+                        .collect();
+                    render_found_files(
+                        index,
+                        &files,
+                        None,
+                        folder.as_deref(),
+                        &key("matches"),
+                        window,
+                        cx,
+                    )
+                }),
+            AgentAction::WebSearch { .. } => text()
+                .map(|text| tool_calls::web_hits(&text))
+                .filter(|hits| !hits.is_empty())
+                .map(|hits| render_web_hits(index, &hits, cx)),
+            _ => None,
+        };
+
         let mut output = Vec::new();
-        if is_open && has_content {
-            let is_edit =
-                matches!(tool_call.kind, acp::ToolKind::Edit) || !tool_call.diffs.is_empty();
-            if !listed_tools.is_empty() {
-                output.push(render_listed_tools(index, listed_tools, cx));
-            } else {
+        match view {
+            Some(view) => output.push(view),
+            None => {
                 for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
-                    output.push(render_diff(
+                    output.push(self.render_file_diff(
                         diff,
                         (index, diff_index),
-                        format!("tool-diff-{}-{diff_index}", tool_call.id),
+                        folder.as_deref(),
                         window,
                         cx,
                     ));
@@ -4845,74 +5127,331 @@ impl AgentView {
                             div()
                                 .w_full()
                                 .py_1()
-                                .rounded_md()
-                                .bg(cx.theme().colors().terminal_background)
                                 .child(terminal.clone())
                                 .into_any_element(),
                         );
                     }
                 }
+                // A page's notes and findings are prose, set off by a line on their left.
+                let is_prose = matches!(
+                    action,
+                    AgentAction::Fetch { .. } | AgentAction::Findings { .. }
+                );
                 for part in 0..tool_call.text.len() {
-                    // A plan reads as the agent's own words, as Zed shows a tool's content.
-                    let style = if is_plan {
-                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+                    let element = if is_prose {
+                        self.markdown((index, part + 1), prose_style(window, cx), cx)
+                            .map(|markdown| {
+                                div()
+                                    .debug_selector(move || format!("tool-call-prose-{index}"))
+                                    .mx(px(10.))
+                                    .my(px(6.))
+                                    .pl(px(12.))
+                                    .border_l_1()
+                                    .border_color(prose_border)
+                                    .child(markdown)
+                                    .into_any_element()
+                            })
                     } else {
-                        tool_output_style(is_execute, window, cx)
+                        self.markdown(
+                            (index, part + 1),
+                            card_output_style(is_execute, window, cx),
+                            cx,
+                        )
+                        .map(|markdown| div().text_xs().child(markdown).into_any_element())
                     };
-                    if let Some(markdown) = self.markdown((index, part + 1), style, cx) {
-                        output.push(
-                            div()
-                                .when(!is_plan, |this| this.text_xs())
-                                .child(markdown)
-                                .into_any_element(),
-                        );
-                    }
-                }
-                for image_index in 0..tool_call.images.len() {
-                    output.push(self.render_tool_image(index, tool_call, image_index, window, cx));
-                }
-                // As in Zed, a tool call with an image shows only the image.
-                let shows_input = !is_execute
-                    && !is_edit
-                    && !is_plan
-                    && tool_call.images.is_empty()
-                    && tool_call.raw_input.is_some()
-                    && !matches!(kind, ToolCallKind::ToolSearch(_));
-                if shows_input {
-                    output.push(self.render_tool_input(index, &tool_call.id, window, cx));
+                    output.extend(element);
                 }
             }
         }
-        let answer_line = tool_call
-            .answer
-            .as_ref()
-            .filter(|_| !needs_confirmation)
-            .map(|answer| render_answer_line(index, answer, cx));
-        let details = (!output.is_empty()).then(|| {
-            with_scrollbar(
-                v_flex()
-                    .id(("tool-call-output", index))
-                    .debug_selector(|| format!("tool-call-output-{index}"))
-                    .max_h(rems(24.))
-                    .overflow_y_scroll()
+        for image_index in 0..tool_call.images.len() {
+            output.push(
+                div()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .child(self.render_tool_image(index, tool_call, image_index, window, cx))
+                    .into_any_element(),
+            );
+        }
+        // As in Zed, a tool call with an image shows only the image.
+        let shows_input = !is_execute
+            && !is_edit
+            && tool_call.images.is_empty()
+            && tool_call.raw_input.is_some()
+            && !matches!(kind, ToolCallKind::ToolSearch(_));
+        if shows_input {
+            output.push(
+                div()
+                    .px(px(10.))
                     .py_1()
-                    .gap_1()
-                    .children(output),
-                div().ml(px(30.)),
-                format!("tool-call-output-{}", tool_call.id),
-                ScrollAxes::Vertical,
+                    .child(self.render_tool_input(index, &tool_call.id, window, cx))
+                    .into_any_element(),
+            );
+        }
+        output
+    }
+
+    /// One file's change in an edit: a header with its icon, its path, the lines it added and
+    /// removed, and Open, which shows the file in the diff panel; then the diff, with the new
+    /// file's line numbers in a gutter, as Zed's editor shows a diff. Long lines scroll sideways.
+    fn render_file_diff(
+        &self,
+        diff: &FileDiff,
+        (entry, part): (usize, usize),
+        folder: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let border = Self::tool_card_border_color(cx);
+        let (added, removed) = diff.line_counts();
+        let icon = match tool_calls::file_icon(&diff.path, cx) {
+            Some(icon_path) => Icon::from_path(icon_path),
+            None => Icon::new(IconName::File),
+        };
+        let path = diff.path.clone();
+        let header = h_flex()
+            .debug_selector(move || format!("tool-diff-header-{entry}-{part}"))
+            .h(px(28.))
+            .gap_1p5()
+            .pl(px(10.))
+            .pr_1()
+            .when(part > 0, |this| this.border_t_1())
+            .border_b_1()
+            .border_color(border)
+            .bg(Self::tool_card_header_bg(cx))
+            .child(
+                icon.size(IconSize::XSmall)
+                    .color(Color::Custom(work_row_color(cx))),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_buffer(cx)
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(colors.text)
+                    .child(tool_calls::display_path(
+                        &diff.path.to_string_lossy(),
+                        folder,
+                    )),
+            )
+            .child(div().flex_none().child(diff_stat(added, removed)))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("tool-diff-open-{entry}-{part}"))
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("tool-diff-open-{entry}-{part}")),
+                            "Open",
+                        )
+                        .label_size(LabelSize::Small)
+                        .color(Color::Accent)
+                        .end_icon(
+                            Icon::new(IconName::ArrowUpRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(AgentViewEvent::OpenDiffFile(path.clone()));
+                        })),
+                    ),
+            );
+        let hunk = diff.numbered_hunk(DIFF_CONTEXT_LINES);
+        let widest = hunk
+            .iter()
+            .filter_map(|(_, number, _)| *number)
+            .max()
+            .map(|number| number.to_string().len());
+        let lines = v_flex()
+            .min_w_full()
+            .children(hunk.into_iter().map(|(kind, number, line)| {
+                let (marker, background) = match kind {
+                    DiffLineKind::Context => ("", None),
+                    DiffLineKind::Removed => {
+                        ("−", Some(colors.editor_diff_hunk_deleted_background))
+                    }
+                    DiffLineKind::Added => ("+", Some(colors.editor_diff_hunk_added_background)),
+                };
+                h_flex()
+                    .min_w_full()
+                    .pl_1()
+                    .whitespace_nowrap()
+                    .when_some(background, |this, background| this.bg(background))
+                    .when(kind == DiffLineKind::Context, |this| {
+                        this.text_color(colors.text_muted)
+                    })
+                    .when_some(widest, |this, widest| {
+                        this.child(
+                            div()
+                                .w(gutter_width(widest))
+                                .flex_none()
+                                .pr(px(6.))
+                                .text_right()
+                                .text_color(colors.editor_line_number)
+                                .child(number.map(|number| number.to_string()).unwrap_or_default()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .text_center()
+                            .text_color(colors.text_muted)
+                            .child(marker),
+                    )
+                    .child(div().pr(px(10.)).child(line.to_string()))
+            }));
+        let scroller = div()
+            .id(ElementId::Name(format!("tool-diff-{entry}-{part}").into()))
+            .debug_selector(move || format!("tool-diff-{entry}-{part}"))
+            .w_full()
+            .overflow_x_scroll()
+            .py_1()
+            .font_buffer(cx)
+            .text_size(rems_from_px(12_f32))
+            .line_height(rems_from_px(18_f32))
+            .child(lines);
+        v_flex()
+            .child(header)
+            .child(with_scrollbar(
+                scroller,
+                div().w_full(),
+                format!("tool-diff-{entry}-{part}"),
+                ScrollAxes::Horizontal,
                 window,
                 cx,
-            )
-        });
-
-        v_flex()
-            .mx_5()
-            .child(row)
-            .children(answer_line)
-            .children(details)
-            .children(self.render_permission_buttons(index, &tool_call.id, cx))
+            ))
             .into_any_element()
+    }
+
+    /// An opened command's header, after the command: the folder it ran in, how long it took,
+    /// its exit code if it failed, Stop while it runs in agentZ's terminal, and Copy, as Zed's
+    /// terminal card has.
+    fn render_command_details(
+        &self,
+        index: usize,
+        tool_call: &ToolCall,
+        terminals: &[Entity<Terminal>],
+        exit_code: Option<i64>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors();
+        let dim = |text: String, name: &'static str| {
+            div()
+                .flex_none()
+                .debug_selector(move || format!("tool-call-{name}-{index}"))
+                .text_size(rems_from_px(12_f32))
+                .text_color(colors.text_placeholder)
+                .child(text)
+                .into_any_element()
+        };
+        let mut details = Vec::new();
+        let folder = tool_calls::command_folder(tool_call)
+            .map(PathBuf::from)
+            .or_else(|| self.store.read(cx).thread_folder(self.thread_id));
+        details.extend(folder.map(|folder| dim(compact_path(&folder), "folder")));
+        let is_running = tool_call.is_running();
+        let time = if is_running {
+            tool_call
+                .started_at
+                .and_then(|started_at| SystemTime::now().duration_since(started_at).ok())
+                .map(format_elapsed)
+        } else {
+            tool_call.duration.map(format_duration)
+        };
+        details.extend(time.map(|time| dim(time, "time")));
+        if let Some(code) = exit_code.filter(|code| *code != 0) {
+            details.push(
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("tool-call-exit-{index}"))
+                    .child(
+                        Label::new(format!("Exit code {code}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if is_running
+            && terminals
+                .iter()
+                .any(|terminal| !terminal.read(cx).has_exited())
+        {
+            let terminals = terminals.to_vec();
+            details.push(
+                Button::new(("tool-call-stop", index), "Stop")
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::Stop).size(IconSize::XSmall))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        // Ctrl-C, as a terminal stops what runs in it.
+                        for terminal in &terminals {
+                            terminal.update(cx, |terminal, cx| terminal.write(vec![0x03], cx));
+                        }
+                    })
+                    .into_any_element(),
+            );
+        }
+        let command = command_text(tool_call);
+        details.push(
+            IconButton::new(("tool-call-copy", index), IconName::Copy)
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Copy Command"))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+                })
+                .into_any_element(),
+        );
+        details
+    }
+
+    /// A plan the agent asks to approve, as a card with "Plan" at its top and the plan drawn
+    /// as markdown, as Zed's permission card shows a plan.
+    fn render_plan_card(
+        &self,
+        index: usize,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let colors = cx.theme().colors();
+        let border = Self::tool_card_border_color(cx);
+        let style = prose_style(window, cx);
+        let parts: Vec<MarkdownElement> = (0..tool_call.text.len())
+            .filter_map(|part| self.markdown((index, part + 1), style.clone(), cx))
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .debug_selector(move || format!("tool-call-plan-{index}"))
+                .ml(px(30.))
+                .my_1()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(colors.editor_background)
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .h(px(26.))
+                        .px(px(10.))
+                        .border_b_1()
+                        .border_color(border)
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(colors.text_placeholder)
+                        .child("Plan"),
+                )
+                .child(div().px(px(12.)).py(px(10.)).children(parts))
+                .into_any_element(),
+        )
     }
 
     /// One of the agent's own subagents (`design/agent-subagents/decisions.md`): a row with the
@@ -4973,7 +5512,7 @@ impl AgentView {
                     .entries()
                     .iter()
                     .filter_map(|entry| match entry {
-                        Entry::ToolCall(step) => Some(step.clone()),
+                        Entry::ToolCall(step) if !tool_calls::is_hidden(step) => Some(step.clone()),
                         _ => None,
                     })
                     .collect()
@@ -5247,6 +5786,7 @@ impl AgentView {
     /// running card's row, `spins` is false: the row's spinner already says it runs.
     fn render_subagent_step(&self, step: &ToolCall, spins: bool, cx: &App) -> AnyElement {
         let (kind, sentence) = self.tool_call_kind(step, cx);
+        let action = tool_call_action(step, &kind, false);
         let is_running = step.is_running();
         h_flex()
             .min_h(px(24.))
@@ -5257,9 +5797,9 @@ impl AgentView {
                     .w(px(24.))
                     .flex_none()
                     .justify_center()
-                    .child(tool_call_icon(step, &kind, cx)),
+                    .child(tool_call_icon(step, &kind, &action, cx)),
             )
-            .child(self.render_tool_call_label(step, &kind, sentence.as_ref(), is_running, cx))
+            .child(self.render_tool_call_label(step, &kind, sentence.as_ref(), &action, cx))
             .when(is_running && spins, |this| {
                 this.child(
                     Icon::new(IconName::LoadCircle)
@@ -5440,17 +5980,18 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// What the tool call did, in t3code's words where its kind says what: "Ran" and the
-    /// command in the code font, "Edited" and the file; agentZ's own tools as what they did
+    /// What the tool call did, in the same words for every agent: "Ran" and the command in the
+    /// code font, "Edited" and the file, the agent's own tools by what they did ("Searched for
+    /// roundTotal in src", `tool_calls::AgentAction`); agentZ's own tools as what they did
     /// ("Started a subthread:" and its title), a ToolSearch as the tools it loaded, another MCP
-    /// tool in words with its server; otherwise the agent's own title. Paths in the thread's
-    /// folder read relative to it.
+    /// tool in words with what it acted on and its server; otherwise the agent's own title.
+    /// Paths in the thread's folder read relative to it.
     fn render_tool_call_label(
         &self,
         tool_call: &ToolCall,
         kind: &ToolCallKind,
         sentence: Option<&Sentence>,
-        in_progress: bool,
+        action: &AgentAction,
         cx: &App,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -5462,6 +6003,15 @@ impl AgentView {
             .gap_1()
             .text_size(rems_from_px(13_f32))
             .text_color(work_row_color(cx));
+        let dim = |text: String| {
+            div()
+                .flex_none()
+                .text_size(rems_from_px(12_f32))
+                .text_color(colors.text_placeholder)
+                .child(text)
+        };
+        let state = CallState::of_call(tool_call);
+        let folder = self.store.read(cx).thread_folder(self.thread_id);
         match (kind, sentence) {
             (ToolCallKind::Own { .. }, Some(sentence)) => {
                 let Some(subject) = &sentence.subject else {
@@ -5491,53 +6041,64 @@ impl AgentView {
                     div()
                         .min_w_0()
                         .truncate()
-                        .child(one_line(&search.label(CallState::of(&tool_call.status)))),
+                        .child(one_line(&search.label(state))),
                 )
+                .children(search.server().map(dim))
                 .into_any_element(),
-            (ToolCallKind::Mcp(name), _) => label
-                .child(div().min_w_0().truncate().child(name.words()))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(rems_from_px(12_f32))
-                        .text_color(colors.text_placeholder)
-                        .child(name.server.clone()),
-                )
-                .into_any_element(),
+            (ToolCallKind::Mcp(name), _) => {
+                let subject = tool_calls::mcp_subject(tool_call);
+                label
+                    .child(
+                        div()
+                            .min_w_0()
+                            .when(subject.is_some(), |this| this.flex_none())
+                            .truncate()
+                            .child(name.words()),
+                    )
+                    .children(subject.map(|subject| {
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(colors.text_muted)
+                            .child(one_line(&subject))
+                    }))
+                    .child(dim(name.server.clone()))
+                    .into_any_element()
+            }
             _ => {
-                let folder = self
-                    .store
-                    .read(cx)
-                    .thread_folder(self.thread_id)
-                    .map(|folder| format!("{}/", folder.display()));
+                if let Some(action_label) = action.label(tool_call, state, folder.as_deref()) {
+                    return render_action_label(label, action_label, cx);
+                }
+                let folder = folder.map(|folder| format!("{}/", folder.display()));
                 let relative = |text: &str| -> String {
                     match &folder {
                         Some(folder) => text.replace(folder.as_str(), ""),
                         None => text.to_string(),
                     }
                 };
+                let denied = tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
                 let (verb, subject) = if matches!(tool_call.kind, acp::ToolKind::Execute) {
-                    // A backslash before a newline continues the command on the next line, so
-                    // on one line it's a space.
-                    let command = tool_call
-                        .title
-                        .trim()
-                        .trim_matches('`')
-                        .replace("\\\r\n", " ")
-                        .replace("\\\n", " ");
-                    (
-                        Some(if in_progress { "Running" } else { "Ran" }),
-                        Some(command),
-                    )
+                    let verb = if tool_call.is_running() {
+                        "Running"
+                    } else if denied {
+                        "Run"
+                    } else {
+                        "Ran"
+                    };
+                    (Some(verb), Some(command_text(tool_call)))
                 } else if let [diff] = tool_call.diffs.as_slice() {
                     (
-                        Some("Edited"),
+                        Some(if denied { "Edit" } else { "Edited" }),
                         Some(relative(&diff.path.display().to_string())),
                     )
                 } else if tool_call.diffs.len() > 1 {
                     (
                         None,
-                        Some(format!("Edited {} files", tool_call.diffs.len())),
+                        Some(format!(
+                            "{} {} files",
+                            if denied { "Edit" } else { "Edited" },
+                            tool_call.diffs.len()
+                        )),
                     )
                 } else {
                     (None, Some(relative(&tool_call.title)))
@@ -5559,10 +6120,13 @@ impl AgentView {
         }
     }
 
+    /// A permission request's choices. In a card, a line above them sets them off from what's
+    /// over them (`bordered`).
     fn render_permission_buttons(
         &self,
         index: usize,
         tool_call_id: &acp::ToolCallId,
+        bordered: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let request = self.thread.read(cx).permission_request(tool_call_id)?;
@@ -5592,8 +6156,10 @@ impl AgentView {
             v_flex()
                 .debug_selector(|| format!("permission-buttons-{index}"))
                 .p_1()
-                .border_t_1()
-                .border_color(Self::tool_card_border_color(cx))
+                .when(bordered, |this| {
+                    this.border_t_1()
+                        .border_color(Self::tool_card_border_color(cx))
+                })
                 .w_full()
                 .gap_0p5()
                 .children(buttons)
@@ -5713,24 +6279,15 @@ impl AgentView {
         asker: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
-        let buttons = self.render_permission_buttons(index, tool_call_id, cx)?;
-        let tool_call = ToolCall {
-            id: tool_call_id.clone(),
-            title: title.to_string(),
-            kind: acp::ToolKind::Other,
-            status: acp::ToolCallStatus::Pending,
-            text: Vec::new(),
-            diffs: Vec::new(),
-            locations: Vec::new(),
-            raw_input: None,
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
-        };
+        let buttons = self.render_permission_buttons(index, tool_call_id, true, cx)?;
+        let tool_call = ToolCall::new(
+            tool_call_id.clone(),
+            title.to_string(),
+            acp::ToolKind::Other,
+            acp::ToolCallStatus::Pending,
+        );
         let (kind, sentence) = self.tool_call_kind(&tool_call, cx);
+        let action = tool_call_action(&tool_call, &kind, false);
         Some(
             v_flex()
                 .rounded_md()
@@ -5759,7 +6316,7 @@ impl AgentView {
                                 &tool_call,
                                 &kind,
                                 sentence.as_ref(),
-                                false,
+                                &action,
                                 cx,
                             )),
                     ),
@@ -6967,26 +7524,49 @@ impl AgentView {
         let images = tool_call.images.clone();
         let file_name: Option<SharedString> = tool_calls::file_path(tool_call)
             .and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned().into()));
+        // What it is, dim under it: "cart.png · 1280 × 800 · 212 KB".
+        let caption = {
+            let size = tool_call.image_sizes.get(image_index).copied().flatten();
+            let mut parts: Vec<String> = file_name.iter().map(ToString::to_string).collect();
+            if let Some(size) = size {
+                parts.push(format!("{} × {}", size.width, size.height));
+                parts.push(tool_calls::format_bytes(size.bytes));
+            }
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        };
         let name = format!("tool-image-{entry_index}-{image_index}");
-        h_flex()
+        let caption_name = format!("tool-image-caption-{entry_index}-{image_index}");
+        let colors = cx.theme().colors();
+        v_flex()
+            .gap_1()
             .child(
-                div()
-                    .id(SharedString::from(name.clone()))
-                    .debug_selector(move || name)
-                    .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .overflow_hidden()
-                    .cursor_zoom_in()
-                    .child(
-                        FittedImage::new(thumbnail, TOOL_IMAGE_SIZE)
-                            .map_image(|image| image.rounded(px(5.))),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let images = this.viewed_images(&images, file_name.clone(), cx);
-                        this.view_images(images, image_index, cx);
-                    })),
+                h_flex().child(
+                    div()
+                        .id(SharedString::from(name.clone()))
+                        .debug_selector(move || name)
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .overflow_hidden()
+                        .cursor_zoom_in()
+                        .child(
+                            FittedImage::new(thumbnail, TOOL_IMAGE_SIZE)
+                                .map_image(|image| image.rounded(px(5.))),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let images = this.viewed_images(&images, file_name.clone(), cx);
+                            this.view_images(images, image_index, cx);
+                        })),
+                ),
             )
+            .children(caption.map(|caption| {
+                div()
+                    .debug_selector(move || caption_name)
+                    .font_ui(cx)
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(colors.text_placeholder)
+                    .child(caption)
+            }))
             .into_any_element()
     }
 
@@ -9599,70 +10179,6 @@ fn with_scrollbar(
         )
 }
 
-/// A tool call's edit. Long lines scroll sideways, as in Zed's editor, rather than being cut
-/// off.
-fn render_diff(
-    diff: &FileDiff,
-    (entry, part): (usize, usize),
-    key: String,
-    window: &mut Window,
-    cx: &mut App,
-) -> AnyElement {
-    let colors = cx.theme().colors();
-    let lines = v_flex()
-        .min_w_full()
-        .children(
-            diff.hunk(DIFF_CONTEXT_LINES)
-                .into_iter()
-                .map(|(kind, line)| {
-                    let (marker, background) = match kind {
-                        DiffLineKind::Context => (" ", None),
-                        DiffLineKind::Removed => {
-                            ("-", Some(colors.editor_diff_hunk_deleted_background))
-                        }
-                        DiffLineKind::Added => {
-                            ("+", Some(colors.editor_diff_hunk_added_background))
-                        }
-                    };
-                    h_flex()
-                        .min_w_full()
-                        .px_2()
-                        .whitespace_nowrap()
-                        .when_some(background, |this, background| this.bg(background))
-                        .when(kind == DiffLineKind::Context, |this| {
-                            this.text_color(colors.text_muted)
-                        })
-                        .child(
-                            div()
-                                .w(px(14.))
-                                .flex_none()
-                                .text_color(colors.text_muted)
-                                .child(marker),
-                        )
-                        .child(line.to_string())
-                }),
-        );
-    let scroller = div()
-        .id(("tool-diff", entry * 1000 + part))
-        .w_full()
-        .overflow_x_scroll()
-        .border_t_1()
-        .border_color(colors.border.opacity(0.8))
-        .font_buffer(cx)
-        .text_size(rems_from_px(12_f32))
-        .line_height(rems_from_px(18_f32))
-        .child(lines);
-    with_scrollbar(
-        scroller,
-        div().w_full(),
-        key,
-        ScrollAxes::Horizontal,
-        window,
-        cx,
-    )
-    .into_any_element()
-}
-
 impl Focusable for AgentView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         if self.is_subthread(cx) {
@@ -10394,64 +10910,416 @@ fn chosen_words(option: &PermissionOption) -> (IconName, String) {
     }
 }
 
-/// A tool call's icon: a read's or an edit's file's own type's icon, as Zed's edit cards show;
-/// otherwise t3code's by its kind (an eye for a read, a pen on a square for an edit), the
-/// agentZ mark for agentZ's tools, and a plug for other MCP tools.
-fn tool_call_icon(tool_call: &ToolCall, kind: &ToolCallKind, cx: &App) -> Icon {
+/// A tool call's icon: by what it did when it's one of the agent's own tools that many agents
+/// share (a book for a skill, a speech bubble for a question), else a read's or an edit's
+/// file's own type's icon, as Zed's edit cards show; otherwise t3code's by its kind (an eye for
+/// a read, a pen on a square for an edit), the agentZ mark for agentZ's tools, and a plug for
+/// other MCP tools.
+fn tool_call_icon(
+    tool_call: &ToolCall,
+    kind: &ToolCallKind,
+    action: &AgentAction,
+    cx: &App,
+) -> Icon {
     let icon = match kind {
         ToolCallKind::Own { .. } => Icon::new(IconName::AgentZ),
         ToolCallKind::ToolSearch(_) => Icon::new(IconName::ToolSearch),
         ToolCallKind::Mcp(_) => Icon::new(IconName::Plug),
         ToolCallKind::Subagent(_) => Icon::new(IconName::Bot),
-        ToolCallKind::Plain => match tool_calls::file_path(tool_call)
-            .and_then(|path| tool_calls::file_icon(&path, cx))
-        {
-            Some(icon_path) => Icon::from_path(icon_path),
-            None => Icon::new(match tool_call.kind {
-                acp::ToolKind::Read => IconName::Eye,
-                acp::ToolKind::Edit => IconName::SquarePen,
-                acp::ToolKind::Delete => IconName::ToolDeleteFile,
-                acp::ToolKind::Move => IconName::ArrowRightLeft,
-                acp::ToolKind::Search => IconName::ToolSearch,
-                acp::ToolKind::Execute => IconName::ToolTerminal,
-                acp::ToolKind::Think => IconName::ToolThink,
-                acp::ToolKind::Fetch => IconName::ToolWeb,
-                acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
-                _ => IconName::ToolHammer,
-            }),
+        ToolCallKind::Plain => match action {
+            AgentAction::Skill { .. } => Icon::new(IconName::Book),
+            AgentAction::Findings { .. } => Icon::new(IconName::ListTodo),
+            AgentAction::Question { .. } => Icon::new(IconName::Chat),
+            AgentAction::Deleted { .. } => Icon::new(IconName::ToolDeleteFile),
+            AgentAction::Moved { .. } => Icon::new(IconName::ArrowRightLeft),
+            AgentAction::Fetch { .. } | AgentAction::WebSearch { .. } => {
+                Icon::new(IconName::ToolWeb)
+            }
+            AgentAction::Grep(_) | AgentAction::Glob(_) => Icon::new(IconName::ToolSearch),
+            _ => match tool_calls::file_path(tool_call)
+                .and_then(|path| tool_calls::file_icon(&path, cx))
+            {
+                Some(icon_path) => Icon::from_path(icon_path),
+                None => Icon::new(match tool_call.kind {
+                    acp::ToolKind::Read => IconName::Eye,
+                    acp::ToolKind::Edit => IconName::SquarePen,
+                    acp::ToolKind::Delete => IconName::ToolDeleteFile,
+                    acp::ToolKind::Move => IconName::ArrowRightLeft,
+                    acp::ToolKind::Search => IconName::ToolSearch,
+                    acp::ToolKind::Execute => IconName::ToolTerminal,
+                    acp::ToolKind::Think => IconName::ToolThink,
+                    acp::ToolKind::Fetch => IconName::ToolWeb,
+                    acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
+                    _ => IconName::ToolHammer,
+                }),
+            },
         },
     };
     icon.size(IconSize::Small)
         .color(Color::Custom(work_row_color(cx)))
 }
 
-/// The tools an opened ToolSearch loaded or found, one a line by what they do: agentZ's by
-/// their titles, other MCP tools in words with their server, and the agent's own by name.
-fn render_listed_tools(index: usize, tools: &[String], cx: &App) -> AnyElement {
+/// What one of the agent's own tools did. agentZ's tools, MCP tools and subagents have rows of
+/// their own, and so does a row naming the questions it asked ("Asked: Approach").
+fn tool_call_action(
+    tool_call: &ToolCall,
+    kind: &ToolCallKind,
+    names_questions: bool,
+) -> AgentAction {
+    match kind {
+        ToolCallKind::Plain if !names_questions => AgentAction::of(tool_call),
+        _ => AgentAction::Other,
+    }
+}
+
+/// Whether a tool call failed on its own: not one the user denied, or one the turn's stop
+/// cut off.
+fn did_fail(tool_call: &ToolCall) -> bool {
+    matches!(tool_call.status, acp::ToolCallStatus::Failed)
+        && !tool_call.stopped
+        && !tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied)
+}
+
+/// The command an Execute tool call ran, on one line: a backslash before a newline continues
+/// it on the next line, so on one line it's a space.
+fn command_text(tool_call: &ToolCall) -> String {
+    tool_call
+        .title
+        .trim()
+        .trim_matches('`')
+        .replace("\\\r\n", " ")
+        .replace("\\\n", " ")
+}
+
+/// A row's words from `tool_calls::ActionLabel`: words that never shrink, names cut short
+/// with "…", paths and patterns in the code font, links that open in the browser, and dim
+/// words after them.
+fn render_action_label(label: Div, action_label: ActionLabel, cx: &App) -> AnyElement {
     let colors = cx.theme().colors();
-    v_flex()
-        .debug_selector(move || format!("tool-call-tools-{index}"))
-        .children(tools.iter().map(|name| {
-            let (icon, words, server) = match ListedTool::named(name) {
-                ListedTool::Own(tool) => (IconName::AgentZ, tool.title().to_string(), None),
-                ListedTool::Mcp(mcp) => (IconName::Plug, mcp.words(), Some(mcp.server)),
-                ListedTool::Other(name) => (IconName::ToolHammer, name, None),
-            };
-            h_flex()
-                .min_h(px(20.))
-                .gap_1p5()
+    let parts = action_label.parts.into_iter().map(|part| match part {
+        LabelPart::Words(text) => div().flex_none().child(text).into_any_element(),
+        LabelPart::Name(text) => div()
+            .min_w_0()
+            .truncate()
+            .child(one_line(&text))
+            .into_any_element(),
+        LabelPart::Code(text) => div()
+            .min_w_0()
+            .truncate()
+            .font_buffer(cx)
+            .text_size(rems_from_px(12_f32))
+            .child(one_line(&text))
+            .into_any_element(),
+        LabelPart::Title(text) => div()
+            .min_w_0()
+            .truncate()
+            .text_color(colors.text_muted)
+            .child(one_line(&text))
+            .into_any_element(),
+        LabelPart::Link { text, url } => div()
+            .id(ElementId::Name(format!("tool-call-link-{url}").into()))
+            .debug_selector(|| "tool-call-link".into())
+            .min_w_0()
+            .truncate()
+            .text_color(colors.text_accent)
+            .cursor_pointer()
+            .hover(|style| style.underline())
+            .child(text)
+            .on_click(move |_, _, cx| {
+                // The row behind it opens and closes on a click.
+                cx.stop_propagation();
+                cx.open_url(&url);
+            })
+            .into_any_element(),
+    });
+    label
+        .children(parts)
+        .children(action_label.detail.map(|detail| {
+            div()
+                .flex_none()
                 .text_size(rems_from_px(12_f32))
-                .text_color(colors.text_muted)
-                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-                .child(div().min_w_0().truncate().child(words))
-                .children(server.map(|server| {
-                    div()
-                        .flex_none()
-                        .text_color(colors.text_placeholder)
-                        .child(server)
-                }))
+                .text_color(colors.text_placeholder)
+                .child(detail)
         }))
         .into_any_element()
+}
+
+/// The line under an approved plan's row marking the change of mode it made: "Plan →
+/// Default".
+fn render_mode_switch(index: usize, switch: &ModeSwitch, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    let rule = || div().flex_1().h_px().bg(colors.border_variant);
+    h_flex()
+        .debug_selector(move || format!("tool-call-mode-switch-{index}"))
+        .h(px(26.))
+        .my_1()
+        .gap(px(10.))
+        .text_size(rems_from_px(12_f32))
+        .text_color(colors.text_placeholder)
+        .child(rule())
+        .child(
+            h_flex()
+                .flex_none()
+                .gap(px(5.))
+                .child(
+                    Icon::new(IconName::ArrowRightLeft)
+                        .size(IconSize::XSmall)
+                        .color(Color::Custom(colors.text_placeholder)),
+                )
+                .child(format!("{} → {}", switch.from, switch.to)),
+        )
+        .child(rule())
+        .into_any_element()
+}
+
+/// The width of a gutter for line numbers of `digits` digits in the 12 px code font.
+fn gutter_width(digits: usize) -> Pixels {
+    px(digits as f32 * 7.5 + 6.)
+}
+
+/// A file's lines in a tool call's card, numbered from `start` in a dim gutter as Zed's
+/// editor numbers them: a new file's, or a deleted one's, `dim`mer. Long lines scroll
+/// sideways.
+fn render_file_lines<'a>(
+    index: usize,
+    lines: impl Iterator<Item = &'a str>,
+    start: u32,
+    dim: bool,
+    key: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let lines: Vec<&str> = lines.collect();
+    let last = start.saturating_add(u32::try_from(lines.len().saturating_sub(1)).unwrap_or(0));
+    let gutter = gutter_width(last.to_string().len());
+    let text_color = if dim { colors.text_muted } else { colors.text };
+    let line_number = colors.editor_line_number;
+    let rows = v_flex()
+        .min_w_full()
+        .children(lines.into_iter().zip(start..).map(|(line, number)| {
+            h_flex()
+                .min_w_full()
+                .px(px(10.))
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .w(gutter)
+                        .flex_none()
+                        .mr(px(14.))
+                        .text_right()
+                        .text_color(line_number)
+                        .child(number.to_string()),
+                )
+                .child(div().text_color(text_color).child(line.to_string()))
+        }));
+    let scroller = div()
+        .id(ElementId::Name(key.clone().into()))
+        .debug_selector(move || format!("tool-call-file-{index}"))
+        .w_full()
+        .overflow_x_scroll()
+        .py(px(6.))
+        .font_buffer(cx)
+        .text_size(rems_from_px(12_f32))
+        .line_height(rems_from_px(17_f32))
+        .child(rows);
+    with_scrollbar(
+        scroller,
+        div().w_full(),
+        key,
+        ScrollAxes::Horizontal,
+        window,
+        cx,
+    )
+    .into_any_element()
+}
+
+/// A search's matches under each file's icon and path, with their line numbers and the
+/// searched words marked, as Zed's grep tool shows them; a search of files' names, its files
+/// alone.
+fn render_found_files(
+    index: usize,
+    files: &[GrepFile],
+    grep: Option<&Grep>,
+    folder: Option<&Path>,
+    key: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let border = colors.border_variant;
+    let line_number = colors.editor_line_number;
+    let mark = gpui::HighlightStyle {
+        background_color: Some(colors.search_match_background),
+        ..Default::default()
+    };
+    // The pattern as the search read it, or else as the words it is.
+    let pattern = grep.and_then(|grep| {
+        let build = |pattern: &str| {
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(grep.ignore_case)
+                .build()
+        };
+        build(&grep.pattern)
+            .or_else(|_| build(&regex::escape(&grep.pattern)))
+            .ok()
+    });
+    let widest = files
+        .iter()
+        .flat_map(|file| &file.lines)
+        .map(|line| line.number)
+        .max()
+        .map(|number| number.to_string().len());
+    let has_lines = widest.is_some();
+    let rows = v_flex()
+        .min_w_full()
+        .py(px(if has_lines { 0. } else { 6. }))
+        .when(has_lines, |this| this.pb_1())
+        .children(files.iter().enumerate().map(|(file_index, file)| {
+            let path = Path::new(&file.path);
+            let icon = match tool_calls::file_icon(path, cx) {
+                Some(icon_path) => Icon::from_path(icon_path),
+                None => Icon::new(IconName::File),
+            };
+            let count = (!file.lines.is_empty() || file.count.is_some()).then(|| file.matches());
+            let header = h_flex()
+                .h(px(if has_lines { 24. } else { 22. }))
+                .px(px(10.))
+                .gap_1p5()
+                .whitespace_nowrap()
+                .when(has_lines && file_index > 0, |this| {
+                    this.border_t_1().border_color(border)
+                })
+                .child(
+                    icon.size(IconSize::XSmall)
+                        .color(Color::Custom(work_row_color(cx))),
+                )
+                .child(div().child(tool_calls::display_path(&file.path, folder)))
+                .children(count.map(|count| {
+                    div()
+                        .font_ui(cx)
+                        .text_color(colors.text_placeholder)
+                        .child(count.to_string())
+                }));
+            let lines = file.lines.iter().map(|line| {
+                let text = line.text.trim_end().to_string();
+                let highlights: Vec<(Range<usize>, gpui::HighlightStyle)> = pattern
+                    .iter()
+                    .flat_map(|pattern| pattern.find_iter(&text))
+                    .filter(|found| !found.is_empty())
+                    .map(|found| (found.range(), mark))
+                    .collect();
+                h_flex()
+                    .px(px(10.))
+                    .whitespace_nowrap()
+                    .children(widest.map(|widest| {
+                        div()
+                            .w(gutter_width(widest))
+                            .flex_none()
+                            .mr(px(12.))
+                            .text_right()
+                            .text_color(line_number)
+                            .child(line.number.to_string())
+                    }))
+                    .child(gpui::StyledText::new(text).with_highlights(highlights))
+            });
+            v_flex().child(header).children(lines)
+        }));
+    let scroller = div()
+        .id(ElementId::Name(key.to_string().into()))
+        .debug_selector(move || format!("tool-call-matches-{index}"))
+        .w_full()
+        .overflow_x_scroll()
+        .font_buffer(cx)
+        .text_size(rems_from_px(12_f32))
+        .line_height(rems_from_px(17_f32))
+        .text_color(colors.text)
+        .child(rows);
+    with_scrollbar(
+        scroller,
+        div().w_full(),
+        key.to_string(),
+        ScrollAxes::Horizontal,
+        window,
+        cx,
+    )
+    .into_any_element()
+}
+
+/// A web search's results: a title and an address each, opening in the browser.
+fn render_web_hits(index: usize, hits: &[WebHit], cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    v_flex()
+        .debug_selector(move || format!("tool-call-links-{index}"))
+        .px(px(10.))
+        .py(px(6.))
+        .children(hits.iter().enumerate().map(|(hit_index, hit)| {
+            let url = hit.url.clone();
+            h_flex()
+                .id(ElementId::Name(
+                    format!("tool-call-link-{index}-{hit_index}").into(),
+                ))
+                .h(px(22.))
+                .gap_2()
+                .min_w_0()
+                .cursor_pointer()
+                .child(
+                    Icon::new(IconName::ToolWeb)
+                        .size(IconSize::XSmall)
+                        .color(Color::Custom(work_row_color(cx))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(relative(0.6))
+                        .truncate()
+                        .text_size(rems_from_px(13_f32))
+                        .text_color(colors.text)
+                        .child(one_line(&hit.title)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(rems_from_px(12_f32))
+                        .text_color(colors.text_accent)
+                        .child(tool_calls::without_scheme(&hit.url)),
+                )
+                .on_click(move |_, _, cx| cx.open_url(&url))
+        }))
+        .into_any_element()
+}
+
+/// Prose a tool gave back (a fetched page's notes, findings, a plan): markdown in the
+/// thread's own font, a size down from the agent's messages.
+fn prose_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+    style.base_text_style.font_size = rems_from_px(13_f32).into();
+    style.base_text_style.line_height = rems_from_px(20_f32).into();
+    style
+}
+
+/// What a tool printed, in its card: in the code font, each line on one line and the block
+/// scrolling sideways, as Zed's code blocks do, reaching the card's edges.
+fn card_output_style(is_execute: bool, window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = tool_output_style(is_execute, window, cx);
+    let length = |pixels: f32| {
+        Some(gpui::DefiniteLength::Absolute(
+            gpui::AbsoluteLength::Pixels(px(pixels)),
+        ))
+    };
+    style.code_block_overflow_x_scroll = true;
+    style.code_block.border_widths = Default::default();
+    style.code_block.border_style = None;
+    style.code_block.background = None;
+    style.code_block.corner_radii = Default::default();
+    style.code_block.padding = gpui::EdgesRefinement {
+        top: length(6.),
+        right: length(10.),
+        bottom: length(6.),
+        left: length(10.),
+    };
+    style
 }
 
 /// The gray of a tool call's row: t3code's secondary label, the muted gray a quarter of the way
@@ -10525,10 +11393,13 @@ fn one_line(text: &str) -> String {
 
 /// Whether an entry is the agent's work between messages, which t3code groups: tool calls and
 /// thoughts. The plan's marker draws nothing, so it doesn't split a run. A subagent's row stands
-/// on its own, so several at once show side by side.
+/// on its own, so several at once show side by side, and so does a tool call that changed the
+/// agent's mode, with the line marking the change under it.
 fn is_work(entry: &Entry) -> bool {
     match entry {
-        Entry::ToolCall(tool_call) => !tool_calls::is_subagent(tool_call),
+        Entry::ToolCall(tool_call) => {
+            !tool_calls::is_subagent(tool_call) && tool_call.mode_switch.is_none()
+        }
         Entry::AgentThought(_) | Entry::Plan => true,
         Entry::UserMessage(_) | Entry::AgentMessage(_) => false,
     }
@@ -10550,12 +11421,19 @@ fn work_run(entries: &[Entry], index: usize) -> Option<Range<usize>> {
     Some(start..end)
 }
 
-/// How many of a run's entries draw a row: the plan's marker doesn't.
+/// How many of a run's entries draw a row: the plan's marker and to-do updates don't.
 fn shown_work(entries: &[Entry]) -> usize {
-    entries
-        .iter()
-        .filter(|entry| !matches!(entry, Entry::Plan))
-        .count()
+    entries.iter().filter(|entry| draws_row(entry)).count()
+}
+
+/// Whether a work entry draws a row of its own: the plan's marker and to-do updates, which the
+/// plan bar shows, don't.
+fn draws_row(entry: &Entry) -> bool {
+    match entry {
+        Entry::Plan => false,
+        Entry::ToolCall(tool_call) => !tool_calls::is_hidden(tool_call),
+        _ => true,
+    }
 }
 
 /// The running turn's last run of work, folded into the row of one of its entries.
@@ -10725,6 +11603,7 @@ fn summarize_work(entries: &[Entry]) -> String {
     let mut thoughts = 0;
     for entry in entries {
         match entry {
+            Entry::ToolCall(tool_call) if tool_calls::is_hidden(tool_call) => {}
             Entry::ToolCall(tool_call) => {
                 let action = WorkAction::of(tool_call);
                 match groups.iter_mut().find(|(other, _)| *other == action) {
@@ -12111,20 +12990,13 @@ mod tests {
 
     fn tool_call(status: acp::ToolCallStatus) -> Entry {
         Entry::ToolCall(ToolCall {
-            id: acp::ToolCallId::new("call-1"),
-            title: "`npm test`".into(),
-            kind: acp::ToolKind::Execute,
-            status,
             text: vec!["PASS src/cart/total.test.ts".into()],
-            diffs: Vec::new(),
-            locations: Vec::new(),
-            raw_input: None,
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
+            ..ToolCall::new(
+                acp::ToolCallId::new("call-1"),
+                "`npm test`".into(),
+                acp::ToolKind::Execute,
+                status,
+            )
         })
     }
 
@@ -12171,24 +13043,18 @@ mod tests {
 
         // An edit's row counts its lines.
         let edit = Entry::ToolCall(ToolCall {
-            id: acp::ToolCallId::new("call-2"),
-            title: "Edit total.ts".into(),
-            kind: acp::ToolKind::Edit,
-            status: acp::ToolCallStatus::Completed,
-            text: Vec::new(),
             diffs: vec![FileDiff {
                 path: "/tmp/demo/total.ts".into(),
                 old_text: Some("a\nb\n".into()),
                 new_text: "a\nc\nd\n".into(),
+                start_line: None,
             }],
-            locations: Vec::new(),
-            raw_input: None,
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
+            ..ToolCall::new(
+                acp::ToolCallId::new("call-2"),
+                "Edit total.ts".into(),
+                acp::ToolKind::Edit,
+                acp::ToolCallStatus::Completed,
+            )
         });
         thread.update(cx, |thread, cx| {
             thread.set_entries_for_test(vec![Entry::UserMessage("Edit it".into()), edit], cx)
@@ -12199,20 +13065,14 @@ mod tests {
 
     fn mcp_call(title: &str, input: &str, output: &str) -> Entry {
         Entry::ToolCall(ToolCall {
-            id: acp::ToolCallId::new(title.to_string()),
-            title: title.into(),
-            kind: acp::ToolKind::Other,
-            status: acp::ToolCallStatus::Completed,
             text: vec![output.into()],
-            diffs: Vec::new(),
-            locations: Vec::new(),
             raw_input: Some(format!("```json\n{input}\n```")),
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
+            ..ToolCall::new(
+                acp::ToolCallId::new(title.to_string()),
+                title.into(),
+                acp::ToolKind::Other,
+                acp::ToolCallStatus::Completed,
+            )
         })
     }
 
@@ -12252,8 +13112,8 @@ mod tests {
         assert!(cx.debug_bounds("tool-call-output-1").is_some());
     }
 
-    /// A subthread agentZ started ends in "Open", and a ToolSearch opens to its tools, with no
-    /// input.
+    /// A subthread agentZ started ends in "Open", and a ToolSearch names its tools in its row,
+    /// with nothing to open.
     #[gpui::test]
     fn agentzs_tools_open_what_they_made(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -12287,8 +13147,203 @@ mod tests {
             .expect("the ToolSearch's row");
         cx.simulate_click(search.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("tool-call-tools-2").is_some());
+        assert!(cx.debug_bounds("tool-call-output-2").is_none());
         assert!(cx.debug_bounds("tool-call-input-2").is_none());
+    }
+
+    fn completed_call(
+        id: &str,
+        title: &str,
+        kind: acp::ToolKind,
+        output: Option<&str>,
+    ) -> ToolCall {
+        ToolCall {
+            text: output.into_iter().map(str::to_string).collect(),
+            ..ToolCall::new(
+                acp::ToolCallId::new(id.to_string()),
+                title.into(),
+                kind,
+                acp::ToolCallStatus::Completed,
+            )
+        }
+    }
+
+    /// Each kind of tool call opens to what it did (`design/tool-calls-2`): a read is a row
+    /// only; an edit has a header per file, whose Open shows the file in the diff panel; a new
+    /// file opens to its lines; a search to its matches by file; a web search to its pages; a
+    /// fetch to its notes, as prose.
+    #[gpui::test]
+    fn each_kind_of_tool_call_opens_to_what_it_did(cx: &mut TestAppContext) {
+        use acp::ToolKind::{Edit, Fetch, Read, Search};
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let read = completed_call("read", "Read /tmp/demo/total.ts", Read, Some("a"));
+        let mut edit = completed_call("edit", "Edit", Edit, None);
+        edit.diffs = vec![
+            FileDiff {
+                path: "/tmp/demo/total.ts".into(),
+                old_text: Some("a\nb\nc\n".into()),
+                new_text: "a\nB\nc\n".into(),
+                start_line: Some(10),
+            },
+            FileDiff {
+                path: "/tmp/demo/round.ts".into(),
+                old_text: Some("x\n".into()),
+                new_text: "y\n".into(),
+                start_line: Some(1),
+            },
+        ];
+        let mut created = completed_call("create", "Write /tmp/demo/new.ts", Edit, None);
+        created.diffs = vec![FileDiff {
+            path: "/tmp/demo/new.ts".into(),
+            old_text: None,
+            new_text: "one\ntwo\n".into(),
+            start_line: Some(1),
+        }];
+        let grep = completed_call(
+            "grep",
+            "grep -n \"roundTotal\" src",
+            Search,
+            Some("src/a.ts:3:roundTotal()\nsrc/b.ts:7:x = roundTotal"),
+        );
+        let web = completed_call(
+            "web",
+            "Search \"vitest toBeCloseTo\"",
+            Fetch,
+            Some(r#"Links: [{"title":"expect | Vitest","url":"https://vitest.dev/api/expect"}]"#),
+        );
+        let fetch = completed_call(
+            "fetch",
+            "Fetch https://vitest.dev/api/expect",
+            Fetch,
+            Some("## toBeCloseTo\n\nCompares **floats**."),
+        );
+        // Each between messages, so none folds into a run.
+        let mut entries = vec![Entry::UserMessage("Go".into())];
+        for tool_call in [read, edit, created, grep, web, fetch] {
+            entries.push(Entry::ToolCall(tool_call));
+            entries.push(Entry::AgentMessage("Next.".into()));
+        }
+        thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
+        cx.run_until_parked();
+        let opened_files: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
+        cx.update(|_, cx| {
+            let opened_files = opened_files.clone();
+            cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
+                if let AgentViewEvent::OpenDiffFile(path) = event {
+                    opened_files.borrow_mut().push(path.clone());
+                }
+            })
+            .detach();
+        });
+
+        click("tool-call-row-1", cx);
+        assert!(cx.debug_bounds("tool-call-output-1").is_none());
+
+        click("tool-call-row-3", cx);
+        assert!(cx.debug_bounds("tool-diff-header-3-0").is_some());
+        click("tool-diff-open-3-1", cx);
+        assert_eq!(
+            *opened_files.borrow(),
+            vec![PathBuf::from("/tmp/demo/round.ts")]
+        );
+        assert!(
+            cx.debug_bounds("tool-call-card-3").is_some(),
+            "Open leaves the card open"
+        );
+        click("tool-call-row-3", cx);
+
+        let opens_to = |row: usize, part: &str, cx: &mut VisualTestContext| {
+            click(format!("tool-call-row-{row}").leak(), cx);
+            let shown = cx.debug_bounds(format!("{part}-{row}").leak()).is_some();
+            click(format!("tool-call-row-{row}").leak(), cx);
+            shown
+        };
+        assert!(opens_to(5, "tool-call-file", cx));
+        assert!(opens_to(7, "tool-call-matches", cx));
+        assert!(opens_to(9, "tool-call-links", cx));
+        assert!(opens_to(11, "tool-call-prose", cx));
+    }
+
+    /// To-do updates have no row and don't count in a run; a folded run says how many of its
+    /// tool calls failed and what it changed.
+    #[gpui::test]
+    fn a_folded_run_says_what_failed_and_what_changed(cx: &mut TestAppContext) {
+        use acp::ToolKind::{Edit, Execute, Think};
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let todos = completed_call("todos", "Update TODOs: Round once", Think, None);
+        let mut failed = completed_call("test", "npm test", Execute, Some("FAIL\nExit code 1"));
+        failed.status = acp::ToolCallStatus::Failed;
+        let Entry::ToolCall(created) = work("create", Edit, Some("/tmp/demo/new.ts")) else {
+            panic!("a tool call");
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Go".into()),
+                    Entry::ToolCall(todos.clone()),
+                    Entry::ToolCall(failed.clone()),
+                    Entry::ToolCall(created),
+                    Entry::AgentMessage("Done.".into()),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("work-run-failed-1").is_some());
+        assert!(cx.debug_bounds("work-run-stat-1").is_some());
+        click("work-run-1", cx);
+        assert!(cx.debug_bounds("tool-call-row-1").is_none(), "the to-dos");
+        assert!(cx.debug_bounds("tool-call-status-2").is_some());
+
+        // A command and a to-do update are one row: no run to fold.
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Go".into()),
+                    Entry::ToolCall(todos),
+                    Entry::ToolCall(failed),
+                    Entry::AgentMessage("Done.".into()),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("work-run-1").is_none());
+        assert!(cx.debug_bounds("tool-call-row-2").is_some());
+    }
+
+    /// An opened command is Zed's terminal card: its folder, how long it took and its exit
+    /// code in the header, in place of "Failed".
+    #[gpui::test]
+    fn an_opened_command_is_a_terminal_card(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let mut command = completed_call(
+            "test",
+            "npm test",
+            acp::ToolKind::Execute,
+            Some("FAIL src/cart\nExit code 1"),
+        );
+        command.status = acp::ToolCallStatus::Failed;
+        command.raw_input =
+            Some("```json\n{\"command\": \"npm test\", \"cwd\": \"/tmp/demo\"}\n```".into());
+        command.duration = Some(Duration::from_millis(400));
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![Entry::UserMessage("Go".into()), Entry::ToolCall(command)],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-status-1").is_some());
+        click("tool-call-row-1", cx);
+        assert!(cx.debug_bounds("tool-call-card-1").is_some());
+        assert!(cx.debug_bounds("tool-call-folder-1").is_some());
+        assert!(cx.debug_bounds("tool-call-time-1").is_some());
+        assert!(cx.debug_bounds("tool-call-exit-1").is_some());
+        assert!(cx.debug_bounds("tool-call-status-1").is_none());
     }
 
     #[test]
@@ -12358,27 +13413,21 @@ mod tests {
 
     fn work(id: &str, kind: acp::ToolKind, path: Option<&str>) -> Entry {
         Entry::ToolCall(ToolCall {
-            id: acp::ToolCallId::new(id.to_string()),
-            title: id.to_string(),
-            kind,
-            status: acp::ToolCallStatus::Completed,
-            text: Vec::new(),
             diffs: path
                 .map(|path| FileDiff {
                     path: path.into(),
                     old_text: None,
                     new_text: "a\n".into(),
+                    start_line: None,
                 })
                 .into_iter()
                 .collect(),
-            locations: Vec::new(),
-            raw_input: None,
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
+            ..ToolCall::new(
+                acp::ToolCallId::new(id.to_string()),
+                id.to_string(),
+                kind,
+                acp::ToolCallStatus::Completed,
+            )
         })
     }
 
@@ -12746,8 +13795,8 @@ mod tests {
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         let mut read = tool_call(acp::ToolCallStatus::Completed);
         if let Entry::ToolCall(tool_call) = &mut read {
-            tool_call.kind = acp::ToolKind::Read;
-            tool_call.title = "Read /tmp/demo/total.ts".into();
+            tool_call.kind = acp::ToolKind::Other;
+            tool_call.title = "Check the cart".into();
             tool_call.text = vec![
                 (1..=200)
                     .map(|line| format!("const line{line} = {line};"))
@@ -12761,7 +13810,9 @@ mod tests {
         entries.push(Entry::AgentMessage("Done.".into()));
         thread.update(cx, |thread, cx| thread.set_entries_for_test(entries, cx));
         cx.run_until_parked();
-        let row = cx.debug_bounds("tool-call-row-31").expect("the read's row");
+        let row = cx
+            .debug_bounds("tool-call-row-31")
+            .expect("the tool call's row");
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
 
@@ -12777,7 +13828,7 @@ mod tests {
         let row_top = |cx: &mut VisualTestContext| {
             f32::from(
                 cx.debug_bounds("tool-call-row-31")
-                    .expect("the read's row")
+                    .expect("the tool call's row")
                     .top(),
             )
         };
@@ -12804,8 +13855,8 @@ mod tests {
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         let mut read = tool_call(acp::ToolCallStatus::Completed);
         if let Entry::ToolCall(tool_call) = &mut read {
-            tool_call.kind = acp::ToolKind::Read;
-            tool_call.title = "Read /tmp/demo/total.ts".into();
+            tool_call.kind = acp::ToolKind::Other;
+            tool_call.title = "Check the cart".into();
             tool_call.text = vec![
                 (1..=200)
                     .map(|line| format!("const line{line} = {line};"))
@@ -12818,7 +13869,9 @@ mod tests {
             thread.set_entries_for_test(vec![Entry::UserMessage("Read it".into()), read], cx)
         });
         cx.run_until_parked();
-        let row = cx.debug_bounds("tool-call-row-1").expect("the read's row");
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let input_top = |cx: &mut VisualTestContext| {
@@ -13465,6 +14518,11 @@ mod tests {
         };
         screenshot.text.clear();
         screenshot.images = vec![image_id()];
+        screenshot.image_sizes = vec![Some(agentz_protocol::thread::ImageSize {
+            width: 1280,
+            height: 800,
+            bytes: 212 * 1024,
+        })];
         thread.update(cx, |thread, cx| {
             thread.set_entries_for_test(
                 vec![
@@ -13475,6 +14533,8 @@ mod tests {
             )
         });
         cx.run_until_parked();
+        // What it is shows dim under it.
+        assert!(cx.debug_bounds("tool-image-caption-1-0").is_some());
         let image = cx.debug_bounds("tool-image-1-0").expect("the tool's image");
         cx.simulate_click(image.center(), gpui::Modifiers::none());
         cx.run_until_parked();
@@ -14230,22 +15290,12 @@ mod tests {
     }
 
     fn subagent_call(id: &str, title: &str, status: acp::ToolCallStatus) -> ToolCall {
-        ToolCall {
-            id: acp::ToolCallId::new(id.to_string()),
-            title: title.into(),
-            kind: acp::ToolKind::Other,
+        ToolCall::new(
+            acp::ToolCallId::new(id.to_string()),
+            title.into(),
+            acp::ToolKind::Other,
             status,
-            text: Vec::new(),
-            diffs: Vec::new(),
-            locations: Vec::new(),
-            raw_input: None,
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
-        }
+        )
     }
 
     /// The agent's own subagents are rows of their own, with their type and how long they ran:
@@ -14629,8 +15679,9 @@ mod tests {
         assert_eq!(said("No, keep planning", RejectOnce), "You denied it");
     }
 
-    /// A plan to approve shows rendered under its row, with no Input, until it's answered;
-    /// then it folds into the row, which opens to it again.
+    /// A plan to approve shows in a card under its row, with no Input, until it's answered;
+    /// then it folds into the row, which opens to it again, and a line marks the change of
+    /// mode it made.
     #[gpui::test]
     fn a_plan_shows_under_its_row_until_answered(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -14646,6 +15697,10 @@ mod tests {
                 };
                 tool_call.text = vec!["## Port the icon picker\n\n1. Copy it.".into()];
                 tool_call.raw_input = Some("```json\n{\"plan\": \"…\"}\n```".into());
+                tool_call.mode_switch = answer.is_some().then(|| ModeSwitch {
+                    from: "Plan".into(),
+                    to: "Default".into(),
+                });
                 tool_call.answer = answer.map(ToolAnswer::Chose);
             }
             entry
@@ -14675,9 +15730,10 @@ mod tests {
             );
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+        assert!(cx.debug_bounds("tool-call-plan-1").is_some());
         assert!(cx.debug_bounds("tool-call-input-1").is_none());
         assert!(cx.debug_bounds("permission-buttons-1").is_some());
+        assert!(cx.debug_bounds("tool-call-mode-switch-1").is_none());
 
         thread.update(cx, |thread, cx| {
             thread.set_permission_requests_for_test(Vec::new(), cx);
@@ -14690,10 +15746,11 @@ mod tests {
             );
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("tool-call-output-1").is_none());
+        assert!(cx.debug_bounds("tool-call-plan-1").is_none());
         assert!(cx.debug_bounds("tool-call-answer-1").is_some());
+        assert!(cx.debug_bounds("tool-call-mode-switch-1").is_some());
         click("tool-call-row-1", cx);
-        assert!(cx.debug_bounds("tool-call-output-1").is_some());
+        assert!(cx.debug_bounds("tool-call-plan-1").is_some());
         assert!(cx.debug_bounds("tool-call-input-1").is_none());
     }
 

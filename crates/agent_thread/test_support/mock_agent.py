@@ -30,7 +30,9 @@ writes the text and a newline to the file, relative to the session's folder, and
 terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
 and replies "Terminal <exit code>: <output>", then releases it. "tool-call <json>" reports
 the tool call (or array of them) in the JSON as completed, as given (title, kind, rawInput,
-content, locations), and ends the turn. "network-error" starts a reply, then fails as a turn
+content, locations), and ends the turn. "running" starts a command ("sleep 60") that runs
+until the turn is cancelled, which it then answers as cancelled, without ending the command's
+tool call. "network-error" starts a reply, then fails as a turn
 does once an agent gives up on a lost connection; sent again, it's echoed.
 
 With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail with
@@ -90,7 +92,8 @@ Claude Agent's AskUserQuestion does for JetBrains AIR (an "Asking for your input
 then a form tied to it, each question followed by its "Other" field), and reply "Answer:
 <action> <content as JSON>". "plan" asks to approve a plan as Claude Agent does (a permission
 request on an "Approve Plan" tool call showing the plan, with its five choices; "Exited Plan
-Mode" once allowed) and replies "Plan: <option>", and "run-tests" asks to run `npm test` with
+Mode" once allowed, which moves it from plan mode to default) and replies "Plan: <option>",
+and "run-tests" asks to run `npm test` with
 Claude Agent's Yes, "Yes, and don't ask again for npm test commands" and No, replying "Ran:
 <option>". A No fails the tool call. "page" has an MCP tool ask the client to open a page
 (a URL elicitation tied to its tool call) and replies "Page: <action>".
@@ -326,6 +329,8 @@ TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwAD
 
 next_request_id = 1000
 pending = {}
+# The "running" prompt, which ends only when it's cancelled.
+running_turn = None
 # Messages steered into the turn in progress.
 steered = []
 mcp_servers = []
@@ -949,6 +954,10 @@ for line in sys.stdin:
             update(params["sessionId"], text_chunk("agent_message_chunk",
                                                    f"**Task stopped by user:** {name}."))
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopped": task is not None}})
+    elif method == "session/cancel":
+        if running_turn is not None:
+            send({"jsonrpc": "2.0", "id": running_turn, "result": {"stopReason": "cancelled"}})
+            running_turn = None
     elif method == "session/set_config_option":
         params = message["params"]
         settings[params["configId"]] = params["value"]
@@ -1007,6 +1016,11 @@ for line in sys.stdin:
             update(params["sessionId"], text_chunk("agent_message_chunk",
                                                    "MCP: " + call_mcp_tool(name, arguments)))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "running":
+            update(params["sessionId"], {"sessionUpdate": "tool_call", "toolCallId": "running-1",
+                                         "title": "sleep 60", "kind": "execute",
+                                         "status": "in_progress"})
+            running_turn = message["id"]
         elif prompt_text.startswith("tool-call "):
             calls = json.loads(prompt_text[len("tool-call "):])
             for index, call in enumerate(calls if isinstance(calls, list) else [calls]):
@@ -1041,6 +1055,11 @@ for line in sys.stdin:
             update(params["sessionId"], text_chunk("agent_message_chunk", reply))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "plan":
+            # Planned in plan mode, which an approval leaves, as Claude Agent's ExitPlanMode
+            # does.
+            settings["mode"] = "plan"
+            update(params["sessionId"], {"sessionUpdate": "config_option_update",
+                                         "configOptions": config_options()})
             chosen = ask_permission(message["id"], params["sessionId"], {
                 "toolCallId": f"plan-{message['id']}", "title": "Approve Plan",
                 "kind": "switch_mode", "rawInput": {"plan": PLAN},
@@ -1051,6 +1070,10 @@ for line in sys.stdin:
                 ("exit-plan-bypass", "Yes, and bypass permissions", "allow_always"),
                 ("exit-plan-default", "Yes, manually approve edits", "allow_once"),
                 ("reject", "No, keep planning", "reject_once")], "Exited Plan Mode")
+            if chosen.startswith("exit-plan"):
+                settings["mode"] = "default"
+                update(params["sessionId"], {"sessionUpdate": "config_option_update",
+                                             "configOptions": config_options()})
             update(params["sessionId"], text_chunk("agent_message_chunk", f"Plan: {chosen}"))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "run-tests":

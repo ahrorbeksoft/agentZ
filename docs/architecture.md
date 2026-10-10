@@ -605,14 +605,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   title with the thread folder stripped, always on one line (`one_line`: newlines and runs of
   spaces become one space, as t3code's truncated rows show a multi-line command, and a
   command's `\`-newline continuations too); a spinner while it runs, "Failed" when it fails
-  ("Denied" when the user said no to it), a chevron on hover. Every row starts closed and a click opens its output beside it (diffs,
-  terminals, text, images), up to 24 rems tall, with the input as JSON behind a small "Input"
-  line at its end (Zed's "View Raw Input"), left out for commands, edits and calls with an
-  image; its code blocks wrap long lines (t3code). A call awaiting permission stays open. Every
-  tool's text shows as it was printed, as one code block in the buffer font (`as_code_block`):
+  ("Stopped" or "Denied", dim, when the turn was stopped or the user said no to it), a chevron on hover. Every row starts closed and a click opens it into a card
+  (Zed's tool call card: the row its header, the output its body), up to 24 rems tall, with
+  the input as JSON behind a small "Input" line at its end (Zed's "View Raw Input"), left out
+  for commands, edits and calls with an image; long lines stay on one line and scroll
+  sideways. A call awaiting permission stays open. Every
+  tool's text shows as it was printed, in the buffer font with no colors (`as_code_block`):
   Claude fences some of it, but most agents send it bare, and as markdown a `git diff` lost its
-  lines and indentation, its `---` became a dash and its `-` lines bullets. A subagent's report
-  and a plan to approve are the texts still drawn as markdown. Rows are
+  lines and indentation, its `---` became a dash and its `-` lines bullets. A subagent's report,
+  a plan, a fetched page's notes and reported findings are the texts drawn as markdown. Rows are
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
   from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
   "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
@@ -621,7 +622,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   calls and thoughts folds into one line that opens to them once the agent writes a message
   after it, also mid-turn (t3code's work groups, `AgentView::folded_run`), saying what it did in
   t3code's words (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and
-  performed 2 other actions"), and a lone call stays a row. While the turn runs, its last run is
+  performed 2 other actions"), ending in the lines it changed (+7 −2) and "1 failed" in red
+  when a call failed, and a lone call stays a row. While the turn runs, its last run is
   one live line (t3code's `work-live` row, `AgentView::live_line`): the row of the tool call
   awaiting confirmation, with its buttons, else of the latest entry still running, else of the
   latest one; clicking it opens the run, and the run folds as usual when a message follows or
@@ -644,10 +646,38 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the base form when failed, and rows that made a subthread, thread or terminal end in "Open".
   A folded run counts them ("Started 3 subthreads"), first. Their titles come from
   `agentz_protocol::mcp_servers::AGENTZ_TOOLS`, which a server test keeps equal to its
-  definitions. A ToolSearch says "Loaded 3 agentZ tools" for a `select:` query or "Searched
-  tools for “issues”" with "2 found", and opens to the tools one a line by their titles, with
-  no JSON. Other MCP tools (`mcp_name`) read as the tool in words and their server, dimmer,
-  with a plug ("Create issue github").
+  definitions. A ToolSearch names the tools it loaded ("Loaded Create issue, List issues and
+  Add comment", cut off with "…", their server dimmer when they share one) or says "Searched
+  tools for “issues”" with "2 found", and has nothing to open. Other MCP tools (`mcp_name`)
+  read as the tool in words, its input's first short text value muted (`mcp_subject`), and
+  its server dimmer, with a plug ("Create issue Cart total off by a cent github").
+- **Every kind of tool call** (`tool_calls.rs`'s `AgentAction`, `agent_view.rs`'s
+  `render_tool_call`; picked in `design/tool-calls-2/`): agents' own tools say what they did
+  in the same words for every agent, told apart by kind, title, input and the agent's own
+  tool name (`ToolCall::tool_name`, Claude Agent's `_meta.claudeCode.toolName`). A read is a
+  row only, its lines dim after the path ("lines 1–120"), with no chevron, as in Zed. An edit
+  opens to a header per file (its icon, path, +2 −2 and Open, which shows the file in the
+  diff panel: `AgentViewEvent::OpenDiffFile`, `DiffPanel::reveal_file`) over its diff, with
+  the new file's line numbers in a gutter when the agent says where each hunk starts
+  (`FileDiff::start_line`, from Claude Agent's locations). A new file says "Created" (+3) and
+  opens to its lines with numbers, not a diff; "Deleted" (−42) opens to its lines, dimmer;
+  "Moved a → b". A grep reads "Searched for roundTotal in src" with "4 matches in 3 files"
+  dimmer and opens to the matches under each file, numbered, the pattern marked; a glob
+  "Found 3 files for **/*.test.ts" opens to the paths. A command opens to Zed's terminal
+  card: the folder it ran in, how long it took, its exit code if it failed, Stop while it
+  runs in agentZ's terminal, Copy, and a dashed red border when it failed. To-do and task
+  updates have no row (`is_hidden`): the plan bar shows the list. "Fetched
+  vitest.dev/api/expect" is a link that opens the browser, and opens to the agent's notes as
+  markdown beside a line; "Searched the web for “…”" opens to its results as links. A plan
+  to approve shows open, as markdown in a "Plan" card over the agent's choices; once
+  answered it folds to "Approved the plan", and the change of mode it made
+  (`ToolCall::mode_switch`, noted by `AgentThread::note_mode_switch`) is a line under it,
+  "Plan → Default". A skill reads "Loaded the review skill" (a book), findings "Reported 2
+  findings" (opening to them as markdown), a question "Asked you" (a speech bubble). A call
+  the turn's stop cut off is "Stopped" (`ToolCall::stopped`, set for every call still
+  running when a turn is stopped, as Zed cancels them). An image a tool gave back has its
+  name, size in pixels and on disk dim under it ("cart.png · 1280 × 800 · 212 KB",
+  `ToolCall::image_sizes`, read from the image's header when it's kept).
 - **Queued messages** (`server/queue_requests.rs`, `agent_view.rs`; Zed's message queue): a
   message sent while the agent works, or while others wait, joins the thread's queue on its
   server (`Request::QueueMessage`), which saves it in `queues.json` and sends one each time a

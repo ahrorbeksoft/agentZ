@@ -77,6 +77,9 @@ pub struct ToolCall {
     pub text: Vec<String>,
     pub diffs: Vec<FileDiff>,
     pub locations: Vec<PathBuf>,
+    /// Each of `locations`' line, when the agent gave one.
+    #[serde(default)]
+    pub location_lines: Vec<Option<u32>>,
     /// The tool's input as markdown (JSON in a code block), for Zed's "Raw Input" view.
     pub raw_input: Option<String>,
     /// Terminals the agent runs the tool in (ACP's `terminal/create`), by the ids it got:
@@ -86,6 +89,9 @@ pub struct ToolCall {
     /// Images the tool gave back, kept for the thread.
     #[serde(default)]
     pub images: Vec<AttachmentId>,
+    /// Each of `images`' size, when it could be read.
+    #[serde(default)]
+    pub image_sizes: Vec<Option<ImageSize>>,
     /// When the agent started it, if that was seen here rather than replayed.
     #[serde(default)]
     pub started_at: Option<SystemTime>,
@@ -99,6 +105,32 @@ pub struct ToolCall {
     /// form it asked them to fill in.
     #[serde(default)]
     pub answer: Option<ToolAnswer>,
+    /// The agent's own name for the tool, which its title may not say: Claude Agent's
+    /// `_meta.claudeCode.toolName` ("Grep", "TodoWrite").
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// It was still running when the turn was stopped.
+    #[serde(default)]
+    pub stopped: bool,
+    /// The change of mode it made once the user approved it, as a plan's approval leaves plan
+    /// mode.
+    #[serde(default)]
+    pub mode_switch: Option<ModeSwitch>,
+}
+
+/// An image's size in pixels and in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSize {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+}
+
+/// The agent's modes before and after a change, by their names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeSwitch {
+    pub from: String,
+    pub to: String,
 }
 
 /// The user's answer to a tool call's request, kept on the tool call so the thread shows it.
@@ -135,11 +167,43 @@ impl ToolAnswer {
 }
 
 impl ToolCall {
+    /// A tool call with nothing in it yet.
+    pub fn new(
+        id: acp::ToolCallId,
+        title: String,
+        kind: acp::ToolKind,
+        status: acp::ToolCallStatus,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            kind,
+            status,
+            text: Vec::new(),
+            diffs: Vec::new(),
+            locations: Vec::new(),
+            location_lines: Vec::new(),
+            raw_input: None,
+            terminals: Vec::new(),
+            images: Vec::new(),
+            image_sizes: Vec::new(),
+            started_at: None,
+            duration: None,
+            subthread: None,
+            answer: None,
+            tool_name: None,
+            stopped: false,
+            mode_switch: None,
+        }
+    }
+
+    /// Whether it still runs: the agent hasn't ended it, and the turn wasn't stopped.
     pub fn is_running(&self) -> bool {
-        matches!(
-            self.status,
-            acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
-        )
+        !self.stopped
+            && matches!(
+                self.status,
+                acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
+            )
     }
 }
 
@@ -156,6 +220,10 @@ pub struct FileDiff {
     pub path: PathBuf,
     pub old_text: Option<String>,
     pub new_text: String,
+    /// The line in the file `new_text` starts at, when it's known: agents send a whole file,
+    /// or a part of it with the line it's at.
+    #[serde(default)]
+    pub start_line: Option<u32>,
 }
 
 impl FileDiff {
@@ -187,6 +255,19 @@ impl FileDiff {
     /// The changed region with up to `context` unchanged lines on each side, as a diff editor
     /// would show it.
     pub fn hunk(&self, context: usize) -> Vec<(DiffLineKind, &str)> {
+        self.numbered_hunk(context)
+            .into_iter()
+            .map(|(kind, _, line)| (kind, line))
+            .collect()
+    }
+
+    /// [`Self::hunk`], with each line's number in the new file when it's known
+    /// ([`Self::start_line`]). Removed lines have none, as in Zed's editor.
+    pub fn numbered_hunk(&self, context: usize) -> Vec<(DiffLineKind, Option<u32>, &str)> {
+        let number = |index: usize| {
+            self.start_line
+                .map(|start| start.saturating_add(u32::try_from(index).unwrap_or(u32::MAX)))
+        };
         let new_lines: Vec<&str> = self.new_text.lines().collect();
         let old_lines: Vec<&str> = self
             .old_text
@@ -206,18 +287,18 @@ impl FileDiff {
             .count();
 
         let mut lines = Vec::new();
-        for line in &new_lines[common_prefix.saturating_sub(context)..common_prefix] {
-            lines.push((DiffLineKind::Context, *line));
+        for index in common_prefix.saturating_sub(context)..common_prefix {
+            lines.push((DiffLineKind::Context, number(index), new_lines[index]));
         }
         for line in &old_lines[common_prefix..old_lines.len() - common_suffix] {
-            lines.push((DiffLineKind::Removed, *line));
+            lines.push((DiffLineKind::Removed, None, *line));
         }
-        for line in &new_lines[common_prefix..new_lines.len() - common_suffix] {
-            lines.push((DiffLineKind::Added, *line));
+        for index in common_prefix..new_lines.len() - common_suffix {
+            lines.push((DiffLineKind::Added, number(index), new_lines[index]));
         }
         let suffix_start = new_lines.len() - common_suffix;
-        for line in &new_lines[suffix_start..(suffix_start + context).min(new_lines.len())] {
-            lines.push((DiffLineKind::Context, *line));
+        for index in suffix_start..(suffix_start + context).min(new_lines.len()) {
+            lines.push((DiffLineKind::Context, number(index), new_lines[index]));
         }
         lines
     }
@@ -970,6 +1051,19 @@ impl ThreadView {
         self.chosen_option_name(acp::SessionConfigOptionCategory::ThoughtLevel)
     }
 
+    /// The display name of the agent's current mode, from its mode selector or its modes.
+    pub fn mode_name(&self) -> Option<String> {
+        self.chosen_option_name(acp::SessionConfigOptionCategory::Mode)
+            .or_else(|| {
+                let modes = self.state.modes.as_ref()?;
+                modes
+                    .available_modes
+                    .iter()
+                    .find(|mode| mode.id == modes.current_mode_id)
+                    .map(|mode| mode.name.clone())
+            })
+    }
+
     /// The display name of what the agent's selector of `category` currently has chosen.
     fn chosen_option_name(&self, category: acp::SessionConfigOptionCategory) -> Option<String> {
         self.state.config_options.iter().find_map(|option| {
@@ -1400,22 +1494,12 @@ mod tests {
     use super::*;
 
     fn tool_call(title: &str, status: acp::ToolCallStatus) -> Entry {
-        Entry::ToolCall(ToolCall {
-            id: acp::ToolCallId::new(title.to_string()),
-            title: title.to_string(),
-            kind: acp::ToolKind::Other,
+        Entry::ToolCall(ToolCall::new(
+            acp::ToolCallId::new(title.to_string()),
+            title.to_string(),
+            acp::ToolKind::Other,
             status,
-            text: Vec::new(),
-            diffs: Vec::new(),
-            locations: Vec::new(),
-            raw_input: None,
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
-        })
+        ))
     }
 
     #[test]
@@ -1494,10 +1578,11 @@ mod tests {
 
     #[test]
     fn diff_line_counts() {
-        let diff = FileDiff {
+        let mut diff = FileDiff {
             path: PathBuf::from("a.rs"),
             old_text: Some("a\nb\nc\nd\n".into()),
             new_text: "a\nB\nB2\nc\nd\n".into(),
+            start_line: None,
         };
         assert_eq!(diff.line_counts(), (2, 1));
         assert_eq!(diff.changed_lines(), (vec!["b"], vec!["B", "B2"]));
@@ -1511,10 +1596,19 @@ mod tests {
                 (DiffLineKind::Context, "c"),
             ]
         );
+        diff.start_line = Some(10);
+        assert_eq!(
+            diff.numbered_hunk(1)
+                .into_iter()
+                .map(|(_, number, _)| number)
+                .collect::<Vec<_>>(),
+            vec![Some(10), None, Some(11), Some(12), Some(13)]
+        );
         let created = FileDiff {
             path: PathBuf::from("b.rs"),
             old_text: None,
             new_text: "x\ny\n".into(),
+            start_line: Some(1),
         };
         assert_eq!(created.line_counts(), (2, 0));
     }

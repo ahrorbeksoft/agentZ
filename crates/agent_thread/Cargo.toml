@@ -20,6 +20,7 @@ anyhow.workspace = true
 base64.workspace = true
 futures.workspace = true
 gpui_shared_string.workspace = true
+image.workspace = true
 libc.workspace = true
 log.workspace = true
 registry.workspace = true

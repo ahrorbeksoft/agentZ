@@ -22,8 +22,8 @@ use agentz_protocol::terminal::{
     TerminalSelectionKind, TerminalSelectionUpdate,
 };
 use agentz_protocol::thread::{
-    ConnectionStatus, Entry, FailedMessage, LoginInput, LostHistory, ThreadView, api_key_meta,
-    login_input,
+    ConnectionStatus, Entry, FailedMessage, LoginInput, LostHistory, ModeSwitch, ThreadView,
+    api_key_meta, login_input,
 };
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -1072,6 +1072,101 @@ async fn threads_outlive_their_clients() {
             })
         })
         .await;
+}
+
+/// A tool call the agent left running when its turn was stopped shows as stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_turn_stops_its_tool_calls() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("running"),
+        })
+        .await;
+    let running = |thread: &ThreadView| {
+        thread.entries().iter().find_map(|entry| match entry {
+            Entry::ToolCall(tool_call) if tool_call.title == "sleep 60" => Some(tool_call.clone()),
+            _ => None,
+        })
+    };
+    client
+        .wait_until(|client| running(client.thread(connection)).is_some())
+        .await;
+    assert!(running(client.thread(connection)).is_some_and(|tool_call| tool_call.is_running()));
+    client.ok(Request::Cancel(connection)).await;
+    client
+        .wait_until(|client| !client.thread(connection).is_working())
+        .await;
+    let stopped = running(client.thread(connection)).expect("the tool call");
+    assert!(stopped.stopped);
+    assert!(!stopped.is_running());
+    assert_eq!(stopped.status, acp::ToolCallStatus::InProgress);
+}
+
+/// An approved plan notes the mode it left, as Claude Agent's ExitPlanMode leaves plan mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approved_plan_notes_its_mode_switch() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("plan"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            !client
+                .thread(connection)
+                .state
+                .permission_requests
+                .is_empty()
+        })
+        .await;
+    assert_eq!(
+        config_value(client.thread(connection), "mode").as_deref(),
+        Some("plan")
+    );
+    let request = client.thread(connection).state.permission_requests[0].clone();
+    client
+        .ok(Request::RespondToPermission {
+            connection,
+            tool_call_id: request.tool_call_id,
+            option_id: acp::PermissionOptionId::new("exit-plan-default"),
+        })
+        .await;
+    client
+        .wait_until(|client| !client.thread(connection).is_working())
+        .await;
+    let switch = client
+        .thread(connection)
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::ToolCall(tool_call) if tool_call.kind == acp::ToolKind::SwitchMode => {
+                tool_call.mode_switch.clone()
+            }
+            _ => None,
+        });
+    assert_eq!(
+        switch,
+        Some(ModeSwitch {
+            from: "Plan".into(),
+            to: "Default".into(),
+        })
+    );
 }
 
 /// The sidebar shows a thread whose agent asked for input as awaiting it, until it's answered.

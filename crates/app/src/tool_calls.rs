@@ -696,6 +696,32 @@ impl CallState {
             _ => Self::Done,
         }
     }
+
+    /// [`Self::of`] its status, where a call cut off by a stopped turn or denied by the user
+    /// didn't happen either.
+    pub fn of_call(tool_call: &ToolCall) -> Self {
+        if tool_call.stopped && !matches!(tool_call.status, acp::ToolCallStatus::Completed) {
+            return Self::Failed;
+        }
+        if tool_call
+            .answer
+            .as_ref()
+            .is_some_and(agentz_protocol::thread::ToolAnswer::is_denied)
+        {
+            return Self::Failed;
+        }
+        Self::of(&tool_call.status)
+    }
+
+    /// The verb for what the call does, in the present while it runs, the past once done, and
+    /// as an order when it didn't happen.
+    fn verb<'a>(self, running: &'a str, done: &'a str, failed: &'a str) -> &'a str {
+        match self {
+            Self::Running => running,
+            Self::Done => done,
+            Self::Failed => failed,
+        }
+    }
 }
 
 struct Verbs {
@@ -814,29 +840,20 @@ impl ToolSearch {
         }
     }
 
-    /// "Loaded 8 agentZ tools", or "Searched tools for “subthread”".
+    /// "Loaded Create issue, List issues and Add comment", or "Searched tools for “subthread”".
     pub fn label(&self, state: CallState) -> String {
         match &self.query {
             ToolQuery::Select(_) => {
-                let count = self.tools.len();
-                let server = self
+                let verb = state.verb("Loading", "Loaded", "Load");
+                if self.tools.is_empty() {
+                    return format!("{verb} tools");
+                }
+                let names: Vec<String> = self
                     .tools
                     .iter()
-                    .map(|tool| ListedTool::named(tool).server())
-                    .reduce(|first, other| if first == other { first } else { None })
-                    .flatten();
-                let tools = match (server, count) {
-                    (Some(server), 1) => format!("1 {server} tool"),
-                    (Some(server), count) => format!("{count} {server} tools"),
-                    (None, 1) => "1 tool".to_string(),
-                    (None, count) => format!("{count} tools"),
-                };
-                let verb = match state {
-                    CallState::Running => "Loading",
-                    CallState::Done => "Loaded",
-                    CallState::Failed => "Load",
-                };
-                format!("{verb} {tools}")
+                    .map(|tool| ListedTool::named(tool).words())
+                    .collect();
+                format!("{verb} {}", join_words(&names))
             }
             ToolQuery::Words(words) => {
                 let verb = match state {
@@ -859,6 +876,29 @@ impl ToolSearch {
             ToolQuery::Words(_) if self.listed => Some(self.tools.len()),
             _ => None,
         }
+    }
+
+    /// The server of every tool it loaded by name, when they share one: "github", or "agentZ"
+    /// for agentZ's own.
+    pub fn server(&self) -> Option<String> {
+        match self.query {
+            ToolQuery::Select(_) => self
+                .tools
+                .iter()
+                .map(|tool| ListedTool::named(tool).server())
+                .reduce(|first, other| if first == other { first } else { None })
+                .flatten(),
+            ToolQuery::Words(_) => None,
+        }
+    }
+}
+
+/// Words joined as a sentence lists them: "A", "A and B", "A, B and C".
+pub fn join_words(words: &[String]) -> String {
+    match words {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -910,6 +950,908 @@ impl ListedTool {
             Self::Mcp(mcp) => Some(mcp.server.clone()),
             Self::Other(_) => None,
         }
+    }
+
+    /// What the tool does: agentZ's by its title, other MCP tools in words, and the agent's
+    /// own by name.
+    pub fn words(&self) -> String {
+        match self {
+            Self::Own(tool) => tool.title().to_string(),
+            Self::Mcp(mcp) => mcp.words(),
+            Self::Other(name) => name.clone(),
+        }
+    }
+}
+
+/// What one of the agent's own tools did, by what most agents' tools share
+/// (`design/tool-calls-2/decisions.md`), so its row says it in the same words for any agent.
+/// Edits and commands keep their own rows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentAction {
+    /// A to-do list or task update: the plan bar shows the list, so it has no row.
+    Todo,
+    /// A read, with the lines it got when known ("lines 1–120", "18 lines").
+    Read {
+        path: Option<PathBuf>,
+        lines: Option<String>,
+    },
+    /// A new file: the one diff it made has no old text.
+    Created {
+        path: PathBuf,
+        lines: usize,
+    },
+    Deleted {
+        path: Option<PathBuf>,
+        lines: Option<usize>,
+    },
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Grep(Grep),
+    Glob(Glob),
+    Fetch {
+        url: String,
+    },
+    WebSearch {
+        query: Option<String>,
+    },
+    Skill {
+        name: String,
+    },
+    Findings {
+        count: Option<usize>,
+    },
+    /// A question the agent asked the user.
+    Question {
+        question: Option<String>,
+    },
+    /// Anything else, by its kind and the agent's title.
+    Other,
+}
+
+/// A search of files' contents.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grep {
+    pub pattern: String,
+    pub path: Option<String>,
+    pub ignore_case: bool,
+}
+
+/// A search of files' names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Glob {
+    pub pattern: String,
+    pub path: Option<String>,
+}
+
+/// To-do and task tools, by their names in words run together: Claude Agent's TodoWrite and
+/// Task*, Codex's update_plan, Gemini CLI's write_todos.
+const TODO_TOOLS: [&str; 8] = [
+    "todowrite",
+    "todoread",
+    "taskcreate",
+    "taskupdate",
+    "tasklist",
+    "taskget",
+    "updateplan",
+    "writetodos",
+];
+
+/// Claude Agent's titles for its to-do and task tools.
+const TODO_TITLES: [&str; 6] = [
+    "Update TODOs",
+    "Update Todos",
+    "Create task:",
+    "Update task:",
+    "List tasks",
+    "Get task",
+];
+
+impl AgentAction {
+    pub fn of(tool_call: &ToolCall) -> Self {
+        let title = tool_call.title.trim();
+        let input = raw_input(tool_call);
+        let input_text = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| text_in(input.as_ref().and_then(|input| input.get(*key))))
+        };
+        if is_hidden(tool_call) {
+            return Self::Todo;
+        }
+        let name = tool_name(tool_call);
+        let is_think = matches!(tool_call.kind, acp::ToolKind::Think | acp::ToolKind::Other);
+        if name.as_deref() == Some("skill")
+            || title.starts_with("Load skill:")
+            || title.starts_with("Skill:")
+        {
+            let skill = input_text(&["skill", "name", "command"]).or_else(|| {
+                title
+                    .split_once(':')
+                    .map(|(_, name)| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+            });
+            if let Some(name) = skill {
+                return Self::Skill { name };
+            }
+        }
+        if name.as_deref() == Some("reportfindings")
+            || (title.starts_with("Report ") && title.contains("finding"))
+        {
+            let count = input
+                .as_ref()
+                .and_then(|input| input.get("findings"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .or_else(|| title.contains("none found").then_some(0))
+                .or_else(|| first_number(title));
+            return Self::Findings { count };
+        }
+        let questions = input
+            .as_ref()
+            .and_then(|input| input.get("questions"))
+            .and_then(Value::as_array);
+        if matches!(
+            name.as_deref(),
+            Some("askuserquestion" | "askuser" | "askfollowupquestion")
+        ) || (is_think && questions.is_some())
+        {
+            let question = questions
+                .and_then(|questions| questions.first())
+                .and_then(|question| text_in(question.get("question")))
+                .or_else(|| input_text(&["question"]))
+                .or_else(|| {
+                    (title != "Asking for your input" && name.is_none() && !title.is_empty())
+                        .then(|| title.to_string())
+                });
+            return Self::Question { question };
+        }
+
+        match tool_call.kind {
+            acp::ToolKind::Read => Self::Read {
+                path: file_path(tool_call),
+                lines: read_lines(tool_call),
+            },
+            acp::ToolKind::Delete => Self::Deleted {
+                path: tool_call
+                    .locations
+                    .first()
+                    .cloned()
+                    .or_else(|| tool_call.diffs.first().map(|diff| diff.path.clone()))
+                    .or_else(|| input_text(&["file_path", "path"]).map(PathBuf::from)),
+                lines: tool_call
+                    .diffs
+                    .first()
+                    .and_then(|diff| diff.old_text.as_ref())
+                    .map(|text| text.lines().count()),
+            },
+            acp::ToolKind::Move => match moved_paths(tool_call, input.as_ref()) {
+                Some((from, to)) => Self::Moved { from, to },
+                None => Self::Other,
+            },
+            acp::ToolKind::Search => search_of(tool_call, input.as_ref(), name.as_deref()),
+            acp::ToolKind::Fetch => {
+                let is_web_search = matches!(
+                    name.as_deref(),
+                    Some("websearch" | "googlewebsearch" | "searchweb")
+                ) || title.starts_with("Search \"")
+                    || title.starts_with("Web search")
+                    || title.starts_with("Searching the web")
+                    || title.starts_with("Searching the Web")
+                    || (input_text(&["query"]).is_some() && input_text(&["url"]).is_none());
+                if is_web_search {
+                    let query = input_text(&["query"]).or_else(|| {
+                        let quoted = title
+                            .strip_prefix("Search \"")
+                            .and_then(|rest| rest.strip_suffix('"'));
+                        let named = title
+                            .strip_prefix("Web search:")
+                            .map(str::trim)
+                            .filter(|query| !query.is_empty());
+                        quoted.or(named).map(str::to_string)
+                    });
+                    return Self::WebSearch { query };
+                }
+                match input_text(&["url"]).or_else(|| url_in(title)) {
+                    Some(url) => Self::Fetch { url },
+                    None => Self::Other,
+                }
+            }
+            _ => match tool_call.diffs.as_slice() {
+                [diff] if diff.old_text.is_none() => Self::Created {
+                    path: diff.path.clone(),
+                    lines: diff.new_text.lines().count(),
+                },
+                _ => Self::Other,
+            },
+        }
+    }
+
+    /// What its row says, with what it acted on, and dim words after them; `None` for those
+    /// whose row is drawn as before: edits, commands and tools nothing knows.
+    pub fn label(
+        &self,
+        tool_call: &ToolCall,
+        state: CallState,
+        folder: Option<&Path>,
+    ) -> Option<ActionLabel> {
+        let shown = |path: &Path| display_path(&path.to_string_lossy(), folder);
+        let label = match self {
+            Self::Todo | Self::Other => return None,
+            Self::Read { path, lines } => ActionLabel {
+                parts: vec![
+                    LabelPart::Words(state.verb("Reading", "Read", "Read").into()),
+                    LabelPart::Name(match path {
+                        Some(path) => shown(path),
+                        None => without_read_range(tool_call.title.trim())
+                            .trim_start_matches("Read ")
+                            .to_string(),
+                    }),
+                ],
+                detail: lines.clone(),
+            },
+            Self::Created { path, .. } => ActionLabel {
+                parts: vec![
+                    LabelPart::Words(state.verb("Creating", "Created", "Create").into()),
+                    LabelPart::Code(shown(path)),
+                ],
+                detail: None,
+            },
+            Self::Deleted { path, .. } => ActionLabel {
+                parts: vec![
+                    LabelPart::Words(state.verb("Deleting", "Deleted", "Delete").into()),
+                    match path {
+                        Some(path) => LabelPart::Code(shown(path)),
+                        None => LabelPart::Name(tool_call.title.trim().to_string()),
+                    },
+                ],
+                detail: None,
+            },
+            Self::Moved { from, to } => ActionLabel {
+                parts: vec![
+                    LabelPart::Words(state.verb("Moving", "Moved", "Move").into()),
+                    LabelPart::Code(shown(from)),
+                    LabelPart::Words("→".into()),
+                    LabelPart::Code(shown(to)),
+                ],
+                detail: None,
+            },
+            Self::Grep(grep) => {
+                let mut parts = vec![
+                    LabelPart::Words(
+                        state
+                            .verb("Searching for", "Searched for", "Search for")
+                            .into(),
+                    ),
+                    LabelPart::Code(grep.pattern.clone()),
+                ];
+                if let Some(path) = &grep.path {
+                    parts.push(LabelPart::Words("in".into()));
+                    parts.push(LabelPart::Name(display_path(path, folder)));
+                }
+                let detail = (state == CallState::Done)
+                    .then(|| output_text(tool_call))
+                    .flatten()
+                    .and_then(|text| grep_files(&text, grep.path.as_deref()))
+                    .map(|files| grep_count(&files));
+                ActionLabel { parts, detail }
+            }
+            Self::Glob(glob) => {
+                let found = (state == CallState::Done)
+                    .then(|| output_text(tool_call))
+                    .flatten()
+                    .map(|text| glob_paths(&text).len());
+                let verb = match (state, found) {
+                    (CallState::Running, _) => "Finding files for".to_string(),
+                    (CallState::Failed, _) => "Find files for".to_string(),
+                    (CallState::Done, Some(0)) => "Found no files for".to_string(),
+                    (CallState::Done, Some(1)) => "Found 1 file for".to_string(),
+                    (CallState::Done, Some(count)) => format!("Found {count} files for"),
+                    (CallState::Done, None) => "Found files for".to_string(),
+                };
+                ActionLabel {
+                    parts: vec![
+                        LabelPart::Words(verb),
+                        LabelPart::Code(glob.pattern.clone()),
+                    ],
+                    detail: None,
+                }
+            }
+            Self::Fetch { url } => ActionLabel {
+                parts: vec![
+                    LabelPart::Words(state.verb("Fetching", "Fetched", "Fetch").into()),
+                    LabelPart::Link {
+                        text: without_scheme(url),
+                        url: url.clone(),
+                    },
+                ],
+                detail: None,
+            },
+            Self::WebSearch { query } => {
+                let verb = state.verb("Searching the web", "Searched the web", "Search the web");
+                ActionLabel {
+                    parts: match query {
+                        Some(query) => vec![
+                            LabelPart::Words(format!("{verb} for")),
+                            LabelPart::Name(format!("“{query}”")),
+                        ],
+                        None => vec![LabelPart::Words(verb.into())],
+                    },
+                    detail: None,
+                }
+            }
+            Self::Skill { name } => ActionLabel {
+                parts: vec![
+                    LabelPart::Words(state.verb("Loading the", "Loaded the", "Load the").into()),
+                    LabelPart::Title(name.clone()),
+                    LabelPart::Words("skill".into()),
+                ],
+                detail: None,
+            },
+            Self::Findings { count } => ActionLabel {
+                parts: vec![LabelPart::Words(match (state, count) {
+                    (CallState::Running, _) => "Reporting findings".to_string(),
+                    (CallState::Failed, _) => "Report findings".to_string(),
+                    (CallState::Done, Some(0)) => "Reported no findings".to_string(),
+                    (CallState::Done, Some(1)) => "Reported 1 finding".to_string(),
+                    (CallState::Done, Some(count)) => format!("Reported {count} findings"),
+                    (CallState::Done, None) => "Reported findings".to_string(),
+                })],
+                detail: None,
+            },
+            Self::Question { question } => {
+                let mut parts = vec![LabelPart::Words(
+                    state.verb("Asking you", "Asked you", "Ask you").into(),
+                )];
+                parts.extend(question.clone().map(LabelPart::Name));
+                ActionLabel {
+                    parts,
+                    detail: None,
+                }
+            }
+        };
+        Some(label)
+    }
+}
+
+/// A row's words, in pieces drawn each its own way.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionLabel {
+    pub parts: Vec<LabelPart>,
+    /// Dim words after them: "lines 1–120", "4 matches in 3 files".
+    pub detail: Option<String>,
+}
+
+impl ActionLabel {
+    /// The label as plain text, for tests.
+    #[cfg(test)]
+    fn text(&self) -> String {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                LabelPart::Words(text)
+                | LabelPart::Name(text)
+                | LabelPart::Code(text)
+                | LabelPart::Title(text) => text.as_str(),
+                LabelPart::Link { text, .. } => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LabelPart {
+    /// Words in the row's gray, never cut short.
+    Words(String),
+    /// A name in the row's gray, cut short with "…" when it doesn't fit.
+    Name(String),
+    /// A path or a pattern, in the code font.
+    Code(String),
+    /// What it acted on, in the brighter gray.
+    Title(String),
+    /// An address that opens in the browser.
+    Link { text: String, url: String },
+}
+
+/// The agent's own name for the tool, in lowercase words run together ("todowrite"): Claude
+/// Agent's from its metadata, or a title that is one name.
+fn tool_name(tool_call: &ToolCall) -> Option<String> {
+    let name = match tool_call.tool_name.as_deref() {
+        Some(name) => name,
+        None => {
+            let title = tool_call.title.trim();
+            if title.is_empty() || !is_name(title) {
+                return None;
+            }
+            title
+        }
+    };
+    Some(
+        name.chars()
+            .filter(|character| !matches!(character, '_' | '-' | ' ' | '.'))
+            .flat_map(char::to_lowercase)
+            .collect(),
+    )
+}
+
+/// Whether the call is a to-do or task update, which has no row: told apart by its name or
+/// title alone, since every run's rows ask.
+pub fn is_hidden(tool_call: &ToolCall) -> bool {
+    if !matches!(tool_call.kind, acp::ToolKind::Think | acp::ToolKind::Other) {
+        return false;
+    }
+    let title = tool_call.title.trim();
+    TODO_TITLES.iter().any(|prefix| title.starts_with(prefix))
+        || tool_name(tool_call).is_some_and(|name| TODO_TOOLS.contains(&name.as_str()))
+}
+
+/// A path as the row shows it: inside the thread's folder, from there.
+pub fn display_path(path: &str, folder: Option<&Path>) -> String {
+    let Some(folder) = folder else {
+        return path.to_string();
+    };
+    match Path::new(path).strip_prefix(folder) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
+/// The lines a read got: the range Claude Agent puts in its title ("(1 - 120)", "(from line
+/// 40)"), or else how many lines came back.
+fn read_lines(tool_call: &ToolCall) -> Option<String> {
+    let title = tool_call.title.trim();
+    if let Some(range) = title
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" ("))
+        .map(|(_, range)| range)
+    {
+        if let Some((start, end)) = range.split_once(" - ")
+            && let (Ok(start), Ok(end)) = (start.trim().parse::<u32>(), end.trim().parse::<u32>())
+        {
+            return Some(format!("lines {start}–{end}"));
+        }
+        if let Some(start) = range
+            .strip_prefix("from line ")
+            .and_then(|start| start.trim().parse::<u32>().ok())
+        {
+            return Some(format!("from line {start}"));
+        }
+    }
+    if !tool_call.images.is_empty() || !matches!(tool_call.status, acp::ToolCallStatus::Completed) {
+        return None;
+    }
+    let text = output_text(tool_call)?;
+    let count = text
+        .lines()
+        .filter(|line| !line.starts_with("[File truncated"))
+        .count();
+    Some(match count {
+        1 => "1 line".to_string(),
+        count => format!("{count} lines"),
+    })
+}
+
+/// A read's title without the range Claude Agent adds after its path.
+fn without_read_range(title: &str) -> &str {
+    match title.rsplit_once(" (") {
+        Some((rest, range))
+            if range.ends_with(')')
+                && range.chars().any(|character| character.is_ascii_digit()) =>
+        {
+            rest
+        }
+        _ => title,
+    }
+}
+
+/// Where a move went from and to: its input's two paths, its two places, or its title's.
+fn moved_paths(tool_call: &ToolCall, input: Option<&Value>) -> Option<(PathBuf, PathBuf)> {
+    let pairs = [
+        ("source", "destination"),
+        ("from", "to"),
+        ("old_path", "new_path"),
+        ("source_path", "destination_path"),
+        ("src", "dst"),
+    ];
+    if let Some(input) = input {
+        for (from, to) in pairs {
+            if let (Some(from), Some(to)) = (text_in(input.get(from)), text_in(input.get(to))) {
+                return Some((from.into(), to.into()));
+            }
+        }
+    }
+    if let [from, to] = tool_call.locations.as_slice() {
+        return Some((from.clone(), to.clone()));
+    }
+    let title = tool_call.title.trim();
+    let rest = title
+        .strip_prefix("Move ")
+        .or_else(|| title.strip_prefix("Rename "))?;
+    let (from, to) = rest
+        .split_once(" → ")
+        .or_else(|| rest.split_once(" -> "))
+        .or_else(|| rest.split_once(" to "))?;
+    let unquote = |path: &str| path.trim().trim_matches(['`', '\'', '"']).to_string();
+    Some((unquote(from).into(), unquote(to).into()))
+}
+
+/// A search, as a grep or a glob, from its input or each agent's title: Claude Agent's `grep
+/// -i "pattern" path` and "Find `path` `pattern`", Codex's "Search for 'pattern' in path",
+/// Factory Droid's "Grep pattern in path".
+fn search_of(tool_call: &ToolCall, input: Option<&Value>, name: Option<&str>) -> AgentAction {
+    let title = tool_call.title.trim();
+    let input_text = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| text_in(input.and_then(|input| input.get(*key))))
+    };
+    let backticked: Vec<&str> = title.split('`').skip(1).step_by(2).collect();
+    let is_glob = matches!(name, Some("glob" | "globfiles" | "findfiles"))
+        || title.starts_with("Find `")
+        || title.starts_with("Glob ");
+    if is_glob {
+        let pattern = input_text(&["pattern", "glob", "glob_pattern"])
+            .or_else(|| backticked.last().map(|pattern| pattern.to_string()))
+            .or_else(|| title.strip_prefix("Glob ").map(str::to_string));
+        let path = input_text(&["path", "dir_path", "directory", "folder"])
+            .or_else(|| (backticked.len() >= 2).then(|| backticked[0].to_string()));
+        return match pattern {
+            Some(pattern) => AgentAction::Glob(Glob { pattern, path }),
+            None => AgentAction::Other,
+        };
+    }
+    let ignore_case = input.is_some_and(|input| {
+        ["-i", "case_insensitive", "ignore_case", "ignoreCase"]
+            .iter()
+            .any(|key| input.get(*key).and_then(Value::as_bool) == Some(true))
+    }) || title.starts_with("grep -i")
+        || title.contains(" -i ");
+    let pattern = input_text(&["pattern", "regex", "query"]);
+    let path = input_text(&["path", "file_path", "dir_path", "directory"]);
+    let (pattern, path) = match pattern {
+        Some(pattern) => (Some(pattern), path),
+        None => match grep_title(title) {
+            Some((pattern, title_path)) => (Some(pattern), path.or(title_path)),
+            None => (None, path),
+        },
+    };
+    match pattern {
+        Some(pattern) => AgentAction::Grep(Grep {
+            pattern,
+            path,
+            ignore_case,
+        }),
+        None => AgentAction::Other,
+    }
+}
+
+/// The pattern and path in a search's title.
+fn grep_title(title: &str) -> Option<(String, Option<String>)> {
+    let some_path = |path: &str| {
+        let path = path.trim().trim_matches(['\'', '"', '`']);
+        (!path.is_empty()).then(|| path.to_string())
+    };
+    if title.starts_with("grep ") {
+        let (_, quoted) = title.split_once('"')?;
+        let (pattern, rest) = quoted.rsplit_once('"')?;
+        return Some((pattern.replace("\\\"", "\""), some_path(rest)));
+    }
+    let rest = title
+        .strip_prefix("Search for ")
+        .or_else(|| title.strip_prefix("Search "))
+        .or_else(|| title.strip_prefix("Grep "))?;
+    let (pattern, path) = match rest.rsplit_once(" in ") {
+        Some((pattern, path)) => (pattern, some_path(path)),
+        None => (rest, None),
+    };
+    let pattern = pattern.trim().trim_matches(['\'', '"', '`']);
+    (!pattern.is_empty()).then(|| (pattern.to_string(), path))
+}
+
+/// The tool's output, as one text, outside any code fence it came in.
+pub fn output_text(tool_call: &ToolCall) -> Option<String> {
+    let texts: Vec<&str> = tool_call
+        .text
+        .iter()
+        .map(|text| unfenced(text))
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+/// Text outside the code fence around it, when it's all one fenced block.
+pub fn unfenced(text: &str) -> &str {
+    let trimmed = text.trim();
+    let fence_length = trimmed.len() - trimmed.trim_start_matches('`').len();
+    if fence_length < 3 {
+        return text;
+    }
+    let Some((_, body)) = trimmed.split_once('\n') else {
+        return text;
+    };
+    let body = body.trim_end();
+    let Some(body) = body.strip_suffix(&trimmed[..fence_length]) else {
+        return text;
+    };
+    body.strip_suffix('\n').unwrap_or(body)
+}
+
+/// One file's matches in a grep's output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrepFile {
+    pub path: String,
+    pub lines: Vec<GrepLine>,
+    /// How many matches the output counted, when it only counted them.
+    pub count: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrepLine {
+    pub number: u32,
+    pub text: String,
+}
+
+impl GrepFile {
+    pub fn matches(&self) -> usize {
+        self.count.unwrap_or(self.lines.len())
+    }
+}
+
+/// The files and lines a grep's output names, as grep and ripgrep print them (`path:line:text`,
+/// `path:count`, or paths alone), or `None` when the output is something else, which then shows
+/// as printed. `searched` is the file a search of one file printed bare `line:text` lines for.
+pub fn grep_files(text: &str, searched: Option<&str>) -> Option<Vec<GrepFile>> {
+    fn file(files: &mut Vec<GrepFile>, path: &str) -> usize {
+        match files.iter().position(|file| file.path == path) {
+            Some(index) => index,
+            None => {
+                files.push(GrepFile {
+                    path: path.to_string(),
+                    lines: Vec::new(),
+                    count: None,
+                });
+                files.len() - 1
+            }
+        }
+    }
+    let mut files: Vec<GrepFile> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed == "--"
+            || trimmed.starts_with('[')
+            || trimmed.starts_with("Found ")
+            || trimmed.starts_with("No matches")
+            || trimmed.starts_with("No files")
+        {
+            continue;
+        }
+        if let Some((path, rest)) = line.split_once(':') {
+            if let Some((number, text)) = rest.split_once(':')
+                && let Ok(number) = number.parse::<u32>()
+                && !path.is_empty()
+            {
+                let index = file(&mut files, path);
+                files[index].lines.push(GrepLine {
+                    number,
+                    text: text.to_string(),
+                });
+                continue;
+            }
+            if let Ok(number) = path.parse::<u32>()
+                && let Some(searched) = searched
+            {
+                let index = file(&mut files, searched);
+                files[index].lines.push(GrepLine {
+                    number,
+                    text: rest.to_string(),
+                });
+                continue;
+            }
+            if let Ok(count) = rest.trim().parse::<usize>() {
+                let index = file(&mut files, path);
+                files[index].count = Some(count);
+                continue;
+            }
+        }
+        // A context line (`path-line-text`) of a search with -A, -B or -C.
+        if files.iter().any(|file| {
+            line.strip_prefix(file.path.as_str())
+                .and_then(|rest| rest.strip_prefix('-'))
+                .and_then(|rest| rest.split_once('-'))
+                .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
+        }) {
+            continue;
+        }
+        if line.contains('\t') || line.starts_with(' ') || line.contains(": ") {
+            return None;
+        }
+        file(&mut files, trimmed);
+    }
+    Some(files)
+}
+
+/// "4 matches in 3 files", "3 files" when only files were listed, or "No matches".
+pub fn grep_count(files: &[GrepFile]) -> String {
+    let plural = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    if files.is_empty() {
+        return "No matches".to_string();
+    }
+    let file_count = plural(files.len(), "file", "files");
+    if files
+        .iter()
+        .all(|file| file.lines.is_empty() && file.count.is_none())
+    {
+        return file_count;
+    }
+    let matches: usize = files.iter().map(GrepFile::matches).sum();
+    format!("{} in {file_count}", plural(matches, "match", "matches"))
+}
+
+/// The paths a glob's output lists, one a line.
+pub fn glob_paths(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with('[')
+                && !line.starts_with('(')
+                && !line.starts_with("No files")
+                && !line.starts_with("Found ")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// A web search's result: a page's title and address.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebHit {
+    pub title: String,
+    pub url: String,
+}
+
+/// The pages a web search's output names: Claude Agent's "Title (url)" lines, markdown links,
+/// or JSON with titles and addresses ("Links: [{"title": …, "url": …}]").
+pub fn web_hits(text: &str) -> Vec<WebHit> {
+    fn push(hits: &mut Vec<WebHit>, title: &str, url: &str) {
+        let url = url.trim();
+        if (url.starts_with("http://") || url.starts_with("https://"))
+            && !hits.iter().any(|hit| hit.url == url)
+        {
+            let title = title.trim();
+            hits.push(WebHit {
+                title: if title.is_empty() {
+                    without_scheme(url)
+                } else {
+                    title.to_string()
+                },
+                url: url.to_string(),
+            });
+        }
+    }
+    fn json_hits(value: &Value, hits: &mut Vec<WebHit>) {
+        match value {
+            Value::Array(values) => values.iter().for_each(|value| json_hits(value, hits)),
+            Value::Object(object) => {
+                if let Some(url) = object.get("url").and_then(Value::as_str) {
+                    let title = object.get("title").and_then(Value::as_str).unwrap_or("");
+                    push(hits, title, url);
+                } else {
+                    object.values().for_each(|value| json_hits(value, hits));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hits = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line);
+        if let Some(json) = line.strip_prefix("Links: ")
+            && let Ok(value) = serde_json::from_str::<Value>(json)
+        {
+            json_hits(&value, &mut hits);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[')
+            && let Some((title, rest)) = rest.split_once("](")
+            && let Some((url, _)) = rest.split_once(')')
+        {
+            push(&mut hits, title, url);
+            continue;
+        }
+        if let Some(rest) = line.strip_suffix(')')
+            && let Some((title, url)) = rest.rsplit_once(" (")
+        {
+            push(&mut hits, title, url);
+        }
+    }
+    if hits.is_empty()
+        && let Some(value) = json_in(text)
+    {
+        json_hits(&value, &mut hits);
+    }
+    hits
+}
+
+/// An address without its scheme or its last slash, as a row shows it.
+pub fn without_scheme(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.trim_end_matches('/').to_string()
+}
+
+/// The first web address in a text, as in Claude Agent's "Fetch https://… (from char 40)".
+fn url_in(text: &str) -> Option<String> {
+    let start = text.find("https://").or_else(|| text.find("http://"))?;
+    let url = text[start..].split_whitespace().next()?;
+    Some(url.to_string())
+}
+
+fn first_number(text: &str) -> Option<usize> {
+    text.split(|character: char| !character.is_ascii_digit())
+        .find(|digits| !digits.is_empty())
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// How a command ended, when its output says: Claude Agent's "Exit code 1", or "Process exited
+/// with code 1" as agentZ's and Factory Droid's commands print it.
+pub fn exit_code(tool_call: &ToolCall) -> Option<i32> {
+    tool_call.text.iter().rev().find_map(|text| {
+        text.lines().rev().find_map(|line| {
+            let line = line.trim().trim_start_matches('[').trim_end_matches(']');
+            let lowered = line.to_ascii_lowercase();
+            let rest = lowered
+                .strip_prefix("exit code")
+                .or_else(|| lowered.strip_prefix("process exited with code"))?;
+            rest.trim_start_matches([':', ' ']).trim().parse().ok()
+        })
+    })
+}
+
+/// Where a command ran, when its input says.
+pub fn command_folder(tool_call: &ToolCall) -> Option<String> {
+    let input = raw_input(tool_call)?;
+    ["cwd", "workdir", "working_directory", "dir"]
+        .iter()
+        .find_map(|key| text_in(input.get(*key)))
+}
+
+/// The first short text an MCP tool was given, which is usually what it acted on: an issue's
+/// title, a query.
+pub fn mcp_subject(tool_call: &ToolCall) -> Option<String> {
+    const SHORT: usize = 60;
+    let codex_input = tool_call
+        .title
+        .trim()
+        .starts_with("Tool: ")
+        .then(|| raw_input(tool_call))
+        .flatten();
+    let arguments = tool_arguments(codex_input.or_else(|| raw_input(tool_call)));
+    arguments.as_object()?.values().find_map(|value| {
+        let text = value.as_str()?.trim();
+        (!text.is_empty() && !text.contains('\n') && text.chars().count() <= SHORT)
+            .then(|| text.to_string())
+    })
+}
+
+/// A size on disk as people read it: "212 KB", "1.4 MB".
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{} KB", (bytes + KB / 2) / KB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
     }
 }
 
@@ -1054,25 +1996,19 @@ mod tests {
 
     fn tool_call(title: &str, raw_input: Option<Value>, output: Option<&str>) -> ToolCall {
         ToolCall {
-            id: acp::ToolCallId::new("call"),
-            title: title.to_string(),
-            kind: acp::ToolKind::Other,
-            status: acp::ToolCallStatus::Completed,
             text: output.into_iter().map(str::to_string).collect(),
-            diffs: Vec::new(),
-            locations: Vec::new(),
             raw_input: raw_input.map(|input| {
                 format!(
                     "```json\n{}\n```",
                     serde_json::to_string_pretty(&input).unwrap_or_default()
                 )
             }),
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
+            ..ToolCall::new(
+                acp::ToolCallId::new("call"),
+                title.to_string(),
+                acp::ToolKind::Other,
+                acp::ToolCallStatus::Completed,
+            )
         }
     }
 
@@ -1349,8 +2285,15 @@ mod tests {
         let ToolCallKind::ToolSearch(search) = ToolCallKind::of(&loaded) else {
             panic!("a ToolSearch");
         };
-        assert_eq!(search.label(CallState::Done), "Loaded 2 agentZ tools");
-        assert_eq!(search.label(CallState::Running), "Loading 2 agentZ tools");
+        assert_eq!(
+            search.label(CallState::Done),
+            "Loaded Delegate a child task and Get delegated task status"
+        );
+        assert_eq!(
+            search.label(CallState::Running),
+            "Loading Delegate a child task and Get delegated task status"
+        );
+        assert_eq!(search.server().as_deref(), Some("agentZ"));
         assert_eq!(search.found(), None);
         assert_eq!(
             search
@@ -1364,7 +2307,7 @@ mod tests {
             ]
         );
 
-        // Without output naming them, the query does; tools of several servers are just tools.
+        // Without output naming them, the query does; tools of several servers name none.
         let mixed = tool_call(
             "ToolSearch",
             Some(json!({"query": "select:mcp__github__create_issue,WebFetch"})),
@@ -1373,7 +2316,11 @@ mod tests {
         let ToolCallKind::ToolSearch(search) = ToolCallKind::of(&mixed) else {
             panic!("a ToolSearch");
         };
-        assert_eq!(search.label(CallState::Done), "Loaded 2 tools");
+        assert_eq!(
+            search.label(CallState::Done),
+            "Loaded Create issue and WebFetch"
+        );
+        assert_eq!(search.server(), None);
         assert_eq!(
             ListedTool::named("mcp__github__create_issue"),
             ListedTool::Mcp(McpName {
@@ -1457,5 +2404,283 @@ mod tests {
 
         let task = tool_call("Task", Some(json!({"description": "Not a subagent"})), None);
         assert!(matches!(ToolCallKind::of(&task), ToolCallKind::Plain));
+    }
+
+    fn label_text(tool_call: &ToolCall, folder: Option<&Path>) -> Option<(String, Option<String>)> {
+        let label =
+            AgentAction::of(tool_call).label(tool_call, CallState::of_call(tool_call), folder)?;
+        Some((label.text(), label.detail))
+    }
+
+    #[test]
+    fn every_agents_reads_and_files_read_the_same() {
+        let folder = Path::new("/work/storefront");
+        let mut claude = tool_call(
+            "Read /work/storefront/src/cart/total.ts (1 - 120)",
+            Some(json!({"file_path": "/work/storefront/src/cart/total.ts"})),
+            Some("1\tconst a = 1;"),
+        );
+        claude.kind = acp::ToolKind::Read;
+        assert_eq!(
+            label_text(&claude, Some(folder)),
+            Some((
+                "Read src/cart/total.ts".to_string(),
+                Some("lines 1–120".to_string())
+            ))
+        );
+        let mut codex = tool_call(
+            "Read total.ts",
+            Some(json!({"path": "/work/storefront/src/cart/total.ts"})),
+            Some("a\nb\nc"),
+        );
+        codex.kind = acp::ToolKind::Read;
+        assert_eq!(
+            label_text(&codex, Some(folder)),
+            Some((
+                "Read src/cart/total.ts".to_string(),
+                Some("3 lines".to_string())
+            ))
+        );
+
+        let mut created = tool_call("Write /work/storefront/src/cart/round.ts", None, None);
+        created.kind = acp::ToolKind::Edit;
+        created.diffs = vec![agentz_protocol::thread::FileDiff {
+            path: "/work/storefront/src/cart/round.ts".into(),
+            old_text: None,
+            new_text: "a\nb\nc\n".into(),
+            start_line: Some(1),
+        }];
+        assert_eq!(
+            AgentAction::of(&created),
+            AgentAction::Created {
+                path: "/work/storefront/src/cart/round.ts".into(),
+                lines: 3
+            }
+        );
+        assert_eq!(
+            label_text(&created, Some(folder)),
+            Some(("Created src/cart/round.ts".to_string(), None))
+        );
+
+        let mut deleted = tool_call("Delete src/cart/legacy.ts", None, None);
+        deleted.kind = acp::ToolKind::Delete;
+        deleted.locations = vec!["/work/storefront/src/cart/legacy.ts".into()];
+        assert_eq!(
+            label_text(&deleted, Some(folder)),
+            Some(("Deleted src/cart/legacy.ts".to_string(), None))
+        );
+
+        let mut moved = tool_call("Move src/cart/util.ts to src/cart/round.ts", None, None);
+        moved.kind = acp::ToolKind::Move;
+        assert_eq!(
+            label_text(&moved, Some(folder)),
+            Some((
+                "Moved src/cart/util.ts → src/cart/round.ts".to_string(),
+                None
+            ))
+        );
+
+        // Edits and commands keep their own rows.
+        let mut edit = tool_call("Edit src/cart/total.ts", None, None);
+        edit.kind = acp::ToolKind::Edit;
+        assert_eq!(AgentAction::of(&edit), AgentAction::Other);
+        assert_eq!(label_text(&edit, None), None);
+    }
+
+    #[test]
+    fn every_agents_searches_read_the_same() {
+        let output = "src/cart/total.ts:3:  return roundTotal(sum);\nsrc/cart/total.ts:9:export function roundTotal(\nsrc/cart/round.ts:1:import { roundTotal }";
+        for title in [
+            "grep -n \"roundTotal\" src",
+            "Search for 'roundTotal' in src",
+            "Grep roundTotal in src",
+        ] {
+            let mut search = tool_call(title, None, Some(output));
+            search.kind = acp::ToolKind::Search;
+            assert_eq!(
+                AgentAction::of(&search),
+                AgentAction::Grep(Grep {
+                    pattern: "roundTotal".into(),
+                    path: Some("src".into()),
+                    ignore_case: false,
+                }),
+                "{title}"
+            );
+            assert_eq!(
+                label_text(&search, None),
+                Some((
+                    "Searched for roundTotal in src".to_string(),
+                    Some("3 matches in 2 files".to_string())
+                )),
+                "{title}"
+            );
+        }
+        let files = grep_files(output, None).unwrap_or_default();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].lines[1].number, 9);
+        assert_eq!(
+            grep_files("src/a.ts:2\nsrc/b.ts:5", None).map(|files| grep_count(&files)),
+            Some("7 matches in 2 files".to_string())
+        );
+        assert_eq!(
+            grep_files("src/a.ts\nsrc/b.ts", None).map(|files| grep_count(&files)),
+            Some("2 files".to_string())
+        );
+        let mut ignoring_case = tool_call(
+            "grep -i \"total\" src",
+            Some(json!({"pattern": "total", "-i": true})),
+            None,
+        );
+        ignoring_case.kind = acp::ToolKind::Search;
+        assert!(matches!(
+            AgentAction::of(&ignoring_case),
+            AgentAction::Grep(Grep {
+                ignore_case: true,
+                ..
+            })
+        ));
+
+        let mut glob = tool_call(
+            "Find `src` `**/*.test.ts`",
+            None,
+            Some("src/a.test.ts\nsrc/b.test.ts\nsrc/c.test.ts"),
+        );
+        glob.kind = acp::ToolKind::Search;
+        assert_eq!(
+            AgentAction::of(&glob),
+            AgentAction::Glob(Glob {
+                pattern: "**/*.test.ts".into(),
+                path: Some("src".into()),
+            })
+        );
+        assert_eq!(
+            label_text(&glob, None),
+            Some(("Found 3 files for **/*.test.ts".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn pages_and_web_searches_say_what_they_fetched() {
+        let mut fetch = tool_call("Fetch https://vitest.dev/api/expect", None, None);
+        fetch.kind = acp::ToolKind::Fetch;
+        assert_eq!(
+            AgentAction::of(&fetch),
+            AgentAction::Fetch {
+                url: "https://vitest.dev/api/expect".into()
+            }
+        );
+        assert_eq!(
+            label_text(&fetch, None),
+            Some(("Fetched vitest.dev/api/expect".to_string(), None))
+        );
+
+        for title in [
+            "Search \"vitest toBeCloseTo\"",
+            "Web search: vitest toBeCloseTo",
+        ] {
+            let mut search = tool_call(title, None, None);
+            search.kind = acp::ToolKind::Fetch;
+            assert_eq!(
+                label_text(&search, None),
+                Some((
+                    "Searched the web for “vitest toBeCloseTo”".to_string(),
+                    None
+                )),
+                "{title}"
+            );
+        }
+        let output = "Web search results for query: \"vitest toBeCloseTo\"\n\nLinks: [{\"title\":\"expect | Vitest\",\"url\":\"https://vitest.dev/api/expect\"},{\"title\":\"Expect\",\"url\":\"https://jestjs.io/docs/expect\"}]";
+        assert_eq!(
+            web_hits(output),
+            vec![
+                WebHit {
+                    title: "expect | Vitest".into(),
+                    url: "https://vitest.dev/api/expect".into()
+                },
+                WebHit {
+                    title: "Expect".into(),
+                    url: "https://jestjs.io/docs/expect".into()
+                },
+            ]
+        );
+        assert_eq!(
+            web_hits("- [Vitest](https://vitest.dev/)"),
+            vec![WebHit {
+                title: "Vitest".into(),
+                url: "https://vitest.dev/".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn tools_many_agents_share_read_in_words() {
+        let skill = tool_call("Load skill: review", None, None);
+        assert_eq!(
+            label_text(&skill, None),
+            Some(("Loaded the review skill".to_string(), None))
+        );
+        let findings = tool_call(
+            "Report 2 findings",
+            Some(json!({"findings": [{"title": "a"}, {"title": "b"}]})),
+            None,
+        );
+        assert_eq!(
+            label_text(&findings, None),
+            Some(("Reported 2 findings".to_string(), None))
+        );
+        let mut question = tool_call(
+            "AskUserQuestion",
+            Some(json!({"questions": [{"question": "Which approach?", "header": "Approach"}]})),
+            None,
+        );
+        question.tool_name = Some("AskUserQuestion".into());
+        assert_eq!(
+            label_text(&question, None),
+            Some(("Asked you Which approach?".to_string(), None))
+        );
+
+        // To-do lists show in the plan bar, so they have no row.
+        let mut todos = tool_call("Update TODOs: Round once", None, None);
+        todos.kind = acp::ToolKind::Think;
+        assert!(is_hidden(&todos));
+        assert_eq!(AgentAction::of(&todos), AgentAction::Todo);
+        let mut codex_plan = tool_call("update_plan", None, None);
+        codex_plan.kind = acp::ToolKind::Other;
+        assert!(is_hidden(&codex_plan));
+        let mut read = tool_call("TodoWrite", None, None);
+        read.kind = acp::ToolKind::Read;
+        assert!(!is_hidden(&read));
+
+        // A tool nothing knows keeps its title.
+        let notebook = tool_call("NotebookEdit", None, None);
+        assert_eq!(AgentAction::of(&notebook), AgentAction::Other);
+    }
+
+    #[test]
+    fn commands_and_mcp_tools_say_how_they_ended_and_what_they_acted_on() {
+        let mut claude = tool_call("npm test", None, Some("FAIL src/cart\nExit code 1"));
+        claude.kind = acp::ToolKind::Execute;
+        assert_eq!(exit_code(&claude), Some(1));
+        let mut droid = tool_call("npm test", None, Some("ok\n[Process exited with code 0]"));
+        droid.kind = acp::ToolKind::Execute;
+        assert_eq!(exit_code(&droid), Some(0));
+        let mut cwd = tool_call("ls", Some(json!({"command": "ls", "cwd": "/work"})), None);
+        cwd.kind = acp::ToolKind::Execute;
+        assert_eq!(command_folder(&cwd).as_deref(), Some("/work"));
+
+        let issue = tool_call(
+            "mcp__github__create_issue",
+            Some(
+                json!({"body": "Long\ntext", "title": "Cart total off by a cent", "labels": ["bug"]}),
+            ),
+            None,
+        );
+        assert_eq!(
+            mcp_subject(&issue).as_deref(),
+            Some("Cart total off by a cent")
+        );
+        assert_eq!(format_bytes(212 * 1024), "212 KB");
+        assert_eq!(format_bytes(1_468_006), "1.4 MB");
+        assert_eq!(format_bytes(900), "900 B");
     }
 }

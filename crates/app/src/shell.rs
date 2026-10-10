@@ -200,6 +200,9 @@ impl Shell {
                 window,
                 |this, _, event, window, cx| match event {
                     SpacesViewEvent::OpenThread(thread) => this.open_thread(*thread, window, cx),
+                    SpacesViewEvent::OpenDiffFile { thread, path } => {
+                        this.open_diff_file(*thread, path.clone(), window, cx)
+                    }
                     SpacesViewEvent::NewThreadInPane { pane, folder } => {
                         this.start_pane_draft(*pane, folder.clone(), window, cx)
                     }
@@ -839,6 +842,24 @@ impl Shell {
         cx.notify();
     }
 
+    /// Shows the thread with its diff panel open at the file's changes.
+    fn open_diff_file(
+        &mut self,
+        thread: ThreadKey,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_thread != Some(thread) || self.view != MainView::Agents {
+            self.open_thread(thread, window, cx);
+        }
+        self.show_diff = true;
+        self.sync_diff_panel(cx);
+        if let Some(panel) = &self.diff_panel {
+            panel.update(cx, |panel, cx| panel.reveal_file(path, cx));
+        }
+    }
+
     fn handle_diff_panel_event(
         &mut self,
         _: Entity<DiffPanel>,
@@ -1151,6 +1172,9 @@ impl Shell {
                     cx,
                 ),
                 AgentViewEvent::OpenThreadOn(other) => this.open_thread(*other, window, cx),
+                AgentViewEvent::OpenDiffFile(path) => {
+                    this.open_diff_file(key, path.clone(), window, cx)
+                }
                 AgentViewEvent::Confirm(request) => {
                     this.open_confirm_dialog(request.clone(), window, cx)
                 }

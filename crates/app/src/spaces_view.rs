@@ -215,6 +215,8 @@ impl PaneKey {
 pub enum SpacesViewEvent {
     /// Show the thread in Agents.
     OpenThread(ThreadKey),
+    /// Show the thread in Agents with its diff panel at the file's changes.
+    OpenDiffFile { thread: ThreadKey, path: PathBuf },
     /// New Thread Here: a draft in the project, in this checkout, shown in the Agents view.
     NewThread {
         project: ProjectKey,
@@ -1139,6 +1141,15 @@ impl SpacesView {
                         }
                         AgentViewEvent::OpenThreadOn(other) => {
                             cx.emit(SpacesViewEvent::OpenThread(*other))
+                        }
+                        AgentViewEvent::OpenDiffFile(path) => {
+                            cx.emit(SpacesViewEvent::OpenDiffFile {
+                                thread: ThreadKey {
+                                    machine,
+                                    thread: thread_id,
+                                },
+                                path: path.clone(),
+                            })
                         }
                         AgentViewEvent::Confirm(request) => {
                             cx.emit(SpacesViewEvent::Confirm(request.clone()))

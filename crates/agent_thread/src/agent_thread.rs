@@ -28,12 +28,13 @@ use agentz_protocol::agents::select_offers;
 use agentz_protocol::attachments::AttachmentId;
 pub use agentz_protocol::thread::{
     AuthStatus, BackgroundTask, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry,
-    FailedMessage, FileDiff, LoginIdentity, LostHistory, PendingHandoff, PermissionOption,
-    PermissionRequest, PlanItem, QueuedMessage, SessionDefaults, SessionRestore, ThreadState,
-    ThreadView, ToolAnswer, ToolCall, TurnTime,
+    FailedMessage, FileDiff, ImageSize, LoginIdentity, LostHistory, ModeSwitch, PendingHandoff,
+    PermissionOption, PermissionRequest, PlanItem, QueuedMessage, SessionDefaults, SessionRestore,
+    ThreadState, ThreadView, ToolAnswer, ToolCall, TurnTime,
 };
 use agentz_protocol::thread::{form_answer, login_code};
 use anyhow::{Context as _, Result, anyhow};
+use base64::Engine as _;
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
@@ -686,20 +687,14 @@ impl AgentThread {
     /// subthread.
     pub fn add_subagent_card(&mut self, subagent: &Subagent, subthread: projects::ThreadId) {
         self.push_entry(Entry::ToolCall(ToolCall {
-            id: subagent_card_id(&subagent.session),
-            title: subagent.name.clone(),
-            kind: acp::ToolKind::Other,
-            status: acp::ToolCallStatus::InProgress,
-            text: Vec::new(),
-            diffs: Vec::new(),
-            locations: Vec::new(),
-            raw_input: None,
-            terminals: Vec::new(),
-            images: Vec::new(),
             started_at: Some(SystemTime::now()),
-            duration: None,
             subthread: Some(subthread),
-            answer: None,
+            ..ToolCall::new(
+                subagent_card_id(&subagent.session),
+                subagent.name.clone(),
+                acp::ToolKind::Other,
+                acp::ToolCallStatus::InProgress,
+            )
         }));
     }
 
@@ -868,6 +863,26 @@ impl AgentThread {
         let attachments = self.attachments.as_ref()?;
         match attachments.add_base64(mime_type, data) {
             Ok(id) => Some(id),
+            Err(error) => {
+                log::error!("failed to keep an image from the agent: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// [`Self::keep_image`], with the image's size for its caption.
+    fn keep_sized_image(
+        &self,
+        mime_type: &str,
+        data: &str,
+    ) -> Option<(AttachmentId, Option<ImageSize>)> {
+        let attachments = self.attachments.as_ref()?;
+        let kept = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .context("decoding the image")
+            .and_then(|bytes| Ok((attachments.add(mime_type, &bytes)?, image_size(&bytes))));
+        match kept {
+            Ok(kept) => Some(kept),
             Err(error) => {
                 log::error!("failed to keep an image from the agent: {error:#}");
                 None
@@ -1124,6 +1139,9 @@ impl AgentThread {
                 self.turn_cancelled = None;
                 match result {
                     Ok(response) => {
+                        if response.stop_reason == acp::StopReason::Cancelled {
+                            self.stop_running_tool_calls();
+                        }
                         self.view.state.last_stop_reason = Some(response.stop_reason);
                         self.last_message = None;
                     }
@@ -2423,6 +2441,63 @@ impl AgentThread {
         }
     }
 
+    /// Notes a change of the agent's mode from `before` on the tool call this turn that asked
+    /// for it once the user allowed it, as Claude Agent's ExitPlanMode leaves plan mode.
+    fn note_mode_switch(&mut self, before: Option<String>) {
+        let (Some(from), Some(to)) = (before, self.view.mode_name()) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let Some(index) = self
+            .view
+            .entries
+            .iter()
+            .rev()
+            .take_while(|entry| !matches!(entry, Entry::UserMessage(_)))
+            .position(|entry| {
+                matches!(entry, Entry::ToolCall(tool_call)
+                if tool_call.kind == acp::ToolKind::SwitchMode
+                    && tool_call.mode_switch.is_none()
+                    && tool_call.answer.as_ref().is_some_and(|answer| {
+                        matches!(answer, ToolAnswer::Chose(_)) && !answer.is_denied()
+                    }))
+            })
+            .map(|position| self.view.entries.len() - 1 - position)
+        else {
+            return;
+        };
+        self.entry_changed(index);
+        if let Entry::ToolCall(tool_call) = &mut self.view.entries[index] {
+            tool_call.mode_switch = Some(ModeSwitch { from, to });
+        }
+    }
+
+    /// Ends the tool calls the agent left running when its turn was stopped, as Zed marks them
+    /// canceled: an agent may never update them again. A subagent's card ends with its
+    /// subthread.
+    fn stop_running_tool_calls(&mut self) {
+        let running: Vec<usize> = self
+            .view
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                matches!(entry, Entry::ToolCall(tool_call)
+                    if tool_call.is_running() && tool_call.subthread.is_none())
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in running {
+            self.entry_changed(index);
+            if let Entry::ToolCall(tool_call) = &mut self.view.entries[index] {
+                tool_call.stopped = true;
+                note_end(tool_call);
+            }
+        }
+    }
+
     /// Asks the agent to stop work it left running ([`ThreadState::background_tasks`]).
     pub fn stop_background_task(&mut self, task_id: &str) {
         let Some(session) = &self.session else {
@@ -3078,12 +3153,16 @@ impl AgentThread {
                 }
             }
             acp::SessionUpdate::ConfigOptionUpdate(update) => {
+                let mode = self.view.mode_name();
                 self.view.state.config_options = update.config_options;
+                self.note_mode_switch(mode);
             }
             acp::SessionUpdate::CurrentModeUpdate(update) => {
+                let mode = self.view.mode_name();
                 if let Some(modes) = &mut self.view.state.modes {
                     modes.current_mode_id = update.current_mode_id;
                 }
+                self.note_mode_switch(mode);
             }
             acp::SessionUpdate::UsageUpdate(update) => {
                 self.view.state.usage = Some(ContextUsage {
@@ -3132,32 +3211,29 @@ impl AgentThread {
 
     fn upsert_tool_call(&mut self, tool_call: acp::ToolCall) {
         let mut entry = ToolCall {
-            id: tool_call.tool_call_id,
-            title: tool_call.title,
-            kind: tool_call.kind,
-            status: tool_call.status,
-            text: Vec::new(),
-            diffs: Vec::new(),
-            locations: tool_call
-                .locations
-                .into_iter()
-                .map(|location| location.path)
-                .collect(),
             raw_input: tool_call.raw_input.as_ref().and_then(raw_input_text),
-            terminals: Vec::new(),
-            images: Vec::new(),
-            started_at: None,
-            duration: None,
-            subthread: None,
-            answer: None,
+            tool_name: agent_tool_name(tool_call.meta.as_ref()),
+            ..ToolCall::new(
+                tool_call.tool_call_id,
+                tool_call.title,
+                tool_call.kind,
+                tool_call.status,
+            )
         };
+        set_locations(&mut entry, tool_call.locations);
         self.tool_content(tool_call.content).apply_to(&mut entry);
+        number_diffs(&mut entry);
         let live = self.view.state.status == ConnectionStatus::Ready;
         if let Some(existing) = self.tool_call_mut(&entry.id) {
             entry.started_at = existing.started_at;
             entry.duration = existing.duration;
             entry.subthread = existing.subthread;
             entry.answer = existing.answer.take();
+            entry.mode_switch = existing.mode_switch.take();
+            entry.stopped = existing.stopped;
+            if entry.tool_name.is_none() {
+                entry.tool_name = existing.tool_name.take();
+            }
             note_end(&mut entry);
             *existing = entry;
         } else {
@@ -3169,33 +3245,25 @@ impl AgentThread {
 
     fn apply_tool_call_update(&mut self, update: acp::ToolCallUpdate) {
         let fields = update.fields;
+        let tool_name = agent_tool_name(update.meta.as_ref());
         // Read before the tool call is borrowed to change, as it keeps the images.
         let content = fields.content.map(|content| self.tool_content(content));
         let Some(existing) = self.tool_call_mut(&update.tool_call_id) else {
             let mut entry = ToolCall {
-                id: update.tool_call_id,
-                title: fields.title.unwrap_or_default(),
-                kind: fields.kind.unwrap_or_default(),
-                status: fields.status.unwrap_or_default(),
-                text: Vec::new(),
-                diffs: Vec::new(),
-                locations: fields
-                    .locations
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|location| location.path)
-                    .collect(),
                 raw_input: fields.raw_input.as_ref().and_then(raw_input_text),
-                terminals: Vec::new(),
-                images: Vec::new(),
-                started_at: None,
-                duration: None,
-                subthread: None,
-                answer: None,
+                tool_name,
+                ..ToolCall::new(
+                    update.tool_call_id,
+                    fields.title.unwrap_or_default(),
+                    fields.kind.unwrap_or_default(),
+                    fields.status.unwrap_or_default(),
+                )
             };
+            set_locations(&mut entry, fields.locations.unwrap_or_default());
             if let Some(content) = content {
                 content.apply_to(&mut entry);
             }
+            number_diffs(&mut entry);
             entry.started_at =
                 (self.view.state.status == ConnectionStatus::Ready).then(SystemTime::now);
             note_end(&mut entry);
@@ -3212,10 +3280,7 @@ impl AgentThread {
             existing.status = status;
         }
         if let Some(locations) = fields.locations {
-            existing.locations = locations
-                .into_iter()
-                .map(|location| location.path)
-                .collect();
+            set_locations(existing, locations);
         }
         if let Some(content) = content {
             content.apply_to(existing);
@@ -3223,6 +3288,10 @@ impl AgentThread {
         if let Some(raw_input) = fields.raw_input.as_ref() {
             existing.raw_input = raw_input_text(raw_input);
         }
+        if tool_name.is_some() {
+            existing.tool_name = tool_name;
+        }
+        number_diffs(existing);
         note_end(existing);
     }
 
@@ -3235,8 +3304,11 @@ impl AgentThread {
                 acp::ToolCallContent::Content(content) => match content.content {
                     acp::ContentBlock::Text(text) => tool_content.text.push(text.text),
                     acp::ContentBlock::Image(image) => {
-                        if let Some(id) = self.keep_image(&image.mime_type, &image.data) {
+                        if let Some((id, size)) =
+                            self.keep_sized_image(&image.mime_type, &image.data)
+                        {
                             tool_content.images.push(id);
+                            tool_content.image_sizes.push(size);
                         }
                     }
                     _ => {}
@@ -3245,6 +3317,7 @@ impl AgentThread {
                     path: diff.path,
                     old_text: diff.old_text,
                     new_text: diff.new_text,
+                    start_line: None,
                 }),
                 acp::ToolCallContent::Terminal(terminal) => tool_content
                     .terminals
@@ -3314,6 +3387,36 @@ impl AgentThread {
     pub fn take_entries_changed_from(&mut self) -> Option<usize> {
         self.entries_changed_from.take()
     }
+}
+
+fn set_locations(tool_call: &mut ToolCall, locations: Vec<acp::ToolCallLocation>) {
+    (tool_call.locations, tool_call.location_lines) = locations
+        .into_iter()
+        .map(|location| (location.path, location.line))
+        .unzip();
+}
+
+/// Numbers each diff's lines from where it starts in its file: Claude Agent sends a location
+/// for each hunk, in the same order, at the line the hunk starts. A created file starts at its
+/// first line.
+fn number_diffs(tool_call: &mut ToolCall) {
+    let paired = tool_call.diffs.len() == tool_call.locations.len();
+    for (index, diff) in tool_call.diffs.iter_mut().enumerate() {
+        let located = paired
+            .then(|| tool_call.location_lines.get(index).copied().flatten())
+            .flatten()
+            .filter(|_| tool_call.locations[index] == diff.path);
+        diff.start_line = located.or(diff.old_text.is_none().then_some(1));
+    }
+}
+
+/// The agent's own name for a tool, which Claude Agent sends as `claudeCode.toolName`.
+fn agent_tool_name(meta: Option<&acp::Meta>) -> Option<String> {
+    meta?
+        .get("claudeCode")?
+        .get("toolName")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Notes how long the tool call ran, once it ended, if it started here.
@@ -3491,6 +3594,7 @@ struct ToolContent {
     diffs: Vec<FileDiff>,
     terminals: Vec<String>,
     images: Vec<AttachmentId>,
+    image_sizes: Vec<Option<ImageSize>>,
 }
 
 impl ToolContent {
@@ -3500,7 +3604,22 @@ impl ToolContent {
         tool_call.diffs = self.diffs;
         tool_call.terminals = self.terminals;
         tool_call.images = self.images;
+        tool_call.image_sizes = self.image_sizes;
     }
+}
+
+/// An image's size, read from its header.
+fn image_size(bytes: &[u8]) -> Option<ImageSize> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    Some(ImageSize {
+        width,
+        height,
+        bytes: bytes.len() as u64,
+    })
 }
 
 fn error_message(error: &agent_client_protocol::Error) -> String {
@@ -4375,6 +4494,7 @@ mod tests {
             path: PathBuf::from("a.rs"),
             old_text: Some("a\nb\nc\nd\n".into()),
             new_text: "a\nB\nB2\nc\nd\n".into(),
+            start_line: None,
         };
         assert_eq!(diff.line_counts(), (2, 1));
         assert_eq!(diff.changed_lines(), (vec!["b"], vec!["B", "B2"]));
@@ -4392,8 +4512,55 @@ mod tests {
             path: PathBuf::from("b.rs"),
             old_text: None,
             new_text: "x\ny\n".into(),
+            start_line: None,
         };
         assert_eq!(created.line_counts(), (2, 0));
+    }
+
+    #[test]
+    fn diffs_are_numbered_from_their_locations() {
+        let diff = |path: &str, old_text: Option<&str>| FileDiff {
+            path: PathBuf::from(path),
+            old_text: old_text.map(str::to_string),
+            new_text: "x\n".into(),
+            start_line: None,
+        };
+        let mut edit = ToolCall {
+            diffs: vec![diff("/a.rs", Some("y\n")), diff("/a.rs", Some("z\n"))],
+            ..ToolCall::new(
+                acp::ToolCallId::new("edit"),
+                "Edit".into(),
+                acp::ToolKind::Edit,
+                acp::ToolCallStatus::Completed,
+            )
+        };
+        set_locations(
+            &mut edit,
+            vec![
+                acp::ToolCallLocation::new("/a.rs").line(12),
+                acp::ToolCallLocation::new("/a.rs").line(40),
+            ],
+        );
+        number_diffs(&mut edit);
+        let starts = |tool_call: &ToolCall| -> Vec<Option<u32>> {
+            tool_call.diffs.iter().map(|diff| diff.start_line).collect()
+        };
+        assert_eq!(starts(&edit), [Some(12), Some(40)]);
+
+        // Unpaired, only a created file's lines are known.
+        edit.diffs.push(diff("/b.rs", None));
+        number_diffs(&mut edit);
+        assert_eq!(starts(&edit), [None, None, Some(1)]);
+    }
+
+    #[test]
+    fn claude_agents_tool_names() {
+        let meta = acp::Meta::from_iter([(
+            "claudeCode".to_string(),
+            serde_json::json!({"toolName": "Grep"}),
+        )]);
+        assert_eq!(agent_tool_name(Some(&meta)).as_deref(), Some("Grep"));
+        assert_eq!(agent_tool_name(None), None);
     }
 
     #[test]

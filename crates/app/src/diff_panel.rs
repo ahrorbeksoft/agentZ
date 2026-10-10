@@ -3,6 +3,7 @@
 //! computes the diff from its checkpoints; the panel reloads it whenever a turn ends.
 
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
 
@@ -73,6 +74,8 @@ pub struct DiffPanel {
     rows: Rc<Vec<Row>>,
     list_state: ListState,
     is_full_screen: bool,
+    /// A file asked for by a tool call's Open, until a scope with its changes has loaded.
+    pending_reveal: Option<PendingReveal>,
     _load: Task<()>,
     /// Asks again every few seconds while a scope shows the folder as it is.
     _live_refresh: Option<Task<()>>,
@@ -120,6 +123,7 @@ impl DiffPanel {
             rows: Rc::new(Vec::new()),
             list_state: ListState::new(0, ListAlignment::Top, px(400.)),
             is_full_screen: false,
+            pending_reveal: None,
             _load: Task::ready(()),
             _live_refresh: None,
             _subscriptions: subscriptions,
@@ -160,6 +164,7 @@ impl DiffPanel {
                     Ok(Response::ThreadDiff(diff)) => {
                         this.error = None;
                         this.set_diff(diff);
+                        this.reveal_pending(cx);
                     }
                     Ok(response) => {
                         log::error!("expected a diff, got {response:?}");
@@ -347,6 +352,61 @@ impl DiffPanel {
                 .splice(prefix..old.len() - suffix, rows.len() - prefix - suffix);
         }
         self.rows = Rc::new(rows);
+    }
+
+    /// Scrolls to a file's changes, opening it if it was collapsed: in the scope shown, else
+    /// in the working tree, where a turn still running has its changes, else in every turn's.
+    pub fn reveal_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.pending_reveal = Some(PendingReveal {
+            path,
+            tried: Vec::new(),
+        });
+        if !self.loading {
+            self.reveal_pending(cx);
+        }
+    }
+
+    fn reveal_pending(&mut self, cx: &mut Context<Self>) {
+        let Some(diff) = self.diff.clone() else {
+            return;
+        };
+        let Some(pending) = self.pending_reveal.as_mut() else {
+            return;
+        };
+        if let Some(file_index) = file_for_path(&diff, &pending.path) {
+            self.pending_reveal = None;
+            if self.collapsed.remove(&diff.files[file_index].path) {
+                self.update_rows(false);
+            }
+            if let Some(item_ix) = self
+                .rows
+                .iter()
+                .position(|row| *row == Row::File(file_index))
+            {
+                self.list_state.scroll_to(gpui::ListOffset {
+                    item_ix,
+                    offset_in_item: px(0.),
+                });
+            }
+            cx.notify();
+            return;
+        }
+        pending.tried.push(self.scope);
+        let next = [DiffScope::WorkingTree, DiffScope::All]
+            .into_iter()
+            .find(|scope| !pending.tried.contains(scope));
+        match next {
+            // Not while the load that brought this diff is still the one running.
+            Some(scope) => {
+                let panel = cx.weak_entity();
+                cx.defer(move |cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.set_scope(scope, cx))
+                        .ok();
+                });
+            }
+            None => self.pending_reveal = None,
+        }
     }
 
     fn toggle_collapsed(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -861,6 +921,23 @@ fn render_row(
             )
             .into_any_element(),
     }
+}
+
+/// A file a tool call's Open asked for, and the scopes already looked in.
+struct PendingReveal {
+    path: PathBuf,
+    tried: Vec<DiffScope>,
+}
+
+/// The diff's file at `path`: the diff names files from the repository's root, and tool calls
+/// by their whole path, so the file whose path ends `path` most closely.
+fn file_for_path(diff: &ThreadDiff, path: &Path) -> Option<usize> {
+    diff.files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| path.ends_with(&file.path))
+        .max_by_key(|(_, file)| Path::new(&file.path).components().count())
+        .map(|(index, _)| index)
 }
 
 fn build_rows(diff: &ThreadDiff, collapsed: &HashSet<String>) -> Vec<Row> {

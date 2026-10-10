@@ -175,6 +175,7 @@ dependencies = [
  "base64",
  "futures",
  "gpui_shared_string",
+ "image",
  "libc",
  "log",
  "projects",
