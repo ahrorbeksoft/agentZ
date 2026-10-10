@@ -1,0 +1,74 @@
+/* The chats round's pieces, over board/mock.css: the app in JetBrains Dark (the user's theme,
+   from assets/themes/jetbrains/jetbrains-dark.json), as in the artifacts round. */
+.m.jb {
+  --title: #26282b; --panel: #26282b; --ed: #1e1f22; --b: #393b41; --bv: #393b41; --bf: #3574f0;
+  --t: #dfe1e5; --mu: #b0b1b3; --ph: #6f737a; --faint: rgba(176,177,179,.45);
+  --ac: #548af7; --ok: #73bd7a; --del: #f75464; --warn: #f2c55c; --pur: #b48ead;
+  --hov: #3c3e41; --sel: #43454a; --dim: #8d8e91; --bubble: #313337;
+}
+.m .zmark { width: 14px; height: 14px; border-radius: 3px; background: #3a3c41; color: #c4c6ca; display: inline-grid; place-items: center; font: 700 9px/1 "IBM Plex Sans", sans-serif; flex: none; }
+
+/* The app's window */
+.m .awin { display: flex; flex-direction: column; height: 100%; }
+.m .atitle { height: 38px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 10px 0 14px; background: var(--title); border-bottom: 1px solid var(--b); font-size: 13px; color: var(--mu); }
+.m .aseg { margin-left: auto; display: flex; border-radius: 6px; padding: 2px; background: var(--ed); font-size: 12px; }
+.m .aseg span { padding: 2px 10px; border-radius: 4px; color: var(--mu); }
+.m .aseg span.on { background: var(--sel); color: var(--t); }
+.m .abody { flex: 1; min-height: 0; display: flex; }
+
+/* The sidebar's cards, rows and shelves (sidebar.rs) */
+.m .asb { width: 290px; flex: none; background: var(--panel); border-right: 1px solid var(--b); display: flex; flex-direction: column; height: 100%; }
+.m .asb-head { height: 38px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 10px 0 12px; color: var(--ph); font-size: 13px; }
+.m .asb-list { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 4px; padding: 2px 4px; }
+.m .tcard { padding: 6px 8px 7px; border-radius: 6px; display: flex; flex-direction: column; gap: 3px; flex: none; }
+.m .tcard.on { background: var(--sel); } .m .tcard.hov { background: var(--hov); }
+.m .tcard .p { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--mu); }
+.m .tcard .tl { font-size: 13px; color: var(--t); }
+.m .tcard .br { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ph); }
+.m .shelf { height: 30px; flex: none; display: flex; align-items: center; gap: 6px; padding: 0 8px; font-size: 12px; color: var(--mu); }
+.m .shelf .rule { flex: 1; height: 1px; background: var(--bv); }
+.m .asb-foot { height: 38px; flex: none; border-top: 1px solid var(--b); display: flex; align-items: center; gap: 8px; padding: 0 12px; color: var(--mu); font-size: 13px; }
+.m .lrow { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px; border-radius: 6px; font-size: 13px; color: var(--t); flex: none; }
+.m .lrow.on { background: var(--sel); } .m .lrow.hov { background: var(--hov); }
+.m .lrow.quiet { color: var(--mu); }
+.m .lrow .when { font-size: 11px; color: var(--ph); flex: none; }
+
+/* The thread (agent_view.rs) */
+.m .thread { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--panel); position: relative; height: 100%; }
+.m .thead { height: 38px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 10px 0 14px; border-bottom: 1px solid var(--b); font-size: 13px; color: var(--mu); }
+.m .thead .tt { color: var(--t); }
+.m .bbtn { height: 24px; padding: 0 8px; border-radius: 5px; border: 1px solid var(--b); display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--mu); flex: none; }
+.m .convo { flex: 1; min-height: 0; overflow: hidden; padding: 16px 0; }
+.m .column { width: 100%; max-width: 760px; margin: 0 auto; padding: 0 24px; display: flex; flex-direction: column; gap: 2px; }
+.m .msg { line-height: 22px; color: var(--t); padding: 4px 0; font-size: 14px; }
+.m .bub { align-self: flex-end; max-width: 78%; background: var(--bubble); border-radius: 12px; padding: 8px 12px; line-height: 21px; font-size: 14px; margin: 2px 0 10px; }
+.m .trow { min-height: 24px; display: flex; align-items: center; gap: 6px; padding: 0 2px; border-radius: 5px; font-size: 13px; color: var(--dim); }
+.m .trow .ico { width: 24px; display: inline-flex; justify-content: center; }
+.m .trow .subj { color: #c4c6ca; }
+.m .worked { font-size: 12px; color: var(--ph); padding: 2px 0 6px; }
+.m .composer { flex: none; border-top: 1px solid var(--b); background: var(--ed); padding: 8px 0 10px; position: relative; }
+.m .composer .in { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+.m code.c { font: 12px "IBM Plex Mono", monospace; background: var(--hov); padding: 1px 4px; border-radius: 3px; }
+
+/* A mention chip in the composer or a sent message */
+.m .mchip { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 6px; border-radius: 4px; background: var(--hov); color: var(--t); font-size: 13px; vertical-align: middle; }
+
+/* Settings (settings_page.rs) */
+.m .sgroup { font-size: 12px; color: var(--mu); margin: 18px 0 8px; }
+.m .scard { border: 1px solid var(--b); border-radius: 8px; background: var(--panel); }
+.m .srowx { display: flex; align-items: center; gap: 16px; padding: 12px 14px; border-top: 1px solid var(--b); }
+.m .srowx:first-child { border-top: 0; }
+.m .srowx .n { font-size: 13px; color: var(--t); }
+.m .srowx .d { font-size: 11px; color: var(--ph); margin-top: 3px; line-height: 1.4; }
+.m .sw { width: 26px; height: 15px; border-radius: 8px; background: var(--sel); display: inline-flex; align-items: center; padding: 2px; flex: none; }
+.m .sw i { width: 11px; height: 11px; border-radius: 50%; background: var(--mu); display: block; }
+.m .sw.on { background: var(--ac); justify-content: flex-end; } .m .sw.on i { background: #1e1f22; }
+
+/* An app-drawn dialog */
+.m .dlg { position: absolute; z-index: 20; background: var(--panel); border: 1px solid var(--b); border-radius: 10px; box-shadow: 0 16px 40px rgba(0,0,0,.55); padding: 16px; width: 380px; font-size: 13px; }
+.m .dlg h4 { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: var(--t); }
+.m .dlg p { margin: 0 0 12px; color: var(--mu); line-height: 1.45; }
+.m .btn.danger { background: var(--del); border-color: var(--del); color: #1e1f22; font-weight: 500; }
+.m .check { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid var(--ph); flex: none; display: inline-grid; place-items: center; }
+.m .check.on { background: var(--ac); border-color: var(--ac); color: #1e1f22; }
+.m .btn.primary { color: #1e1f22; }

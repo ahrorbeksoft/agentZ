@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chats Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="mock-chats.css">
+</head>
+<body data-area="chats" data-title="Chats">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Chats <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>From the backlog: “Chats are for general conversation, not for work in a project. They have their own group in the sidebar, like the Workspaces and Archived shelves, and never belong to a project.” They have everything a thread has (agents, accounts, models, images, files, queued messages, subthreads), mention projects, threads and files with @ instead of being linked to them, publish artifacts, and a setting turns them off. Worktrees, pastures, diffs, branches and project scripts are hidden in a chat.</p>
+<p>How t3code does it: a thread can start without a project (No project in the new thread’s project menu, in New thread in…, or mod+alt+n). Each works in its own folder under the data folder’s scratch folder, named after the date, the first words of its first message and a short id; deleting the thread keeps the folder. Branch, worktree and diff controls are hidden. It starts on the current machine and can move to another before its first message. Inside, it belongs to a hidden Scratch project on each machine.</p>
+<p>In agentZ a chat would also need its own folder (ACP’s session/new takes one) and runs on one machine. The demo: storefront and docs on this Mac, api on Devbox 1, and five chats. The mocks are JetBrains Dark at the app’s sizes; the screenshots beside the topics are today’s app with the mock agent, also in JetBrains Dark.</p>`;
+</script>
+<script src="mock-chats.js"></script>
+<script src="topics-chats.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
