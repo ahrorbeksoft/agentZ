@@ -37,6 +37,7 @@ log.workspace = true
 paths.workspace = true
 polling.workspace = true
 projects.workspace = true
+pulldown-cmark.workspace = true
 registry.workspace = true
 regex.workspace = true
 reqwest_client.workspace = true

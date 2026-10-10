@@ -17,11 +17,12 @@ use crate::slide_drag::{
     DRAG_SCROLL_STEP, SlideDrag, drag_scroll_direction, render_raised_rows, scroll_while_held,
 };
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::artifacts::{Artifact, ArtifactId, ArtifactKind};
 use collections::HashMap;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
-    Focusable as _, FontWeight, Hsla, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Stateful,
-    Subscription, Task, Window, anchored, canvas, deferred, svg,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
+    EventEmitter, Focusable as _, FontWeight, Hsla, KeyBinding, MouseButton, PromptLevel,
+    ScrollHandle, Stateful, Subscription, Task, Window, anchored, canvas, deferred, svg,
 };
 use projects::{
     GitHead, Project, Thread, ThreadOrder, ThreadSection, Workspace, WorkspaceKind, order_key,
@@ -29,7 +30,7 @@ use projects::{
 use text_input::{TextInput, TextInputEvent};
 use ui::{
     CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Tooltip, WithScrollbar as _,
-    prelude::*, right_click_menu,
+    prelude::*, rems_from_px, right_click_menu,
 };
 
 use crate::project_info::{render_project_icon, workspace_icon};
@@ -2376,6 +2377,219 @@ impl Sidebar {
         rows
     }
 
+    /// The Artifacts shelf, above Archived: what the picked project's threads and chats
+    /// published, newest first, opening their pages in the browser (`design/artifacts`,
+    /// topics 5 and 6).
+    fn render_artifacts_shelf(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let machines = self.machines.read(cx);
+        let artifacts = machines.scoped_artifacts(cx);
+        if artifacts.is_empty() {
+            return Vec::new();
+        }
+        let is_expanded = machines.artifacts_expanded(cx);
+        let mut rows = vec![Self::render_shelf_header(
+            "artifacts-shelf-toggle",
+            "Artifacts",
+            artifacts.len(),
+            is_expanded,
+            HeaderTone::Muted,
+            None,
+            |this, cx| {
+                // Kept by this Mac's server, as Archived's is.
+                if let Some(store) = this.store(MachineId::Local, cx) {
+                    store.update(cx, |store, cx| store.toggle_artifacts_expanded(cx));
+                }
+            },
+            cx,
+        )];
+        if is_expanded {
+            for (machine, artifact) in artifacts {
+                rows.push(self.render_artifact_row(machine, artifact, cx));
+            }
+            if let Some(gallery) = self.machines.read(cx).gallery_link(cx) {
+                rows.push(
+                    h_flex()
+                        .id("all-artifacts")
+                        .debug_selector(|| "all-artifacts".into())
+                        .h(ARCHIVED_ROW_HEIGHT)
+                        .px_2p5()
+                        .gap_2p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
+                        .child(
+                            Icon::new(IconName::ArrowUpRight)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new("All artifacts…").color(Color::Muted))
+                        .on_click(move |_, _, cx| cx.open_url(&gallery))
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
+    }
+
+    /// One artifact's row in the shelf: its kind, title and version, where it came from and
+    /// when, opening its page on a click (topic 5).
+    fn render_artifact_row(
+        &self,
+        machine: MachineId,
+        artifact: Artifact,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let hover = colors.ghost_element_hover;
+        let muted = colors.text_muted;
+        let machines = self.machines.read(cx);
+        let link = machines.artifact_link(machine, &artifact.id, None, cx);
+        let place = machines.artifact_place(machine, &artifact, cx);
+        let has_thread = artifact.thread_id.is_some_and(|thread_id| {
+            self.store(machine, cx)
+                .is_some_and(|store| store.read(cx).thread(thread_id).is_some())
+        });
+        let time = format_relative_time(
+            SystemTime::UNIX_EPOCH + Duration::from_millis(artifact.published_at()),
+            SystemTime::now(),
+        );
+        let icon = match artifact.kind {
+            ArtifactKind::Page => IconName::FileCode,
+            ArtifactKind::Document => IconName::FileMarkdown,
+        };
+        let menu_link = link.clone();
+        let menu = {
+            let sidebar = cx.entity().downgrade();
+            let artifact_id = artifact.id.clone();
+            let artifact_title: SharedString = artifact.title.clone().into();
+            let artifact_thread_id = artifact.thread_id;
+            move |window: &mut Window, cx: &mut App| {
+                let sidebar = sidebar.clone();
+                let link = menu_link.clone();
+                let artifact_id = artifact_id.clone();
+                let artifact_title = artifact_title.clone();
+                let artifact_thread_id = artifact_thread_id;
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    let mut menu = menu.entry("Open", None, {
+                        let link = link.clone();
+                        move |_, cx| {
+                            if let Some(link) = &link {
+                                cx.open_url(link);
+                            }
+                        }
+                    });
+                    if let (true, Some(thread_id)) = (has_thread, artifact_thread_id) {
+                        let sidebar = sidebar.clone();
+                        menu = menu.entry("Show Thread", None, move |_, cx| {
+                            sidebar
+                                .update(cx, |_, cx| {
+                                    cx.emit(SidebarEvent::OpenThread(ThreadKey {
+                                        machine,
+                                        thread: thread_id,
+                                    }));
+                                })
+                                .ok();
+                        });
+                    }
+                    if let Some(link) = link.clone() {
+                        menu = menu.entry("Copy Link", None, move |_, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
+                        });
+                    }
+                    let sidebar = sidebar.clone();
+                    menu.entry("Delete…", None, move |_, cx| {
+                        sidebar
+                            .update_in(cx, |sidebar, window, cx| {
+                                sidebar.confirm_delete_artifact(
+                                    machine,
+                                    artifact_id.clone(),
+                                    artifact_title.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    })
+                })
+            }
+        };
+        let mut detail = format!("{} · v{}", artifact.kind.label(), artifact.latest());
+        if !place.is_empty() {
+            detail.push_str(&format!(" · {place}"));
+        }
+        detail.push_str(&format!(" · {time}"));
+        let row_id = SharedString::from(format!("artifact-{}-{}", machine.slug(), artifact.id.0));
+        right_click_menu(format!("artifact-menu-{row_id}"))
+            .trigger(move |_, _, _| {
+                let mut row = h_flex()
+                    .id(row_id.clone())
+                    .debug_selector(move || row_id.to_string())
+                    .min_h(ARCHIVED_ROW_HEIGHT)
+                    .py_0p5()
+                    .px_2p5()
+                    .gap_2p5()
+                    .rounded_md()
+                    .hover(|row| row.bg(hover))
+                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .child(Label::new(artifact.title.clone()).truncate()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(rems_from_px(11_f32))
+                                    .text_color(muted)
+                                    .child(detail.clone()),
+                            ),
+                    );
+                if let Some(link) = link {
+                    row = row.cursor_pointer().on_click(move |_, _, cx| {
+                        cx.open_url(&link);
+                    });
+                }
+                row
+            })
+            .menu(menu)
+            .into_any_element()
+    }
+
+    fn confirm_delete_artifact(
+        &mut self,
+        machine: MachineId,
+        id: ArtifactId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete “{title}”?"),
+            Some("The artifact and every version of it will be removed. This can't be undone."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let machines = self.machines.clone();
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                machines.update(cx, |machines, cx| {
+                    if let Some(client) = machines.client(machine, cx) {
+                        client
+                            .read(cx)
+                            .delete_artifact(id, cx)
+                            .detach_and_log_err(cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     fn render_show_more_archived(&self, hidden_count: usize, cx: &mut Context<Self>) -> AnyElement {
         self.render_show_more(
             "show-more-archived",
@@ -2760,6 +2974,7 @@ impl Sidebar {
                 }
             }
         }
+        shelf.extend(self.render_artifacts_shelf(cx));
         // While a thread that can be archived is held, Archived reads at full strength, even
         // with nothing in it, and takes the accent with the thread over it.
         let archive_tone = match drag.filter(|drag| !drag.is_agent_cli) {
@@ -3765,6 +3980,99 @@ mod view_tests {
         cx.run_until_parked();
         assert!(shown("workspaces-row-2", cx));
         assert!(!shown("workspaces-row-3", cx));
+    }
+
+    #[gpui::test]
+    fn artifacts_list_in_their_shelf_for_the_picked_project(cx: &mut TestAppContext) {
+        use agentz_protocol::artifacts::{
+            Artifact, ArtifactId, ArtifactKind, ArtifactPages, ArtifactVersion, Artifacts,
+        };
+
+        let (_sidebar, store, cx) = new_sidebar(cx);
+        let shown =
+            |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
+        let artifact = |id: &str, project_id: ProjectId, minutes_ago: u64| Artifact {
+            id: ArtifactId(id.to_string()),
+            title: format!("Artifact {id}"),
+            kind: ArtifactKind::Page,
+            versions: vec![ArtifactVersion {
+                published_at: (SystemTime::now() - Duration::from_secs(minutes_ago * 60))
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                bytes: 120,
+                files: Vec::new(),
+            }],
+            thread_id: Some(ThreadId(1)),
+            project_id: Some(project_id),
+            agent_id: None,
+            sent_at: None,
+            frame_key: "key".into(),
+        };
+        let threads = || vec![thread(1, false, None), chat(3, 1)];
+        show(&store, threads(), cx);
+        // None yet: no shelf.
+        assert!(!shown("artifacts-shelf-toggle", cx));
+
+        cx.update(|_, cx| {
+            let client = Machines::global(cx)
+                .read(cx)
+                .client(MachineId::Local, cx)
+                .expect("this Mac's client");
+            client.update(cx, |client, cx| {
+                client.set_online_for_test(cx);
+                client.set_artifacts_for_test(
+                    Artifacts {
+                        artifacts: vec![
+                            artifact("in-demo", ProjectId(1), 5),
+                            artifact("elsewhere", ProjectId(2), 3),
+                            artifact("in-chat", ProjectId::CHATS, 1),
+                        ],
+                        pages: Some(ArtifactPages {
+                            address: "127.0.0.1:4000".into(),
+                            token: "token".into(),
+                        }),
+                    },
+                    cx,
+                )
+            });
+        });
+        cx.run_until_parked();
+        // Closed at first.
+        assert!(shown("artifacts-shelf-toggle", cx));
+        assert!(!shown("artifact-local-in-demo", cx));
+
+        show_snapshot(
+            &store,
+            ProjectsSnapshot {
+                threads: threads(),
+                artifacts_expanded: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert!(shown("artifact-local-in-demo", cx));
+        assert!(shown("artifact-local-elsewhere", cx));
+        assert!(shown("artifact-local-in-chat", cx));
+        assert!(shown("all-artifacts", cx));
+        let top = |name: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(name).expect(name).origin.y
+        };
+        // Newest first.
+        assert!(top("artifact-local-in-chat", cx) < top("artifact-local-elsewhere", cx));
+        assert!(top("artifact-local-elsewhere", cx) < top("artifact-local-in-demo", cx));
+
+        // Under a project, its own and the chats'.
+        cx.update(|_, cx| {
+            let key = Machines::global(cx).read(cx).project_groups(cx)[0]
+                .key
+                .clone();
+            Machines::set_scope(Scope::Group(key), cx);
+        });
+        cx.run_until_parked();
+        assert!(shown("artifact-local-in-demo", cx));
+        assert!(!shown("artifact-local-elsewhere", cx));
+        assert!(shown("artifact-local-in-chat", cx));
     }
 
     /// A chat, last active `minutes_ago` minutes ago.

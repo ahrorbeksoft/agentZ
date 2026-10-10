@@ -7,6 +7,7 @@
 
 mod accounts;
 mod agent_settings;
+mod artifacts;
 pub mod browser;
 mod checkpoints;
 mod connection;
@@ -19,6 +20,7 @@ mod git;
 pub mod handoff;
 mod machine_kind;
 mod mcp_servers;
+mod pages;
 mod repositories;
 mod server;
 mod skills;

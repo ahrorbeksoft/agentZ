@@ -25,7 +25,7 @@ child work owned by this thread: use delegate_task (see orchestrator_capabilitie
 models), keep each taskId, and use task_status or task_cancel to manage it. An async task's end is \
 announced to this thread, so end the turn instead of polling. agentz_thread_launch and \
 create_threads make ordinary top-level threads: use them only when the user asks for separate or \
-new threads, never merely because they said subagent. When this project is also on other machines (orchestrator_capabilities' otherMachines), the thread tools take machine to work there; thread ids are per machine.";
+new threads, never merely because they said subagent. When this project is also on other machines (orchestrator_capabilities' otherMachines), the thread tools take machine to work there; thread ids are per machine. agentz_artifact_publish publishes a page (a self-contained .html or .md file) for the user to open in their browser, with a version per publish; agentz_artifact_list and agentz_artifact_read find them again.";
 
 pub(crate) async fn run(version: &str) -> Result<()> {
     let token = std::env::var("AGENTZ_MCP_TOKEN").context("AGENTZ_MCP_TOKEN isn't set")?;

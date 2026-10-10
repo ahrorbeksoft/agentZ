@@ -251,6 +251,7 @@ dependencies = [
  "paths",
  "polling",
  "projects",
+ "pulldown-cmark",
  "regex",
  "registry",
  "reqwest_client",

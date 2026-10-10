@@ -4,6 +4,7 @@ use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, Thr
 use crate::project_store::ThreadStatus;
 use agentz_protocol::accounts::AccountChoice;
 use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::artifacts::{Artifact, PageTheme};
 use agentz_protocol::layout::Node;
 use agentz_protocol::workspace::WorkspaceChoice;
 use anyhow::Result;
@@ -20,7 +21,7 @@ use util::ResultExt as _;
 
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
-use crate::app_settings::{AppSettingsStore, MachineProfile, is_sidebar_hidden};
+use crate::app_settings::{AppSettingsStore, ArtifactAutoOpen, MachineProfile, is_sidebar_hidden};
 use crate::command_palette::CommandPalette;
 use crate::confirm_dialog::{ConfirmDialog, ConfirmRequest};
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
@@ -237,6 +238,7 @@ impl Shell {
                 },
             ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
+                this.push_page_theme(cx);
                 // Close views (and stop their agents) for threads that were deleted, removed
                 // along with their project, or whose machine was removed. Archived threads stay
                 // open, read-only.
@@ -324,6 +326,15 @@ impl Shell {
                     MachinesEvent::Archiving(thread) => {
                         this.open_draft_after_archiving(*thread, window, cx)
                     }
+                    // A page asked for its thread, as clicking a notification does.
+                    MachinesEvent::ShowThread(thread) => {
+                        window.activate_window();
+                        cx.activate(true);
+                        this.go_to(Place::Thread(*thread), window, cx);
+                    }
+                    MachinesEvent::ArtifactPublished(machine, artifact) => {
+                        this.open_published_artifact(*machine, artifact, window, cx)
+                    }
                 },
             ),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -339,6 +350,8 @@ impl Shell {
             cx.observe_window_appearance(window, |_, _, cx| {
                 AppSettingsStore::global(cx).update(cx, |store, cx| store.reapply_theme(cx));
             }),
+            // Pages an artifact publishes take the app's theme, live (`design/artifacts`).
+            cx.observe_global::<theme::GlobalTheme>(|this, cx| this.push_page_theme(cx)),
         ];
         // Clicking a notification is the user asking for that thread, so it may come forward.
         let shell = cx.entity().downgrade();
@@ -427,6 +440,48 @@ impl Shell {
             .read(cx)
             .thread(key.thread)
             .cloned()
+    }
+
+    /// The app's theme for every machine's pages server: pushed as it changes and as machines
+    /// connect, so a restart or a new machine still gets it.
+    fn push_page_theme(&self, cx: &mut Context<Self>) {
+        self.machines.read(cx).push_page_theme(page_theme(cx), cx);
+    }
+
+    /// Opens a publish's page as the setting says (`design/artifacts`, topic 3): while its
+    /// thread is on screen and agentZ is in front, or a page's first publish, or never.
+    fn open_published_artifact(
+        &mut self,
+        machine: MachineId,
+        artifact: &Artifact,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let opens_it = match AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .artifact_auto_open
+        {
+            ArtifactAutoOpen::Never => false,
+            ArtifactAutoOpen::FirstPublish => artifact.latest() == 1,
+            ArtifactAutoOpen::WhenInThread => {
+                window.is_window_active()
+                    && self.view == MainView::Agents
+                    && self.active_thread.is_some_and(|key| {
+                        key.machine == machine && artifact.thread_id == Some(key.thread)
+                    })
+            }
+        };
+        if !opens_it {
+            return;
+        }
+        if let Some(link) = self
+            .machines
+            .read(cx)
+            .artifact_link(machine, &artifact.id, None, cx)
+        {
+            cx.open_url(&link);
+        }
     }
 
     /// The project the sidebar lists a thread under.
@@ -2060,6 +2115,66 @@ fn render_waiting_badge(count: usize, status: ThreadStatus, cx: &App) -> Div {
         )
 }
 
+gpui::actions!(
+    artifacts,
+    [
+        /// Opens All artifacts in the browser.
+        ShowAll,
+    ]
+);
+
+/// The app's theme as the pages' CSS variables (`design/artifacts`, topic 10): the shell's
+/// colors, under the names a page's CSS uses.
+fn page_theme(cx: &App) -> PageTheme {
+    let theme = cx.theme();
+    let colors = theme.colors();
+    let css = |color: Hsla| {
+        let rgb = color.to_rgb();
+        if color.a >= 1.0 {
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (rgb.r * 255.0).round() as u8,
+                (rgb.g * 255.0).round() as u8,
+                (rgb.b * 255.0).round() as u8
+            )
+        } else {
+            format!(
+                "#{:02x}{:02x}{:02x}{:02x}",
+                (rgb.r * 255.0).round() as u8,
+                (rgb.g * 255.0).round() as u8,
+                (rgb.b * 255.0).round() as u8,
+                (color.a * 255.0).round() as u8
+            )
+        }
+    };
+    PageTheme {
+        dark: !theme.appearance().is_light(),
+        variables: vec![
+            ("--background".to_string(), css(colors.editor_background)),
+            ("--surface".to_string(), css(colors.surface_background)),
+            ("--panel".to_string(), css(colors.panel_background)),
+            ("--text".to_string(), css(colors.text)),
+            ("--muted".to_string(), css(colors.text_muted)),
+            ("--border".to_string(), css(colors.border)),
+            ("--accent".to_string(), css(colors.text_accent)),
+            (
+                "--accent-foreground".to_string(),
+                css(colors.editor_background),
+            ),
+            ("--hover".to_string(), css(colors.ghost_element_hover)),
+            // Quotes aren't let through to the page's style, so only unquoted family names.
+            (
+                "--font-sans".to_string(),
+                "system-ui, -apple-system, Inter, sans-serif".to_string(),
+            ),
+            (
+                "--font-mono".to_string(),
+                "ui-monospace, Menlo, Consolas, monospace".to_string(),
+            ),
+        ],
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().colors().background;
@@ -2107,6 +2222,11 @@ impl Render for Shell {
             .on_action(cx.listener(Self::toggle_shortcuts))
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_go_to))
+            .on_action(cx.listener(|this, _: &ShowAll, _, cx| {
+                if let Some(gallery) = this.machines.read(cx).gallery_link(cx) {
+                    cx.open_url(&gallery);
+                }
+            }))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDiffEdge>, _, cx| {
                     let available = event.bounds.size.width - SIDEBAR_WIDTH - MIN_THREAD_WIDTH;

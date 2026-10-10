@@ -42,6 +42,30 @@ pub enum PlaySound {
     Always,
 }
 
+/// When publishing an artifact opens its page in the browser (`design/artifacts`, topic 3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactAutoOpen {
+    /// While the thread that published it is on screen and agentZ is in front.
+    #[default]
+    WhenInThread,
+    /// Every artifact's first publish.
+    FirstPublish,
+    Never,
+}
+
+impl ArtifactAutoOpen {
+    pub const ALL: [Self; 3] = [Self::WhenInThread, Self::FirstPublish, Self::Never];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WhenInThread => "When I'm in the thread",
+            Self::FirstPublish => "On a page's first publish",
+            Self::Never => "Never",
+        }
+    }
+}
+
 impl PlaySound {
     pub const ALL: [Self; 4] = [
         Self::Never,
@@ -128,6 +152,8 @@ pub struct AppSettings {
     pub show_thinking: bool,
     /// Chats show in the sidebar, New Chat and search. Off, they're hidden and kept.
     pub chats: bool,
+    /// When a published artifact's page opens in the browser.
+    pub artifact_auto_open: ArtifactAutoOpen,
     pub play_sound_when_finished: PlaySound,
     /// When a permission request or a question arrives. Always by default, as herdr plays its
     /// request sound: it needs an answer either way.
@@ -161,6 +187,7 @@ impl Default for AppSettings {
             use_modifier_to_send: false,
             show_thinking: false,
             chats: true,
+            artifact_auto_open: ArtifactAutoOpen::default(),
             play_sound_when_finished: PlaySound::WhenInAnotherThread,
             play_sound_when_input_needed: PlaySound::Always,
             sound_volume: 1.,

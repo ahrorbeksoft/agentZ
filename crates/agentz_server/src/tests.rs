@@ -9116,3 +9116,176 @@ async fn storage_is_measured_and_freed() {
             .all(|checkout| checkout.path != pasture)
     }));
 }
+
+impl TestClient {
+    /// The artifacts the server last said it has.
+    fn artifacts(&self) -> Option<&agentz_protocol::artifacts::Artifacts> {
+        self.events.iter().rev().find_map(|event| match event {
+            Event::Artifacts(artifacts) => Some(artifacts),
+            _ => None,
+        })
+    }
+}
+
+/// One request to the pages server, as a browser sends it: the status and the body.
+async fn page_request(address: &str, method: &str, target: &str, body: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("the pages server");
+    let request = format!(
+        "{method} {target} HTTP/1.1\r\nhost: {address}\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut response = Vec::new();
+    tokio::time::timeout(TIMEOUT, stream.read_to_end(&mut response))
+        .await
+        .expect("an answer in time")
+        .expect("read");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .expect("a status");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn artifacts_are_published_served_and_sent_back() {
+    use agentz_protocol::artifacts::ArtifactId;
+
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let pages = session.artifacts.pages.clone().expect("a pages server");
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread).await;
+
+    let page = server.project_dir.path().join("layouts.html");
+    std::fs::write(&page, "<h1>Layouts</h1>").expect("page");
+    let published = client
+        .tool(
+            thread,
+            "agentz_artifact_publish",
+            json!({"title": "Checkout layouts", "file": page}),
+        )
+        .await;
+    let id = ArtifactId(
+        published["artifactId"]
+            .as_str()
+            .expect("an artifact id")
+            .to_string(),
+    );
+    assert_eq!(published["version"], json!(1));
+
+    // Published again, it's the same artifact's second version.
+    std::fs::write(&page, "<h1>Layouts, again</h1>").expect("page");
+    let again = client
+        .tool(
+            thread,
+            "agentz_artifact_publish",
+            json!({"title": "Checkout layouts", "file": page, "artifactId": id.0}),
+        )
+        .await;
+    assert_eq!(again["version"], json!(2));
+    client
+        .wait_until(|client| {
+            client.artifacts().is_some_and(|artifacts| {
+                artifacts.artifacts.len() == 1 && artifacts.artifacts[0].latest() == 2
+            })
+        })
+        .await;
+    let artifact = client.artifacts().expect("artifacts").artifacts[0].clone();
+    assert_eq!(artifact.thread_id, Some(thread));
+    assert_eq!(artifact.project_id, Some(project_id));
+    let listed = client.tool(thread, "agentz_artifact_list", json!({})).await;
+    assert_eq!(listed["artifacts"][0]["artifactId"], json!(id.0));
+    let read = client
+        .tool(
+            thread,
+            "agentz_artifact_read",
+            json!({"artifactId": id.0, "version": 1}),
+        )
+        .await;
+    assert_eq!(read["source"], json!("<h1>Layouts</h1>"));
+
+    // The page needs the token, and its content the frame's key, which isn't the token.
+    let address = pages.address.as_str();
+    let token = &pages.token;
+    let shell = format!("/a/{}?t={token}", id.0);
+    assert_eq!(page_request(address, "GET", &shell, "").await.0, 200);
+    assert_eq!(
+        page_request(address, "GET", &format!("/a/{}", id.0), "")
+            .await
+            .0,
+        403
+    );
+    assert_eq!(page_request(address, "GET", "/", "").await.0, 403);
+    assert_eq!(
+        page_request(address, "GET", &format!("/?t={token}"), "")
+            .await
+            .0,
+        200
+    );
+    // The page's header reads the artifact as a listing.
+    let (status, body) = page_request(
+        address,
+        "GET",
+        &format!("/api/artifact/{}?t={token}", id.0),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let listing: Value = serde_json::from_str(&body).expect("a listing");
+    assert_eq!(listing["artifact"]["id"], json!(id.0));
+    assert_eq!(listing["has_thread"], json!(true));
+    let content = format!("/a/{}/content/1?key={}", id.0, artifact.frame_key);
+    let (status, body) = page_request(address, "GET", &content, "").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("<h1>Layouts</h1>"), "{body}");
+    let with_token = format!("/a/{}/content/1?key={token}", id.0);
+    assert_eq!(page_request(address, "GET", &with_token, "").await.0, 403);
+
+    // Send to thread puts what the page gave and the note in the thread as the user's.
+    let send = json!({"id": id.0, "version": 2, "text": "Picked B", "note": "Go with it"});
+    let (status, _) = page_request(
+        address,
+        "POST",
+        &format!("/api/send?t={token}"),
+        &send.to_string(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    client
+        .wait_until(|client| {
+            client.user_messages(thread).iter().any(|message| {
+                message.contains(&format!("(agentz://artifact/{}/2)", id.0))
+                    && message.ends_with(" Go with it")
+            })
+        })
+        .await;
+
+    // Deleted, it's gone from the list and its page.
+    client.ok(Request::DeleteArtifact(id.clone())).await;
+    client
+        .wait_until(|client| {
+            client
+                .artifacts()
+                .is_some_and(|artifacts| artifacts.artifacts.is_empty())
+        })
+        .await;
+    assert_eq!(page_request(address, "GET", &content, "").await.0, 404);
+}

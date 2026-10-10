@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use agentz_protocol::agents::AgentId;
+use agentz_protocol::artifacts::ArtifactReply;
 use agentz_protocol::{Event, PeerMachine, Peers, RelayToolCall, ServerMessage, ToolResult};
 use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
@@ -135,6 +136,9 @@ pub(in crate::server) struct Relays {
     /// What each app client sent, the latest last; that one relays.
     peers: Vec<(ClientId, Peers)>,
     pending: HashMap<u64, (ClientId, oneshot::Sender<ToolResult>)>,
+    /// Pages served here that asked another machine for an artifact
+    /// ([`Event::RelayArtifact`]), waiting for its [`Request::ArtifactRelayed`].
+    artifact_pending: HashMap<u64, oneshot::Sender<Result<ArtifactReply, String>>>,
     next_id: u64,
     /// Told when the peers change.
     peer_waiters: Vec<oneshot::Sender<()>>,
@@ -204,13 +208,64 @@ impl Relays {
     pub(in crate::server) fn client_gone(&mut self, client: ClientId) {
         self.peers.retain(|(other, _)| *other != client);
         self.pending.retain(|_, (owner, _)| *owner != client);
+        for (_, answer) in self.artifact_pending.drain() {
+            answer.send(Err("agentZ went away.".to_string())).ok();
+        }
+    }
+
+    /// The client that relays, when an app is connected.
+    pub(in crate::server) fn latest_client(&self) -> Option<ClientId> {
+        self.latest().map(|(client, _)| client)
+    }
+
+    /// Whether the app reaches a machine of this name and it's online.
+    pub(in crate::server) fn machine_online(&self, machine: &str) -> bool {
+        self.latest().is_some_and(|(_, peers)| {
+            peers
+                .machines
+                .iter()
+                .any(|peer| peer.name.eq_ignore_ascii_case(machine) && peer.online)
+        })
+    }
+
+    /// The app's online machines, by name, for the gallery.
+    pub(in crate::server) fn machine_names(&self) -> Vec<String> {
+        self.latest()
+            .map(|(_, peers)| {
+                peers
+                    .machines
+                    .iter()
+                    .filter(|peer| peer.online)
+                    .map(|peer| peer.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(in crate::server) fn start_artifact_relay(
+        &mut self,
+        answer: oneshot::Sender<Result<ArtifactReply, String>>,
+    ) -> u64 {
+        self.next_id += 1;
+        self.artifact_pending.insert(self.next_id, answer);
+        self.next_id
+    }
+
+    pub(in crate::server) fn finish_artifact(
+        &mut self,
+        relay_id: u64,
+        result: Result<ArtifactReply, String>,
+    ) {
+        if let Some(answer) = self.artifact_pending.remove(&relay_id) {
+            answer.send(result).ok();
+        }
     }
 
     fn latest(&self) -> Option<(ClientId, &Peers)> {
         self.peers.last().map(|(client, peers)| (*client, peers))
     }
 
-    fn is_this_machine(&self, machine: &str) -> bool {
+    pub(in crate::server) fn is_this_machine(&self, machine: &str) -> bool {
         self.latest()
             .is_some_and(|(_, peers)| peers.this_machine.eq_ignore_ascii_case(machine))
     }

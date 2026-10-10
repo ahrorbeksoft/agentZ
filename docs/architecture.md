@@ -87,7 +87,7 @@ so an open tool call's output raced the conversation.
 |---|---|
 | `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
-| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
+| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), artifacts (`artifacts.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
@@ -145,6 +145,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `chats/<date>-<first words>-<id>/` | server | Each chat's folder, made with its first message and removed with the chat |
+| `artifacts/<id>/` | server | An artifact: `meta.json` (title, kind, versions, its thread and project), `pages/<version>.html` or `.md`, and the files attached to each version (`files/<version>/`) |
+| `artifacts/server.json`, `artifacts/theme.json` | server | The pages server's port and token, kept so links keep working, and the app's theme for pages |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
 | `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
 | `settings.json` | app | Theme, saved machines, sidebar and terminal preferences, saved layouts |
@@ -1268,6 +1270,59 @@ as picked in `design/chats/`.
 - **The setting** (`AppSettings::chats`, Settings › General › Chats, on by default): while
   it's off, the Chats shelf, New Chat, Chat in the pickers and chats in search and Go To are
   gone. Chats are kept, and one that's working finishes its turn.
+
+### Artifacts
+
+Pages agents publish from a thread or chat, opened in the user's browser: Claude Code's
+artifacts, kept on each machine, as picked in `design/artifacts/`.
+
+- **Publishing** (`server/tools/artifact_tools.rs`; `agentz_artifact_publish`, `_list` and
+  `_read` in `AGENTZ_TOOLS`): one `.html` file (a page) or `.md` file (a document), with a
+  title, files to offer as downloads, and the artifact to add a version to. 16 MiB at most,
+  Claude Code's limit. Any thread's or chat's agent can publish; list shows the caller's
+  project's (or the chats'), every one with `all` or when it has none.
+- **Kept by each machine's server** (`agentz_server::artifacts`, `ArtifactStore`): in
+  `artifacts/` (Data above), sent to apps in the session and `Event::Artifacts`. Deleting the
+  thread keeps its artifacts ("from a deleted thread"); Delete… in the shelf's menu removes
+  one with every version (`Request::DeleteArtifact`).
+- **The pages server** (`pages.rs`, `server/artifact_requests.rs`): a small HTTP server on
+  `127.0.0.1`, with the port and a token kept in `artifacts/server.json`. The page links
+  (`ArtifactPages::link`) carry the token; the agent's page runs in a sandboxed frame served
+  with the artifact's own `frame_key`, so its scripts can't use the token. Around it, the 44px
+  bar: All artifacts, the title, the version menu (an older version shows a banner with Show
+  vN), where it came from (opening the thread in the app, `Event::ShowThread`), Files, Export
+  (Save as HTML or Markdown, Print or Save as PDF, Copy Source) and Send to thread. A Markdown
+  document is rendered by the server as a document page (pulldown-cmark, no syntax
+  highlighting: the tree has no highlighter). Open pages hear of republishes (a bar to show
+  the new version), deletions and theme changes over `/events`. `/` is All artifacts, every
+  machine's, with All, Threads and Chats and a search.
+- **Another machine's artifacts** are served by this Mac's pages server too, through the app:
+  the server asks for them by machine name (`Event::RelayArtifact`), the app asks that
+  machine (`Request::Artifact`, `Machines::relay_artifact`) and answers
+  (`Request::ArtifactRelayed`). Links to them are `/m/<machine>/a/<id>`.
+- **The theme** (`Shell::push_page_theme`, `page_theme`): the app's colors and fonts as CSS
+  variables (`--background`, `--text`, `--accent`, …), sent to every machine's server as the
+  theme changes (`Request::SetPageTheme`) and given to pages as they load and live.
+- **Send to thread**: the bar asks the page for `window.agentzPicks()` (or the selection),
+  then sends it with the user's note as the user's message in the thread
+  (`artifact_send`): the artifact as a chip (`PromptPart::Conversation`) and the note,
+  queued while the agent works.
+- **In the thread** (`AgentView::render_published_artifact`, `tool_calls::published_artifact`):
+  the newest publish of each artifact is a card (its kind's icon, title, "Page · v2 ·
+  published 2m ago", Open, and a menu with Copy Link, Export… and Show in List); earlier ones
+  are a line, "Published an artifact: Checkout redesign · v1". The header has an Artifacts
+  pill before the branch (`render_artifacts_pill`): one opens it, several list in a menu with
+  All artifacts…. Export… saves the source where the user picks.
+- **In the sidebar** (`Sidebar::render_artifacts_shelf`): an Artifacts shelf above Archived,
+  closed at first (`ProjectStore::artifacts_expanded`, kept by this Mac's server), with the
+  picked project's and the chats' artifacts, every one under All
+  (`Machines::scoped_artifacts`), newest first: "Page · v2 · storefront › Add checkout · 2m",
+  opening on a click, with Open, Show Thread, Copy Link and Delete… on a right-click, then All
+  artifacts…. `artifacts: show all` in the command palette opens All artifacts.
+- **Opening on publish** (`Shell::open_published_artifact`, Settings › General › Artifacts ›
+  "Open in the browser", `ArtifactAutoOpen`): when its thread is on screen (the default), on an
+  artifact's first publish, or never. Only a publish the app hears while connected counts
+  (`ServerClientEvent::ArtifactPublished`), not the list a machine sends on connecting.
 
 ### Attention states and notifications
 

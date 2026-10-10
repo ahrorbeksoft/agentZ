@@ -11,7 +11,7 @@ pub const AGENTZ_SERVER_NAME: &str = "agentz";
 
 /// The tools of the `agentz` server, by name, with their titles, so clients can name them
 /// without asking the server. The server's tests keep it in step with its definitions.
-pub const AGENTZ_TOOLS: [(&str, &str); 26] = [
+pub const AGENTZ_TOOLS: [(&str, &str); 29] = [
     (
         "orchestrator_capabilities",
         "Get orchestration capabilities",
@@ -50,6 +50,9 @@ pub const AGENTZ_TOOLS: [(&str, &str); 26] = [
     ("agentz_terminal_wait", "Wait for an agentZ terminal"),
     ("agentz_command_run", "Run a command"),
     ("agentz_project_add", "Add an agentZ project"),
+    ("agentz_artifact_publish", "Publish an artifact"),
+    ("agentz_artifact_list", "List artifacts"),
+    ("agentz_artifact_read", "Read an artifact"),
 ];
 
 /// Agents that ignore the MCP servers ACP gives them (design/accounts plan.md): their

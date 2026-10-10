@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1 as acp;
+use agentz_protocol::artifacts::ArtifactId;
 use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, AGENTZ_TOOLS};
 use agentz_protocol::thread::ToolCall;
 use gpui::{App, SharedString};
@@ -156,6 +157,28 @@ pub fn is_subagent(tool_call: &ToolCall) -> bool {
         || (may_be_subagent(tool_call) && SubagentCall::of(tool_call).is_some())
 }
 
+/// The artifact a finished `agentz_artifact_publish` made and the version it was, from its
+/// answer. Its row is the artifact's card, which shows apart from the work around it, as a
+/// subagent's does.
+pub fn published_artifact(tool_call: &ToolCall) -> Option<(ArtifactId, u32)> {
+    // Told apart by name before the answer is parsed, as most calls aren't one.
+    let title = tool_call.title.as_str();
+    if !title.contains("artifact_publish") && !title.contains("Publish an artifact") {
+        return None;
+    }
+    let ToolCallKind::Own {
+        tool: OwnTool::ArtifactPublish,
+        output: Some(output),
+        ..
+    } = ToolCallKind::of(tool_call)
+    else {
+        return None;
+    };
+    let id = output.get("artifactId")?.as_str()?;
+    let version = u32::try_from(output.get("version")?.as_u64()?).ok()?;
+    Some((ArtifactId(id.to_string()), version))
+}
+
 /// Most calls can't be a subagent, and are told apart without parsing their input: Droid's
 /// Task is of kind "other", and Claude Agent's "think".
 fn may_be_subagent(tool_call: &ToolCall) -> bool {
@@ -264,6 +287,9 @@ pub enum OwnTool {
     TerminalWait,
     CommandRun,
     ProjectAdd,
+    ArtifactPublish,
+    ArtifactList,
+    ArtifactRead,
 }
 
 impl OwnTool {
@@ -294,6 +320,9 @@ impl OwnTool {
         Self::TerminalWait,
         Self::CommandRun,
         Self::ProjectAdd,
+        Self::ArtifactPublish,
+        Self::ArtifactList,
+        Self::ArtifactRead,
     ];
 
     pub fn named(name: &str) -> Option<Self> {
@@ -613,6 +642,30 @@ impl OwnTool {
                 argument("path").map(Subject::code),
                 None,
             ),
+            // Its row is the artifact's card, so a finished publish has no result words.
+            Self::ArtifactPublish => (
+                verbs(
+                    "Publish an artifact:",
+                    "Publishing an artifact:",
+                    "Published an artifact:",
+                ),
+                argument("title").map(Subject::title),
+                None,
+            ),
+            Self::ArtifactList => (
+                verbs("List artifacts", "Listing artifacts…", "Listed artifacts"),
+                None,
+                None,
+            ),
+            Self::ArtifactRead => (
+                verbs(
+                    "Read an artifact",
+                    "Reading an artifact…",
+                    "Read an artifact",
+                ),
+                None,
+                None,
+            ),
         };
         let mut verb = match state {
             CallState::Running => verbs.present,
@@ -777,6 +830,13 @@ impl OwnTool {
                 })
             }
             Self::ProjectAdd => text_in(output.get("name")).and_then(words),
+            // A publish's card says the version; a list says how many there are.
+            Self::ArtifactPublish => None,
+            Self::ArtifactList => words(counted(count("artifacts")?, "artifact", "artifacts")),
+            Self::ArtifactRead => output
+                .get("version")
+                .and_then(Value::as_u64)
+                .and_then(|version| words(format!("v{version}"))),
             Self::ThreadLaunch
             | Self::ThreadSend
             | Self::ThreadInterrupt
@@ -1013,6 +1073,29 @@ impl OwnTool {
             Self::TerminalStart => terminal_line(output).into_iter().collect(),
             Self::TerminalRead | Self::TerminalWait => printed("text").into_iter().collect(),
             Self::CommandRun => printed("output").into_iter().collect(),
+            // The card carries everything a publish has to show.
+            Self::ArtifactPublish => Vec::new(),
+            Self::ArtifactList => output
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|artifact| {
+                    let title = text_in(artifact.get("title"))?;
+                    let mut spans = vec![Span::bright(title)];
+                    if let Some(version) = artifact.get("versions").and_then(Value::as_u64) {
+                        spans.push(Span::dim(format!("v{version}")));
+                    }
+                    if let Some(place) = text_in(artifact.get("place")) {
+                        spans.push(Span::dim(place));
+                    }
+                    Some(OwnPart::Line(spans))
+                })
+                .collect(),
+            Self::ArtifactRead => text_in(output.get("source"))
+                .map(|source| OwnPart::Printed(source.chars().take(2000).collect::<String>()))
+                .into_iter()
+                .collect(),
             Self::ProjectAdd => {
                 let Some(name) = text_in(output.get("name")) else {
                     return Vec::new();
@@ -1087,6 +1170,9 @@ impl OwnTool {
             Self::TerminalWait => counted("Waited for a terminal", "Waited for {} terminals"),
             Self::CommandRun => counted("Ran a command", "Ran {} commands"),
             Self::ProjectAdd => counted("Added a project", "Added {} projects"),
+            Self::ArtifactPublish => counted("Published an artifact", "Published {} artifacts"),
+            Self::ArtifactList => "Listed artifacts".to_string(),
+            Self::ArtifactRead => counted("Read an artifact", "Read {} artifacts"),
         }
     }
 
@@ -3110,6 +3196,25 @@ mod tests {
                 json!({"name": "storefront", "path": "/src/storefront"}),
                 words("storefront"),
             ),
+            (
+                OwnTool::ArtifactList,
+                json!({}),
+                json!({"artifacts": [{}, {}]}),
+                words("2 artifacts"),
+            ),
+            (
+                OwnTool::ArtifactRead,
+                json!({"artifactId": "a1"}),
+                json!({"artifactId": "a1", "version": 3, "source": "<h1>Plan</h1>"}),
+                words("v3"),
+            ),
+            // A publish shows as the artifact's card.
+            (
+                OwnTool::ArtifactPublish,
+                json!({}),
+                json!({"artifactId": "a1", "version": 2}),
+                None,
+            ),
             // Tools that made something open it instead, and others only did something.
             (
                 OwnTool::ThreadLaunch,
@@ -3127,6 +3232,31 @@ mod tests {
         for (tool, arguments, output, expected) in cases {
             assert_eq!(result(tool, arguments, output), expected, "{tool:?}");
         }
+    }
+
+    #[test]
+    fn a_finished_publish_names_its_artifact_and_version() {
+        let published = tool_call(
+            "mcp__agentz__agentz_artifact_publish",
+            Some(json!({"title": "Checkout redesign", "kind": "page"})),
+            Some(r#"{"artifactId": "k3x9", "version": 2, "versions": 2}"#),
+        );
+        assert_eq!(
+            published_artifact(&published),
+            Some((ArtifactId("k3x9".to_string()), 2))
+        );
+        let failed = tool_call(
+            "mcp__agentz__agentz_artifact_publish",
+            Some(json!({"title": "Checkout redesign"})),
+            Some("A page needs an index.html."),
+        );
+        assert_eq!(published_artifact(&failed), None);
+        let listed = tool_call(
+            "mcp__agentz__agentz_artifact_list",
+            None,
+            Some(r#"{"artifactId": "k3x9", "version": 2}"#),
+        );
+        assert_eq!(published_artifact(&listed), None);
     }
 
     #[test]

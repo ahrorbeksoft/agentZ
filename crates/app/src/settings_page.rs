@@ -52,7 +52,9 @@ use std::collections::BTreeMap;
 
 use crate::agent_login::{AgentLogin, LoginLayout, LoginStep};
 use crate::agent_view::TOOLBAR_HEIGHT;
-use crate::app_settings::{AppSettingsStore, MachineProfile, PlaySound, ThemeMode};
+use crate::app_settings::{
+    AppSettingsStore, ArtifactAutoOpen, MachineProfile, PlaySound, ThemeMode,
+};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{
     ACCOUNT_COLORS, ActionButton, ActionStyle, account_badge, account_color, avatar, color_hex,
@@ -1071,6 +1073,11 @@ impl SettingsPage {
             ),
             render_section("Chats", vec![self.render_chats_row(cx)], cx),
             render_section(
+                "Artifacts",
+                vec![self.render_artifact_auto_open_row(window, cx)],
+                cx,
+            ),
+            render_section(
                 "Thread titles",
                 self.render_title_generation_rows(window, cx),
                 cx,
@@ -1133,6 +1140,47 @@ impl SettingsPage {
                         store.update(|settings| settings.show_thinking = enabled, cx)
                     })
                 })
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    /// When a publish opens its page by itself (`design/artifacts`, topic 3, with every
+    /// choice, as its comment asked).
+    fn render_artifact_auto_open_row(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self.app_settings.read(cx).settings().artifact_auto_open;
+        let app_settings = self.app_settings.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for value in ArtifactAutoOpen::ALL {
+                let app_settings = app_settings.clone();
+                menu = menu.toggleable_entry(
+                    value.label(),
+                    current == value,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        app_settings.update(cx, |store, cx| {
+                            store.update(|settings| settings.artifact_auto_open = value, cx)
+                        })
+                    },
+                );
+            }
+            menu
+        });
+        render_row(
+            "Open in the browser",
+            "When a page an agent publishes opens by itself. Otherwise its card's Open does it.",
+            div()
+                .debug_selector(|| "artifact-auto-open".to_string())
+                .child(DropdownMenu::new(
+                    "artifact-auto-open",
+                    current.label(),
+                    menu,
+                ))
                 .into_any_element(),
             cx,
         )

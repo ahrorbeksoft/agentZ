@@ -17,6 +17,9 @@ use agentz_protocol::accounts::{
 };
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::agents::InstallState;
+use agentz_protocol::artifacts::{
+    Artifact, ArtifactId, ArtifactKind, ArtifactReply, ArtifactRequest,
+};
 use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
@@ -3871,6 +3874,7 @@ impl AgentView {
             // From the title's own width, so a narrow header shrinks it and the project's name
             // together.
             .child(h_flex().flex_auto().min_w_0().child(title))
+            .children(self.render_artifacts_pill(cx))
             .when(!is_chat, |toolbar| toolbar.children(self.render_branch(cx)))
             .child(self.render_toolbar_buttons(is_chat, cx))
     }
@@ -4318,6 +4322,353 @@ impl AgentView {
                 .tooltip(Tooltip::text(folder.display().to_string()))
                 .into_any_element(),
         )
+    }
+
+    /// The artifacts this thread published, for its header's pill, newest first.
+    fn thread_artifacts(&self, cx: &App) -> Vec<Artifact> {
+        let key = ThreadKey {
+            machine: self.store.read(cx).machine(),
+            thread: self.thread_id,
+        };
+        Machines::global(cx).read(cx).artifacts_for_thread(&key, cx)
+    }
+
+    /// Claude Code's ⧉ pill, before the branch (`design/artifacts`, topic 5B): the page, or
+    /// with several the count, whose list ends in All artifacts….
+    fn render_artifacts_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let artifacts = self.thread_artifacts(cx);
+        let first = artifacts.first()?;
+        let machine = self.store.read(cx).machine();
+        let border = cx.theme().colors().border_variant;
+        let hover = cx.theme().colors().ghost_element_hover;
+        let pill = |label: SharedString| {
+            h_flex()
+                .id("thread-header-artifacts")
+                .debug_selector(|| "thread-header-artifacts".into())
+                .flex_none()
+                .max_w(px(200.))
+                .h(px(22.))
+                .px_1p5()
+                .gap_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(border)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(
+                    Icon::new(artifact_icon(first.kind))
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+        };
+        if artifacts.len() == 1 {
+            let link = Machines::global(cx)
+                .read(cx)
+                .artifact_link(machine, &first.id, None, cx);
+            return Some(
+                pill(first.title.clone().into())
+                    .tooltip(Tooltip::text("Open in the Browser"))
+                    .when_some(link, |this, link| {
+                        this.on_click(move |_, _, cx| cx.open_url(&link))
+                    })
+                    .into_any_element(),
+            );
+        }
+        let trigger = pill(format!("{} artifacts", artifacts.len()).into());
+        Some(
+            PopoverMenu::new("thread-artifacts-menu")
+                .trigger(ButtonLike::new("thread-artifacts-trigger").child(trigger))
+                .anchor(Anchor::TopRight)
+                .menu(move |window, cx| {
+                    let machines = Machines::global(cx).read(cx);
+                    let entries: Vec<(SharedString, IconName, Option<String>)> = artifacts
+                        .iter()
+                        .map(|artifact| {
+                            (
+                                artifact.title.clone().into(),
+                                artifact_icon(artifact.kind),
+                                machines.artifact_link(machine, &artifact.id, None, cx),
+                            )
+                        })
+                        .collect();
+                    let gallery = machines.gallery_link(cx);
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for (title, icon, link) in entries {
+                            menu = menu.item(
+                                ContextMenuEntry::new(title)
+                                    .icon(icon)
+                                    .icon_color(Color::Muted)
+                                    .handler(move |_, cx| {
+                                        if let Some(link) = &link {
+                                            cx.open_url(link);
+                                        }
+                                    }),
+                            );
+                        }
+                        menu = menu.separator();
+                        menu.entry("All artifacts…", None, move |_, cx| {
+                            if let Some(gallery) = &gallery {
+                                cx.open_url(gallery);
+                            }
+                        })
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// A publish's row (`design/artifacts`, topics 1B and 2D): this thread's newest publish of
+    /// a page is its card, opening it; an earlier one a line that opens the version it made.
+    /// `None` once the artifact is deleted, for the plain row.
+    fn render_published_artifact(
+        &self,
+        index: usize,
+        id: ArtifactId,
+        version: u32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let machine = self.store.read(cx).machine();
+        let machines = Machines::global(cx).read(cx);
+        let artifact = machines
+            .client(machine, cx)?
+            .read(cx)
+            .artifacts()
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id == id)?
+            .clone();
+        let later = self
+            .thread
+            .read(cx)
+            .entries()
+            .get(index + 1..)
+            .unwrap_or_default();
+        let is_newest = !later.iter().any(|entry| match entry {
+            Entry::ToolCall(later) => {
+                later.text.iter().any(|text| text.contains(&id.0))
+                    && tool_calls::published_artifact(later)
+                        .is_some_and(|(later_id, _)| later_id == id)
+            }
+            _ => false,
+        });
+        // The latest version's link follows the page as it's published again.
+        let link = machines.artifact_link(
+            machine,
+            &id,
+            (version < artifact.latest()).then_some(version),
+            cx,
+        );
+        let colors = cx.theme().colors();
+        let hover = colors.ghost_element_hover;
+        let open = {
+            let link = link.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                if let Some(link) = &link {
+                    cx.open_url(link);
+                }
+            }
+        };
+        if !is_newest {
+            return Some(
+                h_flex()
+                    .id(("artifact-line", index))
+                    .debug_selector(move || format!("artifact-line-{index}"))
+                    .min_h(px(24.))
+                    .gap_1p5()
+                    .px_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(open)
+                    .child(
+                        h_flex().w(px(24.)).flex_none().justify_center().child(
+                            Icon::new(artifact_icon(artifact.kind))
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .text_size(rems_from_px(13_f32))
+                            .text_color(work_row_color(cx))
+                            .child(div().flex_none().child("Published an artifact:"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(colors.text_muted)
+                                    .child(one_line(&artifact.title)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(colors.text_placeholder)
+                                    .child(format!("· v{version}")),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let published = artifact
+            .version(version)
+            .map(|version| published_ago(version.published_at))
+            .unwrap_or_default();
+        let detail = format!("{} · v{version} · {published}", artifact.kind.label());
+        let menu = {
+            let view = cx.entity().downgrade();
+            let title = artifact.title.clone();
+            let kind = artifact.kind;
+            move |window: &mut Window, cx: &mut App| {
+                let view = view.clone();
+                let link = link.clone();
+                let id = id.clone();
+                let title = title.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    let view_for_export = view.clone();
+                    menu.when_some(link.clone(), |menu, link| {
+                        menu.entry("Copy Link", None, move |_, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
+                        })
+                    })
+                    .entry("Export…", None, move |_, cx| {
+                        view_for_export
+                            .update(cx, |view, cx| {
+                                view.export_artifact(id.clone(), version, &title, kind, cx)
+                            })
+                            .log_err();
+                    })
+                    .entry("Show in List", None, move |_, cx| {
+                        view.update(cx, |_, cx| show_artifacts_shelf(cx)).log_err();
+                    })
+                })
+            }
+        };
+        let tile_background = colors.element_background;
+        let border = Self::tool_card_border_color(cx);
+        Some(
+            h_flex()
+                .id(("artifact-card", index))
+                .debug_selector(move || format!("artifact-card-{index}"))
+                .my_1()
+                .p_2()
+                .gap_2p5()
+                .w_full()
+                .max_w(px(520.))
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(colors.editor_background)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(open.clone())
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .size(px(36.))
+                        .justify_center()
+                        .rounded_md()
+                        .bg(tile_background)
+                        .child(
+                            Icon::new(artifact_icon(artifact.kind))
+                                .size(IconSize::Medium)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(rems_from_px(13_f32))
+                                .child(one_line(&artifact.title)),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(rems_from_px(12_f32))
+                                .text_color(colors.text_muted)
+                                .child(detail),
+                        ),
+                )
+                .child(
+                    Button::new(("artifact-card-open", index), "Open")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .on_click(open),
+                )
+                .child(
+                    PopoverMenu::new(("artifact-card-menu", index))
+                        .trigger(
+                            IconButton::new(("artifact-card-more", index), IconName::Ellipsis)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted),
+                        )
+                        .anchor(Anchor::TopRight)
+                        .menu(move |window, cx| Some(menu(window, cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The card's Export…: one version's file, saved where the user picks.
+    fn export_artifact(
+        &mut self,
+        id: ArtifactId,
+        version: u32,
+        title: &str,
+        kind: ArtifactKind,
+        cx: &mut Context<Self>,
+    ) {
+        let client = self.thread.read(cx).client().clone();
+        let response = client
+            .read(cx)
+            .request(Request::Artifact(ArtifactRequest::Read {
+                id,
+                version: Some(version),
+            }));
+        let name: String = title
+            .chars()
+            .map(|character| {
+                if character.is_alphanumeric() || " -_".contains(character) {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let name = format!("{}.{}", name.trim(), kind.extension());
+        let folder = dirs::home_dir().unwrap_or_default();
+        let path = cx.prompt_for_new_path(&folder, Some(&name));
+        cx.spawn(async move |_, cx| {
+            let Some(path) = path.await.ok().and_then(|path| path.log_err()).flatten() else {
+                return;
+            };
+            let source = match response.await {
+                Ok(Response::Artifact(ArtifactReply::Page { source, .. })) => source,
+                Ok(response) => {
+                    log::error!("exporting an artifact got {response:?}");
+                    return;
+                }
+                Err(error) => {
+                    log::error!("exporting an artifact: {error:#}");
+                    return;
+                }
+            };
+            cx.background_spawn(async move { std::fs::write(&path, source) })
+                .await
+                .log_err();
+        })
+        .detach();
     }
 
     pub(crate) fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5203,7 +5554,15 @@ impl AgentView {
         {
             return card;
         }
-        // The plan bar shows the to-do list, so its updates have no row, as in Zed.
+        // A publish's row is the artifact's card, or for a page it later republished a line
+        // (design/artifacts, topics 1 and 2).
+        if live_run.is_none()
+            && !needs_confirmation
+            && let Some((artifact, version)) = tool_calls::published_artifact(tool_call)
+            && let Some(card) = self.render_published_artifact(index, artifact, version, cx)
+        {
+            return card;
+        }
         if live_run.is_none() && tool_calls::is_hidden(tool_call) && !needs_confirmation {
             return div().into_any_element();
         }
@@ -12970,10 +13329,39 @@ fn one_line(text: &str) -> String {
 /// thoughts. The plan's marker draws nothing, so it doesn't split a run. A subagent's row stands
 /// on its own, so several at once show side by side, and so does a tool call that changed the
 /// agent's mode, with the line marking the change under it.
+fn artifact_icon(kind: ArtifactKind) -> IconName {
+    match kind {
+        ArtifactKind::Page => IconName::FileCode,
+        ArtifactKind::Document => IconName::FileMarkdown,
+    }
+}
+
+/// "published 2m ago", from milliseconds since the epoch.
+fn published_ago(published_at: u64) -> String {
+    let time = SystemTime::UNIX_EPOCH + Duration::from_millis(published_at);
+    match crate::sidebar::format_relative_time(time, SystemTime::now()).as_str() {
+        "now" => "published just now".to_string(),
+        ago => format!("published {ago} ago"),
+    }
+}
+
+/// The card's Show in List: opens the sidebar's Artifacts shelf, kept by this Mac's server.
+fn show_artifacts_shelf(cx: &mut App) {
+    let machines = Machines::global(cx);
+    if machines.read(cx).artifacts_expanded(cx) {
+        return;
+    }
+    if let Some(store) = machines.read(cx).projects(MachineId::Local, cx) {
+        store.update(cx, |store, cx| store.toggle_artifacts_expanded(cx));
+    }
+}
+
 fn is_work(entry: &Entry) -> bool {
     match entry {
         Entry::ToolCall(tool_call) => {
-            !tool_calls::is_subagent(tool_call) && tool_call.mode_switch.is_none()
+            !tool_calls::is_subagent(tool_call)
+                && tool_call.mode_switch.is_none()
+                && tool_calls::published_artifact(tool_call).is_none()
         }
         Entry::AgentThought(_) | Entry::Plan => true,
         Entry::UserMessage(_) | Entry::AgentMessage(_) => false,

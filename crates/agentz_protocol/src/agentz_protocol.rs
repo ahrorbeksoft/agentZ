@@ -14,6 +14,7 @@
 
 pub mod accounts;
 pub mod agents;
+pub mod artifacts;
 pub mod attachments;
 pub mod diff;
 pub mod layout;
@@ -47,6 +48,7 @@ use crate::agents::{
     AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, CustomAgentChange, IconId,
     RegistrySnapshot,
 };
+use crate::artifacts::{ArtifactId, ArtifactReply, ArtifactRequest, Artifacts, PageTheme};
 use crate::attachments::{AttachmentData, AttachmentId};
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::mcp_servers::McpServer;
@@ -285,6 +287,7 @@ pub enum Request {
     ToggleArchivedExpanded,
     ToggleWorkspacesExpanded,
     ToggleChatsExpanded,
+    ToggleArtifactsExpanded,
 
     /// Answered with [`Response::ThreadCreated`], once its workspace is ready.
     CreateThread {
@@ -772,6 +775,19 @@ pub enum Request {
     /// [`Event::Spaces`].
     Spaces(SpaceRequest),
 
+    /// One of the machine's artifacts, for the pages the app's own machine serves:
+    /// [`Response::Artifact`].
+    Artifact(ArtifactRequest),
+    /// Deletes an artifact and all its versions.
+    DeleteArtifact(ArtifactId),
+    /// The app's theme, for the pages this server serves. Open pages change at once.
+    SetPageTheme(PageTheme),
+    /// The answer to an [`Event::RelayArtifact`], or why there's none.
+    ArtifactRelayed {
+        relay_id: u64,
+        result: std::result::Result<ArtifactReply, String>,
+    },
+
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -964,6 +980,7 @@ pub enum Response {
     TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.
     Message(String),
+    Artifact(ArtifactReply),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -991,6 +1008,8 @@ pub struct SessionSnapshot {
     /// What agentZ keeps on the machine, as last measured.
     #[serde(default)]
     pub storage: Storage,
+    #[serde(default)]
+    pub artifacts: Artifacts,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1005,6 +1024,7 @@ pub enum Event {
     MachineIcon(MachineIcon),
     TitleGeneration(title_generation::TitleGenerationState),
     Storage(Storage),
+    Artifacts(Artifacts),
     Thread {
         connection: ConnectionId,
         update: ThreadUpdate,
@@ -1020,6 +1040,19 @@ pub enum Event {
     TerminalClosed(TerminalKey),
     /// A tool call for one of the client's other machines, from [`Request::SetPeers`].
     RelayToolCall(RelayToolCall),
+    /// What a page this server serves needs from one of the client's other machines, by its
+    /// name in [`Request::SetPeers`]: [`Request::ArtifactRelayed`] answers it.
+    RelayArtifact {
+        relay_id: u64,
+        machine: String,
+        request: ArtifactRequest,
+    },
+    /// A page's link to its thread was clicked: the app shows the thread, on the machine of
+    /// that name, or with none, on this one.
+    ShowThread {
+        machine: Option<String>,
+        thread_id: ThreadId,
+    },
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),

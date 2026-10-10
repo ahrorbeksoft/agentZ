@@ -11,6 +11,7 @@ use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
 use agentz_protocol::accounts::{AccountId, AgentAccount, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
+use agentz_protocol::artifacts::{Artifact, ArtifactId, ArtifactRequest, Artifacts, PageTheme};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
@@ -28,6 +29,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
+use projects::ThreadId;
 use ui::SharedString;
 
 use crate::agent_icons::AgentIconStore;
@@ -86,6 +88,19 @@ pub enum ServerClientEvent {
     /// A terminal pane's agent finished working (`Completed`) or got blocked on a prompt
     /// (`PendingApproval`).
     PaneNeedsAttention(PaneId, ThreadStatus),
+    /// Another machine's pages server needs this machine's artifacts answered.
+    RelayArtifact {
+        relay_id: u64,
+        machine: String,
+        request: ArtifactRequest,
+    },
+    /// A page asks agentZ to show its thread: on this machine, or on the one named.
+    ShowThread {
+        machine: Option<String>,
+        thread_id: ThreadId,
+    },
+    /// An agent published an artifact or a new version of one while the app was connected.
+    ArtifactPublished(Artifact),
 }
 
 pub struct ServerClient {
@@ -118,6 +133,8 @@ pub struct ServerClient {
     title_generation: TitleGenerationState,
     /// What agentZ keeps on the machine, as its server last measured it.
     storage: Storage,
+    /// The machine's published artifacts, and where its pages server is.
+    artifacts: Artifacts,
     /// Open threads and login sessions, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
@@ -170,6 +187,7 @@ impl ServerClient {
                 machine_icon: MachineIcon::default(),
                 title_generation: TitleGenerationState::default(),
                 storage: Storage::default(),
+                artifacts: Artifacts::default(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
@@ -578,6 +596,33 @@ impl ServerClient {
         &self.storage
     }
 
+    pub fn artifacts(&self) -> &Artifacts {
+        &self.artifacts
+    }
+
+    fn set_artifacts(&mut self, artifacts: Artifacts, cx: &mut Context<Self>) {
+        if artifacts != self.artifacts {
+            self.artifacts = artifacts;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_artifacts_for_test(&mut self, artifacts: Artifacts, cx: &mut Context<Self>) {
+        self.set_artifacts(artifacts, cx);
+    }
+
+    /// Deletes an artifact and its versions everywhere it shows.
+    pub fn delete_artifact(&self, id: ArtifactId, cx: &App) -> Task<Result<()>> {
+        let response = self.request(Request::DeleteArtifact(id));
+        cx.background_spawn(async move { response.await.map(|_| ()) })
+    }
+
+    /// The app's look for this machine's pages server, sent as it changes.
+    pub fn set_page_theme(&self, theme: PageTheme, cx: &App) {
+        self.send(Request::SetPageTheme(theme), cx);
+    }
+
     fn set_storage(&mut self, storage: Storage, cx: &mut Context<Self>) {
         if storage != self.storage {
             self.storage = storage;
@@ -834,6 +879,7 @@ impl ServerClient {
                     | Event::MachineIcon(_)
                     | Event::TitleGeneration(_)
                     | Event::Storage(_)
+                    | Event::Artifacts(_)
             )
         {
             queued.push(event);
@@ -852,6 +898,39 @@ impl ServerClient {
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::TitleGeneration(state) => self.set_title_generation(state, cx),
             Event::Storage(storage) => self.set_storage(storage, cx),
+            Event::Artifacts(artifacts) => {
+                // Only a change is a publish: the session's list is what was there before.
+                let published: Vec<Artifact> = artifacts
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        let before = self
+                            .artifacts
+                            .artifacts
+                            .iter()
+                            .find(|known| known.id == artifact.id)
+                            .map_or(0, Artifact::latest);
+                        artifact.latest() > before
+                    })
+                    .cloned()
+                    .collect();
+                self.set_artifacts(artifacts, cx);
+                for artifact in published {
+                    cx.emit(ServerClientEvent::ArtifactPublished(artifact));
+                }
+            }
+            Event::RelayArtifact {
+                relay_id,
+                machine,
+                request,
+            } => cx.emit(ServerClientEvent::RelayArtifact {
+                relay_id,
+                machine,
+                request,
+            }),
+            Event::ShowThread { machine, thread_id } => {
+                cx.emit(ServerClientEvent::ShowThread { machine, thread_id })
+            }
             Event::Thread { connection, update } => {
                 if let Some(thread) = self.threads.get(&connection).and_then(|t| t.upgrade()) {
                     thread.update(cx, |thread, cx| thread.apply_update(update, cx));
@@ -1295,5 +1374,72 @@ mod tests {
             client.set_spaces(spaces(Some(PaneAgentState::Blocked)), cx);
         });
         assert!(attention.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn only_a_publish_while_connected_is_news(cx: &mut TestAppContext) {
+        use agentz_protocol::artifacts::{ArtifactKind, ArtifactVersion};
+
+        let artifact = |id: &str, versions: usize| Artifact {
+            id: ArtifactId(id.to_string()),
+            title: id.to_string(),
+            kind: ArtifactKind::Page,
+            versions: vec![
+                ArtifactVersion {
+                    published_at: 1,
+                    bytes: 10,
+                    files: Vec::new(),
+                };
+                versions
+            ],
+            thread_id: Some(ThreadId(1)),
+            project_id: None,
+            agent_id: None,
+            sent_at: None,
+            frame_key: "key".into(),
+        };
+        let artifacts = |list: Vec<Artifact>| Artifacts {
+            artifacts: list,
+            pages: None,
+        };
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            )
+        });
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let published = published.clone();
+            cx.subscribe(&client, move |_, event: &ServerClientEvent, _| {
+                if let ServerClientEvent::ArtifactPublished(artifact) = event {
+                    published
+                        .borrow_mut()
+                        .push((artifact.id.0.clone(), artifact.latest()));
+                }
+            })
+            .detach();
+        });
+
+        // What the session brings was published before.
+        client.update(cx, |client, cx| {
+            client.set_artifacts_for_test(artifacts(vec![artifact("plan", 1)]), cx)
+        });
+        let change = |list: Vec<Artifact>, cx: &mut TestAppContext| {
+            client.update(cx, |client, cx| {
+                client.handle_event(Event::Artifacts(artifacts(list)), cx)
+            })
+        };
+        change(vec![artifact("plan", 1), artifact("report", 1)], cx);
+        change(vec![artifact("plan", 2), artifact("report", 1)], cx);
+        // A deletion is no publish.
+        change(vec![artifact("plan", 2)], cx);
+        assert_eq!(
+            *published.borrow(),
+            vec![("report".to_string(), 1), ("plan".to_string(), 2)]
+        );
     }
 }

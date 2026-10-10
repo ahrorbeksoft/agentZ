@@ -14,6 +14,7 @@
 //! stay with the user. Mutations take an optional `clientRequestId`, so a retry returns the
 //! first answer instead of doing the work again.
 
+mod artifact_tools;
 mod commands;
 mod project_tools;
 mod relay;
@@ -141,7 +142,7 @@ impl Caller {
 
 /// What a chat may call: reading every project's threads, diffs and workspaces, and delegated
 /// tasks, terminals and commands in its own folder. Nothing that starts or changes a thread.
-const CHAT_TOOLS: [&str; 14] = [
+const CHAT_TOOLS: [&str; 17] = [
     "orchestrator_capabilities",
     "agentz_thread_list",
     "agentz_thread_read",
@@ -156,6 +157,9 @@ const CHAT_TOOLS: [&str; 14] = [
     "agentz_terminal_read",
     "agentz_terminal_wait",
     "agentz_command_run",
+    "agentz_artifact_publish",
+    "agentz_artifact_list",
+    "agentz_artifact_read",
 ];
 
 /// What a chat may call on other machines, which have no folder of its own.
@@ -690,6 +694,9 @@ impl Server {
             "agentz_terminal_wait" => self.terminal_wait(caller, &arguments, timed_out),
             "agentz_command_run" => self.command_run(caller, &arguments),
             "agentz_project_add" => self.project_add(&arguments),
+            "agentz_artifact_publish" => self.artifact_publish(caller, &arguments),
+            "agentz_artifact_list" => self.artifact_list(caller, &arguments),
+            "agentz_artifact_read" => self.artifact_read(&arguments),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
         Ok(match (request_key, step) {
@@ -2682,6 +2689,7 @@ pub(super) fn definitions() -> Value {
         tools.extend(terminals::definitions());
         tools.extend(commands::definitions());
         tools.extend(project_tools::definitions());
+        tools.extend(artifact_tools::definitions());
         let machine = json!({
             "type": "string",
             "maxLength": 256,

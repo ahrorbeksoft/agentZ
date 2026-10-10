@@ -1,6 +1,7 @@
 //! The state the server owns, and how requests and background results change it.
 
 mod account_requests;
+mod artifact_requests;
 mod attachment_requests;
 mod chats;
 mod copy_reads;
@@ -62,11 +63,13 @@ use util::ResultExt as _;
 
 use crate::accounts::{self, AccountStore};
 use crate::agent_settings::AgentSettingsStore;
+use crate::artifacts::ArtifactStore;
 use crate::browser;
 use crate::checkpoints::Checkpoints;
 use crate::continuations;
 use crate::machine_kind;
 use crate::mcp_servers;
+use crate::pages::{self, Pages};
 use crate::repositories::{self, RepositoryChecks};
 use crate::skills;
 use crate::spaces::SpaceStore;
@@ -118,6 +121,8 @@ pub(crate) enum Input {
     },
     /// Background work's result, applied to the server's state.
     Run(Box<dyn FnOnce(&mut Server) + Send>),
+    /// The pages server asked something ([`pages`]).
+    PageAsk(pages::PageAsk),
     Shutdown,
 }
 
@@ -213,6 +218,11 @@ pub(crate) struct Server {
     /// What agentZ keeps on the machine, as last measured, for Settings › Storage.
     storage: Storage,
     storage_reads: storage_reads::StorageReads,
+    /// The pages agents published (design/artifacts), and the server that serves them to the
+    /// browser, when its port could be had.
+    artifacts: ArtifactStore,
+    pages: Option<Pages>,
+    artifacts_revision_sent: u64,
     registry: AgentRegistryStore,
     agent_settings: AgentSettingsStore,
     accounts: AccountStore,
@@ -345,6 +355,8 @@ impl Server {
                 .unwrap_or_default(),
             providers: Vec::new(),
         };
+        let artifacts = ArtifactStore::load(&data_dir);
+        let artifact_pages = pages::start(&runtime, &data_dir, inputs.clone());
         let browser_programs = config.agent_control.as_ref().and_then(|control| {
             let directory = data_dir.join("browser");
             browser::install(&directory, &control.executable)
@@ -396,6 +408,9 @@ impl Server {
             reading_copy_statuses: false,
             storage: Storage::default(),
             storage_reads: storage_reads::StorageReads::default(),
+            artifacts,
+            pages: artifact_pages,
+            artifacts_revision_sent: 0,
             registry,
             agent_settings,
             accounts,
@@ -762,6 +777,7 @@ impl Server {
             Input::Respond { client, id, result } => {
                 self.send(client, ServerMessage::Response { id, result })
             }
+            Input::PageAsk(ask) => self.answer_page_ask(ask),
             Input::Run(then) => then(self),
             Input::Request {
                 client,
@@ -873,6 +889,7 @@ impl Server {
                     machine_icon: self.machine_icon.clone(),
                     title_generation: self.title_generation.clone(),
                     storage: self.storage.clone(),
+                    artifacts: self.artifacts_snapshot(),
                 }))
             }
             Request::SubscribeThread(connection) => {
@@ -945,6 +962,10 @@ impl Server {
             }
             Request::ToggleChatsExpanded => {
                 self.projects.toggle_chats_expanded();
+                Ok(Response::Ok)
+            }
+            Request::ToggleArtifactsExpanded => {
+                self.projects.toggle_artifacts_expanded();
                 Ok(Response::Ok)
             }
             Request::MoveToAgents(thread_id) => {
@@ -1311,6 +1332,22 @@ impl Server {
             }
             Request::BrowseDirectories { .. } => Err(anyhow!("browsing is handled separately")),
             Request::Spaces(request) => self.space_request(request),
+            Request::Artifact(request) => self
+                .artifact_request(request)
+                .map(Response::Artifact)
+                .map_err(|error| anyhow!(error)),
+            Request::DeleteArtifact(id) => {
+                self.delete_artifact(id)?;
+                Ok(Response::Ok)
+            }
+            Request::SetPageTheme(theme) => {
+                self.set_page_theme(theme);
+                Ok(Response::Ok)
+            }
+            Request::ArtifactRelayed { relay_id, result } => {
+                self.artifact_relayed(relay_id, result);
+                Ok(Response::Ok)
+            }
             Request::Unknown(request) => Err(anyhow!("unsupported request: {request}")),
         }
     }
@@ -2447,6 +2484,10 @@ impl Server {
         if self.storage != self.storage_sent {
             self.storage_sent = self.storage.clone();
             self.broadcast(Event::Storage(self.storage.clone()));
+        }
+        if self.artifacts.revision() != self.artifacts_revision_sent {
+            self.artifacts_revision_sent = self.artifacts.revision();
+            self.broadcast(Event::Artifacts(self.artifacts_snapshot()));
         }
 
         for connection in std::mem::take(&mut self.changed_connections) {

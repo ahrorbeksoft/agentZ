@@ -21,6 +21,7 @@ use crate::app_settings::{AppSettingsStore, MachineProfile};
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use crate::server_client::{ServerClient, ServerClientEvent, Transport};
 use crate::spaces_view::PaneKey;
+use agentz_protocol::artifacts::{Artifact, ArtifactId, ArtifactRequest, PageTheme};
 use agentz_protocol::{
     MachineKind, PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response,
     ToolCaller, ToolResult,
@@ -186,6 +187,10 @@ pub enum MachinesEvent {
     PaneNeedsAttention(PaneKey, ThreadStatus),
     /// The user archived the thread from this app.
     Archiving(ThreadKey),
+    /// A page asks agentZ to show its thread.
+    ShowThread(ThreadKey),
+    /// A machine's agent published an artifact, or a new version of one.
+    ArtifactPublished(MachineId, Artifact),
 }
 
 pub struct Machines {
@@ -501,6 +506,49 @@ impl Machines {
         .detach();
     }
 
+    /// A pages server on one machine needs another's artifact answered: it asks here, and the
+    /// answer goes back as `ArtifactRelayed`, as tool-call relays do (`design/artifacts`).
+    fn relay_artifact(
+        &mut self,
+        source: Entity<ServerClient>,
+        relay_id: u64,
+        machine: String,
+        request: ArtifactRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let reply = self
+            .clients
+            .iter()
+            .find(|client| client.read(cx).label().as_ref() == machine)
+            .map(|client| client.read(cx).request(Request::Artifact(request)));
+        let response = match reply {
+            Some(response) => response,
+            None => {
+                source.read(cx).send(
+                    Request::ArtifactRelayed {
+                        relay_id,
+                        result: Err(format!("agentZ knows no machine called {machine}")),
+                    },
+                    cx,
+                );
+                return;
+            }
+        };
+        cx.spawn(async move |_, cx| {
+            let result = match response.await {
+                Ok(Response::Artifact(reply)) => Ok(reply),
+                Ok(response) => Err(format!("unexpected response: {response:?}")),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            cx.update(|cx| {
+                source
+                    .read(cx)
+                    .send(Request::ArtifactRelayed { relay_id, result }, cx)
+            });
+        })
+        .detach();
+    }
+
     fn add(&mut self, client: Entity<ServerClient>, cx: &mut Context<Self>) {
         let machine = client.read(cx).machine();
         let projects = client.read(cx).projects().clone();
@@ -528,6 +576,31 @@ impl Machines {
                             },
                             *status,
                         ))
+                    }
+                    ServerClientEvent::RelayArtifact {
+                        relay_id,
+                        machine,
+                        request,
+                    } => {
+                        this.relay_artifact(client, *relay_id, machine.clone(), request.clone(), cx)
+                    }
+                    ServerClientEvent::ShowThread {
+                        machine: named,
+                        thread_id,
+                    } => {
+                        let machine = match named {
+                            Some(name) => this.machine_named(name, cx),
+                            None => Some(machine),
+                        };
+                        if let Some(machine) = machine {
+                            cx.emit(MachinesEvent::ShowThread(ThreadKey {
+                                machine,
+                                thread: *thread_id,
+                            }))
+                        }
+                    }
+                    ServerClientEvent::ArtifactPublished(artifact) => {
+                        cx.emit(MachinesEvent::ArtifactPublished(machine, artifact.clone()))
                     }
                 }),
                 cx.observe(&registry, |_, _, cx| cx.notify()),
@@ -765,6 +838,140 @@ impl Machines {
             .projects()
             .read(cx)
             .chats_expanded()
+    }
+
+    /// The app's theme for every machine's pages server.
+    pub fn push_page_theme(&self, theme: PageTheme, cx: &App) {
+        for client in &self.clients {
+            client.read(cx).set_page_theme(theme.clone(), cx);
+        }
+    }
+
+    pub fn artifacts_expanded(&self, cx: &App) -> bool {
+        self.clients[0]
+            .read(cx)
+            .projects()
+            .read(cx)
+            .artifacts_expanded()
+    }
+
+    /// Every machine's artifacts, newest publish first, for the Artifacts shelf and gallery
+    /// link. Remote machines without pages contribute nothing.
+    pub fn artifacts(&self, cx: &App) -> Vec<(MachineId, Artifact)> {
+        let mut artifacts: Vec<(MachineId, Artifact)> = self
+            .clients
+            .iter()
+            .filter(|client| client.read(cx).is_online())
+            .flat_map(|client| {
+                let machine = client.read(cx).machine();
+                client
+                    .read(cx)
+                    .artifacts()
+                    .artifacts
+                    .iter()
+                    .map(move |artifact| (machine, artifact.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        artifacts.sort_by_key(|(_, artifact)| std::cmp::Reverse(artifact.published_at()));
+        artifacts
+    }
+
+    /// The artifacts the Artifacts shelf lists for the picked scope: the picked project's
+    /// threads' and chats' pages, or every one with All (`design/artifacts`, topic 6).
+    pub fn scoped_artifacts(&self, cx: &App) -> Vec<(MachineId, Artifact)> {
+        let artifacts = self.artifacts(cx);
+        let Scope::Group(key) = self.scope(cx) else {
+            return artifacts;
+        };
+        let group = self
+            .project_groups(cx)
+            .into_iter()
+            .find(|group| group.key == key);
+        artifacts
+            .into_iter()
+            .filter(|(machine, artifact)| {
+                artifact.is_from_chat()
+                    || artifact.project_id.is_some_and(|project| {
+                        group
+                            .as_ref()
+                            .is_some_and(|group| group.contains(*machine, project))
+                    })
+            })
+            .collect()
+    }
+
+    /// What one thread published, for its header's pill.
+    pub fn artifacts_for_thread(&self, key: &ThreadKey, cx: &App) -> Vec<Artifact> {
+        self.client(key.machine, cx)
+            .map(|client| {
+                client
+                    .read(cx)
+                    .artifacts()
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| artifact.thread_id == Some(key.thread))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Where an artifact came from, as the shelf says it: "storefront › thread", "Chat · …",
+    /// or "from a deleted thread".
+    pub fn artifact_place(&self, machine: MachineId, artifact: &Artifact, cx: &App) -> String {
+        let Some(client) = self.client(machine, cx) else {
+            return String::new();
+        };
+        let store = client.read(cx).projects().read(cx);
+        let Some(thread_id) = artifact.thread_id else {
+            return String::new();
+        };
+        match store.thread(thread_id) {
+            Some(thread) if artifact.is_from_chat() => format!("Chat · {}", thread.title),
+            Some(thread) => {
+                let project = artifact
+                    .project_id
+                    .and_then(|id| store.project(id))
+                    .map(|project| project.name());
+                match project {
+                    Some(project) => format!("{project} › {}", thread.title),
+                    None => thread.title.clone(),
+                }
+            }
+            None => "from a deleted thread".to_string(),
+        }
+    }
+
+    /// The artifact's page URL, served by this machine's pages server: remote machines'
+    /// artifacts are relayed through it (`design/artifacts`).
+    pub fn artifact_link(
+        &self,
+        machine: MachineId,
+        artifact: &ArtifactId,
+        // An earlier version, or the latest with `None`, whose page follows new publishes.
+        version: Option<u32>,
+        cx: &App,
+    ) -> Option<String> {
+        let local = self.clients.first()?.read(cx);
+        if !local.is_online() {
+            return None;
+        }
+        let pages = local.artifacts().pages.as_ref()?;
+        let machine_name = match machine {
+            MachineId::Local => None,
+            _ => Some(self.label(machine, cx)),
+        };
+        Some(pages.link(machine_name.as_deref(), artifact, version))
+    }
+
+    /// The gallery of every artifact, served by this machine's pages server.
+    pub fn gallery_link(&self, cx: &App) -> Option<String> {
+        let local = self.clients.first()?.read(cx);
+        if !local.is_online() {
+            return None;
+        }
+        Some(local.artifacts().pages.as_ref()?.gallery_link())
     }
 
     /// Settings › General's Chats: while it's off, chats are hidden and kept.
