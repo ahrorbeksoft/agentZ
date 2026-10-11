@@ -24,3 +24,13 @@ more reliable way to stop a session's turn.
 
 With a long thread title, the header's project name shrinks to a few letters ("agentZ" shows
 as "age…"). Project names shouldn't shrink this much.
+
+## Features
+
+### Boards: design boards that agentZ draws from an agent's designs
+
+Agents asked for designs publish five artifacts, one per design, or write a whole board page
+themselves. Extend artifacts so the agent gives only the designs (a picture or a built page
+each, with a name, description and the like) and agentZ draws the board around them, as the
+local design board is: an intro, topics, picks, comments, a summary. Picks are kept on the
+server, and the agent can read them whenever it likes. In design: `design/boards/`.
