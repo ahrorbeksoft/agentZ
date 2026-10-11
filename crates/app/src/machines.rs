@@ -965,13 +965,14 @@ impl Machines {
         Some(pages.link(machine_name.as_deref(), artifact, version))
     }
 
-    /// The gallery of every artifact, served by this machine's pages server.
-    pub fn gallery_link(&self, cx: &App) -> Option<String> {
+    /// The artifacts page, served by this machine's pages server, open at a project's place
+    /// when given one.
+    pub fn artifacts_home_link(&self, project: Option<&str>, cx: &App) -> Option<String> {
         let local = self.clients.first()?.read(cx);
         if !local.is_online() {
             return None;
         }
-        Some(local.artifacts().pages.as_ref()?.gallery_link())
+        Some(local.artifacts().pages.as_ref()?.home_link(project))
     }
 
     /// Settings › General's Chats: while it's off, chats are hidden and kept.

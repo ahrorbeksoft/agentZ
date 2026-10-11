@@ -9225,13 +9225,15 @@ async fn artifacts_are_published_served_and_sent_back() {
     let thread = client.create_thread_in(project_id).await;
     client.wait_until_ready(thread).await;
 
-    let page = server.project_dir.path().join("layouts.html");
-    std::fs::write(&page, "<h1>Layouts</h1>").expect("page");
+    let report = server.project_dir.path().join("report.md");
+    std::fs::write(&report, "# Benchmarks\n\nFaster.").expect("report");
+    let data = server.project_dir.path().join("runs.csv");
+    std::fs::write(&data, "run,ms\n1,20\n").expect("data");
     let published = client
         .tool(
             thread,
-            "agentz_artifact_publish",
-            json!({"title": "Checkout layouts", "file": page}),
+            "agentz_document_publish",
+            json!({"title": "Benchmarks", "file": report, "files": [data]}),
         )
         .await;
     let id = ArtifactId(
@@ -9242,13 +9244,13 @@ async fn artifacts_are_published_served_and_sent_back() {
     );
     assert_eq!(published["version"], json!(1));
 
-    // Published again, it's the same artifact's second version.
-    std::fs::write(&page, "<h1>Layouts, again</h1>").expect("page");
+    // Published again, it's the same document's second version.
+    std::fs::write(&report, "# Benchmarks\n\nFaster, again.").expect("report");
     let again = client
         .tool(
             thread,
-            "agentz_artifact_publish",
-            json!({"title": "Checkout layouts", "file": page, "artifactId": id.0}),
+            "agentz_document_publish",
+            json!({"title": "Benchmarks", "file": report, "artifactId": id.0}),
         )
         .await;
     assert_eq!(again["version"], json!(2));
@@ -9264,6 +9266,7 @@ async fn artifacts_are_published_served_and_sent_back() {
     assert_eq!(artifact.project_id, Some(project_id));
     let listed = client.tool(thread, "agentz_artifact_list", json!({})).await;
     assert_eq!(listed["artifacts"][0]["artifactId"], json!(id.0));
+    assert_eq!(listed["artifacts"][0]["kind"], json!("document"));
     let read = client
         .tool(
             thread,
@@ -9271,7 +9274,20 @@ async fn artifacts_are_published_served_and_sent_back() {
             json!({"artifactId": id.0, "version": 1}),
         )
         .await;
-    assert_eq!(read["source"], json!("<h1>Layouts</h1>"));
+    assert_eq!(read["text"], json!("# Benchmarks\n\nFaster."));
+    assert_eq!(read["files"][0]["name"], json!("runs.csv"));
+    let file = client
+        .tool(
+            thread,
+            "agentz_artifact_read",
+            json!({"artifactId": id.0, "version": 1, "file": "runs.csv"}),
+        )
+        .await;
+    let path = file["path"].as_str().expect("the file's path");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("the file"),
+        "run,ms\n1,20\n"
+    );
 
     // The page needs the token, and its content the frame's key, which isn't the token.
     let address = pages.address.as_str();
@@ -9291,7 +9307,22 @@ async fn artifacts_are_published_served_and_sent_back() {
             .0,
         200
     );
-    // The page's header reads the artifact as a listing.
+    let (status, body) =
+        page_request(address, "GET", &format!("/api/artifacts?t={token}"), "").await;
+    assert_eq!(status, 200);
+    let everything: Value = serde_json::from_str(&body).expect("every machine's artifacts");
+    assert_eq!(everything[0]["artifacts"][0]["artifact"]["id"], json!(id.0));
+    let (status, body) = page_request(
+        address,
+        "GET",
+        &format!("/api/search?t={token}&q=again"),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let found: Value = serde_json::from_str(&body).expect("search results");
+    assert_eq!(found[0]["id"], json!(id.0));
+    // The page's bar reads the artifact as a listing.
     let (status, body) = page_request(
         address,
         "GET",
@@ -9306,27 +9337,134 @@ async fn artifacts_are_published_served_and_sent_back() {
     let content = format!("/a/{}/content/1?key={}", id.0, artifact.frame_key);
     let (status, body) = page_request(address, "GET", &content, "").await;
     assert_eq!(status, 200);
-    assert!(body.contains("<h1>Layouts</h1>"), "{body}");
+    assert!(body.contains("Benchmarks</h1>"), "{body}");
     let with_token = format!("/a/{}/content/1?key={token}", id.0);
     assert_eq!(page_request(address, "GET", &with_token, "").await.0, 403);
+    let raw = format!("/a/{}/raw/2?t={token}", id.0);
+    let (status, body) = page_request(address, "GET", &raw, "").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "# Benchmarks\n\nFaster, again.")
+    );
+    let download = format!("/a/{}/files/1/runs.csv?key={}", id.0, artifact.frame_key);
+    let (status, body) = page_request(address, "GET", &download, "").await;
+    assert_eq!((status, body.as_str()), (200, "run,ms\n1,20\n"));
 
-    // Send to thread puts what the page gave and the note in the thread as the user's.
-    let send = json!({"id": id.0, "version": 2, "text": "Picked B", "note": "Go with it"});
+    // A design: a topic with today's and two variants, by their pictures.
+    let picture = |name: &str| {
+        let path = server.project_dir.path().join(format!("{name}.svg"));
+        std::fs::write(&path, "<svg xmlns='http://www.w3.org/2000/svg'/>").expect("picture");
+        path
+    };
+    let (today, table, cards) = (picture("today"), picture("table"), picture("cards"));
+    let design = client
+        .tool(
+            thread,
+            "agentz_design_publish",
+            json!({
+                "title": "Plans page",
+                "topics": [{
+                    "title": "The plans page",
+                    "today": {"picture": today},
+                    "variants": [
+                        {"name": "Compare table", "picture": table, "good": "Every limit"},
+                        {"name": "Three cards", "picture": cards},
+                    ],
+                    "recommended": "B",
+                }],
+            }),
+        )
+        .await;
+    let design_id = ArtifactId(design["artifactId"].as_str().expect("an id").to_string());
+    let (status, body) = page_request(
+        address,
+        "GET",
+        &format!("/api/design/{}?t={token}", design_id.0),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let shown: Value = serde_json::from_str(&body).expect("a design");
+    let topic = &shown["design"]["topics"][0];
+    assert_eq!(topic["recommended"], json!("Three cards"));
+    assert_eq!(topic["variants"][0]["picture"], json!("1-A.svg"));
+    assert_eq!(topic["today"]["name"], json!("Today's"));
+
+    // The page saves picks as they're made, and the agent reads them as text.
+    let picks = json!({
+        "id": design_id.0,
+        "version": 1,
+        "topic": 0,
+        "picks": {"pick": "Three cards", "also": ["Compare table"], "comments": {"Three cards": "Shorter"}},
+    });
+    let picks_path = format!("/api/picks?t={token}");
+    let (status, _) = page_request(address, "POST", &picks_path, &picks.to_string()).await;
+    assert_eq!(status, 200);
+    let read = client
+        .tool(
+            thread,
+            "agentz_artifact_read",
+            json!({"artifactId": design_id.0}),
+        )
+        .await;
+    let text = read["text"].as_str().expect("the picks as text");
+    assert!(text.contains("1 of 1 decided, not submitted"), "{text}");
+    assert!(text.contains("B. Three cards"), "{text}");
+    assert!(text.contains("Shorter"), "{text}");
+
+    // Submit marks it decided, and with Also send puts a short message in the thread.
+    let submit = json!({"id": design_id.0, "version": 1, "send": true, "note": "Go with it"});
     let (status, _) = page_request(
         address,
         "POST",
-        &format!("/api/send?t={token}"),
-        &send.to_string(),
+        &format!("/api/submit?t={token}"),
+        &submit.to_string(),
     )
     .await;
     assert_eq!(status, 200);
     client
         .wait_until(|client| {
             client.user_messages(thread).iter().any(|message| {
-                message.contains(&format!("(agentz://artifact/{}/2)", id.0))
+                message.contains(&format!("(agentz://artifact/{}/1)", design_id.0))
+                    && message.contains("Submitted: picked B, also A")
                     && message.ends_with(" Go with it")
             })
         })
+        .await;
+    let decided = |client: &TestClient| {
+        client.artifacts().and_then(|artifacts| {
+            let design = artifacts
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.id == design_id)?;
+            Some(design.design.as_ref()?.status())
+        })
+    };
+    client
+        .wait_until(|client| decided(client).as_deref() == Some("Decided"))
+        .await;
+
+    // Published again without Compare table, the picks carry over but its Also doesn't, and
+    // the design waits for a Submit again.
+    let v2 = client
+        .tool(
+            thread,
+            "agentz_design_publish",
+            json!({
+                "title": "Plans page",
+                "artifactId": design_id.0,
+                "topics": [{
+                    "title": "The plans page",
+                    "variants": [{"name": "Three cards", "picture": cards}],
+                }],
+            }),
+        )
+        .await;
+    assert_eq!(v2["version"], json!(2));
+    assert_eq!(v2["picksCarriedOverFrom"], json!(1));
+    assert_eq!(v2["variantsGone"], json!(["A. Compare table"]));
+    client
+        .wait_until(|client| decided(client).as_deref() == Some("1 of 1 decided"))
         .await;
 
     // Deleted, it's gone from the list and its page.
@@ -9335,7 +9473,7 @@ async fn artifacts_are_published_served_and_sent_back() {
         .wait_until(|client| {
             client
                 .artifacts()
-                .is_some_and(|artifacts| artifacts.artifacts.is_empty())
+                .is_some_and(|artifacts| artifacts.artifacts.len() == 1)
         })
         .await;
     assert_eq!(page_request(address, "GET", &content, "").await.0, 404);

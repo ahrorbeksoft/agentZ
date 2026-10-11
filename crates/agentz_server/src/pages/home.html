@@ -1,0 +1,315 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Artifacts · agentZ</title>
+<style>
+__SHARED_CSS__
+__VARS__
+body { display: flex; flex-direction: column; overflow: hidden; }
+.bar .title { font-size: 14px; }
+.search { height: 28px; width: 300px; border: 1px solid var(--border); border-radius: 6px; display: flex; align-items: center; gap: 8px; padding: 0 6px 0 10px; background: var(--background); color: var(--muted); flex: none; }
+.search:focus-within { border-color: var(--accent); }
+.search input { flex: 1; min-width: 0; border: none; background: none; outline: none; color: var(--text); font-size: 13px; padding: 0; }
+.search input::placeholder { color: var(--placeholder); }
+.search button { border: none; background: none; color: var(--muted); cursor: pointer; display: grid; place-items: center; padding: 2px; border-radius: 4px; }
+.search button:hover { color: var(--text); background: var(--hover); }
+
+.layout { flex: 1; min-height: 0; display: flex; }
+.side { width: 230px; flex: none; background: var(--panel); border-right: 1px solid var(--border); padding: 10px 8px; display: flex; flex-direction: column; gap: 1px; overflow-y: auto; }
+.item { height: 30px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 8px; border-radius: 6px; font-size: 13px; color: var(--text); cursor: pointer; border: none; background: none; text-align: left; width: 100%; }
+.item svg { color: var(--muted); }
+.item:hover { background: var(--hover); }
+.item.on { background: var(--selected); }
+.item .n { font-size: 12px; color: var(--placeholder); }
+.sec { font-size: 11px; color: var(--placeholder); padding: 14px 8px 4px; }
+.mono { width: 16px; height: 16px; border-radius: 4px; display: inline-grid; place-items: center; font: 600 8px/1 var(--font-sans); color: #fff; flex: none; }
+.mono.small { width: 14px; height: 14px; font-size: 7px; border-radius: 3px; }
+
+.main { flex: 1; min-width: 0; padding: 18px 24px 48px; overflow-y: auto; }
+.head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.head .ht { font-size: 18px; font-weight: 600; overflow-wrap: anywhere; }
+.head .count { color: var(--placeholder); }
+.band { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 8px 12px; font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
+.day { font-size: 12px; color: var(--muted); margin: 14px 0 8px; }
+.cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.card { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); overflow: hidden; min-width: 0; color: inherit; text-decoration: none; display: block; }
+.card:hover { border-color: var(--accent); }
+.thumb { position: relative; aspect-ratio: 16 / 9; overflow: hidden; background: #111214; border-bottom: 1px solid var(--border); }
+.thumb .state { position: absolute; left: 8px; top: 8px; }
+.mosaic { position: absolute; inset: 0; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 2px; }
+.mosaic.one { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+.mosaic.two { grid-template-rows: 1fr; }
+.mosaic img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; }
+.blank { position: absolute; inset: 0; display: grid; place-items: center; color: var(--placeholder); background: var(--background); }
+.doc { position: absolute; inset: 0; background: var(--background); padding: 12px 14px; display: flex; flex-direction: column; gap: 5px; overflow: hidden; }
+.doc b { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; }
+.doc p { margin: 0 0 3px; font-size: 10px; line-height: 1.45; color: var(--muted); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; flex: none; }
+.doc i { height: 5px; border-radius: 3px; background: var(--hover); display: block; flex: none; }
+.body { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.titled { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.titled b { font-weight: 500; }
+.line { font-size: 12px; color: var(--muted); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.meta { font-size: 12px; color: var(--placeholder); }
+.from { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; min-width: 0; }
+.mach { display: inline-flex; align-items: center; gap: 4px; color: var(--placeholder); flex: none; white-space: nowrap; }
+.result { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 8px; font-size: 13px; color: inherit; text-decoration: none; }
+.result:hover { border-color: var(--accent); }
+.result .pic { width: 96px; height: 54px; border-radius: 4px; position: relative; overflow: hidden; border: 1px solid var(--border); flex: none; background: #111214; }
+.result .pic .doc { padding: 4px 6px; gap: 2px; }
+.result .pic .doc b { font-size: 7px; }
+.result .pic .doc p { font-size: 5px; -webkit-line-clamp: 3; }
+.result .pic .doc i { height: 3px; }
+.result .what { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.mark { background: color-mix(in srgb, var(--warning) 25%, transparent); color: var(--text); border-radius: 2px; padding: 0 1px; }
+.empty { color: var(--muted); padding: 48px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="bar" id="bar"></div>
+<div class="layout"><aside class="side" id="side"></aside><main class="main" id="main"></main></div>
+<script>__DATA__</script>
+<script>__SHARED_JS__</script>
+<script>
+// The artifacts page (design/artifacts-2, topics 4 to 7): places on the left with their
+// counts, every machine's artifacts in cards by day, and a search that finds words inside
+// them. Another machine's cards name it; an offline machine's aren't listed, and a line says so.
+let machines = [];
+let place = DATA.project ? 'project:' + DATA.project : 'all';
+let words = '';
+let found = null;
+let searchAsked = 0;
+let searchTimer = null;
+let loaded = false;
+
+const keyOf = (machine, id) => (machine || '') + '\u0000' + id;
+const items = () => machines.flatMap((entry) => entry.artifacts.map((listing) => ({ machine: entry.machine, listing })))
+  .sort((first, second) => publishedAt(second.listing.artifact) - publishedAt(first.listing.artifact));
+const isWaiting = (artifact) => artifact.kind === 'design' && !!artifact.design && !artifact.design.submitted_at;
+
+function inPlace(item, where = place) {
+  const listing = item.listing;
+  if (where === 'waiting') return isWaiting(listing.artifact);
+  if (where === 'chats') return listing.chat;
+  if (where.startsWith('project:')) return listing.project === where.slice('project:'.length);
+  return true;
+}
+
+function placeName(where = place) {
+  if (where === 'waiting') return 'Waiting for you';
+  if (where === 'chats') return 'Chats';
+  if (where.startsWith('project:')) return where.slice('project:'.length);
+  return 'All artifacts';
+}
+
+const COLORS = ['#3d8b5a', '#3a72c4', '#8a5cc7', '#b8673a', '#2f8f8f', '#b5485d', '#7a8a2e'];
+function mono(name, small = false) {
+  const parts = name.split(/[\s_\-./]+/).filter(Boolean);
+  const initials = (parts.length > 1 ? parts[0][0] + parts[1][0] : name.slice(0, 2)).toUpperCase();
+  let hash = 0;
+  for (const character of name) hash = (hash * 31 + character.codePointAt(0)) >>> 0;
+  return h('span', { class: 'mono' + (small ? ' small' : ''), style: { background: COLORS[hash % COLORS.length] }, text: initials });
+}
+
+function renderBar() {
+  const input = h('input', { type: 'search', id: 'q', placeholder: 'Search artifacts…', value: words, autocomplete: 'off' });
+  input.addEventListener('input', () => setWords(input.value));
+  input.addEventListener('keydown', (event) => { if (event.key === 'Escape') { input.value = ''; setWords(''); input.blur(); } });
+  const end = h('span', { class: 'kbd', id: 'slash', text: '/' });
+  fill($('bar'),
+    h('span', { class: 'zmark', text: 'Z' }),
+    h('span', { class: 'title', text: 'Artifacts' }),
+    h('span', { class: 'grow' }),
+    h('label', { class: 'search' }, icon('search', 13), input, end),
+  );
+}
+
+function renderSide() {
+  const list = items();
+  const count = (where) => list.filter((item) => inPlace(item, where)).length;
+  const row = (where, glyph, name) => h('button', { class: 'item' + (where === place ? ' on' : ''), onclick: () => setPlace(where) },
+    glyph, h('span', { class: 'grow trunc', text: name }), h('span', { class: 'n', text: String(count(where)) }));
+  const projects = [...new Set(list.map((item) => item.listing.project).filter(Boolean))];
+  if (place.startsWith('project:') && !projects.includes(place.slice('project:'.length))) projects.push(place.slice('project:'.length));
+  projects.sort((first, second) => first.localeCompare(second));
+  fill($('side'),
+    row('all', icon('layers', 15), 'All artifacts'),
+    row('waiting', icon('inbox', 15), 'Waiting for you'),
+    h('div', { class: 'sec', text: 'Projects' }),
+    ...projects.map((name) => row('project:' + name, mono(name), name)),
+    row('chats', icon('chat', 15), 'Chats'),
+  );
+}
+
+function thumb(item) {
+  const artifact = item.listing.artifact;
+  if (artifact.kind === 'document') {
+    return h('div', { class: 'doc' }, h('b', { text: artifact.title }), artifact.preview ? h('p', { text: artifact.preview }) : null,
+      ['92%', '78%', '86%', '44%'].map((width) => h('i', { style: { width } })));
+  }
+  // Four in a square, or two side by side: three would leave a hole.
+  const all = (artifact.design && artifact.design.pictures) || [];
+  const pictures = all.slice(0, all.length === 3 ? 2 : 4);
+  if (!pictures.length) return h('div', { class: 'blank' }, icon('board', 22));
+  const size = pictures.length === 1 ? ' one' : pictures.length === 2 ? ' two' : '';
+  return h('div', { class: 'mosaic' + size }, pictures.map((name) => h('img', { src: fileUrl(item.machine, artifact.id, artifact.versions.length, name, artifact.frame_key), loading: 'lazy', alt: '' })));
+}
+
+// The line the search found, with its words marked.
+function marked(line) {
+  const lower = line.toLowerCase();
+  const ranges = [];
+  for (const word of words.toLowerCase().split(/\s+/).filter(Boolean)) {
+    for (let at = lower.indexOf(word); at >= 0; at = lower.indexOf(word, at + word.length)) ranges.push([at, at + word.length]);
+  }
+  ranges.sort((first, second) => first[0] - second[0]);
+  const parts = [];
+  let end = 0;
+  for (const [start, stop] of ranges) {
+    if (stop <= end) continue;
+    const from = Math.max(start, end);
+    if (from > end) parts.push(line.slice(end, from));
+    parts.push(h('span', { class: 'mark', text: line.slice(from, stop) }));
+    end = stop;
+  }
+  parts.push(line.slice(end));
+  return parts;
+}
+
+function fromLine(item) {
+  const listing = item.listing;
+  return h('div', { class: 'from' },
+    listing.chat ? icon('chat', 12) : listing.project ? mono(listing.project, true) : null,
+    h('span', { class: 'trunc grow', text: listing.place }),
+    item.machine ? h('span', { class: 'mach', title: 'On ' + item.machine }, icon('server', 11), item.machine) : null,
+    listing.archived ? h('span', { class: 'tag' }, icon('archive', 11), 'Archived') : null);
+}
+
+function card(item) {
+  const artifact = item.listing.artifact;
+  const state = stateTag(artifact.design);
+  return h('a', { class: 'card', href: artifactUrl(item.machine, artifact.id) },
+    h('div', { class: 'thumb' }, thumb(item), state ? h('span', { class: 'state' }, state) : null),
+    h('div', { class: 'body' },
+      h('div', { class: 'titled' }, h('span', { class: 'muted' }, icon(KINDS[artifact.kind].icon, 14)), h('b', { class: 'trunc grow', text: artifact.title })),
+      h('div', { class: 'meta', text: describe(artifact) + ' · ' + ago(publishedAt(artifact)) }),
+      fromLine(item)));
+}
+
+// A search result (topic 5 A): the matching line under the title, its words marked.
+function result(item, line) {
+  const artifact = item.listing.artifact;
+  return h('a', { class: 'result', href: artifactUrl(item.machine, artifact.id) },
+    h('span', { class: 'pic' }, thumb(item)),
+    h('div', { class: 'what' },
+      h('div', { class: 'titled' }, h('span', { class: 'muted' }, icon(KINDS[artifact.kind].icon, 14)), h('b', { class: 'trunc', text: artifact.title }), stateTag(artifact.design, { short: true }), h('span', { class: 'grow' }), h('span', { class: 'meta', text: ago(publishedAt(artifact)) })),
+      line ? h('div', { class: 'line' }, marked(line)) : null,
+      fromLine(item)));
+}
+
+function dayOf(ms) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  if (ms >= today) return 'Today';
+  if (ms >= today - 86400000) return 'Yesterday';
+  if (ms >= today - 6 * 86400000) return 'This week';
+  return 'Earlier';
+}
+
+function renderMain() {
+  const main = $('main');
+  const children = [];
+  for (const entry of machines.filter((entry) => !entry.online)) {
+    children.push(h('div', { class: 'band' }, icon('wifi', 15), h('span', { class: 'grow', text: `${entry.machine} isn’t connected; its artifacts show once it is.` })));
+  }
+  const list = items().filter((item) => inPlace(item));
+  if (words.trim()) {
+    const lower = words.toLowerCase().split(/\s+/).filter(Boolean);
+    const matches = list.filter((item) => {
+      const key = keyOf(item.machine, item.listing.artifact.id);
+      if (found && found.has(key)) return true;
+      const text = (item.listing.artifact.title + ' ' + item.listing.place).toLowerCase();
+      return lower.every((word) => text.includes(word));
+    });
+    children.push(h('div', { class: 'head' }, h('span', { class: 'ht', text: `Results for “${words.trim()}”` }), h('span', { class: 'count', text: String(matches.length) })));
+    const results = h('div', { style: { marginTop: '10px' } });
+    for (const item of matches) results.append(result(item, found ? found.get(keyOf(item.machine, item.listing.artifact.id)) || '' : ''));
+    if (!matches.length) results.append(h('div', { class: 'empty', text: found ? 'Nothing matches.' : 'Searching…' }));
+    children.push(results);
+  } else {
+    children.push(h('div', { class: 'head' }, h('span', { class: 'ht', text: placeName() }), h('span', { class: 'count', text: String(list.length) })));
+    if (!list.length) {
+      const text = !loaded ? 'Loading…'
+        : items().length ? 'No artifacts here.'
+        : 'Nothing published yet. Agents publish documents with agentz_document_publish and designs with agentz_design_publish.';
+      children.push(h('div', { class: 'empty', text }));
+    }
+    let day = null;
+    let grid = null;
+    for (const item of list) {
+      const itemDay = dayOf(publishedAt(item.listing.artifact));
+      if (itemDay !== day) {
+        day = itemDay;
+        children.push(h('div', { class: 'day', text: day }));
+        grid = h('div', { class: 'cards' });
+        children.push(grid);
+      }
+      grid.append(card(item));
+    }
+  }
+  fill(main, ...children);
+}
+
+function setPlace(where) {
+  place = where;
+  history.replaceState(null, '', homeUrl(where.startsWith('project:') ? where.slice('project:'.length) : undefined));
+  renderSide();
+  renderMain();
+  $('main').scrollTop = 0;
+}
+
+function setWords(text) {
+  words = text;
+  found = null;
+  clearTimeout(searchTimer);
+  renderMain();
+  if (!text.trim()) return;
+  searchTimer = setTimeout(async () => {
+    const asked = ++searchAsked;
+    let reply = [];
+    try { reply = await getJson('/api/search', { q: text }); } catch (_) {}
+    if (asked !== searchAsked || words !== text) return;
+    found = new Map(reply.map((entry) => [keyOf(entry.machine, entry.id), entry.line]));
+    renderMain();
+  }, 200);
+}
+
+async function load() {
+  try { machines = await getJson('/api/artifacts'); } catch (_) { machines = []; }
+  loaded = true;
+  renderSide();
+  renderMain();
+}
+
+window.addEventListener('keydown', (event) => {
+  const typing = document.activeElement && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+  if (event.key === '/' && !typing) {
+    event.preventDefault();
+    $('q').focus();
+  }
+});
+
+let reloadTimer = null;
+listenEvents((event) => {
+  if (event.type === 'theme') return;
+  clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(() => { load(); if (words.trim()) setWords(words); }, 300);
+});
+renderBar();
+renderSide();
+renderMain();
+load();
+</script>
+</body>
+</html>

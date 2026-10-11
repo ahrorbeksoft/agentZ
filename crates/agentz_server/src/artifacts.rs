@@ -1,14 +1,19 @@
-//! The machine's artifacts (design/artifacts): each in `artifacts/<id>/` in the data folder,
-//! with a `meta.json` ([`Artifact`]), one `pages/<version>.html|md` per publish, and the files
-//! the agent attached in `files/<version>/`. Deleting the thread that published one keeps it;
-//! deleting the artifact removes the folder.
+//! The machine's artifacts (design/artifacts, design/artifacts-2): each in `artifacts/<id>/`
+//! in the data folder, with a `meta.json` ([`Artifact`]), one `pages/<version>.md|json` per
+//! publish (a document's Markdown, or the [`Design`]), the version's files in
+//! `files/<version>/` (a document's downloads, a design's pictures and pages), and a design's
+//! picks in `picks/<version>.json`. Deleting the thread that published one keeps it; deleting
+//! the artifact removes the folder.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::artifacts::{
-    Artifact, ArtifactFile, ArtifactId, ArtifactKind, ArtifactVersion, MAX_ARTIFACT_SIZE,
+    Artifact, ArtifactFile, ArtifactId, ArtifactKind, ArtifactVersion, Design, DesignDefaults,
+    DesignPicks, DesignSettings, DesignState, DesignTopic, MAX_ARTIFACT_SIZE, TODAY, TopicPicks,
+    VariantChange,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use projects::{ProjectId, ThreadId};
@@ -16,24 +21,50 @@ use util::ResultExt as _;
 
 const MAX_TITLE_CHARS: usize = 256;
 const MAX_FILE_NAME_CHARS: usize = 256;
+const MAX_PREVIEW_CHARS: usize = 280;
+/// The most a comment holds, and a design's words in all.
+const MAX_COMMENT_CHARS: usize = 4_000;
+const MAX_DESIGN_CHARS: usize = 200_000;
 
 /// What a publish brings.
 pub(crate) struct Publish {
     /// The artifact to add a version to; `None` starts one.
     pub id: Option<ArtifactId>,
     pub title: String,
-    pub kind: ArtifactKind,
-    pub source: String,
-    /// Files to offer as downloads: `(name, bytes)`.
-    pub files: Vec<(String, Vec<u8>)>,
+    pub content: Content,
     pub thread_id: ThreadId,
     pub project_id: ProjectId,
     pub agent_id: Option<AgentId>,
 }
 
+pub(crate) enum Content {
+    /// The Markdown, and files to offer as downloads: `(name, bytes)`.
+    Document {
+        source: String,
+        files: Vec<(String, Vec<u8>)>,
+    },
+    /// The design, naming its pictures and pages, which come along: `(name, bytes)`.
+    Design {
+        design: Design,
+        files: Vec<(String, Vec<u8>)>,
+    },
+}
+
+impl Content {
+    fn kind(&self) -> ArtifactKind {
+        match self {
+            Content::Document { .. } => ArtifactKind::Document,
+            Content::Design { .. } => ArtifactKind::Design,
+        }
+    }
+}
+
 pub(crate) struct ArtifactStore {
     folder: PathBuf,
     artifacts: Vec<Artifact>,
+    /// The design defaults the app last sent (`design-defaults.json`), kept for agents that
+    /// start while it isn't connected.
+    design_settings: DesignSettings,
     /// Bumped on every change, so the server's session subscribers are sent the new list.
     revision: u64,
 }
@@ -50,16 +81,22 @@ impl ArtifactStore {
                 };
                 match serde_json::from_slice::<Artifact>(&bytes) {
                     Ok(artifact) => artifacts.push(artifact),
-                    // A half-written or older meta doesn't keep the rest from loading.
+                    // A half-written meta, or a plain HTML page from before designs, doesn't
+                    // keep the rest from loading.
                     Err(error) => {
                         log::warn!("skipping {}: {error:#}", meta.display());
                     }
                 }
             }
         }
+        let design_settings = std::fs::read(folder.join("design-defaults.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         let mut store = Self {
             folder,
             artifacts,
+            design_settings,
             revision: 0,
         };
         store.sort();
@@ -84,6 +121,13 @@ impl ArtifactStore {
         self.artifacts.iter().find(|artifact| &artifact.id == id)
     }
 
+    fn position(&self, id: &ArtifactId) -> Result<usize> {
+        self.artifacts
+            .iter()
+            .position(|artifact| &artifact.id == id)
+            .ok_or_else(|| anyhow!("no such artifact"))
+    }
+
     /// Adds a version, or starts the artifact. Returns it with its new version's number.
     pub fn publish(&mut self, publish: Publish) -> Result<(ArtifactId, u32)> {
         let title = publish.title.trim();
@@ -92,77 +136,129 @@ impl ArtifactStore {
             title.chars().count() <= MAX_TITLE_CHARS,
             "the title is over {MAX_TITLE_CHARS} characters"
         );
-        ensure!(
-            publish.source.len() as u64 <= MAX_ARTIFACT_SIZE,
-            "the page is over 16 MiB"
-        );
+        let kind = publish.content.kind();
         let now = millis(SystemTime::now());
-        let mut files = Vec::with_capacity(publish.files.len());
-        for (name, bytes) in &publish.files {
+        let position = match &publish.id {
+            Some(id) => {
+                let position = self
+                    .artifacts
+                    .iter()
+                    .position(|artifact| &artifact.id == id)
+                    .ok_or_else(|| anyhow!("there's no artifact {} to update", id.0))?;
+                ensure!(
+                    self.artifacts[position].kind == kind,
+                    "{} is a {}; publish it again with the {} tool",
+                    id.0,
+                    self.artifacts[position].kind.name(),
+                    self.artifacts[position].kind.name()
+                );
+                Some(position)
+            }
+            None => None,
+        };
+        let (source, files, design) = match publish.content {
+            Content::Document { source, files } => {
+                ensure!(
+                    source.len() as u64 <= MAX_ARTIFACT_SIZE,
+                    "the document is over 16 MiB"
+                );
+                (source, files, None)
+            }
+            Content::Design { mut design, files } => {
+                check_design(&design, &files)?;
+                let before = position.and_then(|position| {
+                    let artifact = &self.artifacts[position];
+                    let version = artifact.latest();
+                    let design = self.read_design(&artifact.id, version).log_err()?;
+                    let picks = self.read_picks(&artifact.id, version);
+                    Some((artifact.id.clone(), version, design, picks))
+                });
+                let picks = match before {
+                    Some((id, version, old, picks)) => {
+                        let old_files = |name: &str| self.read_file(&id, version, name).ok();
+                        carry_over(&old, &picks, version, &mut design, &files, old_files)
+                    }
+                    None => DesignPicks::default(),
+                };
+                let source =
+                    serde_json::to_string_pretty(&design).context("encoding the design")?;
+                (source, files, Some((design, picks)))
+            }
+        };
+        let mut entries = Vec::with_capacity(files.len());
+        for (name, bytes) in &files {
             let name = file_name(name)?;
             ensure!(
                 bytes.len() as u64 <= MAX_ARTIFACT_SIZE,
                 "{name} is over 16 MiB"
             );
-            files.push((
-                name,
-                ArtifactFile {
-                    name: name.to_string(),
-                    bytes: bytes.len() as u64,
-                },
-            ));
+            entries.push(ArtifactFile {
+                name: name.to_string(),
+                bytes: bytes.len() as u64,
+            });
         }
-        let position = match &publish.id {
-            Some(id) => self
-                .artifacts
-                .iter()
-                .position(|artifact| &artifact.id == id)
-                .ok_or_else(|| anyhow!("there's no artifact {id:?} to update"))?,
+        let position = match position {
+            Some(position) => position,
             None => {
                 let id = self.new_id();
                 self.artifacts.push(Artifact {
                     id,
                     title: String::new(),
-                    kind: publish.kind,
+                    kind,
                     versions: Vec::new(),
                     thread_id: None,
                     project_id: None,
                     agent_id: None,
-                    sent_at: None,
+                    preview: String::new(),
+                    design: None,
                     frame_key: key(),
                 });
                 self.artifacts.len() - 1
             }
         };
+        let folder = self.folder.join(&self.artifacts[position].id.0);
+        let version = self.artifacts[position].latest() + 1;
+        // The files go first, so a version is never listed without them.
+        write(
+            &folder.join("pages"),
+            &page_name(version, kind),
+            source.as_bytes(),
+        )?;
+        for (entry, (_, bytes)) in entries.iter().zip(files.iter()) {
+            write(
+                &folder.join("files").join(version.to_string()),
+                &entry.name,
+                bytes,
+            )?;
+        }
         let artifact = &mut self.artifacts[position];
         artifact.title = title.to_string();
-        artifact.kind = publish.kind;
         artifact.thread_id = Some(publish.thread_id);
         artifact.project_id = Some(publish.project_id);
         artifact.agent_id = publish.agent_id;
         artifact.versions.push(ArtifactVersion {
             published_at: now,
-            bytes: publish.source.len() as u64,
-            files: files.iter().map(|(_, file)| file.clone()).collect(),
+            bytes: source.len() as u64,
+            files: entries,
         });
-        let version = artifact.latest();
-        let folder = self.folder.join(&artifact.id.0);
-        write(
-            &folder.join("pages"),
-            &page_name(version, artifact.kind),
-            publish.source.as_bytes(),
-        )?;
-        for ((name, _), (_, bytes)) in files.iter().zip(publish.files.iter()) {
-            write(&folder.join("files").join(version.to_string()), name, bytes)?;
+        match &design {
+            Some((design, picks)) => {
+                artifact.preview = preview_of_design(design);
+                artifact.design = Some(design_state(design, picks));
+            }
+            None => artifact.preview = preview_of_document(&source, title),
         }
         let id = artifact.id.clone();
+        if let Some((_, picks)) = &design {
+            self.save_picks(&id, version, picks)?;
+        }
         self.save_at(position)?;
         self.sort();
         self.revision += 1;
         Ok((id, version))
     }
 
-    /// A version's source.
+    /// A version's source: a document's Markdown, or a design's JSON.
     pub fn read_source(&self, id: &ArtifactId, version: u32) -> Result<String> {
         let artifact = self.get(id).ok_or_else(|| anyhow!("no such artifact"))?;
         artifact
@@ -178,8 +274,105 @@ impl ArtifactStore {
         Ok(source)
     }
 
-    /// A file attached to a version.
+    pub fn read_design(&self, id: &ArtifactId, version: u32) -> Result<Design> {
+        let artifact = self.get(id).ok_or_else(|| anyhow!("no such artifact"))?;
+        ensure!(
+            artifact.kind == ArtifactKind::Design,
+            "{} isn't a design",
+            artifact.title
+        );
+        let source = self.read_source(id, version)?;
+        serde_json::from_str(&source).context("parsing the design")
+    }
+
+    /// A design version's picks; none yet is empty.
+    pub fn read_picks(&self, id: &ArtifactId, version: u32) -> DesignPicks {
+        let path = self
+            .folder
+            .join(&id.0)
+            .join("picks")
+            .join(format!("{version}.json"));
+        std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).log_err())
+            .unwrap_or_default()
+    }
+
+    fn save_picks(&self, id: &ArtifactId, version: u32, picks: &DesignPicks) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(picks).context("encoding picks")?;
+        write(
+            &self.folder.join(&id.0).join("picks"),
+            &format!("{version}.json"),
+            &bytes,
+        )
+    }
+
+    /// Saves a topic's picks on the latest version. Changing them takes back a Submit.
+    pub fn set_picks(
+        &mut self,
+        id: &ArtifactId,
+        version: u32,
+        topic: usize,
+        picks: TopicPicks,
+    ) -> Result<()> {
+        let position = self.position(id)?;
+        ensure!(
+            version == self.artifacts[position].latest(),
+            "only the latest version takes picks"
+        );
+        let design = self.read_design(id, version)?;
+        let design_topic = design
+            .topics
+            .get(topic)
+            .ok_or_else(|| anyhow!("the design has no topic {}", topic + 1))?;
+        let picks = clean_picks(design_topic, picks)?;
+        let mut all = self.read_picks(id, version);
+        if all.topics.len() < design.topics.len() {
+            all.topics
+                .resize_with(design.topics.len(), TopicPicks::default);
+        }
+        if all.topics[topic] == picks {
+            return Ok(());
+        }
+        // A comment is a change too, but only a pick takes back the Submit (topic 16 A).
+        if all.topics[topic].pick != picks.pick || all.topics[topic].also != picks.also {
+            all.submitted_at = None;
+            all.sent = false;
+        }
+        all.topics[topic] = picks;
+        self.save_picks(id, version, &all)?;
+        self.artifacts[position].design = Some(design_state(&design, &all));
+        self.save_at(position)?;
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Marks the latest version decided (topic 16 A), `sent` when it went to the thread too.
+    pub fn submit(&mut self, id: &ArtifactId, version: u32, sent: bool) -> Result<DesignPicks> {
+        let position = self.position(id)?;
+        ensure!(
+            version == self.artifacts[position].latest(),
+            "only the latest version can be submitted"
+        );
+        let design = self.read_design(id, version)?;
+        let mut picks = self.read_picks(id, version);
+        picks.submitted_at = Some(millis(SystemTime::now()));
+        picks.sent = sent;
+        self.save_picks(id, version, &picks)?;
+        self.artifacts[position].design = Some(design_state(&design, &picks));
+        self.save_at(position)?;
+        self.revision += 1;
+        Ok(picks)
+    }
+
+    /// A file of a version: a download, or a design's picture or page.
     pub fn read_file(&self, id: &ArtifactId, version: u32, name: &str) -> Result<Vec<u8>> {
+        let path = self.file_path(id, version, name)?;
+        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+    }
+
+    /// Where a file of a version is kept.
+    pub fn file_path(&self, id: &ArtifactId, version: u32, name: &str) -> Result<PathBuf> {
         let name = file_name(name)?;
         let artifact = self.get(id).ok_or_else(|| anyhow!("no such artifact"))?;
         let known = artifact
@@ -189,13 +382,12 @@ impl ArtifactStore {
             .iter()
             .any(|file| file.name == name);
         ensure!(known, "the version has no file {name}");
-        let path = self
+        Ok(self
             .folder
             .join(&id.0)
             .join("files")
             .join(version.to_string())
-            .join(name);
-        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+            .join(name))
     }
 
     /// Deletes the artifact and its folder.
@@ -217,18 +409,99 @@ impl ArtifactStore {
         Ok(())
     }
 
-    /// The page sent something back to its thread.
-    pub fn note_sent(&mut self, id: &ArtifactId) {
-        let Some(position) = self
-            .artifacts
-            .iter()
-            .position(|artifact| &artifact.id == id)
-        else {
-            return;
+    /// The design defaults for a project's agents: its own, or General's.
+    pub fn design_defaults(&self, project_id: Option<ProjectId>) -> DesignDefaults {
+        self.design_settings.for_project(project_id)
+    }
+
+    pub fn set_design_settings(&mut self, settings: DesignSettings) -> Result<()> {
+        if settings == self.design_settings {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(&settings).context("encoding design defaults")?;
+        write(&self.folder, "design-defaults.json", &bytes)?;
+        self.design_settings = settings;
+        Ok(())
+    }
+
+    /// Every artifact whose words hold all of the query's, with the line that does: a
+    /// document's, or a design's topics, variants and comments (topic 5 A). A match in the
+    /// title alone has no line.
+    pub fn search(&self, query: &str) -> Vec<(ArtifactId, String)> {
+        let words: Vec<String> = query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .filter(|word| !word.is_empty())
+            .collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let holds = |text: &str| {
+            let text = text.to_lowercase();
+            words.iter().all(|word| text.contains(word))
         };
-        self.artifacts[position].sent_at = Some(millis(SystemTime::now()));
-        self.save_at(position).log_err();
-        self.revision += 1;
+        let mut found = Vec::new();
+        for artifact in &self.artifacts {
+            let lines = self.words_of(artifact).unwrap_or_default();
+            if let Some(line) = lines.iter().find(|line| holds(line)) {
+                found.push((artifact.id.clone(), line.clone()));
+            } else if holds(&artifact.title) || holds(&lines.join(" ")) {
+                found.push((artifact.id.clone(), String::new()));
+            }
+        }
+        found
+    }
+
+    /// The latest version's lines to search: a document's, or a design's words.
+    fn words_of(&self, artifact: &Artifact) -> Result<Vec<String>> {
+        let version = artifact.latest();
+        match artifact.kind {
+            ArtifactKind::Document => Ok(self
+                .read_source(&artifact.id, version)?
+                .lines()
+                .map(|line| plain_line(line))
+                .filter(|line| !line.is_empty())
+                .collect()),
+            ArtifactKind::Design => {
+                let design = self.read_design(&artifact.id, version)?;
+                let picks = self.read_picks(&artifact.id, version);
+                let mut lines = Vec::new();
+                if !design.intro.is_empty() {
+                    lines.push(design.intro.clone());
+                }
+                for (index, topic) in design.topics.iter().enumerate() {
+                    lines.push(format!("{}. {}", index + 1, topic.title));
+                    if !topic.description.is_empty() {
+                        lines.push(format!("{}: {}", topic.title, topic.description));
+                    }
+                    let variants = topic
+                        .today
+                        .iter()
+                        .map(|today| (TODAY.to_string(), today))
+                        .chain(
+                            topic
+                                .variants
+                                .iter()
+                                .map(|variant| (variant.name.clone(), variant)),
+                        );
+                    for (key, variant) in variants {
+                        let label = topic.label(&key);
+                        for text in [&variant.description, &variant.good, &variant.cost] {
+                            if !text.is_empty() {
+                                lines.push(format!("{label}: {text}"));
+                            }
+                        }
+                        if variant.description.is_empty() {
+                            lines.push(label);
+                        }
+                    }
+                    for (key, comment) in &picks.topic(index).comments {
+                        lines.push(format!("Comment on {}: {comment}", topic.short_label(key)));
+                    }
+                }
+                Ok(lines)
+            }
+        }
     }
 
     fn save_at(&self, position: usize) -> Result<()> {
@@ -250,6 +523,479 @@ impl ArtifactStore {
             }
         }
     }
+}
+
+/// What agentZ checks before publishing a design (topic 23 B): every name given once, today's
+/// key left to today's, and every picture and page named among the files.
+fn check_design(design: &Design, files: &[(String, Vec<u8>)]) -> Result<()> {
+    ensure!(
+        !design.topics.is_empty(),
+        "a design needs at least one topic"
+    );
+    let mut topics = std::collections::HashSet::new();
+    let mut words = design.intro.len();
+    for (index, topic) in design.topics.iter().enumerate() {
+        let number = index + 1;
+        ensure!(
+            !topic.title.trim().is_empty(),
+            "topic {number} needs a title"
+        );
+        ensure!(
+            topics.insert(topic.title.trim().to_lowercase()),
+            "two topics are called {:?}",
+            topic.title
+        );
+        ensure!(
+            !topic.variants.is_empty(),
+            "topic {number} ({}) has no variants",
+            topic.title
+        );
+        let mut names = std::collections::HashSet::new();
+        for variant in topic.today.iter().chain(&topic.variants) {
+            ensure!(
+                !variant.name.trim().is_empty(),
+                "every variant in topic {number} needs a name"
+            );
+            words += variant.name.len()
+                + variant.description.len()
+                + variant.good.len()
+                + variant.cost.len();
+            for name in [
+                &variant.picture,
+                &variant.page,
+                &variant.phone_picture,
+                &variant.phone_page,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ensure!(
+                    files.iter().any(|(file, _)| file == name),
+                    "{name} isn't among the design's files"
+                );
+            }
+            ensure!(
+                variant.picture.is_some()
+                    || variant.page.is_some()
+                    || variant.phone_picture.is_some()
+                    || variant.phone_page.is_some(),
+                "{:?} in topic {number} needs a picture or a page",
+                variant.name
+            );
+        }
+        for variant in &topic.variants {
+            ensure!(
+                !variant.name.eq_ignore_ascii_case(TODAY),
+                "a variant can't be called {TODAY:?}; give what's there now as the topic's today"
+            );
+            ensure!(
+                names.insert(variant.name.to_lowercase()),
+                "two variants in topic {number} are called {:?}",
+                variant.name
+            );
+        }
+        if let Some(recommended) = &topic.recommended {
+            ensure!(
+                topic.variant(recommended).is_some(),
+                "topic {number} recommends {recommended:?}, which isn't one of its variants"
+            );
+        }
+    }
+    ensure!(
+        words <= MAX_DESIGN_CHARS,
+        "the design's words are over {MAX_DESIGN_CHARS} characters"
+    );
+    Ok(())
+}
+
+/// The picks of the version before, moved to this one by variant name (topic 19 A): a changed
+/// variant is marked Changed and a new one New; one that's gone takes its pick and comment with
+/// it. A submitted design waits for the user again.
+fn carry_over(
+    old: &Design,
+    old_picks: &DesignPicks,
+    old_version: u32,
+    design: &mut Design,
+    files: &[(String, Vec<u8>)],
+    old_file: impl Fn(&str) -> Option<Vec<u8>>,
+) -> DesignPicks {
+    let file = |name: &Option<String>| -> Option<&[u8]> {
+        let name = name.as_ref()?;
+        files
+            .iter()
+            .find(|(file, _)| file == name)
+            .map(|(_, bytes)| bytes.as_slice())
+    };
+    let several = design.topics.len() > 1 || old.topics.len() > 1;
+    let mut picks = DesignPicks {
+        topics: Vec::with_capacity(design.topics.len()),
+        submitted_at: None,
+        sent: false,
+        carried_from: None,
+        dropped: Vec::new(),
+    };
+    let mut gone = Vec::new();
+    let mut matched = vec![false; old.topics.len()];
+    for (index, topic) in design.topics.iter_mut().enumerate() {
+        let old_index = old
+            .topics
+            .iter()
+            .position(|old_topic| old_topic.title == topic.title)
+            .or_else(|| {
+                // A renamed topic in the same place is the same topic.
+                old.topics
+                    .get(index)
+                    .filter(|old_topic| {
+                        !design_has_title(&topic.title, &old.topics) && !old_topic.title.is_empty()
+                    })
+                    .map(|_| index)
+            })
+            .filter(|old_index| !matched[*old_index]);
+        let Some(old_index) = old_index else {
+            for variant in &mut topic.variants {
+                variant.change = Some(VariantChange::New);
+            }
+            picks.topics.push(TopicPicks::default());
+            continue;
+        };
+        matched[old_index] = true;
+        let old_topic = &old.topics[old_index];
+        let prefix = if several {
+            format!("{}: ", topic.title)
+        } else {
+            String::new()
+        };
+        let same = |new: &agentz_protocol::artifacts::DesignVariant,
+                    before: &agentz_protocol::artifacts::DesignVariant| {
+            new.description == before.description
+                && new.good == before.good
+                && new.cost == before.cost
+                && [
+                    (&new.picture, &before.picture),
+                    (&new.page, &before.page),
+                    (&new.phone_picture, &before.phone_picture),
+                    (&new.phone_page, &before.phone_page),
+                ]
+                .into_iter()
+                .all(|(new_name, old_name)| match (new_name, old_name) {
+                    (None, None) => true,
+                    (Some(_), Some(old_name)) => {
+                        file(new_name).map(<[u8]>::to_vec) == old_file(old_name.as_str())
+                    }
+                    _ => false,
+                })
+        };
+        if let (Some(today), Some(before)) = (&mut topic.today, &old_topic.today) {
+            today.change = (!same(today, before)).then_some(VariantChange::Changed);
+        }
+        for variant in &mut topic.variants {
+            variant.change = match old_topic
+                .variants
+                .iter()
+                .find(|before| before.name == variant.name)
+            {
+                Some(before) => (!same(variant, before)).then_some(VariantChange::Changed),
+                None => Some(VariantChange::New),
+            };
+        }
+        for (old_place, before) in old_topic.variants.iter().enumerate() {
+            if topic.variant(&before.name).is_none() {
+                gone.push(format!(
+                    "{prefix}{}. {}",
+                    DesignTopic::letter(old_place),
+                    before.name
+                ));
+            }
+        }
+        let before = old_picks.topic(old_index);
+        let exists = |key: &String| topic.variant(key).is_some();
+        let mut topic_picks = TopicPicks {
+            pick: before.pick.clone().filter(exists),
+            also: before
+                .also
+                .iter()
+                .filter(|key| exists(key))
+                .cloned()
+                .collect(),
+            comments: before
+                .comments
+                .iter()
+                .filter(|(key, _)| exists(key))
+                .map(|(key, comment)| (key.clone(), comment.clone()))
+                .collect(),
+        };
+        if let Some(gone) = before.pick.as_ref().filter(|key| !exists(key)) {
+            picks
+                .dropped
+                .push(format!("{prefix}{}", old_topic.label(gone)));
+        }
+        topic_picks
+            .also
+            .retain(|key| Some(key) != topic_picks.pick.as_ref());
+        picks.topics.push(topic_picks);
+    }
+    design.gone = gone;
+    if old_picks
+        .topics
+        .iter()
+        .any(|topic| *topic != TopicPicks::default())
+    {
+        picks.carried_from = Some(old_version);
+    }
+    picks
+}
+
+fn design_has_title(title: &str, topics: &[DesignTopic]) -> bool {
+    topics.iter().any(|topic| topic.title == title)
+}
+
+/// A topic's picks as the page sent them, checked against the design: only its variants, the
+/// pick not also an Also, comments trimmed and empty ones dropped.
+fn clean_picks(topic: &DesignTopic, picks: TopicPicks) -> Result<TopicPicks> {
+    let known = |key: &String| topic.variant(key).is_some();
+    if let Some(pick) = &picks.pick {
+        ensure!(known(pick), "{pick:?} isn't one of the topic's variants");
+    }
+    let mut also = Vec::new();
+    for key in picks.also {
+        ensure!(known(&key), "{key:?} isn't one of the topic's variants");
+        if Some(&key) != picks.pick.as_ref() && !also.contains(&key) {
+            also.push(key);
+        }
+    }
+    let mut comments = BTreeMap::new();
+    for (key, comment) in picks.comments {
+        ensure!(known(&key), "{key:?} isn't one of the topic's variants");
+        let comment = comment.trim();
+        ensure!(
+            comment.chars().count() <= MAX_COMMENT_CHARS,
+            "a comment is over {MAX_COMMENT_CHARS} characters"
+        );
+        if !comment.is_empty() {
+            comments.insert(key, comment.to_string());
+        }
+    }
+    Ok(TopicPicks {
+        pick: picks.pick,
+        also,
+        comments,
+    })
+}
+
+pub(crate) fn design_state(design: &Design, picks: &DesignPicks) -> DesignState {
+    let first = design.topics.first();
+    DesignState {
+        topics: design.topics.len() as u32,
+        variants: first.map_or(0, |topic| topic.variants.len() as u32),
+        decided: (0..design.topics.len())
+            .filter(|index| picks.topic(*index).pick.is_some())
+            .count() as u32,
+        submitted_at: picks.submitted_at,
+        pick: match design.topics.as_slice() {
+            [topic] => picks.topic(0).pick.map(|pick| topic.short_label(&pick)),
+            _ => None,
+        },
+        pictures: first
+            .map(|topic| {
+                topic
+                    .variants
+                    .iter()
+                    .filter_map(|variant| variant.picture.clone())
+                    .take(4)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// A design's picks and comments as the agent reads them (topic 24 B), like the design
+/// board's `decisions.md`: whether it's submitted, then a heading per topic with the pick by
+/// letter and name, each picked variant's description, and the comments.
+pub(crate) fn design_text(
+    title: &str,
+    version: u32,
+    place: &str,
+    design: &Design,
+    picks: &DesignPicks,
+) -> String {
+    let total = design.topics.len();
+    let decided = (0..total)
+        .filter(|index| picks.topic(*index).pick.is_some())
+        .count();
+    let state = if picks.submitted_at.is_some() {
+        "submitted".to_string()
+    } else {
+        "not submitted".to_string()
+    };
+    let mut text = format!("# {title}, v{version}: {decided} of {total} decided, {state}\n");
+    text.push_str(&format!("From {place}. "));
+    text.push_str(if picks.submitted_at.is_some() {
+        "The user submitted these picks and comments.\n"
+    } else {
+        "The user's picks and comments so far.\n"
+    });
+    for (index, topic) in design.topics.iter().enumerate() {
+        let topic_picks = picks.topic(index);
+        text.push('\n');
+        let heading = match &topic_picks.pick {
+            Some(pick) => {
+                let mut heading = topic.label(pick);
+                if !topic_picks.also.is_empty() {
+                    let also: Vec<String> = topic_picks
+                        .also
+                        .iter()
+                        .map(|key| topic.label(key))
+                        .collect();
+                    heading.push_str(&format!(", also {}", also.join(", ")));
+                }
+                heading
+            }
+            None => "not decided".to_string(),
+        };
+        text.push_str(&format!("## {}. {}: {heading}\n", index + 1, topic.title));
+        let mut described = Vec::new();
+        let picked = topic_picks.pick.iter().map(|key| (key, false));
+        let also = topic_picks.also.iter().map(|key| (key, true));
+        for (key, is_also) in picked.chain(also) {
+            let Some(variant) = topic.variant(key) else {
+                continue;
+            };
+            let label = topic.label(key);
+            let prefix = if is_also { "Also " } else { "" };
+            if variant.description.is_empty() {
+                text.push_str(&format!("**{prefix}{label}**\n"));
+            } else {
+                text.push_str(&format!("**{prefix}{label}:** {}\n", variant.description));
+            }
+            if let Some(comment) = topic_picks.comments.get(key) {
+                text.push_str(&format!(
+                    "**Comment on {}:** {comment}\n",
+                    topic.short_label(key)
+                ));
+            }
+            described.push(key.clone());
+        }
+        for (key, comment) in &topic_picks.comments {
+            if !described.contains(key) {
+                text.push_str(&format!("**Comment on {}:** {comment}\n", topic.label(key)));
+            }
+        }
+    }
+    text
+}
+
+/// What Submit's message says (topic 17 B): "Submitted: picked B, also C, with 2 comments.",
+/// or with several topics, each topic's pick by its title.
+pub(crate) fn submit_summary(design: &Design, picks: &DesignPicks) -> String {
+    let short = |index: usize, topic: &DesignTopic| {
+        let topic_picks = picks.topic(index);
+        match &topic_picks.pick {
+            Some(pick) => {
+                let mut text = topic.short_label(pick);
+                if !topic_picks.also.is_empty() {
+                    let also: Vec<String> = topic_picks
+                        .also
+                        .iter()
+                        .map(|key| topic.short_label(key))
+                        .collect();
+                    text.push_str(&format!(", also {}", also.join(", ")));
+                }
+                text
+            }
+            None => "not decided".to_string(),
+        }
+    };
+    let mut text = match design.topics.as_slice() {
+        [topic] => match picks.topic(0).pick {
+            Some(_) => format!("Submitted: picked {}", short(0, topic)),
+            None => "Submitted with nothing picked".to_string(),
+        },
+        topics => {
+            let each: Vec<String> = topics
+                .iter()
+                .enumerate()
+                .map(|(index, topic)| format!("{}: {}", topic.title, short(index, topic)))
+                .collect();
+            format!("Submitted: {}", each.join("; "))
+        }
+    };
+    let comments = picks.comments();
+    match comments {
+        0 => {}
+        1 => text.push_str(", with 1 comment"),
+        comments => text.push_str(&format!(", with {comments} comments")),
+    }
+    text.push('.');
+    text
+}
+
+/// A document's first lines for its card, past a first heading that's its title.
+fn preview_of_document(source: &str, title: &str) -> String {
+    let mut preview = String::new();
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("```") || line.starts_with('|') {
+            if !preview.is_empty() && line.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            if preview.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let plain = plain_line(line);
+        if plain.eq_ignore_ascii_case(title) {
+            continue;
+        }
+        if !preview.is_empty() {
+            preview.push(' ');
+        }
+        preview.push_str(&plain);
+        if preview.chars().count() >= MAX_PREVIEW_CHARS {
+            break;
+        }
+    }
+    shorten(&preview)
+}
+
+fn preview_of_design(design: &Design) -> String {
+    let text = if design.intro.trim().is_empty() {
+        design
+            .topics
+            .first()
+            .map(|topic| topic.description.clone())
+            .unwrap_or_default()
+    } else {
+        design.intro.clone()
+    };
+    shorten(text.trim())
+}
+
+fn shorten(text: &str) -> String {
+    if text.chars().count() <= MAX_PREVIEW_CHARS {
+        return text.to_string();
+    }
+    let mut short: String = text.chars().take(MAX_PREVIEW_CHARS).collect();
+    short.push('…');
+    short
+}
+
+/// A line of Markdown without its marks, for previews and search.
+fn plain_line(line: &str) -> String {
+    let line = line.trim();
+    let line = line.trim_start_matches(['#', '>', ' ']);
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line);
+    line.replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_string()
 }
 
 /// The folder's server file: the port and token pages are served with, kept across restarts
@@ -338,8 +1084,8 @@ fn page_name(version: u32, kind: ArtifactKind) -> String {
     format!("{version}.{}", kind.extension())
 }
 
-/// A download's name: no path, no tricks.
-fn file_name(name: &str) -> Result<&str> {
+/// A file's name: no path, no tricks.
+pub(crate) fn file_name(name: &str) -> Result<&str> {
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
     ensure!(
         !name.is_empty() && name != "." && name != "..",
@@ -373,15 +1119,56 @@ pub(crate) fn millis(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use agentz_protocol::artifacts::DesignVariant;
+
     use super::*;
 
-    fn publish(title: &str, source: &str) -> Publish {
+    fn document(title: &str, source: &str) -> Publish {
         Publish {
             id: None,
             title: title.to_string(),
-            kind: ArtifactKind::Page,
-            source: source.to_string(),
-            files: Vec::new(),
+            content: Content::Document {
+                source: source.to_string(),
+                files: Vec::new(),
+            },
+            thread_id: ThreadId(1),
+            project_id: ProjectId(7),
+            agent_id: None,
+        }
+    }
+
+    fn variant(name: &str, description: &str) -> DesignVariant {
+        DesignVariant {
+            name: name.to_string(),
+            description: description.to_string(),
+            picture: Some(format!("{name}.png")),
+            ..DesignVariant::default()
+        }
+    }
+
+    fn design(id: Option<ArtifactId>, variants: &[(&str, &str, &[u8])]) -> Publish {
+        let topic = DesignTopic {
+            title: "The plans page".to_string(),
+            variants: variants
+                .iter()
+                .map(|(name, description, _)| variant(name, description))
+                .collect(),
+            ..DesignTopic::default()
+        };
+        Publish {
+            id,
+            title: "Plans page".to_string(),
+            content: Content::Design {
+                design: Design {
+                    intro: "Five ways to show the plans.".to_string(),
+                    topics: vec![topic],
+                    gone: Vec::new(),
+                },
+                files: variants
+                    .iter()
+                    .map(|(name, _, bytes)| (format!("{name}.png"), bytes.to_vec()))
+                    .collect(),
+            },
             thread_id: ThreadId(1),
             project_id: ProjectId(7),
             agent_id: None,
@@ -393,30 +1180,32 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut store = ArtifactStore::load(temp.path());
         let (id, version) = store
-            .publish(publish("Layouts", "<p>one</p>"))
+            .publish(document("Notes", "# Notes\n\nThe first lines.\n\n## More"))
             .expect("publish");
         assert_eq!(version, 1);
+        assert_eq!(
+            store.get(&id).expect("artifact").preview,
+            "The first lines."
+        );
         let (again, version) = store
             .publish(Publish {
                 id: Some(id.clone()),
-                source: "<p>two</p>".to_string(),
-                ..publish("Layouts", "")
+                ..document("Notes", "two")
             })
             .expect("republish");
         assert_eq!((again, version), (id.clone(), 2));
-        assert_eq!(store.read_source(&id, 1).expect("v1"), "<p>one</p>");
-        assert_eq!(store.read_source(&id, 2).expect("v2"), "<p>two</p>");
-        assert_eq!(store.get(&id).expect("artifact").latest(), 2);
+        assert_eq!(
+            store.read_source(&id, 1).expect("v1"),
+            "# Notes\n\nThe first lines.\n\n## More"
+        );
+        assert_eq!(store.read_source(&id, 2).expect("v2"), "two");
 
         // A restart loads it.
         let store = ArtifactStore::load(temp.path());
         let artifact = store.get(&id).expect("artifact after reload");
-        assert_eq!(artifact.title, "Layouts");
+        assert_eq!(artifact.title, "Notes");
         assert_eq!(artifact.thread_id, Some(ThreadId(1)));
-        assert_eq!(
-            store.read_source(&id, 2).expect("v2 after reload"),
-            "<p>two</p>"
-        );
+        assert_eq!(store.read_source(&id, 2).expect("v2 after reload"), "two");
     }
 
     #[test]
@@ -425,8 +1214,11 @@ mod tests {
         let mut store = ArtifactStore::load(temp.path());
         let (id, _) = store
             .publish(Publish {
-                files: vec![("../report.csv".to_string(), b"a,b".to_vec())],
-                ..publish("Report", "<p>r</p>")
+                content: Content::Document {
+                    source: "r".to_string(),
+                    files: vec![("../report.csv".to_string(), b"a,b".to_vec())],
+                },
+                ..document("Report", "")
             })
             .expect("publish");
         assert_eq!(store.read_file(&id, 1, "report.csv").expect("file"), b"a,b");
@@ -437,11 +1229,207 @@ mod tests {
     fn deleting_removes_the_folder() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut store = ArtifactStore::load(temp.path());
-        let (id, _) = store
-            .publish(publish("Layouts", "<p>one</p>"))
-            .expect("publish");
+        let (id, _) = store.publish(document("Notes", "one")).expect("publish");
         store.delete(&id).expect("delete");
         assert!(store.get(&id).is_none());
         assert!(!temp.path().join("artifacts").join(&id.0).exists());
+    }
+
+    #[test]
+    fn a_design_is_checked_before_it_is_published() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = ArtifactStore::load(temp.path());
+        let mut publish = design(
+            None,
+            &[("Three tiers", "", b"a"), ("Three tiers", "", b"b")],
+        );
+        assert!(store.publish(publish).is_err(), "two variants of one name");
+        publish = design(None, &[("today", "", b"a")]);
+        assert!(store.publish(publish).is_err(), "today is today's");
+        publish = design(None, &[("Three tiers", "", b"a")]);
+        if let Content::Design { files, .. } = &mut publish.content {
+            files.clear();
+        }
+        assert!(
+            store.publish(publish).is_err(),
+            "a picture that isn't there"
+        );
+        assert!(store.artifacts().is_empty());
+    }
+
+    #[test]
+    fn picks_carry_over_to_the_next_version_by_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = ArtifactStore::load(temp.path());
+        let (id, _) = store
+            .publish(design(
+                None,
+                &[
+                    ("Three tiers", "Cards", b"a"),
+                    ("Compare table", "A table", b"b"),
+                    ("One plan", "One", b"d"),
+                ],
+            ))
+            .expect("publish");
+        let artifact = store.get(&id).expect("design");
+        assert_eq!(
+            artifact.design.as_ref().map(DesignState::status),
+            Some("Waiting for you".to_string())
+        );
+        store
+            .set_picks(
+                &id,
+                1,
+                0,
+                TopicPicks {
+                    pick: Some("One plan".to_string()),
+                    also: vec!["Compare table".to_string(), "One plan".to_string()],
+                    comments: [
+                        ("Compare table".to_string(), " Yearly first. ".to_string()),
+                        ("Three tiers".to_string(), " ".to_string()),
+                    ]
+                    .into(),
+                },
+            )
+            .expect("picks");
+        let picks = store.read_picks(&id, 1);
+        assert_eq!(picks.topic(0).also, vec!["Compare table".to_string()]);
+        assert_eq!(picks.comments(), 1);
+        store.submit(&id, 1, false).expect("submit");
+        assert_eq!(
+            store
+                .get(&id)
+                .and_then(|artifact| artifact.design.clone())
+                .map(|state| state.status()),
+            Some("Decided".to_string())
+        );
+
+        // v2: the table changed, One plan is gone, and Slider is new.
+        store
+            .publish(design(
+                Some(id.clone()),
+                &[
+                    ("Three tiers", "Cards", b"a"),
+                    ("Compare table", "A table", b"b2"),
+                    ("Slider", "Slide", b"c"),
+                ],
+            ))
+            .expect("v2");
+        let design = store.read_design(&id, 2).expect("v2's design");
+        let changes: Vec<Option<VariantChange>> = design.topics[0]
+            .variants
+            .iter()
+            .map(|variant| variant.change)
+            .collect();
+        assert_eq!(
+            changes,
+            vec![None, Some(VariantChange::Changed), Some(VariantChange::New)]
+        );
+        assert_eq!(design.gone, vec!["C. One plan".to_string()]);
+        let picks = store.read_picks(&id, 2);
+        assert_eq!(picks.topic(0).pick, None, "the gone variant took its pick");
+        assert_eq!(picks.topic(0).also, vec!["Compare table".to_string()]);
+        assert_eq!(
+            picks
+                .topic(0)
+                .comments
+                .get("Compare table")
+                .map(String::as_str),
+            Some("Yearly first.")
+        );
+        assert_eq!(picks.dropped, vec!["C. One plan".to_string()]);
+        assert_eq!(picks.carried_from, Some(1));
+        assert_eq!(picks.submitted_at, None, "it waits for the user again");
+        // v1 keeps its own.
+        assert!(store.read_picks(&id, 1).submitted_at.is_some());
+        assert!(store.set_picks(&id, 1, 0, TopicPicks::default()).is_err());
+    }
+
+    #[test]
+    fn the_agent_reads_picks_as_text() {
+        let topic = DesignTopic {
+            title: "The plans page".to_string(),
+            today: Some(variant("Today's page", "A plain table.")),
+            variants: vec![
+                variant("Three tiers", "Cards."),
+                variant("Compare table", "Every feature in one table."),
+                variant("Slider by size", "One plan priced by size."),
+            ],
+            ..DesignTopic::default()
+        };
+        let other = DesignTopic {
+            title: "The yearly discount".to_string(),
+            variants: vec![variant("10% off", ""), variant("20% off", "")],
+            ..DesignTopic::default()
+        };
+        let design = Design {
+            intro: String::new(),
+            topics: vec![topic, other],
+            gone: Vec::new(),
+        };
+        let picks = DesignPicks {
+            topics: vec![
+                TopicPicks {
+                    pick: Some("Compare table".to_string()),
+                    also: vec!["Slider by size".to_string()],
+                    comments: [
+                        (
+                            "Compare table".to_string(),
+                            "Yearly by default.".to_string(),
+                        ),
+                        (TODAY.to_string(), "Keep its footer.".to_string()),
+                    ]
+                    .into(),
+                },
+                TopicPicks {
+                    comments: [("20% off".to_string(), "What do others give?".to_string())].into(),
+                    ..TopicPicks::default()
+                },
+            ],
+            ..DesignPicks::default()
+        };
+        let text = design_text(
+            "Pricing",
+            2,
+            "storefront › Design the pricing",
+            &design,
+            &picks,
+        );
+        assert_eq!(
+            text,
+            "# Pricing, v2: 1 of 2 decided, not submitted\n\
+             From storefront › Design the pricing. The user's picks and comments so far.\n\
+             \n\
+             ## 1. The plans page: B. Compare table, also C. Slider by size\n\
+             **B. Compare table:** Every feature in one table.\n\
+             **Comment on B:** Yearly by default.\n\
+             **Also C. Slider by size:** One plan priced by size.\n\
+             **Comment on Today's page (today's):** Keep its footer.\n\
+             \n\
+             ## 2. The yearly discount: not decided\n\
+             **Comment on B. 20% off:** What do others give?\n"
+        );
+    }
+
+    #[test]
+    fn search_finds_words_inside() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = ArtifactStore::load(temp.path());
+        let (notes, _) = store
+            .publish(document(
+                "Notes",
+                "# Notes\n\nShow the **yearly** price first.",
+            ))
+            .expect("publish");
+        let (plans, _) = store
+            .publish(design(
+                None,
+                &[("Compare table", "Monthly and Yearly", b"b")],
+            ))
+            .expect("design");
+        let found = store.search("yearly");
+        assert!(found.contains(&(notes, "Show the yearly price first.".to_string())));
+        assert!(found.contains(&(plans, "A. Compare table: Monthly and Yearly".to_string())));
+        assert!(store.search("nothing like it").is_empty());
     }
 }

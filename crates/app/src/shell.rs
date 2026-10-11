@@ -2162,6 +2162,11 @@ fn page_theme(cx: &App) -> PageTheme {
                 css(colors.editor_background),
             ),
             ("--hover".to_string(), css(colors.ghost_element_hover)),
+            ("--selected".to_string(), css(colors.element_selected)),
+            ("--placeholder".to_string(), css(colors.text_placeholder)),
+            ("--border-variant".to_string(), css(colors.border_variant)),
+            ("--success".to_string(), css(theme.status().success)),
+            ("--warning".to_string(), css(theme.status().warning)),
             // Quotes aren't let through to the page's style, so only unquoted family names.
             (
                 "--font-sans".to_string(),
@@ -2223,7 +2228,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_go_to))
             .on_action(cx.listener(|this, _: &ShowAll, _, cx| {
-                if let Some(gallery) = this.machines.read(cx).gallery_link(cx) {
+                if let Some(gallery) = this.machines.read(cx).artifacts_home_link(None, cx) {
                     cx.open_url(&gallery);
                 }
             }))

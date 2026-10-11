@@ -2406,7 +2406,7 @@ impl Sidebar {
             for (machine, artifact) in artifacts {
                 rows.push(self.render_artifact_row(machine, artifact, cx));
             }
-            if let Some(gallery) = self.machines.read(cx).gallery_link(cx) {
+            if let Some(gallery) = self.machines.read(cx).artifacts_home_link(None, cx) {
                 rows.push(
                     h_flex()
                         .id("all-artifacts")
@@ -2454,8 +2454,8 @@ impl Sidebar {
             SystemTime::now(),
         );
         let icon = match artifact.kind {
-            ArtifactKind::Page => IconName::FileCode,
-            ArtifactKind::Document => IconName::FileMarkdown,
+            ArtifactKind::Document => IconName::FileTextOutlined,
+            ArtifactKind::Design => IconName::LayoutDashboard,
         };
         let menu_link = link.clone();
         let menu = {
@@ -3994,7 +3994,7 @@ mod view_tests {
         let artifact = |id: &str, project_id: ProjectId, minutes_ago: u64| Artifact {
             id: ArtifactId(id.to_string()),
             title: format!("Artifact {id}"),
-            kind: ArtifactKind::Page,
+            kind: ArtifactKind::Document,
             versions: vec![ArtifactVersion {
                 published_at: (SystemTime::now() - Duration::from_secs(minutes_ago * 60))
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -4006,7 +4006,8 @@ mod view_tests {
             thread_id: Some(ThreadId(1)),
             project_id: Some(project_id),
             agent_id: None,
-            sent_at: None,
+            preview: String::new(),
+            design: None,
             frame_key: "key".into(),
         };
         let threads = || vec![thread(1, false, None), chat(3, 1)];

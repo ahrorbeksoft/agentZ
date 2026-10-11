@@ -1,16 +1,18 @@
 //! What the pages server asks of the server actor ([`pages::PageAsk`]): this machine's
 //! artifacts straight from its store, another machine's relayed through the app
-//! ([`Event::RelayArtifact`]), and Send to thread, which queues the page's text and the user's
-//! note as their message in the thread that published it.
+//! ([`Event::RelayArtifact`]), a design's picks as the user makes them, and Submit, which can
+//! tell the thread that published the design with a short message of the user's.
 
 use agentz_protocol::artifacts::{
-    Artifact, ArtifactId, ArtifactListing, ArtifactReply, ArtifactRequest,
+    Artifact, ArtifactId, ArtifactListing, ArtifactReply, ArtifactRequest, DesignSettings,
 };
-use agentz_protocol::{ConnectionId, Event, PromptPart, Request, ServerMessage};
+use agentz_protocol::{ConnectionId, Event, PeerMachine, PromptPart, Request, ServerMessage};
 use base64::Engine as _;
 use futures::channel::oneshot;
+use projects::ProjectId;
 use util::ResultExt as _;
 
+use crate::artifacts::{design_text, submit_summary};
 use crate::pages::{self, PageAsk, PageEvent};
 
 use super::Server;
@@ -40,6 +42,7 @@ impl Server {
         &mut self,
         request: ArtifactRequest,
     ) -> Result<ArtifactReply, String> {
+        let error = |error: anyhow::Error| format!("{error:#}");
         match request {
             ArtifactRequest::List => Ok(ArtifactReply::List(
                 self.artifacts
@@ -49,23 +52,14 @@ impl Server {
                     .collect(),
             )),
             ArtifactRequest::Listing(id) => {
-                let artifact = self
-                    .artifacts
-                    .get(&id)
-                    .ok_or_else(|| "no such artifact".to_string())?;
+                let artifact = self.artifact(&id)?;
                 Ok(ArtifactReply::Listing(self.listing(artifact)))
             }
             ArtifactRequest::Read { id, version } => {
-                let artifact = self
-                    .artifacts
-                    .get(&id)
-                    .ok_or_else(|| "no such artifact".to_string())?;
+                let artifact = self.artifact(&id)?;
                 let version = version.unwrap_or_else(|| artifact.latest());
                 let listing = self.listing(artifact);
-                let source = self
-                    .artifacts
-                    .read_source(&id, version)
-                    .map_err(|error| format!("{error:#}"))?;
+                let source = self.artifacts.read_source(&id, version).map_err(error)?;
                 Ok(ArtifactReply::Page {
                     listing,
                     version,
@@ -76,33 +70,92 @@ impl Server {
                 let bytes = self
                     .artifacts
                     .read_file(&id, version, &name)
-                    .map_err(|error| format!("{error:#}"))?;
+                    .map_err(error)?;
                 Ok(ArtifactReply::File(
                     base64::engine::general_purpose::STANDARD.encode(bytes),
                 ))
             }
-            ArtifactRequest::Send {
+            ArtifactRequest::Design { id, version } => {
+                let artifact = self.artifact(&id)?;
+                let version = version.unwrap_or_else(|| artifact.latest());
+                let listing = self.listing(artifact);
+                let design = self.artifacts.read_design(&id, version).map_err(error)?;
+                let picks = self.artifacts.read_picks(&id, version);
+                Ok(ArtifactReply::Design {
+                    listing,
+                    version,
+                    design,
+                    picks,
+                })
+            }
+            ArtifactRequest::SetPicks {
                 id,
                 version,
-                text,
+                topic,
+                picks,
+            } => {
+                self.artifacts
+                    .set_picks(&id, version, topic as usize, picks)
+                    .map_err(error)?;
+                self.artifacts_changed(Some(id));
+                Ok(ArtifactReply::Saved)
+            }
+            ArtifactRequest::Submit {
+                id,
+                version,
+                send,
                 note,
             } => {
-                self.artifact_send(&id, version, &text, &note)?;
-                Ok(ArtifactReply::Sent)
+                self.submit_design(&id, version, send, &note)?;
+                Ok(ArtifactReply::Saved)
+            }
+            ArtifactRequest::Text { id, version } => {
+                let artifact = self.artifact(&id)?;
+                let version = version.unwrap_or_else(|| artifact.latest());
+                let listing = self.listing(artifact);
+                let text = match artifact.kind {
+                    agentz_protocol::artifacts::ArtifactKind::Document => {
+                        self.artifacts.read_source(&id, version).map_err(error)?
+                    }
+                    agentz_protocol::artifacts::ArtifactKind::Design => {
+                        let design = self.artifacts.read_design(&id, version).map_err(error)?;
+                        let picks = self.artifacts.read_picks(&id, version);
+                        design_text(&artifact.title, version, &listing.place, &design, &picks)
+                    }
+                };
+                Ok(ArtifactReply::Text {
+                    listing,
+                    version,
+                    text,
+                })
+            }
+            ArtifactRequest::Search(query) => {
+                Ok(ArtifactReply::Found(self.artifacts.search(&query)))
             }
             ArtifactRequest::Unknown(_) => Err("the app doesn't know this request".to_string()),
         }
     }
 
+    fn artifact(&self, id: &ArtifactId) -> Result<&Artifact, String> {
+        self.artifacts
+            .get(id)
+            .ok_or_else(|| "no such artifact".to_string())
+    }
+
     /// An artifact as its pages show it: where it came from and its agent's icon.
-    fn listing(&self, artifact: &Artifact) -> ArtifactListing {
+    pub(super) fn listing(&self, artifact: &Artifact) -> ArtifactListing {
         let thread = artifact
             .thread_id
             .and_then(|thread_id| self.projects.thread(thread_id));
+        let project = artifact
+            .project_id
+            .filter(|project_id| *project_id != ProjectId::CHATS)
+            .and_then(|project_id| self.projects.project(project_id))
+            .map(|project| project.name().to_string());
         let place = match thread {
             Some(thread) if thread.is_chat() => format!("Chat · {}", thread.title),
-            Some(thread) => match self.projects.project(thread.project_id) {
-                Some(project) => format!("{} › {}", project.name(), thread.title),
+            Some(thread) => match &project {
+                Some(project) => format!("{project} › {}", thread.title),
                 None => thread.title.clone(),
             },
             None => "from a deleted thread".to_string(),
@@ -116,7 +169,11 @@ impl Server {
         ArtifactListing {
             artifact: artifact.clone(),
             place,
+            project,
+            chat: artifact.is_from_chat(),
             has_thread: thread.is_some(),
+            thread_title: thread.map(|thread| thread.title.clone()),
+            archived: thread.is_some_and(|thread| thread.archived_at.is_some()),
             agent_name: artifact
                 .agent_id
                 .as_ref()
@@ -125,51 +182,82 @@ impl Server {
         }
     }
 
-    /// Send to thread (topic 11): the page's text and the user's note, as their message, with
-    /// a chip naming the page and version. Queued while the agent works, as the composer's
-    /// messages are.
-    fn artifact_send(
+    /// Submit (topic 16 A): marks the design's version decided, and with `send`, puts a short
+    /// message of the user's in its thread (topic 17 B): what they picked and their note,
+    /// behind a chip whose reference has the agent read the rest with `agentz_artifact_read`.
+    /// Queued while the agent works, as the composer's messages are.
+    fn submit_design(
         &mut self,
         id: &ArtifactId,
         version: u32,
-        text: &str,
+        send: bool,
         note: &str,
     ) -> Result<(), String> {
-        let artifact = self
-            .artifacts
-            .get(id)
-            .ok_or_else(|| "no such artifact".to_string())?;
+        let artifact = self.artifact(id)?;
         let thread_id = artifact
             .thread_id
-            .filter(|thread_id| self.projects.thread(*thread_id).is_some())
-            .ok_or_else(|| "the thread that published it was deleted".to_string())?;
-        let title = format!("{} · v{version}", artifact.title);
-        // The chip naming the page carries what it gave; the note follows, as typed after it.
-        let mut prompt = Vec::new();
-        if !text.trim().is_empty() {
-            prompt.push(PromptPart::Conversation {
-                uri: format!("agentz://artifact/{}/{version}", id.0),
-                title,
-                text: text.trim().to_string(),
-            });
+            .filter(|thread_id| self.projects.thread(*thread_id).is_some());
+        if send && thread_id.is_none() {
+            return Err("the thread that published it was deleted".to_string());
         }
+        let title = artifact.title.clone();
+        let place = self.listing(artifact).place;
+        let design = self
+            .artifacts
+            .read_design(id, version)
+            .map_err(|error| format!("{error:#}"))?;
+        let Some(thread_id) = thread_id.filter(|_| send) else {
+            self.artifacts
+                .submit(id, version, false)
+                .map_err(|error| format!("{error:#}"))?;
+            self.artifacts_changed(Some(id.clone()));
+            return Ok(());
+        };
+        if version != artifact.latest() {
+            return Err("only the latest version can be submitted".to_string());
+        }
+        let picks = self.artifacts.read_picks(id, version);
+        let comments = picks.comments();
+        let size = match design.topics.len() {
+            1 => format!(
+                "1 topic, {} variant{}",
+                design.topics[0].variants.len(),
+                if design.topics[0].variants.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            topics => format!("{topics} topics"),
+        };
+        let reference = format!(
+            "{title}: a design ({size}, v{version}), from {place}, submitted just now with \
+             {comments} comment{}. Read the picks and comments with agentz_artifact_read \
+             {{\"artifactId\": \"{}\", \"version\": {version}}}.",
+            if comments == 1 { "" } else { "s" },
+            id.0
+        );
+        let mut message = submit_summary(&design, &picks);
         if !note.trim().is_empty() {
-            let note = note.trim();
-            prompt.push(PromptPart::Text(if prompt.is_empty() {
-                note.to_string()
-            } else {
-                format!(" {note}")
-            }));
+            message.push(' ');
+            message.push_str(note.trim());
         }
-        if prompt.is_empty() {
-            return Err("the page gave nothing, and there's no note".to_string());
-        }
+        let prompt = vec![
+            PromptPart::Conversation {
+                uri: format!("agentz://artifact/{}/{version}", id.0),
+                title: format!("{title} · v{version}"),
+                text: reference,
+            },
+            PromptPart::Text(format!(" {message}")),
+        ];
         self.queue_request(Request::QueueMessage {
             connection: ConnectionId::Thread(thread_id),
             prompt,
         })
         .map_err(|error| format!("{error:#}"))?;
-        self.artifacts.note_sent(id);
+        self.artifacts
+            .submit(id, version, true)
+            .map_err(|error| format!("{error:#}"))?;
         self.artifacts_changed(Some(id.clone()));
         Ok(())
     }
@@ -188,9 +276,13 @@ impl Server {
         }
     }
 
-    /// The other machines the app says it reaches, for the gallery.
-    pub(crate) fn answer_machine_names(&self, answer: oneshot::Sender<Vec<String>>) {
-        answer.send(self.relays.machine_names()).ok();
+    /// The other machines the app says it reaches, and what it calls this one, for the
+    /// artifacts page.
+    pub(crate) fn answer_machines(
+        &self,
+        answer: oneshot::Sender<(Option<String>, Vec<PeerMachine>)>,
+    ) {
+        answer.send(self.relays.machines()).ok();
     }
 
     /// The app's answer to an [`Event::RelayArtifact`].
@@ -255,5 +347,10 @@ impl Server {
         if let Some(pages) = &self.pages {
             pages.set_theme(theme);
         }
+    }
+
+    /// The app's design defaults (`Request::SetDesignDefaults`), for agents' tool lists.
+    pub(super) fn set_design_defaults(&mut self, settings: DesignSettings) -> anyhow::Result<()> {
+        self.artifacts.set_design_settings(settings)
     }
 }

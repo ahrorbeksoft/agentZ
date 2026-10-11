@@ -4415,7 +4415,7 @@ impl AgentView {
                             )
                         })
                         .collect();
-                    let gallery = machines.gallery_link(cx);
+                    let gallery = machines.artifacts_home_link(None, cx);
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                         for (title, icon, link) in entries {
                             menu = menu.item(
@@ -13474,8 +13474,8 @@ fn one_line(text: &str) -> String {
 /// agent's mode, with the line marking the change under it.
 fn artifact_icon(kind: ArtifactKind) -> IconName {
     match kind {
-        ArtifactKind::Page => IconName::FileCode,
-        ArtifactKind::Document => IconName::FileMarkdown,
+        ArtifactKind::Document => IconName::FileTextOutlined,
+        ArtifactKind::Design => IconName::LayoutDashboard,
     }
 }
 

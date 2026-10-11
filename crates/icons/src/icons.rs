@@ -188,6 +188,8 @@ pub enum IconName {
     Json,
     Keyboard,
     Laptop,
+    Layers,
+    LayoutDashboard,
     LineHeight,
     Link,
     Linux,

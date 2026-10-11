@@ -36,7 +36,7 @@ use crate::server::ClientId;
 
 /// The tools that take `machine`, run on that machine's checkout of the project, or for
 /// [`MACHINE_TOOLS`], on the machine.
-pub(super) const RELAYED_TOOLS: [&str; 20] = [
+pub(super) const RELAYED_TOOLS: [&str; 21] = [
     "orchestrator_capabilities",
     "agentz_thread_list",
     "agentz_thread_read",
@@ -57,12 +57,13 @@ pub(super) const RELAYED_TOOLS: [&str; 20] = [
     "agentz_terminal_wait",
     "agentz_command_run",
     "agentz_project_add",
+    "agentz_artifact_read",
 ];
 
 /// The relayed tools that also work on a machine without the caller's project: the
-/// Workspaces view's terminals, commands, and adding a project. The project's checkout goes
-/// along when there is one, for its terminals and as commands' folder.
-pub(super) const MACHINE_TOOLS: [&str; 7] = [
+/// Workspaces view's terminals, commands, adding a project, and reading an artifact. The
+/// project's checkout goes along when there is one, for its terminals and as commands' folder.
+pub(super) const MACHINE_TOOLS: [&str; 8] = [
     "agentz_terminal_list",
     "agentz_terminal_start",
     "agentz_terminal_send",
@@ -70,6 +71,7 @@ pub(super) const MACHINE_TOOLS: [&str; 7] = [
     "agentz_terminal_wait",
     "agentz_command_run",
     "agentz_project_add",
+    "agentz_artifact_read",
 ];
 
 /// How long adding a project on another machine waits for the app to combine it with the
@@ -82,9 +84,9 @@ const COMBINE_WAIT: Duration = Duration::from_secs(2);
 /// The list asks machines the caller didn't name, so one that doesn't answer is left out
 /// rather than holding up the rest.
 #[cfg(not(test))]
-const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const LIST_RELAY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often the tasks delegated to other machines are asked about there.
 #[cfg(not(test))]
@@ -197,6 +199,16 @@ impl Relays {
             .find(|checkouts| checkouts.project_id == project_id)
     }
 
+    /// Whether the app combines the project with a checkout on that machine.
+    pub(super) fn has_checkout(&self, project_id: Option<ProjectId>, machine: &str) -> bool {
+        self.checkouts(project_id).is_some_and(|checkouts| {
+            checkouts
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.machine.eq_ignore_ascii_case(machine))
+        })
+    }
+
     pub(in crate::server) fn finish(&mut self, relay_id: u64, result: ToolResult) {
         if let Some((_, sender)) = self.pending.remove(&relay_id) {
             // The call's caller may have gone meanwhile.
@@ -228,18 +240,12 @@ impl Relays {
         })
     }
 
-    /// The app's online machines, by name, for the gallery.
-    pub(in crate::server) fn machine_names(&self) -> Vec<String> {
-        self.latest()
-            .map(|(_, peers)| {
-                peers
-                    .machines
-                    .iter()
-                    .filter(|peer| peer.online)
-                    .map(|peer| peer.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// The app's other machines, for the artifacts page, and what it calls this one.
+    pub(in crate::server) fn machines(&self) -> (Option<String>, Vec<PeerMachine>) {
+        match self.latest() {
+            Some((_, peers)) => (Some(peers.this_machine.clone()), peers.machines.clone()),
+            None => (None, Vec::new()),
+        }
     }
 
     pub(in crate::server) fn start_artifact_relay(
@@ -272,7 +278,7 @@ impl Relays {
 }
 
 /// Where a relayed call runs.
-struct Target {
+pub(super) struct Target {
     client: ClientId,
     machine: String,
     /// The project's checkout there; `None` for [`MACHINE_TOOLS`] on a machine without it.
@@ -330,6 +336,16 @@ impl Server {
             self.delegate_elsewhere(caller, target, arguments)
         } else if name == "agentz_project_add" {
             Ok(self.add_project_elsewhere(caller, target, arguments))
+        } else if name == "agentz_artifact_read" {
+            let folder = self.data_dir.join("artifacts").join("fetched");
+            let machine = target.machine.clone();
+            let read = self.relay(target, name, Value::Object(arguments));
+            Ok(Step::Background(
+                async move {
+                    super::artifact_tools::keep_fetched_file(folder, machine, read.await?).await
+                }
+                .boxed(),
+            ))
         } else {
             Ok(Step::Background(self.relay(
                 target,
@@ -341,7 +357,7 @@ impl Server {
 
     /// The machine the call names, and the caller's project's checkout there, which only
     /// `needs_project` calls must have.
-    fn relay_target(
+    pub(super) fn relay_target(
         &self,
         caller: Caller,
         machine: &str,
@@ -402,7 +418,7 @@ impl Server {
     }
 
     /// Asks the app to run the call there; the answer is tagged with the machine.
-    fn relay(
+    pub(super) fn relay(
         &mut self,
         target: Target,
         name: &str,

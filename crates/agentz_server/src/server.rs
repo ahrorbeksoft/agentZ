@@ -1288,7 +1288,7 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::HandOff { .. } => Err(anyhow!("this server can't hand off")),
-            Request::ListTools => Ok(Response::Tools(tools::definitions())),
+            Request::ListTools { caller } => Ok(Response::Tools(self.tool_definitions(caller))),
             Request::SetMachineIcon(icon) => {
                 machine_kind::save_choice(&self.data_dir.join("machine.json"), icon.clone())?;
                 self.machine_icon.chosen = icon;
@@ -1344,6 +1344,10 @@ impl Server {
             }
             Request::SetPageTheme(theme) => {
                 self.set_page_theme(theme);
+                Ok(Response::Ok)
+            }
+            Request::SetDesignDefaults(settings) => {
+                self.set_design_defaults(settings)?;
                 Ok(Response::Ok)
             }
             Request::ArtifactRelayed { relay_id, result } => {

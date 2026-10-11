@@ -28,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::{AgentId, AgentSettings, InstallState};
+use agentz_protocol::artifacts::DesignDefaults;
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange};
 use agentz_protocol::thread::{ConnectionStatus, Entry};
 use agentz_protocol::{ConnectionId, ServerMessage, ToolCaller, ToolResult};
@@ -142,7 +143,7 @@ impl Caller {
 
 /// What a chat may call: reading every project's threads, diffs and workspaces, and delegated
 /// tasks, terminals and commands in its own folder. Nothing that starts or changes a thread.
-const CHAT_TOOLS: [&str; 17] = [
+const CHAT_TOOLS: [&str; 18] = [
     "orchestrator_capabilities",
     "agentz_thread_list",
     "agentz_thread_read",
@@ -157,18 +158,21 @@ const CHAT_TOOLS: [&str; 17] = [
     "agentz_terminal_read",
     "agentz_terminal_wait",
     "agentz_command_run",
-    "agentz_artifact_publish",
+    "agentz_document_publish",
+    "agentz_design_publish",
     "agentz_artifact_list",
     "agentz_artifact_read",
 ];
 
 /// What a chat may call on other machines, which have no folder of its own.
-pub(super) const CHAT_RELAYED_TOOLS: [&str; 5] = [
+pub(super) const CHAT_RELAYED_TOOLS: [&str; 7] = [
     "orchestrator_capabilities",
     "agentz_thread_list",
     "agentz_thread_read",
     "agentz_thread_diff",
     "agentz_workspace_list",
+    "agentz_artifact_list",
+    "agentz_artifact_read",
 ];
 
 /// A typed failure, with t3code's `OrchestratorMcpFailure` codes.
@@ -694,9 +698,10 @@ impl Server {
             "agentz_terminal_wait" => self.terminal_wait(caller, &arguments, timed_out),
             "agentz_command_run" => self.command_run(caller, &arguments),
             "agentz_project_add" => self.project_add(&arguments),
-            "agentz_artifact_publish" => self.artifact_publish(caller, &arguments),
+            "agentz_document_publish" => self.document_publish(caller, &arguments),
+            "agentz_design_publish" => self.design_publish(caller, &arguments),
             "agentz_artifact_list" => self.artifact_list(caller, &arguments),
-            "agentz_artifact_read" => self.artifact_read(&arguments),
+            "agentz_artifact_read" => self.artifact_read(caller, &arguments),
             _ => Err(invalid(format!("There is no tool named {name}."))),
         }?;
         Ok(match (request_key, step) {
@@ -2368,9 +2373,20 @@ fn timestamp(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+impl Server {
+    /// The tools for `tools/list`, the design tool's description ending with the caller's
+    /// project's design defaults.
+    pub(super) fn tool_definitions(&self, caller: Option<ToolCaller>) -> Value {
+        let project_id = caller
+            .and_then(|caller| self.resolve_caller(&caller).ok())
+            .and_then(|caller| caller.project_id);
+        definitions(&self.artifacts.design_defaults(project_id))
+    }
+}
+
 /// The tools as MCP tool definitions, for `tools/list`. Names, descriptions and behavior follow
 /// t3code's orchestrator tools, with `agentz_` for `t3_`.
-pub(super) fn definitions() -> Value {
+pub(super) fn definitions(design_defaults: &DesignDefaults) -> Value {
     let thread_id =
         json!({"type": "integer", "description": "A thread id from agentz_thread_list."});
     let client_request_id = json!({
@@ -2689,7 +2705,7 @@ pub(super) fn definitions() -> Value {
         tools.extend(terminals::definitions());
         tools.extend(commands::definitions());
         tools.extend(project_tools::definitions());
-        tools.extend(artifact_tools::definitions());
+        tools.extend(artifact_tools::definitions(design_defaults));
         let machine = json!({
             "type": "string",
             "maxLength": 256,
@@ -2706,6 +2722,10 @@ pub(super) fn definitions() -> Value {
                 continue;
             }
             if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+                // Its own description, which names where the machine comes from.
+                if properties.contains_key("machine") {
+                    continue;
+                }
                 let machine = if relay::MACHINE_TOOLS.contains(&name.as_str()) {
                     &any_machine
                 } else {
@@ -2725,7 +2745,7 @@ mod tests {
     /// Clients name the tools from the protocol's list, so it must be the server's.
     #[test]
     fn the_protocol_lists_every_tool_with_its_title() {
-        let definitions = super::definitions();
+        let definitions = super::definitions(&Default::default());
         let defined: Vec<(&str, &str)> = definitions
             .as_array()
             .into_iter()

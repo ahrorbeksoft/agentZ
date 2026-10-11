@@ -48,7 +48,9 @@ use crate::agents::{
     AgentIcon, AgentId, AgentSession, AgentSessions, AgentSettings, CustomAgentChange, IconId,
     RegistrySnapshot,
 };
-use crate::artifacts::{ArtifactId, ArtifactReply, ArtifactRequest, Artifacts, PageTheme};
+use crate::artifacts::{
+    ArtifactId, ArtifactReply, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
+};
 use crate::attachments::{AttachmentData, AttachmentId};
 use crate::diff::{DiffScope, ThreadDiff};
 use crate::mcp_servers::McpServer;
@@ -752,8 +754,11 @@ pub enum Request {
         stop_running_turns: bool,
     },
 
-    /// The agent-control tools, as MCP tool definitions: [`Response::Tools`].
-    ListTools,
+    /// The agent-control tools, as MCP tool definitions: [`Response::Tools`]. With a caller,
+    /// the design tool's description ends with its project's design defaults.
+    ListTools {
+        caller: Option<ToolCaller>,
+    },
     /// Runs an agent-control tool for the caller: [`Response::ToolResult`]. Tools that wait
     /// answer when they're done.
     CallTool {
@@ -789,6 +794,9 @@ pub enum Request {
     DeleteArtifact(ArtifactId),
     /// The app's theme, for the pages this server serves. Open pages change at once.
     SetPageTheme(PageTheme),
+    /// What designs should be like, for the agents here (`agentz_design_publish`'s
+    /// description). Replaces what the app sent before.
+    SetDesignDefaults(DesignSettings),
     /// The answer to an [`Event::RelayArtifact`], or why there's none.
     ArtifactRelayed {
         relay_id: u64,

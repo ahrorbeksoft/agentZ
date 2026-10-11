@@ -1383,7 +1383,7 @@ mod tests {
         let artifact = |id: &str, versions: usize| Artifact {
             id: ArtifactId(id.to_string()),
             title: id.to_string(),
-            kind: ArtifactKind::Page,
+            kind: ArtifactKind::Document,
             versions: vec![
                 ArtifactVersion {
                     published_at: 1,
@@ -1395,7 +1395,8 @@ mod tests {
             thread_id: Some(ThreadId(1)),
             project_id: None,
             agent_id: None,
-            sent_at: None,
+            preview: String::new(),
+            design: None,
             frame_key: "key".into(),
         };
         let artifacts = |list: Vec<Artifact>| Artifacts {

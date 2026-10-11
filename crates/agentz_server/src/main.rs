@@ -417,7 +417,10 @@ pub(crate) async fn connect_for_tools(
 
 async fn tools() -> Result<()> {
     let connection = connect_for_tools(ClientKind::Cli).await?;
-    match connection.request(Request::ListTools).await? {
+    match connection
+        .request(Request::ListTools { caller: None })
+        .await?
+    {
         Response::Tools(tools) => print_json(&tools),
         response => bail!("unexpected response: {response:?}"),
     }

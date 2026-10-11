@@ -146,8 +146,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `chats/<date>-<first words>-<id>/` | server | Each chat's folder, made with its first message and removed with the chat |
-| `artifacts/<id>/` | server | An artifact: `meta.json` (title, kind, versions, its thread and project), `pages/<version>.html` or `.md`, and the files attached to each version (`files/<version>/`) |
-| `artifacts/server.json`, `artifacts/theme.json` | server | The pages server's port and token, kept so links keep working, and the app's theme for pages |
+| `artifacts/<id>/` | server | An artifact: `meta.json` (title, kind, versions, its thread and project), `pages/<version>.md` (a document) or `.json` (a design), each version's files (`files/<version>/`: a document's downloads, a design's pictures and pages), and a design's picks (`picks/<version>.json`) |
+| `artifacts/server.json`, `artifacts/theme.json`, `artifacts/design-defaults.json` | server | The pages server's port and token, kept so links keep working, the app's theme for pages, and the design defaults from Settings |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
 | `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
 | `settings.json` | app | Theme, saved machines, sidebar and terminal preferences, saved layouts |
@@ -1283,50 +1283,91 @@ as picked in `design/chats/`.
 
 ### Artifacts
 
-Pages agents publish from a thread or chat, opened in the user's browser: Claude Code's
-artifacts, kept on each machine, as picked in `design/artifacts/`.
+Documents and designs agents publish from a thread or chat, opened in the user's browser:
+Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` and
+`design/artifacts-2/`.
 
-- **Publishing** (`server/tools/artifact_tools.rs`; `agentz_artifact_publish`, `_list` and
-  `_read` in `AGENTZ_TOOLS`): one `.html` file (a page) or `.md` file (a document), with a
-  title, files to offer as downloads, and the artifact to add a version to. 16 MiB at most,
-  Claude Code's limit. Any thread's or chat's agent can publish; list shows the caller's
-  project's (or the chats'), every one with `all` or when it has none.
+- **Two kinds** (`ArtifactKind`): a document (Markdown, with downloads) and a design (topics
+  of variants to pick from, which agentZ draws). There are no agent-made pages of their own:
+  a design's variants may be live pages, shown in sandboxed frames on its cards.
+- **Publishing** (`server/tools/artifact_tools.rs`; `agentz_document_publish`,
+  `agentz_design_publish`, `agentz_artifact_list` and `_read` in `AGENTZ_TOOLS`): a document
+  is a `.md` file with files to offer as downloads; a design is a title, an intro and topics,
+  each with a description, today's (kept with Keep today's), variants (name, description,
+  Good, Cost, a picture and/or a live page, at desktop and phone sizes) and the one
+  recommended. Its files are named by topic and letter (`1-B.png`, `1-today-phone.html`).
+  `artifactId` adds a version. 16 MiB a file at most, Claude Code's limit, 128 MiB a design.
+  The design tool's description ends with the design defaults (`DesignDefaults::instructions`:
+  how many variants, today's, sizes, pictures or pages), the project's or General's
+  (`DesignSettings::for_project`, `Request::SetDesignDefaults`), so its tool list is made per
+  caller (`Request::ListTools { caller }`). Any thread's or chat's agent can publish.
+- **Reading** (`agentz_artifact_read`): a document's Markdown, or a design's picks and
+  comments as text, like a round's decisions.md (`artifacts::design_text`): whether it's
+  submitted, a heading per topic with the pick by letter and name, the Alsos, each picked
+  variant's words and the comments. `file` gives one of the version's files by its path (from
+  another machine, copied over to this one). `agentz_artifact_list` lists the thread's, the
+  project's (the default; a chat's lists the chats') or all, on every machine the app
+  reaches, each with its machine and a design's state.
 - **Kept by each machine's server** (`agentz_server::artifacts`, `ArtifactStore`): in
-  `artifacts/` (Data above), sent to apps in the session and `Event::Artifacts`. Deleting the
-  thread keeps its artifacts ("from a deleted thread"); Delete… in the shelf's menu removes
+  `artifacts/` (Data above), sent to apps in the session and `Event::Artifacts`. A design's
+  card state (`DesignState`: topics, variants, decided, submitted, the one-topic pick) rides
+  along. Deleting the thread keeps its artifacts ("from a deleted thread"); Delete… removes
   one with every version (`Request::DeleteArtifact`).
-- **The pages server** (`pages.rs`, `server/artifact_requests.rs`): a small HTTP server on
-  `127.0.0.1`, with the port and a token kept in `artifacts/server.json`. The page links
-  (`ArtifactPages::link`) carry the token; the agent's page runs in a sandboxed frame served
-  with the artifact's own `frame_key`, so its scripts can't use the token. Around it, the 44px
-  bar: All artifacts, the title, the version menu (an older version shows a banner with Show
-  vN), where it came from (opening the thread in the app, `Event::ShowThread`), Files, Export
-  (Save as HTML or Markdown, Print or Save as PDF, Copy Source) and Send to thread. A Markdown
-  document is rendered by the server as a document page (pulldown-cmark, no syntax
-  highlighting: the tree has no highlighter). Open pages hear of republishes (a bar to show
-  the new version), deletions and theme changes over `/events`. `/` is All artifacts, every
-  machine's, with All, Threads and Chats and a search.
+- **Picks** (`ArtifactStore::set_picks`, `DesignPicks`): the design page saves each topic's
+  pick (a variant or today's), its + Also and a comment per variant as they're made. Changing
+  one clears Submitted. A new version carries them over by variant name (`carry_over`): a
+  changed variant is marked Changed, a new one New, a gone one takes its pick with it
+  (`dropped`, `gone`), and the design waits for a Submit again.
+- **Submit** (`ArtifactRequest::Submit`, `Server::submit_design`): marks the version decided,
+  and with "Also send to …" (on at first) puts a short message in the thread as the user's,
+  queued while the agent works: the design as a chip (`PromptPart::Conversation`) whose text
+  tells the agent to read the picks with `agentz_artifact_read`, then "Submitted: picked B,
+  also A" (`submit_summary`) and the note.
+- **The pages server** (`pages.rs`, its pages in `pages/`, `server/artifact_requests.rs`): a
+  small HTTP server on `127.0.0.1`, with the port and a token kept in `artifacts/server.json`.
+  Links (`ArtifactPages::link`, `home_link`) carry the token. What an agent made (a
+  document's rendered Markdown, a version's files) is served only with the artifact's own
+  `frame_key` and a sandboxing CSP, so its scripts can't reach the token. The pages are
+  agentZ's own, in the app's theme (`shared.css`, `shared.js`):
+  - `/` (`home.html`, `?p=` opens a project's place): the bar (agentZ's mark, Artifacts, a
+    search over titles and text, `/api/search`), places on the left with counts (All
+    artifacts, Waiting for you, each project, Chats), then cards by day (Today, Yesterday,
+    This week, Earlier), each with a picture (a design's variants, a document's first lines),
+    its state, an Archived tag, and its machine when it's another's; a machine that isn't
+    connected is a line over the cards (`/api/artifacts`).
+  - A document (`document.html`): the bar (home, the title, the version menu, where it came
+    from, opening the thread in the app with `Event::ShowThread`, Files when it has some,
+    Export: Markdown, Print or Save as PDF, Copy Source) over the document in a sandboxed
+    frame, rendered by the server (pulldown-cmark, no syntax highlighting: the tree has no
+    highlighter).
+  - A design (`design.html`, `/api/design`, `/api/picks`, `/api/submit`): the topics on the
+    left (each with its pick's letter) and Summary, then the topic's cards: today's first,
+    Recommended, Changed and New tags, the picture or the live page scaled down (Open page
+    for the page itself), Pick, + Also and a comment. A close-up (←→, Esc), Desktop · Phone,
+    the progress, Saved, and Submit (Also send, a note, ⌘↩) in the bar; Decided afterwards,
+    and a banner on a new version saying what changed and what was dropped. An earlier
+    version is read-only. Keys 1–9 pick, ←→ change topics.
+  - Open pages hear of republishes (a bar to show the new version), picks, deletions and
+    theme changes over `/events`.
 - **Another machine's artifacts** are served by this Mac's pages server too, through the app:
   the server asks for them by machine name (`Event::RelayArtifact`), the app asks that
   machine (`Request::Artifact`, `Machines::relay_artifact`) and answers
-  (`Request::ArtifactRelayed`). Links to them are `/m/<machine>/a/<id>`.
+  (`Request::ArtifactRelayed`). Links to them are `/m/<machine>/a/<id>`. Picks and Submit go
+  the same way, and the home page lists every machine's.
 - **The theme** (`Shell::push_page_theme`, `page_theme`): the app's colors and fonts as CSS
-  variables (`--background`, `--text`, `--accent`, …), sent to every machine's server as the
-  theme changes (`Request::SetPageTheme`) and given to pages as they load and live.
-- **Send to thread**: the bar asks the page for `window.agentzPicks()` (or the selection),
-  then sends it with the user's note as the user's message in the thread
-  (`artifact_send`): the artifact as a chip (`PromptPart::Conversation`) and the note,
-  queued while the agent works.
+  variables (`--background`, `--text`, `--accent`, `--selected`, `--success`, …), sent to
+  every machine's server as the theme changes (`Request::SetPageTheme`) and given to pages as
+  they load and live.
 - **In the thread** (`AgentView::render_published_artifact`, `tool_calls::published_artifact`):
-  the newest publish of each artifact is a card (its kind's icon, title, "Page · v2 ·
+  the newest publish of each artifact is a card (its kind's icon, title, "Document · v2 ·
   published 2m ago", Open, and a menu with Copy Link, Export… and Show in List); earlier ones
-  are a line, "Published an artifact: Checkout redesign · v1". The header has an Artifacts
+  are a line, "Published a document: Checkout benchmarks · v1". The header has an Artifacts
   pill before the branch (`render_artifacts_pill`): one opens it, several list in a menu with
   All artifacts…. Export… saves the source where the user picks.
 - **In the sidebar** (`Sidebar::render_artifacts_shelf`): an Artifacts shelf above Archived,
   closed at first (`ProjectStore::artifacts_expanded`, kept by this Mac's server), with the
   picked project's and the chats' artifacts, every one under All
-  (`Machines::scoped_artifacts`), newest first: "Page · v2 · storefront › Add checkout · 2m",
+  (`Machines::scoped_artifacts`), newest first: "Document · v2 · storefront › Add checkout · 2m",
   opening on a click, with Open, Show Thread, Copy Link and Delete… on a right-click, then All
   artifacts…. `artifacts: show all` in the command palette opens All artifacts.
 - **Opening on publish** (`Shell::open_published_artifact`, Settings › General › Artifacts ›

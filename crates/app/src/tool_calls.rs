@@ -157,17 +157,25 @@ pub fn is_subagent(tool_call: &ToolCall) -> bool {
         || (may_be_subagent(tool_call) && SubagentCall::of(tool_call).is_some())
 }
 
-/// The artifact a finished `agentz_artifact_publish` made and the version it was, from its
-/// answer. Its row is the artifact's card, which shows apart from the work around it, as a
-/// subagent's does.
+/// The artifact a finished `agentz_document_publish` or `agentz_design_publish` made and the
+/// version it was, from its answer. Its row is the artifact's card, which shows apart from the
+/// work around it, as a subagent's does.
 pub fn published_artifact(tool_call: &ToolCall) -> Option<(ArtifactId, u32)> {
     // Told apart by name before the answer is parsed, as most calls aren't one.
     let title = tool_call.title.as_str();
-    if !title.contains("artifact_publish") && !title.contains("Publish an artifact") {
+    if ![
+        "document_publish",
+        "design_publish",
+        "Publish a document",
+        "Publish a design",
+    ]
+    .iter()
+    .any(|name| title.contains(name))
+    {
         return None;
     }
     let ToolCallKind::Own {
-        tool: OwnTool::ArtifactPublish,
+        tool: OwnTool::DocumentPublish | OwnTool::DesignPublish,
         output: Some(output),
         ..
     } = ToolCallKind::of(tool_call)
@@ -287,7 +295,8 @@ pub enum OwnTool {
     TerminalWait,
     CommandRun,
     ProjectAdd,
-    ArtifactPublish,
+    DocumentPublish,
+    DesignPublish,
     ArtifactList,
     ArtifactRead,
 }
@@ -320,7 +329,8 @@ impl OwnTool {
         Self::TerminalWait,
         Self::CommandRun,
         Self::ProjectAdd,
-        Self::ArtifactPublish,
+        Self::DocumentPublish,
+        Self::DesignPublish,
         Self::ArtifactList,
         Self::ArtifactRead,
     ];
@@ -643,11 +653,20 @@ impl OwnTool {
                 None,
             ),
             // Its row is the artifact's card, so a finished publish has no result words.
-            Self::ArtifactPublish => (
+            Self::DocumentPublish => (
                 verbs(
-                    "Publish an artifact:",
-                    "Publishing an artifact:",
-                    "Published an artifact:",
+                    "Publish a document:",
+                    "Publishing a document:",
+                    "Published a document:",
+                ),
+                argument("title").map(Subject::title),
+                None,
+            ),
+            Self::DesignPublish => (
+                verbs(
+                    "Publish a design:",
+                    "Publishing a design:",
+                    "Published a design:",
                 ),
                 argument("title").map(Subject::title),
                 None,
@@ -831,7 +850,7 @@ impl OwnTool {
             }
             Self::ProjectAdd => text_in(output.get("name")).and_then(words),
             // A publish's card says the version; a list says how many there are.
-            Self::ArtifactPublish => None,
+            Self::DocumentPublish | Self::DesignPublish => None,
             Self::ArtifactList => words(counted(count("artifacts")?, "artifact", "artifacts")),
             Self::ArtifactRead => output
                 .get("version")
@@ -1074,7 +1093,7 @@ impl OwnTool {
             Self::TerminalRead | Self::TerminalWait => printed("text").into_iter().collect(),
             Self::CommandRun => printed("output").into_iter().collect(),
             // The card carries everything a publish has to show.
-            Self::ArtifactPublish => Vec::new(),
+            Self::DocumentPublish | Self::DesignPublish => Vec::new(),
             Self::ArtifactList => output
                 .get("artifacts")
                 .and_then(Value::as_array)
@@ -1083,17 +1102,17 @@ impl OwnTool {
                 .filter_map(|artifact| {
                     let title = text_in(artifact.get("title"))?;
                     let mut spans = vec![Span::bright(title)];
-                    if let Some(version) = artifact.get("versions").and_then(Value::as_u64) {
+                    if let Some(version) = artifact.get("version").and_then(Value::as_u64) {
                         spans.push(Span::dim(format!("v{version}")));
                     }
-                    if let Some(place) = text_in(artifact.get("place")) {
+                    if let Some(place) = text_in(artifact.get("from")) {
                         spans.push(Span::dim(place));
                     }
                     Some(OwnPart::Line(spans))
                 })
                 .collect(),
-            Self::ArtifactRead => text_in(output.get("source"))
-                .map(|source| OwnPart::Printed(source.chars().take(2000).collect::<String>()))
+            Self::ArtifactRead => text_in(output.get("text"))
+                .map(|text| OwnPart::Printed(text.chars().take(2000).collect::<String>()))
                 .into_iter()
                 .collect(),
             Self::ProjectAdd => {
@@ -1170,7 +1189,8 @@ impl OwnTool {
             Self::TerminalWait => counted("Waited for a terminal", "Waited for {} terminals"),
             Self::CommandRun => counted("Ran a command", "Ran {} commands"),
             Self::ProjectAdd => counted("Added a project", "Added {} projects"),
-            Self::ArtifactPublish => counted("Published an artifact", "Published {} artifacts"),
+            Self::DocumentPublish => counted("Published a document", "Published {} documents"),
+            Self::DesignPublish => counted("Published a design", "Published {} designs"),
             Self::ArtifactList => "Listed artifacts".to_string(),
             Self::ArtifactRead => counted("Read an artifact", "Read {} artifacts"),
         }
@@ -3205,14 +3225,20 @@ mod tests {
             (
                 OwnTool::ArtifactRead,
                 json!({"artifactId": "a1"}),
-                json!({"artifactId": "a1", "version": 3, "source": "<h1>Plan</h1>"}),
+                json!({"artifactId": "a1", "version": 3, "text": "# Plan"}),
                 words("v3"),
             ),
             // A publish shows as the artifact's card.
             (
-                OwnTool::ArtifactPublish,
+                OwnTool::DocumentPublish,
                 json!({}),
                 json!({"artifactId": "a1", "version": 2}),
+                None,
+            ),
+            (
+                OwnTool::DesignPublish,
+                json!({}),
+                json!({"artifactId": "a2", "version": 1}),
                 None,
             ),
             // Tools that made something open it instead, and others only did something.
@@ -3237,18 +3263,27 @@ mod tests {
     #[test]
     fn a_finished_publish_names_its_artifact_and_version() {
         let published = tool_call(
-            "mcp__agentz__agentz_artifact_publish",
-            Some(json!({"title": "Checkout redesign", "kind": "page"})),
-            Some(r#"{"artifactId": "k3x9", "version": 2, "versions": 2}"#),
+            "mcp__agentz__agentz_design_publish",
+            Some(json!({"title": "Checkout redesign"})),
+            Some(r#"{"artifactId": "k3x9", "version": 2}"#),
         );
         assert_eq!(
             published_artifact(&published),
             Some((ArtifactId("k3x9".to_string()), 2))
         );
+        let document = tool_call(
+            "mcp__agentz__agentz_document_publish",
+            Some(json!({"title": "Plan"})),
+            Some(r#"{"artifactId": "p1", "version": 1}"#),
+        );
+        assert_eq!(
+            published_artifact(&document),
+            Some((ArtifactId("p1".to_string()), 1))
+        );
         let failed = tool_call(
-            "mcp__agentz__agentz_artifact_publish",
+            "mcp__agentz__agentz_design_publish",
             Some(json!({"title": "Checkout redesign"})),
-            Some("A page needs an index.html."),
+            Some("A design needs at least one topic."),
         );
         assert_eq!(published_artifact(&failed), None);
         let listed = tool_call(

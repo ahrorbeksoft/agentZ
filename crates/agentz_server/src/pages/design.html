@@ -1,0 +1,686 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design · agentZ</title>
+<style>
+__SHARED_CSS__
+__VARS__
+body { display: flex; flex-direction: column; overflow: hidden; }
+.prog { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; flex: none; }
+.progbar { width: 90px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.progbar i { display: block; height: 100%; background: var(--success); }
+.saved { color: var(--placeholder); font-size: 12px; flex: none; white-space: nowrap; }
+.saved.error { color: var(--warning); }
+
+.board { flex: 1; min-height: 0; display: flex; background: var(--background); }
+.nav { width: 220px; flex: none; border-right: 1px solid var(--border); background: var(--panel); padding: 10px 8px; display: flex; flex-direction: column; gap: 1px; overflow-y: auto; }
+.nav h5 { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--placeholder); margin: 8px 8px 4px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav a { display: flex; align-items: center; gap: 7px; padding: 5px 8px; border-radius: 6px; color: var(--muted); font-size: 12.5px; cursor: pointer; text-decoration: none; }
+.nav a:hover { background: var(--hover); }
+.nav a.on { background: var(--selected); color: var(--text); }
+.nav .n { width: 14px; text-align: right; color: var(--placeholder); font-size: 11px; flex: none; }
+.nav .t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.nav .s { font-size: 10px; font-weight: 600; color: var(--background); background: var(--success); border-radius: 4px; padding: 0 5px; flex: none; }
+.nav .c { width: 6px; height: 6px; border-radius: 50%; background: var(--warning); flex: none; }
+.nav .sep { border-top: 1px solid var(--border); margin: 10px 4px 6px; }
+
+.page { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 24px 48px; display: flex; flex-direction: column; gap: 12px; }
+.banners { display: flex; flex-direction: column; gap: 8px; }
+.banners:empty { display: none; }
+.intro { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 0; white-space: pre-wrap; max-width: 900px; }
+.heading { font-size: 20px; font-weight: 600; }
+.how { color: var(--muted); font-size: 12px; margin-top: -6px; }
+.how b { color: var(--text); font-weight: 600; }
+.about { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 0; white-space: pre-wrap; max-width: 900px; }
+
+.grid { display: grid; gap: 14px; align-items: start; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.grid.phone { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+@media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid.phone { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.opt { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.opt.picked { border-color: var(--success); box-shadow: 0 0 0 1px var(--success) inset; }
+.opt.also { border-color: var(--success); border-style: dashed; }
+.oh { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.letter { width: 20px; height: 20px; border-radius: 5px; background: var(--border); display: grid; place-items: center; font-weight: 600; font-size: 11px; flex: none; }
+.opt.picked .letter { background: var(--success); color: var(--background); }
+.oname { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+.otag { font-size: 10px; border: 1px solid var(--border); color: var(--muted); border-radius: 9px; padding: 0 7px; white-space: nowrap; }
+.otag.rec { border-color: color-mix(in srgb, var(--accent) 55%, transparent); color: var(--accent); }
+.otag.new { border-color: color-mix(in srgb, var(--warning) 55%, transparent); color: var(--warning); }
+.desc { color: var(--muted); margin: 0; font-size: 12px; line-height: 1.45; white-space: pre-wrap; }
+.pc { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; font-size: 11.5px; color: var(--muted); line-height: 1.4; }
+.pc b { color: var(--placeholder); font-weight: 500; }
+.fit { border-radius: 8px; overflow: hidden; background: #111214; border: 1px solid var(--border); position: relative; cursor: zoom-in; }
+.fit img { width: 100%; display: block; }
+.live { position: relative; overflow: hidden; background: #fff; }
+.live iframe { position: absolute; left: 0; top: 0; border: none; transform-origin: 0 0; pointer-events: none; background: #fff; }
+.none { aspect-ratio: 390 / 844; border-radius: 8px; border: 1px dashed var(--border); display: grid; place-items: center; color: var(--placeholder); font-size: 12px; text-align: center; padding: 8px; }
+.none.desktop { aspect-ratio: 16 / 10; }
+.hint { position: absolute; z-index: 3; right: 8px; bottom: 8px; font-size: 11px; color: #fff; background: rgba(0, 0, 0, .62); border: none; border-radius: 6px; padding: 3px 8px; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.hint:hover { background: rgba(0, 0, 0, .8); }
+.foot { display: flex; gap: 6px; align-items: flex-start; }
+.grid.phone .foot { flex-wrap: wrap; }
+.grid.phone .comment { flex-basis: 100%; }
+.pick { flex: none; border: 1px solid var(--border); background: var(--background); border-radius: 7px; padding: 4px 11px; font-weight: 500; font-size: 12px; white-space: nowrap; cursor: pointer; color: var(--text); }
+.pick:hover { background: var(--hover); }
+.opt.picked .pick { background: var(--success); border-color: var(--success); color: var(--background); }
+.alsob { flex: none; border: 1px dashed var(--border); border-radius: 7px; padding: 4px 8px; font-size: 11.5px; color: var(--muted); white-space: nowrap; background: none; cursor: pointer; }
+.alsob:hover { color: var(--text); }
+.opt.also .alsob { border-color: var(--success); color: var(--success); }
+.pick:disabled, .alsob:disabled { cursor: default; opacity: .7; }
+.comment { flex: 1; min-width: 0; height: 26px; resize: none; overflow: hidden; background: var(--background); border: 1px solid var(--border); border-radius: 7px; color: var(--text); padding: 4px 8px; font-size: 12px; line-height: 1.4; }
+.comment::placeholder { color: var(--placeholder); }
+.comment:focus { outline: none; border-color: var(--accent); }
+
+.summary { width: 100%; border-collapse: collapse; font-size: 12.5px; max-width: 1100px; }
+.summary td, .summary th { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; vertical-align: top; }
+.summary th { color: var(--placeholder); font-weight: 500; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+.summary tr.topic { cursor: pointer; }
+.summary tr.topic:hover td { background: var(--hover); }
+.summary .ph { color: var(--placeholder); }
+
+.subpop { position: fixed; z-index: 25; right: 12px; top: 48px; width: 380px; max-width: calc(100vw - 24px); background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 16px 40px rgba(0, 0, 0, .55); padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.subpop h4 { margin: 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.subpop .picks { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+.subpop .picks b { color: var(--text); font-weight: 500; }
+.subpop label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.subpop label b { font-weight: 500; }
+.subpop textarea { min-height: 52px; resize: vertical; border: 1px solid var(--border); border-radius: 6px; background: var(--background); padding: 8px 10px; font-size: 12.5px; line-height: 1.5; }
+.subpop textarea:focus { outline: none; border-color: var(--accent); }
+.subpop .error { color: var(--warning); font-size: 12px; }
+.subpop .buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.sw { position: relative; width: 26px; height: 15px; flex: none; }
+.sw input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.sw i { position: absolute; inset: 0; border-radius: 8px; background: var(--selected); pointer-events: none; }
+.sw i::after { content: ''; position: absolute; left: 2px; top: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--muted); transition: left .1s; }
+.sw input:checked + i { background: var(--accent); }
+.sw input:checked + i::after { left: 13px; background: var(--background); }
+
+.over { position: fixed; inset: 0; z-index: 20; background: rgba(8, 9, 12, .86); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 20px 64px 14px; }
+.over .stage { position: relative; max-width: 100%; max-height: calc(100vh - 64px); overflow: auto; border-radius: 6px; flex: none; }
+.over .stage img { display: block; max-width: 100%; }
+.over .stage iframe { display: block; border: none; background: #fff; }
+.over .stage .none { width: 320px; background: var(--background); }
+.over .cap { color: #c9ccd1; font-size: 12px; display: flex; gap: 10px; align-items: center; }
+.over .cap a { color: #8fb2fa; cursor: pointer; }
+.arrow { position: fixed; top: 50%; margin-top: -16px; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: rgba(0, 0, 0, .55); color: #fff; border: none; cursor: pointer; z-index: 21; }
+.arrow:hover { background: rgba(0, 0, 0, .8); }
+.arrow.left { left: 16px; }
+.arrow.right { right: 16px; }
+</style>
+</head>
+<body>
+<div class="bar" id="bar"></div>
+<div id="earlier" hidden></div>
+<div class="board"><nav class="nav" id="nav"></nav><main class="page" id="page"></main></div>
+<div class="subpop" id="submit" hidden></div>
+<div class="over" id="over" hidden></div>
+<script>__DATA__</script>
+<script>__SHARED_JS__</script>
+<script>
+// The design page agentZ draws (design/artifacts-2, topics 9 to 19): the topics on the left
+// with Summary at the end, a topic's variants in cards to pick, take parts of (+ Also) and
+// comment on, today's version as one to keep, a variant up close, Desktop · Phone, and Submit.
+// Picks are saved on the server as they're made, on the latest version only.
+let listing = null;
+let design = null;
+let picks = null;
+let version = DATA.version;
+let latest = 0;
+let topic = 0;
+let mode = null;
+let closeUp = null;
+let cards = [];
+let saving = 0;
+let saveError = '';
+let saveQueue = Promise.resolve();
+let reloadWanted = false;
+const commentTimers = new Map();
+
+const urlFor = (v) => artifactUrl(DATA.machine, DATA.id, v);
+const readOnly = () => version !== latest;
+const letter = (index) => (index < 26 ? String.fromCharCode(65 + index) : String(index + 1));
+const file = (name) => fileUrl(DATA.machine, DATA.id, version, name, listing.artifact.frame_key);
+const busy = () => saving > 0 || commentTimers.size > 0;
+
+// A topic's cards, today's first: `{ key, variant, today, letter }`.
+function entries(index) {
+  const designTopic = design.topics[index];
+  const list = [];
+  if (designTopic.today) list.push({ key: 'today', variant: designTopic.today, today: true, letter: null });
+  designTopic.variants.forEach((variant, place) => list.push({ key: variant.name, variant, today: false, letter: letter(place) }));
+  return list;
+}
+
+function topicPicks(index) {
+  while (picks.topics.length <= index) picks.topics.push({ pick: null, also: [], comments: {} });
+  const entry = picks.topics[index];
+  entry.also = entry.also || [];
+  entry.comments = entry.comments || {};
+  return entry;
+}
+
+// "B. Compare table", or "Today’s page (today’s)".
+function label(index, key) {
+  const designTopic = design.topics[index];
+  if (key === 'today') return designTopic.today ? `${designTopic.today.name} (today’s)` : 'Today’s';
+  const place = designTopic.variants.findIndex((variant) => variant.name === key);
+  return place < 0 ? key : `${letter(place)}. ${key}`;
+}
+
+function shortLabel(index, key) {
+  if (key === 'today') return 'Today';
+  const place = design.topics[index].variants.findIndex((variant) => variant.name === key);
+  return place < 0 ? key : letter(place);
+}
+
+// "B. Compare table, also C. Slider by size", or null when nothing's picked.
+function pickText(index) {
+  const entry = topicPicks(index);
+  if (!entry.pick) return null;
+  let text = label(index, entry.pick);
+  if (entry.also.length) text += ', also ' + entry.also.map((key) => label(index, key)).join(', ');
+  return text;
+}
+
+const decidedCount = () => design.topics.filter((_, index) => topicPicks(index).pick).length;
+const commentCount = () => design.topics.reduce((sum, _, index) => sum + Object.values(topicPicks(index).comments).filter((text) => text.trim()).length, 0);
+const hasComment = (index) => Object.values(topicPicks(index).comments).some((text) => text.trim());
+const anyPicks = () => design.topics.some((_, index) => topicPicks(index).pick || topicPicks(index).also.length || hasComment(index));
+const variantsOf = () => design.topics.flatMap((designTopic) => [designTopic.today, ...designTopic.variants].filter(Boolean));
+const hasPhone = () => variantsOf().some((variant) => variant.phone_picture || variant.phone_page);
+const hasDesktop = () => variantsOf().some((variant) => variant.picture || variant.page);
+
+// The bar: the page's (home, title, version, where) and the design's (Desktop · Phone, how
+// many topics are decided, Saved, Submit or Decided).
+function renderBar() {
+  const artifact = listing.artifact;
+  const decided = decidedCount();
+  const total = design.topics.length;
+  let sizes = null;
+  if (hasPhone() && hasDesktop()) {
+    sizes = h('span', { class: 'seg' },
+      h('button', { class: mode === 'desktop' ? 'on' : '', onclick: () => setMode('desktop') }, icon('monitor', 12), 'Desktop'),
+      h('button', { class: mode === 'phone' ? 'on' : '', onclick: () => setMode('phone') }, icon('phone', 12), 'Phone'));
+  }
+  let end = null;
+  if (picks.submitted_at) {
+    end = h('span', { class: 'tag ok big' }, icon('check', 12), 'Decided ' + ago(picks.submitted_at));
+  } else if (!readOnly()) {
+    end = h('button', { class: 'btn' + (decided === total ? ' primary' : ''), onclick: showSubmit }, icon('check', 13), 'Submit');
+  }
+  fill($('bar'),
+    h('a', { class: 'iconbtn', href: homeUrl(), title: 'Artifacts' }, icon('home', 15)),
+    h('span', { class: 'slash', text: '/' }),
+    h('span', { class: 'title', text: artifact.title }),
+    versionTag(artifact, version, urlFor),
+    whereLine(listing, DATA.machine),
+    h('span', { class: 'grow' }),
+    sizes,
+    h('span', { class: 'prog' }, h('span', { class: 'progbar' }, h('i', { style: { width: (total ? (100 * decided) / total : 0) + '%' } })), `${decided} of ${total} decided`),
+    picks.submitted_at ? null : h('span', { class: 'saved', id: 'saved' }),
+    end,
+  );
+  renderSaved();
+}
+
+function renderSaved() {
+  const element = $('saved');
+  if (!element) return;
+  element.classList.toggle('error', !!saveError);
+  if (saving > 0) element.textContent = 'Saving…';
+  else if (saveError) element.textContent = 'Couldn’t save: ' + saveError;
+  else element.textContent = anyPicks() && !readOnly() ? 'Saved' : '';
+}
+
+function renderNav() {
+  const nav = $('nav');
+  const rows = design.topics.map((designTopic, index) => {
+    const entry = topicPicks(index);
+    return h('a', { class: index === topic ? 'on' : '', onclick: () => goTopic(index) },
+      h('span', { class: 'n', text: String(index + 1) }),
+      h('span', { class: 't', text: designTopic.title, title: designTopic.title }),
+      hasComment(index) ? h('span', { class: 'c', title: 'Commented' }) : null,
+      entry.pick ? h('span', { class: 's', text: shortLabel(index, entry.pick) }) : null);
+  });
+  fill(nav,
+    h('h5', { text: listing.artifact.title, title: listing.artifact.title }),
+    ...rows,
+    h('div', { class: 'sep' }),
+    h('a', { class: topic === design.topics.length ? 'on' : '', onclick: () => goTopic(design.topics.length) }, h('span', { class: 'n', text: '∑' }), h('span', { class: 't', text: 'Summary' })),
+  );
+}
+
+// What changed in this version (topic 19 A), while it waits for a Submit.
+function againText() {
+  if (version < 2 || readOnly() || picks.submitted_at) return null;
+  const several = design.topics.length > 1;
+  const gone = design.gone || [];
+  const dropped = picks.dropped || [];
+  const goneText = (name, shown = name) => shown + ' is gone' + (dropped.includes(name) ? ', and your pick of it' : '');
+  // A topic's changes together, under its title when there are several: "Plans: B changed
+  // after your comment, D is new, D. Slider is gone".
+  const groups = [];
+  const claimed = new Set();
+  design.topics.forEach((designTopic, index) => {
+    const prefix = designTopic.title + ': ';
+    const entry = topicPicks(index);
+    const fresh = designTopic.variants.filter((variant) => variant.change === 'new');
+    if (several && designTopic.variants.length && fresh.length === designTopic.variants.length) {
+      groups.push(designTopic.title + ' is new');
+      return;
+    }
+    const parts = [];
+    designTopic.variants.forEach((variant, place) => {
+      if (variant.change === 'changed') parts.push(letter(place) + ' changed' + (entry.comments[variant.name] ? ' after your comment' : ''));
+      else if (variant.change === 'new') parts.push(letter(place) + ' is new');
+    });
+    for (const name of gone) {
+      if (claimed.has(name) || (several && !name.startsWith(prefix))) continue;
+      claimed.add(name);
+      parts.push(goneText(name, several ? name.slice(prefix.length) : name));
+    }
+    if (parts.length) groups.push((several ? prefix : '') + parts.join(', '));
+  });
+  for (const name of gone) if (!claimed.has(name)) groups.push(goneText(name));
+  if (!groups.length && !picks.carried_from) return null;
+  let text = `v${version} from ${listing.agent_name || 'the agent'}` + (groups.length ? ': ' + groups.join('; ') + '.' : '.');
+  if (picks.carried_from) text += ' Your picks are kept; Submit when you’re happy with them.';
+  return text;
+}
+
+function renderBanners() {
+  const banners = $('banners');
+  if (!banners) return;
+  const list = [];
+  if (picks.submitted_at) {
+    let text = 'Decided ' + ago(picks.submitted_at);
+    if (picks.sent) text += `, and sent to “${listing.thread_title || 'its thread'}”`;
+    text += readOnly() ? '.' : '. Change a pick and Submit comes back.';
+    list.push(h('div', { class: 'banner ok' }, icon('check-circle', 15), h('span', { class: 'grow', text })));
+  } else {
+    const again = againText();
+    if (again) list.push(h('div', { class: 'banner' }, icon('history', 15), h('span', { class: 'grow', text: again })));
+  }
+  fill(banners, ...list);
+}
+
+function renderPage() {
+  const page = $('page');
+  cards = [];
+  const banners = h('div', { class: 'banners', id: 'banners' });
+  if (topic >= design.topics.length) {
+    fill(page, banners, h('div', { class: 'heading', text: 'Summary' }), h('div', { class: 'how', text: 'What you picked in each topic, and your comments.' }), summaryTable());
+    renderBanners();
+    return;
+  }
+  const designTopic = design.topics[topic];
+  const phone = mode === 'phone';
+  const count = designTopic.variants.length;
+  const how = readOnly()
+    ? h('div', { class: 'how', text: 'An earlier version: its picks are as they were.' })
+    : h('div', { class: 'how' }, h('b', { text: 'Pick one' }), ', then ', h('b', { text: '+ Also' }), ' on any others to take parts of. Keys: ', h('b', { text: count > 1 ? `1–${Math.min(count, 9)}` : '1' }), ' pick.');
+  const grid = h('div', { class: 'grid' + (phone ? ' phone' : '') });
+  entries(topic).forEach((entry, index) => grid.append(card(topic, entry, index)));
+  fill(page,
+    banners,
+    topic === 0 && design.intro ? h('p', { class: 'intro', text: design.intro }) : null,
+    h('div', { class: 'heading', text: designTopic.title }),
+    how,
+    designTopic.description ? h('p', { class: 'about', text: designTopic.description }) : null,
+    grid,
+  );
+  renderBanners();
+  refreshCards();
+  page.scrollTop = 0;
+}
+
+function summaryTable() {
+  const table = h('table', { class: 'summary' }, h('tr', {}, h('th', { text: 'Topic' }), h('th', { text: 'Pick' }), h('th', { text: 'Comments' })));
+  design.topics.forEach((designTopic, index) => {
+    const text = pickText(index);
+    const comments = Object.entries(topicPicks(index).comments).filter(([, comment]) => comment.trim());
+    table.append(h('tr', { class: 'topic', onclick: () => goTopic(index) },
+      h('td', { text: `${index + 1} · ${designTopic.title}` }),
+      text ? h('td', { text }) : h('td', { class: 'ph', text: 'Not decided' }),
+      comments.length
+        ? h('td', {}, comments.map(([key, comment]) => h('div', { text: `${shortLabel(index, key)}: ${comment}` })))
+        : h('td', { class: 'ph', text: 'None' })));
+  });
+  return table;
+}
+
+// A variant's card (topic 10 A), today's marked Today with Keep today's (topic 11 B).
+function card(index, entry, place) {
+  const designTopic = design.topics[index];
+  const variant = entry.variant;
+  const phone = mode === 'phone';
+  const tags = [];
+  if (!entry.today && designTopic.recommended === variant.name) tags.push(h('span', { class: 'otag rec', text: 'Recommended' }));
+  if (entry.today) tags.push(h('span', { class: 'otag', text: 'Today' }));
+  if (!entry.today && variant.change === 'changed') tags.push(h('span', { class: 'otag new', text: 'Changed' }));
+  if (!entry.today && variant.change === 'new') tags.push(h('span', { class: 'otag new', text: 'New' }));
+  const pickButton = h('button', { class: 'pick', onclick: () => pick(index, entry.key) });
+  const alsoButton = entry.today ? null : h('button', { class: 'alsob', onclick: () => toggleAlso(index, entry.key) });
+  const comment = h('textarea', { class: 'comment', rows: 1, placeholder: `Comment on ${entry.today ? 'today’s' : entry.letter}…` });
+  comment.addEventListener('input', () => { fitComment(comment); setComment(index, entry.key, comment.value); });
+  comment.addEventListener('blur', () => flushComment(index));
+  const element = h('div', { class: 'opt' },
+    h('div', { class: 'oh' }, entry.today ? h('span', { class: 'letter' }, icon('history', 12)) : h('span', { class: 'letter', text: entry.letter }), h('span', { class: 'oname', text: variant.name }), tags),
+    !phone && variant.description ? h('p', { class: 'desc', text: variant.description }) : null,
+    !phone && (variant.good || variant.cost) ? h('div', { class: 'pc' }, variant.good ? [h('b', { text: 'Good' }), h('span', { text: variant.good })] : null, variant.cost ? [h('b', { text: 'Cost' }), h('span', { text: variant.cost })] : null) : null,
+    preview(index, entry, place),
+    h('div', { class: 'foot' }, pickButton, alsoButton, comment));
+  cards.push({ index, entry, element, pickButton, alsoButton, comment });
+  return element;
+}
+
+function preview(index, entry, place) {
+  const variant = entry.variant;
+  const phone = mode === 'phone';
+  const picture = phone ? variant.phone_picture : variant.picture;
+  const pageFile = phone ? variant.phone_page : variant.page;
+  if (!picture && !pageFile) return h('div', { class: 'none' + (phone ? '' : ' desktop'), text: phone ? 'No phone version' : 'No desktop version' });
+  const fit = h('div', { class: 'fit', title: 'Show it up close', onclick: () => openCloseUp(index, place, false) });
+  if (picture) fit.append(h('img', { src: file(picture), loading: 'lazy', alt: variant.name }));
+  else fit.append(livePage(pageFile, phone));
+  if (pageFile) fit.append(h('button', { class: 'hint', onclick: (event) => { event.stopPropagation(); openCloseUp(index, place, true); } }, icon('external', 11), 'Open page'));
+  return fit;
+}
+
+// A variant's live page in its card, at its real width and zoomed to fit, as the design
+// board draws its mocks.
+function livePage(name, phone) {
+  const width = phone ? 390 : 1280;
+  const height = phone ? 844 : 800;
+  const frame = h('iframe', { sandbox: 'allow-scripts allow-forms', src: file(name), tabindex: '-1', scrolling: 'no', style: { width: width + 'px', height: height + 'px' } });
+  const box = h('div', { class: 'live', style: { aspectRatio: `${width} / ${height}` } }, frame);
+  new ResizeObserver(() => { frame.style.transform = `scale(${box.clientWidth / width})`; }).observe(box);
+  return box;
+}
+
+function fitComment(comment) {
+  comment.style.height = 'auto';
+  comment.style.height = Math.max(26, comment.scrollHeight + 2) + 'px';
+}
+
+// Brings the cards in line with the picks, without redrawing them (a comment being typed
+// keeps its place).
+function refreshCards() {
+  const locked = readOnly();
+  for (const { index, entry, element, pickButton, alsoButton, comment } of cards) {
+    const entryPicks = topicPicks(index);
+    const picked = entryPicks.pick === entry.key;
+    const also = entryPicks.also.includes(entry.key);
+    element.classList.toggle('picked', picked);
+    element.classList.toggle('also', also && !picked);
+    pickButton.textContent = picked ? '✓ Picked' : entry.today ? 'Keep today’s' : 'Pick ' + entry.letter;
+    pickButton.disabled = locked;
+    if (alsoButton) {
+      alsoButton.hidden = picked;
+      alsoButton.textContent = also ? '✓ Also' : '+ Also';
+      alsoButton.disabled = locked;
+    }
+    comment.readOnly = locked;
+    if (document.activeElement !== comment) {
+      const text = entryPicks.comments[entry.key] || '';
+      if (comment.value !== text) comment.value = text;
+      fitComment(comment);
+    }
+  }
+}
+
+function refresh() {
+  renderBar();
+  renderNav();
+  if (topic >= design.topics.length) renderPage();
+  else { renderBanners(); refreshCards(); }
+}
+
+function goTopic(index) {
+  if (index < 0 || index > design.topics.length || index === topic) return;
+  topic = index;
+  renderNav();
+  renderPage();
+}
+
+function setMode(next) {
+  if (mode === next) return;
+  mode = next;
+  renderBar();
+  renderPage();
+}
+
+function pick(index, key) {
+  if (readOnly()) return;
+  const entry = topicPicks(index);
+  if (entry.pick === key) entry.pick = null;
+  else {
+    entry.pick = key;
+    entry.also = entry.also.filter((other) => other !== key);
+  }
+  picks.submitted_at = null;
+  picks.sent = false;
+  refresh();
+  save(index);
+}
+
+function toggleAlso(index, key) {
+  if (readOnly()) return;
+  const entry = topicPicks(index);
+  entry.also = entry.also.includes(key) ? entry.also.filter((other) => other !== key) : [...entry.also, key];
+  picks.submitted_at = null;
+  picks.sent = false;
+  refresh();
+  save(index);
+}
+
+function setComment(index, key, text) {
+  if (readOnly()) return;
+  const entry = topicPicks(index);
+  if (text.trim()) entry.comments[key] = text;
+  else delete entry.comments[key];
+  renderNav();
+  clearTimeout(commentTimers.get(index));
+  commentTimers.set(index, setTimeout(() => save(index), 500));
+  renderSaved();
+}
+
+function flushComment(index) {
+  if (commentTimers.has(index)) save(index);
+}
+
+// Saves a topic's picks, one save after another so a later one is never overwritten.
+function save(index) {
+  clearTimeout(commentTimers.get(index));
+  commentTimers.delete(index);
+  saving++;
+  renderSaved();
+  const entry = topicPicks(index);
+  const body = { machine: DATA.machine, id: DATA.id, version, topic: index, picks: { pick: entry.pick, also: [...entry.also], comments: { ...entry.comments } } };
+  saveQueue = saveQueue.then(async () => {
+    const result = await postJson('/api/picks', body);
+    saving--;
+    saveError = result.error || '';
+    renderSaved();
+    if (!busy() && reloadWanted) {
+      reloadWanted = false;
+      reload();
+    }
+  });
+  return saveQueue;
+}
+
+async function drain() {
+  for (const index of [...commentTimers.keys()]) save(index);
+  await saveQueue;
+}
+
+// Submit (topic 16 A): the picks, Also send to the thread (on at first) and a note.
+function showSubmit() {
+  const box = $('submit');
+  const lines = design.topics.map((designTopic, index) => h('span', {}, h('b', { text: designTopic.title + ':' }), ' ', pickText(index) || 'not decided'));
+  const comments = commentCount();
+  if (comments) lines.push(h('span', { text: comments === 1 ? '1 comment' : comments + ' comments' }));
+  const send = h('input', { type: 'checkbox' });
+  send.checked = listing.has_thread;
+  const sendRow = listing.has_thread
+    ? h('label', {}, h('span', { class: 'sw' }, send, h('i')), h('span', { class: 'grow' }, 'Also send to ', h('b', { text: listing.thread_title || 'its thread' })))
+    : null;
+  const note = h('textarea', { placeholder: 'A note to go with it…' });
+  const error = h('div', { class: 'error', hidden: true });
+  const submit = h('button', { class: 'btn primary' }, icon('check', 13), 'Submit');
+  submit.onclick = async () => {
+    submit.disabled = true;
+    await drain();
+    const result = await postJson('/api/submit', { machine: DATA.machine, id: DATA.id, version, send: listing.has_thread && send.checked, note: note.value });
+    submit.disabled = false;
+    if (result.error) {
+      error.hidden = false;
+      error.textContent = result.error;
+      return;
+    }
+    hideSubmit();
+    await reload();
+  };
+  note.addEventListener('keydown', (event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) submit.click(); });
+  fill(box,
+    h('h4', { text: 'Submit ' + listing.artifact.title }),
+    h('div', { class: 'picks' }, lines),
+    sendRow,
+    note,
+    error,
+    h('div', { class: 'buttons' }, h('button', { class: 'btn', text: 'Cancel', onclick: hideSubmit }), submit));
+  box.hidden = false;
+  note.focus();
+}
+
+function hideSubmit() { $('submit').hidden = true; }
+
+// A variant up close (topic 12 A): its picture at full size, or its page running, with its
+// name under it; ← → go to the next variant and Esc closes.
+function openCloseUp(index, place, page) {
+  closeUp = { index, place, page };
+  renderCloseUp();
+}
+
+function renderCloseUp() {
+  const over = $('over');
+  if (!closeUp) { over.hidden = true; fill(over); return; }
+  const list = entries(closeUp.index);
+  const entry = list[closeUp.place];
+  const variant = entry.variant;
+  const phone = mode === 'phone';
+  const picture = phone ? variant.phone_picture : variant.picture;
+  const pageFile = phone ? variant.phone_page : variant.page;
+  const showPage = !!pageFile && (closeUp.page || !picture);
+  const stage = h('div', { class: 'stage' });
+  if (showPage) {
+    const width = phone ? 390 : Math.min(1280, window.innerWidth - 128);
+    const height = phone ? Math.min(844, window.innerHeight - 64) : window.innerHeight - 64;
+    stage.append(h('iframe', { sandbox: 'allow-scripts allow-forms allow-modals allow-popups', src: file(pageFile), style: { width: width + 'px', height: height + 'px' } }));
+  } else if (picture) {
+    stage.append(h('img', { src: file(picture), alt: variant.name }));
+  } else {
+    stage.append(h('div', { class: 'none' + (phone ? '' : ' desktop'), text: phone ? 'No phone version' : 'No desktop version' }));
+  }
+  const name = entry.today ? `${variant.name} (today’s)` : `${entry.letter}. ${variant.name}`;
+  const caption = h('div', { class: 'cap' }, h('span', { text: name + (list.length > 1 ? ' · ← → the other variants' : '') + ' · Esc closes' }));
+  if (picture && pageFile) {
+    caption.append(h('a', { text: showPage ? 'Show picture' : 'Open page', onclick: () => { closeUp.page = !showPage; renderCloseUp(); } }));
+  }
+  const children = [stage, caption];
+  if (list.length > 1) {
+    children.push(h('button', { class: 'arrow left', title: 'The one before', onclick: () => stepCloseUp(-1) }, icon('chev-left', 16)));
+    children.push(h('button', { class: 'arrow right', title: 'The next', onclick: () => stepCloseUp(1) }, icon('chev-right', 16)));
+  }
+  fill(over, ...children);
+  over.hidden = false;
+}
+
+function stepCloseUp(step) {
+  const count = entries(closeUp.index).length;
+  closeUp.place = (closeUp.place + step + count) % count;
+  renderCloseUp();
+}
+
+function closeCloseUp() {
+  closeUp = null;
+  renderCloseUp();
+}
+
+$('over').addEventListener('click', (event) => { if (event.target === $('over')) closeCloseUp(); });
+
+window.addEventListener('keydown', (event) => {
+  if (!design) return;
+  if (closeUp) {
+    if (event.key === 'Escape') closeCloseUp();
+    else if (event.key === 'ArrowLeft') stepCloseUp(-1);
+    else if (event.key === 'ArrowRight') stepCloseUp(1);
+    else return;
+    event.preventDefault();
+    return;
+  }
+  if (event.key === 'Escape' && !$('submit').hidden) { hideSubmit(); return; }
+  const typing = document.activeElement && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+  if (typing) {
+    if (event.key === 'Escape') document.activeElement.blur();
+    return;
+  }
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.key === 'ArrowLeft') goTopic(topic - 1);
+  else if (event.key === 'ArrowRight') goTopic(topic + 1);
+  else if (/^[1-9]$/.test(event.key) && topic < design.topics.length) {
+    const variants = design.topics[topic].variants;
+    const place = Number(event.key) - 1;
+    if (place >= variants.length) return;
+    pick(topic, variants[place].name);
+  } else return;
+  event.preventDefault();
+});
+
+function gone(text) {
+  document.body.replaceChildren(h('div', { class: 'message', text }));
+}
+
+async function reload() {
+  let reply;
+  try {
+    reply = await getJson('/api/design/' + encodeURIComponent(DATA.id), { machine: DATA.machine, v: version });
+  } catch (error) {
+    return gone(error.message || 'This design couldn’t be loaded.');
+  }
+  const before = { version, latest, design: JSON.stringify(design) };
+  listing = reply.listing;
+  latest = listing.artifact.versions.length;
+  version = reply.version;
+  design = reply.design;
+  picks = reply.picks || { topics: [] };
+  picks.topics = picks.topics || [];
+  design.topics.forEach((_, index) => topicPicks(index));
+  document.title = listing.artifact.title + ' · agentZ';
+  if (!mode) mode = hasDesktop() ? 'desktop' : 'phone';
+  if (topic > design.topics.length) topic = 0;
+  const earlier = $('earlier');
+  earlier.hidden = !readOnly();
+  fill(earlier, ...(readOnly() ? [earlierBar(listing.artifact, version, urlFor)] : []));
+  renderBar();
+  renderNav();
+  const redraw = before.version !== version || before.latest !== latest || before.design !== JSON.stringify(design);
+  if (redraw) renderPage();
+  else refresh();
+  if (before.latest && latest > before.latest && before.version === before.latest) showUpdate(latest, urlFor);
+}
+
+listenEvents((event) => {
+  if (event.type === 'theme') return;
+  if ((event.machine || null) !== (DATA.machine || null) || event.id !== DATA.id) return;
+  if (event.type === 'deleted') return gone('This design was deleted.');
+  if (busy()) reloadWanted = true;
+  else reload();
+});
+reload();
+</script>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Document · agentZ</title>
+<style>
+__SHARED_CSS__
+__VARS__
+body { display: flex; flex-direction: column; overflow: hidden; }
+#frame { flex: 1; width: 100%; min-height: 0; border: none; background: var(--background); }
+@media print { .bar, .versionbar, .updatebar { display: none !important; } }
+</style>
+</head>
+<body>
+<div class="bar" id="bar"></div>
+<div id="earlier" hidden></div>
+<iframe id="frame" sandbox="allow-scripts allow-downloads allow-modals allow-popups allow-popups-to-escape-sandbox"></iframe>
+<script>__DATA__</script>
+<script>__SHARED_JS__</script>
+<script>
+// A document's page (topic 8 A): the bar has the version menu, where it came from, and
+// Export; the document itself runs in a sandboxed frame, served with the artifact's key.
+let listing = null;
+let version = DATA.version;
+const urlFor = (v) => artifactUrl(DATA.machine, DATA.id, v);
+const base = artifactBase(DATA.machine, DATA.id);
+const contentUrl = (v, key, print) => base + '/content/' + v + query({ key, print: print ? 1 : null });
+const rawUrl = (v) => base + '/raw/' + v + query({ t: DATA.token });
+
+function flash(text) {
+  const element = $('flash');
+  if (!element) return;
+  element.textContent = text;
+  setTimeout(() => { if (element.textContent === text) element.textContent = ''; }, 2000);
+}
+
+function fileName(title, v) {
+  return title.replace(/[^\w.-]+/g, ' ').trim().replace(/\s+/g, '-') + '-v' + v + '.md';
+}
+
+function render() {
+  const artifact = listing.artifact;
+  const latest = artifact.versions.length;
+  if (!version || version > latest) version = latest;
+  document.title = artifact.title + ' · agentZ';
+  const files = (artifact.versions[version - 1] || {}).files || [];
+  let filesButton = null;
+  if (files.length) {
+    filesButton = h('button', { class: 'btn' }, icon('download', 13), 'Files ' + files.length);
+    filesButton.onclick = () => menu(files.map((file) => ({
+      label: file.name,
+      when: file.bytes < 1048576 ? Math.max(1, Math.round(file.bytes / 1024)) + ' KB' : (file.bytes / 1048576).toFixed(1) + ' MB',
+      href: fileUrl(DATA.machine, DATA.id, version, file.name, artifact.frame_key),
+      download: file.name,
+    })), filesButton, { align: 'right' });
+  }
+  const exportButton = h('button', { class: 'btn' }, icon('download', 13), 'Export');
+  exportButton.onclick = () => menu([
+    { label: 'Save as Markdown', href: rawUrl(version), download: fileName(artifact.title, version) },
+    { label: 'Print or Save as PDF…', click: () => window.open(contentUrl(version, artifact.frame_key, true), '_blank') },
+    { label: 'Copy Source', click: async () => {
+      try {
+        const text = await (await fetch(rawUrl(version))).text();
+        await navigator.clipboard.writeText(text);
+        flash('Copied');
+      } catch (_) { flash('Couldn’t copy'); }
+    } },
+  ], exportButton, { align: 'right' });
+  fill($('bar'),
+    h('a', { class: 'iconbtn', href: homeUrl(), title: 'Artifacts' }, icon('home', 15)),
+    h('span', { class: 'slash', text: '/' }),
+    h('span', { class: 'title', text: artifact.title }),
+    versionTag(artifact, version, urlFor),
+    whereLine(listing, DATA.machine),
+    h('span', { class: 'grow' }),
+    h('span', { class: 'flash', id: 'flash' }),
+    filesButton,
+    exportButton,
+  );
+  const earlier = $('earlier');
+  earlier.hidden = version === latest;
+  fill(earlier, ...(version === latest ? [] : [earlierBar(artifact, version, urlFor)]));
+  const src = contentUrl(version, artifact.frame_key, false);
+  if ($('frame').getAttribute('src') !== src) $('frame').src = src;
+}
+
+function gone(text) {
+  document.body.replaceChildren(h('div', { class: 'message', text }));
+}
+
+async function load() {
+  try {
+    listing = await getJson('/api/artifact/' + encodeURIComponent(DATA.id), { machine: DATA.machine });
+  } catch (error) {
+    return gone(error.message || 'This document couldn’t be loaded.');
+  }
+  render();
+}
+
+listenEvents(async (event) => {
+  if (event.type === 'theme') {
+    const frame = $('frame');
+    if (frame && frame.contentWindow) frame.contentWindow.postMessage({ agentzTheme: { dark: event.dark, variables: event.variables } }, '*');
+    return;
+  }
+  if ((event.machine || null) !== (DATA.machine || null) || event.id !== DATA.id) return;
+  if (event.type === 'deleted') return gone('This document was deleted.');
+  const before = listing ? listing.artifact.versions.length : 0;
+  const wasLatest = version === before;
+  await load();
+  const now = listing ? listing.artifact.versions.length : 0;
+  if (now > before && wasLatest) {
+    version = before;
+    render();
+    showUpdate(now, urlFor);
+  }
+});
+load();
+</script>
+</body>
+</html>
