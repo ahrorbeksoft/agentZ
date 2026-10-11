@@ -118,9 +118,12 @@ so an open tool call's output raced the conversation.
   `~/.local/agentz.app` as Zed's script puts Zed: `agentz` linked from `~/.local/bin`, and its
   desktop entry in `~/.local/share/applications` pointing there.
 - **Website** (`site/`, `.github/workflows/pages.yml`): the landing page on GitHub Pages,
-  published when `site/` changes. Its screenshots show demo data only: custom agents running the
-  mock agent under real agents' names, with `MOCK_SCRIPTS` giving their scripted turns
-  real-looking prompts, taken as in Testing in `AGENTS.md`.
+  published when `site/` changes: the hero with the agents' icons from the ACP Registry
+  (`site/images/agents/`), then a section per feature, each with a window and a detail cut out
+  of one (`site/images/`). Its screenshots show demo data only: custom agents running the mock
+  agent under real agents' names with scripted, real-looking turns, rendered as in Testing in
+  `AGENTS.md`, with macOS's traffic lights and rounded corners drawn on afterwards.
+  `site/screenshot-threads.png` is the README's picture and the page's preview image.
 
 ### Data
 

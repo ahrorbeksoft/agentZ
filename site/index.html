@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agentZ: all your coding agents, in one Mac app</title>
-<meta name="description" content="A native macOS app for coding agents over the Agent Client Protocol: run Claude, Codex, Gemini CLI, OpenCode and any ACP agent side by side, across your projects and machines, with real terminals.">
+<title>agentZ: every coding agent, every account, every machine</title>
+<meta name="description" content="A native app for macOS and Linux for coding agents over the Agent Client Protocol: run Claude Agent, Codex, Factory Droid, Gemini CLI, OpenCode and any ACP agent side by side, across your projects and machines, with several accounts each and real terminals beside them.">
 <meta property="og:title" content="agentZ">
-<meta property="og:description" content="All your coding agents, in one Mac app.">
+<meta property="og:description" content="Every coding agent, every account, every machine.">
 <meta property="og:image" content="https://ahrorbeksoft.github.io/agentZ/screenshot-threads.png">
 <meta name="theme-color" content="#09090b">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
@@ -33,6 +33,7 @@
     -webkit-font-smoothing: antialiased;
   }
   a { color: inherit; }
+  code { font: 0.92em var(--mono); }
 
   nav {
     position: relative;
@@ -51,7 +52,8 @@
   nav .links a { color: var(--muted); text-decoration: none; }
   nav .links a:hover { color: var(--text); }
 
-  main { position: relative; padding: 0 24px; }
+  /* The details float past their windows' edges; clip them rather than scroll sideways. */
+  main { position: relative; padding: 0 24px; overflow-x: clip; }
   /* t3code's hero grid: faint lines that fade out toward the edges. */
   .grid {
     position: absolute;
@@ -66,7 +68,7 @@
     -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 30%, black 35%, transparent 100%);
   }
 
-  .hero { position: relative; max-width: 760px; margin: 0 auto; padding: 88px 0 64px; text-align: center; }
+  .hero { position: relative; max-width: 780px; margin: 0 auto; padding: 80px 0 40px; text-align: center; }
   h1 {
     margin: 0 0 20px;
     font-size: clamp(40px, 6.4vw, 72px);
@@ -76,7 +78,7 @@
     text-wrap: balance;
   }
   .lead {
-    max-width: 600px;
+    max-width: 640px;
     margin: 0 auto 40px;
     color: var(--muted);
     font-size: clamp(16px, 1.5vw, 19px);
@@ -118,17 +120,131 @@
   .note { margin: 14px 0 0; color: var(--faint); font-size: 14px; }
   .note span { white-space: nowrap; }
 
-  .shots { display: grid; gap: 56px; max-width: 1180px; margin: 0 auto; }
-  figure { margin: 0; }
-  figure img {
+  .agents { position: relative; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; max-width: 980px; margin: 0 auto; padding: 0; list-style: none; }
+  .agents li {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px 6px 10px;
+    background: rgba(19, 19, 22, 0.7);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 13.5px;
+  }
+  .agents li::before {
+    content: "";
+    flex: none;
+    width: 15px;
+    height: 15px;
+    background: var(--text);
+    -webkit-mask: var(--icon) center / contain no-repeat;
+    mask: var(--icon) center / contain no-repeat;
+  }
+  .agents li.more { border-style: dashed; color: var(--faint); }
+  .agents li.more::before { content: none; }
+
+  .hero-shot { position: relative; max-width: 1180px; margin: 56px auto 0; }
+  /* The status colors of the app's threads, blurred behind the window. */
+  .glow {
+    position: absolute;
+    inset: 8% 6% auto;
+    z-index: -1;
+    height: 70%;
+    pointer-events: none;
+    background:
+      radial-gradient(ellipse at 50% 40%, rgba(91, 156, 255, 0.16), transparent 60%),
+      radial-gradient(ellipse at 20% 70%, rgba(180, 140, 242, 0.12), transparent 55%),
+      radial-gradient(ellipse at 80% 70%, rgba(95, 191, 106, 0.1), transparent 55%);
+    filter: blur(30px);
+  }
+
+  /* The shots carry the window's rounded corners and traffic lights; these follow them. */
+  .window {
     display: block;
     width: 100%;
     height: auto;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    box-shadow: 0 28px 64px -28px rgba(0, 0, 0, 0.8);
+    border-radius: 1.37% / 2.2%;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09), 0 40px 100px -40px rgba(0, 0, 0, 0.95);
   }
-  figcaption { margin-top: 16px; color: var(--faint); font-size: 14px; text-align: center; }
+  .detail {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: #26282b;
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.9);
+  }
+  .browser {
+    overflow: hidden;
+    background: #1c1c20;
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    box-shadow: 0 40px 100px -40px rgba(0, 0, 0, 0.95);
+  }
+  .browser .bar { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px; border-bottom: 1px solid var(--border); }
+  .browser .bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a3a40; }
+  .browser .bar span { margin: 0 auto; padding: 2px 14px; border-radius: 6px; background: #26262b; color: var(--faint); font: 12px var(--mono); }
+  .browser img { display: block; width: 100%; height: auto; }
+
+  .section { max-width: 1180px; margin: 160px auto 0; }
+  .section-title { max-width: 760px; margin: 0 auto 56px; text-align: center; }
+  .section-title p { margin: 0; color: var(--muted); font-size: 18px; }
+  h2 {
+    margin: 0 0 16px;
+    font-size: clamp(30px, 3.4vw, 42px);
+    font-weight: 600;
+    line-height: 1.1;
+    letter-spacing: -0.03em;
+    text-wrap: balance;
+  }
+  .section-title h2 { font-size: clamp(34px, 4vw, 52px); }
+  .eyebrow { display: inline-flex; align-items: center; gap: 8px; margin: 0 0 14px; color: var(--muted); font-size: 13px; line-height: 1; letter-spacing: 0.01em; }
+  .eyebrow::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--color); }
+  .body { margin: 0; color: var(--muted); font-size: 17px; line-height: 1.6; text-wrap: pretty; }
+  .points { display: grid; gap: 10px; margin: 22px 0 0; padding: 0; list-style: none; }
+  .points li { position: relative; padding-left: 24px; color: var(--muted); font-size: 15px; line-height: 1.5; }
+  .points li::before {
+    content: "";
+    position: absolute;
+    top: 0.42em;
+    left: 2px;
+    width: 9px;
+    height: 5px;
+    border-bottom: 1.5px solid var(--faint);
+    border-left: 1.5px solid var(--faint);
+    transform: rotate(-45deg);
+  }
+
+  .tour { display: grid; gap: 150px; }
+  .tour .row { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 64px; align-items: center; }
+  .tour .row.flip { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+  .tour .row.flip .text { order: 2; }
+  .tour .visual { position: relative; }
+  .tour .pop { position: absolute; bottom: -12%; width: 58%; }
+  .tour .row .pop { left: -10%; }
+  .tour .row.flip .pop { right: -10%; left: auto; }
+  .tour .wide .text { max-width: 720px; margin: 0 auto 48px; text-align: center; }
+  .tour .wide .points { grid-template-columns: repeat(3, auto); justify-content: center; gap: 10px 28px; text-align: left; }
+
+  .tools { overflow: hidden; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; box-shadow: 0 30px 80px -40px rgba(0, 0, 0, 0.9); }
+  .tools .head { display: flex; justify-content: space-between; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  .tools .head b { color: var(--text); font-weight: 600; }
+  .tools .tool { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 16px; padding: 11px 18px; border-bottom: 1px solid var(--border); font-size: 14px; }
+  .tools .tool code { color: #c9a7ff; font-size: 13px; }
+  .tools .tool span { color: var(--muted); }
+  .tools pre { margin: 0; padding: 14px 18px; overflow-x: auto; background: #0d0d10; color: var(--muted); font: 12.5px/1.6 var(--mono); }
+  .tools pre b { color: var(--text); font-weight: 500; }
+
+  .extras { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; background: var(--border); border: 1px solid var(--border); border-radius: 16px; }
+  .extras div { padding: 26px 28px; background: var(--background); }
+  .extras h3 { margin: 0 0 6px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+  .extras p { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.55; }
+
+  .cta { max-width: 760px; margin: 140px auto 0; text-align: center; }
+  .cta h2 { font-size: clamp(32px, 3.6vw, 46px); }
+  .cta .body { margin-bottom: 32px; }
 
   footer {
     display: flex;
@@ -136,7 +252,7 @@
     justify-content: space-between;
     gap: 8px 24px;
     max-width: 1180px;
-    margin: 96px auto 0;
+    margin: 112px auto 0;
     padding: 24px 24px 48px;
     border-top: 1px solid var(--border);
     color: var(--faint);
@@ -145,10 +261,26 @@
   footer a { text-decoration: none; }
   footer a:hover { color: var(--text); }
 
+  @media (max-width: 1320px) {
+    .tour .row .pop { left: -4%; }
+    .tour .row.flip .pop { right: -4%; }
+  }
+  @media (max-width: 900px) {
+    .section { margin-top: 112px; }
+    .tour { gap: 112px; }
+    .tour .row, .tour .row.flip { grid-template-columns: minmax(0, 1fr); gap: 32px; }
+    .tour .row.flip .text { order: 0; }
+    .tour .pop, .tour .row .pop, .tour .row.flip .pop { position: relative; inset: auto; width: 82%; margin: -14% 0 0 auto; }
+    .tour .wide .points { grid-template-columns: minmax(0, 1fr); justify-content: start; }
+    .extras { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
   @media (max-width: 600px) {
-    .hero { padding: 48px 0 48px; }
+    nav .links { gap: 16px; }
+    nav .links .optional { display: none; }
+    .hero { padding: 48px 0 32px; }
     .install code { font-size: 13.5px; }
-    .shots { gap: 40px; }
+    .tools .tool { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+    .extras { grid-template-columns: minmax(0, 1fr); }
   }
 </style>
 </head>
@@ -156,6 +288,8 @@
 <nav>
   <a class="brand" href="./"><img src="icon.svg" alt="">agentZ</a>
   <div class="links">
+    <a class="optional" href="#features">Features</a>
+    <a class="optional" href="#install">Install</a>
     <a href="https://github.com/ahrorbeksoft/agentZ/releases/latest">Releases</a>
     <a href="https://github.com/ahrorbeksoft/agentZ">GitHub</a>
   </div>
@@ -164,28 +298,267 @@
 <main>
   <div class="grid" aria-hidden="true"></div>
   <section class="hero">
-    <h1>All your coding agents, in one Mac app.</h1>
-    <p class="lead">Run Claude, Codex, Gemini CLI, OpenCode and any other
-      <a href="https://agentclientprotocol.com">ACP</a> agent side by side, across your projects,
-      your Mac and your Linux servers, with real terminals next to them.</p>
+    <h1>Every coding agent, every account, every machine.</h1>
+    <p class="lead">Run Claude Agent, Codex, Factory Droid, Gemini CLI, OpenCode and any other
+      <a href="https://agentclientprotocol.com">ACP</a> agent side by side, across your projects
+      and machines, with several accounts each and real terminals beside them.</p>
     <div class="install">
-      <code id="command">curl -fsSL https://<wbr>ahrorbeksoft.github.io/<wbr>agentZ/<wbr>install.sh | sh</code>
-      <button type="button" id="copy">Copy</button>
+      <code>curl -fsSL https://<wbr>ahrorbeksoft.github.io/<wbr>agentZ/<wbr>install.sh | sh</code>
+      <button type="button">Copy</button>
     </div>
     <p class="note"><span>macOS: installs agentZ.app</span> · <span>Linux desktop: installs the app in ~/.local</span></p>
   </section>
 
-  <div class="shots">
-    <figure>
-      <img src="screenshot-threads.png" width="2624" height="1640"
-        alt="agentZ: threads from several projects and machines in the sidebar, agents working and waiting for input">
-    </figure>
-    <figure>
-      <img src="screenshot-workspaces.png" width="2624" height="1640" loading="lazy"
-        alt="agentZ's Workspaces view: agents, agent CLIs and terminals in split panes">
-      <figcaption>Workspaces: agents, agent CLIs and terminals in split panes, one space per project.</figcaption>
-    </figure>
+  <ul class="agents" aria-label="Agents">
+    <li style="--icon: url(images/agents/claude-acp.svg)">Claude Agent</li>
+    <li style="--icon: url(images/agents/codex-acp.svg)">Codex</li>
+    <li style="--icon: url(images/agents/factory-droid.svg)">Factory Droid</li>
+    <li style="--icon: url(images/agents/gemini.svg)">Gemini CLI</li>
+    <li style="--icon: url(images/agents/github-copilot-cli.svg)">Copilot</li>
+    <li style="--icon: url(images/agents/cursor.svg)">Cursor</li>
+    <li style="--icon: url(images/agents/devin.svg)">Devin</li>
+    <li style="--icon: url(images/agents/opencode.svg)">OpenCode</li>
+    <li style="--icon: url(images/agents/amp-acp.svg)">Amp</li>
+    <li style="--icon: url(images/agents/grok-build.svg)">Grok Build</li>
+    <li style="--icon: url(images/agents/antigravity-acp.svg)">Antigravity</li>
+    <li style="--icon: url(images/agents/qwen-code.svg)">Qwen Code</li>
+    <li style="--icon: url(images/agents/goose.svg)">goose</li>
+    <li style="--icon: url(images/agents/kimi.svg)">Kimi CLI</li>
+    <li style="--icon: url(images/agents/junie.svg)">Junie</li>
+    <li style="--icon: url(images/agents/cline.svg)">Cline</li>
+    <li class="more">and any ACP agent</li>
+  </ul>
+
+  <div class="hero-shot">
+    <div class="glow"></div>
+    <img class="window" src="images/threads.webp" width="2624" height="1640"
+      alt="agentZ: threads from several projects and machines in the sidebar, agents working and waiting for input">
   </div>
+
+  <section class="section" id="features">
+    <div class="section-title">
+      <h2>What it does</h2>
+      <p>Everything in agentZ, a section at a time.</p>
+    </div>
+    <div class="tour">
+      <div class="row">
+        <div class="text">
+          <p class="eyebrow" style="--color: #5b9cff">Projects and threads</p>
+          <h2>Every project and every thread, in one sidebar</h2>
+          <p class="body">Threads from all your projects and machines in one list, with their agent,
+            branch, machine and state: working, waiting for approval, waiting for your answer, or
+            done. Each thread works in the project's folder, in a new git worktree, or in a pasture:
+            an instant copy-on-write copy of the project.</p>
+          <ul class="points">
+            <li>Diffs by turn, from checkpoints that never touch your branches</li>
+            <li>Pin, reorder, archive and search; titles written for you</li>
+            <li>Chats, for questions outside any project</li>
+          </ul>
+        </div>
+        <div class="visual">
+          <img class="window" src="images/thread-working.webp" width="2624" height="1640" loading="lazy"
+            alt="A thread at work, with threads from several projects in the sidebar">
+        </div>
+      </div>
+
+      <div class="row flip">
+        <div class="text">
+          <p class="eyebrow" style="--color: #b48cf2">Agents</p>
+          <h2>Any ACP agent, and everything it does</h2>
+          <p class="body">Install Claude Agent, Codex, Factory Droid, Gemini CLI, Copilot, Cursor,
+            Devin, OpenCode, Amp and 30 more from the ACP Registry, or add your own command. A
+            thread shows the agent's whole turn: its messages, tool calls with their output, edits
+            as diffs, its plan, and the permissions and answers it asks you for.</p>
+          <ul class="points">
+            <li>Mention files, threads and artifacts with @, and paste images</li>
+            <li>Queue messages while it works, or steer the turn</li>
+            <li>Subagents run as subthreads you can open and stop</li>
+            <li>Import an agent's own past sessions</li>
+          </ul>
+        </div>
+        <div class="visual">
+          <img class="window" src="images/question.webp" width="2624" height="1640" loading="lazy"
+            alt="An agent asking a question in the thread, with choices to pick">
+          <div class="pop">
+            <img class="detail" src="images/detail-approval.webp" width="1650" height="480" loading="lazy"
+              alt="An agent asking permission to run a command">
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="text">
+          <p class="eyebrow" style="--color: #5fbf6a">Accounts and usage</p>
+          <h2>Several accounts each, and what's left on them</h2>
+          <p class="body">Add more logins to Claude Agent, Codex, Factory Droid, Devin, Grok Build,
+            Antigravity and Qoder CLI. Each account runs as its own process, so threads on different
+            accounts work in parallel. agentZ reads each account's plan and limits, and colors the
+            bars by pace, so you see whether a limit runs out before it resets.</p>
+          <ul class="points">
+            <li>Pick the account for each thread; its color marks the thread</li>
+            <li>At a used-up limit, continue on the account with the most left</li>
+            <li>Or let agentZ continue the thread when the limit resets, even with the app closed</li>
+          </ul>
+        </div>
+        <div class="visual">
+          <img class="window" src="images/usage.webp" width="2624" height="1640" loading="lazy"
+            alt="Settings, Usage: every account's limits, with bars colored by pace">
+          <div class="pop">
+            <img class="detail" src="images/detail-accounts.webp" width="1380" height="810" loading="lazy"
+              alt="Claude Agent's three accounts with their session and weekly usage">
+          </div>
+        </div>
+      </div>
+
+      <div class="row flip">
+        <div class="text">
+          <p class="eyebrow" style="--color: #f08a4b">Continue in another agent</p>
+          <h2>Hand a thread to another agent</h2>
+          <p class="body">Continue with Another Agent starts a thread with another agent, or another
+            account of the same one, in the same checkout, and gives it the conversation so far:
+            your messages, its replies, the tools it used and its plan. You see exactly what goes
+            before you send it, and the two threads link to each other.</p>
+          <ul class="points">
+            <li>The same checkout, so the work goes on where it stopped</li>
+            <li>Preview what the next agent gets</li>
+            <li>Continue on another account of the same agent at a limit</li>
+          </ul>
+        </div>
+        <div class="visual">
+          <img class="window" src="images/continue.webp" width="2624" height="1640" loading="lazy"
+            alt="A thread's menu: Continue with Another Agent, listing agents and their accounts">
+          <div class="pop">
+            <img class="detail" src="images/detail-handoff.webp" width="1400" height="510" loading="lazy"
+              alt="The new thread's composer, with the conversation it continues attached">
+          </div>
+        </div>
+      </div>
+
+      <div class="wide">
+        <div class="text">
+          <p class="eyebrow" style="--color: #4fc1c9">Workspaces and terminals</p>
+          <h2>Terminals and agent CLIs, in split panes</h2>
+          <p class="body">The Workspaces view holds shells, agent CLIs and agent threads in tabs of
+            split panes, a workspace for each folder. agentZ sees when Claude Code, Codex, Droid,
+            OpenCode or Gemini CLI is working, done or waiting for you, and tells you.</p>
+          <ul class="points">
+            <li>Save a tab's layout with its commands, and open it in any workspace</li>
+            <li>Worktrees group under their repository</li>
+            <li>Real terminals with scrollback, find and the mouse, in threads too</li>
+          </ul>
+        </div>
+        <img class="window" src="images/workspaces.webp" width="2624" height="1640" loading="lazy"
+          alt="The Workspaces view: Claude Code, Codex and a dev server in split panes">
+      </div>
+
+      <div class="row">
+        <div class="text">
+          <p class="eyebrow" style="--color: #e5b94e">Machines</p>
+          <h2>Your servers, beside your Mac</h2>
+          <p class="body">Add a Mac or a Linux machine over SSH, and agentZ installs its server there
+            and keeps it updated. Its projects, threads, terminals and workspaces show beside this
+            computer's. Each machine's server owns its agents, so quitting the app or losing the
+            connection doesn't stop them.</p>
+          <ul class="points">
+            <li>One repository on several machines is one project</li>
+            <li>New Thread shows how each copy stands in git</li>
+            <li>Agents delegate tasks to another machine's copy</li>
+          </ul>
+        </div>
+        <div class="visual">
+          <img class="window" src="images/projects.webp" width="2624" height="1640" loading="lazy"
+            alt="The projects menu: a project on several machines, this Mac's projects and a server's">
+          <div class="pop">
+            <img class="detail" src="images/detail-machines.webp" width="1380" height="580" loading="lazy"
+              alt="Settings, Machines: this Mac and two machines over SSH, connected">
+          </div>
+        </div>
+      </div>
+
+      <div class="row flip">
+        <div class="text">
+          <p class="eyebrow" style="--color: #f06ba8">Artifacts and designs</p>
+          <h2>Documents and designs, in your browser</h2>
+          <p class="body">Agents publish documents and designs from any thread, and agentZ opens them
+            in your browser, in the app's theme. A document is Markdown with files, exported to
+            Markdown or PDF. A design is a few variants of each decision beside what's there today:
+            pick one, take parts of others, comment, and the agent reads your picks.</p>
+          <ul class="points">
+            <li>Each publish is a new version</li>
+            <li>The Artifacts button lists them by thread</li>
+            <li>@ mentions them in any thread</li>
+          </ul>
+        </div>
+        <div class="visual">
+          <div class="browser">
+            <div class="bar"><i></i><i></i><i></i><span>127.0.0.1:52597/a/03bdf351</span></div>
+            <img src="images/design.webp" width="2624" height="1640" loading="lazy"
+              alt="A design in the browser: variants to pick from, beside today's">
+          </div>
+          <div class="pop">
+            <img class="detail" src="images/detail-design-card.webp" width="1690" height="710" loading="lazy"
+              alt="The design's card in the thread that published it">
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="text">
+          <p class="eyebrow" style="--color: #a1a1aa">Agent control</p>
+          <h2>Agents that run other agents</h2>
+          <p class="body">Every agent gets agentZ's own MCP server, and scripts and agent CLIs get the
+            <code>agentz-server call</code> command. With them an agent reads other threads, starts
+            threads and sends them messages, delegates tasks to subthreads on this machine or
+            another, opens terminals and runs commands, never with more permission than the thread
+            that calls it.</p>
+          <ul class="points">
+            <li>Delegate a task to another agent, here or on another machine</li>
+            <li>Read and message other threads</li>
+            <li>Publish documents and designs</li>
+          </ul>
+        </div>
+        <div class="visual">
+          <div class="tools">
+            <div class="head"><b>agentz</b><span>MCP server · every agent, every account</span></div>
+            <div class="tool"><code>agentz_thread_launch</code><span>Start a thread with any agent, in any project</span></div>
+            <div class="tool"><code>agentz_thread_send</code><span>Send a thread a message</span></div>
+            <div class="tool"><code>agentz_thread_read</code><span>Read another thread's conversation</span></div>
+            <div class="tool"><code>delegate_task</code><span>Hand a task to a subthread, here or on another machine</span></div>
+            <div class="tool"><code>agentz_terminal_start</code><span>Open a terminal and send it keys</span></div>
+            <div class="tool"><code>agentz_command_run</code><span>Run a command and wait for its output</span></div>
+            <div class="tool"><code>agentz_project_add</code><span>Add a project</span></div>
+            <div class="tool"><code>agentz_design_publish</code><span>Publish a design to pick from</span></div>
+            <pre><b>$ agentz-server call delegate_task</b> '{
+    "machine": "gpu-box", "agentId": "codex-acp",
+    "task": "Retrain the ranker on last week’s clicks and report the eval."
+  }'</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-title" style="margin-bottom: 40px"><h2>And the rest</h2></div>
+    <div class="extras">
+      <div><h3>Skills and MCP servers</h3><p>Added once in Settings, they reach every agent and account.</p></div>
+      <div><h3>Notifications</h3><p>A sound and a notification when a thread finishes or waits for you.</p></div>
+      <div><h3>Storage</h3><p>What agentZ keeps on each machine, and a way to delete what you pick.</p></div>
+      <div><h3>The keyboard</h3><p>The command palette, Go To for every thread and pane, and a shortcuts sheet.</p></div>
+      <div><h3>Zed's themes</h3><p>One, Ayu, Gruvbox, JetBrains and Catppuccin, light and dark.</p></div>
+      <div><h3>Free and open source</h3><p>GPL-3.0, native, and built on Zed's GPUI.</p></div>
+    </div>
+  </section>
+
+  <section class="cta" id="install">
+    <h2>Install agentZ</h2>
+    <p class="body">Free and open source. One command installs it, and runs again to update.</p>
+    <div class="install">
+      <code>curl -fsSL https://<wbr>ahrorbeksoft.github.io/<wbr>agentZ/<wbr>install.sh | sh</code>
+      <button type="button">Copy</button>
+    </div>
+    <p class="note"><span>macOS: installs agentZ.app</span> · <span>Linux desktop: installs the app in ~/.local</span></p>
+  </section>
 </main>
 
 <footer>
@@ -193,18 +566,19 @@
   <a href="https://github.com/ahrorbeksoft/agentZ">github.com/ahrorbeksoft/agentZ</a>
 </footer>
 <script>
-  const button = document.getElementById("copy");
-  const command = document.getElementById("command");
-  button.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(command.textContent);
-      button.textContent = "Copied";
-      setTimeout(() => (button.textContent = "Copy"), 1500);
-    } catch {
-      // Without clipboard access, select the command so it can be copied by hand.
-      window.getSelection().selectAllChildren(command);
-    }
-  });
+  for (const button of document.querySelectorAll(".install button")) {
+    const command = button.previousElementSibling;
+    button.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(command.textContent);
+        button.textContent = "Copied";
+        setTimeout(() => (button.textContent = "Copy"), 1500);
+      } catch {
+        // Without clipboard access, select the command so it can be copied by hand.
+        window.getSelection().selectAllChildren(command);
+      }
+    });
+  }
 </script>
 </body>
 </html>
