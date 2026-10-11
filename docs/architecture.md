@@ -1387,6 +1387,14 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   `agentz://artifact/<id>/<version>`): what it is ("a design (1 topic, 5 variants, v1, 1 of 1
   decided)"), where it's from, its machine when it's not the thread's, and the
   `agentz_artifact_read` call that reads it.
+- **Design defaults** (`AppSettings::{design_defaults, project_design_defaults}`,
+  `SettingsPage::{render_design_default_rows, render_project_design_defaults}`,
+  `Machines::sync_design_defaults`; `design/artifacts-2` topic 21 B): Settings › General ›
+  Artifacts has Variants (a stepper, 3 at first), Include today's, Sizes (Desktop · Phone ·
+  Both) and Variants as (Pictures · Live pages · Both). Each project's page has Design
+  defaults: "Use General's" (on at first, saying General's in a line); off, the same four rows
+  for that project, kept by its combined project's key. Every server gets General's and its
+  own copies' (`Request::SetDesignDefaults`) as they change and as it connects.
 - **Opening on publish** (`Shell::open_published_artifact`, Settings › General › Artifacts ›
   "Open in the browser", `ArtifactAutoOpen`): when its thread is on screen (the default), on an
   artifact's first publish, or never. Only a publish the app hears while connected counts

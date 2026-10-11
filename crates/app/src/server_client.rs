@@ -11,7 +11,9 @@ use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
 use agentz_protocol::accounts::{AccountId, AgentAccount, AgentAccounts};
 use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
-use agentz_protocol::artifacts::{Artifact, ArtifactId, ArtifactRequest, Artifacts, PageTheme};
+use agentz_protocol::artifacts::{
+    Artifact, ArtifactId, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
+};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
@@ -147,6 +149,8 @@ pub struct ServerClient {
     retry_now: Option<oneshot::Sender<()>>,
     /// What the server was last told of the other machines, this connection.
     peers_sent: Option<Peers>,
+    /// The design defaults the server was last given, this connection.
+    design_settings_sent: Option<DesignSettings>,
     #[cfg(test)]
     sent_for_test: std::cell::RefCell<Vec<Request>>,
     /// Answers requests as the server would, for a test client.
@@ -194,6 +198,7 @@ impl ServerClient {
                 upload_progress: None,
                 retry_now: None,
                 peers_sent: None,
+                design_settings_sent: None,
                 #[cfg(test)]
                 sent_for_test: Default::default(),
                 #[cfg(test)]
@@ -377,6 +382,15 @@ impl ServerClient {
         }
         self.send(Request::SetPeers(peers.clone()), cx);
         self.peers_sent = Some(peers);
+    }
+
+    /// Gives the server the design defaults for its agents' design tool, when they've changed.
+    pub(crate) fn set_design_settings(&mut self, settings: DesignSettings, cx: &App) {
+        if !self.is_online() || self.design_settings_sent.as_ref() == Some(&settings) {
+            return;
+        }
+        self.send(Request::SetDesignDefaults(settings.clone()), cx);
+        self.design_settings_sent = Some(settings);
     }
 
     /// The server was told of this checkout, so its agents may work there. Without one, the
@@ -795,6 +809,7 @@ impl ServerClient {
         );
         self.connection = Some(connection);
         self.peers_sent = None;
+        self.design_settings_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
         self.upload_progress = None;

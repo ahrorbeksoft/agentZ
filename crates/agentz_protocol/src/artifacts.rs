@@ -456,12 +456,20 @@ pub enum DesignSizes {
     Both,
 }
 
+impl DesignSizes {
+    pub const ALL: [Self; 3] = [Self::Desktop, Self::Phone, Self::Both];
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VariantsAs {
     Pictures,
     LivePages,
     Both,
+}
+
+impl VariantsAs {
+    pub const ALL: [Self; 3] = [Self::Pictures, Self::LivePages, Self::Both];
 }
 
 /// A machine's artifacts, newest publish first, and where its server serves pages.

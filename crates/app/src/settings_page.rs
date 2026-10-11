@@ -25,6 +25,7 @@ use agentz_protocol::agents::{
     AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
     InstallState,
 };
+use agentz_protocol::artifacts::{DesignDefaults, DesignSizes, VariantsAs};
 use agentz_protocol::title_generation::{TitleGeneration, TitleProvider, effort_label};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use agentz_protocol::{CAPABILITY_IMPORT_SESSIONS, Request, Response};
@@ -1072,9 +1073,13 @@ impl SettingsPage {
                 cx,
             ),
             render_section("Chats", vec![self.render_chats_row(cx)], cx),
-            render_section(
+            render_section_with_note(
                 "Artifacts",
-                vec![self.render_artifact_auto_open_row(window, cx)],
+                std::iter::once(self.render_artifact_auto_open_row(window, cx))
+                    .chain(self.render_design_default_rows(None, cx))
+                    .collect(),
+                "Given to agents as defaults for their designs; they may change them for a \
+                 project.",
                 cx,
             ),
             render_section(
@@ -1184,6 +1189,175 @@ impl SettingsPage {
                 .into_any_element(),
             cx,
         )
+    }
+
+    /// The design defaults' rows (`design/artifacts-2`, topic 21): General's, or with `project`
+    /// a project's own.
+    fn render_design_default_rows(
+        &self,
+        project: Option<GroupKey>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let settings = self.app_settings.read(cx).settings();
+        let defaults = project
+            .as_ref()
+            .and_then(|key| settings.project_design_defaults.get(key).copied())
+            .unwrap_or(settings.design_defaults);
+        let prefix = if project.is_some() {
+            "project-design"
+        } else {
+            "design"
+        };
+        let change = |change: Rc<dyn Fn(&mut DesignDefaults)>| {
+            let app_settings = self.app_settings.clone();
+            let project = project.clone();
+            move |cx: &mut App| {
+                app_settings.update(cx, |store, cx| {
+                    store.update(
+                        |settings| {
+                            let general = settings.design_defaults;
+                            let defaults = match &project {
+                                Some(key) => settings
+                                    .project_design_defaults
+                                    .entry(key.clone())
+                                    .or_insert(general),
+                                None => &mut settings.design_defaults,
+                            };
+                            change(defaults);
+                        },
+                        cx,
+                    )
+                })
+            }
+        };
+        let colors = cx.theme().colors().clone();
+        let fewer = change(Rc::new(|defaults| {
+            defaults.variants = defaults
+                .variants
+                .saturating_sub(1)
+                .max(DesignDefaults::MIN_VARIANTS)
+        }));
+        let more = change(Rc::new(|defaults| {
+            defaults.variants = (defaults.variants + 1).min(DesignDefaults::MAX_VARIANTS)
+        }));
+        let stepper = h_flex()
+            .debug_selector(move || format!("{prefix}-variants"))
+            .h(px(28.))
+            .px_0p5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(
+                div()
+                    .debug_selector(move || format!("{prefix}-fewer-variants"))
+                    .child(
+                        IconButton::new(format!("{prefix}-fewer-variants"), IconName::Dash)
+                            .icon_size(IconSize::Small)
+                            .disabled(defaults.variants <= DesignDefaults::MIN_VARIANTS)
+                            .on_click(move |_, _, cx| fewer(cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(16.))
+                    .flex()
+                    .justify_center()
+                    .child(Label::new(defaults.variants.to_string())),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("{prefix}-more-variants"))
+                    .child(
+                        IconButton::new(format!("{prefix}-more-variants"), IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .disabled(defaults.variants >= DesignDefaults::MAX_VARIANTS)
+                            .on_click(move |_, _, cx| more(cx)),
+                    ),
+            );
+        let include_today = change(Rc::new(|defaults| {
+            defaults.include_today = !defaults.include_today
+        }));
+        let segments = |id: String,
+                        labels: [&'static str; 3],
+                        selected: usize,
+                        pick: [Rc<dyn Fn(&mut App)>; 3]| {
+            let [first, second, third] = pick;
+            let selector = id.clone();
+            div()
+                .debug_selector(move || selector)
+                .child(
+                    ToggleButtonGroup::single_row(
+                        id,
+                        [
+                            ToggleButtonSimple::new(labels[0], move |_, _, cx| first(cx)),
+                            ToggleButtonSimple::new(labels[1], move |_, _, cx| second(cx)),
+                            ToggleButtonSimple::new(labels[2], move |_, _, cx| third(cx)),
+                        ],
+                    )
+                    .style(ToggleButtonGroupStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .auto_width()
+                    .selected_index(selected),
+                )
+                .into_any_element()
+        };
+        let sizes = DesignSizes::ALL.map(|sizes| -> Rc<dyn Fn(&mut App)> {
+            Rc::new(change(Rc::new(move |defaults| defaults.sizes = sizes)))
+        });
+        let variants_as = VariantsAs::ALL.map(|variants_as| -> Rc<dyn Fn(&mut App)> {
+            Rc::new(change(Rc::new(move |defaults| {
+                defaults.variants_as = variants_as
+            })))
+        });
+        vec![
+            render_row(
+                "Variants",
+                "How many variants a topic has.",
+                stepper.into_any_element(),
+                cx,
+            ),
+            render_row(
+                "Include today's",
+                "Today's version as a variant to keep.",
+                Switch::new(
+                    SharedString::from(format!("{prefix}-include-today")),
+                    defaults.include_today.into(),
+                )
+                .on_click(move |_, _, cx| include_today(cx))
+                .into_any_element(),
+                cx,
+            ),
+            render_row(
+                "Sizes",
+                "The sizes each variant is shown at.",
+                segments(
+                    format!("{prefix}-sizes"),
+                    ["Desktop", "Phone", "Both"],
+                    DesignSizes::ALL
+                        .iter()
+                        .position(|sizes| *sizes == defaults.sizes)
+                        .unwrap_or(0),
+                    sizes,
+                ),
+                cx,
+            ),
+            render_row(
+                "Variants as",
+                "Pictures, live pages, or both.",
+                segments(
+                    format!("{prefix}-variants-as"),
+                    ["Pictures", "Live pages", "Both"],
+                    VariantsAs::ALL
+                        .iter()
+                        .position(|variants_as| *variants_as == defaults.variants_as)
+                        .unwrap_or(0),
+                    variants_as,
+                ),
+                cx,
+            ),
+        ]
     }
 
     fn render_chats_row(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -7384,9 +7558,69 @@ impl SettingsPage {
                 .child(render_section(machine_label, copy_rows, cx))
                 .into_any_element(),
             self.render_checkouts(key.machine, &project, cx),
+            self.render_project_design_defaults(key, cx),
             render_section("Danger", vec![remove_row], cx),
         ])
         .collect()
+    }
+
+    /// A project's design defaults (`design/artifacts-2`, topic 21 B): General's at first, or
+    /// its own once "Use General's" is off, for every copy of it.
+    fn render_project_design_defaults(
+        &self,
+        key: ProjectKey,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let group = self
+            .machines
+            .read(cx)
+            .group_of(key.machine, key.project, cx)
+            .map_or_else(|| GroupKey::of_project(key), |group| group.key);
+        let settings = self.app_settings.read(cx).settings();
+        let general = settings.design_defaults;
+        let has_own = settings.project_design_defaults.contains_key(&group);
+        let app_settings = self.app_settings.clone();
+        let use_general = {
+            let group = group.clone();
+            Switch::new("project-design-use-general", (!has_own).into()).on_click(
+                move |state, _, cx| {
+                    let use_general = *state == ToggleState::Selected;
+                    let group = group.clone();
+                    app_settings.update(cx, |store, cx| {
+                        store.update(
+                            |settings| {
+                                if use_general {
+                                    settings.project_design_defaults.remove(&group);
+                                } else {
+                                    settings.project_design_defaults.insert(group, general);
+                                }
+                            },
+                            cx,
+                        )
+                    })
+                },
+            )
+        };
+        let mut rows = vec![render_row(
+            "Use General's",
+            general.summary(),
+            div()
+                .debug_selector(|| "project-design-use-general".to_string())
+                .child(use_general)
+                .into_any_element(),
+            cx,
+        )];
+        if !has_own {
+            return render_section("Design defaults", rows, cx);
+        }
+        rows.extend(self.render_design_default_rows(Some(group), cx));
+        let name = self.project_name(key, cx);
+        render_section_with_note(
+            "Design defaults",
+            rows,
+            format!("For {name}'s threads, in place of General's."),
+            cx,
+        )
     }
 
     /// Whether the copy combines with the repository's other checkouts, which is saved for
@@ -9174,6 +9408,8 @@ mod tests {
             client
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        // Thread titles is below the window's first screen.
+        cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
         page.update_in(cx, |page, window, cx| {
             page.select(Section::General, window, cx)
         });
@@ -11266,6 +11502,88 @@ mod tests {
             })
         );
         assert!(cx.debug_bounds("project-copy-local-2").is_some());
+    }
+
+    /// `design/artifacts-2` topic 21 B: General's design defaults go to every machine, and a
+    /// project's own, once "Use General's" is off, to each machine one of its copies is on.
+    #[gpui::test]
+    fn design_defaults_go_to_every_machine_and_a_projects_to_its_copies(cx: &mut TestAppContext) {
+        let (local, devbox) = machines_with_copies(cx);
+        cx.update(|cx| {
+            for client in [&local, &devbox] {
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+            }
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::General, window, cx)
+        });
+        cx.run_until_parked();
+        let click = |name: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let last_sent = |client: &Entity<ServerClient>, cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .rev()
+                    .find_map(|request| match request {
+                        Request::SetDesignDefaults(settings) => Some(settings),
+                        _ => None,
+                    })
+            })
+        };
+        let sent = |general, projects| {
+            Some(agentz_protocol::artifacts::DesignSettings { general, projects })
+        };
+        let general = DesignDefaults::default();
+        assert_eq!(last_sent(&local, cx), sent(general, Vec::new()));
+
+        click("design-more-variants", cx);
+        let general = DesignDefaults {
+            variants: 4,
+            ..general
+        };
+        for client in [&local, &devbox] {
+            assert_eq!(last_sent(client, cx), sent(general, Vec::new()));
+        }
+
+        page.update_in(cx, |page, window, cx| {
+            page.show_project(
+                ProjectKey {
+                    machine: MachineId::Local,
+                    project: ProjectId(1),
+                },
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("project-design-variants").is_none());
+        click("project-design-use-general", cx);
+        click("project-design-fewer-variants", cx);
+        let own = DesignDefaults {
+            variants: 3,
+            ..general
+        };
+        assert_eq!(
+            last_sent(&local, cx),
+            sent(general, vec![(ProjectId(1), own), (ProjectId(2), own)])
+        );
+        assert_eq!(
+            last_sent(&devbox, cx),
+            sent(general, vec![(ProjectId(1), own)])
+        );
+
+        click("project-design-use-general", cx);
+        assert!(cx.debug_bounds("project-design-variants").is_none());
+        assert_eq!(last_sent(&devbox, cx), sent(general, Vec::new()));
     }
 
     /// The icon chosen is the whole project's, a file inside it too; a file picked outside it

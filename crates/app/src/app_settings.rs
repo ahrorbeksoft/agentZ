@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agentz_protocol::artifacts::DesignDefaults;
 use agentz_protocol::spaces::LayoutNode;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task, WindowAppearance};
@@ -154,6 +155,11 @@ pub struct AppSettings {
     pub chats: bool,
     /// When a published artifact's page opens in the browser.
     pub artifact_auto_open: ArtifactAutoOpen,
+    /// What agents' designs are like unless they hear otherwise (`design/artifacts-2`, topic
+    /// 21), given to every machine's server for its agents' design tool.
+    pub design_defaults: DesignDefaults,
+    /// A project's own (by its [`GroupKey`]), in place of `design_defaults`.
+    pub project_design_defaults: std::collections::BTreeMap<GroupKey, DesignDefaults>,
     pub play_sound_when_finished: PlaySound,
     /// When a permission request or a question arrives. Always by default, as herdr plays its
     /// request sound: it needs an answer either way.
@@ -188,6 +194,8 @@ impl Default for AppSettings {
             show_thinking: false,
             chats: true,
             artifact_auto_open: ArtifactAutoOpen::default(),
+            design_defaults: DesignDefaults::default(),
+            project_design_defaults: Default::default(),
             play_sound_when_finished: PlaySound::WhenInAnotherThread,
             play_sound_when_input_needed: PlaySound::Always,
             sound_volume: 1.,

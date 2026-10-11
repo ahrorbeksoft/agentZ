@@ -21,7 +21,9 @@ use crate::app_settings::{AppSettingsStore, MachineProfile};
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use crate::server_client::{ServerClient, ServerClientEvent, Transport};
 use crate::spaces_view::PaneKey;
-use agentz_protocol::artifacts::{Artifact, ArtifactId, ArtifactRequest, PageTheme};
+use agentz_protocol::artifacts::{
+    Artifact, ArtifactId, ArtifactRequest, DesignDefaults, DesignSettings, PageTheme,
+};
 use agentz_protocol::{
     MachineKind, PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response,
     ToolCaller, ToolResult,
@@ -244,11 +246,15 @@ pub fn init_for_test(clients: Vec<Entity<ServerClient>>, cx: &mut App) {
         let mut this = Machines {
             clients: Vec::new(),
             subscriptions: HashMap::default(),
-            _settings_subscription: cx.observe(&settings, |_: &mut Machines, _, _| {}),
+            _settings_subscription: cx.observe(&settings, |this: &mut Machines, _, cx| {
+                this.sync_servers(cx)
+            }),
         };
         for client in clients {
             this.add(client, cx);
         }
+        // As a connection would, so the views' tests start from what's already been sent.
+        this.sync_servers(cx);
         this
     });
     cx.set_global(GlobalMachines(machines));
@@ -420,7 +426,49 @@ impl Machines {
         if changed {
             cx.notify();
         }
+        self.sync_servers(cx);
+    }
+
+    /// What each server is told of the app's state, as it changes and as it connects.
+    fn sync_servers(&mut self, cx: &mut Context<Self>) {
         self.sync_peers(cx);
+        self.sync_design_defaults(cx);
+    }
+
+    /// Gives each server General's design defaults, and those of its projects whose combined
+    /// project has its own (`design/artifacts-2`, topic 21 B).
+    fn sync_design_defaults(&mut self, cx: &mut Context<Self>) {
+        let settings = AppSettingsStore::global(cx).read(cx).settings();
+        let general = settings.design_defaults;
+        let own: Vec<(ProjectGroup, DesignDefaults)> =
+            if settings.project_design_defaults.is_empty() {
+                Vec::new()
+            } else {
+                let own = settings.project_design_defaults.clone();
+                self.project_groups(cx)
+                    .into_iter()
+                    .filter_map(|group| {
+                        let defaults = *own.get(&group.key)?;
+                        Some((group, defaults))
+                    })
+                    .collect()
+            };
+        for client in self.clients.clone() {
+            let machine = client.read(cx).machine();
+            let projects = own
+                .iter()
+                .flat_map(|(group, defaults)| {
+                    group
+                        .members
+                        .iter()
+                        .filter(|(member_machine, _)| *member_machine == machine)
+                        .map(|(_, project)| (project.id, *defaults))
+                })
+                .collect();
+            client.update(cx, |client, cx| {
+                client.set_design_settings(DesignSettings { general, projects }, cx)
+            });
+        }
     }
 
     /// Tells each server about the other machines and the projects combined with its own, so
@@ -557,11 +605,11 @@ impl Machines {
             machine,
             vec![
                 cx.observe(&client, |this, _, cx| {
-                    this.sync_peers(cx);
+                    this.sync_servers(cx);
                     cx.notify()
                 }),
                 cx.observe(&projects, |this, _, cx| {
-                    this.sync_peers(cx);
+                    this.sync_servers(cx);
                     cx.notify()
                 }),
                 cx.subscribe(&client, move |this, client, event, cx| match event {
