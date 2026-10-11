@@ -847,16 +847,8 @@ impl Machines {
         }
     }
 
-    pub fn artifacts_expanded(&self, cx: &App) -> bool {
-        self.clients[0]
-            .read(cx)
-            .projects()
-            .read(cx)
-            .artifacts_expanded()
-    }
-
-    /// Every machine's artifacts, newest publish first, for the Artifacts shelf and gallery
-    /// link. Remote machines without pages contribute nothing.
+    /// Every machine's artifacts, newest publish first. Machines that aren't connected
+    /// contribute nothing.
     pub fn artifacts(&self, cx: &App) -> Vec<(MachineId, Artifact)> {
         let mut artifacts: Vec<(MachineId, Artifact)> = self
             .clients
@@ -877,26 +869,23 @@ impl Machines {
         artifacts
     }
 
-    /// The artifacts the Artifacts shelf lists for the picked scope: the picked project's
-    /// threads' and chats' pages, or every one with All (`design/artifacts`, topic 6).
+    /// The artifacts the Artifacts button counts and lists for the picked scope: the picked
+    /// project's threads', or every one, chats' too, under All projects (`design/artifacts-2`,
+    /// topic 1).
     pub fn scoped_artifacts(&self, cx: &App) -> Vec<(MachineId, Artifact)> {
         let artifacts = self.artifacts(cx);
         let Scope::Group(key) = self.scope(cx) else {
             return artifacts;
         };
-        let group = self
-            .project_groups(cx)
-            .into_iter()
-            .find(|group| group.key == key);
+        let Some(group) = self.group(&key, cx) else {
+            return Vec::new();
+        };
         artifacts
             .into_iter()
             .filter(|(machine, artifact)| {
-                artifact.is_from_chat()
-                    || artifact.project_id.is_some_and(|project| {
-                        group
-                            .as_ref()
-                            .is_some_and(|group| group.contains(*machine, project))
-                    })
+                artifact
+                    .project_id
+                    .is_some_and(|project| group.contains(*machine, project))
             })
             .collect()
     }
@@ -915,32 +904,6 @@ impl Machines {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Where an artifact came from, as the shelf says it: "storefront › thread", "Chat · …",
-    /// or "from a deleted thread".
-    pub fn artifact_place(&self, machine: MachineId, artifact: &Artifact, cx: &App) -> String {
-        let Some(client) = self.client(machine, cx) else {
-            return String::new();
-        };
-        let store = client.read(cx).projects().read(cx);
-        let Some(thread_id) = artifact.thread_id else {
-            return String::new();
-        };
-        match store.thread(thread_id) {
-            Some(thread) if artifact.is_from_chat() => format!("Chat · {}", thread.title),
-            Some(thread) => {
-                let project = artifact
-                    .project_id
-                    .and_then(|id| store.project(id))
-                    .map(|project| project.name());
-                match project {
-                    Some(project) => format!("{project} › {}", thread.title),
-                    None => thread.title.clone(),
-                }
-            }
-            None => "from a deleted thread".to_string(),
-        }
     }
 
     /// The artifact's page URL, served by this machine's pages server: remote machines'

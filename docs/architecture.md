@@ -1360,16 +1360,24 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   they load and live.
 - **In the thread** (`AgentView::render_published_artifact`, `tool_calls::published_artifact`):
   the newest publish of each artifact is a card (its kind's icon, title, "Document · v2 ·
-  published 2m ago", Open, and a menu with Copy Link, Export… and Show in List); earlier ones
-  are a line, "Published a document: Checkout benchmarks · v1". The header has an Artifacts
-  pill before the branch (`render_artifacts_pill`): one opens it, several list in a menu with
-  All artifacts…. Export… saves the source where the user picks.
-- **In the sidebar** (`Sidebar::render_artifacts_shelf`): an Artifacts shelf above Archived,
-  closed at first (`ProjectStore::artifacts_expanded`, kept by this Mac's server), with the
-  picked project's and the chats' artifacts, every one under All
-  (`Machines::scoped_artifacts`), newest first: "Document · v2 · storefront › Add checkout · 2m",
-  opening on a click, with Open, Show Thread, Copy Link and Delete… on a right-click, then All
-  artifacts…. `artifacts: show all` in the command palette opens All artifacts.
+  published 2m ago" or "Design · 5 variants · v1 · published 2m ago", Open, and a menu with
+  Copy Link, a document's Export…, and Show in List); earlier ones are a line, "Published a
+  document: Checkout benchmarks · v1". The header has a pill before the branch
+  (`render_artifacts_pill`, `design/artifacts-2` topic 3): one artifact is its title and opens
+  it; several are "2 artifacts", a menu of only this thread's, each with a design's state.
+  Export… saves the source where the user picks.
+- **The Artifacts button** (`Shell::render_artifacts_button`, `artifacts_list.rs`;
+  `design/artifacts-2` topics 1 and 2): after the project picker, once anything has been
+  published, "Artifacts" and the count: the picked project's, or every one, chats' too, under
+  All projects (`Machines::scoped_artifacts`). It opens a list like the picker's: a search
+  (titles, and the thread's title), All · Documents · Designs, and the rows grouped by the
+  thread they came from ("Chat · …", the project first under All, "· Archived", "From a
+  deleted thread"), each with its kind, title and a design's state ("Waiting for you", "2 of 3
+  decided", "Decided") or when. A click or Enter opens it in the browser; a right-click has
+  Open, Show Thread, Copy Link and Delete…; "Open the artifacts page" ends it, at the picked
+  project. A card's Show in List (`artifacts::ShowInList`) opens it at that artifact, under All
+  projects when it isn't the picked project's. `artifacts: show all` in the command palette
+  opens the artifacts page.
 - **Opening on publish** (`Shell::open_published_artifact`, Settings › General › Artifacts ›
   "Open in the browser", `ArtifactAutoOpen`): when its thread is on screen (the default), on an
   artifact's first publish, or never. Only a publish the app hears while connected counts

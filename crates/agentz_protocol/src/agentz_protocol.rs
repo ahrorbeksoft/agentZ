@@ -289,7 +289,6 @@ pub enum Request {
     ToggleArchivedExpanded,
     ToggleWorkspacesExpanded,
     ToggleChatsExpanded,
-    ToggleArtifactsExpanded,
 
     /// Answered with [`Response::ThreadCreated`], once its workspace is ready.
     CreateThread {

@@ -852,6 +852,7 @@ impl ServerClient {
         self.set_machine_icon_state(session.machine_icon, cx);
         self.set_title_generation(session.title_generation, cx);
         self.set_storage(session.storage, cx);
+        self.set_artifacts(session.artifacts, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }

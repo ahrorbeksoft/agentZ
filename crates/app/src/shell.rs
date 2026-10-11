@@ -1,10 +1,12 @@
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey};
 use crate::project_store::ThreadStatus;
 use agentz_protocol::accounts::AccountChoice;
 use agentz_protocol::agents::{AgentId, InstallState};
-use agentz_protocol::artifacts::{Artifact, PageTheme};
+use agentz_protocol::artifacts::{Artifact, ArtifactId, PageTheme};
 use agentz_protocol::layout::Node;
 use agentz_protocol::workspace::WorkspaceChoice;
 use anyhow::Result;
@@ -22,6 +24,7 @@ use util::ResultExt as _;
 use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
 use crate::app_settings::{AppSettingsStore, ArtifactAutoOpen, MachineProfile, is_sidebar_hidden};
+use crate::artifacts_list::{ArtifactsList, ShowInList};
 use crate::command_palette::CommandPalette;
 use crate::confirm_dialog::{ConfirmDialog, ConfirmRequest};
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
@@ -160,6 +163,10 @@ pub struct Shell {
     /// A draft New Thread is making, so another press doesn't make a second.
     _starting_draft: Option<Task<()>>,
     switcher_handle: PopoverMenuHandle<ProjectSwitcher>,
+    artifacts_handle: PopoverMenuHandle<ArtifactsList>,
+    /// What the Artifacts button's list opens at, once: a card's Show in List. Shared with the
+    /// list's builder, which runs while the shell is being updated.
+    artifact_to_select: Rc<Cell<Option<(MachineId, ArtifactId)>>>,
     new_thread_modal: Option<(Entity<NewThreadModal>, Vec<Subscription>)>,
     add_project_modal: Option<(Entity<AddProjectModal>, Vec<Subscription>)>,
     worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
@@ -383,6 +390,8 @@ impl Shell {
             spaces_view,
             _starting_draft: None,
             switcher_handle: PopoverMenuHandle::default(),
+            artifacts_handle: PopoverMenuHandle::default(),
+            artifact_to_select: Rc::default(),
             new_thread_modal: None,
             add_project_modal: None,
             worktree_modal: None,
@@ -1701,6 +1710,81 @@ impl Shell {
         self.switcher_handle.toggle(window, cx);
     }
 
+    /// A card's Show in List: the Artifacts button's list, at the artifact. A chat's artifact,
+    /// or another project's, is listed only under All projects.
+    fn show_artifact_in_list(
+        &mut self,
+        action: &ShowInList,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_listed = self
+            .machines
+            .read(cx)
+            .scoped_artifacts(cx)
+            .iter()
+            .any(|(machine, artifact)| *machine == action.machine && artifact.id == action.id);
+        if !is_listed {
+            Machines::set_scope(Scope::All, cx);
+        }
+        if self.view != MainView::Agents {
+            self.set_view(MainView::Agents, window, cx);
+        }
+        self.artifact_to_select
+            .set(Some((action.machine, action.id.clone())));
+        // Once the title bar has drawn the button, after the menu that asked has given focus
+        // back.
+        let handle = self.artifacts_handle.clone();
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| handle.show(window, cx));
+        });
+    }
+
+    /// The Artifacts button, after the project picker (`design/artifacts-2`, topic 1B): drawn
+    /// as the picker is, it opens the list of the picked project's artifacts.
+    fn render_artifacts_button(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let artifact_to_select = self.artifact_to_select.clone();
+        let shell = cx.entity().downgrade();
+        // Keeps a press on the button from starting a window drag.
+        div()
+            .debug_selector(|| "artifacts-button".into())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                PopoverMenu::new("artifacts-list")
+                    .with_handle(self.artifacts_handle.clone())
+                    .menu(move |window, cx| {
+                        let selected = artifact_to_select.take();
+                        let shell = shell.clone();
+                        let open_thread = move |key, window: &mut Window, cx: &mut App| {
+                            shell
+                                .update(cx, |shell, cx| shell.open_thread(key, window, cx))
+                                .ok();
+                        };
+                        Some(cx.new(|cx| ArtifactsList::new(selected, open_thread, window, cx)))
+                    })
+                    .trigger(
+                        ButtonLike::new("artifacts-button").child(
+                            h_flex()
+                                .px_1()
+                                .gap_1p5()
+                                .child(
+                                    Icon::new(IconName::Layers)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new("Artifacts").size(LabelSize::Small))
+                                .child(
+                                    Label::new(count.to_string())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                    )
+                    .anchor(gpui::Anchor::TopLeft)
+                    .offset(gpui::point(px(0.), px(4.))),
+            )
+    }
+
     fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let tabs_border = colors.border;
@@ -1712,6 +1796,9 @@ impl Shell {
         let scope_machines = scope_group
             .as_ref()
             .and_then(|group| render_machine_icons(group, cx));
+        // Shown once anything has been published, anywhere.
+        let artifact_count =
+            (!machines.artifacts(cx).is_empty()).then(|| machines.scoped_artifacts(cx).len());
         let (scope_icon, scope_label): (AnyElement, SharedString) = match scope_group
             .as_ref()
             .and_then(|group| Some((group, group.primary()?)))
@@ -1930,6 +2017,10 @@ impl Shell {
                         ),
                 )
             })
+            .when_some(
+                artifact_count.filter(|_| shows_switcher),
+                |title_bar, count| title_bar.child(self.render_artifacts_button(count, cx)),
+            )
             .child(div().flex_1())
             .children(self.render_connection_status(cx))
             .child(
@@ -2118,7 +2209,7 @@ fn render_waiting_badge(count: usize, status: ThreadStatus, cx: &App) -> Div {
 gpui::actions!(
     artifacts,
     [
-        /// Opens All artifacts in the browser.
+        /// Opens the artifacts page in the browser, at All artifacts.
         ShowAll,
     ]
 );
@@ -2228,10 +2319,11 @@ impl Render for Shell {
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_go_to))
             .on_action(cx.listener(|this, _: &ShowAll, _, cx| {
-                if let Some(gallery) = this.machines.read(cx).artifacts_home_link(None, cx) {
-                    cx.open_url(&gallery);
+                if let Some(home) = this.machines.read(cx).artifacts_home_link(None, cx) {
+                    cx.open_url(&home);
                 }
             }))
+            .on_action(cx.listener(Self::show_artifact_in_list))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDiffEdge>, _, cx| {
                     let available = event.bounds.size.width - SIDEBAR_WIDTH - MIN_THREAD_WIDTH;
@@ -2565,6 +2657,119 @@ mod modal_tests {
         cx.simulate_click(point(px(20.), px(500.)), Modifiers::none());
         cx.run_until_parked();
         assert!(shell.read_with(cx, |shell, _| shell.new_thread_modal.is_none()));
+    }
+
+    /// Once something is published, the Artifacts button follows the project picker, counting
+    /// the picked project's; a card's Show in List opens its list at the artifact, under All
+    /// projects for a chat's.
+    #[gpui::test]
+    fn the_artifacts_button_lists_the_picked_projects_artifacts(cx: &mut TestAppContext) {
+        use agentz_protocol::artifacts::{ArtifactKind, ArtifactPages, ArtifactVersion, Artifacts};
+
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| client.set_online_for_test(cx));
+            client.read(cx).projects().clone().update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![Project {
+                            id: ProjectId(1),
+                            path: "/tmp/demo".into(),
+                            custom_name: None,
+                            icon: None,
+                            workspaces: Vec::new(),
+                            repository: None,
+                        }],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            crate::sidebar::init(cx);
+            client
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("artifacts-button").is_none());
+
+        let artifact = |id: &str, project_id: ProjectId| Artifact {
+            id: ArtifactId(id.to_string()),
+            title: id.to_string(),
+            kind: ArtifactKind::Document,
+            versions: vec![ArtifactVersion {
+                published_at: 1,
+                bytes: 1,
+                files: Vec::new(),
+            }],
+            thread_id: None,
+            project_id: Some(project_id),
+            agent_id: None,
+            preview: String::new(),
+            design: None,
+            frame_key: "key".into(),
+        };
+        cx.update(|_, cx| {
+            client.update(cx, |client, cx| {
+                client.set_artifacts_for_test(
+                    Artifacts {
+                        artifacts: vec![
+                            artifact("notes", ProjectId(1)),
+                            artifact("in-chat", ProjectId::CHATS),
+                        ],
+                        pages: Some(ArtifactPages {
+                            address: "127.0.0.1:4000".into(),
+                            token: "token".into(),
+                        }),
+                    },
+                    cx,
+                )
+            });
+            let key = Machines::global(cx).read(cx).project_groups(cx)[0]
+                .key
+                .clone();
+            Machines::set_scope(Scope::Group(key), cx);
+        });
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("artifacts-button")
+            .expect("the Artifacts button is shown");
+        cx.simulate_click(button.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("artifacts-list-local-notes").is_some());
+        assert!(cx.debug_bounds("artifacts-list-local-in-chat").is_none());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("artifacts-list").is_none());
+
+        shell.update_in(cx, |shell, window, cx| {
+            window.focus(&shell.focus_handle, cx)
+        });
+        cx.dispatch_action(ShowInList {
+            machine: MachineId::Local,
+            id: ArtifactId("in-chat".into()),
+        });
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.simulate_next_frame(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| Machines::global(cx).read(cx).scope(cx)),
+            Scope::All
+        );
+        assert!(cx.debug_bounds("artifacts-list-local-notes").is_some());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("http://127.0.0.1:4000/a/in-chat?t=token")
+        );
     }
 
     // Linux has no traffic lights to leave room for.

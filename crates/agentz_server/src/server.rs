@@ -965,10 +965,6 @@ impl Server {
                 self.projects.toggle_chats_expanded();
                 Ok(Response::Ok)
             }
-            Request::ToggleArtifactsExpanded => {
-                self.projects.toggle_artifacts_expanded();
-                Ok(Response::Ok)
-            }
             Request::MoveToAgents(thread_id) => {
                 self.move_to_agents(thread_id)?;
                 Ok(Response::Ok)

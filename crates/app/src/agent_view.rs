@@ -64,6 +64,7 @@ use crate::agent_icons::agent_icon;
 use crate::agent_login::{
     AgentLogin, LoginDialog, LoginLayout, method_button_label, method_description,
 };
+use crate::artifacts_list::{ShowInList, artifact_icon, render_design_state};
 use crate::attachment_image::{
     AttachmentImage, FileImage, ImagePreviewTooltip, ImageViewer, MarkdownImageSource,
     MessagePiece, ViewedImage, classify_markdown_image, is_loading, message_pieces,
@@ -4351,15 +4352,16 @@ impl AgentView {
         Machines::global(cx).read(cx).artifacts_for_thread(&key, cx)
     }
 
-    /// Claude Code's ⧉ pill, before the branch (`design/artifacts`, topic 5B): the page, or
-    /// with several the count, whose list ends in All artifacts….
+    /// Claude Code's ⧉ pill, before the branch (`design/artifacts-2`, topic 3A): the artifact,
+    /// opening it, or with several their count, opening a list of only this thread's, each
+    /// with a design's state.
     fn render_artifacts_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let artifacts = self.thread_artifacts(cx);
         let first = artifacts.first()?;
         let machine = self.store.read(cx).machine();
         let border = cx.theme().colors().border_variant;
         let hover = cx.theme().colors().ghost_element_hover;
-        let pill = |label: SharedString| {
+        let pill = |icon: IconName, label: SharedString, has_menu: bool| {
             h_flex()
                 .id("thread-header-artifacts")
                 .debug_selector(|| "thread-header-artifacts".into())
@@ -4373,24 +4375,27 @@ impl AgentView {
                 .border_color(border)
                 .cursor_pointer()
                 .hover(move |style| style.bg(hover))
-                .child(
-                    Icon::new(artifact_icon(first.kind))
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
                 .child(
                     Label::new(label)
                         .size(LabelSize::Small)
                         .color(Color::Muted)
                         .truncate(),
                 )
+                .when(has_menu, |pill| {
+                    pill.child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
         };
         if artifacts.len() == 1 {
             let link = Machines::global(cx)
                 .read(cx)
                 .artifact_link(machine, &first.id, None, cx);
             return Some(
-                pill(first.title.clone().into())
+                pill(artifact_icon(first.kind), first.title.clone().into(), false)
                     .tooltip(Tooltip::text("Open in the Browser"))
                     .when_some(link, |this, link| {
                         this.on_click(move |_, _, cx| cx.open_url(&link))
@@ -4398,43 +4403,38 @@ impl AgentView {
                     .into_any_element(),
             );
         }
-        let trigger = pill(format!("{} artifacts", artifacts.len()).into());
+        let trigger = pill(
+            IconName::Layers,
+            format!("{} artifacts", artifacts.len()).into(),
+            true,
+        );
         Some(
             PopoverMenu::new("thread-artifacts-menu")
                 .trigger(ButtonLike::new("thread-artifacts-trigger").child(trigger))
                 .anchor(Anchor::TopRight)
                 .menu(move |window, cx| {
                     let machines = Machines::global(cx).read(cx);
-                    let entries: Vec<(SharedString, IconName, Option<String>)> = artifacts
+                    let entries: Vec<(Artifact, Option<String>)> = artifacts
                         .iter()
                         .map(|artifact| {
                             (
-                                artifact.title.clone().into(),
-                                artifact_icon(artifact.kind),
+                                artifact.clone(),
                                 machines.artifact_link(machine, &artifact.id, None, cx),
                             )
                         })
                         .collect();
-                    let gallery = machines.artifacts_home_link(None, cx);
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        for (title, icon, link) in entries {
-                            menu = menu.item(
-                                ContextMenuEntry::new(title)
-                                    .icon(icon)
-                                    .icon_color(Color::Muted)
-                                    .handler(move |_, cx| {
-                                        if let Some(link) = &link {
-                                            cx.open_url(link);
-                                        }
-                                    }),
+                        for (artifact, link) in entries {
+                            menu = menu.custom_entry(
+                                move |_, cx| render_thread_artifact_row(&artifact, cx),
+                                move |_, cx| {
+                                    if let Some(link) = &link {
+                                        cx.open_url(link);
+                                    }
+                                },
                             );
                         }
-                        menu = menu.separator();
-                        menu.entry("All artifacts…", None, move |_, cx| {
-                            if let Some(gallery) = &gallery {
-                                cx.open_url(gallery);
-                            }
-                        })
+                        menu
                     }))
                 })
                 .into_any_element(),
@@ -4539,7 +4539,15 @@ impl AgentView {
             .version(version)
             .map(|version| published_ago(version.published_at))
             .unwrap_or_default();
-        let detail = format!("{} · v{version} · {published}", artifact.kind.label());
+        // "Design · 5 variants · v1 · published 2m ago" (`design/artifacts-2`, topic 18).
+        let detail = match &artifact.design {
+            Some(design) => format!(
+                "{} · {} · v{version} · {published}",
+                artifact.kind.label(),
+                design.size()
+            ),
+            None => format!("{} · v{version} · {published}", artifact.kind.label()),
+        };
         let menu = {
             let view = cx.entity().downgrade();
             let title = artifact.title.clone();
@@ -4550,21 +4558,30 @@ impl AgentView {
                 let id = id.clone();
                 let title = title.clone();
                 ContextMenu::build(window, cx, move |menu, _, _| {
-                    let view_for_export = view.clone();
+                    let export_id = id.clone();
+                    let show_in_list = ShowInList {
+                        machine,
+                        id: id.clone(),
+                    };
                     menu.when_some(link.clone(), |menu, link| {
                         menu.entry("Copy Link", None, move |_, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
                         })
                     })
-                    .entry("Export…", None, move |_, cx| {
-                        view_for_export
-                            .update(cx, |view, cx| {
-                                view.export_artifact(id.clone(), version, &title, kind, cx)
+                    // A design's page has no Export: it's the picks that matter, which the
+                    // agent reads.
+                    .when(kind == ArtifactKind::Document, |menu| {
+                        let view = view.clone();
+                        let title = title.clone();
+                        menu.entry("Export…", None, move |_, cx| {
+                            view.update(cx, |view, cx| {
+                                view.export_artifact(export_id.clone(), version, &title, kind, cx)
                             })
                             .log_err();
+                        })
                     })
-                    .entry("Show in List", None, move |_, cx| {
-                        view.update(cx, |_, cx| show_artifacts_shelf(cx)).log_err();
+                    .entry("Show in List", None, move |window, cx| {
+                        window.dispatch_action(Box::new(show_in_list.clone()), cx);
                     })
                 })
             }
@@ -13472,11 +13489,35 @@ fn one_line(text: &str) -> String {
 /// thoughts. The plan's marker draws nothing, so it doesn't split a run. A subagent's row stands
 /// on its own, so several at once show side by side, and so does a tool call that changed the
 /// agent's mode, with the line marking the change under it.
-fn artifact_icon(kind: ArtifactKind) -> IconName {
-    match kind {
-        ArtifactKind::Document => IconName::FileTextOutlined,
-        ArtifactKind::Design => IconName::LayoutDashboard,
-    }
+/// One of the thread's artifacts in its pill's list: its kind, title, and a design's state or
+/// when it was published.
+fn render_thread_artifact_row(artifact: &Artifact, cx: &App) -> AnyElement {
+    let end = match &artifact.design {
+        Some(design) => render_design_state(design, cx),
+        None => Label::new(crate::sidebar::format_relative_time(
+            SystemTime::UNIX_EPOCH + Duration::from_millis(artifact.published_at()),
+            SystemTime::now(),
+        ))
+        .size(LabelSize::Small)
+        .color(Color::Muted)
+        .into_any_element(),
+    };
+    h_flex()
+        .w(px(280.))
+        .gap_2()
+        .child(
+            Icon::new(artifact_icon(artifact.kind))
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Label::new(one_line(&artifact.title)).truncate()),
+        )
+        .child(end)
+        .into_any_element()
 }
 
 /// "published 2m ago", from milliseconds since the epoch.
@@ -13485,17 +13526,6 @@ fn published_ago(published_at: u64) -> String {
     match crate::sidebar::format_relative_time(time, SystemTime::now()).as_str() {
         "now" => "published just now".to_string(),
         ago => format!("published {ago} ago"),
-    }
-}
-
-/// The card's Show in List: opens the sidebar's Artifacts shelf, kept by this Mac's server.
-fn show_artifacts_shelf(cx: &mut App) {
-    let machines = Machines::global(cx);
-    if machines.read(cx).artifacts_expanded(cx) {
-        return;
-    }
-    if let Some(store) = machines.read(cx).projects(MachineId::Local, cx) {
-        store.update(cx, |store, cx| store.toggle_artifacts_expanded(cx));
     }
 }
 

@@ -3,6 +3,7 @@ mod agent_icons;
 mod agent_login;
 mod agent_view;
 mod app_settings;
+mod artifacts_list;
 mod attachment_image;
 mod branch_picker;
 mod command_palette;
@@ -154,6 +155,7 @@ fn init_for_test(cx: &mut App) {
     app_settings::init_for_test(cx);
     agent_icons::init(cx);
     text_input::init(cx);
+    artifacts_list::init(cx);
     agent_view::init(cx);
     agent_login::init(cx);
     terminal_view::init(cx);
@@ -249,6 +251,7 @@ fn main() {
             init_theme(cx);
             text_input::init(cx);
             project_switcher::init(cx);
+            artifacts_list::init(cx);
             new_thread_modal::init(cx);
             new_space_picker::init(cx);
             branch_picker::init(cx);

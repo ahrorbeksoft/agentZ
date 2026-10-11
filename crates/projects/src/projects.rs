@@ -577,9 +577,6 @@ pub struct ProjectsSnapshot {
     pub archived_expanded: bool,
     pub workspaces_expanded: bool,
     pub chats_collapsed: bool,
-    /// Whether the sidebar's Artifacts shelf is open. It starts closed.
-    #[serde(default)]
-    pub artifacts_expanded: bool,
     pub working_threads: Vec<ThreadId>,
     /// Threads waiting for the user to answer a permission request.
     pub blocked_threads: Vec<ThreadId>,
@@ -679,8 +676,6 @@ struct PersistedState {
     workspaces_expanded: bool,
     #[serde(default)]
     chats_collapsed: bool,
-    #[serde(default)]
-    artifacts_expanded: bool,
 }
 
 pub struct ProjectStore {
@@ -695,8 +690,6 @@ pub struct ProjectStore {
     workspaces_expanded: bool,
     /// Whether the sidebar's Chats shelf is closed. It starts open.
     chats_collapsed: bool,
-    /// Whether the sidebar's Artifacts shelf is open. It starts closed.
-    artifacts_expanded: bool,
     /// Where a chat works until its first message makes its own folder: the folder those are
     /// made in. Set by the server, which knows its data directory. Not persisted.
     chats_folder: Option<PathBuf>,
@@ -750,7 +743,6 @@ impl ProjectStore {
             archived_expanded: state.archived_expanded,
             workspaces_expanded: state.workspaces_expanded,
             chats_collapsed: state.chats_collapsed,
-            artifacts_expanded: state.artifacts_expanded,
             chats_folder: None,
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
@@ -847,15 +839,6 @@ impl ProjectStore {
 
     pub fn toggle_chats_expanded(&mut self) {
         self.chats_collapsed = !self.chats_collapsed;
-        self.changed();
-    }
-
-    pub fn artifacts_expanded(&self) -> bool {
-        self.artifacts_expanded
-    }
-
-    pub fn toggle_artifacts_expanded(&mut self) {
-        self.artifacts_expanded = !self.artifacts_expanded;
         self.changed();
     }
 
@@ -1988,7 +1971,6 @@ impl ProjectStore {
             archived_expanded: self.archived_expanded,
             workspaces_expanded: self.workspaces_expanded,
             chats_collapsed: self.chats_collapsed,
-            artifacts_expanded: self.artifacts_expanded,
             working_threads,
             blocked_threads,
             awaiting_input_threads,
@@ -2043,7 +2025,6 @@ impl ProjectStore {
                 archived_expanded: snapshot.archived_expanded,
                 workspaces_expanded: snapshot.workspaces_expanded,
                 chats_collapsed: snapshot.chats_collapsed,
-                artifacts_expanded: snapshot.artifacts_expanded,
             },
             None,
         );
@@ -2099,7 +2080,6 @@ impl ProjectStore {
             archived_expanded: self.archived_expanded,
             workspaces_expanded: self.workspaces_expanded,
             chats_collapsed: self.chats_collapsed,
-            artifacts_expanded: self.artifacts_expanded,
         });
     }
 }
@@ -2657,13 +2637,10 @@ mod tests {
         // They outlive a restart, and so does whether the section is open.
         assert!(!store.workspaces_expanded());
         store.toggle_workspaces_expanded();
-        assert!(!store.artifacts_expanded());
-        store.toggle_artifacts_expanded();
         drop(store);
         let mut store = ProjectStore::load(Some(state_path));
         assert_eq!(store.threads().len(), 3);
         assert!(store.workspaces_expanded());
-        assert!(store.artifacts_expanded());
 
         let child = store
             .add_subthread(
