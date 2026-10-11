@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Artifacts 2 Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="../artifacts/mock-artifacts.css">
+<link rel="stylesheet" href="mock-artifacts-2.css">
+</head>
+<body data-area="artifacts-2" data-title="Artifacts 2">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Artifacts 2 <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>The second <b>artifacts</b> round. The first (<code>design/artifacts/</code>) is built: pages and documents an agent publishes from a thread or a chat, opened in your browser, with a card in the thread, a pill in its header, a shelf in the sidebar and All artifacts. This round changes where they’re listed and what they can be, and adds designs that agentZ draws itself. It replaces the boards round, which wasn’t decided.</p>
+<p>Already decided, from your answers: the sidebar loses its Artifacts shelf; an <b>Artifacts button</b> by the project picker lists every artifact under All projects, or the picked project’s (chats’ count only under All projects). A thread lists only its own. Chats can publish, as they can today. Two kinds, for now: <b>documents</b>, Markdown only and read-only (no comments), and <b>designs</b>; HTML is only for designs, so plain HTML pages stop being a kind. A new <b>artifacts page</b>, the homepage, opens in the browser and looks like the app. For a <b>design</b>, agentZ draws the page and the agent gives only the variants (pictures or live pages) and the words; a design holds one question or several topics, and its picks and comments are saved on the server with it, for the agent to read whenever it likes. <b>Submit</b> is optional: it marks a design decided, and can send it to the thread. <b>Design defaults</b> (how many variants, today’s version too, phone and desktop, pictures and live pages) are settings given to agents, which may change them for a project. Artifacts can be <b>@-mentioned</b> (this thread’s first, then the project’s, then anywhere’s) as a short reference the agent reads with its tools. Across <b>machines</b> they work like threads: fetched when needed, not synced; one list of every machine’s; an artifact moves with its thread when the thread goes on on another machine, and opens from any machine. An <b>archived</b> thread’s artifacts stay in the lists, marked. This round is how all of that looks, and the shape of the agent’s tools.</p>
+<p>The models: the first <b>artifacts</b> round’s decisions (the card in the thread, the page’s bar, versions, the document page, Send to thread, kept when the thread is deleted); agentZ’s own <b>design board</b>, this page (topics, cards, Pick and + Also, comments, a note, a summary, saving as you go); <b>claude.ai’s artifacts page</b> (a grid of cards with a picture of each, search, and what’s yours apart); and <b>Claude Code’s artifacts</b> (a page at a link with a thin bar, each publish a version, a pill under the prompt).</p>
+<p>Words used: an <b>artifact</b> is anything published; a <b>document</b> is a Markdown artifact; a <b>design</b> is an artifact agentZ draws from the agent’s variants; a <b>topic</b> is one question in a design; a <b>variant</b> is one option in a topic; a <b>pick</b> is what you chose; <b>Submit</b> marks a design decided. The demo: 15 artifacts, from threads in <i>storefront</i> and from chats on This Mac, and from <i>api</i> on Devbox 1. Claude Agent made the <b>Plans page</b> design (five variants) in <i>Design the plans page</i>, after a document, <b>Competitors’ plans pages</b>; the pictures are real pages, rendered for the boards round. <b>Pricing</b> is a design with three topics. The mocks are JetBrains Dark, your theme, at real sizes in a 1280 px browser. The screenshots beside the topics are today’s app with the mock agent.</p>`;
+</script>
+<script src="../artifacts/mock-artifacts.js"></script>
+<script src="mock-artifacts-2.js"></script>
+<script src="topics-artifacts-2.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
