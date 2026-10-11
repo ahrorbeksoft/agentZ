@@ -260,6 +260,10 @@ From Zed's guidelines, which this code follows:
   loop's poller (an epoll, an eventfd and a timerfd). An agent's terminals stay as long as
   their thread, so a long thread's commands used up the server's 1024 descriptors, and every
   new terminal, agent and usage read then failed with "No file descriptors available".
+- **A release build doesn't see a new asset by itself.** rust-embed embeds each file with
+  `include_bytes!`, which tracks the files it found but not new ones, so an incremental release
+  build kept the older set and a new icon drew nothing. `crates/assets/build.rs` rebuilds the
+  crate when anything in `assets/` changes.
 - **A running server outlives its binary.** Installing renames the new binary into place, so an
   older server keeps running; it reports the hash beside its executable at start
   (`ServerWelcome::build`), and the app compares it with the installed one.
