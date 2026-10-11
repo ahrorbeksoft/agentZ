@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice">
+  <!-- A stand-in for the user's own picture: mountains at dusk over a lake. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2b5a"/>
+      <stop offset=".45" stop-color="#6b4c8a"/>
+      <stop offset=".72" stop-color="#e2836b"/>
+      <stop offset="1" stop-color="#f6c27a"/>
+    </linearGradient>
+    <radialGradient id="sun" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#fff3d1"/>
+      <stop offset=".35" stop-color="#ffd58a"/>
+      <stop offset="1" stop-color="#ffd58a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="lake" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e9a77a"/>
+      <stop offset=".4" stop-color="#7b5a8c"/>
+      <stop offset="1" stop-color="#1b2347"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="1000" fill="url(#sky)"/>
+  <circle cx="1040" cy="560" r="230" fill="url(#sun)"/>
+  <path d="M0 560 L140 470 L250 520 L400 400 L520 470 L640 380 L780 480 L900 430 L1040 520 L1180 410 L1320 480 L1460 400 L1600 460 L1600 640 L0 640 Z" fill="#8f5f8f" opacity=".75"/>
+  <path d="M0 600 L180 500 L300 560 L470 450 L600 540 L760 470 L880 560 L1010 500 L1150 580 L1290 490 L1420 560 L1600 510 L1600 660 L0 660 Z" fill="#5d3f72"/>
+  <path d="M0 650 L120 590 L260 640 L420 560 L560 630 L700 590 L860 650 L1000 600 L1160 660 L1320 600 L1480 650 L1600 620 L1600 680 L0 680 Z" fill="#33284f"/>
+  <rect y="680" width="1600" height="320" fill="url(#lake)"/>
+  <ellipse cx="1040" cy="700" rx="260" ry="10" fill="#ffe2b0" opacity=".55"/>
+  <rect x="900" y="730" width="280" height="4" rx="2" fill="#ffe2b0" opacity=".35"/>
+  <rect x="950" y="760" width="180" height="3" rx="1.5" fill="#ffe2b0" opacity=".25"/>
+  <rect x="990" y="790" width="100" height="3" rx="1.5" fill="#ffe2b0" opacity=".18"/>
+  <path d="M0 1000 L0 820 Q200 780 420 840 T900 870 T1600 820 L1600 1000 Z" fill="#141a33"/>
+</svg>
