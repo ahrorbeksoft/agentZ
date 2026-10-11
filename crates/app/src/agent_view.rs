@@ -56,15 +56,16 @@ use ui::{
 use util::ResultExt as _;
 
 use crate::mention_menu::{
-    Mention, MentionKind, MentionMatch, MentionQuery, MentionTarget, MentionableProject,
-    MentionableThread, find_mentions, mention_query, render_mention_menu, target_icon,
+    Mention, MentionKind, MentionMatch, MentionQuery, MentionTarget, MentionableArtifact,
+    MentionableProject, MentionableThread, artifact_reference, find_mentions, mention_query,
+    render_mention_menu, target_icon,
 };
 
 use crate::agent_icons::agent_icon;
 use crate::agent_login::{
     AgentLogin, LoginDialog, LoginLayout, method_button_label, method_description,
 };
-use crate::artifacts_list::{ShowInList, artifact_icon, render_design_state};
+use crate::artifacts_list::{ShowInList, artifact_icon, render_design_state, thread_group};
 use crate::attachment_image::{
     AttachmentImage, FileImage, ImagePreviewTooltip, ImageViewer, MarkdownImageSource,
     MessagePiece, ViewedImage, classify_markdown_image, is_loading, message_pieces,
@@ -2707,6 +2708,7 @@ impl AgentView {
         }
         let threads = self.mentionable_threads(cx);
         let projects = is_chat.then(|| self.mentionable_projects(cx));
+        let artifacts = self.mentionable_artifacts(cx);
         let query = self
             .mention_query
             .as_ref()
@@ -2718,6 +2720,7 @@ impl AgentView {
             self.files.as_ref(),
             &threads,
             projects.as_deref(),
+            &artifacts,
         );
     }
 
@@ -2859,6 +2862,94 @@ impl AgentView {
         projects
     }
 
+    /// Every connected machine's artifacts (`design/artifacts-2`, topic 20): this thread's
+    /// first, then its project's (on every machine it's on; a chat's are the other chats'),
+    /// then the rest, each run the newest first, with where it's from.
+    fn mentionable_artifacts(&self, cx: &App) -> Vec<MentionableArtifact> {
+        let own_machine = self.client.read(cx).machine();
+        let machines = Machines::global(cx).read(cx);
+        let Some(project_id) = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .map(|thread| thread.project_id)
+        else {
+            return Vec::new();
+        };
+        let group = (project_id != ProjectId::CHATS)
+            .then(|| machines.group_of(own_machine, project_id, cx))
+            .flatten();
+        let mut runs: [Vec<MentionableArtifact>; 3] = Default::default();
+        for (machine, artifact) in machines.artifacts(cx) {
+            let in_project = artifact
+                .project_id
+                .is_some_and(|artifact_project| match &group {
+                    Some(group) => group.contains(machine, artifact_project),
+                    None => machine == own_machine && artifact_project == project_id,
+                });
+            let (run, detail) =
+                if machine == own_machine && artifact.thread_id == Some(self.thread_id) {
+                    (0, "This thread".to_string())
+                } else {
+                    let run = if in_project { 1 } else { 2 };
+                    let (_, origin) = thread_group(machines, machine, &artifact, run == 2, cx);
+                    let mut detail = origin.label.to_string();
+                    if origin.is_archived {
+                        detail.push_str(" · archived");
+                    }
+                    if machine != own_machine {
+                        detail.push_str(" · ");
+                        detail.push_str(&machines.label(machine, cx));
+                    }
+                    (run, detail)
+                };
+            runs[run].push(MentionableArtifact {
+                machine,
+                id: artifact.id.clone(),
+                kind: artifact.kind,
+                title: artifact.title.clone().into(),
+                detail: detail.into(),
+            });
+        }
+        runs.into_iter().flatten().collect()
+    }
+
+    /// What mentioning an artifact sends: a short reference the agent reads it by.
+    fn artifact_mention(
+        &self,
+        machine: MachineId,
+        id: &ArtifactId,
+        cx: &App,
+    ) -> Option<(Mention, ChipPreview)> {
+        let own_machine = self.client.read(cx).machine();
+        let machines = Machines::global(cx).read(cx);
+        let artifact = machines
+            .client(machine, cx)?
+            .read(cx)
+            .artifacts()
+            .artifacts
+            .iter()
+            .find(|artifact| &artifact.id == id)?
+            .clone();
+        let place = if machine == own_machine && artifact.thread_id == Some(self.thread_id) {
+            "this thread".to_string()
+        } else {
+            let (_, origin) = thread_group(machines, machine, &artifact, true, cx);
+            if origin.has_thread {
+                origin.label.to_string()
+            } else {
+                "a deleted thread".to_string()
+            }
+        };
+        let machine_name = (machine != own_machine).then(|| machines.label(machine, cx));
+        let mention = Mention::Conversation {
+            uri: format!("agentz://artifact/{}/{}", id.0, artifact.latest()),
+            title: artifact.title.clone(),
+            text: artifact_reference(&artifact, &place, machine_name.as_deref()),
+        };
+        Some((mention, ChipPreview::Text(artifact.description().into())))
+    }
+
     /// A chat ([`projects::ProjectId::CHATS`]): it has no project, its agent's folder isn't
     /// shown, and nothing in it touches a checkout.
     fn is_chat(&self, cx: &App) -> bool {
@@ -2915,6 +3006,12 @@ impl AgentView {
                     ))
                 };
                 (mention, ChipPreview::Text(preview.into()))
+            }
+            MentionTarget::Artifact { machine, id, .. } => {
+                let Some(found) = self.artifact_mention(*machine, id, cx) else {
+                    return;
+                };
+                found
             }
         };
         self.mention_query = None;
@@ -9113,7 +9210,7 @@ impl AgentView {
                 }
                 PromptPart::Conversation { uri, title, text } => (
                     title.clone(),
-                    IconName::Thread,
+                    self.conversation_icon(uri, cx),
                     ChipPreview::Text(title.clone().into()),
                     Mention::Conversation {
                         uri: uri.clone(),
@@ -9145,6 +9242,23 @@ impl AgentView {
                 PromptPart::Conversation { title, .. } => format!("@{title}"),
             })
             .collect()
+    }
+
+    /// A mentioned artifact's kind icon (`agentz://artifact/<id>/<version>`), or a thread's.
+    fn conversation_icon(&self, uri: &str, cx: &App) -> IconName {
+        let Some(id) = uri
+            .strip_prefix("agentz://artifact/")
+            .and_then(|rest| rest.split('/').next())
+        else {
+            return IconName::Thread;
+        };
+        let kind = Machines::global(cx)
+            .read(cx)
+            .artifacts(cx)
+            .into_iter()
+            .find(|(_, artifact)| artifact.id.0 == id)
+            .map_or(ArtifactKind::Document, |(_, artifact)| artifact.kind);
+        artifact_icon(kind)
     }
 
     fn thread_title(&self, thread_id: ThreadId, cx: &App) -> String {
@@ -15244,6 +15358,87 @@ mod tests {
                 PromptPart::Path("/tmp/demo/src/total.ts".into()),
                 PromptPart::Text(" and ".into()),
                 PromptPart::Thread(ThreadId(1)),
+                PromptPart::Text(" ".into()),
+            ]
+        );
+    }
+
+    /// `design/artifacts-2` topic 20: @ lists artifacts first, this thread's, then the
+    /// project's, then any other's, and a mention is a short reference the agent reads it by.
+    #[gpui::test]
+    fn at_mentions_artifacts_this_threads_first(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let artifact =
+            |id: &str, title: &str, thread: u64, project: u64, minutes_ago: u64| Artifact {
+                id: ArtifactId(id.into()),
+                title: title.into(),
+                kind: ArtifactKind::Document,
+                versions: vec![agentz_protocol::artifacts::ArtifactVersion {
+                    published_at: now - minutes_ago * 60_000,
+                    bytes: 1,
+                    files: Vec::new(),
+                }],
+                thread_id: Some(ThreadId(thread)),
+                project_id: Some(ProjectId(project)),
+                agent_id: None,
+                preview: String::new(),
+                design: None,
+                frame_key: "key".into(),
+            };
+        // Newest first would put them the other way around.
+        let artifacts = vec![
+            artifact("mine", "Plan notes", 2, 1, 30),
+            artifact("project", "Plan for login", 1, 1, 20),
+            artifact("elsewhere", "Planning research", 9, 2, 10),
+            artifact("other", "Release notes", 2, 1, 5),
+        ];
+        client.update(cx, |client, cx| {
+            client.set_artifacts_for_test(
+                agentz_protocol::artifacts::Artifacts {
+                    artifacts,
+                    pages: None,
+                },
+                cx,
+            )
+        });
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("@plan");
+        cx.run_until_parked();
+        let found = view.read_with(cx, |view, _| {
+            view.mention_matches
+                .iter()
+                .filter(|found| matches!(found.target, MentionTarget::Artifact { .. }))
+                .map(|found| (found.label.to_string(), found.detail.to_string()))
+                .collect::<Vec<_>>()
+        });
+        let pair = |label: &str, detail: &str| (label.to_string(), detail.to_string());
+        assert_eq!(
+            found,
+            [
+                pair("Plan notes", "This thread"),
+                pair("Plan for login", "New thread"),
+                pair("Planning research", "From a deleted thread"),
+            ]
+        );
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let prompt = view.read_with(cx, |view, cx| view.composer_prompt(cx));
+        assert_eq!(
+            prompt,
+            [
+                PromptPart::Conversation {
+                    uri: "agentz://artifact/mine/1".into(),
+                    title: "Plan notes".into(),
+                    text: "Plan notes: a document (v1), from this thread.\nRead it with \
+                           agentz_artifact_read {\"artifactId\":\"mine\",\"version\":1}."
+                        .into(),
+                },
                 PromptPart::Text(" ".into()),
             ]
         );

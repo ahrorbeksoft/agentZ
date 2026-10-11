@@ -110,11 +110,11 @@ struct Row {
 }
 
 /// The thread a run of rows came from.
-struct Group {
-    label: SharedString,
-    is_archived: bool,
+pub(crate) struct Group {
+    pub(crate) label: SharedString,
+    pub(crate) is_archived: bool,
     /// Whether the thread is still there, for Show Thread.
-    has_thread: bool,
+    pub(crate) has_thread: bool,
 }
 
 pub struct ArtifactsList {
@@ -521,7 +521,7 @@ impl ArtifactsList {
 
 /// The group an artifact is listed under: its thread, "Chat · …" for a chat's, with its project
 /// under All projects; or one group for every deleted thread's.
-fn thread_group(
+pub(crate) fn thread_group(
     machines: &Machines,
     machine: MachineId,
     artifact: &Artifact,

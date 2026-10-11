@@ -1,14 +1,16 @@
 //! The composer's @-mentions (Zed's, with t3code's menu as picked in `design/composer/`): what @
-//! finds as it's typed, files and threads in groups, and what each mention sends.
+//! finds as it's typed, artifacts, files and threads in groups, and what each mention sends.
 
 use std::path::PathBuf;
 
+use agentz_protocol::artifacts::{Artifact, ArtifactId, ArtifactKind};
 use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::{FileListing, PromptPart};
 use gpui::{AnyElement, App, SharedString};
 use projects::{Mentioned, Project, ThreadId};
 use ui::{ListItem, ListItemSpacing, prelude::*};
 
+use crate::artifacts_list::artifact_icon;
 use crate::machines::MachineId;
 use crate::project_info::render_project_icon;
 use crate::project_switcher::fuzzy_match;
@@ -17,6 +19,7 @@ use crate::project_switcher::fuzzy_match;
 const MAX_FILES: usize = 8;
 const MAX_THREADS: usize = 5;
 const MAX_PROJECTS: usize = 5;
+const MAX_ARTIFACTS: usize = 8;
 
 /// What a chip in the composer stands for.
 #[derive(Clone)]
@@ -124,6 +127,16 @@ pub(crate) struct MentionableProject {
     pub detail: SharedString,
 }
 
+/// An artifact @ can mention (`design/artifacts-2`, topic 20), on any machine.
+pub(crate) struct MentionableArtifact {
+    pub machine: MachineId,
+    pub id: ArtifactId,
+    pub kind: ArtifactKind,
+    pub title: SharedString,
+    /// Where it's from, as the menu shows it.
+    pub detail: SharedString,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MentionTarget {
     /// Relative to the file listing's root.
@@ -137,6 +150,52 @@ pub(crate) enum MentionTarget {
         machine: MachineId,
         project: Project,
     },
+    Artifact {
+        machine: MachineId,
+        id: ArtifactId,
+        kind: ArtifactKind,
+    },
+}
+
+/// What the agent gets for a mentioned artifact: what it is and where it's from, to read with
+/// its tools, from whichever machine it's on (`machine`, when not the thread's own).
+pub(crate) fn artifact_reference(
+    artifact: &Artifact,
+    place: &str,
+    machine: Option<&str>,
+) -> String {
+    let version = artifact.latest();
+    let what = match &artifact.design {
+        Some(design) => {
+            let size = if design.topics == 1 {
+                format!("1 topic, {}", design.size())
+            } else {
+                design.size()
+            };
+            let state = if design.submitted_at.is_some() {
+                "submitted".to_string()
+            } else if design.decided > 0 {
+                format!("{} of {} decided", design.decided, design.topics)
+            } else {
+                "nothing picked yet".to_string()
+            };
+            format!("a design ({size}, v{version}, {state})")
+        }
+        None => format!("a document (v{version})"),
+    };
+    let mut arguments = serde_json::json!({
+        "artifactId": artifact.id.0,
+        "version": version,
+    });
+    let mut on = String::new();
+    if let Some(machine) = machine {
+        arguments["machine"] = machine.into();
+        on = format!(", on {machine}");
+    }
+    format!(
+        "{}: {what}, from {place}{on}.\nRead it with agentz_artifact_read {arguments}.",
+        artifact.title
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -146,15 +205,17 @@ pub(crate) struct MentionMatch {
     pub detail: SharedString,
 }
 
-/// What a query finds: files whose name matches before those whose path does, the most
-/// compact matches first; then threads, the latest first. A chat's (with `projects`) lists
-/// projects first, then threads, then the files in its own folder.
+/// What a query finds: artifacts in the order given; files whose name matches before those
+/// whose path does, the most compact matches first; then threads, the latest first. A chat's
+/// (with `projects`) lists projects first, then artifacts, threads, and the files in its own
+/// folder.
 pub(crate) fn find_mentions(
     query: &str,
     kind: MentionKind,
     files: Option<&FileListing>,
     threads: &[MentionableThread],
     projects: Option<&[MentionableProject]>,
+    artifacts: &[MentionableArtifact],
 ) -> Vec<MentionMatch> {
     let query = query.to_lowercase();
     let mut found = Vec::new();
@@ -173,6 +234,23 @@ pub(crate) fn find_mentions(
                     },
                     label: project.name.clone(),
                     detail: project.detail.clone(),
+                }),
+        );
+    }
+    if kind == MentionKind::Any {
+        found.extend(
+            artifacts
+                .iter()
+                .filter(|artifact| fuzzy_match(&query, &artifact.title).is_some())
+                .take(MAX_ARTIFACTS)
+                .map(|artifact| MentionMatch {
+                    target: MentionTarget::Artifact {
+                        machine: artifact.machine,
+                        id: artifact.id.clone(),
+                        kind: artifact.kind,
+                    },
+                    label: artifact.title.clone(),
+                    detail: artifact.detail.clone(),
                 }),
         );
     }
@@ -250,6 +328,7 @@ pub(crate) fn target_icon(target: &MentionTarget) -> IconName {
         }
         MentionTarget::Path { .. } => IconName::File,
         MentionTarget::Thread { .. } => IconName::Thread,
+        MentionTarget::Artifact { kind, .. } => artifact_icon(*kind),
     }
 }
 
@@ -275,6 +354,7 @@ pub(crate) fn render_mention_menu(
             MentionTarget::Path { .. } => "Files",
             MentionTarget::Thread { .. } => "Threads",
             MentionTarget::Project { .. } => "Projects",
+            MentionTarget::Artifact { .. } => "Artifacts",
         };
         if last_group != Some(group) {
             items.push(header(group).into_any_element());
@@ -388,14 +468,83 @@ mod tests {
             title: "Order totals report".into(),
             detail: "2d".into(),
         }];
-        let found = find_mentions("tot", MentionKind::Any, Some(&files), &threads, None);
+        let artifacts = [MentionableArtifact {
+            machine: MachineId::Local,
+            id: ArtifactId("t1".into()),
+            kind: ArtifactKind::Document,
+            title: "Totals research".into(),
+            detail: "This thread".into(),
+        }];
+        let found = find_mentions(
+            "tot",
+            MentionKind::Any,
+            Some(&files),
+            &threads,
+            None,
+            &artifacts,
+        );
         let labels: Vec<&str> = found.iter().map(|found| found.label.as_ref()).collect();
         assert_eq!(
             labels,
-            ["totals", "total.ts", "readme.md", "Order totals report"]
+            [
+                "Totals research",
+                "totals",
+                "total.ts",
+                "readme.md",
+                "Order totals report"
+            ]
         );
-        let only_threads = find_mentions("tot", MentionKind::Threads, Some(&files), &threads, None);
+        let only_threads = find_mentions(
+            "tot",
+            MentionKind::Threads,
+            Some(&files),
+            &threads,
+            None,
+            &artifacts,
+        );
         assert_eq!(only_threads.len(), 1);
+    }
+
+    #[test]
+    fn an_artifacts_reference_says_what_it_is_and_how_to_read_it() {
+        let design = Artifact {
+            id: ArtifactId("5d1c9e".into()),
+            title: "Plans page".into(),
+            kind: ArtifactKind::Design,
+            versions: vec![agentz_protocol::artifacts::ArtifactVersion {
+                published_at: 0,
+                bytes: 10,
+                files: Vec::new(),
+            }],
+            thread_id: Some(ThreadId(3)),
+            project_id: Some(projects::ProjectId(1)),
+            agent_id: None,
+            preview: String::new(),
+            design: Some(agentz_protocol::artifacts::DesignState {
+                topics: 1,
+                variants: 5,
+                decided: 1,
+                ..Default::default()
+            }),
+            frame_key: "key".into(),
+        };
+        assert_eq!(
+            artifact_reference(&design, "storefront › Design the plans page", None),
+            "Plans page: a design (1 topic, 5 variants, v1, 1 of 1 decided), from storefront › \
+             Design the plans page.\nRead it with agentz_artifact_read \
+             {\"artifactId\":\"5d1c9e\",\"version\":1}."
+        );
+        let document = Artifact {
+            kind: ArtifactKind::Document,
+            design: None,
+            ..design
+        };
+        assert_eq!(
+            artifact_reference(&document, "this thread", Some("Devbox 1")),
+            "Plans page: a document (v1), from this thread, on Devbox 1.\nRead it with \
+             agentz_artifact_read {\"artifactId\":\"5d1c9e\",\"version\":1,\
+             \"machine\":\"Devbox 1\"}."
+        );
     }
 
     #[test]
@@ -426,14 +575,30 @@ mod tests {
             name: "storefront".into(),
             detail: "".into(),
         }];
+        let artifacts = [MentionableArtifact {
+            machine: MachineId::Local,
+            id: ArtifactId("s1".into()),
+            kind: ArtifactKind::Design,
+            title: "Storefront plans".into(),
+            detail: "storefront › Design the plans page".into(),
+        }];
         let found = find_mentions(
             "st",
             MentionKind::Any,
             Some(&files),
             &threads,
             Some(&projects),
+            &artifacts,
         );
         let labels: Vec<&str> = found.iter().map(|found| found.label.as_ref()).collect();
-        assert_eq!(labels, ["storefront", "Stock levels", "store-notes.md"]);
+        assert_eq!(
+            labels,
+            [
+                "storefront",
+                "Storefront plans",
+                "Stock levels",
+                "store-notes.md"
+            ]
+        );
     }
 }

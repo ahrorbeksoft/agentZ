@@ -628,7 +628,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   that machine first (`Request::UploadFile`, kept in the thread's `attachments/…/files/`) and
   the mention names the copy there; a folder can't be, so it goes as its path. Paste as Plain
   Text pastes only text. A chat's @ lists Projects, every project's Threads and its own Files
-  (see Chats).
+  (see Chats). Artifacts come first (after a chat's Projects; see Artifacts).
 - **Sending mentions** (`PromptPart`, `agent_thread::MessagePart`): a message goes as its parts
   in order. The server reads a mentioned file (up to 1 MB of text) and takes a mentioned
   thread's conversation (`thread::mentioned_thread`, the handoff's summary), starting its agent
@@ -1378,6 +1378,15 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   project. A card's Show in List (`artifacts::ShowInList`) opens it at that artifact, under All
   projects when it isn't the picked project's. `artifacts: show all` in the command palette
   opens the artifacts page.
+- **Mentions** (`AgentView::{mentionable_artifacts, artifact_mention}`,
+  `mention_menu::artifact_reference`; `design/artifacts-2` topic 20): @ has an Artifacts group
+  before Files and Threads, every connected machine's: this thread's first ("This thread"),
+  then its project's on any machine (a chat's: the other chats'), then the rest, each with
+  where it's from, "· archived" and another machine's name. A mention is a chip with the
+  kind's icon, sent as a short reference (`PromptPart::Conversation`,
+  `agentz://artifact/<id>/<version>`): what it is ("a design (1 topic, 5 variants, v1, 1 of 1
+  decided)"), where it's from, its machine when it's not the thread's, and the
+  `agentz_artifact_read` call that reads it.
 - **Opening on publish** (`Shell::open_published_artifact`, Settings › General › Artifacts ›
   "Open in the browser", `ArtifactAutoOpen`): when its thread is on screen (the default), on an
   artifact's first publish, or never. Only a publish the app hears while connected counts
