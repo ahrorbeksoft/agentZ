@@ -776,6 +776,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   thread work as for a turn, with its reply as a new message, until the agent's result (a
   usage update with its cost) or 30 seconds without updates or running tool calls. Messages sent
   meanwhile wait for it, as for a turn; Stop cancels it.
+- **Stop** (`AgentThread::{cancel, end_unanswered_turn}`; Zed's `cancel_inner` ends the turn at
+  once): Stop sends `session/cancel` and the turn ends when the agent answers its prompt as
+  cancelled. One that hasn't answered 10 seconds later ends as stopped all the same, its
+  running tool calls Stopped, and the agent restarts with its session (Reload Agent), since
+  Factory Droid refuses a prompt while it still has one. Droid never answers a prompt whose
+  session it closed meanwhile: it closes one after 30 minutes without activity, even while
+  the turn waits on the user's answer, so agentZ starts it with the longest wait it takes
+  (`OVERRIDE_DROID_SESSION_TIMEOUT_MS`, from `AgentDescription::variables`, which every
+  account's agent gets), and stops idle agents itself (Agent lifetimes).
 - **Images** (`attachment_image.rs`, `server/attachment_requests.rs`; t3code's attachments and
   `ExpandedImageDialog`): every image in a thread is kept by its server, so every client sees
   it. Clients fetch one by id (`Request::Attachment`), as a 640-pixel PNG thumbnail (made once

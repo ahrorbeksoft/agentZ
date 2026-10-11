@@ -2028,10 +2028,10 @@ impl Server {
             || self.has_unannounced_tasks(thread_id)
     }
 
-    /// The command that starts the agent, with the environment from the account's settings
-    /// (`None` being the External account). An agentZ account's agent runs in the account's
-    /// home, so each account is an agent process of its own. Threads opened right after launch
-    /// wait for the registry to load.
+    /// The command that starts the agent, with its description's variables and the environment
+    /// from the account's settings (`None` being the External account). An agentZ account's
+    /// agent runs in the account's home, so each account is an agent process of its own.
+    /// Threads opened right after launch wait for the registry to load.
     fn agent_command(
         &mut self,
         agent_id: &AgentId,
@@ -2051,10 +2051,17 @@ impl Server {
             None => self.registry.command(agent_id),
         };
         let env = self.account_settings(agent_id, account).env;
+        let external_description = match account {
+            None => self.account_description(agent_id),
+            Some(_) => None,
+        };
         async move {
             let mut command = command.await?;
             match home {
-                None => command.env.extend(env),
+                None => match external_description {
+                    Some(description) => description.apply_external(&mut command, env),
+                    None => command.env.extend(env),
+                },
                 Some((description, home)) => {
                     std::fs::create_dir_all(&home)
                         .with_context(|| format!("creating {}", home.display()))?;

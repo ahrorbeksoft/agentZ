@@ -65,6 +65,7 @@ pub(super) fn description() -> AgentDescription {
         ]
         .map(String::from)
         .to_vec(),
+        variables: BTreeMap::new(),
         skills_folders: vec!["skills".into()],
         // Whatever its home, as Devin reads Claude's.
         outside_skills_folders: vec![

@@ -71,6 +71,10 @@ const OWN_WORK_QUIET: Duration = Duration::from_secs(30);
 /// result, as Claude Agent does, before the thread counts as done without it.
 const OWN_WORK_GRACE: Duration = Duration::from_secs(15);
 
+/// How long a stopped turn waits for the agent to answer its prompt, as ACP says it must,
+/// before it ends without the answer.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
     WorkingChanged(bool),
@@ -232,6 +236,8 @@ enum MessageKind {
     OwnWorkQuiet(u64),
     /// [`OWN_WORK_GRACE`] passed since the background task with this count ended.
     OwnWorkOverdue(u64),
+    /// [`STOP_TIMEOUT`] passed since the turn with this count was stopped.
+    StopOverdue(u64),
     /// The owner's work after the agent's work of its own is done.
     OwnWorkEnded,
     /// The agent reported on one of its own subagents, in the session given.
@@ -381,6 +387,8 @@ pub struct AgentThread {
     turn_hook: Option<TurnHook>,
     /// Set by [`Self::cancel`] for the turn in flight, in case its prompt hasn't gone out yet.
     turn_cancelled: Option<Arc<AtomicBool>>,
+    /// Counts the prompts sent, so a stop's [`STOP_TIMEOUT`] ends only the turn it stopped.
+    prompts_sent: u64,
     stderr_lines: VecDeque<String>,
     /// False for a connection made only to log in or out (from settings), which never opens a
     /// session.
@@ -761,6 +769,7 @@ impl AgentThread {
             terminal_host: None,
             turn_hook: None,
             turn_cancelled: None,
+            prompts_sent: 0,
             stderr_lines: VecDeque::new(),
             opens_session: true,
             key_method: None,
@@ -1213,6 +1222,17 @@ impl AgentThread {
                 if ended == self.tasks_ended {
                     self.own_work_due = false;
                 }
+            }
+            MessageKind::StopOverdue(turn) => {
+                if turn != self.prompts_sent || !self.is_working() || self.working_on_its_own {
+                    return;
+                }
+                // A handoff in progress takes the agent as it is.
+                if self.is_paused() {
+                    self.check_stop_later();
+                    return;
+                }
+                self.end_unanswered_turn();
             }
         }
     }
@@ -2404,6 +2424,7 @@ impl AgentThread {
         // The prompt's turn ends the work, if the agent was working on its own.
         self.working_on_its_own = false;
         self.own_work_ending = false;
+        self.prompts_sent += 1;
         self.set_working(true);
         let Some(hook) = self.turn_hook.clone() else {
             let response = connection.send_request(request).block_task();
@@ -2439,6 +2460,9 @@ impl AgentThread {
             {
                 log::error!("failed to cancel the agent's turn: {error:?}");
             }
+            if !self.working_on_its_own {
+                self.check_stop_later();
+            }
         } else {
             self.queued_prompts.clear();
             self.set_working(false);
@@ -2447,6 +2471,42 @@ impl AgentThread {
         // No prompt's answer will end it.
         if self.working_on_its_own {
             self.end_own_work();
+        }
+    }
+
+    fn check_stop_later(&mut self) {
+        let turn = self.prompts_sent;
+        self.spawn(async move {
+            tokio::time::sleep(STOP_TIMEOUT).await;
+            MessageKind::StopOverdue(turn)
+        });
+    }
+
+    /// The agent didn't answer the prompt of the turn it was asked to stop. Factory Droid
+    /// never answers it once it has put a session that waited on the user to sleep and woken
+    /// it with their answer, so the thread would work forever. The turn ends as stopped, as Zed
+    /// ends a stopped turn at once, and the agent restarts (Reload Agent): one that kept the
+    /// turn refuses the next prompt.
+    fn end_unanswered_turn(&mut self) {
+        let Some(command) = self.view.state.command.clone() else {
+            return;
+        };
+        log::warn!(
+            "{} didn't answer the stop of its turn in {STOP_TIMEOUT:?}; restarting it",
+            self.view.state.agent_name
+        );
+        self.stop_running_tool_calls();
+        self.view.state.last_stop_reason = Some(acp::StopReason::Cancelled);
+        self.last_message = None;
+        // The prompt's own end, with its hook, stops with the agent.
+        if let (Some(hook), Some(runtime)) = (self.turn_hook.clone(), &self.runtime) {
+            runtime.spawn(hook(TurnPoint::Ended));
+        }
+        let after_turn = std::mem::take(&mut self.after_turn);
+        self.restart_with(command, None);
+        self.after_turn = after_turn;
+        if let Some(parts) = self.after_turn.pop_front() {
+            self.send_after_turn(parts);
         }
     }
 
@@ -4670,7 +4730,11 @@ mod tests {
         }
 
         async fn wait_until(&mut self, done: impl Fn(&AgentThread) -> bool) {
-            let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            self.wait_up_to(Duration::from_secs(5), done).await
+        }
+
+        async fn wait_up_to(&mut self, timeout: Duration, done: impl Fn(&AgentThread) -> bool) {
+            let waited = tokio::time::timeout(timeout, async {
                 while !done(&self.thread) {
                     let message = self.inbox.next().await.expect("the inbox closed");
                     self.thread.handle(message);
@@ -5836,6 +5900,58 @@ mod tests {
         assert_eq!(
             last_message.as_deref(),
             Some("Echo: permission (chose allow)")
+        );
+    }
+
+    /// A stopped turn the agent never answers ends after a while all the same, and the agent
+    /// restarts with its session, which takes the next message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ends_a_stopped_turn_the_agent_never_answers() {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(command) = mock_agent(&[history_file]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("lost-turn".into()));
+        thread
+            .wait_until(|thread| agent_text(thread).contains("turn lost"))
+            .await;
+        let stopped = std::time::Instant::now();
+        thread.update(AgentThread::cancel);
+        // Stopping it again doesn't put the end off.
+        thread.update(AgentThread::cancel);
+        thread
+            .wait_up_to(STOP_TIMEOUT + Duration::from_secs(5), |thread| {
+                !thread.is_working()
+            })
+            .await;
+        assert!(stopped.elapsed() >= STOP_TIMEOUT);
+        assert_eq!(
+            thread.thread.last_stop_reason(),
+            Some(&acp::StopReason::Cancelled)
+        );
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
+
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("hello".into()));
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert_eq!(
+            agent_text(&thread.thread),
+            "Done, with the turn lost.Echo: hello"
+        );
+        assert_eq!(
+            thread.thread.last_stop_reason(),
+            Some(&acp::StopReason::EndTurn)
         );
     }
 

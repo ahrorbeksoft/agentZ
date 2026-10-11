@@ -90,6 +90,7 @@ pub(super) fn description() -> AgentDescription {
         ]
         .map(String::from)
         .to_vec(),
+        variables: BTreeMap::new(),
         skills_folders: vec!["config/skills".into(), "antigravity-cli/skills".into()],
         // It reads no skills outside its home but the project's.
         outside_skills_folders: Vec::new(),

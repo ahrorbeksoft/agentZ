@@ -68,6 +68,7 @@ pub(super) fn description() -> AgentDescription {
             "ANTHROPIC_AUTH_TOKEN".into(),
             "CLAUDE_CODE_OAUTH_TOKEN".into(),
         ],
+        variables: BTreeMap::new(),
         skills_folders: vec!["skills".into()],
         outside_skills_folders: Vec::new(),
         // Its sessions open while it's logged out. `loggedIn` is also true on an API key or

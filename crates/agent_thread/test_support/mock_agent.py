@@ -34,7 +34,9 @@ the tool call (or array of them) in the JSON as completed, as given (title, kind
 content, locations), and ends the turn. "running" starts a command ("sleep 60") that runs
 until the turn is cancelled, which it then answers as cancelled, without ending the command's
 tool call. "network-error" starts a reply, then fails as a turn
-does once an agent gives up on a lost connection; sent again, it's echoed.
+does once an agent gives up on a lost connection; sent again, it's echoed. "lost-turn" replies
+but never answers the prompt, even once the turn is cancelled, as Factory Droid loses a turn
+once it has put a session that waited on the user to sleep.
 
 With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail with
 "authentication required" and a pairing code, as Factory Droid does); "mock-login" creates
@@ -1023,6 +1025,10 @@ for line in sys.stdin:
             update(params["sessionId"], text_chunk("agent_message_chunk",
                                                    "MCP: " + call_mcp_tool(name, arguments)))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+        elif prompt_text == "lost-turn":
+            # As Factory Droid loses a turn once it has put a session that waited on the user
+            # to sleep: it replies, but never answers the prompt, even once it's cancelled.
+            update(params["sessionId"], text_chunk("agent_message_chunk", "Done, with the turn lost."))
         elif prompt_text == "running":
             update(params["sessionId"], {"sessionUpdate": "tool_call", "toolCallId": "running-1",
                                          "title": "sleep 60", "kind": "execute",

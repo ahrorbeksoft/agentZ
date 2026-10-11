@@ -129,7 +129,8 @@ From Zed's guidelines, which this code follows:
   `mcp <tool> <json>`), `slow`, `demo`, `form`, `write <path> <text>`, `delete <path>` and
   `tool-call <json>` (tool calls as given, as any agent would send them) script different
   turns (see its docstring), and `network-error` fails its first turn as a lost connection
-  does, and `running` leaves a command running until the turn is stopped. `question` and
+  does, and `running` leaves a command running until the turn is stopped, and `lost-turn`
+  never answers its prompt, even once stopped, as Factory Droid loses a turn. `question` and
   `questions` ask as Claude Agent's AskUserQuestion does, `plan` asks to approve a plan (and
   leaves plan mode once approved), `run-tests` asks to run a command, and `page` asks to open
   a page. `background-task [seconds]` leaves a command running

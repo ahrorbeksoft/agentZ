@@ -344,6 +344,7 @@ fn mock_accounts() -> crate::AgentDescription {
         normal_home: String::new(),
         login_variables: vec!["MOCK_API_KEY".into()],
         // Its External account's home is the user's: tests that link skills name their own.
+        variables: BTreeMap::new(),
         skills_folders: Vec::new(),
         outside_skills_folders: Vec::new(),
         login_check: crate::LoginCheck::Session,

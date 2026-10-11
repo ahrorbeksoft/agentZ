@@ -51,6 +51,7 @@ pub(super) fn description() -> AgentDescription {
         normal_home: ".codex".into(),
         // The adapter's API Key login reads them.
         login_variables: vec!["CODEX_API_KEY".into(), "OPENAI_API_KEY".into()],
+        variables: BTreeMap::new(),
         skills_folders: vec!["skills".into()],
         outside_skills_folders: vec![SHARED_SKILLS_FOLDER.into()],
         // The adapter asks Codex for the account before it opens a session.

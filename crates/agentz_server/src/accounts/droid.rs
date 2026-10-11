@@ -24,6 +24,11 @@ const HOME_SETTINGS: &str = "{\n  \"cloudSessionSync\": false\n}\n";
 /// opens aren't uploaded on any account, the External one included.
 const READER_SETTINGS: &str = "{\"cloudSessionSync\": false}\n";
 const READER_SETTINGS_FILE: &str = "droid-settings.json";
+/// Droid closes a session after 30 minutes without activity, even one whose turn waits on the
+/// user's answer, and the turn it resumes once they answer never ends the prompt: the thread
+/// stays working. The server stops idle agents itself, so Droid gets the longest wait
+/// `setTimeout` takes (about 24 days).
+const SESSION_TIMEOUT_MS: &str = "2147483647";
 /// Wide enough that the trust question's folder fits on one line, and tall enough that
 /// `/status` fits on the screen: Droid draws below what it drew before, and what scrolls off
 /// can't be drawn again.
@@ -69,6 +74,10 @@ pub(super) fn description() -> AgentDescription {
         normal_home: String::new(),
         // A key in the environment overrides the stored login.
         login_variables: vec!["FACTORY_API_KEY".into()],
+        variables: BTreeMap::from([(
+            "OVERRIDE_DROID_SESSION_TIMEOUT_MS".into(),
+            SESSION_TIMEOUT_MS.into(),
+        )]),
         // Both in the home it's given.
         skills_folders: vec![".factory/skills".into(), ".agents/skills".into()],
         outside_skills_folders: Vec::new(),
