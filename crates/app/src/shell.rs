@@ -3302,6 +3302,67 @@ mod modal_tests {
         assert_eq!(panel_width(cx), None);
     }
 
+    /// A narrow thread's header has its changes in ⋯, which shows and hides the panel as the
+    /// header's button does.
+    #[gpui::test]
+    fn a_narrow_threads_menu_shows_its_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let projects = client.read(cx).projects().clone();
+            let thread: projects::Thread = serde_json::from_value(serde_json::json!({
+                "id": 5,
+                "project_id": 1,
+                "title": "Fix the login",
+                "agent_id": "mock",
+            }))
+            .expect("a thread");
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![demo_project(1, "/tmp/demo")],
+                        threads: vec![thread],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+            crate::sidebar::init(cx);
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        cx.simulate_resize(gpui::size(px(700.), px(800.)));
+        shell.update_in(cx, |shell, window, cx| {
+            let key = ThreadKey {
+                machine: MachineId::Local,
+                thread: ThreadId(5),
+            };
+            shell.open_thread(key, window, cx);
+            window.focus(&shell.focus_handle, cx);
+        });
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        assert!(cx.debug_bounds("thread-header-changes").is_none());
+        click("thread-options", cx);
+        click("thread-options-changes", cx);
+        assert!(cx.debug_bounds("diff-panel").is_some());
+        click("thread-options", cx);
+        click("thread-options-changes", cx);
+        assert!(cx.debug_bounds("diff-panel").is_none());
+    }
+
     #[gpui::test]
     fn cmd_d_splits_in_workspaces_and_shows_changes_in_agents(cx: &mut TestAppContext) {
         init_places(cx);

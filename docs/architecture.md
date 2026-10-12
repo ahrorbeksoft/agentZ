@@ -872,13 +872,28 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Source Thread and Merge Back (below). A Workspaces thread has its folder (icon and name, the path in its
   tooltip) where the project goes, and no Archive. A chat has Chat there (a click starts
   another), and only "⋯" at the right: no branch, changes or Terminal, and no Archive.
+- **Narrow threads** (`AgentView::view_width`, measured by `render_view_measure`;
+  `render_toolbar`, `CompactHeaderItems`, `render_options_menu`; design round
+  `design/thread-narrow/`, 2 C and 3 B, from t3code's compact controls): a thread can be as
+  narrow as 320 px (a small window, or the Changes panel beside it). In the header the
+  branch gives way first, as it shrinks faster than the rest (to 72 px, and under 560 px
+  only its icon, its name and folder in the tooltip); then the title truncates, keeping at
+  least 120 px, and the project's name shrinks only after it. At 360 px and under the
+  project shows only its icon. Under 480 px the branch, the artifacts pill, the changes and
+  Terminal leave the header for "⋯", which they head: the branch as a line, Toggle
+  Terminal, Show or Hide Changes with the counts, then the artifacts, then the agent's
+  options; Terminal's running dot moves onto "⋯". Under 560 px the composer's agent picker
+  shows only its icon and a sent thread's account picker only its avatar, their names in
+  the tooltips, and when its controls wrap, they keep to the right, so Send stays in the
+  corner.
 - **Switching agents** (`Request::SwitchAgent`, `Server::switch_agent` in
   `server/workspace_requests.rs`, `ProjectStore::switch_thread_agent`,
   `agentz_protocol::thread::switch_handoff`, `agent_view.rs`'s `render_agent_picker`,
   `render_account_picker` and `render_switch_divider`; t3code's in-thread provider switch and
   context handoff, design round `design/agent-switching/`): a sent thread's composer has the
   agent picker, and beside it the account picker while the agent has more than one account
-  (the current one "This thread's account"). They work between turns. Picking another agent
+  (the current one under "This thread", the others under "Switch to"; `design/thread-narrow/`,
+  1 D). They work between turns. Picking another agent
   or account stops the thread's agent, keeping the conversation in its transcript, and starts
   the new one in the same thread and folder: in the session it had in the thread, if it was
   there before (`Thread::other_sessions`, each with how many entries it saw), or in a new one.
@@ -993,7 +1008,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   server answers. The account picker (`AgentView::render_account_picker`,
   §12 of the accounts round) shows only while the agent lists more than one account: the
   draft's account with its avatar, and a menu of the accounts with their plan (or "Logged
-  out") and the window closest to running out (`usage_limits::tightest_window`), then Manage
+  out") and the window closest to running out (`usage_limits::tightest_window`), the draft's
+  under "This thread" and the others under "Switch to", as a sent thread's, then Manage
   Accounts…, which opens the agent's Account tab on the thread's machine
   (`AgentViewEvent::OpenAgentAccounts`, `SettingsPage::show_agent_accounts`). Another
   checkout keeps the draft's account; another agent or machine takes its account for new

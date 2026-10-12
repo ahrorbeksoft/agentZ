@@ -137,6 +137,26 @@ const MIN_DRAWER_HEIGHT: Pixels = px(100.);
 const MIN_CONVERSATION_HEIGHT: Pixels = px(160.);
 /// The strip along a panel's edge that drags to resize it.
 pub(crate) const RESIZE_EDGE_SIZE: Pixels = px(6.);
+/// Narrower than this, the thread's header moves its branch, changes, artifacts and Terminal
+/// into its ⋯ menu (`design/thread-narrow`, topic 2C).
+const COMPACT_HEADER_WIDTH: Pixels = px(480.);
+/// Narrower than this, the header's branch shows only its icon.
+const BRANCH_ICON_WIDTH: Pixels = px(560.);
+/// This narrow or narrower, the header's project shows only its icon.
+const PROJECT_ICON_WIDTH: Pixels = px(360.);
+/// The least the header leaves the title: everything else gives way first.
+const MIN_HEADER_TITLE_WIDTH: Pixels = px(120.);
+/// How fast the header's branch and project's name shrink against the title's 1: the branch
+/// gives way first, then the title, and the project's name only once the title is at its
+/// least.
+const BRANCH_SHRINK: f32 = 1000.;
+const PROJECT_NAME_SHRINK: f32 = 0.001;
+/// The least the branch shrinks to before the project and title do: its icon and a few
+/// letters.
+const MIN_BRANCH_WIDTH: Pixels = px(72.);
+/// Narrower than this, the composer's agent and account show only their icon and avatar
+/// (`design/thread-narrow`, topic 3B).
+const COMPACT_COMPOSER_WIDTH: Pixels = px(560.);
 
 /// The drawer's top edge, being dragged to resize it.
 struct DraggedDrawerEdge;
@@ -452,6 +472,9 @@ pub struct AgentView {
     list_state: ListState,
     /// The conversation's width when it was last drawn, which places the turn rail.
     conversation_width: Pixels,
+    /// The view's width when it was last drawn, which the header and composer fit; zero
+    /// until then.
+    view_width: Pixels,
     turn_rail_hover: TurnRailHover,
     /// Where the turn rail's strips were last drawn, to find the turn under the mouse.
     turn_rail_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -724,6 +747,7 @@ impl AgentView {
                 list_state
             },
             conversation_width: px(0.),
+            view_width: px(0.),
             turn_rail_hover: TurnRailHover::default(),
             turn_rail_bounds: Rc::default(),
             synced_revisions: Vec::new(),
@@ -3649,6 +3673,47 @@ impl AgentView {
         .size_full()
     }
 
+    /// Measures the view, whose width decides what its header and composer leave out, and
+    /// draws it again when that changes.
+    fn render_view_measure(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let drawn_width = self.view_width;
+        canvas(
+            move |bounds, window, cx| {
+                let width = bounds.size.width;
+                if width != drawn_width {
+                    window.defer(cx, move |_, cx| {
+                        view.update(cx, |view, cx| {
+                            view.view_width = width;
+                            cx.notify();
+                        })
+                        .log_err();
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
+    /// Whether the view is narrower than `width`. Before it's drawn, it's taken to be wide.
+    fn is_narrower_than(&self, width: Pixels) -> bool {
+        self.view_width > px(0.) && self.view_width < width
+    }
+
+    fn is_at_most(&self, width: Pixels) -> bool {
+        self.view_width > px(0.) && self.view_width <= width
+    }
+
+    fn is_header_compact(&self) -> bool {
+        self.is_narrower_than(COMPACT_HEADER_WIDTH)
+    }
+
+    fn is_composer_compact(&self) -> bool {
+        self.is_narrower_than(COMPACT_COMPOSER_WIDTH)
+    }
+
     /// t3code's timeline minimap, in the gutter left of the conversation's text: a strip for
     /// each of the user's messages, bright while it's in view, a preview of the turn under the
     /// mouse, and Previous and Next turn buttons. Shown once there are two turns, all the time
@@ -4027,6 +4092,8 @@ impl AgentView {
         } else {
             self.render_title_menu(cx)
         };
+        // Narrow, the branch, the artifacts, the changes and Terminal are in ⋯.
+        let is_compact = self.is_header_compact();
         h_flex()
             .h(TOOLBAR_HEIGHT)
             .flex_none()
@@ -4037,13 +4104,22 @@ impl AgentView {
             .when(is_chat, |toolbar| toolbar.child(self.render_chat_crumb(cx)))
             .children(project.map(|project| self.render_project_crumb(&project, cx)))
             .children(folder.map(render_folder_crumb))
-            // From the title's own width, so a narrow header shrinks it and the project's name
-            // together.
-            .child(h_flex().flex_auto().min_w_0().child(title))
+            // From the title's own width; the branch gives way before it, and the project's
+            // name only once it's at its least.
+            .child(
+                h_flex()
+                    .debug_selector(|| "thread-header-title-slot".into())
+                    .flex_auto()
+                    .min_w(MIN_HEADER_TITLE_WIDTH)
+                    .child(title),
+            )
             .children(self.render_fork_source_pill(cx))
-            .children(self.render_artifacts_pill(cx))
-            .when(!is_chat, |toolbar| toolbar.children(self.render_branch(cx)))
-            .child(self.render_toolbar_buttons(is_chat, cx))
+            .when(!is_compact, |toolbar| {
+                toolbar
+                    .children(self.render_artifacts_pill(cx))
+                    .when(!is_chat, |toolbar| toolbar.children(self.render_branch(cx)))
+            })
+            .child(self.render_toolbar_buttons(is_chat, is_compact, cx))
     }
 
     /// Chat where a thread's project is; a click starts another chat, as the project starts
@@ -4097,9 +4173,14 @@ impl AgentView {
         });
         let icon = render_project_icon(machine, project, px(14.), cx);
         let hover = cx.theme().colors().ghost_element_hover;
-        // Shrinks with the title when the header is narrow, so neither takes all the room.
+        let shows_name = !self.is_at_most(PROJECT_ICON_WIDTH);
+        // Its name keeps its width while the title truncates, and only shrinks once the
+        // title is down to its least; very narrow it shows only its icon, which never shrinks.
         h_flex()
-            .min_w_0()
+            .when(shows_name, |crumb| {
+                crumb.min_w_0().flex_shrink(PROJECT_NAME_SHRINK)
+            })
+            .when(!shows_name, |crumb| crumb.flex_none())
             .gap_1()
             .child(
                 h_flex()
@@ -4113,14 +4194,20 @@ impl AgentView {
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
                     .child(div().flex_none().child(icon))
-                    .child(
-                        div().min_w_0().max_w(px(160.)).child(
-                            Label::new(name.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        ),
-                    )
+                    .when(shows_name, |crumb| {
+                        crumb.child(
+                            div()
+                                .debug_selector(|| "thread-header-project-name".into())
+                                .min_w_0()
+                                .max_w(px(160.))
+                                .child(
+                                    Label::new(name.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                    })
                     .tooltip(Tooltip::text(format!("New Thread in {name}")))
                     .on_click(new_thread),
             )
@@ -4345,14 +4432,31 @@ impl AgentView {
         Some((branch.into(), icon, folder))
     }
 
-    /// The branch the thread works on, marked as a worktree or pasture's.
+    /// The branch the thread works on, marked as a worktree or pasture's. It's the first to
+    /// give way when the header is narrow: it truncates, then shows only its icon, with its
+    /// name in the tooltip.
     fn render_branch(&self, cx: &App) -> Option<AnyElement> {
         let (branch, icon, folder) = self.thread_branch(cx)?;
+        let is_icon_only = self.is_narrower_than(BRANCH_ICON_WIDTH);
+        let folder: SharedString = folder.display().to_string().into();
+        let tooltip_title = is_icon_only.then(|| branch.clone());
+        let tooltip = move |_: &mut Window, cx: &mut App| match &tooltip_title {
+            Some(branch) => Tooltip::with_meta(branch.clone(), None, folder.clone(), cx),
+            None => Tooltip::simple(folder.clone(), cx),
+        };
         Some(
             h_flex()
                 .id("thread-header-branch")
-                .flex_none()
-                .max_w(px(200.))
+                .debug_selector(|| "thread-header-branch".into())
+                .map(|pill| {
+                    if is_icon_only {
+                        pill.flex_none()
+                    } else {
+                        pill.flex_shrink(BRANCH_SHRINK)
+                            .min_w(MIN_BRANCH_WIDTH)
+                            .max_w(px(200.))
+                    }
+                })
                 .h(px(22.))
                 .px_1p5()
                 .gap_1()
@@ -4360,13 +4464,17 @@ impl AgentView {
                 .border_1()
                 .border_color(cx.theme().colors().border_variant)
                 .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-                .child(
-                    Label::new(branch)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
-                )
-                .tooltip(Tooltip::text(folder.display().to_string()))
+                .when(!is_icon_only, |pill| {
+                    pill.child(
+                        div().min_w_0().child(
+                            Label::new(branch)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                })
+                .tooltip(tooltip)
                 .into_any_element(),
         )
     }
@@ -4927,32 +5035,53 @@ impl AgentView {
     }
 
     /// The changes, terminal and agent options buttons; a chat's agent options alone.
-    fn render_toolbar_buttons(&self, is_chat: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The commands still running in the thread's terminals while its drawer is hidden.
+    fn hidden_running_commands(&self, cx: &App) -> Vec<String> {
+        if self.is_drawer_open {
+            return Vec::new();
+        }
+        self.client
+            .read(cx)
+            .projects()
+            .read(cx)
+            .drawer_commands(self.thread_id)
+            .map(|(_, command)| command.to_string())
+            .collect()
+    }
+
+    fn render_toolbar_buttons(
+        &self,
+        is_chat: bool,
+        is_compact: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        if is_compact {
+            let items = self.compact_header_items(is_chat, cx);
+            return h_flex()
+                .flex_none()
+                .child(self.render_options_menu(Some(items), cx));
+        }
         if is_chat {
             return h_flex().child(self.render_agent_options(cx));
         }
         h_flex()
+            .flex_none()
             .gap_1p5()
-            .child(render_changes_button(self.changes, self.is_diff_open))
+            .child(
+                div()
+                    .debug_selector(|| "thread-header-changes".into())
+                    .child(render_changes_button(self.changes, self.is_diff_open)),
+            )
             .child({
                 // With the drawer hidden, a dot says something still runs in its terminals.
-                let running: Vec<String> = if self.is_drawer_open {
-                    Vec::new()
-                } else {
-                    self.client
-                        .read(cx)
-                        .projects()
-                        .read(cx)
-                        .drawer_commands(self.thread_id)
-                        .map(|(_, command)| command.to_string())
-                        .collect()
-                };
+                let running = self.hidden_running_commands(cx);
                 let tooltip: SharedString = match running.as_slice() {
                     [] => "Toggle Terminal".into(),
                     [command] => format!("Toggle Terminal · {command} running").into(),
                     commands => format!("Toggle Terminal · {} running", commands.join(", ")).into(),
                 };
                 div()
+                    .debug_selector(|| "thread-header-terminal".into())
                     .relative()
                     .child(
                         IconButton::new("toggle-terminal-drawer", IconName::Terminal)
@@ -4974,17 +5103,61 @@ impl AgentView {
             .child(self.render_agent_options(cx))
     }
 
+    /// What a narrow header moves into its ⋯ menu.
+    fn compact_header_items(&self, is_chat: bool, cx: &App) -> CompactHeaderItems {
+        let machine = self.store.read(cx).machine();
+        let machines = Machines::global(cx).read(cx);
+        let artifacts = self
+            .thread_artifacts(cx)
+            .into_iter()
+            .map(|artifact| {
+                let link = machines.artifact_link(machine, &artifact.id, None, cx);
+                (artifact, link)
+            })
+            .collect();
+        CompactHeaderItems {
+            branch: (!is_chat)
+                .then(|| self.thread_branch(cx))
+                .flatten()
+                .map(|(branch, icon, _)| (branch, icon)),
+            has_terminal: !is_chat,
+            is_running: !is_chat && !self.hidden_running_commands(cx).is_empty(),
+            changes: (!is_chat).then_some((self.changes, self.is_diff_open)),
+            artifacts,
+        }
+    }
+
     /// Zed's agent options: log in again, log out, or restart the agent. A workspace pane's
     /// header shows them too.
-    pub(crate) fn render_agent_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_agent_options(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.render_options_menu(None, cx)
+    }
+
+    /// The header's ⋯: the agent's options, after what a narrow header moved into it (t3code's
+    /// compact controls menu): the branch as a line at the top, then Toggle Terminal, the
+    /// changes and the artifacts. With the drawer hidden, its dot says something still runs
+    /// in the thread's terminals.
+    fn render_options_menu(
+        &self,
+        header_items: Option<CompactHeaderItems>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let thread = self.thread.clone();
         let view = cx.weak_entity();
         let agent_name = self.agent_name(cx);
-        PopoverMenu::new("thread-options")
+        let is_running = header_items.as_ref().is_some_and(|items| items.is_running);
+        let tooltip = if header_items.is_some() {
+            "More Options"
+        } else {
+            "Agent Options"
+        };
+        let header_items = header_items.map(Rc::new);
+        let menu = PopoverMenu::new("thread-options")
             .menu(move |window, cx| {
                 let thread = thread.clone();
                 let view = view.clone();
                 let agent_name = agent_name.clone();
+                let header_items = header_items.clone();
                 let (has_auth_methods, supports_logout, can_reload) = {
                     let thread = thread.read(cx);
                     (
@@ -4994,6 +5167,12 @@ impl AgentView {
                     )
                 };
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if let Some(items) = &header_items {
+                        menu = items.add_to_menu(menu, &view);
+                        if has_auth_methods || supports_logout || can_reload {
+                            menu = menu.separator();
+                        }
+                    }
                     if has_auth_methods {
                         let thread = thread.clone();
                         menu = menu.entry("Reauthenticate", None, move |_, cx| {
@@ -5028,9 +5207,17 @@ impl AgentView {
             .trigger_with_tooltip(
                 IconButton::new("thread-options-trigger", IconName::Ellipsis)
                     .icon_size(IconSize::Small),
-                Tooltip::text("Agent Options"),
+                Tooltip::text(tooltip),
             )
-            .anchor(gpui::Anchor::TopRight)
+            .anchor(gpui::Anchor::TopRight);
+        div()
+            .debug_selector(|| "thread-options".into())
+            .relative()
+            .child(menu)
+            .when(is_running, |button| {
+                button.child(indicator_dot(cx).debug_selector(|| "thread-options-running".into()))
+            })
+            .into_any_element()
     }
 
     /// Whether the message is a subthread's first, the task its parent sent.
@@ -10640,9 +10827,10 @@ impl AgentView {
                             })),
                     )
                     // Zed's footer: when it's too narrow, the controls go to their own row as a
-                    // whole, then wrap within it.
+                    // whole, at the right so Send stays in the corner, then wrap within it.
                     .child(
                         h_flex()
+                            .debug_selector(|| "composer-footer".into())
                             .w_full()
                             .min_w_0()
                             .flex_none()
@@ -10669,16 +10857,23 @@ impl AgentView {
                                             .children(self.render_usage_gauge(cx))
                                             .into_any_element(),
                                         (ComposerStyle::Bar, None) => h_flex()
+                                            .id("thread-agent-name")
                                             .gap_1()
                                             .px_1()
                                             .child(
                                                 self.thread_agent_icon(cx).size(IconSize::XSmall),
                                             )
-                                            .child(
-                                                Label::new(agent_name)
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted),
-                                            )
+                                            .map(|agent| {
+                                                if self.is_composer_compact() {
+                                                    agent.tooltip(Tooltip::text(agent_name))
+                                                } else {
+                                                    agent.child(
+                                                        Label::new(agent_name)
+                                                            .size(LabelSize::Small)
+                                                            .color(Color::Muted),
+                                                    )
+                                                }
+                                            })
                                             .children(self.render_usage_gauge(cx))
                                             .into_any_element(),
                                         (ComposerStyle::Card, _) => {
@@ -10688,8 +10883,13 @@ impl AgentView {
                             )
                             .child(
                                 h_flex()
+                                    .debug_selector(|| "composer-controls".into())
+                                    // Fills what its line leaves, so it keeps to the right
+                                    // there.
+                                    .flex_grow_1()
                                     .min_w_0()
                                     .flex_wrap()
+                                    .justify_end()
                                     .gap_1()
                                     .children(self.render_context_usage(cx))
                                     .children(settings_loading)
@@ -10949,6 +11149,14 @@ impl AgentView {
                 ("thread-agent", "thread-agent-trigger", !can_switch)
             }
         };
+        // Narrow, only its icon, with its name in the tooltip.
+        let is_compact = self.is_composer_compact();
+        let agent_name = self.agent_name(cx);
+        let tooltip: SharedString = if is_compact {
+            agent_name.clone()
+        } else {
+            "Change Agent".into()
+        };
         let menu = PopoverMenu::new(id)
             .menu(move |window, cx| {
                 let agents: Vec<(AgentId, SharedString)> = {
@@ -11042,9 +11250,13 @@ impl AgentView {
                 }))
             })
             .trigger_with_tooltip(
-                picker_chip(trigger_id, self.agent_icon(cx), self.agent_name(cx))
-                    .disabled(disabled),
-                Tooltip::text("Change Agent"),
+                if is_compact {
+                    icon_picker_chip(trigger_id, self.agent_icon(cx))
+                } else {
+                    picker_chip(trigger_id, self.agent_icon(cx), agent_name)
+                }
+                .disabled(disabled),
+                Tooltip::text(tooltip),
             )
             .anchor(gpui::Anchor::TopLeft)
             .offset(gpui::point(px(0.), px(4.)));
@@ -11662,22 +11874,24 @@ impl AgentView {
         // A draft made before its account was found logged out still shows it.
         let current = self.store.read(cx).thread(self.thread_id)?.account;
         let shown = account_entry(&accounts, current);
-        let (id, trigger_id, selector, current_note, disabled) = match picker {
+        let (id, trigger_id, selector, disabled) = match picker {
             PickerFor::NewThread => (
                 "new-thread-account",
                 "new-thread-account-trigger",
                 "new-thread-account",
-                None,
                 false,
             ),
             PickerFor::SentThread { can_switch } => (
                 "thread-account",
                 "thread-account-trigger",
                 "thread-account",
-                Some(SharedString::from("This thread’s account")),
                 !can_switch,
             ),
         };
+        // Narrow, the composer's shows only its avatar, with its name in the tooltip. The new
+        // thread's sits with the other pickers under its composer, which keep their names.
+        let is_compact =
+            matches!(picker, PickerFor::SentThread { .. }) && self.is_composer_compact();
         let chip = ButtonLike::new(trigger_id)
             .style(ButtonStyle::Subtle)
             .size(ButtonSize::Compact)
@@ -11687,60 +11901,71 @@ impl AgentView {
                     .min_w_0()
                     .gap_1()
                     .child(render_entry_avatar(&shown, px(14.), cx))
-                    .child(
-                        Label::new(shown.name.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
-                    )
+                    .when(!is_compact, |chip| {
+                        chip.child(
+                            Label::new(shown.name.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                    })
                     .child(
                         Icon::new(IconName::ChevronDown)
                             .size(IconSize::XSmall)
                             .color(Color::Muted),
                     ),
             );
+        let tooltip: SharedString = if is_compact {
+            shown.name.clone()
+        } else {
+            "Account".into()
+        };
         let view = cx.weak_entity();
         let now = SystemTime::now();
         let menu = PopoverMenu::new(id)
             .menu(move |window, cx| {
                 let view = view.clone();
                 let entries = entries.clone();
+                let shown = shown.clone();
                 let agent_id = agent_id.clone();
-                let current_note = current_note.clone();
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for entry in &entries {
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let add_row = |menu: ContextMenu, entry: &AccountEntry| {
                         let account = entry.account;
-                        let is_current = account == current;
-                        let note = current_note.clone().filter(|_| is_current);
                         let entry = entry.clone();
                         let view = view.clone();
                         let agent_id = agent_id.clone();
-                        menu = menu.custom_entry(
+                        menu.custom_entry(
+                            move |_, cx| render_account_row(selector, &entry, now, cx),
                             move |_, cx| {
-                                render_account_row(
-                                    selector,
-                                    &entry,
-                                    note.clone(),
-                                    is_current,
-                                    now,
-                                    cx,
-                                )
-                            },
-                            move |_, cx| {
+                                if account == current {
+                                    return;
+                                }
                                 let agent_id = agent_id.clone();
                                 view.update(cx, |view, cx| match picker {
                                     PickerFor::NewThread => {
                                         view.change_new_thread_account(account, cx)
                                     }
-                                    PickerFor::SentThread { .. } if account != current => {
+                                    PickerFor::SentThread { .. } => {
                                         view.switch_agent(agent_id, AccountChoice::of(account), cx)
                                     }
-                                    PickerFor::SentThread { .. } => {}
                                 })
                                 .log_err();
                             },
-                        );
+                        )
+                    };
+                    let mut menu = add_row(menu.header("This thread"), &shown);
+                    let mut others = entries
+                        .iter()
+                        .filter(|entry| entry.account != current)
+                        .peekable();
+                    if others.peek().is_some() {
+                        menu = menu.separator().header("Switch to");
                     }
+                    for entry in others {
+                        menu = add_row(menu, entry);
+                    }
+                    let view = view.clone();
+                    let agent_id = agent_id.clone();
                     menu.separator().item(
                         ContextMenuEntry::new("Manage Accounts…")
                             .icon(IconName::Settings)
@@ -11756,7 +11981,7 @@ impl AgentView {
                     )
                 }))
             })
-            .trigger_with_tooltip(chip, Tooltip::text("Account"))
+            .trigger_with_tooltip(chip, Tooltip::text(tooltip))
             .anchor(gpui::Anchor::TopLeft)
             .offset(gpui::point(px(0.), px(4.)));
         Some(
@@ -12265,45 +12490,28 @@ fn render_folder_crumb(folder: PathBuf) -> AnyElement {
         .into_any_element()
 }
 
-/// An account in the new thread's account picker: its avatar, its name over its plan, the
-/// window closest to running out, and a check when the thread runs on it.
+/// An account in a thread's account picker: its avatar, its name over its plan and the window
+/// closest to running out.
 fn render_account_row(
     picker: &'static str,
     entry: &AccountEntry,
-    note: Option<SharedString>,
-    is_current: bool,
     now: SystemTime,
     cx: &App,
 ) -> AnyElement {
     let selector = account_selector(entry.account);
-    account_row(entry, note, false, now, cx)
+    account_row(entry, false, now, cx)
         .debug_selector(move || format!("{picker}-{selector}"))
-        .child(div().flex_none().w(px(14.)).when(is_current, |slot| {
-            slot.child(
-                Icon::new(IconName::Check)
-                    .size(IconSize::Small)
-                    .color(Color::Accent),
-            )
-        }))
         .into_any_element()
 }
 
-/// An account as the menus that pick one show it: its avatar, its name over `note` (else its
-/// plan), and the window closest to running out. Greyed, it can't be picked.
-fn account_row(
-    entry: &AccountEntry,
-    note: Option<SharedString>,
-    is_greyed: bool,
-    now: SystemTime,
-    cx: &App,
-) -> Div {
-    let note = note.or_else(|| {
-        if entry.is_logged_out {
-            Some("Logged out".into())
-        } else {
-            entry.plan.clone().map(SharedString::from)
-        }
-    });
+/// An account as the menus that pick one show it: its avatar, its name over its plan, and the
+/// window closest to running out. Greyed, it can't be picked.
+fn account_row(entry: &AccountEntry, is_greyed: bool, now: SystemTime, cx: &App) -> Div {
+    let note: Option<SharedString> = if entry.is_logged_out {
+        Some("Logged out".into())
+    } else {
+        entry.plan.clone().map(SharedString::from)
+    };
     let (name_color, note_color) = if is_greyed {
         (Color::Disabled, Color::Disabled)
     } else {
@@ -12447,6 +12655,23 @@ fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike 
                     .size(IconSize::XSmall)
                     .color(Color::Muted),
             ),
+        )
+}
+
+/// A picker's chip with only its icon, for a narrow composer.
+fn icon_picker_chip(id: &'static str, icon: Icon) -> ButtonLike {
+    ButtonLike::new(id)
+        .style(ButtonStyle::Subtle)
+        .size(ButtonSize::Compact)
+        .child(
+            h_flex()
+                .gap_1()
+                .child(icon.size(IconSize::XSmall).color(Color::Muted))
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                ),
         )
 }
 
@@ -12688,7 +12913,9 @@ impl Render for AgentView {
                 this.answer_first_request(acp::PermissionOptionKind::RejectOnce, cx)
             }))
             .size_full()
+            .relative()
             .bg(panel_background)
+            .child(self.render_view_measure(cx))
             .when(!self.is_in_pane, |this| {
                 this.on_action(cx.listener(Self::toggle_terminal_drawer))
             })
@@ -13073,6 +13300,115 @@ pub(crate) fn render_changes_button(changes: ChangeStat, is_open: bool) -> AnyEl
             .tooltip(move |_, cx| Tooltip::for_action(tooltip.clone(), &ToggleDiff, cx))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleDiff), cx))
             .into_any_element()
+    }
+}
+
+/// What a narrow header moves into its ⋯ menu (`design/thread-narrow`, topic 2C). A chat has
+/// no branch, terminal or changes.
+struct CompactHeaderItems {
+    branch: Option<(SharedString, IconName)>,
+    has_terminal: bool,
+    /// Whether something runs in the thread's terminals while its drawer is hidden.
+    is_running: bool,
+    /// What the thread changed, and whether the Changes panel is open.
+    changes: Option<(ChangeStat, bool)>,
+    /// Newest first, with their links.
+    artifacts: Vec<(Artifact, Option<String>)>,
+}
+
+impl CompactHeaderItems {
+    fn add_to_menu(&self, mut menu: ContextMenu, view: &WeakEntity<AgentView>) -> ContextMenu {
+        if let Some((branch, icon)) = self.branch.clone() {
+            menu = menu.custom_row(move |_, _| {
+                h_flex()
+                    .debug_selector(|| "thread-options-branch".into())
+                    .max_w(px(240.))
+                    .gap_1p5()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                    .child(
+                        div().min_w_0().child(
+                            Label::new(branch.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                    .into_any_element()
+            });
+        }
+        if self.has_terminal {
+            let view = view.clone();
+            menu = menu.item(
+                ContextMenuEntry::new("Toggle Terminal")
+                    .icon(IconName::Terminal)
+                    .icon_color(Color::Muted)
+                    .action(Box::new(ToggleTerminalDrawer))
+                    // Directly: dispatched, the action would start at the menu.
+                    .handler(move |window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.toggle_terminal_drawer(&ToggleTerminalDrawer, window, cx)
+                        })
+                        .log_err();
+                    }),
+            );
+        }
+        if let Some((changes, is_open)) = self.changes {
+            let label = if is_open {
+                "Hide Changes"
+            } else {
+                "Show Changes"
+            };
+            menu = menu.custom_entry(
+                move |_, cx| {
+                    h_flex()
+                        .debug_selector(|| "thread-options-changes".into())
+                        .w_full()
+                        .justify_between()
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(
+                                    Icon::new(IconName::Diff)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(label)),
+                        )
+                        .child(
+                            h_flex()
+                                .ml_4()
+                                .gap_2()
+                                .when(changes.files > 0, |end| {
+                                    end.child(diff_stat(changes.additions, changes.deletions))
+                                })
+                                .child(ui::KeyBinding::for_action(&ToggleDiff, cx)),
+                        )
+                        .into_any_element()
+                },
+                |window, cx| window.dispatch_action(Box::new(ToggleDiff), cx),
+            );
+        }
+        if !self.artifacts.is_empty() {
+            menu = menu.separator().header("Artifacts");
+            for (artifact, link) in self.artifacts.iter().cloned() {
+                let selector = format!("thread-options-artifact-{}", artifact.id.0);
+                menu = menu.custom_entry(
+                    move |_, cx| {
+                        let selector = selector.clone();
+                        div()
+                            .debug_selector(move || selector)
+                            .child(render_thread_artifact_row(&artifact, cx))
+                            .into_any_element()
+                    },
+                    move |_, cx| {
+                        if let Some(link) = &link {
+                            cx.open_url(link);
+                        }
+                    },
+                );
+            }
+        }
+        menu
     }
 }
 
@@ -15428,11 +15764,187 @@ mod tests {
             vec![(ThreadId(2), mock, AccountChoice::Account(work))]
         );
 
+        // The thread's account comes first, under "This thread", the others under "Switch to".
+        let top = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"))
+                .top()
+        };
+        click("thread-account", cx);
+        assert!(top("thread-account-external", cx) < top("thread-account-1", cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        let mut on_work = snapshot(Some("Fix the login"));
+        on_work.threads[1].account = Some(work);
+        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
+        cx.run_until_parked();
+        click("thread-account", cx);
+        assert!(top("thread-account-1", cx) < top("thread-account-external", cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
         // Not while the agent works.
         thread.update(cx, |thread, cx| thread.set_working_for_test(true, cx));
         cx.run_until_parked();
         click("thread-account", cx);
         assert!(cx.debug_bounds("thread-account-1").is_none());
+    }
+
+    /// As the thread narrows, its header gives way in order (`design/thread-narrow`, topic
+    /// 2C): under 560 px the branch shows only its icon; under 480 the branch, the changes and
+    /// Terminal move into ⋯, the branch as a line at its top, and ⋯ takes Terminal's running
+    /// dot; at 360 and under the project shows only its icon. The title keeps at least 120 px.
+    #[gpui::test]
+    fn a_narrow_header_gives_way_in_order(cx: &mut TestAppContext) {
+        let mut snapshot = snapshot(Some("Fix the login"));
+        snapshot.git_heads = vec![(
+            "/tmp/demo".into(),
+            projects::GitHead {
+                branch: "agentz/fix-login-redirect".into(),
+                worktree: None,
+            },
+        )];
+        snapshot.drawer_commands = vec![(ThreadId(2), 1, "cargo test".into())];
+        let (view, cx) = open_in(snapshot, 2, false, cx);
+        view.update(cx, |view, cx| {
+            view.title = "Fix the login redirect loop after OAuth sign-in".into();
+            view.changes = ChangeStat {
+                files: 3,
+                additions: 42,
+                deletions: 9,
+            };
+            cx.notify();
+        });
+        let resize = |width: f32, cx: &mut VisualTestContext| {
+            cx.simulate_resize(gpui::size(px(width), px(700.)));
+            cx.run_until_parked();
+        };
+        let width_of = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector).map(|bounds| bounds.size.width)
+        };
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        resize(720., cx);
+        assert!(width_of("thread-header-branch", cx).is_some_and(|width| width > px(100.)));
+        assert!(cx.debug_bounds("thread-header-changes").is_some());
+        assert!(cx.debug_bounds("thread-header-terminal").is_some());
+        assert!(cx.debug_bounds("thread-options-running").is_none());
+
+        // The branch gives way before the title does.
+        resize(600., cx);
+        let branch = width_of("thread-header-branch", cx).expect("the branch is shown");
+        assert!(
+            branch >= MIN_BRANCH_WIDTH && branch < px(100.),
+            "{branch:?}"
+        );
+        assert!(cx.debug_bounds("thread-header-project-name").is_some());
+
+        resize(520., cx);
+        assert!(width_of("thread-header-branch", cx).is_some_and(|width| width < px(40.)));
+        assert!(
+            width_of("thread-header-title-slot", cx)
+                .is_some_and(|width| width >= MIN_HEADER_TITLE_WIDTH)
+        );
+
+        resize(440., cx);
+        assert!(cx.debug_bounds("thread-header-branch").is_none());
+        assert!(cx.debug_bounds("thread-header-changes").is_none());
+        assert!(cx.debug_bounds("thread-header-terminal").is_none());
+        assert!(cx.debug_bounds("thread-header-project-name").is_some());
+        assert!(cx.debug_bounds("thread-options-running").is_some());
+        click("thread-options", cx);
+        let branch = cx
+            .debug_bounds("thread-options-branch")
+            .expect("⋯ has the branch");
+        let terminal = cx
+            .debug_bounds("MENU_ITEM-Toggle Terminal")
+            .expect("⋯ has Terminal");
+        let changes = cx
+            .debug_bounds("thread-options-changes")
+            .expect("⋯ has the changes");
+        assert!(branch.top() < terminal.top() && terminal.top() < changes.top());
+        click("MENU_ITEM-Toggle Terminal", cx);
+        assert!(view.read_with(cx, |view, _| view.is_drawer_open));
+        assert!(cx.debug_bounds("thread-options-running").is_none());
+
+        for width in [360., 320.] {
+            resize(width, cx);
+            let project = cx
+                .debug_bounds("thread-header-project")
+                .expect("the project is shown");
+            let title = cx
+                .debug_bounds("thread-header-title-slot")
+                .expect("the title is shown");
+            assert!(cx.debug_bounds("thread-header-project-name").is_none());
+            // Its icon doesn't shrink under the "/" and the title.
+            assert!(project.size.width >= px(20.), "{project:?}");
+            assert!(project.right() < title.left());
+            assert!(title.size.width >= MIN_HEADER_TITLE_WIDTH);
+        }
+    }
+
+    /// Under 560 px, the composer's agent and account show only their icon and avatar
+    /// (`design/thread-narrow`, topic 3B), and when its controls wrap, they keep to the
+    /// right, so Send stays in the corner.
+    #[gpui::test]
+    fn a_narrow_composer_shows_icons_then_wraps_to_the_right(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let mut accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            ..AgentAccounts::default()
+        };
+        let work = accounts.add();
+        if let Some(account) = accounts.account_mut(work) {
+            account.choices.label = Some("Work".into());
+            account.logged_in = Some(true);
+        }
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(AgentId::new("mock"), accounts)].into(), cx)
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx)
+        });
+        let resize = |width: f32, cx: &mut VisualTestContext| {
+            cx.simulate_resize(gpui::size(px(width), px(700.)));
+            cx.run_until_parked();
+        };
+        let bounds_of = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"))
+        };
+
+        let at_the_right = |cx: &mut VisualTestContext| {
+            let footer = bounds_of("composer-footer", cx);
+            let controls = bounds_of("composer-controls", cx);
+            assert!(
+                (footer.right() - controls.right()).abs() < px(1.),
+                "{footer:?} {controls:?}"
+            );
+            controls.top() > footer.top()
+        };
+
+        resize(720., cx);
+        let agent = bounds_of("thread-agent", cx).size.width;
+        let account = bounds_of("thread-account", cx).size.width;
+        assert!(!at_the_right(cx));
+
+        resize(520., cx);
+        assert!(bounds_of("thread-agent", cx).size.width < agent);
+        assert!(bounds_of("thread-account", cx).size.width < account);
+        assert!(!at_the_right(cx));
+
+        // Too narrow for one line, the controls wrap to a line of their own.
+        resize(120., cx);
+        assert!(at_the_right(cx));
     }
 
     /// Each finished reply has its turn's time and an agent icon that names, on hover, who
