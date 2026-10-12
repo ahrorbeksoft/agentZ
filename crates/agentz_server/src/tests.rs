@@ -3769,7 +3769,8 @@ async fn projects_show_their_favicon() {
     let Some(server) = TestServer::start() else {
         return;
     };
-    let folder = server.project_dir.path();
+    // As the server keeps it: macOS's temporary folders are under a link, `/var`.
+    let folder = &std::fs::canonicalize(server.project_dir.path()).expect("canonical path");
     let mut client = server.connect().await;
     client.ok(Request::SubscribeSession).await;
     let project_id = client.add_project(folder).await;
@@ -3807,7 +3808,8 @@ async fn a_chosen_icon_file_comes_before_the_favicon() {
     let Some(server) = TestServer::start() else {
         return;
     };
-    let folder = server.project_dir.path();
+    // As the server keeps it: macOS's temporary folders are under a link, `/var`.
+    let folder = &std::fs::canonicalize(server.project_dir.path()).expect("canonical path");
     std::fs::create_dir_all(folder.join("public")).expect("a folder");
     std::fs::write(folder.join("public/favicon.svg"), "<svg/>").expect("written");
     std::fs::create_dir_all(folder.join("assets")).expect("a folder");
@@ -6300,6 +6302,9 @@ async fn threads_work_in_worktrees_and_pastures() {
         else {
             panic!("expected a thread");
         };
+        // Made as its first message is sent, as the worktree was.
+        client.wait_until_ready(pasture_thread).await;
+        client.prompt_and_wait(pasture_thread, "hello").await;
         let pasture = client
             .project_thread(pasture_thread)
             .and_then(|thread| thread.workspace.clone())
