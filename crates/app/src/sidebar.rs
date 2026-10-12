@@ -3778,7 +3778,7 @@ mod view_tests {
         assert_eq!(color_of(&on_side, cx), None);
         assert_eq!(
             account_in_details(&outside, cx).as_deref(),
-            Some("Outside agentZ")
+            Some("External")
         );
         assert_eq!(account_in_details(&on_work, cx).as_deref(), Some("Work"));
         // Named even without a color.

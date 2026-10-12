@@ -823,7 +823,7 @@ mod tests {
         );
         assert_eq!(
             reason(&[None, Some(AccountId(1)), Some(AccountId(3))]),
-            "Claude Agent on Outside agentZ, Work and Team has its own skill named review, so \
+            "Claude Agent on External, Work and Team has its own skill named review, so \
              it keeps that one."
         );
     }

@@ -378,13 +378,12 @@ impl SettingsPage {
         self.select(Section::Project(key), window, cx);
     }
 
-    /// The agent's Account tab on `machine`, adding an account there with `add_account`, as
-    /// its Add Account does. An agent page already open stays, with its login sessions.
+    /// The agent's Account tab on `machine`. An agent page already open stays, with its login
+    /// sessions.
     pub fn show_agent_accounts(
         &mut self,
         machine: MachineId,
         agent_id: &AgentId,
-        add_account: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -405,9 +404,6 @@ impl SettingsPage {
             self.open_agent(agent_id, &name, window, cx);
         }
         self.select_agent_tab(AgentTab::Account, cx);
-        if add_account {
-            self.add_account(window, cx);
-        }
     }
 
     fn project(&self, key: ProjectKey, cx: &App) -> Option<Project> {
@@ -4554,11 +4550,7 @@ impl SettingsPage {
                                                 .child(Label::new(entry.name.clone()).truncate()),
                                         )
                                         .when(account.is_none(), |name| {
-                                            name.child(account_tag(
-                                                "Outside agentZ",
-                                                Color::Muted,
-                                                cx,
-                                            ))
+                                            name.child(account_tag("External", Color::Muted, cx))
                                         })
                                         .when(default == account, |name| {
                                             name.child(account_tag("Default", Color::Accent, cx))
@@ -4854,9 +4846,9 @@ impl SettingsPage {
                 }
             );
             tags.push(
-                account_tag("Outside agentZ", Color::Muted, cx)
-                    .id("account-tag-outside")
-                    .debug_selector(|| "account-tag-outside".into())
+                account_tag("External", Color::Muted, cx)
+                    .id("account-tag-external")
+                    .debug_selector(|| "account-tag-external".into())
                     .tooltip(Tooltip::element(move |_, _| {
                         div()
                             .w(px(320.))
@@ -6960,7 +6952,7 @@ impl SettingsPage {
         let on_open = Rc::new(
             move |agent_id: &AgentId, window: &mut Window, cx: &mut App| {
                 page.update(cx, |page, cx| {
-                    page.show_agent_accounts(machine, agent_id, false, window, cx)
+                    page.show_agent_accounts(machine, agent_id, window, cx)
                 })
                 .log_err();
             },
@@ -7148,7 +7140,7 @@ impl SettingsPage {
                                             .child(Label::new(entry.name.clone()).truncate()),
                                     )
                                     .when(entry.account.is_none(), |name| {
-                                        name.child(account_tag("Outside", Color::Muted, cx))
+                                        name.child(account_tag("External", Color::Muted, cx))
                                     }),
                             )
                             .when(!detail.is_empty(), |column| {
@@ -7178,7 +7170,7 @@ impl SettingsPage {
                 ),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.show_agent_accounts(machine, &agent_id, false, window, cx)
+                this.show_agent_accounts(machine, &agent_id, window, cx)
             }))
             .into_any_element()
     }
@@ -8323,7 +8315,7 @@ fn render_login_source(
 ) -> AnyElement {
     let Some(method) = login_method else {
         let colors = cx.theme().colors();
-        let heading = "Logged in outside agentZ.";
+        let heading = "External login.";
         let text = format!(
             "{heading} {agent_name} found the login it already had on {machine} (from its CLI or \
              its own settings). Every thread with it uses this login{}",
@@ -8339,7 +8331,7 @@ fn render_login_source(
             ..Default::default()
         };
         return h_flex()
-            .debug_selector(|| "login-source-outside".into())
+            .debug_selector(|| "login-source-external".into())
             .items_start()
             .gap_2p5()
             .px_3()
@@ -8447,7 +8439,7 @@ pub(crate) fn account_entries(accounts: &AgentAccounts) -> Vec<AccountEntry> {
 pub(crate) fn account_entry(accounts: &AgentAccounts, account: Option<AccountId>) -> AccountEntry {
     let name = accounts.name(account);
     let fallback = match account {
-        None => "Outside agentZ".to_string(),
+        None => "External".to_string(),
         // An API key's account has no email, and goes by its login method.
         Some(id) => accounts
             .account(id)
@@ -8556,7 +8548,7 @@ pub(crate) fn render_account_entry(entry: &AccountEntry, is_current: bool, cx: &
         .into_any_element()
 }
 
-/// A small tag beside an account's name: "Outside agentZ", "Default".
+/// A small tag beside an account's name: "External", "Default".
 fn account_tag(label: &'static str, color: Color, cx: &App) -> gpui::Div {
     div()
         .flex_none()
@@ -10280,7 +10272,7 @@ mod tests {
         });
         let (page, cx) = open_page_with_dialogs(cx);
         page.update_in(cx, |page, window, cx| {
-            page.show_agent_accounts(MachineId::Local, &mock, false, window, cx)
+            page.show_agent_accounts(MachineId::Local, &mock, window, cx)
         });
         cx.run_until_parked();
         let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
@@ -10647,7 +10639,7 @@ mod tests {
         click("account-line-external", cx);
         assert!(cx.debug_bounds("account-dialog").is_some());
         assert!(cx.debug_bounds("account-card-external").is_some());
-        assert!(cx.debug_bounds("account-tag-outside").is_some());
+        assert!(cx.debug_bounds("account-tag-external").is_some());
         assert!(cx.debug_bounds("account-tag-default-external").is_none());
         // The head says when the limits were read, before the ⋯ menu and ×.
         let read = cx
@@ -10925,7 +10917,7 @@ mod tests {
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         page.update_in(cx, |page, window, cx| {
-            page.show_agent_accounts(MachineId::Local, &AgentId::new("mock"), false, window, cx)
+            page.show_agent_accounts(MachineId::Local, &AgentId::new("mock"), window, cx)
         });
         cx.run_until_parked();
 
@@ -11470,22 +11462,20 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("account-picker").is_none());
 
-        // A new thread's Add Account… goes to the Account tab of the page already open, and
-        // adds an account there.
+        // A thread's Manage Accounts… goes to the Account tab of the page already open.
         let external_session = Request::OpenLoginSession {
             agent_id: mock.clone(),
             account: None,
         };
         let external_sessions = count(&external_session);
         page.update_in(cx, |page, window, cx| {
-            page.show_agent_accounts(MachineId::Local, &mock, true, window, cx)
+            page.show_agent_accounts(MachineId::Local, &mock, window, cx)
         });
         cx.run_until_parked();
         assert!(page.read_with(cx, |page, _| {
             page.agent_panel()
                 .is_some_and(|panel| panel.tab == AgentTab::Account)
         }));
-        assert!(sent(&Request::AddAccount(mock.clone())));
         assert_eq!(count(&external_session), external_sessions);
     }
 

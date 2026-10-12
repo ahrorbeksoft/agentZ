@@ -59,6 +59,27 @@ const MIN_THREAD_WIDTH: Pixels = px(320.);
 
 /// The Changes panel's left edge, being dragged to resize it.
 struct DraggedDiffEdge;
+
+/// How a thread's Changes panel was left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiffLayout {
+    is_shown: bool,
+    /// As its left edge was last dragged.
+    width: Pixels,
+    /// It fills the thread's area.
+    is_full_screen: bool,
+}
+
+impl Default for DiffLayout {
+    fn default() -> Self {
+        Self {
+            is_shown: false,
+            width: DIFF_PANEL_WIDTH,
+            is_full_screen: false,
+        }
+    }
+}
+
 /// Leaves room for the macOS traffic lights.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 
@@ -185,15 +206,12 @@ pub struct Shell {
     /// A draft to open once the Agents view has no thread to show and one can start, as
     /// t3code's index route drops into one: at launch, and after the open thread is deleted.
     pending_draft: Option<DraftLanding>,
-    /// Whether the active thread's changes show beside it. Stays on across threads.
-    show_diff: bool,
+    /// How each thread's changes were left: shown beside it or not, and how wide, so opening
+    /// them in one thread leaves the others as they were.
+    diff_layouts: HashMap<ThreadKey, DiffLayout>,
     /// The active thread's changes while shown. Only one, so hidden threads don't reload theirs.
     diff_panel: Option<Entity<DiffPanel>>,
     _diff_panel_events: Option<Subscription>,
-    /// The panel's width, as its left edge was last dragged.
-    diff_width: Pixels,
-    /// The panel fills the thread's area.
-    diff_full_screen: bool,
     should_move_window: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -238,11 +256,9 @@ impl Shell {
                         this.open_save_layout(root.clone(), panes.clone(), name.clone(), window, cx)
                     }
                     SpacesViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
-                    SpacesViewEvent::OpenAgentAccounts {
-                        machine,
-                        agent_id,
-                        add_account,
-                    } => this.open_agent_accounts(*machine, agent_id, *add_account, window, cx),
+                    SpacesViewEvent::OpenAgentAccounts { machine, agent_id } => {
+                        this.open_agent_accounts(*machine, agent_id, window, cx)
+                    }
                 },
             ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
@@ -410,11 +426,9 @@ impl Shell {
             active_thread: None,
             active_project: None,
             pending_draft: Some(DraftLanding::Latest),
-            show_diff: false,
+            diff_layouts: HashMap::default(),
             diff_panel: None,
             _diff_panel_events: None,
-            diff_width: DIFF_PANEL_WIDTH,
-            diff_full_screen: false,
             should_move_window: false,
             _subscriptions: subscriptions,
         }
@@ -850,19 +864,18 @@ impl Shell {
         }
     }
 
-    /// Add Account… and Manage Accounts…, from a new thread's account picker.
+    /// Manage Accounts…, from a thread's account picker.
     fn open_agent_accounts(
         &mut self,
         machine: MachineId,
         agent_id: &AgentId,
-        add_account: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.open_settings(&OpenSettings, window, cx);
         if let Some((page, _)) = &self.settings_page {
             page.update(cx, |page, cx| {
-                page.show_agent_accounts(machine, agent_id, add_account, window, cx)
+                page.show_agent_accounts(machine, agent_id, window, cx)
             });
         }
     }
@@ -901,15 +914,29 @@ impl Shell {
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_diff = !self.show_diff;
+        self.update_diff_layout(|layout| layout.is_shown = !layout.is_shown);
         self.sync_diff_panel(cx);
+    }
+
+    /// How the active thread's changes were left.
+    fn diff_layout(&self) -> DiffLayout {
+        self.active_thread
+            .and_then(|key| self.diff_layouts.get(&key))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn update_diff_layout(&mut self, update: impl FnOnce(&mut DiffLayout)) {
+        if let Some(key) = self.active_thread {
+            update(self.diff_layouts.entry(key).or_default());
+        }
     }
 
     /// Shows the active thread's changes when they're wanted, and tells the views. A chat has
     /// none to show.
     fn sync_diff_panel(&mut self, cx: &mut Context<Self>) {
         let thread_id = self.active_thread.filter(|key| {
-            self.show_diff
+            self.diff_layout().is_shown
                 && self.settings_page.is_none()
                 && self.view == MainView::Agents
                 && !self.thread(*key, cx).is_some_and(|thread| thread.is_chat())
@@ -938,7 +965,7 @@ impl Shell {
                 self._diff_panel_events = None;
             }
         }
-        let is_full_screen = self.diff_full_screen;
+        let is_full_screen = self.diff_layout().is_full_screen;
         if let Some(panel) = &self.diff_panel {
             panel.update(cx, |panel, cx| panel.set_full_screen(is_full_screen, cx));
         }
@@ -960,7 +987,7 @@ impl Shell {
         if self.active_thread != Some(thread) || self.view != MainView::Agents {
             self.open_thread(thread, window, cx);
         }
-        self.show_diff = true;
+        self.update_diff_layout(|layout| layout.is_shown = true);
         self.sync_diff_panel(cx);
         if let Some(panel) = &self.diff_panel {
             panel.update(cx, |panel, cx| panel.reveal_file(path, cx));
@@ -974,11 +1001,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match event {
-            DiffPanelEvent::Close => {
-                self.show_diff = false;
-                self.diff_full_screen = false;
+            DiffPanelEvent::Close => self.update_diff_layout(|layout| {
+                layout.is_shown = false;
+                layout.is_full_screen = false;
+            }),
+            DiffPanelEvent::ToggleFullScreen => {
+                self.update_diff_layout(|layout| layout.is_full_screen = !layout.is_full_screen)
             }
-            DiffPanelEvent::ToggleFullScreen => self.diff_full_screen = !self.diff_full_screen,
         }
         self.sync_diff_panel(cx);
     }
@@ -1295,10 +1324,9 @@ impl Shell {
                     cx,
                 ),
                 AgentViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
-                AgentViewEvent::OpenAgentAccounts {
-                    agent_id,
-                    add_account,
-                } => this.open_agent_accounts(key.machine, agent_id, *add_account, window, cx),
+                AgentViewEvent::OpenAgentAccounts { agent_id } => {
+                    this.open_agent_accounts(key.machine, agent_id, window, cx)
+                }
                 AgentViewEvent::Replaced { thread, text } => {
                     this.open_thread(*thread, window, cx);
                     if let Some(OpenThread {
@@ -2308,7 +2336,8 @@ impl Render for Shell {
             );
         // Beside the thread, or filling its area when full screen.
         let diff_panel = self.diff_panel.clone();
-        let is_diff_full_screen = self.diff_full_screen && diff_panel.is_some();
+        let diff_layout = self.diff_layout();
+        let is_diff_full_screen = diff_layout.is_full_screen && diff_panel.is_some();
         let border = cx.theme().colors().border;
         let active_view = self
             .active_thread
@@ -2353,8 +2382,8 @@ impl Render for Shell {
                     let width = (event.bounds.right() - event.event.position.x)
                         .min(available)
                         .max(MIN_DIFF_PANEL_WIDTH);
-                    if this.diff_width != width {
-                        this.diff_width = width;
+                    if this.diff_layout().width != width {
+                        this.update_diff_layout(|layout| layout.width = width);
                         cx.notify();
                     }
                 }),
@@ -2406,6 +2435,7 @@ impl Render for Shell {
                         .when_some(diff_panel, |row, panel| {
                             row.child(
                                 div()
+                                    .debug_selector(|| "diff-panel".into())
                                     .relative()
                                     .map(|this| {
                                         if is_diff_full_screen {
@@ -2413,7 +2443,7 @@ impl Render for Shell {
                                         } else {
                                             // Narrower when the window can't fit it beside
                                             // the conversation.
-                                            this.w(self.diff_width)
+                                            this.w(diff_layout.width)
                                                 .min_w(MIN_DIFF_PANEL_WIDTH)
                                                 .flex_shrink(1.)
                                         }
@@ -2427,6 +2457,7 @@ impl Render for Shell {
                                         this.child(
                                             div()
                                                 .id("diff-resize-edge")
+                                                .debug_selector(|| "diff-resize-edge".into())
                                                 .absolute()
                                                 .left(-RESIZE_EDGE_SIZE / 2.)
                                                 .top_0()
@@ -2943,6 +2974,11 @@ mod modal_tests {
         init_places(cx);
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
         shell.update_in(cx, |shell, window, cx| {
+            let key = ThreadKey {
+                machine: MachineId::Local,
+                thread: ThreadId(5),
+            };
+            shell.open_thread(key, window, cx);
             window.focus(&shell.focus_handle, cx)
         });
         cx.run_until_parked();
@@ -2965,7 +3001,7 @@ mod modal_tests {
         assert!(cx.debug_bounds("command-agentz: toggle sidebar").is_none());
         cx.simulate_keystrokes("enter");
         assert!(!is_open(cx));
-        assert!(shell.read_with(cx, |shell, _| shell.show_diff));
+        assert!(shell.read_with(cx, |shell, _| shell.diff_layout().is_shown));
         shell.update_in(cx, |shell, window, _| {
             assert!(shell.focus_handle.is_focused(window));
         });
@@ -3175,8 +3211,10 @@ mod modal_tests {
         assert!(!hidden(cx));
     }
 
+    /// Each thread keeps its Changes panel as it was left there: shown or hidden, and as wide
+    /// as it was dragged.
     #[gpui::test]
-    fn cmd_d_splits_in_workspaces_and_shows_changes_in_agents(cx: &mut TestAppContext) {
+    fn each_thread_keeps_its_own_changes_panel(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init_for_test(cx);
             let client = ServerClient::new_for_test(
@@ -3185,10 +3223,97 @@ mod modal_tests {
                 SpacesSnapshot::default(),
                 cx,
             );
+            let projects = client.read(cx).projects().clone();
+            let thread = |id: u64, title: &str| -> projects::Thread {
+                serde_json::from_value(serde_json::json!({
+                    "id": id,
+                    "project_id": 1,
+                    "title": title,
+                    "agent_id": "mock",
+                }))
+                .expect("a thread")
+            };
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![demo_project(1, "/tmp/demo")],
+                        threads: vec![thread(5, "Fix the login"), thread(6, "Add a test")],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
             crate::machines::init_for_test(vec![client], cx);
             crate::sidebar::init(cx);
         });
         let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
+        let open = |thread: u64, cx: &mut gpui::VisualTestContext| {
+            shell.update_in(cx, |shell, window, cx| {
+                let key = ThreadKey {
+                    machine: MachineId::Local,
+                    thread: ThreadId(thread),
+                };
+                shell.open_thread(key, window, cx);
+                // The thread's composer isn't drawn without its agent, so its focus would
+                // leave the keys nowhere.
+                window.focus(&shell.focus_handle, cx);
+            });
+            cx.run_until_parked();
+        };
+        let panel_width = |cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds("diff-panel")
+                .map(|bounds| bounds.size.width)
+        };
+
+        // Shown in one thread and dragged wider there.
+        open(5, cx);
+        assert_eq!(panel_width(cx), None);
+        cx.dispatch_action(ToggleDiff);
+        cx.run_until_parked();
+        assert_eq!(panel_width(cx), Some(DIFF_PANEL_WIDTH));
+        let edge = cx.debug_bounds("diff-resize-edge").expect("the edge drags");
+        let none = gpui::Modifiers::none();
+        cx.simulate_mouse_down(edge.center(), MouseButton::Left, none);
+        // The first move picks the edge up; the next ones move it.
+        let picked_up = edge.center() - point(px(2.), px(0.));
+        cx.simulate_mouse_move(picked_up, MouseButton::Left, none);
+        let dragged = edge.center() - point(px(100.), px(0.));
+        cx.simulate_mouse_move(dragged, MouseButton::Left, none);
+        cx.simulate_mouse_move(dragged, MouseButton::Left, none);
+        cx.simulate_mouse_up(dragged, MouseButton::Left, none);
+        cx.run_until_parked();
+        let wider = panel_width(cx).expect("the panel is shown");
+        assert!(wider > DIFF_PANEL_WIDTH + px(90.), "{wider:?}");
+
+        // The other thread's stays hidden, and opens at its own width.
+        open(6, cx);
+        assert_eq!(panel_width(cx), None);
+        cx.dispatch_action(ToggleDiff);
+        cx.run_until_parked();
+        assert_eq!(panel_width(cx), Some(DIFF_PANEL_WIDTH));
+        cx.dispatch_action(ToggleDiff);
+        cx.run_until_parked();
+
+        // Back in the first, it's as it was left.
+        open(5, cx);
+        assert_eq!(panel_width(cx), Some(wider));
+        open(6, cx);
+        assert_eq!(panel_width(cx), None);
+    }
+
+    #[gpui::test]
+    fn cmd_d_splits_in_workspaces_and_shows_changes_in_agents(cx: &mut TestAppContext) {
+        init_places(cx);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            let key = ThreadKey {
+                machine: MachineId::Local,
+                thread: ThreadId(5),
+            };
+            shell.open_thread(key, window, cx);
+            window.focus(&shell.focus_handle, cx);
+        });
         let dispatched = Rc::new(RefCell::new(Vec::new()));
         let _subscription = cx.update(|_, cx| {
             let dispatched = dispatched.clone();
@@ -3204,14 +3329,15 @@ mod modal_tests {
         });
         cx.simulate_keystrokes(crate::platform_keys("cmd-d", "ctrl-shift-o"));
         assert_eq!(dispatched.borrow().last(), Some(&"workspaces::SplitRight"));
-        assert!(!shell.read_with(cx, |shell, _| shell.show_diff));
+        assert!(!shell.read_with(cx, |shell, _| shell.diff_layout().is_shown));
 
         shell.update_in(cx, |shell, window, cx| {
-            shell.set_view(MainView::Agents, window, cx)
+            shell.set_view(MainView::Agents, window, cx);
+            window.focus(&shell.focus_handle, cx);
         });
         cx.simulate_keystrokes("secondary-d");
         assert_eq!(dispatched.borrow().last(), Some(&"agentz::ToggleDiff"));
-        assert!(shell.read_with(cx, |shell, _| shell.show_diff));
+        assert!(shell.read_with(cx, |shell, _| shell.diff_layout().is_shown));
     }
 
     fn demo_project(id: u64, path: &str) -> Project {

@@ -371,7 +371,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   with Change Account and Log Out (both described under Agent threads). For an agent that can
   have more accounts (its listing's `accounts`), Account shows its one account as a card
   (usage round topic 4): the avatar in the account's color, its name (Rename's, else its
-  email), "Outside agentZ" on the External one, its plan, when its limits were read
+  email), "External" on the External one, its plan, when its limits were read
   ("read 2m ago") before a ⋯ menu (Rename in place, Use for New Threads, Color, Refresh Usage,
   Open Usage Page, Show in Finder, Log Out, Remove Account), its limit rows (see Limit rows
   below), and under a hairline its settings as small rows with their menus at the right
@@ -450,7 +450,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   whose accounts' limits are read (its listing's `accounts.reads_usage`), as a card with a
   table (`UsageTable`): a column per window, by its name in the order they first appear, and a
   row per account with a read, in the order they're listed (the External one first, tagged
-  "Outside"): its avatar, name, plan (and email, when it's named otherwise), and a cell per
+  "External"): its avatar, name, plan (and email, when it's named otherwise), and a cell per
   window. Accounts found logged out are left out, their last reads being out of date. With more
   than one account, an "All N accounts" row comes first, with what's left of each window across
   them (100 less the mean used, each account counting the same, as t3code's
@@ -960,8 +960,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
   t3code's `ComposerUsageLimits`, accounts topic 16, usage round topic 3): beside the agent in
   a started thread's composer, what's left of its account's window closest to running out
-  ("62%", leaving out windows past their reset), yellow at 15% or less and red when used up,
-  with the window's name in its tooltip ("Weekly: 3% left"). It shows once the account has a
+  ("62%", leaving out windows past their reset) on a borderless button like the pickers'
+  beside it, yellow at 15% or less and red when used up, with the window's name in its tooltip
+  ("Weekly: 3% left"). It shows once the account has a
   read, and not while it's found logged out. A click opens that account's windows (avatar,
   name, plan, the limit rows) with Usage ↗ for the agent's usage page, the card's limit resets
   line, whose Use Reset closes it for the thread's question
@@ -992,11 +993,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   server answers. The account picker (`AgentView::render_account_picker`,
   §12 of the accounts round) shows only while the agent lists more than one account: the
   draft's account with its avatar, and a menu of the accounts with their plan (or "Logged
-  out") and the window closest to running out (`usage_limits::tightest_window`), then Add
-  Account… and Manage Accounts…, which open the agent's Account tab on the thread's machine
-  (`AgentViewEvent::OpenAgentAccounts`, `SettingsPage::show_agent_accounts`), adding an account
-  there for the first. Another checkout keeps the draft's account; another agent or machine
-  takes its account for new threads (`AccountChoice::Default`).
+  out") and the window closest to running out (`usage_limits::tightest_window`), then Manage
+  Accounts…, which opens the agent's Account tab on the thread's machine
+  (`AgentViewEvent::OpenAgentAccounts`, `SettingsPage::show_agent_accounts`). Another
+  checkout keeps the draft's account; another agent or machine takes its account for new
+  threads (`AccountChoice::Default`).
 - **Drafts** (`Thread::is_draft`, `Thread::unsent_text`, `Server::sweep_drafts`,
   `Shell::open_thread`; t3code's draft threads and composer drafts): every new agent thread is
   a draft until its first message, so its agent starts at once, but it isn't in the thread
@@ -1129,7 +1130,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   each login agentZ makes, per agent and machine, with the first account reported after it
   (`AuthStatus::identity`). It forgets it when the agent is logged out (by agentZ, or asking for
   a login) or reports another account. While logged in with nothing recorded, the note under
-  the Account card is a callout: "Logged in outside agentZ", found on that machine, and that
+  the Account card is a callout: "External login", found on that machine, and that
   logging out here logs out the CLI too. Otherwise it says "Logged in from agentZ with <method>".
 - **Accounts** (`agentz_protocol::accounts`, `agentz_server::accounts`,
   `server/account_requests.rs`; the accounts round in `design/accounts/`, being built as its
@@ -1717,8 +1718,11 @@ t3code's checkpoints (`apps/server/src/checkpointing/`).
   `main`/`master`, as t3code finds it), Latest turn, and Turn ▸ any finished turn with when it
   finished. The working tree and branch changes are fetched again every 5 seconds while shown,
   t3code's 5-second staleness. Files and hunks, Viewed (a file reopens when it changes). The
-  panel narrows when the window can't fit it beside the conversation. Revert puts files back, only for a thread alone in its worktree or
-  pasture; ACP can't rewind a conversation, so only files go back.
+  panel narrows when the window can't fit it beside the conversation. Each thread keeps its
+  own panel as it was left there, shown or hidden, full screen and as wide as its edge was
+  dragged (`Shell::diff_layouts`), for as long as the app runs. Revert puts files back, only
+  for a thread alone in its worktree or pasture; ACP can't rewind a conversation, so only
+  files go back.
 - The diff button shows a dot while the panel is hidden and the thread has changed files.
 - Diffs are parsed on the server (`agentz_protocol::diff`), capped at 10 MB of patch.
 

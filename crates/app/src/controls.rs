@@ -4,11 +4,13 @@
 //! code in boxes, and a dialog's frame.
 
 use gpui::{
-    AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, Focusable as _, FontWeight, Hsla,
-    SharedString, Window, div, linear_color_stop, linear_gradient,
+    AnyElement, App, BoxShadow, ClickEvent, ElementId, Entity, Focusable as _, Font, FontWeight,
+    Hsla, SharedString, TextAlign, TextRun, Window, canvas, div, linear_color_stop,
+    linear_gradient, point,
 };
 use text_input::TextInput;
 use ui::{CommonAnimationExt as _, prelude::*};
+use util::ResultExt as _;
 
 /// What a field's text, and a button's label, are set in.
 pub(crate) const CONTROL_TEXT_SIZE: f32 = 13.;
@@ -300,22 +302,56 @@ pub(crate) fn avatar(name: &str, color: Option<Hsla>, size: Pixels, cx: &App) ->
         .map(|character| character.to_uppercase().collect::<String>())
         .unwrap_or_default()
         .into();
+    let text_size = rems_from_px((f32::from(size) * 13. / 32.).round().max(9.));
+    let text_color = on_fill_color(cx);
     div()
         .size(size)
         .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
         .rounded_full()
         .bg(linear_gradient(
             135.,
             linear_color_stop(accent.blend(gpui::white().opacity(0.3)), 0.),
             linear_color_stop(accent.blend(gpui::black().opacity(0.15)), 1.),
         ))
-        .text_size(rems_from_px((f32::from(size) * 13. / 32.).round().max(9.)))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(on_fill_color(cx))
-        .child(initial)
+        // Painted rather than laid out as text: a text element rounds its width up and
+        // centers the font's whole line box, which left the letter off center in the circle.
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, cx| {
+                    let font = Font {
+                        weight: FontWeight::SEMIBOLD,
+                        ..window.text_style().font()
+                    };
+                    let font_size = text_size.to_pixels(window.rem_size());
+                    let line = window.text_system().shape_line(
+                        initial.clone(),
+                        font_size,
+                        &[TextRun {
+                            len: initial.len(),
+                            font: font.clone(),
+                            color: text_color,
+                            ..TextRun::default()
+                        }],
+                        None,
+                    );
+                    let font_id = window.text_system().resolve_font(&font);
+                    let cap_height = window.text_system().cap_height(font_id, font_size);
+                    let baseline = bounds.center().y + cap_height / 2.;
+                    let origin = point(bounds.center().x - line.width / 2., baseline - line.ascent);
+                    line.paint(
+                        origin,
+                        line.ascent + line.descent,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .log_err();
+                },
+            )
+            .size_full(),
+        )
         .into_any_element()
 }
 

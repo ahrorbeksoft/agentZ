@@ -321,11 +321,10 @@ pub enum AgentViewEvent {
     },
     /// Manage Agents, from the new thread's agent picker: Settings › Agents.
     OpenAgentSettings,
-    /// Manage Accounts…, from the new thread's account picker: the agent's Account tab on the
-    /// thread's machine, adding an account there with Add Account….
+    /// Manage Accounts…, from the thread's account picker: the agent's Account tab on the
+    /// thread's machine.
     OpenAgentAccounts {
         agent_id: AgentId,
-        add_account: bool,
     },
 }
 
@@ -6096,7 +6095,6 @@ impl AgentView {
             .min_h(px(24.))
             .gap_1p5()
             .px_0p5()
-            .when(is_card, |this| this.pr_1())
             .when(!is_card, |this| this.rounded_md())
             .when(is_openable, |this| {
                 this.cursor_pointer()
@@ -6227,9 +6225,13 @@ impl AgentView {
             let colors = cx.theme().colors();
             // A command that failed gets Zed's dashed red border.
             let is_failed_command = is_command_card && (failed || exited_badly);
+            // The border sits just outside the row, so its header stays where the closed row
+            // was and nothing moves as it opens.
             v_flex()
                 .debug_selector(|| format!("tool-call-card-{index}"))
-                .my_1()
+                .mt(-px(1.))
+                .mx(-px(1.))
+                .mb_1()
                 .rounded_md()
                 .border_1()
                 .map(|this| {
@@ -10019,7 +10021,7 @@ impl AgentView {
                     PopoverMenu::new("usage-gauge-menu")
                         .trigger_with_tooltip(
                             ButtonLike::new("usage-gauge")
-                                .style(ButtonStyle::Filled)
+                                .style(ButtonStyle::Subtle)
                                 .size(ButtonSize::Compact)
                                 .child(
                                     h_flex()
@@ -11645,7 +11647,7 @@ impl AgentView {
 
     /// The account the new thread runs on, shown only when its agent has more than one: its
     /// avatar and name, with a menu of the accounts, their plans and the windows closest to
-    /// running out, then Add Account… and Manage Accounts….
+    /// running out, then Manage Accounts….
     fn render_account_picker(
         &self,
         picker: PickerFor,
@@ -11739,32 +11741,19 @@ impl AgentView {
                             },
                         );
                     }
-                    let open_accounts = |add_account: bool| {
-                        let view = view.clone();
-                        let agent_id = agent_id.clone();
-                        move |_: &mut Window, cx: &mut App| {
-                            view.update(cx, |_, cx| {
-                                cx.emit(AgentViewEvent::OpenAgentAccounts {
-                                    agent_id: agent_id.clone(),
-                                    add_account,
+                    menu.separator().item(
+                        ContextMenuEntry::new("Manage Accounts…")
+                            .icon(IconName::Settings)
+                            .icon_color(Color::Muted)
+                            .handler(move |_, cx| {
+                                view.update(cx, |_, cx| {
+                                    cx.emit(AgentViewEvent::OpenAgentAccounts {
+                                        agent_id: agent_id.clone(),
+                                    })
                                 })
-                            })
-                            .log_err();
-                        }
-                    };
-                    menu.separator()
-                        .item(
-                            ContextMenuEntry::new("Add Account…")
-                                .icon(IconName::Plus)
-                                .icon_color(Color::Muted)
-                                .handler(open_accounts(true)),
-                        )
-                        .item(
-                            ContextMenuEntry::new("Manage Accounts…")
-                                .icon(IconName::Settings)
-                                .icon_color(Color::Muted)
-                                .handler(open_accounts(false)),
-                        )
+                                .log_err();
+                            }),
+                    )
                 }))
             })
             .trigger_with_tooltip(chip, Tooltip::text("Account"))
@@ -12320,8 +12309,8 @@ fn account_row(
     } else {
         (Color::Default, Color::Muted)
     };
-    // Unnamed, the External account is already called "Outside agentZ".
-    let is_outside = entry.account.is_none() && entry.is_named;
+    // Unnamed, the External account is already called "External".
+    let is_external = entry.account.is_none() && entry.is_named;
     h_flex()
         .w_full()
         .gap_2()
@@ -12334,9 +12323,9 @@ fn account_row(
                     h_flex()
                         .gap_1()
                         .child(Label::new(entry.name.clone()).color(name_color).truncate())
-                        .when(is_outside, |name| {
+                        .when(is_external, |name| {
                             name.child(
-                                Label::new("· outside agentZ")
+                                Label::new("· External")
                                     .size(LabelSize::XSmall)
                                     .color(Color::Placeholder),
                             )
@@ -12427,12 +12416,12 @@ fn label_in_sentence(label: &str) -> String {
 
 /// How the limit notice names an account in a sentence.
 fn account_phrase(entry: &AccountEntry, starts_sentence: bool) -> String {
-    // Unnamed, the External account goes by "Outside agentZ", which isn't a name.
+    // Unnamed, the External account goes by "External", which isn't a name.
     if entry.account.is_none() && !entry.is_named {
         if starts_sentence {
-            "The account outside agentZ".to_string()
+            "The External account".to_string()
         } else {
-            "the account outside agentZ".to_string()
+            "the External account".to_string()
         }
     } else {
         entry.name.to_string()
@@ -14696,7 +14685,7 @@ mod tests {
             account.logged_in = Some(true);
         }
         let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
-        let events: Rc<RefCell<Vec<(AgentId, bool)>>> = Rc::default();
+        let events: Rc<RefCell<Vec<AgentId>>> = Rc::default();
         let client = view.read_with(cx, |view, _| view.client.clone());
         client.update(cx, |client, cx| {
             let requests = requests.clone();
@@ -14713,12 +14702,8 @@ mod tests {
         cx.update(|_, cx| {
             let events = events.clone();
             cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
-                if let AgentViewEvent::OpenAgentAccounts {
-                    agent_id,
-                    add_account,
-                } = event
-                {
-                    events.borrow_mut().push((agent_id.clone(), *add_account));
+                if let AgentViewEvent::OpenAgentAccounts { agent_id } = event {
+                    events.borrow_mut().push(agent_id.clone());
                 }
             })
             .detach();
@@ -14806,12 +14791,13 @@ mod tests {
             }
         )));
 
-        // Add Account… opens the agent's accounts to add one there.
+        // Manage Accounts… opens the agent's accounts, and there's no Add Account… beside it.
         store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
         cx.run_until_parked();
         click("new-thread-account", cx);
-        click("MENU_ITEM-Add Account…", cx);
-        assert_eq!(*events.borrow(), vec![(mock, true)]);
+        assert!(cx.debug_bounds("MENU_ITEM-Add Account…").is_none());
+        click("MENU_ITEM-Manage Accounts…", cx);
+        assert_eq!(*events.borrow(), vec![mock]);
     }
 
     /// A thread that stopped while its account's last read has a window used up shows the limit

@@ -244,11 +244,10 @@ pub enum SpacesViewEvent {
     },
     /// Manage Agents, from a new thread's agent picker.
     OpenAgentSettings,
-    /// Add Account… or Manage Accounts…, from a new thread's account picker.
+    /// Manage Accounts…, from a thread's account picker.
     OpenAgentAccounts {
         machine: MachineId,
         agent_id: AgentId,
-        add_account: bool,
     },
 }
 
@@ -1167,14 +1166,12 @@ impl SpacesView {
                         AgentViewEvent::OpenAgentSettings => {
                             cx.emit(SpacesViewEvent::OpenAgentSettings)
                         }
-                        AgentViewEvent::OpenAgentAccounts {
-                            agent_id,
-                            add_account,
-                        } => cx.emit(SpacesViewEvent::OpenAgentAccounts {
-                            machine,
-                            agent_id: agent_id.clone(),
-                            add_account: *add_account,
-                        }),
+                        AgentViewEvent::OpenAgentAccounts { agent_id } => {
+                            cx.emit(SpacesViewEvent::OpenAgentAccounts {
+                                machine,
+                                agent_id: agent_id.clone(),
+                            })
+                        }
                     });
                     (PaneView::Agent(view), vec![subscription])
                 }
