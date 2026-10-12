@@ -522,7 +522,7 @@ impl SettingsPage {
                 }),
             )
         });
-        render_storage_row(
+        let row = render_storage_row(
             StorageRow {
                 selector: format!("storage-checkout-{name}"),
                 lead: Icon::new(workspace_icon(checkout.kind))
@@ -538,7 +538,15 @@ impl SettingsPage {
                 is_indented: false,
             },
             cx,
-        )
+        );
+        // Pastures of one project can be on the same branch, so the row's id is kept apart by
+        // its path's, or their hovers would be one.
+        div()
+            .id(SharedString::from(
+                checkout.path.to_string_lossy().into_owned(),
+            ))
+            .child(row)
+            .into_any_element()
     }
 
     fn render_node_row(
@@ -1041,7 +1049,9 @@ fn render_storage_row(row: StorageRow, cx: &App) -> AnyElement {
         end,
         is_indented,
     } = row;
+    // GPUI repaints for a hover only on an element with an id, which keeps its hover state.
     h_flex()
+        .id(SharedString::from(selector.clone()))
         .debug_selector(move || selector)
         .group(ROW_GROUP)
         .min_h(px(34.))
