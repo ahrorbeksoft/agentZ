@@ -266,7 +266,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   have, in an order that keeps the first few apart, then one of the least used, by its id.
   Accounts kept from before then got theirs, the External one's included, once, as the server
   loaded them (`AgentAccounts::give_colors`, `colors_given`), so No Color from the account's
-  Color menu stays.
+  Color menu stays. They're drawn at 60% of their saturation (`controls::account_color`,
+  `account_fill_color`), as Tailwind's shades glowed beside the theme's grays.
 - **Generated titles** (`agentz_server/src/title_generation.rs`, `server/title_requests.rs`,
   Settings › General › Thread titles; t3code's text generation): off by default, and kept per
   machine in `title-generation.json`. Once on, after a thread's first turn, the server asks

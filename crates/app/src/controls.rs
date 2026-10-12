@@ -332,23 +332,40 @@ pub(crate) fn color_hex(color: u32) -> String {
     format!("#{color:06x}")
 }
 
+/// How much of its saturation an account's color keeps as it's drawn: Tailwind's shades at
+/// full strength glowed beside the theme's grays, behind agents' icons most of all.
+const ACCOUNT_COLOR_SATURATION: f32 = 0.6;
+
+fn softened(color: Hsla) -> Hsla {
+    Hsla {
+        s: color.s * ACCOUNT_COLOR_SATURATION,
+        ..color
+    }
+}
+
 /// An account's color in the current theme: one of [`ACCOUNT_COLORS`] in the theme's shade,
-/// any other `#rrggbb` as it is.
+/// any other `#rrggbb` as it is, softened.
 pub(crate) fn account_color(hex: &str, cx: &App) -> Option<Hsla> {
     let is_light = cx.theme().appearance().is_light();
     if let Some((_, light, dark)) = ACCOUNT_COLORS
         .iter()
         .find(|(_, light, _)| color_hex(*light).eq_ignore_ascii_case(hex))
     {
-        return Some(gpui::rgb(if is_light { *light } else { *dark }).into());
+        return Some(softened(
+            gpui::rgb(if is_light { *light } else { *dark }).into(),
+        ));
     }
-    gpui::Rgba::try_from(hex).ok().map(Hsla::from)
+    gpui::Rgba::try_from(hex)
+        .ok()
+        .map(|color| softened(color.into()))
 }
 
 /// An account's color behind white, in every theme: as it's kept, which for
-/// [`ACCOUNT_COLORS`] is the darker shade.
+/// [`ACCOUNT_COLORS`] is the darker shade, softened.
 pub(crate) fn account_fill_color(hex: &str) -> Option<Hsla> {
-    gpui::Rgba::try_from(hex).ok().map(Hsla::from)
+    gpui::Rgba::try_from(hex)
+        .ok()
+        .map(|color| softened(color.into()))
 }
 
 /// A round badge for an account the agent didn't name: a person with a check.
