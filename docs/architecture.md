@@ -94,7 +94,7 @@ so an open tool call's output raced the conversation.
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
 | `paths` | Data locations (`AGENTZ_DATA_DIR` overrides). |
-| `text_input` | The single-line text field. |
+| `text_input` | The text field: one line that scrolls sideways to keep the cursor in view, or several that wrap and grow to a limit, then scroll (`multi_line` with line breaks, as the composer's; `wrapping` without, as a form's text field's). |
 | `theme_json` | The bundled JSON themes in `assets/themes`. |
 
 `tooling/bundle-mac.sh` makes `target/bundle/agentZ.app` with the icon
@@ -1264,9 +1264,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   which replays the conversation.
 - **Requests for input** (`elicitation_card.rs`, Zed's checks for ACP's `elicitation/create`,
   picked in `design/agent-input/`): a card in the thread for a form (text, numbers, a choice,
-  checkboxes) with Decline and Submit, or a page to open. A required field's label ends in a
-  red *, Submit stays dim until each is filled (`FormState::lacks_required`), and a text field
-  says what's wrong as it loses focus (`ElicitationCard::check_field`). The agent's own
+  checkboxes) with Decline and Submit, or a page to open. A text field wraps a long answer onto
+  a second row, then scrolls, without line breaks; a number's stays one row. A required
+  field's label ends in a red *, Submit stays dim until each is filled
+  (`FormState::lacks_required`), and a text field says what's wrong as it loses focus
+  (`ElicitationCard::check_field`). The agent's own
   questions (Claude Agent's AskUserQuestion, as it asks JetBrains AIR:
   `agentz_protocol::thread::form_questions`, each a field with choices followed by its "Other"
   field) go one at a time, with "1 of 2" and Back: a choice of one goes on to the next, several

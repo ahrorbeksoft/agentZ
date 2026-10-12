@@ -188,15 +188,20 @@ pub(crate) fn field_frame(is_focused: bool, is_invalid: bool, cx: &App) -> gpui:
         })
 }
 
-/// A text input in its frame, ringed while it has focus.
+/// A text input in its frame, ringed while it has focus. One that wraps grows with its rows.
 pub(crate) fn text_field(
     input: &Entity<TextInput>,
     is_invalid: bool,
     window: &Window,
     cx: &App,
 ) -> gpui::Div {
-    let is_focused = input.read(cx).focus_handle(cx).is_focused(window);
-    field_frame(is_focused, is_invalid, cx).child(div().flex_1().min_w_0().child(input.clone()))
+    let input_state = input.read(cx);
+    let is_focused = input_state.focus_handle(cx).is_focused(window);
+    field_frame(is_focused, is_invalid, cx)
+        .when(input_state.wraps(), |frame| {
+            frame.h_auto().min_h(FIELD_HEIGHT).py(px(2.))
+        })
+        .child(div().flex_1().min_w_0().child(input.clone()))
 }
 
 /// A field's label above it.

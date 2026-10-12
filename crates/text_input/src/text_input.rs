@@ -1,5 +1,6 @@
-//! A text input: one line, or several that wrap and grow up to a limit
-//! ([`TextInput::multi_line`]).
+//! A text input: one line, which scrolls sideways to follow the cursor once the text is wider
+//! than it, or several that wrap and grow up to a limit ([`TextInput::multi_line`],
+//! [`TextInput::wrapping`]).
 //!
 //! Derived from gpui's `examples/input.rs` (Apache-2.0), restyled with the active theme and
 //! made to emit [`TextInputEvent`]s so owners can react to edits. An input of several lines also
@@ -48,6 +49,7 @@ actions!(
 );
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const CURSOR_WIDTH: Pixels = px(1.5);
 const MASK: char = '•';
 const KEY_CONTEXT: &str = "TextInput";
 /// In the key context of an input of several lines.
@@ -154,9 +156,13 @@ pub struct TextInput {
     masked: bool,
     /// With several lines, how many show before it scrolls.
     max_lines: Option<usize>,
+    /// Whether Shift-Enter and pasting make line breaks, with several lines.
+    line_breaks: bool,
     chips: Vec<Chip>,
     next_chip_id: ChipId,
     scroll_top: Pixels,
+    /// How far one line is scrolled sideways.
+    scroll_left: Pixels,
     /// Scroll the cursor into view at the next layout.
     autoscroll: bool,
     /// Where Up and Down aim, kept across a run of them as in any editor.
@@ -203,6 +209,7 @@ struct TextLayout {
     bounds: Bounds<Pixels>,
     line_height: Pixels,
     scroll_top: Pixels,
+    scroll_left: Pixels,
     lines: Vec<LaidOutLine>,
     rows: Vec<Row>,
     chip_bounds: Vec<(ChipId, Bounds<Pixels>)>,
@@ -278,6 +285,22 @@ impl TextLayout {
     fn content_height(&self) -> Pixels {
         self.rows.len() as f32 * self.line_height
     }
+
+    /// How far one line can scroll sideways: its width, with room for the cursor at its end,
+    /// past the input's.
+    fn horizontal_overflow(&self) -> Pixels {
+        let width = self
+            .lines
+            .iter()
+            .map(|line| line.line.unwrapped_layout.width)
+            .fold(px(0.), Pixels::max);
+        (width + CURSOR_WIDTH - self.bounds.size.width).max(px(0.))
+    }
+
+    /// Where the text's origin is drawn, as it's scrolled.
+    fn text_origin(&self) -> Point<Pixels> {
+        self.bounds.origin - point(self.scroll_left, self.scroll_top)
+    }
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -300,9 +323,11 @@ impl TextInput {
             focus_subscription: None,
             masked: false,
             max_lines: None,
+            line_breaks: false,
             chips: Vec::new(),
             next_chip_id: 0,
             scroll_top: px(0.),
+            scroll_left: px(0.),
             autoscroll: false,
             goal_x: None,
             menu_open: false,
@@ -322,7 +347,22 @@ impl TextInput {
     /// new line, and pasted text keeps its line breaks.
     pub fn multi_line(mut self, max_lines: usize) -> Self {
         self.max_lines = Some(max_lines.max(1));
+        self.line_breaks = true;
         self
+    }
+
+    /// Wraps its text and grows with it up to `max_lines` before scrolling, as
+    /// [`Self::multi_line`] does, but makes no line breaks: Shift-Enter does nothing, and pasted
+    /// lines are joined with spaces.
+    pub fn wrapping(mut self, max_lines: usize) -> Self {
+        self.max_lines = Some(max_lines.max(1));
+        self.line_breaks = false;
+        self
+    }
+
+    /// Whether it wraps its text over several rows.
+    pub fn wraps(&self) -> bool {
+        self.is_multi_line()
     }
 
     /// Leaves pasting to the owner, as [`TextInputEvent::Paste`].
@@ -429,7 +469,7 @@ impl TextInput {
 
     /// Types `text` in place of the selection.
     pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
-        let text = if self.is_multi_line() {
+        let text = if self.line_breaks {
             text.replace("\r\n", "\n")
         } else {
             text.replace(['\r', '\n'], " ")
@@ -761,7 +801,7 @@ impl TextInput {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_multi_line() {
+        if self.line_breaks {
             self.replace_text_in_range(None, "\n", window, cx);
         }
     }
@@ -878,12 +918,21 @@ impl TextInput {
         let Some(layout) = &self.layout else {
             return;
         };
-        let overflow = layout.content_height() - layout.bounds.size.height;
-        if overflow <= px(0.) {
-            return;
-        }
         let delta = event.delta.pixel_delta(layout.line_height);
-        self.scroll_top = (self.scroll_top - delta.y).clamp(px(0.), overflow);
+        if self.is_multi_line() {
+            let overflow = layout.content_height() - layout.bounds.size.height;
+            if overflow <= px(0.) {
+                return;
+            }
+            self.scroll_top = (self.scroll_top - delta.y).clamp(px(0.), overflow);
+        } else {
+            // Only sideways, so a list the input sits in still scrolls under it.
+            let overflow = layout.horizontal_overflow();
+            if overflow <= px(0.) || delta.x == px(0.) {
+                return;
+            }
+            self.scroll_left = (self.scroll_left - delta.x).clamp(px(0.), overflow);
+        }
         cx.stop_propagation();
         cx.notify();
     }
@@ -994,10 +1043,7 @@ impl TextInput {
                 return self.content.len();
             }
         }
-        let local = point(
-            position.x - bounds.left(),
-            position.y - bounds.top() + layout.scroll_top,
-        );
+        let local = position - layout.text_origin();
         self.content_offset(layout.index_for_position(local))
     }
 
@@ -1248,7 +1294,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let layout = self.layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let origin = layout.bounds.origin - point(px(0.), layout.scroll_top);
+        let origin = layout.text_origin();
         let start = layout.position_for_index(self.display_offset(range.start));
         let end = layout.position_for_index(self.display_offset(range.end));
         Some(Bounds::from_corners(
@@ -1264,7 +1310,7 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let layout = self.layout.as_ref()?;
-        let local = point - layout.bounds.origin + gpui::point(px(0.), layout.scroll_top);
+        let local = point - layout.text_origin();
         let index = self.content_offset(layout.index_for_position(local));
         Some(self.offset_to_utf16(index))
     }
@@ -1437,6 +1483,7 @@ fn lay_out(
         bounds,
         line_height: shaping.line_height,
         scroll_top,
+        scroll_left: px(0.),
         lines,
         rows,
         chip_bounds: Vec::new(),
@@ -1543,7 +1590,24 @@ impl Element for TextElement {
             scroll_top = scroll_top.clamp(px(0.), overflow);
         }
         layout.scroll_top = scroll_top;
-        let origin = bounds.origin - point(px(0.), scroll_top);
+        // One line scrolls sideways instead, keeping the cursor in view as it moves.
+        if wrap_width.is_none() && !shaping.is_placeholder {
+            let overflow = layout.horizontal_overflow();
+            let mut scroll_left = input.scroll_left.min(overflow);
+            if input.autoscroll {
+                let cursor_x = layout
+                    .position_for_index(input.display_offset(input.cursor_offset()))
+                    .x;
+                if cursor_x < scroll_left {
+                    scroll_left = cursor_x;
+                } else if cursor_x + CURSOR_WIDTH > scroll_left + bounds.size.width {
+                    scroll_left = cursor_x + CURSOR_WIDTH - bounds.size.width;
+                }
+                scroll_left = scroll_left.clamp(px(0.), overflow);
+            }
+            layout.scroll_left = scroll_left;
+        }
+        let origin = layout.text_origin();
         let colors = cx.theme().colors();
         let local_player = cx.theme().players().local();
 
@@ -1557,7 +1621,7 @@ impl Element for TextElement {
         let mut cursor = None;
         if shaping.is_placeholder {
             cursor = Some(fill(
-                Bounds::new(bounds.origin, size(px(1.5), line_height)),
+                Bounds::new(bounds.origin, size(CURSOR_WIDTH, line_height)),
                 local_player.cursor,
             ));
         } else {
@@ -1566,7 +1630,7 @@ impl Element for TextElement {
             if start == end {
                 let position = layout.position_for_index(start);
                 cursor = Some(fill(
-                    Bounds::new(origin + position, size(px(1.5), line_height)),
+                    Bounds::new(origin + position, size(CURSOR_WIDTH, line_height)),
                     local_player.cursor,
                 ));
             } else {
@@ -1673,7 +1737,7 @@ impl Element for TextElement {
             cx,
         );
         let layout = &prepaint.layout;
-        let origin = bounds.origin - point(px(0.), layout.scroll_top);
+        let origin = layout.text_origin();
         let icon_color: Hsla = cx.theme().colors().icon_muted;
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for selection in prepaint.selection.drain(..) {
@@ -1724,6 +1788,7 @@ impl Element for TextElement {
             bounds,
             line_height: prepaint.layout.line_height,
             scroll_top: prepaint.layout.scroll_top,
+            scroll_left: prepaint.layout.scroll_left,
             lines: Vec::new(),
             rows: Vec::new(),
             chip_bounds: Vec::new(),
@@ -1731,6 +1796,7 @@ impl Element for TextElement {
         let layout = std::mem::replace(&mut prepaint.layout, empty);
         self.input.update(cx, |input, _cx| {
             input.scroll_top = layout.scroll_top;
+            input.scroll_left = layout.scroll_left;
             if !is_placeholder {
                 input.autoscroll = false;
             }
@@ -1894,9 +1960,7 @@ impl Render for TextInput {
                     cx.notify();
                 }
             }))
-            .when(self.is_multi_line(), |this| {
-                this.on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            })
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(TextElement { input: cx.entity() })
             .children(preview)
     }
@@ -1955,20 +2019,32 @@ mod tests {
         multi_line: bool,
         cx: &mut TestAppContext,
     ) -> (Entity<TextInput>, &mut VisualTestContext) {
+        input_with(
+            move |input| {
+                if multi_line {
+                    input.multi_line(3)
+                } else {
+                    input
+                }
+            },
+            cx,
+        )
+    }
+
+    fn input_with(
+        build: impl FnOnce(TextInput) -> TextInput + 'static,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TextInput>, &mut VisualTestContext) {
         cx.update(|cx| {
             theme::init(theme::LoadThemes::JustBase, cx);
             theme::set_theme_settings_provider(Box::new(Fonts(gpui::font("Helvetica"))), cx);
             init(cx);
         });
-        let (input, cx) = cx.add_window_view(|_, cx| {
-            let input = TextInput::new("", cx);
-            if multi_line {
-                input.multi_line(3)
-            } else {
-                input
-            }
-        });
-        let (_, cx) = cx.add_window_view(|_, _| Host(input.clone()));
+        // Drawn only in the host, as a second window's draw would take the input's scroll to
+        // the cursor before the host's.
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| build(TextInput::new("", cx)))));
+        let input = host.read_with(cx, |host, _| host.0.clone());
         let focus = input.read_with(cx, |input, cx| input.focus_handle(cx));
         cx.update(|window, cx| window.focus(&focus, cx));
         cx.run_until_parked();
@@ -2032,6 +2108,77 @@ mod tests {
         cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
         cx.simulate_keystrokes("cmd-v");
         assert_eq!(text(&input, cx), "a b");
+    }
+
+    /// Where the cursor is drawn, and the input's bounds.
+    fn cursor_and_bounds(
+        input: &Entity<TextInput>,
+        cx: &mut VisualTestContext,
+    ) -> (Point<Pixels>, Bounds<Pixels>) {
+        cx.run_until_parked();
+        input.read_with(cx, |input, _| {
+            let layout = input.layout.as_ref().expect("the input's layout");
+            let cursor = input.display_offset(input.cursor_offset());
+            (
+                layout.text_origin() + layout.position_for_index(cursor),
+                layout.bounds,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn one_line_scrolls_sideways_to_keep_the_cursor_in_view(cx: &mut TestAppContext) {
+        let (input, cx) = input(false, cx);
+        let text = "a sentence far too long to fit in the input at once";
+        cx.simulate_input(text);
+        let (cursor, bounds) = cursor_and_bounds(&input, cx);
+        assert!(
+            bounds.left() < cursor.x && cursor.x + CURSOR_WIDTH <= bounds.right(),
+            "{cursor:?} in {bounds:?}"
+        );
+        let scrolled = input.read_with(cx, |input, _| input.scroll_left);
+        assert!(scrolled > px(0.));
+
+        cx.simulate_keystrokes("home");
+        let (cursor, bounds) = cursor_and_bounds(&input, cx);
+        assert_eq!(cursor.x, bounds.left());
+        assert_eq!(input.read_with(cx, |input, _| input.scroll_left), px(0.));
+
+        // A click finds the text drawn under it, scrolled as it is.
+        cx.simulate_keystrokes("end");
+        let at = text.find("once").expect("the last word");
+        click(position_of(&input, at, cx), 1, cx);
+        let cursor = input.read_with(cx, |input, _| input.cursor_offset());
+        assert!((at..=at + 1).contains(&cursor), "{cursor}");
+
+        // Deleting the end brings the rest back in view.
+        input.update(cx, |input, cx| input.set_text("short", cx));
+        cx.run_until_parked();
+        assert_eq!(input.read_with(cx, |input, _| input.scroll_left), px(0.));
+    }
+
+    #[gpui::test]
+    fn a_wrapping_input_grows_to_its_limit_without_line_breaks(cx: &mut TestAppContext) {
+        let (input, cx) = input_with(|input| input.wrapping(2), cx);
+        let height = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.debug_bounds("input").expect("the input").size.height
+        };
+        cx.simulate_input("one");
+        let one_line = height(cx);
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(text(&input, cx), "one");
+        cx.write_to_clipboard(ClipboardItem::new_string(" two\nthree".into()));
+        cx.simulate_keystrokes("cmd-v");
+        assert_eq!(text(&input, cx), "one two three");
+        assert_eq!(height(cx), one_line);
+        input.update_in(cx, |input, _, cx| input.set_text("word ".repeat(10), cx));
+        assert_eq!(height(cx), one_line * 2.);
+        // Two rows at most; the rest scrolls, keeping the cursor in view.
+        input.update_in(cx, |input, _, cx| input.set_text("word ".repeat(40), cx));
+        assert_eq!(height(cx), one_line * 2.);
+        let (cursor, bounds) = cursor_and_bounds(&input, cx);
+        assert!(bounds.top() <= cursor.y && cursor.y < bounds.bottom());
     }
 
     #[gpui::test]
@@ -2170,9 +2317,9 @@ mod tests {
         cx.run_until_parked();
         input.read_with(cx, |input, _| {
             let layout = input.layout.as_ref().expect("the input's layout");
-            layout.bounds.origin
+            layout.text_origin()
                 + layout.position_for_index(offset)
-                + point(px(1.), layout.line_height / 2. - layout.scroll_top)
+                + point(px(1.), layout.line_height / 2.)
         })
     }
 

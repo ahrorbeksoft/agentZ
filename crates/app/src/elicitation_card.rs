@@ -26,6 +26,8 @@ use crate::thread_entity::AgentThread;
 const KEY_CONTEXT: &str = "ElicitationForm";
 const MIN_URL_DISPLAY_SEGMENT_CHARS: usize = 16;
 const MAX_URL_DISPLAY_SEGMENT_CHARS: usize = 64;
+/// How many rows a text field grows to before it scrolls.
+const TEXT_FIELD_MAX_LINES: usize = 2;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("enter", menu::Confirm, Some(KEY_CONTEXT))]);
@@ -1054,9 +1056,13 @@ struct FormState {
 impl FormState {
     fn new(schema: &acp::ElicitationSchema, cx: &mut App) -> Self {
         let required = schema.required.as_deref().unwrap_or_default();
-        let text_input = |default: Option<String>, cx: &mut App| {
+        // Text wraps, as an answer may be a sentence or two; a number stays on one line.
+        let text_input = |default: Option<String>, wraps: bool, cx: &mut App| {
             cx.new(|cx| {
                 let mut input = TextInput::new("", cx);
+                if wraps {
+                    input = input.wrapping(TEXT_FIELD_MAX_LINES);
+                }
                 if let Some(default) = default {
                     input.set_text(default, cx);
                 }
@@ -1070,7 +1076,7 @@ impl FormState {
                 acp::ElicitationPropertySchema::String(schema) => {
                     let options = single_select_options(schema);
                     if options.is_empty() {
-                        Field::Text(text_input(schema.default.clone(), cx))
+                        Field::Text(text_input(schema.default.clone(), true, cx))
                     } else {
                         // A default that isn't one of the options is dropped; a required
                         // choice starts on the first.
@@ -1088,10 +1094,12 @@ impl FormState {
                 }
                 acp::ElicitationPropertySchema::Number(schema) => Field::Text(text_input(
                     schema.default.map(|default| default.to_string()),
+                    false,
                     cx,
                 )),
                 acp::ElicitationPropertySchema::Integer(schema) => Field::Text(text_input(
                     schema.default.map(|default| default.to_string()),
+                    false,
                     cx,
                 )),
                 acp::ElicitationPropertySchema::Boolean(schema) => {

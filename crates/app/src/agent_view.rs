@@ -18941,6 +18941,65 @@ mod tests {
         assert_eq!(elicitation_answers(&client, cx), 1);
     }
 
+    /// A form's text field wraps a long answer onto a second row, then scrolls; a number's
+    /// stays one row. Neither makes a line break, so Enter still submits.
+    #[gpui::test]
+    fn a_forms_text_field_grows_to_two_rows(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        show_elicitation(
+            &thread,
+            serde_json::json!({
+                "mode": "form",
+                "sessionId": "session",
+                "message": "Details for the issue",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "title": "Title"},
+                        "estimate": {"type": "integer", "title": "Estimate"},
+                    },
+                },
+            }),
+            cx,
+        );
+        let height = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"))
+                .size
+                .height
+        };
+        let one_row = height("elicitation-field-1-title", cx);
+        assert_eq!(one_row, crate::controls::FIELD_HEIGHT);
+        assert_eq!(height("elicitation-field-1-estimate", cx), one_row);
+
+        click("elicitation-field-1-title", cx);
+        cx.simulate_input(&"word ".repeat(40));
+        let two_rows = height("elicitation-field-1-title", cx);
+        assert!(two_rows > one_row);
+        cx.simulate_input(&"word ".repeat(40));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(height("elicitation-field-1-title", cx), two_rows);
+
+        click("elicitation-field-1-estimate", cx);
+        cx.simulate_input("12345678901234567");
+        assert_eq!(height("elicitation-field-1-estimate", cx), one_row);
+
+        click("elicitation-field-1-title", cx);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(elicitation_answers(&client, cx), 1);
+        let answered = sent(&client, cx)
+            .into_iter()
+            .find_map(|request| match request {
+                Request::RespondToElicitation { action, .. } => Some(format!("{action:?}")),
+                _ => None,
+            });
+        let answered = answered.expect("the answer");
+        assert!(!answered.contains("\\n"), "{answered}");
+    }
+
     /// A page to open shows its host first, its whole address behind Show address, and
     /// Copy link beside Open.
     #[gpui::test]

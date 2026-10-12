@@ -159,6 +159,7 @@ fn init_for_test(cx: &mut App) {
     artifacts_list::init(cx);
     agent_view::init(cx);
     agent_login::init(cx);
+    elicitation_card::init(cx);
     terminal_view::init(cx);
     terminal_thread_view::init(cx);
     new_space_picker::init(cx);
