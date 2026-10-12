@@ -727,8 +727,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Every kind of tool call** (`tool_calls.rs`'s `AgentAction`, `agent_view.rs`'s
   `render_tool_call`; picked in `design/tool-calls-2/`): agents' own tools say what they did
   in the same words for every agent, told apart by kind, title, input and the agent's own
-  tool name (`ToolCall::tool_name`, Claude Agent's `_meta.claudeCode.toolName`). A read is a
-  row only, its lines dim after the path ("lines 1–120"), with no chevron, as in Zed. An edit
+  tool name (`ToolCall::tool_name`, Claude Agent's `_meta.claudeCode.toolName`). A read has
+  its lines dim after the path ("lines 1–120") and opens, as other rows do, to what it got in
+  the file view, numbered in a gutter (`tool_calls::read_file_lines`): Claude Agent's own
+  numbers ("845→") move out of the text, and other agents' bare text is numbered from where
+  the read started (its location, its input's `offset`, or its title's range). An edit
   opens to a header per file (its icon, path, +2 −2 and Open, which shows the file in the
   diff panel: `AgentViewEvent::OpenDiffFile`, `DiffPanel::reveal_file`) over its diff, with
   the new file's line numbers in a gutter when the agent says where each hunk starts
@@ -819,7 +822,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   `design/tool-calls/` (topics 4–6): a message's images (`message_pieces`,
   `without_image_links`) show as 100 × 75 thumbnails cropped to fill, two to a row: the
   user's above its text, the agent's where they are in its reply. A tool call with an image
-  starts open, the image under its row at most 384 px wide and tall, in a thin border; its
+  starts closed as any row and opens to the image at most 384 px wide and tall, in a thin
+  border; its
   row is measured again once the image loads (`remeasure_loaded_images`), since its
   height is known only then. A finished read of an image file that gave back only text
   (Factory Droid's say "[Image: image/png]") keeps the file it read as the read's image

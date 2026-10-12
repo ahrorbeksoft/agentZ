@@ -5739,10 +5739,8 @@ impl AgentView {
         let is_execute = matches!(tool_call.kind, acp::ToolKind::Execute);
         let (kind, sentence) = self.tool_call_kind(tool_call, cx);
         let action = tool_call_action(tool_call, &kind, names_questions);
-        let has_content = match (&kind, &action) {
-            (ToolCallKind::ToolSearch(_), _) => false,
-            // What a read got is the file, so it doesn't open, unless it's an image.
-            (_, AgentAction::Read { .. }) => !tool_call.images.is_empty(),
+        let has_content = match &kind {
+            ToolCallKind::ToolSearch(_) => false,
             _ => {
                 !tool_call.text.is_empty()
                     || !tool_call.diffs.is_empty()
@@ -5753,10 +5751,8 @@ impl AgentView {
         };
         let is_live = live_run.is_some();
         let is_openable = is_live || (has_content && !needs_confirmation);
-        // One with an image starts open, so the image shows as the thread goes by.
-        let opens_at_first = !tool_call.images.is_empty();
-        let is_open = needs_confirmation
-            || (!is_live && opens_at_first != self.toggled_tool_calls.contains(&tool_call.id));
+        let is_open =
+            needs_confirmation || (!is_live && self.toggled_tool_calls.contains(&tool_call.id));
         let (added, removed) = tool_call.diffs.iter().map(FileDiff::line_counts).fold(
             (0, 0),
             |(added, removed), (more_added, more_removed)| {
@@ -6056,8 +6052,21 @@ impl AgentView {
         let folder = self.store.read(cx).thread_folder(self.thread_id);
         let text = || tool_calls::output_text(tool_call);
         let key = |part: &str| format!("tool-{part}-{}", tool_call.id);
-        // A view of what it made or found, when its output reads as one.
+        // A view of what it read, made or found, when its output reads as one.
         let view = match action {
+            AgentAction::Read { .. } if tool_call.images.is_empty() => {
+                tool_calls::read_file_lines(tool_call).map(|(start, lines)| {
+                    render_file_lines(
+                        index,
+                        lines.iter().map(String::as_str),
+                        start,
+                        false,
+                        key("file"),
+                        window,
+                        cx,
+                    )
+                })
+            }
             AgentAction::Created { .. } => tool_call.diffs.first().map(|diff| {
                 render_file_lines(
                     index,
@@ -15918,8 +15927,8 @@ mod tests {
         }
     }
 
-    /// Each kind of tool call opens to what it did (`design/tool-calls-2`): a read is a row
-    /// only; an edit has a header per file, whose Open shows the file in the diff panel; a new
+    /// Each kind of tool call opens to what it did (`design/tool-calls-2`): a read to its
+    /// lines; an edit has a header per file, whose Open shows the file in the diff panel; a new
     /// file opens to its lines; a search to its matches by file; a web search to its pages; a
     /// fetch to its notes, as prose.
     #[gpui::test]
@@ -15988,7 +15997,7 @@ mod tests {
         });
 
         click("tool-call-row-1", cx);
-        assert!(cx.debug_bounds("tool-call-output-1").is_none());
+        assert!(cx.debug_bounds("tool-call-file-1").is_some());
 
         click("tool-call-row-3", cx);
         assert!(cx.debug_bounds("tool-diff-header-3-0").is_some());
@@ -16494,6 +16503,10 @@ mod tests {
         };
         screenshot.text.clear();
         screenshot.images = vec![image_id()];
+        // Opened, as the user left it.
+        view.update(cx, |view, _| {
+            view.toggled_tool_calls.insert(screenshot.id.clone());
+        });
         let mut entries = vec![
             Entry::UserMessage("Take a screenshot".into()),
             Entry::ToolCall(screenshot),
@@ -17255,8 +17268,35 @@ mod tests {
                 if *prompt == [PromptPart::Image(image_id()), PromptPart::Text(" ".into())])));
     }
 
-    /// A tool call with an image starts open, showing it; a click shows it whole until Escape,
-    /// and a click on the row closes it as any row.
+    /// A read starts closed and opens to the lines it got, numbered in a gutter.
+    #[gpui::test]
+    fn a_read_opens_to_its_lines(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let Entry::ToolCall(mut read) = tool_call(acp::ToolCallStatus::Completed) else {
+            panic!("a tool call");
+        };
+        read.kind = acp::ToolKind::Read;
+        read.title = "Read /tmp/demo/cart.rs".into();
+        read.text = vec!["845→fn total() {\n846→}".into()];
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![Entry::UserMessage("Read it".into()), Entry::ToolCall(read)],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-file-1").is_none());
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-file-1").is_some());
+    }
+
+    /// A tool call with an image starts closed as any row, and opens to it; a click shows it
+    /// whole until Escape, and a click on the row closes it again.
     #[gpui::test]
     fn an_image_opens_whole_in_the_viewer(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -17282,6 +17322,12 @@ mod tests {
                 cx,
             )
         });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-image-1-0").is_none());
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         // What it is shows dim under it.
         assert!(cx.debug_bounds("tool-image-caption-1-0").is_some());
@@ -17457,6 +17503,11 @@ mod tests {
                 cx,
             )
         });
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("tool-call-row-1")
+            .expect("the tool call's row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let image = cx.debug_bounds("tool-image-1-0").expect("the tool's image");
         // In its border.

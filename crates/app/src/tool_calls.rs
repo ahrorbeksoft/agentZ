@@ -2239,6 +2239,61 @@ fn read_lines(tool_call: &ToolCall) -> Option<String> {
 }
 
 /// A read's title without the range Claude Agent adds after its path.
+/// What a read got, as a file's lines from the number of its first. Claude Agent numbers each
+/// line itself ("845→text", or `cat -n`'s "   845\ttext"), and those move to the gutter
+/// (`design/tool-calls-2`, topic 14); others send the bare text, numbered on from the line
+/// the read started at.
+pub fn read_file_lines(tool_call: &ToolCall) -> Option<(u32, Vec<String>)> {
+    let text = output_text(tool_call)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let numbered: Option<Vec<(u32, &str)>> = lines.iter().map(|line| numbered_line(line)).collect();
+    if let Some(numbered) = numbered
+        && let Some(&(first, _)) = numbered.first()
+        && numbered
+            .iter()
+            .zip(first..)
+            .all(|((number, _), expected)| *number == expected)
+    {
+        let lines = numbered.into_iter().map(|(_, line)| line.to_string());
+        return Some((first, lines.collect()));
+    }
+    let offset = raw_input(tool_call)
+        .and_then(|input| input.get("offset")?.as_u64())
+        .and_then(|offset| u32::try_from(offset).ok());
+    let start = tool_call
+        .location_lines
+        .first()
+        .copied()
+        .flatten()
+        .or(offset)
+        .or_else(|| title_read_start(&tool_call.title))
+        .filter(|start| *start > 0)
+        .unwrap_or(1);
+    Some((start, lines.into_iter().map(str::to_string).collect()))
+}
+
+/// A line Claude Agent numbered: its number, then an arrow or a tab, then the line.
+fn numbered_line(line: &str) -> Option<(u32, &str)> {
+    let trimmed = line.trim_start();
+    let digits = trimmed.len()
+        - trimmed
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len();
+    let number = trimmed[..digits].parse().ok()?;
+    let rest = &trimmed[digits..];
+    let line = rest.strip_prefix('→').or_else(|| rest.strip_prefix('\t'))?;
+    Some((number, line))
+}
+
+/// The first line of the range in Claude Agent's title: "(40 - 120)" or "(from line 40)".
+fn title_read_start(title: &str) -> Option<u32> {
+    let (_, range) = title.trim().strip_suffix(')')?.rsplit_once(" (")?;
+    let start = range
+        .strip_prefix("from line ")
+        .or_else(|| range.split_once(" - ").map(|(start, _)| start))?;
+    start.trim().parse().ok()
+}
+
 fn without_read_range(title: &str) -> &str {
     match title.rsplit_once(" (") {
         Some((rest, range))
@@ -3498,6 +3553,52 @@ mod tests {
         assert_eq!(file_path(&read), Some(PathBuf::from("/tmp/other.rs")));
         let search = tool_call("Search", Some(json!({"path": "src"})), None);
         assert_eq!(file_path(&search), None);
+    }
+
+    /// A read opens to its file's lines, numbered from where it started: Claude Agent's own
+    /// numbers move out of the text; others' bare text is numbered from its place, its input's
+    /// offset or its title's range.
+    #[test]
+    fn reads_are_numbered_lines() {
+        let lines = |tool_call: &ToolCall| read_file_lines(tool_call);
+        let owned = |lines: &[&str]| lines.iter().map(|line| line.to_string()).collect();
+
+        let claude = tool_call(
+            "Read src/cart.rs",
+            None,
+            Some("845→fn total() {\n846→\n847→}"),
+        );
+        assert_eq!(
+            lines(&claude),
+            Some((845, owned(&["fn total() {", "", "}"])))
+        );
+        let cat = tool_call(
+            "Read src/cart.rs",
+            None,
+            Some("```\n     9\tlet a = 1;\n    10\tlet b = 2;\n```"),
+        );
+        assert_eq!(lines(&cat), Some((9, owned(&["let a = 1;", "let b = 2;"]))));
+
+        // Numbers that don't run on are the file's own text.
+        let table = tool_call("Read ids.tsv", None, Some("3\tthree\n7\tseven"));
+        assert_eq!(lines(&table), Some((1, owned(&["3\tthree", "7\tseven"]))));
+
+        let mut droid = tool_call("Read src/cart.rs", None, Some("a\nb"));
+        assert_eq!(lines(&droid), Some((1, owned(&["a", "b"]))));
+        droid.location_lines = vec![Some(40)];
+        assert_eq!(lines(&droid).map(|(start, _)| start), Some(40));
+        let offset = tool_call(
+            "Read src/cart.rs",
+            Some(json!({"file_path": "src/cart.rs", "offset": 70, "limit": 35})),
+            Some("a"),
+        );
+        assert_eq!(lines(&offset).map(|(start, _)| start), Some(70));
+        let titled = tool_call("Read src/cart.rs (from line 12)", None, Some("a"));
+        assert_eq!(lines(&titled).map(|(start, _)| start), Some(12));
+        let ranged = tool_call("Read src/cart.rs (5 - 9)", None, Some("a"));
+        assert_eq!(lines(&ranged).map(|(start, _)| start), Some(5));
+
+        assert_eq!(lines(&tool_call("Read src/cart.rs", None, None)), None);
     }
 
     #[test]
