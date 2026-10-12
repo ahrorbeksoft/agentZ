@@ -407,6 +407,33 @@ impl ProjectStore {
         )
     }
 
+    /// Fork from This Response: a thread that begins with the conversation up to the end of
+    /// the turn of the reply at `entry`.
+    pub fn fork_thread(
+        &mut self,
+        thread_id: ThreadId,
+        entry: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ThreadId>> {
+        self.request(
+            Request::ForkThread { thread_id, entry },
+            |response| match response {
+                Response::ThreadCreated(thread_id) => Some(thread_id),
+                _ => None,
+            },
+            cx,
+        )
+    }
+
+    /// Merges a fork back into the thread it was forked from, for that thread's next message.
+    pub fn merge_back(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.request(
+            Request::MergeBack(thread_id),
+            |response| matches!(response, Response::Ok).then_some(()),
+            cx,
+        )
+    }
+
     /// A thread that runs a terminal: a login shell, or `command` in one.
     pub fn create_terminal_thread(
         &mut self,

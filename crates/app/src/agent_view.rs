@@ -25,8 +25,8 @@ use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, HandoffSource, LostHistory,
-    ModeSwitch, PermissionOption, PlanItem, SessionRestore, ThreadAgent, ToolAnswer, ToolCall,
-    TurnTime, without_handoff,
+    ModeSwitch, PendingHandoff, PermissionOption, PlanItem, SessionRestore, ThreadAgent,
+    ToolAnswer, ToolCall, TurnTime, without_handoff,
 };
 use agentz_protocol::workspace::{
     PastureSupport, ProjectGit, SetupStepKind, SetupStepState, WorkspaceChoice, WorkspaceSetup,
@@ -554,12 +554,20 @@ pub struct AgentView {
     rename_input: Entity<TextInput>,
     renaming: bool,
     _rename_blur: Option<Subscription>,
-    /// The composer's handoff chip shows what goes to the agent.
-    handoff_expanded: bool,
-    /// Why "Continue with another agent", a switch to another agent or account, or the limit
-    /// notice's Continue at the reset, Switch to Droid Core or Use Reset, didn't work.
+    /// The composer's handoff chip that shows what goes to the agent, by when its handoff was
+    /// made.
+    expanded_handoff: Option<SystemTime>,
+    /// [`Self::fork_divider_rows`] as last measured.
+    synced_fork_rows: Vec<usize>,
+    /// Why "Continue with another agent", a switch to another agent or account, a fork or its
+    /// merge back, or the limit notice's Continue at the reset, Switch to Droid Core or Use
+    /// Reset, didn't work.
     continue_error: Option<SharedString>,
     _continuing: Task<()>,
+    /// Fork from This Response, while the fork is being made.
+    forking: Option<Task<()>>,
+    /// The header's Merge Back, while it's on its way.
+    merging: Option<Task<()>>,
     /// The composer's switch to another agent or account, while it's on its way.
     switching_agent: Option<Task<()>>,
     /// The limit notice's Switch to Droid Core, while it's on its way.
@@ -637,6 +645,7 @@ impl AgentView {
             ),
             cx.observe(&store, |this, _, cx| {
                 this.sync_agent(cx);
+                this.sync_fork_dividers(cx);
                 this.sync_blocked_subthreads(cx);
                 this.sync_agents_section(cx);
                 this.sync_delegated_cards(cx);
@@ -776,9 +785,12 @@ impl AgentView {
             rename_input,
             renaming: false,
             _rename_blur: None,
-            handoff_expanded: false,
+            expanded_handoff: None,
+            synced_fork_rows: Vec::new(),
             continue_error: None,
             _continuing: Task::ready(()),
+            forking: None,
+            merging: None,
             switching_agent: None,
             switching_to_core: None,
             using_limit_reset: None,
@@ -3256,7 +3268,17 @@ impl AgentView {
             let Some(entry) = self.thread.read(cx).entries().get(index - 1).cloned() else {
                 return div().into_any_element();
             };
-            self.render_entry(index - 1, &entry, index == entry_count, window, cx)
+            let element = self.render_entry(index - 1, &entry, index == entry_count, window, cx);
+            let dividers = self.render_fork_dividers(index - 1, cx);
+            if dividers.is_empty() {
+                element
+            } else {
+                v_flex()
+                    .w_full()
+                    .child(element)
+                    .children(dividers)
+                    .into_any_element()
+            }
         } else {
             v_flex()
                 .w_full()
@@ -4026,6 +4048,7 @@ impl AgentView {
             // From the title's own width, so a narrow header shrinks it and the project's name
             // together.
             .child(h_flex().flex_auto().min_w_0().child(title))
+            .children(self.render_fork_source_pill(cx))
             .children(self.render_artifacts_pill(cx))
             .when(!is_chat, |toolbar| toolbar.children(self.render_branch(cx)))
             .child(self.render_toolbar_buttons(is_chat, cx))
@@ -4491,6 +4514,90 @@ impl AgentView {
     /// Claude Code's ⧉ pill, before the branch (`design/artifacts-2`, topic 3A): the artifact,
     /// opening it, or with several their count, opening a list of only this thread's, each
     /// with a design's state.
+    /// A fork's source in its header, as t3code lists it: a pill with the source's title that
+    /// opens Open Source Thread and Merge Back.
+    fn render_fork_source_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.header_parent(cx).is_some() {
+            return None;
+        }
+        let store = self.store.read(cx);
+        let source = store
+            .thread(self.thread_id)
+            .and_then(|thread| thread.forked_from)
+            .and_then(|fork_point| store.thread(fork_point.thread))?;
+        let source_id = source.id;
+        let source_title: SharedString = source.title.clone().into();
+        let can_merge = !self.thread.read(cx).is_working() && self.merging.is_none();
+        let border = cx.theme().colors().border_variant;
+        let hover = cx.theme().colors().ghost_element_hover;
+        let view = cx.weak_entity();
+        let trigger = h_flex()
+            .id("thread-header-fork-source")
+            .debug_selector(|| "thread-header-fork-source".into())
+            .flex_none()
+            .max_w(px(200.))
+            .h(px(22.))
+            .px_1p5()
+            .gap_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(border)
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .child(
+                Icon::new(IconName::GitFork)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(source_title)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            );
+        Some(
+            PopoverMenu::new("thread-fork-source-menu")
+                .trigger(ButtonLike::new("thread-fork-source-trigger").child(trigger))
+                .anchor(Anchor::TopRight)
+                .menu(move |window, cx| {
+                    let view = view.clone();
+                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                        let open_view = view.clone();
+                        let merge_view = view.clone();
+                        menu.item(
+                            ContextMenuEntry::new("Open Source Thread")
+                                .icon(IconName::ArrowUpRight)
+                                .icon_color(Color::Muted)
+                                .handler(move |_, cx| {
+                                    open_view
+                                        .update(cx, |_, cx| {
+                                            cx.emit(AgentViewEvent::OpenThread(source_id))
+                                        })
+                                        .log_err();
+                                }),
+                        )
+                        .item(
+                            ContextMenuEntry::new("Merge Back")
+                                .icon(IconName::GitMerge)
+                                .icon_color(Color::Muted)
+                                .disabled(!can_merge)
+                                .handler(move |_, cx| {
+                                    merge_view
+                                        .update(cx, |view, cx| view.merge_back(cx))
+                                        .log_err();
+                                }),
+                        )
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_artifacts_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let artifacts = self.thread_artifacts(cx);
         let first = artifacts.first()?;
@@ -5293,13 +5400,15 @@ impl AgentView {
                             )
                             .children(self.render_not_sent(index, cx)),
                     );
-                match self.render_handoff_divider(index, cx) {
-                    Some(divider) => v_flex()
+                let dividers = self.render_handoff_dividers(index, cx);
+                if dividers.is_empty() {
+                    message.into_any_element()
+                } else {
+                    v_flex()
                         .w_full()
-                        .child(divider)
+                        .children(dividers)
                         .child(message)
-                        .into_any_element(),
-                    None => message.into_any_element(),
+                        .into_any_element()
                 }
             }
             Entry::AgentMessage(text) => {
@@ -5709,9 +5818,104 @@ impl AgentView {
                                         }
                                     })),
                             ),
-                    ),
+                    )
+                    .when(self.can_fork(cx), |actions| {
+                        actions.child(
+                            div()
+                                .debug_selector(move || format!("fork-reply-{index}"))
+                                .child(
+                                    IconButton::new(
+                                        ("fork-agent-response", index),
+                                        IconName::GitFork,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .disabled(self.forking.is_some())
+                                    .tooltip(Tooltip::text("Fork from This Response"))
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.fork_from(index, cx)
+                                        }),
+                                    ),
+                                ),
+                        )
+                    }),
             )
             .into_any_element()
+    }
+
+    /// A subthread's replies aren't forked: a fork is a thread of its own in the project, and
+    /// a subthread belongs to its parent's turn.
+    fn can_fork(&self, cx: &App) -> bool {
+        self.header_parent(cx).is_none()
+    }
+
+    /// Fork from This Response: a new thread in the same folder that begins with the
+    /// conversation up to the end of the reply's turn, and opens it.
+    fn fork_from(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.forking.is_some() {
+            return;
+        }
+        self.continue_error = None;
+        let thread_id = self.thread_id;
+        let task = self
+            .store
+            .update(cx, |store, cx| store.fork_thread(thread_id, index, cx));
+        self.forking = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.forking = None;
+                match result {
+                    Ok(fork) => cx.emit(AgentViewEvent::OpenThread(fork)),
+                    Err(error) => {
+                        log::error!("couldn't fork the thread: {error:#}");
+                        this.continue_error = Some(format!("Couldn't fork: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// The header's Merge Back: what happened in the fork waits in its source for the next
+    /// message there, and the source opens, as t3code's does.
+    fn merge_back(&mut self, cx: &mut Context<Self>) {
+        if self.merging.is_some() {
+            return;
+        }
+        let Some(source) = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .and_then(|thread| thread.forked_from)
+            .map(|fork_point| fork_point.thread)
+        else {
+            return;
+        };
+        self.continue_error = None;
+        let thread_id = self.thread_id;
+        let task = self
+            .store
+            .update(cx, |store, cx| store.merge_back(thread_id, cx));
+        self.merging = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.merging = None;
+                match result {
+                    Ok(()) => cx.emit(AgentViewEvent::OpenThread(source)),
+                    Err(error) => {
+                        log::error!("couldn't merge the fork back: {error:#}");
+                        this.continue_error =
+                            Some(format!("Couldn't merge it back: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
     }
 
     /// The reply's agent icon, which names on hover who answered the turn: the agent, its
@@ -10143,7 +10347,7 @@ impl AgentView {
         self.is_draft(cx)
             && self.typed_draft(cx).text.is_none()
             && self.replacing.is_none()
-            && self.thread.read(cx).pending_handoff().is_none()
+            && self.thread.read(cx).pending_handoffs().is_empty()
     }
 
     /// A new thread nothing has been sent in yet (t3code's draft thread).
@@ -10160,13 +10364,38 @@ impl AgentView {
                 .any(|entry| matches!(entry, Entry::UserMessage(_)))
     }
 
+    /// The dividers over a message that brought handoffs: where the thread went on with
+    /// another agent or account, and where a fork was merged back.
+    fn render_handoff_dividers(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let sources: Vec<HandoffSource> = self
+            .thread
+            .read(cx)
+            .handoff_marks(index)
+            .map(|mark| mark.source.clone())
+            .collect();
+        sources
+            .iter()
+            .filter_map(|source| match source {
+                HandoffSource::Agent { from, to, .. } => {
+                    Some(self.render_switch_divider(index, from, to, cx))
+                }
+                HandoffSource::Merge { fork, title } => {
+                    Some(self.render_merge_divider(index, *fork, title, cx))
+                }
+                HandoffSource::Thread { .. } | HandoffSource::Fork { .. } => None,
+            })
+            .collect()
+    }
+
     /// t3code's divider where the thread went on with another agent or account: Context
     /// handoff, from → to, before the first message the new one got with what it hadn't seen.
-    fn render_handoff_divider(&self, index: usize, cx: &App) -> Option<AnyElement> {
-        let mark = self.thread.read(cx).handoff_mark(index)?;
-        let HandoffSource::Agent { from, to, .. } = &mark.source else {
-            return None;
-        };
+    fn render_switch_divider(
+        &self,
+        index: usize,
+        from: &ThreadAgent,
+        to: &ThreadAgent,
+        cx: &App,
+    ) -> AnyElement {
         // The same agent on another account goes by the accounts.
         let same_agent = from.agent_id == to.agent_id;
         let side = |agent: &ThreadAgent| {
@@ -10194,44 +10423,227 @@ impl AgentView {
         };
         let border = cx.theme().colors().border_variant;
         let line = || div().flex_1().min_w_4().h_px().bg(border);
-        Some(
-            h_flex()
-                .debug_selector(move || format!("handoff-divider-{index}"))
-                .w_full()
-                .px_5()
-                .pt_3()
-                .gap_3()
-                .child(line())
-                .child(
-                    h_flex()
-                        .flex_none()
-                        .gap_1p5()
-                        .child(
-                            Icon::new(IconName::ArrowRightLeft)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new("Context handoff")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(side(from))
-                        .child(
-                            Icon::new(IconName::ArrowRight)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(side(to)),
-                )
-                .child(line())
-                .into_any_element(),
-        )
+        h_flex()
+            .debug_selector(move || format!("handoff-divider-{index}"))
+            .w_full()
+            .px_5()
+            .pt_3()
+            .gap_3()
+            .child(line())
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::ArrowRightLeft)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Context handoff")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(side(from))
+                    .child(
+                        Icon::new(IconName::ArrowRight)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(side(to)),
+            )
+            .child(line())
+            .into_any_element()
+    }
+
+    /// Where a fork came back: Merged back from the fork, which a click opens, over the message
+    /// that brought what happened there.
+    fn render_merge_divider(
+        &self,
+        index: usize,
+        fork: ThreadId,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fork_exists = self.store.read(cx).thread(fork);
+        let title: SharedString = fork_exists
+            .map_or_else(|| title.to_string(), |fork| fork.title.clone())
+            .into();
+        let fork_exists = fork_exists.is_some();
+        let border = cx.theme().colors().border_variant;
+        let line = || div().flex_1().min_w_4().h_px().bg(border);
+        h_flex()
+            .debug_selector(move || format!("merged-divider-{index}"))
+            .w_full()
+            .px_5()
+            .pt_3()
+            .gap_3()
+            .child(line())
+            .child(
+                h_flex()
+                    .flex_none()
+                    .max_w(px(420.))
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::GitMerge)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Merged back from")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .single_line(),
+                    )
+                    .child(
+                        div()
+                            .id(("merged-from", index))
+                            .min_w_0()
+                            .when(fork_exists, |link| {
+                                link.cursor_pointer()
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(AgentViewEvent::OpenThread(fork))
+                                    }))
+                            })
+                            .child(
+                                Label::new(title)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .when(fork_exists, |label| label.underline())
+                                    .truncate(),
+                            ),
+                    ),
+            )
+            .child(line())
+            .into_any_element()
+    }
+
+    /// t3code's pill dividers where the conversation forked, after the entry at `index`, the
+    /// last of the turn it forked from: Forked from conversation in a fork, which opens its
+    /// source, and Conversation fork in the source, for each fork from there, which opens it.
+    fn render_fork_dividers(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let pills = self.fork_pills(index, cx);
+        let colors = cx.theme().colors();
+        let border = colors.border_variant;
+        let hover = colors.ghost_element_hover;
+        let line = || div().flex_1().min_w_4().h_px().bg(border);
+        pills
+            .into_iter()
+            .map(|(label, tooltip, thread_id, selector)| {
+                h_flex()
+                    .debug_selector(move || selector)
+                    .w_full()
+                    .px_5()
+                    .pt_3()
+                    .gap_3()
+                    .child(line())
+                    .child(
+                        h_flex()
+                            .id(("fork-divider", thread_id.0))
+                            .flex_none()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(border)
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .child(
+                                Icon::new(IconName::GitFork)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(AgentViewEvent::OpenThread(thread_id))
+                            })),
+                    )
+                    .child(line())
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// The fork dividers after the entry at `index`: their label, tooltip, the thread they
+    /// open, and their selector.
+    fn fork_pills(
+        &self,
+        index: usize,
+        cx: &App,
+    ) -> Vec<(&'static str, &'static str, ThreadId, String)> {
+        let store = self.store.read(cx);
+        let mut pills = Vec::new();
+        if let Some(fork_point) = store
+            .thread(self.thread_id)
+            .and_then(|thread| thread.forked_from)
+            && fork_point.entries == index + 1
+            && store.thread(fork_point.thread).is_some()
+        {
+            pills.push((
+                "Forked from conversation",
+                "Open Source Conversation",
+                fork_point.thread,
+                "forked-from".to_string(),
+            ));
+        }
+        for fork in store.forks(self.thread_id) {
+            if fork
+                .forked_from
+                .is_some_and(|fork_point| fork_point.entries == index + 1)
+            {
+                pills.push((
+                    "Conversation fork",
+                    "Open Fork",
+                    fork.id,
+                    format!("conversation-fork-{}", fork.id.0),
+                ));
+            }
+        }
+        pills
+    }
+
+    /// The entries the fork dividers follow, so their rows are measured again as they come and
+    /// go.
+    fn fork_divider_rows(&self, cx: &App) -> Vec<usize> {
+        let store = self.store.read(cx);
+        let mut rows: Vec<usize> = store
+            .forks(self.thread_id)
+            .filter_map(|fork| fork.forked_from)
+            .chain(
+                store
+                    .thread(self.thread_id)
+                    .and_then(|thread| thread.forked_from),
+            )
+            .map(|fork_point| fork_point.entries)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    fn sync_fork_dividers(&mut self, cx: &mut Context<Self>) {
+        let rows = self.fork_divider_rows(cx);
+        if rows == self.synced_fork_rows {
+            return;
+        }
+        // An entry's row is one past it, after the head, and a divider follows the entry
+        // before the fork point.
+        for row in rows.iter().chain(&self.synced_fork_rows) {
+            self.list_state.remeasure_items(*row..*row + 1);
+        }
+        self.synced_fork_rows = rows;
     }
 
     /// The title of the thread this one continues, until its first message is sent.
     fn continued_title(&self, cx: &App) -> Option<SharedString> {
-        let (_, title, _) = self.thread.read(cx).pending_handoff()?.from_thread()?;
+        let (_, title, _) = self
+            .thread
+            .read(cx)
+            .pending_handoffs()
+            .iter()
+            .find_map(PendingHandoff::from_thread)?;
         Some(title.to_string().into())
     }
 
@@ -10378,34 +10790,138 @@ impl AgentView {
             .collect()
     }
 
-    /// The conversation a continued thread brings with its first message, as an attachment in
-    /// the composer: a click shows exactly what goes to the agent, × starts without it.
-    fn render_handoff_chip(
+    /// What waits to go with the next message, as attachments in the composer: the
+    /// conversation a continued thread brings, and forks merged back. A click shows exactly what
+    /// goes to the agent, × goes on without it.
+    fn render_handoff_chips(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // What the thread's new agent or account hasn't seen goes along without a word; it
-        // shows in the conversation once sent.
-        let handoff = self.thread.read(cx).pending_handoff()?.clone();
-        let (from, title, agent_name) = handoff.from_thread()?;
-        let title = SharedString::from(title.to_string());
-        let agent_name = SharedString::from(agent_name.to_string());
-        let icon = {
-            let store = self.store.read(cx);
-            store
-                .thread(from)
-                .map(|from| self.thread_agent(from, cx).1)
-                .unwrap_or_else(|| Icon::new(IconName::Sparkle).color(Color::Muted).into())
-        };
+        // What the thread's new agent or account hasn't seen, and the conversation a fork
+        // starts with, go along without a word; they show in the conversation once sent.
+        let handoffs: Vec<PendingHandoff> = self
+            .thread
+            .read(cx)
+            .pending_handoffs()
+            .iter()
+            .filter(|handoff| {
+                matches!(
+                    handoff.source,
+                    HandoffSource::Thread { .. } | HandoffSource::Merge { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if handoffs.is_empty() {
+            return None;
+        }
         let colors = cx.theme().colors().clone();
+        let chips: Vec<AnyElement> = handoffs
+            .iter()
+            .enumerate()
+            .map(|(index, handoff)| self.render_handoff_chip(index, handoff, cx))
+            .collect();
+        let preview = handoffs
+            .iter()
+            .find(|handoff| self.expanded_handoff == Some(handoff.made_at))
+            .map(|handoff| {
+                with_scrollbar(
+                    div()
+                        .id("handoff-preview")
+                        .debug_selector(|| "handoff-preview".into())
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.editor_background)
+                        .font_buffer(cx)
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .child(handoff.text.clone()),
+                    div(),
+                    "handoff-preview".into(),
+                    ScrollAxes::Vertical,
+                    window,
+                    cx,
+                )
+            });
+        Some(
+            v_flex()
+                .w_full()
+                .pt_1()
+                .gap_1()
+                .child(h_flex().w_full().flex_wrap().gap_1().children(chips))
+                .children(preview)
+                .into_any_element(),
+        )
+    }
+
+    fn render_handoff_chip(
+        &self,
+        index: usize,
+        handoff: &PendingHandoff,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let messages = match handoff.messages {
             1 => "1 message".to_string(),
             count => format!("{count} messages"),
         };
-        let chip = h_flex()
-            .id("handoff-chip")
-            .debug_selector(|| "handoff-chip".into())
+        let (selector, icons, title, detail, drop_tooltip) = match &handoff.source {
+            HandoffSource::Thread { id, title, agent } => {
+                let icon = {
+                    let store = self.store.read(cx);
+                    store
+                        .thread(*id)
+                        .map(|from| self.thread_agent(from, cx).1)
+                        .unwrap_or_else(|| Icon::new(IconName::Sparkle).color(Color::Muted).into())
+                };
+                (
+                    "handoff-chip".to_string(),
+                    vec![
+                        Icon::new(IconName::Return)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element(),
+                        icon.size(IconSize::XSmall).into_any_element(),
+                    ],
+                    SharedString::from(title.clone()),
+                    format!("· {agent} · {messages}"),
+                    "Start Without It",
+                )
+            }
+            HandoffSource::Merge { fork, title } => {
+                // The fork as it's called now.
+                let title = self
+                    .store
+                    .read(cx)
+                    .thread(*fork)
+                    .map_or_else(|| title.clone(), |fork| fork.title.clone());
+                (
+                    format!("merge-chip-{}", fork.0),
+                    vec![
+                        Icon::new(IconName::GitMerge)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element(),
+                    ],
+                    SharedString::from(title),
+                    format!("· {messages}"),
+                    "Don’t Merge It Back",
+                )
+            }
+            HandoffSource::Agent { .. } | HandoffSource::Fork { .. } => {
+                return div().into_any_element();
+            }
+        };
+        let made_at = handoff.made_at;
+        let is_expanded = self.expanded_handoff == Some(made_at);
+        let colors = cx.theme().colors();
+        h_flex()
+            .id(("handoff-chip", index))
+            .debug_selector(move || selector)
             .max_w_full()
             .min_w_0()
             .gap_1p5()
@@ -10418,73 +10934,40 @@ impl AgentView {
             .bg(colors.element_background)
             .cursor_pointer()
             .hover(|style| style.bg(colors.element_hover))
-            .when(self.handoff_expanded, |chip| {
-                chip.bg(colors.element_selected)
-            })
-            .child(
-                Icon::new(IconName::Return)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(icon.size(IconSize::XSmall))
+            .when(is_expanded, |chip| chip.bg(colors.element_selected))
+            .children(icons)
             .child(
                 div()
                     .min_w_0()
                     .child(Label::new(title).size(LabelSize::Small).truncate()),
             )
             .child(
-                Label::new(format!("· {agent_name} · {messages}"))
+                Label::new(detail)
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .single_line(),
             )
             .child(
-                IconButton::new("drop-handoff", IconName::Close)
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Start Without It"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.handoff_expanded = false;
-                        this.thread.update(cx, |thread, cx| thread.drop_handoff(cx));
-                    })),
+                div()
+                    .debug_selector(move || format!("drop-handoff-{index}"))
+                    .child(
+                        IconButton::new(("drop-handoff", index), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(drop_tooltip))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.expanded_handoff = None;
+                                this.thread
+                                    .update(cx, |thread, cx| thread.drop_handoff(made_at, cx));
+                            })),
+                    ),
             )
             .tooltip(Tooltip::text("Show What Goes with Your Message"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.handoff_expanded = !this.handoff_expanded;
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.expanded_handoff = (this.expanded_handoff != Some(made_at)).then_some(made_at);
                 cx.notify();
-            }));
-        let preview = self.handoff_expanded.then(|| {
-            with_scrollbar(
-                div()
-                    .id("handoff-preview")
-                    .debug_selector(|| "handoff-preview".into())
-                    .max_h(px(200.))
-                    .overflow_y_scroll()
-                    .p_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.editor_background)
-                    .font_buffer(cx)
-                    .text_xs()
-                    .text_color(colors.text_muted)
-                    .child(handoff.text.clone()),
-                div(),
-                "handoff-preview".into(),
-                ScrollAxes::Vertical,
-                window,
-                cx,
-            )
-        });
-        Some(
-            v_flex()
-                .w_full()
-                .pt_1()
-                .gap_1()
-                .child(h_flex().w_full().child(chip))
-                .children(preview)
-                .into_any_element(),
-        )
+            }))
+            .into_any_element()
     }
 
     fn render_message_editor(
@@ -10600,7 +11083,7 @@ impl AgentView {
                     })
                     // A draft can still be typed, but the composer reads as waiting on the login.
                     .when(needs_login, |this| this.opacity(0.55))
-                    .children(self.render_handoff_chip(window, cx))
+                    .children(self.render_handoff_chips(window, cx))
                     .child(
                         v_flex()
                             .relative()
@@ -10925,7 +11408,7 @@ impl AgentView {
         // A continuation brings a conversation, which only an agent can take, a Workspaces
         // draft sits in a workspace, beside its shells, and a chat has no folder to open one in.
         let offers_terminal = picker == PickerFor::NewThread
-            && self.thread.read(cx).pending_handoff().is_none()
+            && self.thread.read(cx).pending_handoffs().is_empty()
             && !self.in_workspaces(cx)
             && !self.is_chat(cx);
         let (id, trigger_id, disabled) = match picker {
@@ -15709,6 +16192,186 @@ mod tests {
         assert!(cx.debug_bounds("answered-by-account").is_some());
         assert!(cx.debug_bounds("answered-by-model").is_some());
         assert!(cx.debug_bounds("answered-by-effort").is_none());
+    }
+
+    /// The demo snapshot with thread 6, a fork of thread 2 from its first reply.
+    fn snapshot_with_fork() -> ProjectsSnapshot {
+        let mut snapshot = snapshot(Some("Fix the login"));
+        if let Some(source) = snapshot.threads.iter_mut().find(|thread| thread.id.0 == 2) {
+            source.title = "Fix the login redirect loop".into();
+        }
+        let mut fork = thread(6, None);
+        fork.title = "Fix the login redirect loop fork".into();
+        fork.forked_from = Some(projects::ForkPoint {
+            thread: ThreadId(2),
+            entries: 2,
+        });
+        snapshot.threads.push(fork);
+        snapshot
+    }
+
+    fn two_turns() -> (Vec<Entry>, Vec<TurnTime>) {
+        let turn = |entries: std::ops::Range<usize>| TurnTime {
+            entries_start: entries.start,
+            entries_end: entries.end,
+            duration: Duration::from_secs(52),
+            agent: None,
+            model: None,
+            effort: None,
+            outcome: agentz_protocol::thread::TurnOutcome::Completed,
+        };
+        (
+            vec![
+                Entry::UserMessage("The login page redirects back to itself. Fix it.".into()),
+                Entry::AgentMessage("Fixed.".into()),
+                Entry::UserMessage("Add a test for it".into()),
+                Entry::AgentMessage("Added one.".into()),
+            ],
+            vec![turn(0..2), turn(2..4)],
+        )
+    }
+
+    /// Fork from This Response sits next to Copy, and opens the fork it makes. The source has
+    /// a Conversation fork divider where each fork left it, and a merge back waits in its
+    /// composer, then marks the message that brought it.
+    #[gpui::test]
+    fn a_reply_forks_into_a_thread_that_merges_back(cx: &mut TestAppContext) {
+        use agentz_protocol::thread::{HandoffMark, PendingHandoff};
+        use std::cell::RefCell;
+
+        let (view, cx) = open_in(snapshot_with_fork(), 2, false, cx);
+        let opened = opened_threads(&view, cx);
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::ForkThread { .. } => Some(Response::ThreadCreated(ThreadId(7))),
+                    Request::DropHandoff { .. } => Some(Response::Ok),
+                    _ => None,
+                }
+            });
+        });
+        let made_at = SystemTime::now();
+        let merge = HandoffSource::Merge {
+            fork: ThreadId(6),
+            title: "Fix the login redirect loop fork".into(),
+        };
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let (entries, turns) = two_turns();
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(entries, cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.finished_turns = turns;
+                    state.handoffs.push(HandoffMark {
+                        entry: 2,
+                        source: merge.clone(),
+                        made_at,
+                    });
+                    state.pending_handoffs.push(PendingHandoff {
+                        source: merge.clone(),
+                        text: "Merged back".into(),
+                        messages: 2,
+                        made_at,
+                    });
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("conversation-fork-6").is_some());
+        assert!(cx.debug_bounds("forked-from").is_none());
+        assert!(cx.debug_bounds("thread-header-fork-source").is_none());
+        assert!(cx.debug_bounds("merged-divider-2").is_some());
+        assert!(cx.debug_bounds("merge-chip-6").is_some());
+        assert!(cx.debug_bounds("fork-reply-3").is_some());
+        assert!(cx.debug_bounds("fork-reply-1").is_none());
+
+        let footer = cx
+            .debug_bounds("reply-footer-1")
+            .expect("the earlier reply has a footer");
+        cx.simulate_mouse_move(footer.center(), None, gpui::Modifiers::none());
+        let fork = cx
+            .debug_bounds("fork-reply-1")
+            .expect("an earlier reply forks on hover");
+        cx.simulate_click(fork.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(requests.borrow().iter().any(|request| matches!(
+            request,
+            Request::ForkThread {
+                thread_id: ThreadId(2),
+                entry: 1,
+            }
+        )));
+        assert_eq!(*opened.borrow(), vec![ThreadId(7)]);
+
+        let divider = cx
+            .debug_bounds("conversation-fork-6")
+            .expect("the fork's divider");
+        cx.simulate_click(divider.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), vec![ThreadId(7), ThreadId(6)]);
+
+        let drop = cx
+            .debug_bounds("drop-handoff-0")
+            .expect("the merge can be dropped");
+        cx.simulate_click(drop.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(requests.borrow().iter().any(|request| matches!(
+            request,
+            Request::DropHandoff { made_at: dropped, .. } if *dropped == made_at
+        )));
+    }
+
+    /// A fork has Forked from conversation where it left its source, and the source in its
+    /// header, whose Merge Back sends what happened in the fork there and opens it.
+    #[gpui::test]
+    fn a_fork_names_its_source_and_merges_back(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+
+        let (view, cx) = open_in(snapshot_with_fork(), 6, false, cx);
+        let opened = opened_threads(&view, cx);
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                matches!(request, Request::MergeBack(_)).then_some(Response::Ok)
+            });
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let (entries, turns) = two_turns();
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(entries, cx);
+            thread.update_state_for_test(|state| state.finished_turns = turns, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("forked-from").is_some());
+        assert!(cx.debug_bounds("conversation-fork-6").is_none());
+        assert!(cx.debug_bounds("thread-header-fork-source").is_some());
+
+        let divider = cx
+            .debug_bounds("forked-from")
+            .expect("the source's divider");
+        cx.simulate_click(divider.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), vec![ThreadId(2)]);
+
+        view.update(cx, |view, cx| view.merge_back(cx));
+        cx.run_until_parked();
+        assert!(
+            requests
+                .borrow()
+                .iter()
+                .any(|request| matches!(request, Request::MergeBack(ThreadId(6))))
+        );
+        assert_eq!(*opened.borrow(), vec![ThreadId(2), ThreadId(2)]);
     }
 
     #[test]

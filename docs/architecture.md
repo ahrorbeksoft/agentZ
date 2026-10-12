@@ -137,7 +137,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `queues.json` | server | Each thread's queued messages, and whether the first one steers |
 | `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turns (when, how long, who answered with which model and effort, how they ended), where handoffs went |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
-| `handoffs/<thread id>.json` | server | What goes with a thread's next message, written by agentZ: what its new agent or account hasn't seen of it, or the conversation of the thread it continues; removed once the agent takes the message |
+| `handoffs/<thread id>.json` | server | What goes with a thread's next message, written by agentZ: what its new agent or account hasn't seen of it, the conversation of the thread it continues or was forked from, or what happened in a fork merged back into it; removed once the agent takes the message |
 | `agents/settings.json` | server | Per-agent env, defaults and known options: the External account's |
 | `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, last login check and last identity and limits read, its account for new threads, and the same for the External account |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
@@ -708,8 +708,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   12s". Under each finished reply (the last agent message of its turn) is a clock with how
   long the turn took (t3code's durations), then a generic agent icon whose tooltip lists the
   turn's Agent, Account, Model and Effort in rows (`render_reply_footer`, picked in
-  `design/agent-switching/`, 4 C), then Copy, which shows on hover except under the latest
-  reply. Both times come from the server (`ThreadState::sent_times` by entry, `finished_turns`
+  `design/agent-switching/`, 4 C), then Copy and Fork from This Response (below), which show
+  on hover except under the latest reply. Both times come from the server (`ThreadState::sent_times` by entry, `finished_turns`
   by each turn's entries, with who answered it), so they survive reopening the thread;
   messages and turns an agent replays from history have none, and turns from before agents
   were recorded have no Agent or Account.
@@ -866,13 +866,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the menu the first opened; the field takes focus after the menu's delayed focus). Then the
   branch with its worktree or pasture icon, the changes as +added −removed (the Diff icon when
   none), Terminal, and "⋯" with the agent's options. A workspace pane keeps its own header with
-  the same buttons. A Workspaces thread has its folder (icon and name, the path in its
+  the same buttons. A fork has its source's title in a pill before the changes, opening Open
+  Source Thread and Merge Back (below). A Workspaces thread has its folder (icon and name, the path in its
   tooltip) where the project goes, and no Archive. A chat has Chat there (a click starts
   another), and only "⋯" at the right: no branch, changes or Terminal, and no Archive.
 - **Switching agents** (`Request::SwitchAgent`, `Server::switch_agent` in
   `server/workspace_requests.rs`, `ProjectStore::switch_thread_agent`,
   `agentz_protocol::thread::switch_handoff`, `agent_view.rs`'s `render_agent_picker`,
-  `render_account_picker` and `render_handoff_divider`; t3code's in-thread provider switch and
+  `render_account_picker` and `render_switch_divider`; t3code's in-thread provider switch and
   context handoff, design round `design/agent-switching/`): a sent thread's composer has the
   agent picker, and beside it the account picker while the agent has more than one account
   (the current one "This thread's account"). They work between turns. Picking another agent
@@ -886,6 +887,25 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   same agent), from `ThreadState::handoffs`. Each finished turn records who answered it, with
   which model and effort, and how it ended (`TurnTime`), so the handoff names them. A task
   keeps the agent it was given to.
+- **Forking** (`Request::{ForkThread, MergeBack}`, `Server::{fork_thread, merge_back}` in
+  `server/workspace_requests.rs`, `agentz_protocol::thread::{fork_handoff, merge_handoff}`,
+  `Thread::forked_from`, `agent_view.rs`'s `render_fork_dividers`, `render_fork_source_pill`
+  and `render_merge_divider`; t3code's fork and merge back, design round
+  `design/agent-switching/`, 5 A to 8 A): Fork from This Response, beside Copy under a finished
+  reply (not in a subthread), makes a thread in the same project and folder, with the same
+  agent and account, named "<title> fork". It begins with the source's conversation up to the
+  end of that reply's turn, its turns and marks included, and its first message brings that
+  conversation (`HandoffSource::Fork`), since its agent has no session yet; then it opens.
+  t3code's pill dividers link the two where they part: Forked from conversation in the fork,
+  Conversation fork in the source (one for each fork from there), each opening the other.
+  The fork's header pill (above) has Merge Back, between the fork's turns: what happened in
+  the fork since it was forked (`HandoffSource::Merge`, which tells the agent the fork's file
+  changes are in the folder already) waits in the source for its next message, in place of
+  an earlier merge of the same fork that hasn't gone yet, and the source opens. It shows
+  there as a chip over the composer, "<fork> · 2 messages", which previews it and × drops; the
+  message it goes with gets a Merged back from <fork> divider, whose title opens the fork.
+  Several handoffs can wait at once (`ThreadState::pending_handoffs`): a switch's, a merge
+  for each fork, and they go together.
 - **Handoffs** (`agentz_protocol::thread::{switch_handoff, handoff}`, `AgentThread::{send_message,
   send_to_agent, return_handoff}`; t3code's `handoffBudget.ts`): the conversation goes in an
   `<agentz-handoff thread="…" from="…">` block: an intro naming the thread, its title and

@@ -1030,8 +1030,18 @@ impl Server {
             Request::PlanWorkspace { thread_id, plan } => self.plan_workspace(thread_id, plan),
             Request::RetryWorkspaceSetup(thread_id) => self.retry_workspace_setup(thread_id),
             Request::UseLocal(thread_id) => self.use_local(thread_id),
-            Request::DropHandoff(connection) => {
-                self.update_thread(connection, AgentThread::drop_handoff)?;
+            Request::DropHandoff {
+                connection,
+                made_at,
+            } => {
+                self.update_thread(connection, |thread| thread.drop_handoff(made_at))?;
+                Ok(Response::Ok)
+            }
+            Request::ForkThread { thread_id, entry } => {
+                Ok(Response::ThreadCreated(self.fork_thread(thread_id, entry)?))
+            }
+            Request::MergeBack(thread_id) => {
+                self.merge_back(thread_id)?;
                 Ok(Response::Ok)
             }
             Request::SwitchAgent {
@@ -1705,11 +1715,8 @@ impl Server {
             name: self.agent_name(&agent_id).to_string(),
             account,
         });
-        if let Some(handoff) = continuations::load(&self.data_dir, thread_id)
-            .log_err()
-            .flatten()
-        {
-            agent_thread.set_handoff(Some(handoff));
+        if let Some(handoffs) = continuations::load(&self.data_dir, thread_id).log_err() {
+            agent_thread.set_handoffs(handoffs);
         }
         if let Some(transcript) = transcripts::load(&self.data_dir, thread_id)
             .log_err()
@@ -2211,6 +2218,16 @@ impl Server {
             return;
         };
         let events = thread.take_events();
+        // What still waits, once a handoff went or was dropped, for its file.
+        let pending_handoffs = events
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    AgentThreadEvent::HandoffSent(_) | AgentThreadEvent::HandoffDropped
+                )
+            })
+            .then(|| thread.state.pending_handoffs.clone());
         let mut paused = false;
         let model = thread.model_name();
         let config_options = thread.config_options().to_vec();
@@ -2312,12 +2329,8 @@ impl Server {
                     if let HandoffSource::Thread { id, .. } = source {
                         self.projects.set_continued_from(thread_id, id);
                     }
-                    continuations::remove(&self.data_dir, thread_id).log_err();
                 }
-                // Dropped, it's a new thread like any other.
-                (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffDropped) => {
-                    continuations::remove(&self.data_dir, thread_id).log_err();
-                }
+                (ConnectionId::Thread(_), AgentThreadEvent::HandoffDropped) => {}
                 (
                     ConnectionId::Thread(_),
                     event @ (AgentThreadEvent::SubagentStarted(_)
@@ -2330,6 +2343,9 @@ impl Server {
         if let ConnectionId::Thread(thread_id) = connection {
             for event in subagent_events {
                 self.subagent_event(thread_id, event);
+            }
+            if let Some(pending_handoffs) = pending_handoffs {
+                continuations::save(&self.data_dir, thread_id, &pending_handoffs).log_err();
             }
         }
         if let Some((thread_id, false)) = waiting {

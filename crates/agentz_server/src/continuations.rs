@@ -1,9 +1,10 @@
-//! The conversations waiting to go with a thread's next message ([`ThreadState::handoff`]): what
-//! its new agent or account hasn't seen, or another thread's ("Continue with another agent").
-//! Each is kept in `handoffs/<thread id>.json` until the agent takes a message with it, so a
-//! restart of the server doesn't lose one.
+//! The conversations waiting to go with a thread's next message
+//! ([`ThreadState::pending_handoffs`]): what its new agent or account hasn't seen, the
+//! conversation a fork starts with, another thread's ("Continue with another agent"), and forks
+//! merged back. They're kept in `handoffs/<thread id>.json` until the agent takes a message with
+//! them, so a restart of the server doesn't lose one.
 //!
-//! [`ThreadState::handoff`]: agentz_protocol::thread::ThreadState::handoff
+//! [`ThreadState::pending_handoffs`]: agentz_protocol::thread::ThreadState::pending_handoffs
 
 use std::path::{Path, PathBuf};
 
@@ -17,23 +18,31 @@ pub(crate) fn path(data_dir: &Path, thread_id: ThreadId) -> PathBuf {
         .join(format!("{}.json", thread_id.0))
 }
 
-pub(crate) fn save(data_dir: &Path, thread_id: ThreadId, handoff: &PendingHandoff) -> Result<()> {
+/// Keeps the thread's waiting handoffs, removing the file once none wait.
+pub(crate) fn save(
+    data_dir: &Path,
+    thread_id: ThreadId,
+    handoffs: &[PendingHandoff],
+) -> Result<()> {
+    if handoffs.is_empty() {
+        return remove(data_dir, thread_id);
+    }
     let path = path(data_dir, thread_id);
     if let Some(directory) = path.parent() {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
     }
-    let json = serde_json::to_vec(handoff).context("encoding the handoff")?;
+    let json = serde_json::to_vec(handoffs).context("encoding the handoffs")?;
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
 }
 
-pub(crate) fn load(data_dir: &Path, thread_id: ThreadId) -> Result<Option<PendingHandoff>> {
+pub(crate) fn load(data_dir: &Path, thread_id: ThreadId) -> Result<Vec<PendingHandoff>> {
     let path = path(data_dir, thread_id);
     match std::fs::read(&path) {
-        Ok(json) => serde_json::from_slice(&json)
-            .map(Some)
-            .with_context(|| format!("reading {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(json) => {
+            serde_json::from_slice(&json).with_context(|| format!("reading {}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }

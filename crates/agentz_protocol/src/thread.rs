@@ -674,10 +674,12 @@ pub struct ThreadState {
     /// A one-time code the agent printed while logging in, to enter on the page it links to
     /// (a device login).
     pub auth_code: Option<SharedString>,
-    /// The conversation to go with the next message, while it waits for one: what the thread's
-    /// new agent or account hasn't seen ([`HandoffSource::Agent`]), or another thread's
-    /// ("Continue with another agent"). It stays until the agent takes a message with it.
-    pub handoff: Option<PendingHandoff>,
+    /// The conversations to go with the next message, in the order they go, while they wait for
+    /// one: what the thread's new agent or account hasn't seen ([`HandoffSource::Agent`]), the
+    /// conversation a fork starts with, another thread's ("Continue with another agent"), and
+    /// forks merged back. Each stays until the agent takes a message with it.
+    #[serde(default)]
+    pub pending_handoffs: Vec<PendingHandoff>,
     /// Where handoffs went with messages, in order: the conversation shows each one there.
     #[serde(default)]
     pub handoffs: Vec<HandoffMark>,
@@ -818,7 +820,15 @@ impl ThreadView {
 
     /// The handoff that went with the user message at `index`, if one did.
     pub fn handoff_mark(&self, index: usize) -> Option<&HandoffMark> {
-        self.state.handoffs.iter().find(|mark| mark.entry == index)
+        self.handoff_marks(index).next()
+    }
+
+    /// The handoffs that went with the user message at `index`, in the order they went.
+    pub fn handoff_marks(&self, index: usize) -> impl Iterator<Item = &HandoffMark> {
+        self.state
+            .handoffs
+            .iter()
+            .filter(move |mark| mark.entry == index)
     }
 
     /// The name of the agent that answered at `index`: the turn's, or for turns from before
@@ -1021,8 +1031,8 @@ impl ThreadView {
         self.state.login_page.as_ref()
     }
 
-    pub fn pending_handoff(&self) -> Option<&PendingHandoff> {
-        self.state.handoff.as_ref()
+    pub fn pending_handoffs(&self) -> &[PendingHandoff] {
+        &self.state.pending_handoffs
     }
 
     pub fn workspace_setup(&self) -> Option<&crate::workspace::WorkspaceSetup> {
@@ -1268,6 +1278,37 @@ pub enum HandoffSource {
         title: String,
         agent: String,
     },
+    /// The conversation this fork of `source` starts with, copied from there
+    /// ([`fork_handoff`]).
+    Fork { source: projects::ThreadId },
+    /// What happened in a fork of this thread since it was forked ([`merge_handoff`]).
+    Merge {
+        fork: projects::ThreadId,
+        title: String,
+    },
+}
+
+impl HandoffSource {
+    /// Whether a handoff from here takes the place of one from `other` that still waits: the
+    /// thread hands over only its latest switch, and a fork's latest merge.
+    pub fn replaces(&self, other: &HandoffSource) -> bool {
+        match (self, other) {
+            (HandoffSource::Merge { fork, .. }, HandoffSource::Merge { fork: other, .. }) => {
+                fork == other
+            }
+            (HandoffSource::Merge { .. }, _) | (_, HandoffSource::Merge { .. }) => false,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+
+    /// Whether it tells the whole conversation, which a thread's new agent then needs no
+    /// switch handoff for.
+    pub fn tells_everything(&self) -> bool {
+        matches!(
+            self,
+            HandoffSource::Thread { .. } | HandoffSource::Fork { .. }
+        )
+    }
 }
 
 /// A conversation to go with the next message ([`ThreadState::handoff`]).
@@ -1287,7 +1328,7 @@ impl PendingHandoff {
     pub fn from_thread(&self) -> Option<(projects::ThreadId, &str, &str)> {
         match &self.source {
             HandoffSource::Thread { id, title, agent } => Some((*id, title, agent)),
-            HandoffSource::Agent { .. } => None,
+            _ => None,
         }
     }
 }
@@ -1387,6 +1428,74 @@ pub fn handoff(
         messages: messages.len(),
         made_at: SystemTime::now(),
     }
+}
+
+/// The conversation a fork starts with: its entries, copied from `source` up to where it was
+/// forked, for the fork's agent, which hasn't seen any of it. `None` when that has no messages.
+pub fn fork_handoff(
+    view: &ThreadView,
+    fork: projects::ThreadId,
+    source: projects::ThreadId,
+    source_title: &str,
+    default_agent: &str,
+) -> Option<PendingHandoff> {
+    let messages = handoff_messages(view, 0, default_agent);
+    if messages.is_empty() {
+        return None;
+    }
+    let (body, told) = handoff_body(view, &messages, source_title);
+    let text = format!(
+        "{HANDOFF_OPENING} thread=\"{id}\" from=\"{agent}\">\n\
+         Context handoff: agentZ thread {id} is a fork of thread {source_id}, “{source_title}”, \
+         in the same folder: the user goes on here from its last reply below, with you. This is \
+         its conversation up to there, oldest first ({told}). {}\n\n{body}\n{HANDOFF_CLOSING}",
+        handoff_guidance(fork),
+        id = fork.0,
+        source_id = source.0,
+        agent = attribute(default_agent),
+    );
+    Some(PendingHandoff {
+        source: HandoffSource::Fork { source },
+        text,
+        messages: messages.len(),
+        made_at: SystemTime::now(),
+    })
+}
+
+/// What happened in a fork since it was forked, its entries from `since` on, merged back into
+/// the thread it was forked from, as t3code's merge back hands over the fork's delta. `None`
+/// when nothing has.
+pub fn merge_handoff(
+    fork_view: &ThreadView,
+    fork: projects::ThreadId,
+    fork_title: &str,
+    since: usize,
+    default_agent: &str,
+) -> Option<PendingHandoff> {
+    let messages = handoff_messages(fork_view, since, default_agent);
+    if messages.is_empty() {
+        return None;
+    }
+    let (body, told) = handoff_body(fork_view, &messages, fork_title);
+    let id = fork.0;
+    let text = format!(
+        "{HANDOFF_OPENING} thread=\"{id}\" from=\"{agent}\">\n\
+         Merged back: the user forked this conversation into agentZ thread {id}, “{fork_title}”, \
+         in the same folder, and went on there. This is what happened in the fork since, oldest \
+         first ({told}); its changes to files are already in the folder. {}\n\n{body}\n\
+         {HANDOFF_CLOSING}",
+        handoff_guidance(fork),
+        agent = attribute(default_agent),
+    );
+    Some(PendingHandoff {
+        source: HandoffSource::Merge {
+            fork,
+            title: fork_title.to_string(),
+        },
+        text,
+        messages: messages.len(),
+        made_at: SystemTime::now(),
+    })
 }
 
 /// What every handoff says of itself, as t3code's does: it's context, and where the rest is.
@@ -1641,15 +1750,18 @@ fn handoff_plan(view: &ThreadView) -> Option<String> {
     Some(format!("<plan>\n{}\n</plan>", plan.join("\n")))
 }
 
-/// A user message without the handoff it began with, as an agent may replay it.
+/// A user message without the handoffs it began with, as an agent may replay it.
 pub fn without_handoff(text: &str) -> &str {
-    let trimmed = text.trim_start();
-    if !trimmed.starts_with(HANDOFF_OPENING) {
-        return text;
-    }
-    match trimmed.find(HANDOFF_CLOSING) {
-        Some(end) => trimmed[end + HANDOFF_CLOSING.len()..].trim_start(),
-        None => text,
+    let mut rest = text;
+    loop {
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with(HANDOFF_OPENING) {
+            return rest;
+        }
+        match trimmed.find(HANDOFF_CLOSING) {
+            Some(end) => rest = trimmed[end + HANDOFF_CLOSING.len()..].trim_start(),
+            None => return rest,
+        }
     }
 }
 

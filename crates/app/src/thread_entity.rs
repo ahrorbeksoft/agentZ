@@ -451,9 +451,16 @@ impl AgentThread {
         }
     }
 
-    /// Starts this continued thread without the conversation it would have brought.
-    pub fn drop_handoff(&mut self, cx: &mut Context<Self>) {
-        self.request(Request::DropHandoff, cx)
+    /// Goes on without a conversation the next message would have brought: the one made at
+    /// `made_at`.
+    pub fn drop_handoff(&mut self, made_at: std::time::SystemTime, cx: &mut Context<Self>) {
+        self.request(
+            |connection| Request::DropHandoff {
+                connection,
+                made_at,
+            },
+            cx,
+        )
     }
 
     pub fn clear_plan(&mut self, cx: &mut Context<Self>) {

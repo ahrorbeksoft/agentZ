@@ -22,8 +22,8 @@ use agentz_protocol::terminal::{
     TerminalSelectionKind, TerminalSelectionUpdate,
 };
 use agentz_protocol::thread::{
-    ConnectionStatus, Entry, FailedMessage, LoginInput, LostHistory, ModeSwitch, ThreadView,
-    api_key_meta, login_input,
+    ConnectionStatus, Entry, FailedMessage, HandoffSource, LoginInput, LostHistory, ModeSwitch,
+    ThreadView, api_key_meta, login_input,
 };
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -577,7 +577,8 @@ async fn continues_threads_with_another_agent() {
     client.subscribe_thread(new).await;
     let handoff = client
         .thread(new)
-        .pending_handoff()
+        .pending_handoffs()
+        .first()
         .cloned()
         .expect("the conversation waits for the first message");
     assert_eq!(handoff.messages, 2);
@@ -622,7 +623,7 @@ async fn continues_threads_with_another_agent() {
         })
         .await;
     let thread = client.thread(new);
-    assert_eq!(thread.pending_handoff(), None);
+    assert!(thread.pending_handoffs().is_empty());
     // Only the user's words are their message.
     assert!(matches!(thread.entries().first(), Some(Entry::UserMessage(text)) if text == "next"));
     assert!(!saved.exists());
@@ -724,11 +725,12 @@ async fn switches_a_threads_account_between_turns() {
         client.thread(connection).entries().len()
     );
     client
-        .wait_until(|client| client.thread(connection).pending_handoff().is_some())
+        .wait_until(|client| !client.thread(connection).pending_handoffs().is_empty())
         .await;
     let handoff = client
         .thread(connection)
-        .pending_handoff()
+        .pending_handoffs()
+        .first()
         .cloned()
         .expect("what the new account hasn't seen waits for the next message");
     assert_eq!(handoff.messages, 2);
@@ -763,7 +765,7 @@ async fn switches_a_threads_account_between_turns() {
         })
         .await;
     let thread = client.thread(connection);
-    assert_eq!(thread.pending_handoff(), None);
+    assert!(thread.pending_handoffs().is_empty());
     let message = thread
         .entries()
         .iter()
@@ -788,11 +790,12 @@ async fn switches_a_threads_account_between_turns() {
         .await;
     assert_eq!(record(&client).session_id, first_session);
     client
-        .wait_until(|client| client.thread(connection).pending_handoff().is_some())
+        .wait_until(|client| !client.thread(connection).pending_handoffs().is_empty())
         .await;
     let handoff = client
         .thread(connection)
-        .pending_handoff()
+        .pending_handoffs()
+        .first()
         .cloned()
         .expect("what happened since");
     assert_eq!(handoff.messages, 2);
@@ -815,7 +818,7 @@ async fn switches_a_threads_account_between_turns() {
     client
         .wait_until(|client| {
             record(client).account == Some(work)
-                && client.thread(connection).pending_handoff().is_none()
+                && client.thread(connection).pending_handoffs().is_empty()
         })
         .await;
     assert!(!saved.exists());
@@ -854,6 +857,165 @@ async fn refuses_to_switch_a_working_threads_agent() {
         .await
         .expect_err("a working thread keeps its agent");
     assert!(error.message.contains("working"), "{}", error.message);
+}
+
+/// Fork from This Response: a thread in the same folder that begins with the conversation up
+/// to the end of that reply's turn, which its first message brings. Merge Back hands what
+/// happened in the fork since to the source's next message.
+#[tokio::test(flavor = "multi_thread")]
+async fn forks_a_thread_from_a_reply_and_merges_it_back() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let source = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(source).await;
+    for (prompt, reply) in [
+        ("build the page", "Echo: build the page"),
+        ("add a test", "Echo: add a test"),
+    ] {
+        client
+            .ok(Request::Prompt {
+                connection: source,
+                prompt: PromptPart::text(prompt),
+            })
+            .await;
+        client
+            .wait_until(|client| {
+                let thread = client.thread(source);
+                !thread.is_working() && agent_text(thread).ends_with(reply)
+            })
+            .await;
+    }
+    let entries = client.thread(source).entries().to_vec();
+    let reply = entries
+        .iter()
+        .position(|entry| matches!(entry, Entry::AgentMessage(_)))
+        .expect("the first reply");
+    let end = entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::UserMessage(_)))
+        .expect("the second message");
+
+    let error = client
+        .request(Request::ForkThread {
+            thread_id,
+            entry: end,
+        })
+        .await
+        .expect_err("a message isn't a reply");
+    assert!(error.message.contains("reply"), "{}", error.message);
+    let error = client
+        .request(Request::MergeBack(thread_id))
+        .await
+        .expect_err("the thread isn't a fork");
+    assert!(error.message.contains("isn't a fork"), "{}", error.message);
+
+    let Response::ThreadCreated(fork_id) = client
+        .ok(Request::ForkThread {
+            thread_id,
+            entry: reply,
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let fork = ConnectionId::Thread(fork_id);
+    client.subscribe_thread(fork).await;
+    let record = |client: &TestClient, id: ThreadId| {
+        client
+            .projects
+            .as_ref()
+            .and_then(|projects| projects.threads.iter().find(|thread| thread.id == id))
+            .cloned()
+            .expect("the thread")
+    };
+    let fork_record = record(&client, fork_id);
+    assert_eq!(
+        fork_record.title,
+        format!("{} fork", record(&client, thread_id).title)
+    );
+    assert_eq!(
+        fork_record.forked_from,
+        Some(projects::ForkPoint {
+            thread: thread_id,
+            entries: end,
+        })
+    );
+    assert!(!fork_record.is_draft);
+    assert_eq!(client.thread(fork).entries(), &entries[..end]);
+    let handoff = client
+        .thread(fork)
+        .pending_handoffs()
+        .first()
+        .cloned()
+        .expect("the conversation waits for the fork's first message");
+    assert_eq!(handoff.source, HandoffSource::Fork { source: thread_id });
+    assert_eq!(handoff.messages, 2);
+    assert!(handoff.text.contains("is a fork of thread"));
+    assert!(!handoff.text.contains("add a test"));
+    let saved = server
+        .data_dir
+        .path()
+        .join(format!("handoffs/{}.json", fork_id.0));
+    assert!(saved.exists());
+
+    client
+        .ok(Request::Prompt {
+            connection: fork,
+            prompt: PromptPart::text("try another way"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(fork);
+            !thread.is_working()
+                && agent_text(thread).ends_with("Echo: try another way [with agentz://handoff]")
+        })
+        .await;
+    assert!(client.thread(fork).pending_handoffs().is_empty());
+    client.wait_until(|_| !saved.exists()).await;
+
+    // Merged twice before the source's next message, it brings the latest once.
+    client.ok(Request::MergeBack(fork_id)).await;
+    client.ok(Request::MergeBack(fork_id)).await;
+    let pending = client.thread(source).pending_handoffs().to_vec();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert!(matches!(
+        &pending[0].source,
+        HandoffSource::Merge { fork, .. } if *fork == fork_id
+    ));
+    assert_eq!(pending[0].messages, 2);
+    assert!(pending[0].text.contains("Merged back"));
+    assert!(pending[0].text.contains("try another way"));
+    assert!(!pending[0].text.contains("turn=\"1\""));
+
+    client
+        .ok(Request::Prompt {
+            connection: source,
+            prompt: PromptPart::text("keep it"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(source);
+            !thread.is_working()
+                && agent_text(thread).ends_with("Echo: keep it [with agentz://handoff]")
+        })
+        .await;
+    let thread = client.thread(source);
+    assert!(thread.pending_handoffs().is_empty());
+    let message = thread
+        .entries()
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::UserMessage(_)))
+        .expect("the message");
+    assert!(matches!(
+        thread.handoff_mark(message).map(|mark| &mark.source),
+        Some(HandoffSource::Merge { fork, .. }) if *fork == fork_id
+    ));
 }
 
 /// An archived thread's agent stops once nothing needs it and no client has the thread open,

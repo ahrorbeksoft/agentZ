@@ -92,9 +92,10 @@ pub enum AgentThreadEvent {
     ConfigOptionChanged(acp::SessionConfigId, acp::SessionConfigOptionValue),
     /// The user changed the session's mode; Zed keeps it as the agent's default.
     ModeChanged(acp::SessionModeId),
-    /// The agent took a message with the handoff that went with it ([`ThreadState::handoff`]).
+    /// The agent took a message with a handoff that went with it
+    /// ([`ThreadState::pending_handoffs`]).
     HandoffSent(HandoffSource),
-    /// The user started the thread without the conversation it would have brought.
+    /// The user went on without a conversation the next message would have brought.
     HandoffDropped,
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
@@ -378,9 +379,10 @@ pub struct AgentThread {
     /// The first entry that changed since the server last sent this thread's changes, so it
     /// doesn't compare a long conversation's every entry on each update.
     entries_changed_from: Option<usize>,
-    /// The handoff that went with the prompt in flight, taken from [`ThreadState::handoff`]. It
-    /// goes back there if the prompt fails, for the next message to bring.
-    handoff_in_flight: Option<PendingHandoff>,
+    /// The handoffs that went with the prompt in flight, taken from
+    /// [`ThreadState::pending_handoffs`]. They go back there if the prompt fails, for the next
+    /// message to bring.
+    handoff_in_flight: Vec<PendingHandoff>,
     /// Who answers the thread's turns, for their records ([`TurnTime::agent`]).
     agent: Option<ThreadAgent>,
     /// How many entries there were when the turn in progress started.
@@ -538,7 +540,7 @@ pub struct AgentSnapshot {
     subagent_sessions: HashMap<String, bool>,
     /// [`AgentThread::handoff_in_flight`].
     #[serde(default)]
-    handoff_in_flight: Option<PendingHandoff>,
+    handoff_in_flight: Vec<PendingHandoff>,
     /// [`AgentThread::agent`].
     #[serde(default)]
     agent: Option<ThreadAgent>,
@@ -782,7 +784,7 @@ impl AgentThread {
             queued_prompts: Vec::new(),
             after_turn: VecDeque::new(),
             entries_changed_from: Some(0),
-            handoff_in_flight: None,
+            handoff_in_flight: Vec::new(),
             agent: None,
             turn_started_entries: 0,
             turn_outcome: TurnOutcome::Completed,
@@ -1189,7 +1191,7 @@ impl AgentThread {
                         self.view.state.last_stop_reason = Some(response.stop_reason);
                         self.last_message = None;
                         // A stopped turn took the message too.
-                        if let Some(handoff) = self.handoff_in_flight.take() {
+                        for handoff in std::mem::take(&mut self.handoff_in_flight) {
                             self.emit(AgentThreadEvent::HandoffSent(handoff.source));
                         }
                     }
@@ -1996,9 +1998,17 @@ impl AgentThread {
         });
     }
 
-    /// The conversation to go with the next message ([`ThreadState::handoff`]).
-    pub fn set_handoff(&mut self, handoff: Option<PendingHandoff>) {
-        self.view.state.handoff = handoff;
+    /// The conversations to go with the next message ([`ThreadState::pending_handoffs`]).
+    pub fn set_handoffs(&mut self, handoffs: Vec<PendingHandoff>) {
+        self.view.state.pending_handoffs = handoffs;
+    }
+
+    /// Another conversation to go with the next message, in place of a waiting one it replaces
+    /// ([`HandoffSource::replaces`]).
+    pub fn add_handoff(&mut self, handoff: PendingHandoff) {
+        let pending = &mut self.view.state.pending_handoffs;
+        pending.retain(|pending| !handoff.source.replaces(&pending.source));
+        pending.push(handoff);
     }
 
     /// Who answers the thread's turns, for their records. Set it right after starting.
@@ -2006,11 +2016,17 @@ impl AgentThread {
         self.agent = Some(agent);
     }
 
-    /// Goes on without the conversation the next message would have brought.
-    pub fn drop_handoff(&mut self) {
-        let Some(handoff) = self.view.state.handoff.take() else {
+    /// Goes on without a conversation the next message would have brought: the one made at
+    /// `made_at`.
+    pub fn drop_handoff(&mut self, made_at: SystemTime) {
+        let pending = &mut self.view.state.pending_handoffs;
+        let Some(position) = pending
+            .iter()
+            .position(|handoff| handoff.made_at == made_at)
+        else {
             return;
         };
+        let handoff = pending.remove(position);
         // Shown at a message that didn't get through, it didn't go there after all.
         self.view
             .state
@@ -2020,14 +2036,20 @@ impl AgentThread {
         self.emit(AgentThreadEvent::HandoffDropped);
     }
 
-    /// The handoff that went with a prompt the agent didn't take waits for the next message
-    /// again, unless another has taken its place.
+    /// The handoffs that went with a prompt the agent didn't take wait for the next message
+    /// again, ahead of newer ones, unless one has taken their place.
     fn return_handoff(&mut self) {
-        if let Some(handoff) = self.handoff_in_flight.take()
-            && self.view.state.handoff.is_none()
-        {
-            self.view.state.handoff = Some(handoff);
-        }
+        let in_flight = std::mem::take(&mut self.handoff_in_flight);
+        let pending = &mut self.view.state.pending_handoffs;
+        let returning: Vec<PendingHandoff> = in_flight
+            .into_iter()
+            .filter(|handoff| {
+                !pending
+                    .iter()
+                    .any(|pending| pending.source.replaces(&handoff.source))
+            })
+            .collect();
+        pending.splice(0..0, returning);
     }
 
     /// Whether the user has sent a message, or queued one.
@@ -2234,20 +2256,21 @@ impl AgentThread {
             .push((self.view.entries.len(), SystemTime::now()));
         let index = self.view.entries.len();
         self.push_entry(Entry::UserMessage(message_markdown(&parts)));
-        // The conversation shows where the handoff went, from the first message it goes with.
-        if let Some(handoff) = &self.view.state.handoff
-            && !self
+        // The conversation shows where each handoff went, from the first message it goes with.
+        for handoff in &self.view.state.pending_handoffs {
+            if !self
                 .view
                 .state
                 .handoffs
                 .iter()
                 .any(|mark| mark.made_at == handoff.made_at)
-        {
-            self.view.state.handoffs.push(HandoffMark {
-                entry: index,
-                source: handoff.source.clone(),
-                made_at: handoff.made_at,
-            });
+            {
+                self.view.state.handoffs.push(HandoffMark {
+                    entry: index,
+                    source: handoff.source.clone(),
+                    made_at: handoff.made_at,
+                });
+            }
         }
         self.view.state.turn_error = None;
         // A new message takes the place of one that didn't get through.
@@ -2464,16 +2487,16 @@ impl AgentThread {
             return;
         }
         let mut prompt = self.content_blocks(parts.clone());
-        let handoff = self.view.state.handoff.take();
-        if let Some(handoff) = &handoff {
-            // Embedded, the agent tells it from the message: replays show only the message.
-            let block = if self
-                .view
-                .state
-                .capabilities
-                .prompt_capabilities
-                .embedded_context
-            {
+        let handoffs = std::mem::take(&mut self.view.state.pending_handoffs);
+        let embedded = self
+            .view
+            .state
+            .capabilities
+            .prompt_capabilities
+            .embedded_context;
+        // Embedded, the agent tells them from the message: replays show only the message.
+        let blocks = handoffs.iter().map(|handoff| {
+            if embedded {
                 acp::ContentBlock::Resource(acp::EmbeddedResource::new(
                     acp::EmbeddedResourceResource::TextResourceContents(
                         acp::TextResourceContents::new(handoff.text.clone(), "agentz://handoff")
@@ -2482,10 +2505,10 @@ impl AgentThread {
                 ))
             } else {
                 acp::ContentBlock::Text(acp::TextContent::new(handoff.text.clone()))
-            };
-            prompt.insert(0, block);
-        }
-        self.handoff_in_flight = handoff;
+            }
+        });
+        prompt.splice(0..0, blocks);
+        self.handoff_in_flight = handoffs;
         self.last_message = Some(SentMessage { parts });
         let Some(session) = &self.session else {
             return;

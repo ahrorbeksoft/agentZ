@@ -577,8 +577,23 @@ pub enum Request {
         #[serde(default)]
         account: AccountChoice,
     },
-    /// Starts the continued thread without the conversation it would have brought.
-    DropHandoff(ConnectionId),
+    /// Goes on without a conversation the next message would have brought: the
+    /// [`thread::PendingHandoff`] made then.
+    DropHandoff {
+        connection: ConnectionId,
+        made_at: std::time::SystemTime,
+    },
+    /// Forks the thread from the finished reply at `entry`: a thread with the same agent and
+    /// account, in the same folder, that begins with the conversation up to the end of that
+    /// reply's turn and brings it with its first message ([`thread::fork_handoff`]), as
+    /// t3code's Fork from This Response. [`Response::ThreadCreated`].
+    ForkThread {
+        thread_id: ThreadId,
+        entry: usize,
+    },
+    /// Merges a fork back into the thread it was forked from: what happened in the fork since
+    /// waits there for its next message ([`thread::merge_handoff`]).
+    MergeBack(ThreadId),
     /// The thread goes on with another agent, or another account of its agent, between turns.
     /// An agent and account it was with before goes back to its session; otherwise a new
     /// session starts. Either way the next message brings what that session hasn't seen

@@ -8,7 +8,8 @@ use agentz_protocol::accounts::{AccountChoice, AccountId};
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, HandoffSource, PendingHandoff, ThreadAgent, handoff, switch_handoff,
+    ConnectionStatus, Entry, HandoffSource, PendingHandoff, ThreadAgent, ThreadState, ThreadView,
+    fork_handoff, handoff, merge_handoff, switch_handoff,
 };
 use agentz_protocol::workspace::{RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{ConnectionId, Request, Response};
@@ -18,8 +19,8 @@ use futures::future::BoxFuture;
 use projects::{ProjectId, ThreadId, Workspace, WorkspaceKind};
 
 use super::{ClientId, OPEN_GRACE, Server};
-use crate::continuations;
 use crate::workspaces::{self, NewWorkspace};
+use crate::{continuations, transcripts};
 use util::ResultExt as _;
 
 /// What a new thread runs.
@@ -453,11 +454,203 @@ impl Server {
         )?;
         self.projects.set_started_in(new_thread, thread.started_in);
         // Its first message links it to this thread.
-        continuations::save(&self.data_dir, new_thread, &handoff).log_err();
+        continuations::save(&self.data_dir, new_thread, std::slice::from_ref(&handoff)).log_err();
         self.update_thread(ConnectionId::Thread(new_thread), |thread| {
-            thread.set_handoff(Some(handoff))
+            thread.add_handoff(handoff)
         })?;
         Ok(new_thread)
+    }
+
+    /// Fork from This Response ([`Request::ForkThread`]): a thread on the same agent and
+    /// account, in the same folder, that begins with the conversation up to the end of the
+    /// turn of the reply at `entry`, as t3code forks a finished run. Its first message brings
+    /// that conversation ([`fork_handoff`]).
+    pub(super) fn fork_thread(&mut self, thread_id: ThreadId, entry: usize) -> Result<ThreadId> {
+        let thread = self
+            .projects
+            .thread(thread_id)
+            .context("no such thread")?
+            .clone();
+        anyhow::ensure!(
+            thread.terminal.is_none(),
+            "a terminal thread has no conversation to fork"
+        );
+        let agent_id = thread
+            .agent_id
+            .clone()
+            .map(AgentId::new)
+            .context("the thread has no agent")?;
+        let connection = ConnectionId::Thread(thread_id);
+        if !self.threads.contains_key(&thread_id) {
+            self.update_thread(connection, |_| {})?;
+        }
+        let running = self.threads.get(&thread_id).context("no such thread")?;
+        anyhow::ensure!(
+            running.conversation_revision().is_some(),
+            "the thread is still loading its conversation"
+        );
+        anyhow::ensure!(
+            matches!(running.entries.get(entry), Some(Entry::AgentMessage(_))),
+            "only an agent's reply can be forked"
+        );
+        let end = match running.turn_record(entry) {
+            Some(turn) => turn.entries_end.min(running.entries.len()),
+            None => match running.entries[entry + 1..]
+                .iter()
+                .position(|entry| matches!(entry, Entry::UserMessage(_)))
+            {
+                Some(offset) => entry + 1 + offset,
+                None => {
+                    anyhow::ensure!(
+                        !running.is_working(),
+                        "the reply's turn hasn't finished yet"
+                    );
+                    running.entries.len()
+                }
+            },
+        };
+        let state = &running.state;
+        let fork_view = ThreadView {
+            entries: running.entries[..end].to_vec(),
+            state: ThreadState {
+                finished_turns: state
+                    .finished_turns
+                    .iter()
+                    .filter(|turn| turn.entries_end <= end)
+                    .cloned()
+                    .collect(),
+                prompts_from_agents: state
+                    .prompts_from_agents
+                    .iter()
+                    .filter(|(index, _)| *index < end)
+                    .cloned()
+                    .collect(),
+                task_notices: state
+                    .task_notices
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < end)
+                    .collect(),
+                sent_times: state
+                    .sent_times
+                    .iter()
+                    .copied()
+                    .filter(|(index, _)| *index < end)
+                    .collect(),
+                handoffs: state
+                    .handoffs
+                    .iter()
+                    .filter(|mark| mark.entry < end)
+                    .cloned()
+                    .collect(),
+                ..ThreadState::default()
+            },
+        };
+        let agent_name = self.agent_name(&agent_id).to_string();
+        let choice = thread
+            .workspace
+            .clone()
+            .map_or(WorkspaceChoice::Checkout, WorkspaceChoice::Existing);
+        let PreparedWorkspace::Ready(folder) = self.prepare_workspace(thread.project_id, choice)?
+        else {
+            return Err(anyhow!("the thread's workspace isn't ready"));
+        };
+        let fork = self.create_thread_in(
+            thread.project_id,
+            NewThread::Agent(agent_id, thread.account),
+            folder,
+        )?;
+        // It has a conversation already, so it's no draft.
+        self.projects.set_draft(fork, false);
+        self.draft_due.remove(&fork);
+        self.projects
+            .rename_thread(fork, format!("{} fork", thread.title));
+        self.projects.set_started_in(fork, thread.started_in);
+        self.projects.set_forked_from(
+            fork,
+            projects::ForkPoint {
+                thread: thread_id,
+                entries: end,
+            },
+        );
+        let handoffs: Vec<PendingHandoff> =
+            fork_handoff(&fork_view, fork, thread_id, &thread.title, &agent_name)
+                .into_iter()
+                .collect();
+        let transcript = agent_thread::TranscriptRef {
+            entries: &fork_view.entries,
+            plan: &fork_view.state.plan,
+            finished_turns: &fork_view.state.finished_turns,
+            prompts_from_agents: &fork_view.state.prompts_from_agents,
+            task_notices: &fork_view.state.task_notices,
+            sent_times: &fork_view.state.sent_times,
+            handoffs: &fork_view.state.handoffs,
+        };
+        transcripts::save(&self.data_dir, fork, transcript).log_err();
+        continuations::save(&self.data_dir, fork, &handoffs).log_err();
+        let ThreadView { entries, state } = fork_view;
+        self.update_thread(ConnectionId::Thread(fork), |thread| {
+            thread.restore_transcript(agent_thread::Transcript {
+                entries,
+                plan: state.plan,
+                finished_turns: state.finished_turns,
+                prompts_from_agents: state.prompts_from_agents,
+                task_notices: state.task_notices,
+                sent_times: state.sent_times,
+                handoffs: state.handoffs,
+            });
+            thread.set_handoffs(handoffs);
+        })?;
+        Ok(fork)
+    }
+
+    /// Merge Back ([`Request::MergeBack`]): what happened in the fork since it was forked waits
+    /// in the thread it was forked from, for that thread's next message ([`merge_handoff`]),
+    /// in place of an earlier merge of the fork that hasn't gone yet, as t3code supersedes it.
+    pub(super) fn merge_back(&mut self, fork_id: ThreadId) -> Result<()> {
+        let fork = self
+            .projects
+            .thread(fork_id)
+            .context("no such thread")?
+            .clone();
+        let fork_point = fork.forked_from.context("the thread isn't a fork")?;
+        anyhow::ensure!(
+            self.projects.thread(fork_point.thread).is_some(),
+            "the thread it was forked from was deleted"
+        );
+        let connection = ConnectionId::Thread(fork_id);
+        if !self.threads.contains_key(&fork_id) {
+            self.update_thread(connection, |_| {})?;
+        }
+        let running = self.threads.get(&fork_id).context("no such thread")?;
+        anyhow::ensure!(
+            !running.is_working(),
+            "the fork is working; wait for it to finish first"
+        );
+        anyhow::ensure!(
+            running.conversation_revision().is_some(),
+            "the fork is still loading its conversation"
+        );
+        let agent_name = fork
+            .agent_id
+            .clone()
+            .map(|agent_id| self.agent_name(&AgentId::new(agent_id)).to_string())
+            .unwrap_or_else(|| running.agent_name().to_string());
+        let handoff = merge_handoff(
+            running,
+            fork_id,
+            &fork.title,
+            fork_point.entries,
+            &agent_name,
+        )
+        .context("nothing has happened in the fork to merge back yet")?;
+        let source = fork_point.thread;
+        let handoffs = self.update_thread(ConnectionId::Thread(source), |thread| {
+            thread.add_handoff(handoff);
+            thread.state.pending_handoffs.clone()
+        })?;
+        continuations::save(&self.data_dir, source, &handoffs).log_err();
+        Ok(())
     }
 
     /// The thread goes on with `agent_id` on `account` ([`Request::SwitchAgent`]): its agent
@@ -519,51 +712,56 @@ impl Server {
                 && thread.session_id.is_some()),
             "the thread is still loading its conversation"
         );
-        let pending = running.state.handoff.clone();
-        // A session that was still to be told what it missed has seen only what it saw then.
-        let seen = match &pending {
-            Some(PendingHandoff {
-                source: HandoffSource::Agent { since, .. },
-                ..
-            }) => *since,
-            _ => running.entries.len(),
+        let pending = running.state.pending_handoffs.clone();
+        let tells_everything = pending
+            .iter()
+            .any(|handoff| handoff.source.tells_everything());
+        // A session that was still to be told what it missed has seen only what it saw then,
+        // and one whose whole conversation was still to go has seen none of it.
+        let seen = if tells_everything {
+            0
+        } else {
+            pending
+                .iter()
+                .find_map(|handoff| match handoff.source {
+                    HandoffSource::Agent { since, .. } => Some(since),
+                    _ => None,
+                })
+                .unwrap_or(running.entries.len())
         };
         let returning =
             self.projects
                 .switch_thread_agent(thread_id, to.agent_id.clone(), to.account, seen);
-        let handoff = match pending {
-            // Another thread's conversation, which this one hasn't started on yet.
-            Some(
-                pending @ PendingHandoff {
-                    source: HandoffSource::Thread { .. },
-                    ..
-                },
-            ) => Some(pending),
-            _ => {
-                // From the agent that answered last, which isn't the current one when it was
-                // switched to and never answered.
-                let from = running
-                    .state
-                    .finished_turns
-                    .iter()
-                    .rev()
-                    .find_map(|turn| turn.agent.clone())
-                    .or(current)
-                    .unwrap_or_else(|| ThreadAgent {
-                        name: running.agent_name().to_string(),
-                        ..ThreadAgent::default()
-                    });
-                let since = returning.as_ref().map_or(0, |session| session.seen);
-                switch_handoff(running, thread_id, &thread.title, from, to, since)
-            }
-        };
+        // The other conversations still go: forks merged back, and a whole conversation this
+        // thread hasn't started on yet, which tells the new agent everything.
+        let mut handoffs: Vec<PendingHandoff> = pending
+            .into_iter()
+            .filter(|handoff| !matches!(handoff.source, HandoffSource::Agent { .. }))
+            .collect();
+        if !tells_everything {
+            // From the agent that answered last, which isn't the current one when it was
+            // switched to and never answered.
+            let from = running
+                .state
+                .finished_turns
+                .iter()
+                .rev()
+                .find_map(|turn| turn.agent.clone())
+                .or(current)
+                .unwrap_or_else(|| ThreadAgent {
+                    name: running.agent_name().to_string(),
+                    ..ThreadAgent::default()
+                });
+            let since = returning.as_ref().map_or(0, |session| session.seen);
+            handoffs.splice(
+                0..0,
+                switch_handoff(running, thread_id, &thread.title, from, to, since),
+            );
+        }
         self.stop_agent(thread_id);
         self.tool_sessions
             .retain(|_, session_thread| *session_thread != thread_id);
-        match &handoff {
-            Some(handoff) => continuations::save(&self.data_dir, thread_id, handoff).log_err(),
-            None => continuations::remove(&self.data_dir, thread_id).log_err(),
-        };
+        continuations::save(&self.data_dir, thread_id, &handoffs).log_err();
         // Starts the new agent, which takes the handoff from its file.
         self.update_thread(connection, |_| {})
     }

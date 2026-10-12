@@ -146,6 +146,14 @@ pub struct Workspace {
     pub created_at: SystemTime,
 }
 
+/// Where a fork came from ([`Thread::forked_from`]): its source, and how many of the source's
+/// entries it began with, those up to the end of the turn it was forked from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkPoint {
+    pub thread: ThreadId,
+    pub entries: usize,
+}
+
 /// A new worktree or pasture for a draft, made as its first message is sent (t3code's thread
 /// setup).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +383,10 @@ pub struct Thread {
     /// first message.
     #[serde(default)]
     pub continued_from: Option<ThreadId>,
+    /// The thread this one is a fork of, and where: it began with that thread's conversation up
+    /// to there.
+    #[serde(default)]
+    pub forked_from: Option<ForkPoint>,
     /// A thread the user started and hasn't sent anything in yet: t3code's draft thread. It's
     /// left out of the thread list, and removed once the user leaves it with nothing typed.
     #[serde(default)]
@@ -1168,6 +1180,7 @@ impl ProjectStore {
             planned_workspace: None,
             terminal: None,
             continued_from: None,
+            forked_from: None,
             is_draft: false,
             unsent_text: None,
             unsent_mentions: Vec::new(),
@@ -1711,6 +1724,22 @@ impl ProjectStore {
             thread.continued_from = Some(from);
             self.changed();
         }
+    }
+
+    pub fn set_forked_from(&mut self, id: ThreadId, from: ForkPoint) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+            thread.forked_from = Some(from);
+            self.changed();
+        }
+    }
+
+    /// The forks of this thread, oldest first.
+    pub fn forks(&self, id: ThreadId) -> impl Iterator<Item = &Thread> {
+        self.threads.iter().filter(move |thread| {
+            thread
+                .forked_from
+                .is_some_and(|fork_point| fork_point.thread == id)
+        })
     }
 
     /// The threads that continue this one with other agents, oldest first.
