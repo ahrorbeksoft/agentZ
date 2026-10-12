@@ -43,6 +43,7 @@ use crate::spaces_view::{self, PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
 use crate::thread_entity::AgentThread;
 use crate::welcome::{Section, SectionButton, render_welcome};
+use crate::window_background;
 use crate::window_decorations::{self, RoundedTopCorners as _, Side};
 use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
@@ -2296,6 +2297,7 @@ impl Render for Shell {
         let no_thread = (!shows_workspaces && settings_page.is_none() && active_view.is_none())
             .then(|| self.render_no_thread(cx));
         let decorations = window.window_decorations();
+        let picture = window_background::shown_picture(cx);
 
         let shell = v_flex()
             .key_context(KEY_CONTEXT)
@@ -2338,7 +2340,11 @@ impl Render for Shell {
             )
             .relative()
             .size_full()
-            .bg(background)
+            .map(|shell| match &picture {
+                // The picture brings its own cover of the theme's color.
+                Some(_) => shell,
+                None => shell.bg(background),
+            })
             .map(|shell| match decorations {
                 Decorations::Client { tiling } => shell.rounded_top_corners(tiling),
                 Decorations::Server => shell,
@@ -2346,6 +2352,9 @@ impl Render for Shell {
             .text_color(text_color)
             .font_ui(cx)
             .text_ui(cx)
+            .when_some(picture, |shell, picture| {
+                shell.child(window_background::render_picture(picture, decorations))
+            })
             .child(self.render_title_bar(window, cx))
             .when(shows_workspaces, |shell| {
                 shell.child(div().flex_1().min_h_0().child(self.spaces_view.clone()))

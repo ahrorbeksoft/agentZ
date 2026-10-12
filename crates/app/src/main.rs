@@ -46,6 +46,7 @@ mod tool_calls;
 mod usage_limits;
 mod usage_timeline;
 mod welcome;
+mod window_background;
 mod window_decorations;
 mod worktree_modal;
 

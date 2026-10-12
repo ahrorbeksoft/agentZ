@@ -98,6 +98,7 @@ use crate::tool_calls::{
 use crate::usage_limits::{
     LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, tightest_window,
 };
+use crate::window_background;
 use crate::{NewChat, OpenFolder, ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
@@ -3950,10 +3951,11 @@ impl AgentView {
         cx.theme().colors().border.opacity(0.8)
     }
 
+    /// Solid even over a picture, as "N left" covers the end of the row.
     fn activity_bar_bg(cx: &App) -> Hsla {
         let colors = cx.theme().colors();
-        colors
-            .editor_background
+        window_background::solid_backdrop(cx)
+            .blend(colors.editor_background)
             .blend(colors.element_selected.opacity(0.3))
     }
 

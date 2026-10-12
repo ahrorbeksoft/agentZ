@@ -153,7 +153,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `artifacts/server.json`, `artifacts/theme.json`, `artifacts/design-defaults.json` | server | The pages server's port and token, kept so links keep working, the app's theme for pages, and the design defaults from Settings |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
 | `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
-| `settings.json` | app | Theme, saved machines, sidebar and terminal preferences, saved layouts |
+| `settings.json` | app | Theme, the window's picture, saved machines, sidebar and terminal preferences, saved layouts |
+| `backgrounds/<name>.jpg`, `<name>-soft.jpg` | app | The picture behind the window, as Choose… copied it, sharp and softened |
 | `viewed.json` | app | Completions this client has displayed |
 
 ## Features
@@ -330,7 +331,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   lead. The row menu is Pin, Rename and Delete…: chats aren't archived. Search lists chats
   among the threads, by last activity, with the chat icon.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
-  chats, combining repositories), Appearance (Zed's theme modes), Notifications (sounds and system
+  chats, combining repositories), Appearance (Zed's theme modes, and a picture behind the
+  window), Notifications (sounds and system
   notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, Storage,
   and a page per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines
@@ -541,6 +543,20 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   it won't a project's.
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
   Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
+- **A picture behind the window** (`window_background.rs`, `design/appearance`; as Warp's and
+  iTerm2's background images, neither Zed nor t3code has one): Settings › Appearance › Window
+  picks Solid or Picture, the picture (Choose…), Soften picture and how much shows through (a
+  slider, 12% at first). Choose… copies the picture into `backgrounds/`, turned as its camera
+  says, scaled down to 3840 pixels and once more small and blurred for Soften picture (GPUI
+  can't blur as it draws); HEIC, which `image` can't read, goes through macOS's `sips`. The
+  window stays opaque: the shell draws the picture under everything, then the editor's color at
+  the user's opacity as the one cover over it, and applies a see-through copy of the theme
+  (`window_background::apply`, from `apply_theme`) whose surface colors are each the least
+  opaque color that shows as it over the editor's. So a card in the editor's color adds
+  nothing however deeply it's nested, and the sidebar, a selected row or a code block keep
+  their shades; menus and popovers, over the content rather than the background, are their own
+  color at the user's opacity. Covers that hide text under them (the sidebar's hover buttons,
+  the plan's "N left") paint over `solid_backdrop`, the editor's color made solid again.
 
 ### Agent threads
 

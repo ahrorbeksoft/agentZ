@@ -54,7 +54,8 @@ use std::collections::BTreeMap;
 use crate::agent_login::{AgentLogin, LoginLayout, LoginStep};
 use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::app_settings::{
-    AppSettingsStore, ArtifactAutoOpen, MachineProfile, PlaySound, ThemeMode,
+    AppSettings, AppSettingsStore, ArtifactAutoOpen, MachineProfile, PlaySound, ThemeMode,
+    WindowBackground,
 };
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{
@@ -77,6 +78,7 @@ use crate::usage_limits::{
     render_limit_windows,
 };
 use crate::usage_timeline::{TimelineAgent, TimelineZoom, UsageTimeline};
+use crate::window_background;
 
 const KEY_CONTEXT: &str = "SettingsPage";
 const ACCOUNT_RENAME_KEY_CONTEXT: &str = "AccountRename";
@@ -241,6 +243,10 @@ pub struct SettingsPage {
     mcp_servers_page: mcp_servers::McpServersPage,
     /// Why deleting or switching an MCP server failed.
     mcp_server_error: Option<SharedString>,
+    /// Choose… for the window's picture, from picking the file until the window shows it.
+    choosing_picture: Option<Task<()>>,
+    /// Why the picture picked couldn't be used.
+    picture_error: Option<SharedString>,
     storage_page: storage::StoragePage,
     nav_scroll: ScrollHandle,
     /// The open section's rows, a list as Zed's settings pages are: laying out a page whole
@@ -347,6 +353,8 @@ impl SettingsPage {
             skills_page: skills::SkillsPage::List,
             skill_error: None,
             adding_skill: None,
+            choosing_picture: None,
+            picture_error: None,
             mcp_servers_page: mcp_servers::McpServersPage::List,
             mcp_server_error: None,
             storage_page: storage::StoragePage::default(),
@@ -2045,7 +2053,7 @@ impl SettingsPage {
         };
         let (light_theme, light_menu) = theme_menu(Appearance::Light, window, cx);
         let (dark_theme, dark_menu) = theme_menu(Appearance::Dark, window, cx);
-        vec![render_section(
+        let theme_section = render_section(
             "Theme",
             vec![
                 render_row(
@@ -2068,7 +2076,198 @@ impl SettingsPage {
                 ),
             ],
             cx,
-        )]
+        );
+        let mut sections = vec![theme_section, self.render_window_section(window, cx)];
+        sections.extend(
+            self.picture_error
+                .clone()
+                .map(|error| skills::render_error(error, "picture-error")),
+        );
+        sections
+    }
+
+    /// What's behind the window (`design/appearance`, topic 4): solid, or a picture of the
+    /// user's under the theme's colors, softened or not, with how much of it shows.
+    fn render_window_section(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let settings = self.app_settings.read(cx).settings().clone();
+        let app_settings = self.app_settings.clone();
+        let current = settings.window_background;
+        let background_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for background in WindowBackground::ALL {
+                let app_settings = app_settings.clone();
+                menu = menu.toggleable_entry(
+                    background.label(),
+                    background == current,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        app_settings.update(cx, |store, cx| {
+                            store.update(|settings| settings.window_background = background, cx)
+                        })
+                    },
+                );
+            }
+            menu
+        });
+        let mut rows = vec![render_row(
+            "Background",
+            "What shows behind the window.",
+            DropdownMenu::new("window-background", current.label(), background_menu)
+                .into_any_element(),
+            cx,
+        )];
+        if current == WindowBackground::Picture {
+            rows.push(render_row(
+                "Picture",
+                "Shown behind the window, covering it.",
+                self.render_picture_control(&settings, cx),
+                cx,
+            ));
+            let app_settings = self.app_settings.clone();
+            rows.push(render_row(
+                "Soften picture",
+                "Blur it, so it reads as color rather than detail.",
+                Switch::new(
+                    "soften-background-picture",
+                    settings.soften_background_picture.into(),
+                )
+                .on_click(move |state, _, cx| {
+                    let soften = *state == ToggleState::Selected;
+                    app_settings.update(cx, |store, cx| {
+                        // The copy no longer shown would stay in memory.
+                        if let Some(name) = &store.settings().background_picture {
+                            window_background::forget_picture(
+                                window_background::picture_path(name, !soften),
+                                cx,
+                            );
+                        }
+                        store.update(|settings| settings.soften_background_picture = soften, cx)
+                    })
+                })
+                .into_any_element(),
+                cx,
+            ));
+            let app_settings = self.app_settings.clone();
+            rows.push(render_row(
+                "Shows through",
+                "How much of the picture shows through the theme's colors.",
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new("Solid")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "background-picture-opacity".to_string())
+                            .child(
+                                Slider::new(
+                                    "background-picture-opacity",
+                                    1. - settings.background_picture_opacity,
+                                )
+                                .on_release(
+                                    move |shows_through, _, cx| {
+                                        app_settings.update(cx, |store, cx| {
+                                            store.update(
+                                                |settings| {
+                                                    settings.background_picture_opacity =
+                                                        1. - shows_through
+                                                },
+                                                cx,
+                                            )
+                                        });
+                                    },
+                                ),
+                            ),
+                    )
+                    .child(
+                        Label::new("Clear")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+                cx,
+            ));
+        }
+        render_section("Window", rows, cx)
+    }
+
+    /// The picture's thumbnail beside Choose…, which waits while a new one is copied.
+    fn render_picture_control(&self, settings: &AppSettings, cx: &mut Context<Self>) -> AnyElement {
+        let border = cx.theme().colors().border;
+        // The copy the window shows, so Settings doesn't load the other one too.
+        let thumbnail = settings.background_picture.as_deref().map(|name| {
+            gpui::img(window_background::picture_path(
+                name,
+                settings.soften_background_picture,
+            ))
+            .w(px(54.))
+            .h(px(34.))
+            .rounded_sm()
+            .border_1()
+            .border_color(border)
+            .object_fit(gpui::ObjectFit::Cover)
+        });
+        let is_choosing = self.choosing_picture.is_some();
+        h_flex()
+            .gap_2()
+            .children(thumbnail)
+            .child(
+                Button::new(
+                    "choose-background-picture",
+                    if is_choosing {
+                        "Copying…"
+                    } else {
+                        "Choose…"
+                    },
+                )
+                .style(ButtonStyle::Outlined)
+                .disabled(is_choosing)
+                .on_click(cx.listener(|this, _, _, cx| this.choose_background_picture(cx))),
+            )
+            .into_any_element()
+    }
+
+    /// Picks a picture on this Mac and shows it behind the window.
+    fn choose_background_picture(&mut self, cx: &mut Context<Self>) {
+        if self.choosing_picture.is_some() {
+            return;
+        }
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use as Background".into()),
+        });
+        self.picture_error = None;
+        self.choosing_picture = Some(cx.spawn(async move |this, cx| {
+            let source = match paths.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(error)) => {
+                    log::error!("failed to pick a background picture: {error:#}");
+                    None
+                }
+            };
+            let chosen = match source {
+                Some(source) => {
+                    cx.update(|cx| window_background::choose_picture(source, cx))
+                        .await
+                }
+                None => Ok(()),
+            };
+            this.update(cx, |this, cx| {
+                this.choosing_picture = None;
+                if let Err(error) = chosen {
+                    this.picture_error =
+                        Some(format!("Couldn't use that picture: {error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
     }
 
     /// Settings › Agents: the installed agents, the ACP Registry, or one agent's page.

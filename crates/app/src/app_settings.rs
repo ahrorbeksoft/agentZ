@@ -1,6 +1,6 @@
 //! App-wide preferences, saved as JSON in the data directory: the theme, picked the way Zed
-//! picks it (a mode, plus one theme for light appearance and one for dark), the saved machines,
-//! and which projects the sidebar shows.
+//! picks it (a mode, plus one theme for light appearance and one for dark), a picture behind
+//! the window, the saved machines, and which projects the sidebar shows.
 //!
 //! Agent settings belong to each machine's server; its client keeps the app's copy.
 
@@ -16,6 +16,7 @@ use theme::{ActiveTheme as _, DEFAULT_DARK_THEME, GlobalTheme, ThemeRegistry};
 use util::ResultExt as _;
 
 use crate::machines::{GroupKey, ProjectGroupingMode, Scope};
+use crate::window_background;
 
 const DEFAULT_LIGHT_THEME: &str = "One Light";
 
@@ -27,6 +28,28 @@ pub enum ThemeMode {
     System,
     Light,
     Dark,
+}
+
+/// What's behind the window's surfaces (`design/appearance`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowBackground {
+    /// The theme's colors, solid.
+    #[default]
+    Solid,
+    /// A picture of the user's, under the theme's colors.
+    Picture,
+}
+
+impl WindowBackground {
+    pub const ALL: [Self; 2] = [Self::Solid, Self::Picture];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Solid => "Solid",
+            Self::Picture => "Picture",
+        }
+    }
 }
 
 /// Zed's `PlaySoundWhenAgentDone`, set for each sound, with a choice for another app in front.
@@ -131,6 +154,13 @@ pub struct AppSettings {
     pub theme_mode: ThemeMode,
     pub light_theme: String,
     pub dark_theme: String,
+    pub window_background: WindowBackground,
+    /// The picture Choose… copied for the window: its copies' name in the data directory.
+    pub background_picture: Option<String>,
+    /// The picture shows blurred, as color and light rather than detail.
+    pub soften_background_picture: bool,
+    /// How much of the theme's color covers the picture, from 0 (none) to 1 (all of it).
+    pub background_picture_opacity: f32,
     pub machines: Vec<MachineProfile>,
     pub scope: Scope,
     /// How checkouts of one repository are combined in the projects list.
@@ -183,6 +213,10 @@ impl Default for AppSettings {
             theme_mode: ThemeMode::default(),
             light_theme: DEFAULT_LIGHT_THEME.to_string(),
             dark_theme: DEFAULT_DARK_THEME.to_string(),
+            window_background: WindowBackground::default(),
+            background_picture: None,
+            soften_background_picture: false,
+            background_picture_opacity: window_background::DEFAULT_OPACITY,
             machines: Vec::new(),
             scope: Scope::default(),
             project_grouping: ProjectGroupingMode::default(),
@@ -319,10 +353,13 @@ fn apply_theme(settings: &AppSettings, cx: &mut App) {
     let registry = ThemeRegistry::global(cx);
     match registry.get(name).or_else(|_| registry.get(fallback)) {
         Ok(theme) => {
+            let (theme, picture_changed) = window_background::apply(theme, settings, cx);
             // Compared by identity rather than name: at startup the active theme is the
             // built-in fallback, which shares its name with the bundled "One Dark".
             if !Arc::ptr_eq(cx.theme(), &theme) {
                 GlobalTheme::update_theme(cx, theme);
+                cx.refresh_windows();
+            } else if picture_changed {
                 cx.refresh_windows();
             }
         }

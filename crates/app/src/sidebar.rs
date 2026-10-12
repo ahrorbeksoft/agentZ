@@ -34,6 +34,7 @@ use ui::{
 
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_switcher::compact_path;
+use crate::window_background;
 use crate::{NewChat, NewThread, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
@@ -1669,12 +1670,14 @@ impl Sidebar {
             })
             .child(status);
         // The buttons cover the end of the title in the card's own color, fading in from it,
-        // so a long title doesn't show through them.
-        let cover = colors.panel_background.blend(if is_active {
-            selected_background
-        } else {
-            hover_background
-        });
+        // so a long title doesn't show through them, even over a picture.
+        let cover = window_background::solid_backdrop(cx)
+            .blend(colors.panel_background)
+            .blend(if is_active {
+                selected_background
+            } else {
+                hover_background
+            });
         let hover_buttons = has_hover_buttons.then(|| {
             // Centered on its line, like t3code's Settle button.
             h_flex()
