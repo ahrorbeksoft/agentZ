@@ -17,7 +17,7 @@ use std::future::Future;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -28,9 +28,10 @@ use agentz_protocol::agents::select_offers;
 use agentz_protocol::attachments::AttachmentId;
 pub use agentz_protocol::thread::{
     AuthStatus, BackgroundTask, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry,
-    FailedMessage, FileDiff, ImageSize, LoginIdentity, LostHistory, ModeSwitch, PendingHandoff,
-    PermissionOption, PermissionRequest, PlanItem, QueuedMessage, SessionDefaults, SessionRestore,
-    ThreadState, ThreadView, ToolAnswer, ToolCall, TurnTime,
+    FailedMessage, FileDiff, HandoffMark, HandoffSource, ImageSize, LoginIdentity, LostHistory,
+    ModeSwitch, PendingHandoff, PermissionOption, PermissionRequest, PlanItem, QueuedMessage,
+    SessionDefaults, SessionRestore, ThreadAgent, ThreadState, ThreadView, ToolAnswer, ToolCall,
+    TurnOutcome, TurnTime,
 };
 use agentz_protocol::thread::{form_answer, login_code};
 use anyhow::{Context as _, Result, anyhow};
@@ -91,9 +92,8 @@ pub enum AgentThreadEvent {
     ConfigOptionChanged(acp::SessionConfigId, acp::SessionConfigOptionValue),
     /// The user changed the session's mode; Zed keeps it as the agent's default.
     ModeChanged(acp::SessionModeId),
-    /// The conversation this thread continues, from the given thread, went to the agent with
-    /// its first message.
-    HandoffSent(projects::ThreadId),
+    /// The agent took a message with the handoff that went with it ([`ThreadState::handoff`]).
+    HandoffSent(HandoffSource),
     /// The user started the thread without the conversation it would have brought.
     HandoffDropped,
     /// Logging in with the named method succeeded.
@@ -349,8 +349,13 @@ struct Session {
 
 struct SentMessage {
     parts: Vec<MessagePart>,
-    /// The conversation that went with it, which goes again with it.
-    handoff: Option<PendingHandoff>,
+}
+
+/// Each thread's connections are counted from a number of their own, so what a stopped
+/// thread's agent sent can't pass for a message to the thread that took its place.
+fn next_generation() -> u64 {
+    static GENERATIONS: AtomicU64 = AtomicU64::new(0);
+    GENERATIONS.fetch_add(1, Ordering::Relaxed)
 }
 
 pub struct AgentThread {
@@ -373,9 +378,15 @@ pub struct AgentThread {
     /// The first entry that changed since the server last sent this thread's changes, so it
     /// doesn't compare a long conversation's every entry on each update.
     entries_changed_from: Option<usize>,
-    /// The conversation this thread continues, taken from [`ThreadState::handoff`] by the first
-    /// message, to go with it once that's sent.
-    handoff_to_send: Option<PendingHandoff>,
+    /// The handoff that went with the prompt in flight, taken from [`ThreadState::handoff`]. It
+    /// goes back there if the prompt fails, for the next message to bring.
+    handoff_in_flight: Option<PendingHandoff>,
+    /// Who answers the thread's turns, for their records ([`TurnTime::agent`]).
+    agent: Option<ThreadAgent>,
+    /// How many entries there were when the turn in progress started.
+    turn_started_entries: usize,
+    /// How the turn ending ended, for its record.
+    turn_outcome: TurnOutcome,
     /// The user's last message, as it went to the agent, to send again if it doesn't get
     /// through ([`ThreadState::failed_message`]).
     last_message: Option<SentMessage>,
@@ -525,6 +536,12 @@ pub struct AgentSnapshot {
     /// [`AgentThread::subagent_sessions`].
     #[serde(default)]
     subagent_sessions: HashMap<String, bool>,
+    /// [`AgentThread::handoff_in_flight`].
+    #[serde(default)]
+    handoff_in_flight: Option<PendingHandoff>,
+    /// [`AgentThread::agent`].
+    #[serde(default)]
+    agent: Option<ThreadAgent>,
     /// Requests the agent waits on an answer to, as it sent them.
     unanswered: Vec<String>,
     stdout_rest: Vec<u8>,
@@ -543,6 +560,7 @@ pub struct Transcript {
     pub prompts_from_agents: Vec<(usize, projects::ThreadCreator)>,
     pub task_notices: Vec<usize>,
     pub sent_times: Vec<(usize, SystemTime)>,
+    pub handoffs: Vec<HandoffMark>,
 }
 
 /// A [`Transcript`] borrowed from its thread, which saves in the same form. The server saves
@@ -556,6 +574,7 @@ pub struct TranscriptRef<'a> {
     pub prompts_from_agents: &'a [(usize, projects::ThreadCreator)],
     pub task_notices: &'a [usize],
     pub sent_times: &'a [(usize, SystemTime)],
+    pub handoffs: &'a [HandoffMark],
 }
 
 impl From<TranscriptRef<'_>> for Transcript {
@@ -567,6 +586,7 @@ impl From<TranscriptRef<'_>> for Transcript {
             prompts_from_agents: transcript.prompts_from_agents.to_vec(),
             task_notices: transcript.task_notices.to_vec(),
             sent_times: transcript.sent_times.to_vec(),
+            handoffs: transcript.handoffs.to_vec(),
         }
     }
 }
@@ -762,7 +782,10 @@ impl AgentThread {
             queued_prompts: Vec::new(),
             after_turn: VecDeque::new(),
             entries_changed_from: Some(0),
-            handoff_to_send: None,
+            handoff_in_flight: None,
+            agent: None,
+            turn_started_entries: 0,
+            turn_outcome: TurnOutcome::Completed,
             last_message: None,
             mcp_servers: Vec::new(),
             attachments: None,
@@ -779,7 +802,7 @@ impl AgentThread {
             events: Vec::new(),
             runtime,
             messages,
-            generation: 0,
+            generation: next_generation(),
             tasks: JoinSet::new(),
             wire: None,
             process: None,
@@ -815,6 +838,7 @@ impl AgentThread {
         self.view.state.prompts_from_agents = transcript.prompts_from_agents;
         self.view.state.task_notices = transcript.task_notices;
         self.view.state.sent_times = transcript.sent_times;
+        self.view.state.handoffs = transcript.handoffs;
         self.entry_changed(0);
         self.has_conversation = true;
     }
@@ -841,6 +865,7 @@ impl AgentThread {
             prompts_from_agents: &self.view.state.prompts_from_agents,
             task_notices: &self.view.state.task_notices,
             sent_times: &self.view.state.sent_times,
+            handoffs: &self.view.state.handoffs,
         })
     }
 
@@ -1159,9 +1184,14 @@ impl AgentThread {
                     Ok(response) => {
                         if response.stop_reason == acp::StopReason::Cancelled {
                             self.stop_running_tool_calls();
+                            self.turn_outcome = TurnOutcome::Stopped;
                         }
                         self.view.state.last_stop_reason = Some(response.stop_reason);
                         self.last_message = None;
+                        // A stopped turn took the message too.
+                        if let Some(handoff) = self.handoff_in_flight.take() {
+                            self.emit(AgentThreadEvent::HandoffSent(handoff.source));
+                        }
                     }
                     // Some agents (Claude Agent, OpenCode) open sessions logged out and ask at
                     // the first prompt.
@@ -1170,11 +1200,15 @@ impl AgentThread {
                         self.found_logged_out();
                         self.view.state.auth_description = auth_description(&error);
                         self.message_failed(FailedMessage::NeedsLogin);
+                        self.return_handoff();
+                        self.turn_outcome = TurnOutcome::Failed;
                     }
                     Err(error) => {
                         log::error!("agent prompt failed: {error:?}");
                         self.view.state.turn_error = Some(error_message(&error).into());
                         self.message_failed(FailedMessage::TurnFailed);
+                        self.return_handoff();
+                        self.turn_outcome = TurnOutcome::Failed;
                     }
                 }
                 // A finished turn can't still be waiting on a permission answer.
@@ -1252,7 +1286,8 @@ impl AgentThread {
     pub fn restart_with(&mut self, command: AgentCommand, log_in_with: Option<acp::AuthMethodId>) {
         // The new agent waits for the old one to close the session it will load.
         let stopping = self.stop_agent();
-        self.generation += 1;
+        self.generation = next_generation();
+        self.return_handoff();
         // What a loading session replayed comes again. An agent that asked for a login
         // replayed nothing: its entries are messages that didn't go, which Retry sends.
         if !self.has_conversation && self.view.state.status != ConnectionStatus::AuthRequired {
@@ -1262,6 +1297,7 @@ impl AgentThread {
             self.view.state.prompts_from_agents.clear();
             self.view.state.task_notices.clear();
             self.view.state.sent_times.clear();
+            self.view.state.handoffs.clear();
             self.view.state.plan.clear();
         }
         self.cancel_permission_requests();
@@ -1426,16 +1462,20 @@ impl AgentThread {
                 std::mem::take(&mut self.view.state.prompts_from_agents),
                 std::mem::take(&mut self.view.state.task_notices),
                 std::mem::take(&mut self.view.state.sent_times),
+                std::mem::take(&mut self.view.state.handoffs),
             )
         });
         self.reload();
         self.queued_prompts = queued_prompts;
-        if let Some((entries, prompts_from_agents, task_notices, sent_times)) = conversation {
+        if let Some((entries, prompts_from_agents, task_notices, sent_times, handoffs)) =
+            conversation
+        {
             self.view.entries = entries;
             self.entry_changed(0);
             self.view.state.prompts_from_agents = prompts_from_agents;
             self.view.state.task_notices = task_notices;
             self.view.state.sent_times = sent_times;
+            self.view.state.handoffs = handoffs;
         }
     }
 
@@ -1541,6 +1581,8 @@ impl AgentThread {
                 prompt_id: wire.prompt_id,
                 working_on_its_own: self.working_on_its_own,
                 subagent_sessions: self.subagent_sessions.clone(),
+                handoff_in_flight: self.handoff_in_flight.clone(),
+                agent: self.agent.clone(),
                 unanswered: wire.unanswered,
                 stdout_rest: wire.stdout_rest,
                 stderr_rest: wire.stderr_rest,
@@ -1606,6 +1648,8 @@ impl AgentThread {
         // Ready once the new connection is.
         this.view.state.status = ConnectionStatus::Connecting;
         this.previous_session = snapshot.previous_session;
+        this.handoff_in_flight = snapshot.handoff_in_flight;
+        this.agent = snapshot.agent;
         this.pending_title = snapshot.pending_title;
         this.mcp_servers = snapshot.mcp_servers;
         this.defaults = snapshot.defaults;
@@ -1891,11 +1935,8 @@ impl AgentThread {
             return;
         };
         self.queued_prompts.clear();
-        // The conversation it continues is still to go, in `handoff_to_send`.
-        self.last_message = Some(SentMessage {
-            parts,
-            handoff: None,
-        });
+        // The handoff it would have brought waits in `ThreadState::handoff` still.
+        self.last_message = Some(SentMessage { parts });
         self.message_failed(reason);
     }
 
@@ -1917,9 +1958,6 @@ impl AgentThread {
         }
         self.view.state.failed_message = None;
         self.view.state.turn_error = None;
-        if message.handoff.is_some() {
-            self.handoff_to_send = message.handoff;
-        }
         // The new reply isn't more of what the failed turn said.
         self.new_message_due = true;
         self.send_to_agent(message.parts);
@@ -1958,15 +1996,37 @@ impl AgentThread {
         });
     }
 
-    /// The conversation this thread continues, to go with its first message.
+    /// The conversation to go with the next message ([`ThreadState::handoff`]).
     pub fn set_handoff(&mut self, handoff: Option<PendingHandoff>) {
         self.view.state.handoff = handoff;
     }
 
-    /// Starts without the conversation the thread would have brought.
+    /// Who answers the thread's turns, for their records. Set it right after starting.
+    pub fn set_agent(&mut self, agent: ThreadAgent) {
+        self.agent = Some(agent);
+    }
+
+    /// Goes on without the conversation the next message would have brought.
     pub fn drop_handoff(&mut self) {
-        if self.view.state.handoff.take().is_some() || self.handoff_to_send.take().is_some() {
-            self.emit(AgentThreadEvent::HandoffDropped);
+        let Some(handoff) = self.view.state.handoff.take() else {
+            return;
+        };
+        // Shown at a message that didn't get through, it didn't go there after all.
+        self.view
+            .state
+            .handoffs
+            .retain(|mark| mark.made_at != handoff.made_at);
+        self.conversation_revision += 1;
+        self.emit(AgentThreadEvent::HandoffDropped);
+    }
+
+    /// The handoff that went with a prompt the agent didn't take waits for the next message
+    /// again, unless another has taken its place.
+    fn return_handoff(&mut self) {
+        if let Some(handoff) = self.handoff_in_flight.take()
+            && self.view.state.handoff.is_none()
+        {
+            self.view.state.handoff = Some(handoff);
         }
     }
 
@@ -2172,9 +2232,22 @@ impl AgentThread {
             .state
             .sent_times
             .push((self.view.entries.len(), SystemTime::now()));
+        let index = self.view.entries.len();
         self.push_entry(Entry::UserMessage(message_markdown(&parts)));
-        if let Some(handoff) = self.view.state.handoff.take() {
-            self.handoff_to_send = Some(handoff);
+        // The conversation shows where the handoff went, from the first message it goes with.
+        if let Some(handoff) = &self.view.state.handoff
+            && !self
+                .view
+                .state
+                .handoffs
+                .iter()
+                .any(|mark| mark.made_at == handoff.made_at)
+        {
+            self.view.state.handoffs.push(HandoffMark {
+                entry: index,
+                source: handoff.source.clone(),
+                made_at: handoff.made_at,
+            });
         }
         self.view.state.turn_error = None;
         // A new message takes the place of one that didn't get through.
@@ -2182,10 +2255,7 @@ impl AgentThread {
         self.last_message = None;
         match self.view.state.status {
             ConnectionStatus::Ready if self.view.state.lost_history.is_some() => {
-                self.last_message = Some(SentMessage {
-                    parts,
-                    handoff: None,
-                });
+                self.last_message = Some(SentMessage { parts });
                 self.message_failed(FailedMessage::LostHistory);
             }
             ConnectionStatus::Ready => self.send_to_agent(parts),
@@ -2195,10 +2265,7 @@ impl AgentThread {
             }
             // As if the agent had asked for the login at it: the user retries it once logged in.
             ConnectionStatus::AuthRequired => {
-                self.last_message = Some(SentMessage {
-                    parts,
-                    handoff: None,
-                });
+                self.last_message = Some(SentMessage { parts });
                 self.message_failed(FailedMessage::NeedsLogin);
             }
             ConnectionStatus::Failed(_) => {}
@@ -2397,7 +2464,7 @@ impl AgentThread {
             return;
         }
         let mut prompt = self.content_blocks(parts.clone());
-        let handoff = self.handoff_to_send.take();
+        let handoff = self.view.state.handoff.take();
         if let Some(handoff) = &handoff {
             // Embedded, the agent tells it from the message: replays show only the message.
             let block = if self
@@ -2417,9 +2484,9 @@ impl AgentThread {
                 acp::ContentBlock::Text(acp::TextContent::new(handoff.text.clone()))
             };
             prompt.insert(0, block);
-            self.emit(AgentThreadEvent::HandoffSent(handoff.from));
         }
-        self.last_message = Some(SentMessage { parts, handoff });
+        self.handoff_in_flight = handoff;
+        self.last_message = Some(SentMessage { parts });
         let Some(session) = &self.session else {
             return;
         };
@@ -2935,6 +3002,7 @@ impl AgentThread {
         if working == self.is_working() {
             return;
         }
+        let outcome = std::mem::take(&mut self.turn_outcome);
         if !working
             && let Some(duration) = self
                 .view
@@ -2943,10 +3011,18 @@ impl AgentThread {
                 .and_then(|started| started.elapsed().ok())
         {
             self.view.state.finished_turns.push(TurnTime {
+                entries_start: self.turn_started_entries.min(self.view.entries.len()),
                 entries_end: self.view.entries.len(),
                 duration,
+                agent: self.agent.clone(),
+                model: self.view.model_name(),
+                effort: self.view.effort_name(),
+                outcome,
             });
             self.conversation_revision += 1;
+        }
+        if working {
+            self.turn_started_entries = self.view.entries.len();
         }
         self.view.state.turn_started_at = working.then(SystemTime::now);
         self.emit(AgentThreadEvent::WorkingChanged(working));
@@ -2960,6 +3036,7 @@ impl AgentThread {
         }
         self.view.state.status = ConnectionStatus::Failed(message.into());
         self.session = None;
+        self.return_handoff();
         self.end_subagents();
         self.queued_prompts.clear();
         self.after_turn.clear();

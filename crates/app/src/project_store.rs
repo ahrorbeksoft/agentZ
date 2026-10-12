@@ -364,6 +364,26 @@ impl ProjectStore {
         )
     }
 
+    /// The thread goes on with `agent_id` on `account`, between turns: its next message brings
+    /// what they haven't seen of it.
+    pub fn switch_agent(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: AgentId,
+        account: AccountChoice,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.request(
+            Request::SwitchAgent {
+                thread_id,
+                agent_id,
+                account,
+            },
+            |response| matches!(response, Response::Ok).then_some(()),
+            cx,
+        )
+    }
+
     /// "Continue with another agent": a thread with `agent_id` on `account` in the thread's
     /// workspace, whose first message brings the thread's conversation.
     pub fn continue_thread(

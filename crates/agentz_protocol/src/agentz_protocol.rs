@@ -579,6 +579,16 @@ pub enum Request {
     },
     /// Starts the continued thread without the conversation it would have brought.
     DropHandoff(ConnectionId),
+    /// The thread goes on with another agent, or another account of its agent, between turns.
+    /// An agent and account it was with before goes back to its session; otherwise a new
+    /// session starts. Either way the next message brings what that session hasn't seen
+    /// ([`thread::switch_handoff`]).
+    SwitchAgent {
+        thread_id: ThreadId,
+        agent_id: AgentId,
+        #[serde(default)]
+        account: AccountChoice,
+    },
     /// From the agent's own process, through agentZ's `xdg-open`: it tried to open a page in a
     /// browser. While it logs in, clients show it ([`thread::ThreadState::login_page`]); refused
     /// when the connection isn't logging in, or the page opens on the agent's machine. Dropped

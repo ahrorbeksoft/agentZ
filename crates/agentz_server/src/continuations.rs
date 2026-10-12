@@ -1,7 +1,9 @@
-//! The conversations threads continue with another agent ("Continue with another agent"), kept
-//! in `handoffs/<thread id>.json` until each goes with its thread's first message, so a restart
-//! of the server doesn't lose one. Until then the thread is a draft, removed once the user leaves
-//! it empty ([`crate::server`]'s `sweep_drafts`).
+//! The conversations waiting to go with a thread's next message ([`ThreadState::handoff`]): what
+//! its new agent or account hasn't seen, or another thread's ("Continue with another agent").
+//! Each is kept in `handoffs/<thread id>.json` until the agent takes a message with it, so a
+//! restart of the server doesn't lose one.
+//!
+//! [`ThreadState::handoff`]: agentz_protocol::thread::ThreadState::handoff
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +47,7 @@ pub(crate) fn remove(data_dir: &Path, thread_id: ThreadId) -> Result<()> {
     }
 }
 
-/// The threads whose conversation waits for their first message.
+/// The threads with a conversation waiting for their next message.
 pub(crate) fn list(data_dir: &Path) -> Vec<ThreadId> {
     let Ok(entries) = std::fs::read_dir(data_dir.join("handoffs")) else {
         return Vec::new();

@@ -584,12 +584,12 @@ async fn continues_threads_with_another_agent() {
     assert!(
         handoff
             .text
-            .contains("<message from=\"user\">\nbuild the page\n</message>")
+            .contains("<message from=\"user\" turn=\"1\">\nbuild the page\n</message>")
     );
     assert!(
         handoff
             .text
-            .contains("<message from=\"Mock\">\nEcho: build the page")
+            .contains("<message from=\"Mock\" turn=\"1\">\nEcho: build the page")
     );
     let saved = server
         .data_dir
@@ -652,6 +652,208 @@ async fn continues_threads_with_another_agent() {
             })
         })
         .await;
+}
+
+/// A thread goes on with another account between turns, in a session of its own, which its next
+/// message tells the conversation so far. Back on the first account, the thread's first session
+/// loads again and is told only what happened since it left.
+#[tokio::test(flavor = "multi_thread")]
+async fn switches_a_threads_account_between_turns() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("build the page"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == "Echo: build the page"
+        })
+        .await;
+    let record = |client: &TestClient| {
+        client
+            .projects
+            .as_ref()
+            .and_then(|projects| {
+                projects
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == thread_id)
+            })
+            .cloned()
+            .expect("the thread")
+    };
+    client
+        .wait_until(|client| record(client).session_id.is_some())
+        .await;
+    let first_session = record(&client).session_id;
+
+    let Response::AccountAdded(work) = client.ok(Request::AddAccount(AgentId::new("mock"))).await
+    else {
+        panic!("expected an account");
+    };
+    client
+        .ok(Request::SwitchAgent {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+            account: AccountChoice::Account(work),
+        })
+        .await;
+    client
+        .wait_until(|client| record(client).account == Some(work))
+        .await;
+    let thread = record(&client);
+    assert_eq!(thread.session_id, None);
+    assert_eq!(thread.other_sessions.len(), 1);
+    assert_eq!(
+        thread.other_sessions[0].session_id,
+        first_session.clone().expect("a session")
+    );
+    // It saw the whole conversation.
+    assert_eq!(
+        thread.other_sessions[0].seen,
+        client.thread(connection).entries().len()
+    );
+    client
+        .wait_until(|client| client.thread(connection).pending_handoff().is_some())
+        .await;
+    let handoff = client
+        .thread(connection)
+        .pending_handoff()
+        .cloned()
+        .expect("what the new account hasn't seen waits for the next message");
+    assert_eq!(handoff.messages, 2);
+    assert!(handoff.text.contains("you're taking over agentZ thread"));
+    assert!(
+        handoff
+            .text
+            .contains("<message from=\"user\" turn=\"1\">\nbuild the page\n</message>")
+    );
+    let saved = server
+        .data_dir
+        .path()
+        .join(format!("handoffs/{}.json", thread_id.0));
+    assert!(saved.exists());
+    // The conversation stays as it was.
+    assert_eq!(
+        agent_text(client.thread(connection)),
+        "Echo: build the page"
+    );
+
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("next"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working()
+                && agent_text(thread).ends_with("Echo: next [with agentz://handoff]")
+        })
+        .await;
+    let thread = client.thread(connection);
+    assert_eq!(thread.pending_handoff(), None);
+    let message = thread
+        .entries()
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::UserMessage(_)))
+        .expect("the message");
+    assert!(thread.handoff_mark(message).is_some());
+    assert!(!saved.exists());
+    client
+        .wait_until(|client| record(client).session_id.is_some())
+        .await;
+
+    // Back on the External account, its session is the thread's again.
+    client
+        .ok(Request::SwitchAgent {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+            account: AccountChoice::External,
+        })
+        .await;
+    client
+        .wait_until(|client| record(client).account.is_none())
+        .await;
+    assert_eq!(record(&client).session_id, first_session);
+    client
+        .wait_until(|client| client.thread(connection).pending_handoff().is_some())
+        .await;
+    let handoff = client
+        .thread(connection)
+        .pending_handoff()
+        .cloned()
+        .expect("what happened since");
+    assert_eq!(handoff.messages, 2);
+    assert!(handoff.text.contains("you worked on agentZ thread"));
+    assert!(
+        handoff
+            .text
+            .contains("<message from=\"user\" turn=\"2\">\nnext\n</message>")
+    );
+    assert!(!handoff.text.contains("turn=\"1\""));
+
+    // Its own account again, with nothing new to tell.
+    client
+        .ok(Request::SwitchAgent {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+            account: AccountChoice::Account(work),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            record(client).account == Some(work)
+                && client.thread(connection).pending_handoff().is_none()
+        })
+        .await;
+    assert!(!saved.exists());
+}
+
+/// The thread's agent changes only between turns.
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_to_switch_a_working_threads_agent() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("slow"),
+        })
+        .await;
+    client
+        .wait_until(|client| client.thread(connection).is_working())
+        .await;
+    let Response::AccountAdded(work) = client.ok(Request::AddAccount(AgentId::new("mock"))).await
+    else {
+        panic!("expected an account");
+    };
+    let error = client
+        .request(Request::SwitchAgent {
+            thread_id,
+            agent_id: AgentId::new("mock"),
+            account: AccountChoice::Account(work),
+        })
+        .await
+        .expect_err("a working thread keeps its agent");
+    assert!(error.message.contains("working"), "{}", error.message);
 }
 
 /// An archived thread's agent stops once nothing needs it and no client has the thread open,

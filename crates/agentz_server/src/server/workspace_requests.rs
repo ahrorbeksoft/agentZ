@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use agentz_protocol::accounts::{AccountChoice, AccountId};
-use agentz_protocol::agents::AgentId;
+use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
-use agentz_protocol::thread::{ConnectionStatus, handoff};
+use agentz_protocol::thread::{
+    ConnectionStatus, HandoffSource, PendingHandoff, ThreadAgent, handoff, switch_handoff,
+};
 use agentz_protocol::workspace::{RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{ConnectionId, Request, Response};
 use anyhow::{Context as _, Result, anyhow};
@@ -456,6 +458,114 @@ impl Server {
             thread.set_handoff(Some(handoff))
         })?;
         Ok(new_thread)
+    }
+
+    /// The thread goes on with `agent_id` on `account` ([`Request::SwitchAgent`]): its agent
+    /// stops, keeping the conversation, and the new one starts in the session it had in the
+    /// thread, if it was there before, or a new one. Its next message brings what that session
+    /// hasn't seen ([`switch_handoff`]).
+    pub(super) fn switch_agent(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: AgentId,
+        account: AccountChoice,
+    ) -> Result<()> {
+        let thread = self
+            .projects
+            .thread(thread_id)
+            .context("no such thread")?
+            .clone();
+        anyhow::ensure!(thread.terminal.is_none(), "a terminal thread has no agent");
+        anyhow::ensure!(
+            thread.task.is_none(),
+            "a task stays with the agent it was given to"
+        );
+        anyhow::ensure!(
+            self.custom_agents.contains_key(&agent_id)
+                || matches!(
+                    self.registry.install_state(&agent_id),
+                    InstallState::Installed { .. }
+                ),
+            "{} isn't installed",
+            self.agent_name(&agent_id)
+        );
+        let account = self.choose_account(&agent_id, account)?;
+        let to = ThreadAgent {
+            agent_id: agent_id.0.to_string(),
+            name: self.agent_name(&agent_id).to_string(),
+            account,
+        };
+        let current = thread.agent_id.clone().map(|current| ThreadAgent {
+            name: self.agent_name(&AgentId::new(current.clone())).to_string(),
+            agent_id: current,
+            account: thread.account,
+        });
+        if current.as_ref().is_some_and(|current| current.is(&to)) {
+            return Ok(());
+        }
+        let connection = ConnectionId::Thread(thread_id);
+        // Its conversation is what the new agent is told.
+        if !self.threads.contains_key(&thread_id) {
+            self.update_thread(connection, |_| {})?;
+        }
+        let running = self.threads.get(&thread_id).context("no such thread")?;
+        anyhow::ensure!(
+            !running.is_working(),
+            "the thread is working; stop it or wait for it to finish first"
+        );
+        anyhow::ensure!(
+            !(*running.status() == ConnectionStatus::Connecting
+                && running.conversation_revision().is_none()
+                && thread.session_id.is_some()),
+            "the thread is still loading its conversation"
+        );
+        let pending = running.state.handoff.clone();
+        // A session that was still to be told what it missed has seen only what it saw then.
+        let seen = match &pending {
+            Some(PendingHandoff {
+                source: HandoffSource::Agent { since, .. },
+                ..
+            }) => *since,
+            _ => running.entries.len(),
+        };
+        let returning =
+            self.projects
+                .switch_thread_agent(thread_id, to.agent_id.clone(), to.account, seen);
+        let handoff = match pending {
+            // Another thread's conversation, which this one hasn't started on yet.
+            Some(
+                pending @ PendingHandoff {
+                    source: HandoffSource::Thread { .. },
+                    ..
+                },
+            ) => Some(pending),
+            _ => {
+                // From the agent that answered last, which isn't the current one when it was
+                // switched to and never answered.
+                let from = running
+                    .state
+                    .finished_turns
+                    .iter()
+                    .rev()
+                    .find_map(|turn| turn.agent.clone())
+                    .or(current)
+                    .unwrap_or_else(|| ThreadAgent {
+                        name: running.agent_name().to_string(),
+                        ..ThreadAgent::default()
+                    });
+                let since = returning.as_ref().map_or(0, |session| session.seen);
+                switch_handoff(running, thread_id, &thread.title, from, to, since)
+            }
+        };
+        self.stop_agent(thread_id);
+        self.tool_sessions
+            .retain(|_, session_thread| *session_thread != thread_id);
+        match &handoff {
+            Some(handoff) => continuations::save(&self.data_dir, thread_id, handoff).log_err(),
+            None => continuations::remove(&self.data_dir, thread_id).log_err(),
+        };
+        // Starts the new agent, which takes the handoff from its file.
+        self.update_thread(connection, |_| {})
     }
 
     pub(super) fn project_path(&self, project_id: ProjectId) -> Result<PathBuf> {

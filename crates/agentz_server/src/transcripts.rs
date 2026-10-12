@@ -90,8 +90,13 @@ mod tests {
         let transcript = Transcript {
             entries: vec![agent_thread::Entry::UserMessage("hello".into())],
             finished_turns: vec![agent_thread::TurnTime {
+                entries_start: 1,
                 entries_end: 1,
                 duration: std::time::Duration::from_secs(2),
+                agent: None,
+                model: Some("Sonnet".into()),
+                effort: None,
+                outcome: agent_thread::TurnOutcome::Stopped,
             }],
             sent_times: vec![(0, std::time::SystemTime::UNIX_EPOCH)],
             ..Transcript::default()
@@ -103,6 +108,7 @@ mod tests {
             prompts_from_agents: &transcript.prompts_from_agents,
             task_notices: &transcript.task_notices,
             sent_times: &transcript.sent_times,
+            handoffs: &transcript.handoffs,
         };
         save(data_dir.path(), thread_id, saved).expect("saved");
         assert_eq!(

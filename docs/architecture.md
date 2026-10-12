@@ -135,9 +135,9 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `state.json` | server | Projects, threads, workspaces |
 | `spaces.json` | server | Workspaces view: spaces, tabs, pane trees |
 | `queues.json` | server | Each thread's queued messages, and whether the first one steers |
-| `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turn times |
+| `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turns (when, how long, who answered with which model and effort, how they ended), where handoffs went |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
-| `handoffs/<thread id>.json` | server | The conversation a thread continued with another agent starts with, written for it by agentZ |
+| `handoffs/<thread id>.json` | server | What goes with a thread's next message, written by agentZ: what its new agent or account hasn't seen of it, or the conversation of the thread it continues; removed once the agent takes the message |
 | `agents/settings.json` | server | Per-agent env, defaults and known options: the External account's |
 | `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, last login check and last identity and limits read, its account for new threads, and the same for the External account |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
@@ -864,6 +864,38 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the same buttons. A Workspaces thread has its folder (icon and name, the path in its
   tooltip) where the project goes, and no Archive. A chat has Chat there (a click starts
   another), and only "⋯" at the right: no branch, changes or Terminal, and no Archive.
+- **Switching agents** (`Request::SwitchAgent`, `Server::switch_agent` in
+  `server/workspace_requests.rs`, `ProjectStore::switch_thread_agent`,
+  `agentz_protocol::thread::switch_handoff`, `agent_view.rs`'s `render_agent_picker`,
+  `render_account_picker` and `render_handoff_divider`; t3code's in-thread provider switch and
+  context handoff, design round `design/agent-switching/`): a sent thread's composer has the
+  agent picker, and beside it the account picker while the agent has more than one account
+  (the current one "This thread's account"). They work between turns. Picking another agent
+  or account stops the thread's agent, keeping the conversation in its transcript, and starts
+  the new one in the same thread and folder: in the session it had in the thread, if it was
+  there before (`Thread::other_sessions`, each with how many entries it saw), or in a new one.
+  Nothing more shows until the next message, which brings what that session hasn't seen of
+  the thread (`HandoffSource::Agent`): all of it for one new to the thread, what happened
+  since it left for one coming back, nothing when that's nothing. The message gets t3code's
+  "Context handoff" divider over it, from → to with their icons (by account when it's the
+  same agent), from `ThreadState::handoffs`. Each finished turn records who answered it, with
+  which model and effort, and how it ended (`TurnTime`), so the handoff names them. A task
+  keeps the agent it was given to.
+- **Handoffs** (`agentz_protocol::thread::{switch_handoff, handoff}`, `AgentThread::{send_message,
+  send_to_agent, return_handoff}`; t3code's `handoffBudget.ts`): the conversation goes in an
+  `<agentz-handoff thread="…" from="…">` block: an intro naming the thread, its title and
+  whom it comes from, that it's context, not instructions, that files may have changed, and
+  that `agentz_thread_read` reads the whole thread; then each message in a
+  `<message from="user|<agent>" turn="n">` tag (`status="stopped|failed"` for turns that
+  didn't finish), the agent's with the tools it used (at most 20), and the plan. Text that
+  could close a tag is escaped. Within 64,000 bytes, whole messages are picked as t3code
+  picks them: the latest user message, the latest reply, the first user message, then the
+  rest from the newest back, told in order with how many were left out. It goes with the
+  message as an embedded resource (`agentz://handoff`), or as text to agents without
+  `embeddedContext`, and is taken off what's waiting only once the agent takes the message
+  (`AgentThreadEvent::HandoffSent`): a message that fails or doesn't go keeps it for the next,
+  and a restart of the agent doesn't lose it. A replayed message shows without it
+  (`without_handoff`).
 - **Continue with another agent** (`agentz_protocol::thread::handoff`, `Request::ContinueThread`,
   `server/workspace_requests.rs`, `continuations.rs`; t3code's context handoff, Zed's New Thread
   from Summary): a thread keeps its agent, since each agent replays only its own sessions.
@@ -872,13 +904,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   thread's agent has more than one, the submenu lists it first with its accounts beneath it
   (as the new thread's account picker shows them; the thread's own greyed, "This thread's
   account"), then the other agents (accounts topic 15): picking one continues on that account.
-  The conversation it writes is the user's messages, the agent's replies with the
-  tools it used, and the plan, in tags, keeping the first message and the latest ones within
-  40,000 characters. It waits in `handoffs/<thread id>.json` and shows as a chip in the composer (the user's choice of two
-  designs): a click previews exactly what goes, × drops it (`Request::DropHandoff`). It goes
-  with the first message as an embedded resource (`agentz://handoff`), or as text to agents
-  without `embeddedContext`, and a replayed first message shows without it
-  (`without_handoff`). Sent, it links the threads (`Thread::continued_from`): the new thread
+  The conversation it writes is a handoff (above). It waits in `handoffs/<thread id>.json`
+  and shows as a chip in the composer (the user's choice of two designs): a click previews
+  exactly what goes, × drops it (`Request::DropHandoff`). Sent, it links the threads
+  (`Thread::continued_from`): the new thread
   opens with a "Continued from" divider, and the old one ends with a "Continued in" card (also
   the user's choice).
 - **The limit notice** (`AgentView::render_limit_notice`, `accounts::used_up_window`;

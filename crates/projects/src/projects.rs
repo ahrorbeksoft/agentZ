@@ -288,11 +288,13 @@ pub struct Thread {
     pub id: ThreadId,
     pub project_id: ProjectId,
     pub title: String,
-    /// The registry id of the agent the thread was started with.
+    /// The registry id of the thread's agent. It can change between turns
+    /// ([`ProjectStore::switch_thread_agent`]).
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// The agent's account the thread runs on, for good: accounts share no sessions. `None` is
-    /// the External account, the agent's own login in its normal home.
+    /// The agent's account the thread runs on. `None` is the External account, the agent's
+    /// own login in its normal home. Accounts share no sessions, so another account goes on
+    /// in a session of its own.
     #[serde(default)]
     pub account: Option<AccountId>,
     /// When the thread was created or its agent last did something.
@@ -309,6 +311,9 @@ pub struct Thread {
     /// load while the agent reports another one was lost to the account change.
     #[serde(default)]
     pub session_login: Option<LoginIdentity>,
+    /// The sessions of the agents and accounts the thread went on from, to go back to.
+    #[serde(default)]
+    pub other_sessions: Vec<AgentSession>,
     /// Set when the thread is archived; archived threads only show in Thread History.
     #[serde(default)]
     pub archived_at: Option<SystemTime>,
@@ -381,6 +386,19 @@ pub struct Thread {
     /// The mentions in [`Thread::unsent_text`], in order, so they come back as chips.
     #[serde(default)]
     pub unsent_mentions: Vec<UnsentMention>,
+}
+
+/// The session an agent on one of its accounts had in a thread before the thread went on with
+/// another ([`Thread::other_sessions`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentSession {
+    pub agent_id: String,
+    pub account: Option<AccountId>,
+    pub session_id: String,
+    #[serde(default)]
+    pub session_login: Option<LoginIdentity>,
+    /// How many of the thread's entries the session has seen: the ones after are new to it.
+    pub seen: usize,
 }
 
 /// What tells one of an agent's logins from another, from what the agent reports of it: the
@@ -1134,6 +1152,7 @@ impl ProjectStore {
             created_at: Some(now),
             session_id: None,
             session_login: None,
+            other_sessions: Vec::new(),
             archived_at: None,
             pinned_at: None,
             pin_order_key: None,
@@ -1713,14 +1732,59 @@ impl ProjectStore {
     }
 
     /// The thread's agent starts a new session next time, as one moved to another folder must.
+    /// The sessions of the agents it went on from are forgotten too.
     pub fn forget_thread_session(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
-            && thread.session_id.is_some()
+            && (thread.session_id.is_some() || !thread.other_sessions.is_empty())
         {
             thread.session_id = None;
             thread.session_login = None;
+            thread.other_sessions.clear();
             self.changed();
         }
+    }
+
+    /// The thread goes on with `agent_id` on `account`. The session it had keeps, with the
+    /// `seen` entries it has seen, to go back to; the one the new agent and account had, if
+    /// they were in the thread before, is the thread's again. Returns that one.
+    pub fn switch_thread_agent(
+        &mut self,
+        id: ThreadId,
+        agent_id: String,
+        account: Option<AccountId>,
+        seen: usize,
+    ) -> Option<AgentSession> {
+        let thread = self.threads.iter_mut().find(|thread| thread.id == id)?;
+        if let (Some(current), Some(session_id)) =
+            (thread.agent_id.clone(), thread.session_id.take())
+        {
+            let account = thread.account;
+            thread
+                .other_sessions
+                .retain(|session| !(session.agent_id == current && session.account == account));
+            thread.other_sessions.push(AgentSession {
+                agent_id: current,
+                account,
+                session_id,
+                session_login: thread.session_login.take(),
+                seen,
+            });
+        }
+        let returning = thread
+            .other_sessions
+            .iter()
+            .position(|session| session.agent_id == agent_id && session.account == account)
+            .map(|index| thread.other_sessions.remove(index));
+        thread.session_id = returning.as_ref().map(|session| session.session_id.clone());
+        thread.session_login = returning
+            .as_ref()
+            .and_then(|session| session.session_login.clone());
+        thread.agent_id = Some(agent_id);
+        thread.account = account;
+        // Filled in once the agent's session opens.
+        thread.model = None;
+        self.changed();
+        returning
     }
 
     pub fn set_session_login(&mut self, id: ThreadId, login: LoginIdentity) {

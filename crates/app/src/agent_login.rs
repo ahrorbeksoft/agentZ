@@ -225,6 +225,14 @@ impl AgentLogin {
         this
     }
 
+    /// The agent the thread goes on with, once it switches to another.
+    pub(crate) fn set_agent_id(&mut self, agent_id: Option<AgentId>, cx: &mut Context<Self>) {
+        if self.agent_id != agent_id {
+            self.agent_id = agent_id;
+            cx.notify();
+        }
+    }
+
     /// Names the account the login is for, while the agent has more than one.
     pub(crate) fn set_account(&mut self, account: Option<SharedString>, cx: &mut Context<Self>) {
         if self.account != account {
