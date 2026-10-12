@@ -792,8 +792,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   logging in doesn't send it by itself. A turn that ends with an error
   (`FailedMessage::TurnFailed`, its callout "The agent stopped with an error") has the mark too:
   Claude Agent and Codex retry a lost connection themselves, and the prompt fails once they
-  give up. The failed message and its error stay across a reload of the agent, and a new
-  message takes its place. The retried reply starts a message of its own. A message that would
+  give up. The failed message stays across a reload of the agent, but not its error, which
+  was the old agent's (Zed's reload starts the thread view over), and a new message takes its
+  place. The retried reply starts a message of its own. A message that would
   go to a session without the conversation fails too, with Send Anyway (see Lost
   conversations).
 - **Background tasks** (`AgentThread::{apply_background_task_update, stop_background_task}`,
@@ -910,7 +911,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the account's last read. At that time the server queues "Continue." in the thread, which
   starts its agent if it had stopped, so it goes with the app closed; a server that starts
   waits again for the threads waiting when it stopped. A turn that starts meanwhile cancels
-  the wait, as Don't Continue does; an archived thread doesn't continue, and a subthread
+  the wait, as Don't Continue does, but not one the agent starts by itself (Claude Agent's
+  after a background task ends, which stops at once at the limit, with the limit only in its
+  text); an archived thread doesn't continue, and a subthread
   never waits. On Droid this only happens when Droid itself stops at its limit.
 - **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
   t3code's `ComposerUsageLimits`, accounts topic 16, usage round topic 3): beside the agent in

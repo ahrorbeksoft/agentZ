@@ -10,6 +10,7 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
+use agent_thread::AgentThread;
 use agentz_protocol::accounts::{AccountId, AtLimit, used_up_window};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::{ConnectionId, PromptPart, Request};
@@ -25,8 +26,17 @@ const CONTINUE_MESSAGE: &str = "Continue.";
 const CLOCK_CHECK: Duration = Duration::from_secs(60);
 
 impl Server {
-    /// A turn that starts, by the user or by the wait, ends the wait.
+    /// A turn that starts, by the user or by the wait, ends the wait. One the agent starts on
+    /// its own doesn't: Claude Agent goes on once a background task ends, and at the limit that
+    /// turn stops at once, with the limit in its text rather than as an error.
     pub(super) fn turn_started(&mut self, thread_id: ThreadId) {
+        if self
+            .threads
+            .get(&thread_id)
+            .is_some_and(AgentThread::works_on_its_own)
+        {
+            return;
+        }
         self.failed_turns.remove(&thread_id);
         self.projects.set_continues_at(thread_id, None);
     }

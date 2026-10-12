@@ -1277,11 +1277,10 @@ impl AgentThread {
         self.view.state.auth_links.clear();
         self.view.state.auth_code = None;
         self.view.state.login_page = None;
-        // A failed message can still go once the agent is back (after a login, often), and its
-        // error says why it failed.
-        if self.view.state.failed_message.is_none() {
-            self.view.state.turn_error = None;
-        }
+        // The restarted agent is asked again, as Zed's reload starts the thread view over: the
+        // error was the old one's, and may not hold any more (a limit that has reset). A message
+        // that failed keeps its Retry.
+        self.view.state.turn_error = None;
         self.view.state.status = ConnectionStatus::Connecting;
         self.authenticate_once_connected = log_in_with;
         self.waits_for_login = false;
@@ -1482,6 +1481,11 @@ impl AgentThread {
     /// Whether the connection is paused or pausing: what's sent to the agent waits.
     pub fn is_paused(&self) -> bool {
         self.pausing.is_some() || self.wire.as_ref().is_some_and(Wire::is_paused)
+    }
+
+    /// Whether the agent works without a prompt ([`Self::working_on_its_own`]).
+    pub fn works_on_its_own(&self) -> bool {
+        self.working_on_its_own
     }
 
     /// Whether the thread could be handed off once paused: its session is open, and it isn't
@@ -5478,8 +5482,9 @@ mod tests {
         assert_eq!(user_messages(&thread.thread), ["hello"]);
     }
 
-    /// A turn that fails, as on a lost connection, keeps its message and error, even across a
-    /// reload, and Retry sends the message again.
+    /// A turn that fails, as on a lost connection, keeps its message and error, and Retry sends
+    /// the message again. A reload keeps the message but not the error, which was the old
+    /// agent's.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_turn_is_retried() {
         let history_dir = tempfile::tempdir().expect("temp dir");
@@ -5515,7 +5520,7 @@ mod tests {
             thread.thread.failed_message(),
             Some(FailedMessage::TurnFailed)
         );
-        assert!(thread.thread.turn_error().is_some());
+        assert_eq!(thread.thread.turn_error(), None);
 
         // The restarted mock fails it once more, then takes it.
         thread.update(AgentThread::retry_message);

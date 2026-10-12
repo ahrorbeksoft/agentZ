@@ -3419,6 +3419,119 @@ async fn threads_stopped_by_a_limit_continue_at_the_reset() {
     assert_eq!(continues_at(&client), None);
 }
 
+/// The agent going on by itself while the thread waits for the reset, as Claude Agent does
+/// once a background task ends, doesn't call the wait off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_waiting_for_the_reset_still_continues_after_the_agent_goes_on_by_itself() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let work = add_an_account_before_start(data_dir.path());
+    let home = account_home(data_dir.path(), work);
+    let Some(server) = TestServer::start_with_description(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let Response::ThreadCreated(thread_id) = client
+        .ok(Request::CreateThread {
+            project_id,
+            agent_id: AgentId::new("mock"),
+            workspace: Default::default(),
+            account: AccountChoice::Account(work),
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    let continues_at = |client: &TestClient| {
+        client
+            .project_thread(thread_id)
+            .and_then(|thread| thread.continues_at)
+    };
+
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("background-task 4"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && !thread.state.background_tasks.is_empty()
+        })
+        .await;
+    // The account runs out while the command runs.
+    std::fs::write(home.join("usage"), "100").expect("use the account up");
+    let resets_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("time")
+        .as_secs()
+        + 8;
+    std::fs::write(home.join("resets_at"), resets_at.to_string()).expect("set the reset");
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            thread.turn_error().is_some()
+                && !thread.is_working()
+                && client
+                    .accounts("mock")
+                    .status(Some(work))
+                    .is_some_and(|read| read.status.windows[0].used_percent == 100.)
+        })
+        .await;
+    client
+        .ok(Request::ContinueAtReset {
+            thread_id,
+            on: true,
+        })
+        .await;
+    client
+        .wait_until(|client| continues_at(client).is_some())
+        .await;
+
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            agent_text(thread).contains("The command finished.") && !thread.is_working()
+        })
+        .await;
+    assert_eq!(
+        continues_at(&client),
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(resets_at))
+    );
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            agent_text(thread).contains("Echo: Continue.") && !thread.is_working()
+        })
+        .await;
+    assert_eq!(
+        client.user_messages(thread_id),
+        ["background-task 4", "hello", "Continue."]
+    );
+}
+
 /// Codex's device-code login asks the client to open a URL (an elicitation) while
 /// `authenticate` waits. The request reaches the app through the server, and so does the
 /// answer.
