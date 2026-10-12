@@ -144,6 +144,88 @@ async fn hands_terminals_to_a_new_server() {
     }
 }
 
+async fn open_terminal(connection: &Connection, folder: &Path) -> TerminalKey {
+    match connection
+        .request(Request::Spaces(SpaceRequest::CreateSpace {
+            folder: folder.to_path_buf(),
+            project_id: None,
+            content: PaneContent::Terminal(PaneTerminal {
+                folder: folder.to_path_buf(),
+                command: None,
+            }),
+        }))
+        .await
+        .expect("creates a space")
+    {
+        Response::SpacePane(location) => TerminalKey::Pane(location.pane),
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
+/// A server started from the shell of an account's agent (one that relaunched the app) doesn't
+/// pass that account's folder on, to its terminals or to the server that takes over, or the
+/// External account's agents run in that account's folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn leaves_out_an_account_folder_it_inherited() {
+    let data_dir = tempfile::Builder::new()
+        .prefix("az")
+        .tempdir_in("/tmp")
+        .expect("temp dir");
+    let socket = data_dir.path().join("server.sock");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_agentz-server"))
+        .arg("start")
+        .env("AGENTZ_DATA_DIR", data_dir.path())
+        .env(
+            "FACTORY_HOME_OVERRIDE",
+            data_dir.path().join("accounts/factory-droid/3"),
+        )
+        .env("AGENTZ_TEST_KEPT", "kept")
+        .status()
+        .expect("start");
+    assert!(status.success());
+    let check = r#"echo "inherited-[$FACTORY_HOME_OVERRIDE]-$AGENTZ_TEST_KEPT""#;
+
+    let connection = connect(&socket).await.expect("connects");
+    let old_pid = connection.welcome().pid;
+    let key = open_terminal(&connection, data_dir.path()).await;
+    type_line(&connection, &key, check);
+    assert_eq!(
+        wait_for_line(&connection, &key, "inherited-").await,
+        "[]-kept"
+    );
+
+    let response = connection
+        .request(Request::HandOff {
+            stop_running_turns: false,
+        })
+        .await
+        .expect("hands off");
+    assert_eq!(response, Response::Ok);
+    let deadline = Instant::now() + TIMEOUT;
+    let connection = loop {
+        if let Ok(connection) = connect(&socket).await
+            && connection.welcome().pid != old_pid
+        {
+            break connection;
+        }
+        assert!(Instant::now() < deadline, "no new server");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let key = open_terminal(&connection, data_dir.path()).await;
+    type_line(&connection, &key, check);
+    assert_eq!(
+        wait_for_line(&connection, &key, "inherited-").await,
+        "[]-kept"
+    );
+
+    drop(connection.request(Request::Shutdown));
+    let deadline = Instant::now() + TIMEOUT;
+    while socket.exists() {
+        assert!(Instant::now() < deadline, "the new server didn't stop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Connects as the app does, with the events (and so the answers) passed on.
 async fn connect_app(
     socket: &Path,
