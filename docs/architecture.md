@@ -652,7 +652,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   out, fuzzy-matched in the app) and the project's other threads. A pick becomes a chip, an
   outlined box with the kind's icon and the name in the code font, which the cursor steps over
   and Backspace removes whole; hovering shows its path. Zed's + button (Add Context) types @
-  narrowed to Files & Directories or Threads, or picks images. Pasting an image, or pasting or
+  narrowed to Files & Directories, Threads or Artifacts, or picks images. Pasting an image, or pasting or
   dropping an image file (one copied in Finder too), makes an Image chip, for agents that take
   images (ACP's prompt capabilities): the image goes to the thread's server at once
   (`Request::AddAttachment`, up to 32 MB), and a message waits for its chips' uploads

@@ -81,6 +81,7 @@ pub(crate) enum MentionKind {
     Any,
     Files,
     Threads,
+    Artifacts,
 }
 
 /// The `@query` the cursor is at the end of.
@@ -237,7 +238,7 @@ pub(crate) fn find_mentions(
                 }),
         );
     }
-    if kind == MentionKind::Any {
+    if matches!(kind, MentionKind::Any | MentionKind::Artifacts) {
         found.extend(
             artifacts
                 .iter()
@@ -255,7 +256,7 @@ pub(crate) fn find_mentions(
         );
     }
     let mut files_found = Vec::new();
-    if kind != MentionKind::Threads
+    if matches!(kind, MentionKind::Any | MentionKind::Files)
         && let Some(files) = files
     {
         let mut scored: Vec<((u8, usize, usize), &agentz_protocol::FileEntry)> = files
@@ -300,7 +301,7 @@ pub(crate) fn find_mentions(
     if projects.is_none() {
         found.append(&mut files_found);
     }
-    if kind != MentionKind::Files {
+    if matches!(kind, MentionKind::Any | MentionKind::Threads) {
         found.extend(
             threads
                 .iter()
@@ -503,6 +504,32 @@ mod tests {
             &artifacts,
         );
         assert_eq!(only_threads.len(), 1);
+        let only_artifacts = find_mentions(
+            "tot",
+            MentionKind::Artifacts,
+            Some(&files),
+            &threads,
+            None,
+            &artifacts,
+        );
+        let labels: Vec<&str> = only_artifacts
+            .iter()
+            .map(|found| found.label.as_ref())
+            .collect();
+        assert_eq!(labels, ["Totals research"]);
+        let only_files = find_mentions(
+            "tot",
+            MentionKind::Files,
+            Some(&files),
+            &threads,
+            None,
+            &artifacts,
+        );
+        assert!(
+            only_files
+                .iter()
+                .all(|found| matches!(found.target, MentionTarget::Path { .. }))
+        );
     }
 
     #[test]

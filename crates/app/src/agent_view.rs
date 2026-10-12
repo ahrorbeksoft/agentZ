@@ -3063,7 +3063,7 @@ impl AgentView {
         self.uploads.insert(chip, upload);
     }
 
-    /// The + button's kinds: types `@`, narrowed to files or threads.
+    /// The + button's kinds: types `@`, narrowed to files, threads or artifacts.
     fn start_mention(&mut self, kind: MentionKind, window: &mut Window, cx: &mut Context<Self>) {
         let composer = self.composer.read(cx);
         let cursor = composer.cursor_offset();
@@ -3111,7 +3111,7 @@ impl AgentView {
     fn render_add_context_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let supports_images = self.thread.read(cx).supports_images();
-        PopoverMenu::new("add-context-menu")
+        let menu = PopoverMenu::new("add-context-menu")
             .trigger_with_tooltip(
                 IconButton::new("add-context", IconName::Plus)
                     .icon_size(IconSize::Small)
@@ -3148,6 +3148,11 @@ impl AgentView {
                         IconName::Thread,
                         MentionKind::Threads,
                     ))
+                    .item(kind_entry(
+                        "Artifacts",
+                        IconName::Layers,
+                        MentionKind::Artifacts,
+                    ))
                     .item(
                         ContextMenuEntry::new("Image")
                             .icon(IconName::Image)
@@ -3161,7 +3166,8 @@ impl AgentView {
                             }),
                     )
                 }))
-            })
+            });
+        div().debug_selector(|| "add-context".into()).child(menu)
     }
 
     /// Zed's menu for its message editor.
@@ -15449,6 +15455,67 @@ mod tests {
                 PromptPart::Text(" ".into()),
             ]
         );
+    }
+
+    #[gpui::test]
+    fn the_plus_menus_artifacts_lists_only_artifacts(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            client.answer_for_test(|request| match request {
+                Request::ListFiles(_) => Some(Response::Files(agentz_protocol::FileListing {
+                    root: "/tmp/demo".into(),
+                    entries: vec![agentz_protocol::FileEntry {
+                        path: "README.md".into(),
+                        is_dir: false,
+                    }],
+                })),
+                _ => None,
+            });
+            client.set_artifacts_for_test(
+                agentz_protocol::artifacts::Artifacts {
+                    artifacts: vec![Artifact {
+                        id: ArtifactId("notes".into()),
+                        title: "Plan notes".into(),
+                        kind: ArtifactKind::Document,
+                        versions: vec![agentz_protocol::artifacts::ArtifactVersion {
+                            published_at: 0,
+                            bytes: 1,
+                            files: Vec::new(),
+                        }],
+                        thread_id: Some(ThreadId(2)),
+                        project_id: Some(ProjectId(1)),
+                        agent_id: None,
+                        preview: String::new(),
+                        design: None,
+                        frame_key: "key".into(),
+                    }],
+                    pages: None,
+                },
+                cx,
+            )
+        });
+        let labels = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.mention_matches
+                    .iter()
+                    .map(|found| found.label.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("@");
+        cx.run_until_parked();
+        assert_eq!(labels(cx), ["Plan notes", "README.md", "New thread"]);
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+
+        click_on("add-context", cx);
+        click_on("MENU_ITEM-Artifacts", cx);
+        let text = view.read_with(cx, |view, cx| view.composer.read(cx).text().to_string());
+        assert_eq!(text, "@");
+        assert_eq!(labels(cx), ["Plan notes"]);
     }
 
     /// A long thread draws only the rows in view, at its end, and follows new output.
