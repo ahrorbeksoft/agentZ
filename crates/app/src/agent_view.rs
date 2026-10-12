@@ -12543,7 +12543,12 @@ fn render_plan_entries(plan: &[PlanItem], window: &mut Window, cx: &mut App) -> 
             } else {
                 icon.into_any_element()
             };
+            // An item longer than the row ends in an ellipsis, as the summary's does, and shows
+            // in full in its tooltip, as Zed's does.
+            let content: SharedString = item.content.clone().into();
             h_flex()
+                .id(("plan-entry", index))
+                .debug_selector(move || format!("plan-entry-{index}"))
                 .py_1()
                 .px_2()
                 .gap_2()
@@ -12553,13 +12558,27 @@ fn render_plan_entries(plan: &[PlanItem], window: &mut Window, cx: &mut App) -> 
                 })
                 .child(
                     h_flex()
+                        .w_full()
                         .gap_1p5()
                         .min_w_0()
                         .text_xs()
                         .text_color(colors.text_muted)
                         .child(icon)
-                        .child(item.content.clone()),
+                        .child(
+                            div()
+                                .debug_selector(move || format!("plan-entry-text-{index}"))
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(content.clone()),
+                        ),
                 )
+                .tooltip(Tooltip::element(move |_, _| {
+                    div()
+                        .debug_selector(move || format!("plan-entry-tooltip-{index}"))
+                        .child(content.clone())
+                        .into_any_element()
+                }))
         }));
     with_scrollbar(
         entries,
@@ -19271,6 +19290,57 @@ mod tests {
         click("tool-call-row-1", cx);
         assert!(cx.debug_bounds("tool-call-plan-1").is_some());
         assert!(cx.debug_bounds("tool-call-input-1").is_none());
+    }
+
+    /// A plan item too long for its row stays on one line, cut short inside the row, and its
+    /// tooltip shows all of it.
+    #[gpui::test]
+    fn a_long_plan_item_shows_in_full_in_its_tooltip(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let long = "Stage 3b: server: ForkThread (a new thread in the same folder with the \
+            source's transcript up to the reply and a handoff) and MergeBack (a pending \
+            handoff on the source with what the fork did)"
+            .repeat(3);
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Plan it".into())], cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.plan = vec![
+                        PlanItem {
+                            content: long.clone(),
+                            status: acp::PlanEntryStatus::InProgress,
+                        },
+                        PlanItem {
+                            content: "Stage 4".into(),
+                            status: acp::PlanEntryStatus::Pending,
+                        },
+                    ]
+                },
+                cx,
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.plan_expanded = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let row = cx
+            .debug_bounds("plan-entry-0")
+            .expect("the long item's row");
+        let text = cx.debug_bounds("plan-entry-text-0").expect("the long item");
+        let short = cx
+            .debug_bounds("plan-entry-text-1")
+            .expect("the short item");
+        assert!(text.right() <= row.right());
+        assert_eq!(text.size.height, short.size.height);
+        assert!(cx.debug_bounds("plan-entry-tooltip-0").is_none());
+
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("plan-entry-tooltip-0").is_some());
     }
 
     /// Claude Agent's two questions, as it asks them for JetBrains AIR.

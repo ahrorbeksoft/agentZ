@@ -755,7 +755,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   "Found 3 files for **/*.test.ts" opens to the paths. A command opens to Zed's terminal
   card: the folder it ran in, how long it took, its exit code if it failed, Stop while it
   runs in agentZ's terminal, Copy, and a dashed red border when it failed. To-do and task
-  updates have no row (`is_hidden`): the plan bar shows the list. "Fetched
+  updates have no row (`is_hidden`): the plan bar shows the list, an item too long for its
+  row cut short with an ellipsis and shown in full in its tooltip, as Zed's. "Fetched
   vitest.dev/api/expect" is a link that opens the browser, and opens to the agent's notes as
   markdown beside a line; "Searched the web for “…”" opens to its results as links. A plan
   to approve shows open, as markdown in a "Plan" card over the agent's choices; once
