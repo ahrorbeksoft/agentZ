@@ -104,8 +104,9 @@ so an open tool call's output raced the conversation.
 
 ### Releases and installing
 
-- **Releases** (`.github/workflows/release.yml`): a `v<version>` tag matching
-  `crates/app/Cargo.toml` builds the Linux servers, then the universal app with them in its
+- **Releases** (`.github/workflows/release.yml`): a `v<version>` tag matching the workspace's
+  version in `Cargo.toml` (one for the app and `agentz-server`, which the Machines settings
+  show side by side) builds the Linux servers, then the universal app with them in its
   resources and the x86_64 Linux app (`tooling/bundle-linux.sh`, on Ubuntu 22.04 for an older
   glibc), and publishes a GitHub release with `agentZ-macos.zip`, `agentZ-linux-x86_64.tar.gz`
   and `SHA256SUMS`. There's no update server: the apps carry every machine's server, so remote

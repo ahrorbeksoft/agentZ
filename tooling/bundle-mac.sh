@@ -38,7 +38,7 @@ else
     cargo build -p app -p agentz_server --bin agentz --bin agentz-server
 fi
 
-version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/app/Cargo.toml | head -n 1)
+version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
 app=target/bundle/agentZ.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"

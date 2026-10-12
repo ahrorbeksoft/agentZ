@@ -1,5 +1,5 @@
 # Publishes a release when a version tag is pushed: `git tag v0.1.0 && git push origin v0.1.0`.
-# The tag must match the version in crates/app/Cargo.toml. The release has the universal macOS
+# The tag must match the workspace's version in Cargo.toml. The release has the universal macOS
 # app and the x86_64 Linux app, each carrying the Linux servers for machines it reaches over SSH,
 # and SHA256SUMS, which site/install.sh checks them against.
 name: Release
@@ -23,9 +23,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check the tag matches the version
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/app/Cargo.toml | head -n 1)
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::$GITHUB_REF_NAME doesn't match version $version in crates/app/Cargo.toml"
+            echo "::error::$GITHUB_REF_NAME doesn't match version $version in Cargo.toml"
             exit 1
           fi
       - name: Install Rust

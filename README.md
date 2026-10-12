@@ -187,7 +187,8 @@ to run and test it.
 
 ## Releases
 
-Pushing a tag that matches the version in `crates/app/Cargo.toml` publishes a release:
+Pushing a tag that matches the version in `Cargo.toml` (`[workspace.package]`, the app's and the
+server's) publishes a release:
 
 ```sh
 git tag v0.1.0
