@@ -705,9 +705,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   23:30") and Copy on hover. The bubble is the thread's background a tenth of the way toward its
   text (`user_message_background`), so it shows in every theme: most themes give
   `element_background` the panel's own color. While a turn runs the footer says "Working for
-  12s"; under a finished answer, "Worked for 8.0s" (t3code's durations) and Copy. Both come from the server
-  (`ThreadState::sent_times` by entry, `finished_turns` by each turn's end entry), so they
-  survive reopening the thread; messages and turns an agent replays from history have none.
+  12s". Under each finished reply (the last agent message of its turn) is a clock with how
+  long the turn took (t3code's durations), then a generic agent icon whose tooltip lists the
+  turn's Agent, Account, Model and Effort in rows (`render_reply_footer`, picked in
+  `design/agent-switching/`, 4 C), then Copy, which shows on hover except under the latest
+  reply. Both times come from the server (`ThreadState::sent_times` by entry, `finished_turns`
+  by each turn's entries, with who answered it), so they survive reopening the thread;
+  messages and turns an agent replays from history have none, and turns from before agents
+  were recorded have no Agent or Account.
 - **Tool call rows** (`tool_calls.rs`, `agent_view.rs`; picked in `design/tool-calls/`): a read
   or an edit of one file gets its file type's icon from the icon theme (Zed's edit cards),
   other kinds t3code's (an eye, a pen on a square, a terminal, a globe). agentZ's own tools

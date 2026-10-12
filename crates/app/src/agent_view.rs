@@ -26,7 +26,7 @@ use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
     ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, HandoffSource, LostHistory,
     ModeSwitch, PermissionOption, PlanItem, SessionRestore, ThreadAgent, ToolAnswer, ToolCall,
-    without_handoff,
+    TurnTime, without_handoff,
 };
 use agentz_protocol::workspace::{
     PastureSupport, ProjectGit, SetupStepKind, SetupStepState, WorkspaceChoice, WorkspaceSetup,
@@ -5304,12 +5304,14 @@ impl AgentView {
             }
             Entry::AgentMessage(text) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-                let show_controls = !self.thread.read(cx).is_working()
+                let is_latest_reply = !self.thread.read(cx).is_working()
                     && self.thread.read(cx).entries()[index + 1..]
                         .iter()
                         .all(|entry| {
                             !matches!(entry, Entry::AgentMessage(_) | Entry::UserMessage(_))
                         });
+                let has_footer = is_latest_reply || self.ends_finished_turn(index, cx);
+                let group = SharedString::from(format!("agent-message-{index}"));
                 let pieces = message_pieces(text);
                 let has_images = pieces.len() > 1;
                 let images: Vec<AttachmentId> = pieces
@@ -5342,19 +5344,20 @@ impl AgentView {
                     }
                 }
                 v_flex()
+                    .group(group.clone())
                     .w_full()
                     .child(
                         v_flex()
                             .px_5()
                             .py_1p5()
                             .when(has_images, |this| this.gap_2())
-                            .when(is_last && !show_controls, |this| this.pb_4())
+                            .when(is_last && !has_footer, |this| this.pb_4())
                             .w_full()
                             .text_ui(cx)
                             .children(content),
                     )
-                    .when(show_controls, |this| {
-                        this.child(self.render_thread_controls(index, cx))
+                    .when(has_footer, |this| {
+                        this.child(self.render_reply_footer(index, is_latest_reply, group, cx))
                     })
                     .into_any_element()
             }
@@ -5628,33 +5631,139 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// Zed's controls under a finished reply: copy it, jump to the prompt, jump to the top.
-    fn render_thread_controls(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let turn_time = self.thread.read(cx).turn_time(index);
+    /// Whether the agent's message at `index` is the last of a finished turn: its reply, which
+    /// has a footer.
+    fn ends_finished_turn(&self, index: usize, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let end = match thread.turn_record(index) {
+            Some(turn) => turn.entries_end.min(entries.len()),
+            // Turns from before they were recorded end at the next message.
+            None => match entries[index + 1..]
+                .iter()
+                .position(|entry| matches!(entry, Entry::UserMessage(_)))
+            {
+                Some(offset) => index + 1 + offset,
+                None if thread.is_working() => return false,
+                None => entries.len(),
+            },
+        };
+        !entries[index + 1..end]
+            .iter()
+            .any(|entry| matches!(entry, Entry::AgentMessage(_)))
+    }
+
+    /// Under each finished reply: how long its turn took, who answered it (on hover), and
+    /// Copy, which shows on hover except under the latest reply.
+    fn render_reply_footer(
+        &self,
+        index: usize,
+        is_latest_reply: bool,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let turn = self.thread.read(cx).turn_record(index).cloned();
         h_flex()
+            .debug_selector(move || format!("reply-footer-{index}"))
             .w_full()
             .px_5()
             .pb_3()
             .gap_2()
-            .children(turn_time.map(|duration| {
-                Label::new(format!("Worked for {}", format_duration(duration)))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
+            .children(turn.as_ref().map(|turn| {
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Clock)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format_duration(turn.duration))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
             }))
+            .children(
+                turn.as_ref()
+                    .and_then(|turn| self.render_answered_by(index, turn, cx)),
+            )
             .child(
-                IconButton::new(("copy-agent-response", index), IconName::Copy)
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Copy This Agent Response"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(Entry::AgentMessage(text)) =
-                            this.thread.read(cx).entries().get(index)
-                        {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
-                        }
-                    })),
+                h_flex()
+                    .gap_2()
+                    .when(!is_latest_reply, |actions| actions.visible_on_hover(group))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("copy-reply-{index}"))
+                            .child(
+                                IconButton::new(("copy-agent-response", index), IconName::Copy)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Copy This Agent Response"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(Entry::AgentMessage(text)) =
+                                            this.thread.read(cx).entries().get(index)
+                                        {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                text.clone(),
+                                            ));
+                                        }
+                                    })),
+                            ),
+                    ),
             )
             .into_any_element()
+    }
+
+    /// The reply's agent icon, which names on hover who answered the turn: the agent, its
+    /// account, the model and the effort.
+    fn render_answered_by(&self, index: usize, turn: &TurnTime, cx: &App) -> Option<AnyElement> {
+        let mut rows: Vec<(&'static str, SharedString)> = Vec::new();
+        if let Some(agent) = &turn.agent {
+            rows.push(("Agent", agent.name.clone().into()));
+            let accounts = self
+                .client
+                .read(cx)
+                .accounts(&AgentId::new(agent.agent_id.clone()));
+            rows.push(("Account", account_entry(&accounts, agent.account).name));
+        }
+        if let Some(model) = &turn.model {
+            rows.push(("Model", model.clone().into()));
+        }
+        if let Some(effort) = &turn.effort {
+            rows.push(("Effort", effort.clone().into()));
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id(("answered-by", index))
+                .debug_selector(move || format!("answered-by-{index}"))
+                .child(
+                    Icon::new(IconName::Sparkle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::element(move |_, _| {
+                    v_flex()
+                        .gap_0p5()
+                        .children(rows.iter().map(|(label, value)| {
+                            h_flex()
+                                .debug_selector(|| format!("answered-by-{}", label.to_lowercase()))
+                                .gap_4()
+                                .child(
+                                    div().w_16().child(
+                                        Label::new(*label)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                                .child(Label::new(value.clone()).size(LabelSize::Small))
+                        }))
+                        .into_any_element()
+                }))
+                .into_any_element(),
+        )
     }
 
     /// A thought, as a row among the tool calls (t3code's reasoning row): "Thinking" with a
@@ -15515,6 +15624,91 @@ mod tests {
         cx.run_until_parked();
         click("thread-account", cx);
         assert!(cx.debug_bounds("thread-account-1").is_none());
+    }
+
+    /// Each finished reply has its turn's time and an agent icon that names, on hover, who
+    /// answered it. Copy shows under the latest reply, and under earlier ones on hover.
+    #[gpui::test]
+    fn finished_replies_say_how_long_and_who(cx: &mut TestAppContext) {
+        use agentz_protocol::thread::TurnOutcome;
+
+        let (view, cx) = open(2, false, cx);
+        let mut accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            ..AgentAccounts::default()
+        };
+        let work = accounts.add();
+        if let Some(account) = accounts.account_mut(work) {
+            account.choices.label = Some("Work".into());
+        }
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(AgentId::new("mock"), accounts)].into(), cx)
+        });
+        let turn = |entries: std::ops::Range<usize>, agent: Option<ThreadAgent>| TurnTime {
+            entries_start: entries.start,
+            entries_end: entries.end,
+            duration: Duration::from_secs(75),
+            agent,
+            model: Some("Mock Large".into()),
+            effort: None,
+            outcome: TurnOutcome::Completed,
+        };
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Fix the login".into()),
+                    Entry::AgentMessage("Looking.".into()),
+                    Entry::AgentMessage("Fixed it.".into()),
+                    Entry::UserMessage("Add a test".into()),
+                    Entry::AgentMessage("Added one.".into()),
+                ],
+                cx,
+            );
+            thread.update_state_for_test(
+                |state| {
+                    state.finished_turns = vec![
+                        turn(
+                            0..3,
+                            Some(ThreadAgent {
+                                agent_id: "mock".into(),
+                                name: "Mock".into(),
+                                account: Some(work),
+                            }),
+                        ),
+                        // From before turns recorded who answered them.
+                        turn(3..5, None),
+                    ]
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("reply-footer-1").is_none());
+        assert!(cx.debug_bounds("reply-footer-2").is_some());
+        assert!(cx.debug_bounds("reply-footer-4").is_some());
+        assert!(cx.debug_bounds("answered-by-4").is_some());
+        assert!(cx.debug_bounds("copy-reply-4").is_some());
+        assert!(cx.debug_bounds("copy-reply-2").is_none());
+
+        let footer = cx
+            .debug_bounds("reply-footer-2")
+            .expect("the earlier reply has a footer");
+        cx.simulate_mouse_move(footer.center(), None, gpui::Modifiers::none());
+        assert!(cx.debug_bounds("copy-reply-2").is_some());
+
+        let icon = cx
+            .debug_bounds("answered-by-2")
+            .expect("the reply names who answered it");
+        cx.simulate_mouse_move(icon.center(), None, gpui::Modifiers::none());
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("answered-by-agent").is_some());
+        assert!(cx.debug_bounds("answered-by-account").is_some());
+        assert!(cx.debug_bounds("answered-by-model").is_some());
+        assert!(cx.debug_bounds("answered-by-effort").is_none());
     }
 
     #[test]
