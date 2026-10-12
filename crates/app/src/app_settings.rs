@@ -159,7 +159,8 @@ pub struct AppSettings {
     pub background_picture: Option<String>,
     /// The picture shows blurred, as color and light rather than detail.
     pub soften_background_picture: bool,
-    /// How much of the theme's color covers the picture, from 0 (none) to 1 (all of it).
+    /// How much of the theme's color covers the picture, from 1 (all of it) down to
+    /// `1 - window_background::MAX_SHOWS_THROUGH`.
     pub background_picture_opacity: f32,
     pub machines: Vec<MachineProfile>,
     pub scope: Scope,

@@ -29,6 +29,9 @@ use crate::window_decorations::RoundedTopCorners as _;
 /// How much of the theme's color covers the picture until the user moves the slider: a hint of
 /// the picture, mostly the theme (the board's "A little").
 pub const DEFAULT_OPACITY: f32 = 0.88;
+/// The most of the picture the slider lets show through. Past about 30%, text over the picture
+/// gets hard to read, and people keep it at 10–20%.
+pub const MAX_SHOWS_THROUGH: f32 = 0.3;
 
 /// The copy's longest side: a full-screen window on a 4K display. Larger pictures only cost
 /// memory, since the window draws the copy whole.
@@ -230,7 +233,9 @@ pub fn apply(theme: Arc<Theme>, settings: &AppSettings, cx: &mut App) -> (Arc<Th
     let (theme, shown) = match picture {
         None => (theme, None),
         Some(path) => {
-            let opacity = settings.background_picture_opacity.clamp(0., 1.);
+            let opacity = settings
+                .background_picture_opacity
+                .clamp(1. - MAX_SHOWS_THROUGH, 1.);
             let see_through = match &state.see_through {
                 Some(cached)
                     if Arc::ptr_eq(&cached.source, &theme) && cached.opacity == opacity =>
@@ -276,6 +281,18 @@ pub fn solid_backdrop(cx: &App) -> Hsla {
     cx.try_global::<WindowPicture>()
         .and_then(|state| state.shown.as_ref())
         .map_or(gpui::transparent_black(), |picture| picture.solid)
+}
+
+/// A solid color mixed from the theme's (over [`solid_backdrop`]), made see-through as the
+/// theme's own surfaces are while a picture shows.
+pub fn see_through_color(color: Hsla, cx: &App) -> Hsla {
+    match cx
+        .try_global::<WindowPicture>()
+        .and_then(|state| state.shown.as_ref())
+    {
+        Some(picture) => overlay(color, picture.solid.to_rgb()),
+        None => color,
+    }
 }
 
 /// The picture filling the window, under the theme's color, for the shell to put first.

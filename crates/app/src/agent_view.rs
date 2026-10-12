@@ -3951,12 +3951,14 @@ impl AgentView {
         cx.theme().colors().border.opacity(0.8)
     }
 
-    /// Solid even over a picture, as "N left" covers the end of the row.
     fn activity_bar_bg(cx: &App) -> Hsla {
         let colors = cx.theme().colors();
-        window_background::solid_backdrop(cx)
-            .blend(colors.editor_background)
-            .blend(colors.element_selected.opacity(0.3))
+        window_background::see_through_color(
+            window_background::solid_backdrop(cx)
+                .blend(colors.editor_background)
+                .blend(colors.element_selected.opacity(0.3)),
+            cx,
+        )
     }
 
     /// t3code's breadcrumb: the project, where a click starts a new thread, then the title,
@@ -8705,46 +8707,38 @@ impl AgentView {
             .iter()
             .find(|item| item.status == acp::PlanEntryStatus::InProgress)
             .cloned();
-        let activity_bg = Self::activity_bar_bg(cx);
         let plan_expanded = self.plan_expanded;
 
+        // Zed fades the item out under "N left" with a cover in the bar's color, which over a
+        // picture would have to be solid, so the item is cut short with an ellipsis instead.
         let title = match in_progress.filter(|_| !plan_expanded) {
             Some(item) => h_flex()
-                .relative()
                 .w_full()
                 .gap_1()
                 .overflow_hidden()
                 .child(
-                    Label::new("Current:")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div().flex_none().child(
+                        Label::new("Current:")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .text_xs()
                         .text_color(colors.text_muted)
-                        .whitespace_nowrap()
+                        .truncate()
                         .child(item.content),
                 )
                 .when(pending > 0, |this| {
                     this.child(
-                        h_flex()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .h_full()
-                            .child(div().min_w_8().h_full().bg(gpui::linear_gradient(
-                                90.,
-                                gpui::linear_color_stop(activity_bg, 1.),
-                                gpui::linear_color_stop(activity_bg.opacity(0.2), 0.),
-                            )))
-                            .child(
-                                div().pr_0p5().bg(activity_bg).child(
-                                    Label::new(format!("{pending} left"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
-                            ),
+                        div().flex_none().pr_0p5().child(
+                            Label::new(format!("{pending} left"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                     )
                 }),
             None => h_flex()

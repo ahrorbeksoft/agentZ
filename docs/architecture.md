@@ -546,7 +546,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **A picture behind the window** (`window_background.rs`, `design/appearance`; as Warp's and
   iTerm2's background images, neither Zed nor t3code has one): Settings › Appearance › Window
   picks Solid or Picture, the picture (Choose…), Soften picture and how much shows through (a
-  slider, 12% at first). Choose… copies the picture into `backgrounds/`, turned as its camera
+  slider from none to 30%, `MAX_SHOWS_THROUGH`, since more makes text hard to read; 12% at
+  first). Choose… copies the picture into `backgrounds/`, turned as its camera
   says, scaled down to 3840 pixels and once more small and blurred for Soften picture (GPUI
   can't blur as it draws); HEIC, which `image` can't read, goes through macOS's `sips`. The
   window stays opaque: the shell draws the picture under everything, then the editor's color at
@@ -555,8 +556,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   opaque color that shows as it over the editor's. So a card in the editor's color adds
   nothing however deeply it's nested, and the sidebar, a selected row or a code block keep
   their shades; menus and popovers, over the content rather than the background, are their own
-  color at the user's opacity. Covers that hide text under them (the sidebar's hover buttons,
-  the plan's "N left") paint over `solid_backdrop`, the editor's color made solid again.
+  color at the user's opacity. Covers that hide text under them (the sidebar's hover buttons)
+  paint over `solid_backdrop`, the editor's color made solid again. A color the app mixes from
+  the theme's, as the thread's activity bar (plan, queue) does, goes through
+  `see_through_color` to show through as the theme's own surfaces do; so the plan's current
+  item is cut short with an ellipsis before "N left" rather than faded under a cover as Zed's.
 
 ### Agent threads
 

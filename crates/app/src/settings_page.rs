@@ -2164,15 +2164,17 @@ impl SettingsPage {
                             .child(
                                 Slider::new(
                                     "background-picture-opacity",
-                                    1. - settings.background_picture_opacity,
+                                    (1. - settings.background_picture_opacity)
+                                        / window_background::MAX_SHOWS_THROUGH,
                                 )
                                 .on_release(
-                                    move |shows_through, _, cx| {
+                                    move |position, _, cx| {
                                         app_settings.update(cx, |store, cx| {
                                             store.update(
                                                 |settings| {
-                                                    settings.background_picture_opacity =
-                                                        1. - shows_through
+                                                    settings.background_picture_opacity = 1.
+                                                        - position
+                                                            * window_background::MAX_SHOWS_THROUGH
                                                 },
                                                 cx,
                                             )
@@ -2182,9 +2184,12 @@ impl SettingsPage {
                             ),
                     )
                     .child(
-                        Label::new("Clear")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(format!(
+                            "{:.0}%",
+                            window_background::MAX_SHOWS_THROUGH * 100.
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
                     .into_any_element(),
                 cx,
