@@ -1,7 +1,6 @@
 //! The conversations waiting to go with a thread's next message
 //! ([`ThreadState::pending_handoffs`]): what its new agent or account hasn't seen, the
-//! conversation a fork starts with, another thread's ("Continue with another agent"), and forks
-//! merged back. They're kept in `handoffs/<thread id>.json` until the agent takes a message with
+//! conversation a fork starts with or a new session couldn't load, and forks merged back. They're kept in `handoffs/<thread id>.json` until the agent takes a message with
 //! them, so a restart of the server doesn't lose one.
 //!
 //! [`ThreadState::pending_handoffs`]: agentz_protocol::thread::ThreadState::pending_handoffs

@@ -652,8 +652,8 @@ pub struct ThreadState {
     pub modes: Option<acp::SessionModeState>,
     pub session_restore: Option<SessionRestore>,
     /// The previous session couldn't be restored, so the agent doesn't know the conversation.
-    /// Messages fail ([`FailedMessage::LostHistory`]) rather than go to it, until the user sends
-    /// one anyway ([`crate::Request::RetryMessage`]).
+    /// Messages fail ([`FailedMessage::LostHistory`]) rather than go to it, until the user
+    /// resends one with the conversation ([`crate::Request::RetryMessage`]).
     pub lost_history: Option<LostHistory>,
     pub permission_requests: Vec<PermissionRequest>,
     pub capabilities: acp::AgentCapabilities,
@@ -676,8 +676,8 @@ pub struct ThreadState {
     pub auth_code: Option<SharedString>,
     /// The conversations to go with the next message, in the order they go, while they wait for
     /// one: what the thread's new agent or account hasn't seen ([`HandoffSource::Agent`]), the
-    /// conversation a fork starts with, another thread's ("Continue with another agent"), and
-    /// forks merged back. Each stays until the agent takes a message with it.
+    /// conversation a fork starts with or a new session couldn't load, and forks merged back.
+    /// Each stays until the agent takes a message with it.
     #[serde(default)]
     pub pending_handoffs: Vec<PendingHandoff>,
     /// Where handoffs went with messages, in order: the conversation shows each one there.
@@ -971,9 +971,9 @@ impl ThreadView {
     }
 
     /// Whether messages waiting to go (queued ones, finished tasks') wait for the user: a
-    /// message failed for the lost conversation, and Send Anyway is theirs to press. Until one
-    /// has failed, the next goes, and fails to be that message.
-    pub fn waits_for_send_anyway(&self) -> bool {
+    /// message failed for the lost conversation, and Resend with Context is theirs to press.
+    /// Until one has failed, the next goes, and fails to be that message.
+    pub fn waits_for_resend(&self) -> bool {
         self.state.lost_history.is_some() && self.state.failed_message.is_some()
     }
 
@@ -1241,7 +1241,8 @@ pub fn gateway_meta(base_url: &str, headers: &[(String, String)]) -> acp::Meta {
     )])
 }
 
-/// Opens the context a handoff brings with a message: [`switch_handoff`], [`handoff`].
+/// Opens the context a handoff brings with a message: [`switch_handoff`], [`fork_handoff`],
+/// [`merge_handoff`], [`session_handoff`].
 pub const HANDOFF_OPENING: &str = "<agentz-handoff";
 const HANDOFF_CLOSING: &str = "</agentz-handoff>";
 /// How much of a conversation a handoff brings, in bytes: a long thread's gist without
@@ -1271,13 +1272,9 @@ pub enum HandoffSource {
         to: ThreadAgent,
         since: usize,
     },
-    /// Another thread's conversation, which this one continues ("Continue with another
-    /// agent").
-    Thread {
-        id: projects::ThreadId,
-        title: String,
-        agent: String,
-    },
+    /// The conversation so far, for the session the agent opened when it couldn't load the
+    /// thread's ([`ThreadState::lost_history`]): Resend with Context ([`session_handoff`]).
+    NewSession,
     /// The conversation this fork of `source` starts with, copied from there
     /// ([`fork_handoff`]).
     Fork { source: projects::ThreadId },
@@ -1290,13 +1287,15 @@ pub enum HandoffSource {
 
 impl HandoffSource {
     /// Whether a handoff from here takes the place of one from `other` that still waits: the
-    /// thread hands over only its latest switch, and a fork's latest merge.
+    /// thread hands over only its latest switch, and a fork's latest merge. One that tells the
+    /// whole conversation tells a switch's part of it too.
     pub fn replaces(&self, other: &HandoffSource) -> bool {
         match (self, other) {
             (HandoffSource::Merge { fork, .. }, HandoffSource::Merge { fork: other, .. }) => {
                 fork == other
             }
             (HandoffSource::Merge { .. }, _) | (_, HandoffSource::Merge { .. }) => false,
+            (_, HandoffSource::Agent { .. }) if self.tells_everything() => true,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
@@ -1304,10 +1303,7 @@ impl HandoffSource {
     /// Whether it tells the whole conversation, which a thread's new agent then needs no
     /// switch handoff for.
     pub fn tells_everything(&self) -> bool {
-        matches!(
-            self,
-            HandoffSource::Thread { .. } | HandoffSource::Fork { .. }
-        )
+        matches!(self, HandoffSource::Fork { .. } | HandoffSource::NewSession)
     }
 }
 
@@ -1320,17 +1316,6 @@ pub struct PendingHandoff {
     pub messages: usize,
     /// Tells it from other handoffs, for its mark ([`HandoffMark`]).
     pub made_at: SystemTime,
-}
-
-impl PendingHandoff {
-    /// The thread whose conversation it brings, its title and agent, for one from another
-    /// thread.
-    pub fn from_thread(&self) -> Option<(projects::ThreadId, &str, &str)> {
-        match &self.source {
-            HandoffSource::Thread { id, title, agent } => Some((*id, title, agent)),
-            _ => None,
-        }
-    }
 }
 
 /// Where a handoff went with a message ([`ThreadState::handoffs`]).
@@ -1399,35 +1384,35 @@ pub fn switch_handoff(
     })
 }
 
-/// A thread's conversation for another agent to continue in a thread of its own: the user's
-/// messages, the agents' replies with the tools they used, and the plan.
-pub fn handoff(
+/// The conversation so far, for the session an agent opened in place of the thread's, which it
+/// couldn't load: the user resends their message with it (Resend with Context). `None` when
+/// there's nothing to tell yet.
+pub fn session_handoff(
     view: &ThreadView,
-    from: projects::ThreadId,
-    agent_name: &str,
+    thread: projects::ThreadId,
     title: &str,
-) -> PendingHandoff {
+    agent_name: &str,
+) -> Option<PendingHandoff> {
     let messages = handoff_messages(view, 0, agent_name);
+    if messages.is_empty() {
+        return None;
+    }
     let (body, told) = handoff_body(view, &messages, title);
-    let id = from.0;
+    let id = thread.0;
     let text = format!(
         "{HANDOFF_OPENING} thread=\"{id}\" from=\"{agent}\">\n\
-         The user is continuing, with you, a conversation they had with {agent_name} in agentZ \
-         thread {id}, “{title}”, in this same folder. This is what happened there, oldest first \
-         ({told}). {}\n\n{body}\n{HANDOFF_CLOSING}",
-        handoff_guidance(from),
+         Context handoff: the earlier session of agentZ thread {id}, “{title}”, couldn't be \
+         loaded, so this one starts without it. This is the thread's conversation so far, oldest \
+         first ({told}). {}\n\n{body}\n{HANDOFF_CLOSING}",
+        handoff_guidance(thread),
         agent = attribute(agent_name),
     );
-    PendingHandoff {
-        source: HandoffSource::Thread {
-            id: from,
-            title: title.to_string(),
-            agent: agent_name.to_string(),
-        },
+    Some(PendingHandoff {
+        source: HandoffSource::NewSession,
         text,
         messages: messages.len(),
         made_at: SystemTime::now(),
-    }
+    })
 }
 
 /// The conversation a fork starts with: its entries, copied from `source` up to where it was
@@ -1929,12 +1914,13 @@ mod tests {
                 status: acp::PlanEntryStatus::Pending,
             },
         ];
-        let handoff = handoff(
+        let handoff = session_handoff(
             &view,
             projects::ThreadId(1),
-            "Claude \"Agent\"",
             "Checkout page",
-        );
+            "Claude \"Agent\"",
+        )
+        .expect("a conversation to tell");
         assert_eq!(handoff.messages, 2);
         assert!(
             handoff
@@ -1977,7 +1963,8 @@ mod tests {
         // Too long to go at all, it's left out whole rather than cut.
         view.entries
             .push(Entry::AgentMessage(format!("Huge {}", "z".repeat(70_000))));
-        let handoff = handoff(&view, projects::ThreadId(1), "Codex", "Long");
+        let handoff =
+            session_handoff(&view, projects::ThreadId(1), "Long", "Codex").expect("a conversation");
         assert_eq!(handoff.messages, 81);
         assert!(
             handoff

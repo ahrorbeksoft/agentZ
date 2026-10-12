@@ -45,7 +45,7 @@ use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, McpServer};
 use agentz_protocol::skills::Skill;
 use agentz_protocol::storage::Storage;
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
-use agentz_protocol::thread::{HandoffSource, ThreadAgent};
+use agentz_protocol::thread::ThreadAgent;
 use agentz_protocol::title_generation::TitleGenerationState;
 use agentz_protocol::{
     AgentSettingsChange, ConnectionId, ErrorResponse, Event, MachineIcon, MachineInfo, Request,
@@ -1020,13 +1020,6 @@ impl Server {
                 self.sweep_drafts();
                 Ok(Response::Ok)
             }
-            Request::ContinueThread {
-                thread_id,
-                agent_id,
-                account,
-            } => Ok(Response::ThreadCreated(
-                self.continue_thread(thread_id, agent_id, account)?,
-            )),
             Request::PlanWorkspace { thread_id, plan } => self.plan_workspace(thread_id, plan),
             Request::RetryWorkspaceSetup(thread_id) => self.retry_workspace_setup(thread_id),
             Request::UseLocal(thread_id) => self.use_local(thread_id),
@@ -1167,7 +1160,7 @@ impl Server {
                 Ok(Response::Ok)
             }
             Request::RetryMessage(connection) => {
-                self.update_thread(connection, AgentThread::retry_message)?;
+                self.retry_message(connection)?;
                 Ok(Response::Ok)
             }
             Request::Reload(connection) => {
@@ -2224,7 +2217,7 @@ impl Server {
             .any(|event| {
                 matches!(
                     event,
-                    AgentThreadEvent::HandoffSent(_) | AgentThreadEvent::HandoffDropped
+                    AgentThreadEvent::HandoffSent | AgentThreadEvent::HandoffDropped
                 )
             })
             .then(|| thread.state.pending_handoffs.clone());
@@ -2324,13 +2317,10 @@ impl Server {
                     }
                 }
                 (ConnectionId::Thread(_), AgentThreadEvent::Paused) => paused = true,
-                (ConnectionId::Thread(thread_id), AgentThreadEvent::HandoffSent(source)) => {
-                    // Sent, the thread is the continuation of the other.
-                    if let HandoffSource::Thread { id, .. } = source {
-                        self.projects.set_continued_from(thread_id, id);
-                    }
-                }
-                (ConnectionId::Thread(_), AgentThreadEvent::HandoffDropped) => {}
+                (
+                    ConnectionId::Thread(_),
+                    AgentThreadEvent::HandoffSent | AgentThreadEvent::HandoffDropped,
+                ) => {}
                 (
                     ConnectionId::Thread(_),
                     event @ (AgentThreadEvent::SubagentStarted(_)

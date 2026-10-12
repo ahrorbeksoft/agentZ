@@ -92,9 +92,9 @@ pub enum AgentThreadEvent {
     ConfigOptionChanged(acp::SessionConfigId, acp::SessionConfigOptionValue),
     /// The user changed the session's mode; Zed keeps it as the agent's default.
     ModeChanged(acp::SessionModeId),
-    /// The agent took a message with a handoff that went with it
+    /// The agent took a message with handoffs that went with it
     /// ([`ThreadState::pending_handoffs`]).
-    HandoffSent(HandoffSource),
+    HandoffSent,
     /// The user went on without a conversation the next message would have brought.
     HandoffDropped,
     /// Logging in with the named method succeeded.
@@ -1191,8 +1191,8 @@ impl AgentThread {
                         self.view.state.last_stop_reason = Some(response.stop_reason);
                         self.last_message = None;
                         // A stopped turn took the message too.
-                        for handoff in std::mem::take(&mut self.handoff_in_flight) {
-                            self.emit(AgentThreadEvent::HandoffSent(handoff.source));
+                        if !std::mem::take(&mut self.handoff_in_flight).is_empty() {
+                            self.emit(AgentThreadEvent::HandoffSent);
                         }
                     }
                     // Some agents (Claude Agent, OpenCode) open sessions logged out and ask at
@@ -1937,14 +1937,15 @@ impl AgentThread {
             return;
         };
         self.queued_prompts.clear();
-        // The handoff it would have brought waits in `ThreadState::handoff` still.
+        // The handoffs it would have brought wait in `ThreadState::pending_handoffs` still.
         self.last_message = Some(SentMessage { parts });
         self.message_failed(reason);
     }
 
     /// Sends the message that didn't get through ([`ThreadState::failed_message`]) again, as it
     /// went, once the agent is ready for it. The thread shows it once. One that failed for the
-    /// lost conversation goes to the new session anyway, and so do the messages after it.
+    /// lost conversation goes to the new session, with the conversation when the server has
+    /// added it ([`HandoffSource::NewSession`]), and so do the messages after it.
     pub fn retry_message(&mut self) {
         if self.view.state.failed_message.is_none()
             || self.view.state.status != ConnectionStatus::Ready
@@ -3510,7 +3511,7 @@ impl AgentThread {
     }
 
     /// A replayed or streamed chunk of a message as its entry shows it, mentions as links. The
-    /// handoff a continued thread began with stays hidden.
+    /// handoffs a message brought stay hidden.
     fn content_markdown(&self, content: acp::ContentBlock) -> Option<String> {
         match content {
             acp::ContentBlock::Text(text) => Some(text.text),

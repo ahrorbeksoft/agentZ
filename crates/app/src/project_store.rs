@@ -384,29 +384,6 @@ impl ProjectStore {
         )
     }
 
-    /// "Continue with another agent": a thread with `agent_id` on `account` in the thread's
-    /// workspace, whose first message brings the thread's conversation.
-    pub fn continue_thread(
-        &mut self,
-        thread_id: ThreadId,
-        agent_id: AgentId,
-        account: AccountChoice,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<ThreadId>> {
-        self.request(
-            Request::ContinueThread {
-                thread_id,
-                agent_id,
-                account,
-            },
-            |response| match response {
-                Response::ThreadCreated(thread_id) => Some(thread_id),
-                _ => None,
-            },
-            cx,
-        )
-    }
-
     /// Fork from This Response: a thread that begins with the conversation up to the end of
     /// the turn of the reply at `entry`.
     pub fn fork_thread(

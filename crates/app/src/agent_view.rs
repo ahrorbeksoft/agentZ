@@ -52,7 +52,7 @@ use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, Chip, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
     IconPosition, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars, Severity, SpinnerLabel,
-    SplitButton, SplitButtonStyle, Switch, ToggleState, Tooltip, WithScrollbar as _, prelude::*,
+    Switch, ToggleState, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -548,7 +548,7 @@ pub struct AgentView {
     elicitation_cards: Vec<Entity<ElicitationCard>>,
     /// What the composer says while empty: to log in first, while the agent needs a login.
     composer_placeholder: SharedString,
-    /// The header title's menu: Rename, Continue with Another Agent, Archive, Delete.
+    /// The header title's menu: Pin, Rename, Regenerate Title, Archive, Delete.
     title_menu: PopoverMenuHandle<ContextMenu>,
     /// The header's title, while it's renamed in place.
     rename_input: Entity<TextInput>,
@@ -559,11 +559,9 @@ pub struct AgentView {
     expanded_handoff: Option<SystemTime>,
     /// [`Self::fork_divider_rows`] as last measured.
     synced_fork_rows: Vec<usize>,
-    /// Why "Continue with another agent", a switch to another agent or account, a fork or its
-    /// merge back, or the limit notice's Continue at the reset, Switch to Droid Core or Use
-    /// Reset, didn't work.
+    /// Why a switch to another agent or account, a fork or its merge back, or the limit
+    /// notice's Continue at the reset, Switch to Droid Core or Use Reset, didn't work.
     continue_error: Option<SharedString>,
-    _continuing: Task<()>,
     /// Fork from This Response, while the fork is being made.
     forking: Option<Task<()>>,
     /// The header's Merge Back, while it's on its way.
@@ -788,7 +786,6 @@ impl AgentView {
             expanded_handoff: None,
             synced_fork_rows: Vec::new(),
             continue_error: None,
-            _continuing: Task::ready(()),
             forking: None,
             merging: None,
             switching_agent: None,
@@ -3260,10 +3257,7 @@ impl AgentView {
     ) -> AnyElement {
         let entry_count = self.thread.read(cx).entries().len();
         let content = if index == 0 {
-            let continued_from = (entry_count > 0)
-                .then(|| self.render_continued_from(cx))
-                .flatten();
-            div().pt_2().children(continued_from).into_any_element()
+            div().pt_2().into_any_element()
         } else if index <= entry_count {
             let Some(entry) = self.thread.read(cx).entries().get(index - 1).cloned() else {
                 return div().into_any_element();
@@ -3300,7 +3294,6 @@ impl AgentView {
     fn render_tail_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let entry_count = self.thread.read(cx).entries().len();
         let mut rows = self.render_workspace_setup(cx);
-        rows.extend(self.render_continuations(cx));
         let orphans: Vec<(acp::ToolCallId, String)> = self
             .thread
             .read(cx)
@@ -4176,42 +4169,34 @@ impl AgentView {
             .unwrap_or_default()
     }
 
-    /// The title as the trigger of the thread's menu: Rename, Continue with Another Agent,
-    /// Archive and Delete. A Workspaces thread isn't archived. In a subthread, they're its
-    /// parent's.
+    /// The title as the trigger of the thread's menu: Pin, Rename, Regenerate Title, Archive and
+    /// Delete. A Workspaces thread isn't archived. In a subthread, they're its parent's.
     fn render_title_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.weak_entity();
         let is_subthread = self.header_parent(cx).is_some();
         let (client, thread_id) = self.header_thread(cx);
         let store = client.read(cx).projects().clone();
-        let registry = client.read(cx).registry().clone();
-        let (current_agent, is_archived) = if is_subthread {
-            let parent = store.read(cx).thread(thread_id);
-            (
-                parent
-                    .and_then(|thread| thread.agent_id.clone())
-                    .map(AgentId::new),
-                parent.is_some_and(|thread| thread.archived_at.is_some()),
-            )
+        let is_archived = if is_subthread {
+            store
+                .read(cx)
+                .thread(thread_id)
+                .is_some_and(|thread| thread.archived_at.is_some())
         } else {
-            (self.agent_id.clone(), self.is_archived)
+            self.is_archived
         };
         // Workspaces threads and chats aren't archived.
         let can_archive = store
             .read(cx)
             .thread(thread_id)
             .is_some_and(|thread| !thread.in_workspaces() && !thread.is_chat());
-        // A draft has no conversation to continue, and its agent picker changes the agent.
+        // A draft has no conversation to title from.
         let is_draft = self.is_draft(cx);
         let title = self.header_title(cx);
         let title_label = title.clone();
-        let rename = {
-            let view = view.clone();
-            Rc::new(move |window: &mut Window, cx: &mut App| {
-                view.update(cx, |view, cx| view.start_rename(window, cx))
-                    .log_err();
-            })
-        };
+        let rename = Rc::new(move |window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| view.start_rename(window, cx))
+                .log_err();
+        });
         let rename_from_menu = rename.clone();
         PopoverMenu::new("thread-title-menu")
             .with_handle(self.title_menu.clone())
@@ -4219,41 +4204,6 @@ impl AgentView {
             // over the branch and buttons.
             .full_width(true)
             .menu(move |window, cx| {
-                let agents: Vec<(AgentId, SharedString)> = {
-                    let registry = registry.read(cx);
-                    registry
-                        .agents()
-                        .iter()
-                        .filter(|agent| {
-                            Some(agent.id()) != current_agent.as_ref()
-                                && agent.supports_current_platform()
-                                && matches!(
-                                    registry.install_state(agent.id()),
-                                    InstallState::Installed { .. }
-                                )
-                        })
-                        .map(|agent| (agent.id().clone(), agent.name().clone()))
-                        .collect()
-                };
-                // Accounts share no sessions, so going on with another of the agent's accounts
-                // is continuing too.
-                let own_accounts = current_agent.as_ref().and_then(|agent_id| {
-                    let entries = account_entries(&client.read(cx).accounts(agent_id));
-                    if entries.len() < 2 {
-                        return None;
-                    }
-                    let name = registry
-                        .read(cx)
-                        .agent(agent_id)
-                        .map_or_else(|| agent_id.0.clone(), |agent| agent.name().clone());
-                    Some((agent_id.clone(), name, entries))
-                });
-                let thread_account = store
-                    .read(cx)
-                    .thread(thread_id)
-                    .map(|thread| thread.account);
-                let now = SystemTime::now();
-                let view = view.clone();
                 let store = store.clone();
                 let title = title.clone();
                 let rename = rename_from_menu.clone();
@@ -4281,81 +4231,6 @@ impl AgentView {
                                     Machines::pin_thread(&Machines::global(cx), key, cx);
                                 }
                             }
-                        }
-                    };
-                    let continue_with = {
-                        let view = view.clone();
-                        let agents = agents.clone();
-                        let own_accounts = own_accounts.clone();
-                        move |mut menu: ContextMenu,
-                              _: &mut Window,
-                              _: &mut Context<ContextMenu>| {
-                            if agents.is_empty() && own_accounts.is_none() {
-                                return menu.label("No other agents are installed");
-                            }
-                            // The thread's agent first, its accounts beneath it.
-                            if let Some((agent_id, name, entries)) = &own_accounts {
-                                let render_id = agent_id.clone();
-                                let name = name.clone();
-                                menu = menu.custom_row(move |_, cx| {
-                                    render_agent_item(&render_id, name.clone(), cx)
-                                });
-                                for entry in entries {
-                                    let account = entry.account;
-                                    let is_own = thread_account == Some(account);
-                                    let entry = entry.clone();
-                                    let render = move |_: &mut Window, cx: &mut App| {
-                                        let selector = account_selector(entry.account);
-                                        account_row(
-                                            &entry,
-                                            is_own.then(|| "This thread's account".into()),
-                                            is_own,
-                                            now,
-                                            cx,
-                                        )
-                                        .debug_selector(move || {
-                                            format!("continue-on-account-{selector}")
-                                        })
-                                        .pl(px(18.))
-                                        .child(div().flex_none().w(px(14.)))
-                                        .into_any_element()
-                                    };
-                                    if is_own {
-                                        menu = menu.custom_row(render);
-                                        continue;
-                                    }
-                                    let view = view.clone();
-                                    let agent_id = agent_id.clone();
-                                    menu = menu.custom_entry(render, move |_, cx| {
-                                        let agent_id = agent_id.clone();
-                                        view.update(cx, |view, cx| {
-                                            view.continue_with(
-                                                agent_id,
-                                                AccountChoice::of(account),
-                                                cx,
-                                            )
-                                        })
-                                        .log_err();
-                                    });
-                                }
-                            }
-                            for (agent_id, name) in &agents {
-                                let view = view.clone();
-                                let agent_id = agent_id.clone();
-                                let render_id = agent_id.clone();
-                                let name = name.clone();
-                                menu = menu.custom_entry(
-                                    move |_, cx| render_agent_item(&render_id, name.clone(), cx),
-                                    move |_, cx| {
-                                        let agent_id = agent_id.clone();
-                                        view.update(cx, |view, cx| {
-                                            view.continue_with(agent_id, AccountChoice::Default, cx)
-                                        })
-                                        .log_err();
-                                    },
-                                );
-                            }
-                            menu
                         }
                     };
                     let archive = {
@@ -4397,12 +4272,7 @@ impl AgentView {
                                 .handler(move |window, cx| rename(window, cx)),
                         );
                     if !is_draft {
-                        menu = crate::sidebar::with_regenerate_title(menu, &client, thread_id, cx)
-                            .submenu_with_icon(
-                                "Continue with Another Agent",
-                                IconName::ArrowRight,
-                                continue_with,
-                            );
+                        menu = crate::sidebar::with_regenerate_title(menu, &client, thread_id, cx);
                     }
                     menu.separator()
                         .when(can_archive, |menu| {
@@ -5055,36 +4925,6 @@ impl AgentView {
             .log_err();
         }));
         cx.notify();
-    }
-
-    /// Starts a thread with `agent_id` on `account` that continues the header's thread, and
-    /// opens it.
-    fn continue_with(&mut self, agent_id: AgentId, account: AccountChoice, cx: &mut Context<Self>) {
-        self.continue_error = None;
-        let agent_name = self
-            .registry
-            .read(cx)
-            .agent(&agent_id)
-            .map(|agent| agent.name().clone())
-            .unwrap_or_else(|| agent_id.0.clone());
-        let (client, thread_id) = self.header_thread(cx);
-        let machine = client.read(cx).machine();
-        let task = client.read(cx).projects().clone().update(cx, |store, cx| {
-            store.continue_thread(thread_id, agent_id, account, cx)
-        });
-        self._continuing = cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| match result {
-                Ok(thread) => this.open_thread(ThreadKey { machine, thread }, cx),
-                Err(error) => {
-                    log::error!("couldn't continue the thread: {error:#}");
-                    this.continue_error =
-                        Some(format!("Couldn't continue with {agent_name}: {error:#}").into());
-                    cx.notify();
-                }
-            })
-            .log_err();
-        });
     }
 
     /// The changes, terminal and agent options buttons; a chat's agent options alone.
@@ -8554,9 +8394,9 @@ impl AgentView {
     }
 
     /// t3code's banner for a thread stopped by a usage limit, as Zed's warning callout over the
-    /// composer: whose limit ran out and when it resets, then Continue on the agent's account
-    /// with the most left, its arrow listing the others, the account's own ways on (Use Reset,
-    /// Droid's), and Continue at the reset (or its cancel, once agentZ waits for it).
+    /// composer: whose limit ran out and when it resets, then the account's own ways on (Use
+    /// Reset, Droid's) and Continue at the reset (or its cancel, once agentZ waits for it). To go
+    /// on with another account, the user picks it in the composer.
     fn render_limit_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.limit_notice_dismissed {
             return None;
@@ -8575,11 +8415,6 @@ impl AgentView {
             reached.continues_at,
             now,
         );
-        let others = if has_accounts {
-            accounts_to_continue_on(&reached.accounts, reached.account, now)
-        } else {
-            Vec::new()
-        };
         let support = self
             .registry
             .read(cx)
@@ -8662,86 +8497,6 @@ impl AgentView {
                 .on_click(move |_, _, cx| cx.open_url(&url))
         });
 
-        let continue_button = others.split_first().map(|(first, rest)| {
-            let label = format!(
-                "Continue on {}{}",
-                account_phrase(first, false),
-                room_note(first, now)
-            );
-            let agent_id = reached.agent_id.clone();
-            let account = first.account;
-            let on_click = cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.continue_with(agent_id.clone(), AccountChoice::of(account), cx)
-            });
-            if rest.is_empty() {
-                return div()
-                    .debug_selector(|| "limit-continue".into())
-                    .child(
-                        Button::new("limit-continue", label)
-                            .style(ButtonStyle::Outlined)
-                            .label_size(LabelSize::Small)
-                            .on_click(on_click),
-                    )
-                    .into_any_element();
-            }
-            let view = cx.weak_entity();
-            let agent_id = reached.agent_id.clone();
-            let rest = rest.to_vec();
-            let menu = PopoverMenu::new("limit-continue-menu")
-                .trigger_with_tooltip(
-                    IconButton::new("limit-continue-others", IconName::ChevronDown)
-                        .icon_size(IconSize::XSmall),
-                    Tooltip::text("Continue on Another Account"),
-                )
-                .menu(move |window, cx| {
-                    let view = view.clone();
-                    let agent_id = agent_id.clone();
-                    let rest = rest.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        for entry in &rest {
-                            let account = entry.account;
-                            let entry = entry.clone();
-                            let view = view.clone();
-                            let agent_id = agent_id.clone();
-                            menu = menu.custom_entry(
-                                move |_, cx| {
-                                    let selector = account_selector(entry.account);
-                                    account_row(&entry, None, false, now, cx)
-                                        .debug_selector(move || {
-                                            format!("limit-continue-on-{selector}")
-                                        })
-                                        .into_any_element()
-                                },
-                                move |_, cx| {
-                                    let agent_id = agent_id.clone();
-                                    view.update(cx, |view, cx| {
-                                        view.continue_with(agent_id, AccountChoice::of(account), cx)
-                                    })
-                                    .log_err();
-                                },
-                            );
-                        }
-                        menu
-                    }))
-                })
-                .anchor(Anchor::TopRight)
-                .offset(gpui::point(px(0.), px(2.)));
-            div()
-                .debug_selector(|| "limit-continue".into())
-                .child(
-                    SplitButton::new(
-                        ButtonLike::new("limit-continue")
-                            .child(Label::new(label).size(LabelSize::Small))
-                            .on_click(on_click),
-                        div()
-                            .debug_selector(|| "limit-continue-others".into())
-                            .child(menu)
-                            .into_any_element(),
-                    )
-                    .style(SplitButtonStyle::Outlined),
-                )
-                .into_any_element()
-        });
         let usage_button = usage_page.map(|url| {
             Button::new("limit-usage-page", "Usage")
                 .label_size(LabelSize::Small)
@@ -8774,8 +8529,7 @@ impl AgentView {
                         })),
                 )
         });
-        let has_buttons = continue_button.is_some()
-            || limit_reset_button.is_some()
+        let has_buttons = limit_reset_button.is_some()
             || switch_button.is_some()
             || extra_usage_button.is_some()
             || reset_button.is_some()
@@ -8801,7 +8555,6 @@ impl AgentView {
                             h_flex()
                                 .flex_wrap()
                                 .gap_1()
-                                .children(continue_button)
                                 .children(limit_reset_button)
                                 .children(switch_button)
                                 .children(extra_usage_button)
@@ -8840,7 +8593,7 @@ impl AgentView {
         let thread = self.thread.read(cx);
         // Without the conversation, it goes only if the user wants it to.
         let retry_label = match thread.failed_message()? {
-            FailedMessage::LostHistory => "Send Anyway",
+            FailedMessage::LostHistory => "Resend with Context",
             FailedMessage::NeedsLogin | FailedMessage::TurnFailed => "Retry",
         };
         let last_message = thread
@@ -8944,43 +8697,20 @@ impl AgentView {
     }
 
     /// The agent couldn't load the thread's conversation, so messages sent here wait ("Not sent
-    /// · Send Anyway"): a line over the composer says why, and continues in a new thread on the
-    /// same agent and account, which brings the conversation along.
+    /// · Resend with Context"): a line over the composer says why.
     fn render_lost_history_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
         if self.is_archived {
             return None;
         }
         let lost = self.thread.read(cx).lost_history()?;
         let agent_name = self.agent_name(cx);
-        let why = match lost {
+        let description = match lost {
             LostHistory::AccountChanged => format!(
                 "{agent_name} is logged in to another account now and couldn't load this \
                  conversation there."
             ),
             LostHistory::Unexplained => format!("{agent_name} couldn't load this conversation."),
         };
-        let description = format!(
-            "{why} Continue in a new thread to bring it along. Messages sent here wait until you \
-             send them anyway, without it."
-        );
-        // A subthread belongs to its task.
-        let continue_button = self
-            .agent_id
-            .clone()
-            .zip(self.store.read(cx).thread(self.thread_id))
-            .filter(|_| !self.is_subthread(cx))
-            .map(|(agent_id, thread)| {
-                let account = thread.account;
-                div()
-                    .debug_selector(|| "lost-history-continue".into())
-                    .child(
-                        ActionButton::new("lost-history-continue", "Continue in New Thread")
-                            .style(ActionStyle::Primary)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.continue_with(agent_id.clone(), AccountChoice::of(account), cx)
-                            })),
-                    )
-            });
         Some(
             div()
                 .debug_selector(|| "lost-history-notice".into())
@@ -8990,10 +8720,7 @@ impl AgentView {
                     Callout::new()
                         .severity(Severity::Warning)
                         .title("Conversation not loaded")
-                        .description(description)
-                        .when_some(continue_button, |callout, button| {
-                            callout.actions_slot(button)
-                        }),
+                        .description(description),
                 )
                 .into_any_element(),
         )
@@ -10330,24 +10057,10 @@ impl AgentView {
         )
     }
 
-    /// The thread this one continues, with its agent's name and icon, while it's kept.
-    fn continued_from(
-        &self,
-        cx: &App,
-    ) -> Option<(ThreadId, SharedString, SharedString, AgentIcon)> {
-        let store = self.store.read(cx);
-        let from = store.thread(store.thread(self.thread_id)?.continued_from?)?;
-        let (name, icon) = self.thread_agent(from, cx);
-        Some((from.id, from.title.clone().into(), name, icon))
-    }
-
     /// A plain draft with nothing typed, which New Thread opens again rather than making
     /// another, as t3code does.
     pub(crate) fn is_untouched_draft(&self, cx: &App) -> bool {
-        self.is_draft(cx)
-            && self.typed_draft(cx).text.is_none()
-            && self.replacing.is_none()
-            && self.thread.read(cx).pending_handoffs().is_empty()
+        self.is_draft(cx) && self.typed_draft(cx).text.is_none() && self.replacing.is_none()
     }
 
     /// A new thread nothing has been sent in yet (t3code's draft thread).
@@ -10382,7 +10095,7 @@ impl AgentView {
                 HandoffSource::Merge { fork, title } => {
                     Some(self.render_merge_divider(index, *fork, title, cx))
                 }
-                HandoffSource::Thread { .. } | HandoffSource::Fork { .. } => None,
+                HandoffSource::Fork { .. } | HandoffSource::NewSession => None,
             })
             .collect()
     }
@@ -10636,40 +10349,6 @@ impl AgentView {
         self.synced_fork_rows = rows;
     }
 
-    /// The title of the thread this one continues, until its first message is sent.
-    fn continued_title(&self, cx: &App) -> Option<SharedString> {
-        let (_, title, _) = self
-            .thread
-            .read(cx)
-            .pending_handoffs()
-            .iter()
-            .find_map(PendingHandoff::from_thread)?;
-        Some(title.to_string().into())
-    }
-
-    /// A thread's agent, by name, and its icon: muted, on the thread's account's color.
-    fn thread_agent(&self, thread: &projects::Thread, cx: &App) -> (SharedString, AgentIcon) {
-        let agent_id = thread.agent_id.clone().map(AgentId::new);
-        let name = agent_id
-            .as_ref()
-            .and_then(|agent_id| self.registry.read(cx).agent(agent_id))
-            .map(|agent| agent.name().clone())
-            .or_else(|| thread.agent_id.clone().map(SharedString::from))
-            .unwrap_or_else(|| "Agent".into());
-        let icon = agent_id
-            .as_ref()
-            .and_then(|agent_id| agent_icon(agent_id, cx))
-            .map(Icon::from_svg_markup)
-            .unwrap_or_else(|| Icon::new(IconName::Sparkle));
-        let account_color = agent_id
-            .as_ref()
-            .and_then(|agent_id| self.account_icon_color(agent_id, thread.account, cx));
-        (
-            name,
-            AgentIcon::new(icon.color(Color::Muted), account_color),
-        )
-    }
-
     /// The color behind the agent's icon on the account's threads
     /// ([`agentz_protocol::accounts::AgentAccounts::thread_color`]).
     fn account_icon_color(
@@ -10682,135 +10361,21 @@ impl AgentView {
         account_fill_color(hex)
     }
 
-    /// The divider that opens a continued thread: where it came from.
-    fn render_continued_from(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (from_id, title, agent_name, icon) = self.continued_from(cx)?;
-        let line = cx.theme().colors().border;
-        let rule = move || div().flex_1().h_px().bg(line);
-        Some(
-            h_flex()
-                .debug_selector(|| "thread-continued-from".into())
-                .w_full()
-                .px_5()
-                .pt_2()
-                .pb_1()
-                .gap_2()
-                .child(rule())
-                .child(
-                    h_flex()
-                        .flex_none()
-                        .gap_1()
-                        .child(
-                            Label::new("Continued from")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(icon.size(IconSize::XSmall))
-                        .child(
-                            Label::new(format!("{agent_name} ·"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            div()
-                                .id("continued-from-thread")
-                                .max_w(px(320.))
-                                .cursor_pointer()
-                                .child(
-                                    Label::new(title)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .underline()
-                                        .truncate(),
-                                )
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(AgentViewEvent::OpenThread(from_id))
-                                })),
-                        ),
-                )
-                .child(rule())
-                .into_any_element(),
-        )
-    }
-
-    /// A card for each thread that continues this one with another agent, after its end.
-    fn render_continuations(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let continuations: Vec<(ThreadId, SharedString, SharedString, AgentIcon)> = {
-            let store = self.store.read(cx);
-            store
-                .continuations(self.thread_id)
-                .map(|thread| {
-                    let (name, icon) = self.thread_agent(thread, cx);
-                    (thread.id, thread.title.clone().into(), name, icon)
-                })
-                .collect()
-        };
-        let colors = cx.theme().colors().clone();
-        continuations
-            .into_iter()
-            .map(|(thread_id, title, agent_name, icon)| {
-                let open = cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    cx.emit(AgentViewEvent::OpenThread(thread_id))
-                });
-                div()
-                    .px_5()
-                    .pt_2()
-                    .pb_1()
-                    .child(
-                        h_flex()
-                            .debug_selector(|| "thread-continued-in".into())
-                            .px_3()
-                            .py_2p5()
-                            .gap_3()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(colors.border)
-                            .child(icon.size(IconSize::Small))
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Label::new(format!("Continued in {agent_name}")))
-                                    .child(
-                                        Label::new(title)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    ),
-                            )
-                            .child(
-                                Button::new(("open-continuation", thread_id.0), "Open")
-                                    .style(ButtonStyle::Outlined)
-                                    .label_size(LabelSize::Small)
-                                    .on_click(open),
-                            ),
-                    )
-                    .into_any_element()
-            })
-            .collect()
-    }
-
-    /// What waits to go with the next message, as attachments in the composer: the
-    /// conversation a continued thread brings, and forks merged back. A click shows exactly what
-    /// goes to the agent, × goes on without it.
+    /// Forks merged back, which wait to go with the next message, as attachments in the
+    /// composer. A click shows exactly what goes to the agent, × goes on without it.
     fn render_handoff_chips(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // What the thread's new agent or account hasn't seen, and the conversation a fork
-        // starts with, go along without a word; they show in the conversation once sent.
+        // The other handoffs go along without a word; a switch's shows in the conversation once
+        // sent.
         let handoffs: Vec<PendingHandoff> = self
             .thread
             .read(cx)
             .pending_handoffs()
             .iter()
-            .filter(|handoff| {
-                matches!(
-                    handoff.source,
-                    HandoffSource::Thread { .. } | HandoffSource::Merge { .. }
-                )
-            })
+            .filter(|handoff| matches!(handoff.source, HandoffSource::Merge { .. }))
             .cloned()
             .collect();
         if handoffs.is_empty() {
@@ -10869,59 +10434,23 @@ impl AgentView {
             1 => "1 message".to_string(),
             count => format!("{count} messages"),
         };
-        let (selector, icons, title, detail, drop_tooltip) = match &handoff.source {
-            HandoffSource::Thread { id, title, agent } => {
-                let icon = {
-                    let store = self.store.read(cx);
-                    store
-                        .thread(*id)
-                        .map(|from| self.thread_agent(from, cx).1)
-                        .unwrap_or_else(|| Icon::new(IconName::Sparkle).color(Color::Muted).into())
-                };
-                (
-                    "handoff-chip".to_string(),
-                    vec![
-                        Icon::new(IconName::Return)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted)
-                            .into_any_element(),
-                        icon.size(IconSize::XSmall).into_any_element(),
-                    ],
-                    SharedString::from(title.clone()),
-                    format!("· {agent} · {messages}"),
-                    "Start Without It",
-                )
-            }
-            HandoffSource::Merge { fork, title } => {
-                // The fork as it's called now.
-                let title = self
-                    .store
-                    .read(cx)
-                    .thread(*fork)
-                    .map_or_else(|| title.clone(), |fork| fork.title.clone());
-                (
-                    format!("merge-chip-{}", fork.0),
-                    vec![
-                        Icon::new(IconName::GitMerge)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted)
-                            .into_any_element(),
-                    ],
-                    SharedString::from(title),
-                    format!("· {messages}"),
-                    "Don’t Merge It Back",
-                )
-            }
-            HandoffSource::Agent { .. } | HandoffSource::Fork { .. } => {
-                return div().into_any_element();
-            }
+        let HandoffSource::Merge { fork, title } = &handoff.source else {
+            return div().into_any_element();
         };
+        let fork = *fork;
+        // The fork as it's called now.
+        let title: SharedString = self
+            .store
+            .read(cx)
+            .thread(fork)
+            .map_or_else(|| title.clone(), |fork| fork.title.clone())
+            .into();
         let made_at = handoff.made_at;
         let is_expanded = self.expanded_handoff == Some(made_at);
         let colors = cx.theme().colors();
         h_flex()
             .id(("handoff-chip", index))
-            .debug_selector(move || selector)
+            .debug_selector(move || format!("merge-chip-{}", fork.0))
             .max_w_full()
             .min_w_0()
             .gap_1p5()
@@ -10935,14 +10464,18 @@ impl AgentView {
             .cursor_pointer()
             .hover(|style| style.bg(colors.element_hover))
             .when(is_expanded, |chip| chip.bg(colors.element_selected))
-            .children(icons)
+            .child(
+                Icon::new(IconName::GitMerge)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
             .child(
                 div()
                     .min_w_0()
                     .child(Label::new(title).size(LabelSize::Small).truncate()),
             )
             .child(
-                Label::new(detail)
+                Label::new(format!("· {messages}"))
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .single_line(),
@@ -10954,7 +10487,7 @@ impl AgentView {
                         IconButton::new(("drop-handoff", index), IconName::Close)
                             .icon_size(IconSize::XSmall)
                             .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text(drop_tooltip))
+                            .tooltip(Tooltip::text("Don’t Merge It Back"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.expanded_handoff = None;
                                 this.thread
@@ -11217,11 +10750,6 @@ impl AgentView {
             .text_center()
             .text_2xl()
             .text_color(cx.theme().colors().text);
-        if let Some(title) = self.continued_title(cx) {
-            return headline
-                .child(format!("Continue “{title}”"))
-                .into_any_element();
-        }
         if self.is_chat(cx) {
             return headline
                 .child("What do you want to talk about?")
@@ -11405,12 +10933,10 @@ impl AgentView {
         let view = cx.weak_entity();
         let registry = self.registry.clone();
         let current_agent = self.agent_id.clone();
-        // A continuation brings a conversation, which only an agent can take, a Workspaces
-        // draft sits in a workspace, beside its shells, and a chat has no folder to open one in.
-        let offers_terminal = picker == PickerFor::NewThread
-            && self.thread.read(cx).pending_handoffs().is_empty()
-            && !self.in_workspaces(cx)
-            && !self.is_chat(cx);
+        // A Workspaces draft sits in a workspace, beside its shells, and a chat has no folder
+        // to open one in.
+        let offers_terminal =
+            picker == PickerFor::NewThread && !self.in_workspaces(cx) && !self.is_chat(cx);
         let (id, trigger_id, disabled) = match picker {
             PickerFor::NewThread => (
                 "new-thread-agent",
@@ -12504,8 +12030,7 @@ impl AgentView {
     }
 
     /// ACP can't change a session's agent, account or folder, so the new thread is made again
-    /// with what was picked, shown in its place, and this one is deleted. A continuation stays
-    /// one, in the workspace of the thread it continues.
+    /// with what was picked, shown in its place, and this one is deleted.
     fn replace_new_thread(
         &mut self,
         project: ProjectKey,
@@ -12520,12 +12045,6 @@ impl AgentView {
         let Some(store) = Machines::global(cx).read(cx).projects(project.machine, cx) else {
             return;
         };
-        let continued_from = self
-            .store
-            .read(cx)
-            .thread(self.thread_id)
-            .and_then(|thread| thread.continued_from)
-            .filter(|_| project.machine == self.store.read(cx).machine());
         let starting_folder = self
             .store
             .read(cx)
@@ -12535,17 +12054,14 @@ impl AgentView {
         self.replacing = Some("Starting…".into());
         self.replace_error = None;
         cx.notify();
-        let created = store.update(cx, |store, cx| match (starter, continued_from) {
-            (Starter::Agent(agent_id), Some(from)) => {
-                store.continue_thread(from, agent_id, account, cx)
-            }
-            (Starter::Agent(agent_id), None) => match starting_folder {
+        let created = store.update(cx, |store, cx| match starter {
+            Starter::Agent(agent_id) => match starting_folder {
                 Some(folder) => {
                     store.create_workspaces_thread(folder, agent_id, workspace, account, cx)
                 }
                 None => store.create_thread(project.project, agent_id, workspace, account, cx),
             },
-            (Starter::Terminal, _) => store.create_terminal_thread(
+            Starter::Terminal => store.create_terminal_thread(
                 project.project,
                 TerminalCommand::default(),
                 workspace,
@@ -12783,21 +12299,6 @@ fn render_account_row(
         .into_any_element()
 }
 
-/// An agent in Continue with Another Agent: its icon and name.
-fn render_agent_item(agent_id: &AgentId, name: SharedString, cx: &App) -> AnyElement {
-    h_flex()
-        .gap_1p5()
-        .child(
-            agent_icon(agent_id, cx)
-                .map(Icon::from_svg_markup)
-                .unwrap_or_else(|| Icon::new(IconName::Sparkle))
-                .size(IconSize::Small)
-                .color(Color::Muted),
-        )
-        .child(Label::new(name))
-        .into_any_element()
-}
-
 /// An account as the menus that pick one show it: its avatar, its name over `note` (else its
 /// plan), and the window closest to running out. Greyed, it can't be picked.
 fn account_row(
@@ -12938,46 +12439,6 @@ fn account_phrase(entry: &AccountEntry, starts_sentence: bool) -> String {
     }
 }
 
-/// The agent's other listed accounts, the one with the most room first.
-fn accounts_to_continue_on(
-    accounts: &AgentAccounts,
-    own: Option<AccountId>,
-    now: SystemTime,
-) -> Vec<AccountEntry> {
-    let mut entries: Vec<AccountEntry> = account_entries(accounts)
-        .into_iter()
-        .filter(|entry| entry.account != own)
-        .collect();
-    entries.sort_by_key(|entry| std::cmp::Reverse(room(entry, now)));
-    entries
-}
-
-/// How much room an account has to go on, for ordering: what's left of its tightest window,
-/// then not read yet, then used up, then logged out.
-fn room(entry: &AccountEntry, now: SystemTime) -> i16 {
-    if entry.is_logged_out {
-        return -2;
-    }
-    if used_up_window(&entry.windows, now).is_some() {
-        return -1;
-    }
-    tightest_window(&entry.windows, now).map_or(0, |window| i16::from(window.left_percent()))
-}
-
-/// What the Continue button says of the account it continues on.
-fn room_note(entry: &AccountEntry, now: SystemTime) -> String {
-    if entry.is_logged_out {
-        return " · Logged out".to_string();
-    }
-    if used_up_window(&entry.windows, now).is_some() {
-        return " · Used up".to_string();
-    }
-    tightest_window(&entry.windows, now)
-        .map(|window| format!(" · {}% left", window.left_percent()))
-        .unwrap_or_default()
-}
-
-/// A borderless button that opens one of the new thread's pickers.
 /// Which composer a picker is in: a new thread's, made again with what's picked, or a sent
 /// thread's, which goes on with it once it `can_switch`.
 #[derive(Clone, Copy, PartialEq)]
@@ -12986,6 +12447,7 @@ enum PickerFor {
     SentThread { can_switch: bool },
 }
 
+/// A borderless button that opens one of the new thread's pickers.
 fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike {
     ButtonLike::new(id)
         .style(ButtonStyle::Subtle)
@@ -13303,18 +12765,8 @@ impl Render for AgentView {
                                 )
                             })
                             .when(!has_rows && !is_connecting && !needs_login, |this| {
-                                let prompt = match self.continued_title(cx) {
-                                    Some(title) => format!(
-                                        "{} continues “{title}”. Tell it what to do next.",
-                                        self.agent_name(cx)
-                                    ),
-                                    None => {
-                                        format!(
-                                            "Start a conversation with {}.",
-                                            self.agent_name(cx)
-                                        )
-                                    }
-                                };
+                                let prompt =
+                                    format!("Start a conversation with {}.", self.agent_name(cx));
                                 this.child(
                                     div()
                                         .w_full()
@@ -15343,99 +14795,12 @@ mod tests {
         assert_eq!(*events.borrow(), vec![(mock, true)]);
     }
 
-    /// With two accounts, Continue with Another Agent lists the thread's agent first with its
-    /// accounts beneath it, and continues the thread on the one picked. The thread's own can't
-    /// be picked.
-    #[gpui::test]
-    fn a_thread_continues_on_another_of_its_agents_accounts(cx: &mut TestAppContext) {
-        use agentz_protocol::accounts::AgentAccounts;
-        use std::cell::RefCell;
-
-        let (view, cx) = open(2, false, cx);
-        let mock = AgentId::new("mock");
-        let mut accounts = AgentAccounts {
-            external_logged_in: Some(true),
-            ..AgentAccounts::default()
-        };
-        let work = accounts.add();
-        if let Some(account) = accounts.account_mut(work) {
-            account.choices.label = Some("Work".into());
-            account.logged_in = Some(true);
-        }
-        let store = view.read_with(cx, |view, _| view.store.clone());
-        let mut on_work = snapshot(None);
-        on_work.threads[1].account = Some(work);
-        store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
-        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
-        let client = view.read_with(cx, |view, _| view.client.clone());
-        client.update(cx, |client, cx| {
-            let requests = requests.clone();
-            client.answer_for_test(move |request| {
-                requests.borrow_mut().push(request.clone());
-                match request {
-                    Request::ContinueThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
-                    _ => None,
-                }
-            });
-            client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
-        });
-        cx.run_until_parked();
-        let continued = |requests: &RefCell<Vec<Request>>| {
-            requests
-                .borrow()
-                .iter()
-                .filter_map(|request| match request {
-                    Request::ContinueThread {
-                        thread_id,
-                        agent_id,
-                        account,
-                    } => Some((*thread_id, agent_id.clone(), *account)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-
-        view.update_in(cx, |view, window, cx| view.title_menu.show(window, cx));
-        cx.run_until_parked();
-        // The submenu opens on hovering the row under Rename. It's placed beside the row once a
-        // frame has measured the row, which the pointer moving on draws.
-        let rename = cx
-            .debug_bounds("MENU_ITEM-Rename")
-            .expect("the menu is open");
-        for nudge in [px(0.), px(4.)] {
-            cx.simulate_mouse_move(
-                rename.center() + gpui::point(nudge, rename.size.height),
-                None,
-                gpui::Modifiers::none(),
-            );
-            cx.run_until_parked();
-        }
-        let external = cx
-            .debug_bounds("continue-on-account-external")
-            .expect("the External account is offered");
-        let own = cx
-            .debug_bounds("continue-on-account-1")
-            .expect("the thread's own account is shown");
-        assert!(external.top() < own.top());
-
-        cx.simulate_click(own.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(continued(&requests).is_empty());
-        cx.simulate_click(external.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert_eq!(
-            continued(&requests),
-            vec![(ThreadId(2), mock, AccountChoice::External)]
-        );
-    }
-
     /// A thread that stopped while its account's last read has a window used up shows the limit
-    /// notice in place of the agent's error. It continues on the account with the most left,
-    /// its arrow lists the others, and once closed it stays closed until the next turn.
+    /// notice in place of the agent's error. Another account is picked in the composer, not
+    /// there, and once closed it stays closed until the next turn.
     #[gpui::test]
-    fn a_thread_stopped_at_its_accounts_limit_offers_another_account(cx: &mut TestAppContext) {
+    fn a_thread_stopped_at_its_accounts_limit_shows_the_limit_notice(cx: &mut TestAppContext) {
         use agentz_protocol::accounts::{AccountStatus, StatusRead};
-        use std::cell::RefCell;
 
         let (view, cx) = open(2, false, cx);
         let mock = AgentId::new("mock");
@@ -15470,30 +14835,11 @@ mod tests {
         let mut on_work = snapshot(None);
         on_work.threads[1].account = Some(work);
         store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
-        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
         let client = view.read_with(cx, |view, _| view.client.clone());
         client.update(cx, |client, cx| {
-            let requests = requests.clone();
-            client.answer_for_test(move |request| {
-                requests.borrow_mut().push(request.clone());
-                match request {
-                    Request::ContinueThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
-                    _ => None,
-                }
-            });
             client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx);
         });
         cx.run_until_parked();
-        let continued = |requests: &RefCell<Vec<Request>>| {
-            requests
-                .borrow()
-                .iter()
-                .filter_map(|request| match request {
-                    Request::ContinueThread { account, .. } => Some(*account),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         let at_limit = |view: &Entity<AgentView>, cx: &mut VisualTestContext| {
             view.read_with(cx, |view, cx| {
@@ -15513,33 +14859,8 @@ mod tests {
         cx.run_until_parked();
         assert!(at_limit(&view, cx));
         assert!(cx.debug_bounds("limit-notice").is_some());
-
-        let primary = cx
-            .debug_bounds("limit-continue")
-            .expect("Continue on Side is offered");
-        cx.simulate_click(
-            primary.origin + gpui::point(px(12.), primary.size.height / 2.),
-            gpui::Modifiers::none(),
-        );
-        cx.run_until_parked();
-        assert_eq!(continued(&requests), vec![AccountChoice::Account(side)]);
-
-        let others = cx
-            .debug_bounds("limit-continue-others")
-            .expect("the other accounts have an arrow");
-        cx.simulate_click(others.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("limit-continue-on-2").is_none());
-        assert!(cx.debug_bounds("limit-continue-on-1").is_none());
-        let external = cx
-            .debug_bounds("limit-continue-on-external")
-            .expect("the External account is listed");
-        cx.simulate_click(external.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert_eq!(
-            continued(&requests),
-            vec![AccountChoice::Account(side), AccountChoice::External]
-        );
+        assert!(cx.debug_bounds("limit-continue-at-reset").is_some());
+        assert!(cx.debug_bounds("thread-account").is_some());
 
         // Closed, it comes back with the next turn's stop.
         let dismiss = cx
@@ -18138,10 +17459,10 @@ mod tests {
         assert!(cx.debug_bounds("retry-message").is_none());
     }
 
-    /// A thread whose conversation didn't load says why over the composer, with Continue in New
-    /// Thread on its own agent and account, and its message waits for Send Anyway.
+    /// A thread whose conversation didn't load says why over the composer, and its message waits
+    /// for Resend with Context.
     #[gpui::test]
-    fn a_lost_conversation_offers_a_new_thread(cx: &mut TestAppContext) {
+    fn a_lost_conversation_waits_to_resend_with_context(cx: &mut TestAppContext) {
         use std::cell::RefCell;
 
         let (view, cx) = open(2, false, cx);
@@ -18152,10 +17473,7 @@ mod tests {
             let requests = requests.clone();
             client.answer_for_test(move |request| {
                 requests.borrow_mut().push(request.clone());
-                match request {
-                    Request::ContinueThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
-                    _ => None,
-                }
+                None
             });
         });
         thread.update(cx, |thread, cx| {
@@ -18180,15 +17498,6 @@ mod tests {
                 .iter()
                 .any(|request| matches!(request, Request::RetryMessage(_)))
         );
-        click("lost-history-continue", cx);
-        assert!(requests.borrow().iter().any(|request| matches!(
-            request,
-            Request::ContinueThread {
-                thread_id: ThreadId(2),
-                account: AccountChoice::External,
-                ..
-            }
-        )));
 
         thread.update(cx, |thread, cx| {
             thread.update_state_for_test(

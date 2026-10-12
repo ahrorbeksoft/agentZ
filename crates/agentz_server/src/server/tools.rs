@@ -363,8 +363,7 @@ impl Server {
                     self.follow_ups.remove(&thread_id);
                     continue;
                 }
-                ConnectionStatus::Ready
-                    if !thread.is_working() && !thread.waits_for_send_anyway() => {}
+                ConnectionStatus::Ready if !thread.is_working() && !thread.waits_for_resend() => {}
                 _ => continue,
             }
             let Some(queue) = self.follow_ups.get_mut(&thread_id) else {

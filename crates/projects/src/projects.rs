@@ -379,10 +379,6 @@ pub struct Thread {
     /// Set on a terminal thread, which runs this instead of an ACP agent.
     #[serde(default)]
     pub terminal: Option<TerminalCommand>,
-    /// The thread this one continues with another agent, whose conversation went with its
-    /// first message.
-    #[serde(default)]
-    pub continued_from: Option<ThreadId>,
     /// The thread this one is a fork of, and where: it began with that thread's conversation up
     /// to there.
     #[serde(default)]
@@ -1179,7 +1175,6 @@ impl ProjectStore {
             started_in: None,
             planned_workspace: None,
             terminal: None,
-            continued_from: None,
             forked_from: None,
             is_draft: false,
             unsent_text: None,
@@ -1719,13 +1714,6 @@ impl ProjectStore {
         }
     }
 
-    pub fn set_continued_from(&mut self, id: ThreadId, from: ThreadId) {
-        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
-            thread.continued_from = Some(from);
-            self.changed();
-        }
-    }
-
     pub fn set_forked_from(&mut self, id: ThreadId, from: ForkPoint) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
             thread.forked_from = Some(from);
@@ -1740,13 +1728,6 @@ impl ProjectStore {
                 .forked_from
                 .is_some_and(|fork_point| fork_point.thread == id)
         })
-    }
-
-    /// The threads that continue this one with other agents, oldest first.
-    pub fn continuations(&self, id: ThreadId) -> impl Iterator<Item = &Thread> {
-        self.threads
-            .iter()
-            .filter(move |thread| thread.continued_from == Some(id))
     }
 
     pub fn set_thread_session(&mut self, id: ThreadId, session_id: String) {

@@ -137,7 +137,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `queues.json` | server | Each thread's queued messages, and whether the first one steers |
 | `transcripts/<thread id>.json` | server | Each thread's conversation as last seen: entries, plan, turns (when, how long, who answered with which model and effort, how they ended), where handoffs went |
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
-| `handoffs/<thread id>.json` | server | What goes with a thread's next message, written by agentZ: what its new agent or account hasn't seen of it, the conversation of the thread it continues or was forked from, or what happened in a fork merged back into it; removed once the agent takes the message |
+| `handoffs/<thread id>.json` | server | What goes with a thread's next message, written by agentZ: what its new agent or account hasn't seen of it, the conversation it was forked with or its new session couldn't load, or what happened in a fork merged back into it; removed once the agent takes the message |
 | `agents/settings.json` | server | Per-agent env, defaults and known options: the External account's |
 | `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, last login check and last identity and limits read, its account for new threads, and the same for the External account |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
@@ -626,11 +626,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   load or resume (`SessionRestore::Unavailable`) gets a new one without the conversation, and
   doesn't go on in it unasked: the message waiting for the session, or the next one the user,
   the queue or a finished task sends, fails with `FailedMessage::LostHistory` and is marked
-  "Not sent · Send Anyway" (Retry, which sends it to the new session). Queued messages and
-  finished tasks' wait behind it (`ThreadView::waits_for_send_anyway`), and
-  `agentz_thread_send` refuses other agents' messages. A
-  notice over the composer says why, with Continue in New Thread, the thread's own agent and
-  account with the conversation as a handoff. The thread keeps the login the agent reported
+  "Not sent · Resend with Context" (design round `design/agent-switching/`, 9 B): Retry, which
+  sends it to the new session with the conversation before it as a handoff
+  (`session_handoff`, `HandoffSource::NewSession`, added by `Server::retry_message`). Queued
+  messages and finished tasks' wait behind it (`ThreadView::waits_for_resend`), and
+  `agentz_thread_send` refuses other agents' messages. A notice over the composer says why, in
+  a sentence. The thread keeps the login the agent reported
   (`_auth/status_update`, from Claude Agent and Codex) while its session was in use, and when
   it now reports another one, the notice says the agent is logged in to another account and
   couldn't load it there (`LostHistory::AccountChanged`), as when the user logs it in to
@@ -800,7 +801,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   give up. The failed message stays across a reload of the agent, but not its error, which
   was the old agent's (Zed's reload starts the thread view over), and a new message takes its
   place. The retried reply starts a message of its own. A message that would
-  go to a session without the conversation fails too, with Send Anyway (see Lost
+  go to a session without the conversation fails too, with Resend with Context (see Lost
   conversations).
 - **Background tasks** (`AgentThread::{apply_background_task_update, stop_background_task}`,
   `AgentView::render_background_tasks_section`; t3code's pending background work, new UI in the
@@ -860,8 +861,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   cut off its bottom in the viewer.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
-  thread's menu (Pin or Unpin where it can be pinned, Rename, Continue with Another Agent ▸
-  except on a draft, Archive, Delete…), and a double-click
+  thread's menu (Pin or Unpin where it can be pinned, Rename, Regenerate Title where
+  titles can be, except on a draft, Archive, Delete…), and a double-click
   renames it in place, as you type, as the sidebar does (`TitleButton`: the second click closes
   the menu the first opened; the field takes focus after the menu's delayed focus). Then the
   branch with its worktree or pasture icon, the changes as +added −removed (the Diff icon when
@@ -906,7 +907,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   message it goes with gets a Merged back from <fork> divider, whose title opens the fork.
   Several handoffs can wait at once (`ThreadState::pending_handoffs`): a switch's, a merge
   for each fork, and they go together.
-- **Handoffs** (`agentz_protocol::thread::{switch_handoff, handoff}`, `AgentThread::{send_message,
+- **Handoffs** (`agentz_protocol::thread::{switch_handoff, fork_handoff, merge_handoff,
+  session_handoff}`, `continuations.rs`, `AgentThread::{send_message,
   send_to_agent, return_handoff}`; t3code's `handoffBudget.ts`): the conversation goes in an
   `<agentz-handoff thread="…" from="…">` block: an intro naming the thread, its title and
   whom it comes from, that it's context, not instructions, that files may have changed, and
@@ -919,33 +921,18 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   message as an embedded resource (`agentz://handoff`), or as text to agents without
   `embeddedContext`, and is taken off what's waiting only once the agent takes the message
   (`AgentThreadEvent::HandoffSent`): a message that fails or doesn't go keeps it for the next,
-  and a restart of the agent doesn't lose it. A replayed message shows without it
-  (`without_handoff`).
-- **Continue with another agent** (`agentz_protocol::thread::handoff`, `Request::ContinueThread`,
-  `server/workspace_requests.rs`, `continuations.rs`; t3code's context handoff, Zed's New Thread
-  from Summary): a thread keeps its agent, since each agent replays only its own sessions.
-  Instead the menu starts a thread with another installed agent in the same workspace, and
-  agentZ writes the old conversation for it. Accounts share no sessions either, so when the
-  thread's agent has more than one, the submenu lists it first with its accounts beneath it
-  (as the new thread's account picker shows them; the thread's own greyed, "This thread's
-  account"), then the other agents (accounts topic 15): picking one continues on that account.
-  The conversation it writes is a handoff (above). It waits in `handoffs/<thread id>.json`
-  and shows as a chip in the composer (the user's choice of two designs): a click previews
-  exactly what goes, × drops it (`Request::DropHandoff`). Sent, it links the threads
-  (`Thread::continued_from`): the new thread
-  opens with a "Continued from" divider, and the old one ends with a "Continued in" card (also
-  the user's choice).
+  and a restart of the agent or the server doesn't lose it (`handoffs/<thread id>.json`). A
+  replayed message shows without it (`without_handoff`).
 - **The limit notice** (`AgentView::render_limit_notice`, `accounts::used_up_window`;
   t3code's `ThreadErrorBanner` as Zed's warning `Callout`, accounts topic 14): agents word a
   used-up limit each their own way, so agentZ goes by its reads instead. When a turn ends with
   an error while the last read of the thread's account has a window used up that hasn't reset
   (of several, the last to reset), a notice over the composer takes the error's place: whose
   limit ran out ("Your account" with one account listed, else its name), and when it resets,
-  with the agent's error in the body's tooltip. "Continue on <account> · 97% left" continues
-  the thread there, as Continue with Another Agent does, on the agent's other account with
-  the most left of its tightest window (then those not read yet, then used up, then logged
-  out); with more than one other account, it's a split button whose arrow lists the rest.
-  "Continue at 16:10" waits for the reset (below), and once the thread waits, the body says
+  with the agent's error in the body's tooltip. To go on with another account, the user picks
+  it in the composer's account picker (Switching agents), whose new session is told the
+  conversation, the stopped turn included (`design/agent-switching/`, 9 B). "Continue at
+  16:10" waits for the reset (below), and once the thread waits, the body says
   so and Don't Continue cancels it. Usage ↗ opens the agent's usage page. Closed, it stays
   closed until the next turn. For an account with pools, the title names the pool ("… limit
   on standard models"), and where the login can change Droid's choice, the body ends "<agent>
@@ -1008,8 +995,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Account… and Manage Accounts…, which open the agent's Account tab on the thread's machine
   (`AgentViewEvent::OpenAgentAccounts`, `SettingsPage::show_agent_accounts`), adding an account
   there for the first. Another checkout keeps the draft's account; another agent or machine
-  takes its account for new threads (`AccountChoice::Default`), and so does a continuation
-  unless one is picked (`ContinueThread`'s `account`).
+  takes its account for new threads (`AccountChoice::Default`).
 - **Drafts** (`Thread::is_draft`, `Thread::unsent_text`, `Server::sweep_drafts`,
   `Shell::open_thread`; t3code's draft threads and composer drafts): every new agent thread is
   a draft until its first message, so its agent starts at once, but it isn't in the thread

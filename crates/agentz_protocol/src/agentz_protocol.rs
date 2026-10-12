@@ -568,15 +568,6 @@ pub enum Request {
         connection: ConnectionId,
         method_id: acp::AuthMethodId,
     },
-    /// Starts a thread with another agent, in the same workspace, that continues this one: its
-    /// conversation goes with the new thread's first message ([`thread::handoff`]).
-    /// [`Response::ThreadCreated`].
-    ContinueThread {
-        thread_id: ThreadId,
-        agent_id: AgentId,
-        #[serde(default)]
-        account: AccountChoice,
-    },
     /// Goes on without a conversation the next message would have brought: the
     /// [`thread::PendingHandoff`] made then.
     DropHandoff {
@@ -616,7 +607,8 @@ pub enum Request {
     Logout(ConnectionId),
     RetrySession(ConnectionId),
     /// Sends the message that didn't get through ([`thread::ThreadState::failed_message`])
-    /// again, once the agent is ready.
+    /// again, once the agent is ready. One that failed for the lost conversation goes with it
+    /// ([`thread::session_handoff`]): Resend with Context.
     RetryMessage(ConnectionId),
     Reload(ConnectionId),
     /// From a login session: checks again whether the agent is logged in.

@@ -8,8 +8,8 @@ use agentz_protocol::accounts::{AccountChoice, AccountId};
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, Entry, HandoffSource, PendingHandoff, ThreadAgent, ThreadState, ThreadView,
-    fork_handoff, handoff, merge_handoff, switch_handoff,
+    ConnectionStatus, Entry, FailedMessage, HandoffSource, PendingHandoff, ThreadAgent,
+    ThreadState, ThreadView, fork_handoff, merge_handoff, session_handoff, switch_handoff,
 };
 use agentz_protocol::workspace::{RepositoryCheckouts, WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{ConnectionId, Request, Response};
@@ -401,64 +401,38 @@ impl Server {
         Ok(thread_id)
     }
 
-    /// "Continue with another agent": a thread with `agent_id` on `account` in `thread_id`'s
-    /// workspace, whose first message brings `thread_id`'s conversation ([`handoff`]), t3code's
-    /// context handoff. The conversation is the one the running agent replayed, so the thread
-    /// is open.
-    pub(super) fn continue_thread(
-        &mut self,
-        thread_id: ThreadId,
-        agent_id: AgentId,
-        account: AccountChoice,
-    ) -> Result<ThreadId> {
-        let thread = self
-            .projects
-            .thread(thread_id)
-            .context("no such thread")?
-            .clone();
-        anyhow::ensure!(
-            thread.terminal.is_none(),
-            "a terminal thread has no conversation to continue"
-        );
-        let running = self
-            .threads
-            .get(&thread_id)
-            .context("the thread's agent isn't running; open the thread first")?;
-        anyhow::ensure!(
-            *running.status() != ConnectionStatus::Connecting,
-            "the thread is still loading its conversation"
-        );
-        let from_agent = thread
-            .agent_id
-            .clone()
-            .map(|agent_id| self.agent_name(&AgentId::new(agent_id)))
-            .unwrap_or_else(|| running.agent_name().clone());
-        let handoff = handoff(running, thread_id, &from_agent, &thread.title);
-        anyhow::ensure!(
-            handoff.messages > 0,
-            "the thread has no conversation to continue yet"
-        );
-        let choice = thread
-            .workspace
-            .clone()
-            .map_or(WorkspaceChoice::Checkout, WorkspaceChoice::Existing);
-        let PreparedWorkspace::Ready(folder) = self.prepare_workspace(thread.project_id, choice)?
-        else {
-            return Err(anyhow!("the thread's workspace isn't ready"));
-        };
-        let account = self.choose_account(&agent_id, account)?;
-        let new_thread = self.create_thread_in(
-            thread.project_id,
-            NewThread::Agent(agent_id, account),
-            folder,
-        )?;
-        self.projects.set_started_in(new_thread, thread.started_in);
-        // Its first message links it to this thread.
-        continuations::save(&self.data_dir, new_thread, std::slice::from_ref(&handoff)).log_err();
-        self.update_thread(ConnectionId::Thread(new_thread), |thread| {
-            thread.add_handoff(handoff)
-        })?;
-        Ok(new_thread)
+    /// Retry ([`Request::RetryMessage`]). A message that failed for the lost conversation is
+    /// resent with it (Resend with Context): the session the agent opened in its place is told
+    /// the conversation before the message ([`session_handoff`]).
+    pub(super) fn retry_message(&mut self, connection: ConnectionId) -> Result<()> {
+        if let ConnectionId::Thread(thread_id) = connection
+            && let Some(running) = self.threads.get(&thread_id)
+            && running.failed_message() == Some(FailedMessage::LostHistory)
+            && let Some(thread) = self.projects.thread(thread_id)
+        {
+            let before = running
+                .entries
+                .iter()
+                .rposition(|entry| matches!(entry, Entry::UserMessage(_)))
+                .unwrap_or(running.entries.len());
+            let view = ThreadView {
+                entries: running.entries[..before].to_vec(),
+                state: running.state.clone(),
+            };
+            let agent_name = thread
+                .agent_id
+                .clone()
+                .map(|agent_id| self.agent_name(&AgentId::new(agent_id)).to_string())
+                .unwrap_or_else(|| running.agent_name().to_string());
+            if let Some(handoff) = session_handoff(&view, thread_id, &thread.title, &agent_name) {
+                let handoffs = self.update_thread(connection, |thread| {
+                    thread.add_handoff(handoff);
+                    thread.state.pending_handoffs.clone()
+                })?;
+                continuations::save(&self.data_dir, thread_id, &handoffs).log_err();
+            }
+        }
+        self.update_thread(connection, agent_thread::AgentThread::retry_message)
     }
 
     /// Fork from This Response ([`Request::ForkThread`]): a thread on the same agent and

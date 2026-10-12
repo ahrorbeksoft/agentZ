@@ -471,8 +471,8 @@ async fn prompts_a_thread_and_names_it() {
     assert!(error.is_err());
 }
 
-/// Retry sends a message whose turn failed again, with the conversation a continued thread
-/// brings, which went with it the first time. The thread shows the message once.
+/// Retry sends a message whose turn failed again, with the conversation a fork brings, which
+/// went with it the first time. The thread shows the message once.
 #[tokio::test(flavor = "multi_thread")]
 async fn retries_a_failed_message() {
     let Some(server) = TestServer::start() else {
@@ -495,10 +495,9 @@ async fn retries_a_failed_message() {
         })
         .await;
     let Response::ThreadCreated(new_id) = client
-        .ok(Request::ContinueThread {
+        .ok(Request::ForkThread {
             thread_id,
-            agent_id: AgentId::new("mock"),
-            account: AccountChoice::Default,
+            entry: 1,
         })
         .await
     else {
@@ -535,124 +534,8 @@ async fn retries_a_failed_message() {
         .iter()
         .filter(|entry| matches!(entry, Entry::UserMessage(_)))
         .count();
-    assert_eq!(user_messages, 1);
-}
-
-/// "Continue with another agent": a new thread in the same workspace, pointing back at the old
-/// one, whose first message brings the old conversation as embedded context.
-#[tokio::test(flavor = "multi_thread")]
-async fn continues_threads_with_another_agent() {
-    let Some(server) = TestServer::start() else {
-        return;
-    };
-    let mut client = server.connect().await;
-    client.ok(Request::SubscribeSession).await;
-    let thread_id = client.create_thread(&server).await;
-    let old = ConnectionId::Thread(thread_id);
-    client.subscribe_thread(old).await;
-    client
-        .ok(Request::Prompt {
-            connection: old,
-            prompt: PromptPart::text("build the page"),
-        })
-        .await;
-    client
-        .wait_until(|client| {
-            let thread = client.thread(old);
-            !thread.is_working() && agent_text(thread) == "Echo: build the page"
-        })
-        .await;
-
-    let Response::ThreadCreated(new_id) = client
-        .ok(Request::ContinueThread {
-            thread_id,
-            agent_id: AgentId::new("mock"),
-            account: AccountChoice::Default,
-        })
-        .await
-    else {
-        panic!("expected a thread");
-    };
-    let new = ConnectionId::Thread(new_id);
-    client.subscribe_thread(new).await;
-    let handoff = client
-        .thread(new)
-        .pending_handoffs()
-        .first()
-        .cloned()
-        .expect("the conversation waits for the first message");
-    assert_eq!(handoff.messages, 2);
-    assert!(
-        handoff
-            .text
-            .contains("<message from=\"user\" turn=\"1\">\nbuild the page\n</message>")
-    );
-    assert!(
-        handoff
-            .text
-            .contains("<message from=\"Mock\" turn=\"1\">\nEcho: build the page")
-    );
-    let saved = server
-        .data_dir
-        .path()
-        .join(format!("handoffs/{}.json", new_id.0));
-    assert!(saved.exists());
-    let continued_from = |client: &TestClient| {
-        client
-            .projects
-            .as_ref()
-            .and_then(|projects| projects.threads.iter().find(|thread| thread.id == new_id))
-            .and_then(|thread| thread.continued_from)
-    };
-    // A draft, which links to the old thread only once its first message goes.
-    assert_eq!(continued_from(&client), None);
-
-    client
-        .ok(Request::Prompt {
-            connection: new,
-            prompt: PromptPart::text("next"),
-        })
-        .await;
-    client
-        .wait_until(|client| continued_from(client) == Some(thread_id))
-        .await;
-    client
-        .wait_until(|client| {
-            let thread = client.thread(new);
-            !thread.is_working() && agent_text(thread) == "Echo: next [with agentz://handoff]"
-        })
-        .await;
-    let thread = client.thread(new);
-    assert!(thread.pending_handoffs().is_empty());
-    // Only the user's words are their message.
-    assert!(matches!(thread.entries().first(), Some(Entry::UserMessage(text)) if text == "next"));
-    assert!(!saved.exists());
-
-    // A continuation can run on another of the agent's accounts.
-    let Response::AccountAdded(work) = client.ok(Request::AddAccount(AgentId::new("mock"))).await
-    else {
-        panic!("expected an account");
-    };
-    let Response::ThreadCreated(on_work) = client
-        .ok(Request::ContinueThread {
-            thread_id,
-            agent_id: AgentId::new("mock"),
-            account: AccountChoice::Account(work),
-        })
-        .await
-    else {
-        panic!("expected a thread");
-    };
-    client
-        .wait_until(|client| {
-            client.projects.as_ref().is_some_and(|projects| {
-                projects
-                    .threads
-                    .iter()
-                    .any(|thread| thread.id == on_work && thread.account == Some(work))
-            })
-        })
-        .await;
+    // The one the fork began with, and the retried one once.
+    assert_eq!(user_messages, 2);
 }
 
 /// A thread goes on with another account between turns, in a session of its own, which its next
@@ -1278,20 +1161,10 @@ async fn removes_drafts_left_empty() {
         .await;
     assert!(thread(&client, thread_id).is_some_and(|thread| !thread.is_draft));
 
-    let Response::ThreadCreated(continuation) = client
-        .ok(Request::ContinueThread {
-            thread_id,
-            agent_id: AgentId::new("mock"),
-            account: AccountChoice::Default,
-        })
-        .await
-    else {
-        panic!("expected a thread");
-    };
     let project_id = thread(&client, thread_id)
         .expect("the thread exists")
         .project_id;
-    let mut drafts = vec![continuation];
+    let mut drafts = Vec::new();
     for _ in 0..2 {
         match client
             .ok(Request::CreateThread {
@@ -1306,8 +1179,8 @@ async fn removes_drafts_left_empty() {
             response => panic!("unexpected response: {response:?}"),
         }
     }
-    let [continuation, left, typed] = drafts[..] else {
-        panic!("expected three threads");
+    let [left, typed] = drafts[..] else {
+        panic!("expected two threads");
     };
     for thread_id in drafts.iter().copied() {
         client
@@ -1338,9 +1211,7 @@ async fn removes_drafts_left_empty() {
             .await;
     }
     client
-        .wait_until(|client| {
-            thread(client, continuation).is_none() && thread(client, left).is_none()
-        })
+        .wait_until(|client| thread(client, left).is_none())
         .await;
     let typed_thread = thread(&client, typed).expect("typed text keeps a draft");
     assert!(typed_thread.is_draft);
@@ -1351,9 +1222,6 @@ async fn removes_drafts_left_empty() {
         Some("and the @footer.css")
     );
     assert_eq!(typed_in_thread.unsent_mentions, vec![mention]);
-    let handoffs = server.data_dir.path().join("handoffs");
-    assert!(!handoffs.join(format!("{}.json", continuation.0)).exists());
-
     // Cleared, the draft goes like any other left empty.
     client
         .ok(Request::SetUnsentText {
@@ -8733,8 +8601,7 @@ async fn conversations_outlive_the_server() {
 
 /// A thread whose session doesn't load on the account the agent is logged in to now (another
 /// login made in a terminal) doesn't go on without its conversation: its messages, its queue
-/// and other agents' messages wait for the user, who sends anyway or continues in a new thread
-/// with the conversation.
+/// and other agents' messages wait for the user, who resends with the conversation.
 #[tokio::test(flavor = "multi_thread")]
 async fn threads_that_lost_their_conversation_wait_for_the_user() {
     let Some(mut command) = mock_agent() else {
@@ -8821,51 +8688,31 @@ async fn threads_that_lost_their_conversation_wait_for_the_user() {
         .await;
     client.queue(thread_id, "later").await;
 
-    let Response::ThreadCreated(new_id) = client
-        .ok(Request::ContinueThread {
-            thread_id,
-            agent_id: AgentId::new("mock"),
-            account: AccountChoice::of(None),
-        })
-        .await
-    else {
-        panic!("expected a thread");
-    };
-    let new = ConnectionId::Thread(new_id);
+    let other = client.create_thread_in(project_id).await;
     let code = client
         .tool_failure(
-            ToolCaller::Thread(new_id),
+            ToolCaller::Thread(other),
             "agentz_thread_send",
             json!({"threadId": thread_id.0, "message": "are you there?"}),
         )
         .await;
     assert_eq!(code, "thread_not_sendable");
-    client.wait_until_ready(new_id).await;
-    client
-        .ok(Request::Prompt {
-            connection: new,
-            prompt: PromptPart::text("next"),
-        })
-        .await;
-    client
-        .wait_until(|client| {
-            let thread = client.thread(new);
-            !thread.is_working() && agent_text(thread) == "Echo: next [with agentz://handoff]"
-        })
-        .await;
     assert_eq!(client.queued_texts(thread_id), ["later"]);
     assert_eq!(agent_text(client.thread(connection)), "Echo: hello");
 
+    // Resend with Context: the new session is told the conversation before the message.
     client.ok(Request::RetryMessage(connection)).await;
     client
         .wait_until(|client| {
             let thread = client.thread(connection);
-            !thread.is_working() && agent_text(thread) == "Echo: helloEcho: go onEcho: later"
+            !thread.is_working()
+                && agent_text(thread) == "Echo: helloEcho: go on [with agentz://handoff]Echo: later"
         })
         .await;
     let thread = client.thread(connection);
     assert_eq!(thread.lost_history(), None);
     assert_eq!(thread.failed_message(), None);
+    assert!(thread.pending_handoffs().is_empty());
     client
         .wait_until(|client| {
             client
