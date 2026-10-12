@@ -4202,13 +4202,14 @@ impl AgentView {
                 let store = store.clone();
                 let title = title.clone();
                 let rename = rename_from_menu.clone();
+                let client = client.clone();
                 // Drafts, Workspaces threads and agents' subthreads aren't pinned.
                 let is_pinned = store
                     .read(cx)
                     .thread(thread_id)
                     .filter(|thread| thread.can_pin())
                     .map(Thread::is_pinned);
-                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                Some(ContextMenu::build(window, cx, move |menu, _, cx| {
                     let rename = rename.clone();
                     let toggle_pinned = {
                         let store = store.clone();
@@ -4341,11 +4342,12 @@ impl AgentView {
                                 .handler(move |window, cx| rename(window, cx)),
                         );
                     if !is_draft {
-                        menu = menu.submenu_with_icon(
-                            "Continue with Another Agent",
-                            IconName::ArrowRight,
-                            continue_with,
-                        );
+                        menu = crate::sidebar::with_regenerate_title(menu, &client, thread_id, cx)
+                            .submenu_with_icon(
+                                "Continue with Another Agent",
+                                IconName::ArrowRight,
+                                continue_with,
+                            );
                     }
                     menu.separator()
                         .when(can_archive, |menu| {

@@ -754,6 +754,11 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::RegenerateTitle(thread_id),
+            } => self.regenerate_title(client, id, thread_id),
+            Input::Request {
+                client,
+                id,
                 request: Request::ProjectImageFiles(project_id),
             } => self.project_image_files(client, id, project_id),
             Input::Request {
@@ -1274,6 +1279,9 @@ impl Server {
             Request::ListFiles(_) => Err(anyhow!("listing files is handled separately")),
             Request::MentionedThread(_) => Err(anyhow!("mentioned threads are read separately")),
             Request::ProjectFavicon(_) => Err(anyhow!("favicons are handled separately")),
+            Request::RegenerateTitle(_) => {
+                Err(anyhow!("regenerating titles is handled separately"))
+            }
             Request::ClearStorage(_) => Err(anyhow!("clearing storage is handled separately")),
             Request::ProjectImageFiles(_) => {
                 Err(anyhow!("listing image files is handled separately"))

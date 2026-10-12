@@ -1,14 +1,16 @@
 //! Titles written by a CLI ([`crate::title_generation`]) for threads whose agent gives them
-//! none: once each, after the thread's first turn, unless the user has named it.
+//! none: once each, after the thread's first turn, unless the user has named it, and again
+//! whenever the user asks.
 
 use agentz_protocol::Response;
 use agentz_protocol::thread::{Entry, without_handoff};
 use agentz_protocol::title_generation::TitleGeneration;
-use anyhow::Result;
+use anyhow::{Context as _, Result, anyhow};
 use projects::ThreadId;
 
-use super::Server;
-use crate::title_generation;
+use super::{ClientId, Server};
+use crate::title_generation::{self, Speaker};
+use crate::transcripts;
 
 impl Server {
     pub(super) fn set_title_generation(&mut self, settings: TitleGeneration) -> Result<Response> {
@@ -65,7 +67,7 @@ impl Server {
         self.generated_titles.insert(thread_id);
         let search_path = self.title_generation_path.clone();
         self.spawn_then(
-            title_generation::generate(settings, message, search_path),
+            title_generation::generate(settings, title_generation::prompt(&message), search_path),
             move |server, result| match result {
                 Ok(title) => {
                     if server.agent_titled_threads.contains(&thread_id) {
@@ -84,4 +86,78 @@ impl Server {
             },
         );
     }
+
+    /// Titles the thread again from its conversation so far (t3code's Regenerate title), over
+    /// any title it has, and answers once it's set. A thread whose agent isn't running is
+    /// read from its transcript.
+    pub(super) fn regenerate_title(&mut self, client: ClientId, id: u64, thread_id: ThreadId) {
+        let settings = self.title_generation.settings.clone();
+        if !settings.enabled {
+            return self.respond(client, id, Err(anyhow!("title generation is off")));
+        }
+        let Some(thread) = self.projects.thread(thread_id) else {
+            return self.respond(client, id, Err(anyhow!("no such thread")));
+        };
+        let previous_title = thread.title.clone();
+        let loaded = self
+            .threads
+            .get(&thread_id)
+            .map(|thread| title_messages(thread.entries()));
+        let data_dir = self.data_dir.clone();
+        let search_path = self.title_generation_path.clone();
+        self.spawn_then(
+            async move {
+                let messages = match loaded {
+                    Some(messages) => messages,
+                    None => {
+                        let read = move || transcripts::load(&data_dir, thread_id);
+                        tokio::task::spawn_blocking(read)
+                            .await
+                            .context("reading the transcript")??
+                            .map(|transcript| title_messages(&transcript.entries))
+                            .unwrap_or_default()
+                    }
+                };
+                let contents = title_generation::thread_context(&messages);
+                if contents.is_empty() {
+                    return Err(anyhow!("the thread has no messages to title it by"));
+                }
+                let prompt = title_generation::regeneration_prompt(&previous_title, &contents);
+                title_generation::generate(settings, prompt, search_path).await
+            },
+            move |server, result| {
+                let result = result.map(|title| {
+                    server.projects.rename_thread(thread_id, title);
+                    // Asked for, the new title shows even over a name the user gave.
+                    if server
+                        .projects
+                        .thread(thread_id)
+                        .is_some_and(|thread| thread.has_custom_title)
+                    {
+                        server.projects.set_custom_title(thread_id, String::new());
+                    }
+                    Response::Ok
+                });
+                if let Err(error) = &result {
+                    log::warn!(
+                        "couldn't regenerate the title of thread {}: {error:#}",
+                        thread_id.0
+                    );
+                }
+                server.respond(client, id, result);
+            },
+        );
+    }
+}
+
+/// The user's messages and the agent's replies, in order, for [`title_generation::thread_context`].
+fn title_messages(entries: &[Entry]) -> Vec<(Speaker, String)> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::UserMessage(text) => Some((Speaker::User, without_handoff(text).to_string())),
+            Entry::AgentMessage(text) => Some((Speaker::Agent, text.clone())),
+            _ => None,
+        })
+        .collect()
 }

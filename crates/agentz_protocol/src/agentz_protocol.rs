@@ -776,6 +776,10 @@ pub enum Request {
     /// How the machine titles threads whose agent doesn't. Reaches session subscribers as
     /// [`Event::TitleGeneration`], once the server has looked for the providers again.
     SetTitleGeneration(title_generation::TitleGeneration),
+    /// Titles the thread again from its conversation so far, as t3code's Regenerate title
+    /// does, even over a title the user gave it. Answered once the title is set, or with why
+    /// it couldn't be (title generation is off, or the CLI failed).
+    RegenerateTitle(ThreadId),
     /// The answer to an [`Event::RelayToolCall`].
     RelayToolResult {
         relay_id: u64,

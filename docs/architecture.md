@@ -277,6 +277,13 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   rename get one, once each, as their automatic title. The server looks for the CLIs at
   start and whenever the setting changes, with Codex's models from `codex debug models` and
   the others' from t3code's lists; the page picks the provider, model and reasoning effort.
+  While it's on, Regenerate Title (t3code's Regenerate title, after Rename in a card's menu
+  and the title menu; not on drafts or terminal threads) titles the thread again
+  (`Request::RegenerateTitle`) with t3code's regeneration prompt, which names the previous
+  title, over the thread's messages within t3code's budget (`title_generation::thread_context`,
+  from its transcript when its agent isn't running). The new title replaces even the user's
+  own. The entry reads "Regenerating Title…", disabled, till the server answers
+  (`ServerClient::regenerate_title`).
 - **Pinned threads** (`sidebar.rs`, `Machines::active_threads`, `projects::order_key`; t3code's
   `pinnedAt`, order keys and `planSidebarThreadDrop`, the user's picks in `design/pins/`):
   pinned cards come first, with nothing between them and the rest, each with a muted pin

@@ -8680,6 +8680,69 @@ fn thread_title(client: &TestClient, thread_id: ThreadId) -> Option<String> {
         .map(|thread| thread.title.clone())
 }
 
+/// Asked to, the server titles a thread again from its conversation, as t3code's Regenerate
+/// title does, even over the user's own title; while title generation is off, it says no.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn regenerates_a_title_on_request() {
+    use agentz_protocol::title_generation::TitleGeneration;
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let (clis, search_path) = fake_title_clis("Login Redirect Fix");
+    let Some(server) = TestServer::start_with_config(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        None,
+        Some(search_path),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    client
+        .ok(Request::RenameThread {
+            thread_id,
+            title: "Mine".into(),
+        })
+        .await;
+    prompt_and_wait(&mut client, thread_id, "fix the login redirect").await;
+    assert!(
+        client
+            .request(Request::RegenerateTitle(thread_id))
+            .await
+            .is_err()
+    );
+
+    client
+        .ok(Request::SetTitleGeneration(TitleGeneration {
+            enabled: true,
+            ..TitleGeneration::default()
+        }))
+        .await;
+    client.ok(Request::RegenerateTitle(thread_id)).await;
+    client
+        .wait_until(|client| {
+            thread_title(client, thread_id).as_deref() == Some("Login Redirect Fix")
+        })
+        .await;
+    let calls = title_cli_calls(clis.path());
+    let [call] = calls.as_slice() else {
+        panic!("expected one call, got {calls:#?}");
+    };
+    let prompt = call["stdin"].as_str().expect("prompt");
+    assert!(prompt.starts_with("Regenerate the title for an existing agentZ thread"));
+    assert!(prompt.contains("The previous title was \"Mine\"."));
+    assert!(
+        prompt.contains("\n\nThread contents:\nUSER:\nfix the login redirect\n\nASSISTANT:\n"),
+        "{prompt}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn titles_threads_their_agent_does_not_name() {

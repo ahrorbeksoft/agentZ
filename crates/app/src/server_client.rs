@@ -3,7 +3,7 @@
 //! (projects, registry, agent settings) and of its open threads and terminals up to date, and
 //! reconnects when the connection drops. While it's down, the copies stay as they were.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use projects::ThreadId;
 use ui::SharedString;
+use util::ResultExt as _;
 
 use crate::agent_icons::AgentIconStore;
 use crate::machines::MachineId;
@@ -133,6 +134,8 @@ pub struct ServerClient {
     machine_icon: MachineIcon,
     /// How the machine titles threads whose agent doesn't, and the CLIs it found for it.
     title_generation: TitleGenerationState,
+    /// Threads whose title was asked to be regenerated, till the server answers.
+    regenerating_titles: HashSet<ThreadId>,
     /// What agentZ keeps on the machine, as its server last measured it.
     storage: Storage,
     /// The machine's published artifacts, and where its pages server is.
@@ -190,6 +193,7 @@ impl ServerClient {
                 unseen_panes: BTreeSet::new(),
                 machine_icon: MachineIcon::default(),
                 title_generation: TitleGenerationState::default(),
+                regenerating_titles: HashSet::default(),
                 storage: Storage::default(),
                 artifacts: Artifacts::default(),
                 threads: HashMap::default(),
@@ -580,6 +584,34 @@ impl ServerClient {
 
     pub fn title_generation(&self) -> &TitleGenerationState {
         &self.title_generation
+    }
+
+    /// Titles the thread again from its conversation (`Request::RegenerateTitle`), as
+    /// t3code's Regenerate title does; [`Self::is_regenerating_title`] till it's done.
+    pub fn regenerate_title(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        if !self.regenerating_titles.insert(thread_id) {
+            return;
+        }
+        cx.notify();
+        let response = self.request(Request::RegenerateTitle(thread_id));
+        cx.spawn(async move |this, cx| {
+            response.await.log_err();
+            this.update(cx, |this, cx| {
+                this.regenerating_titles.remove(&thread_id);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn is_regenerating_title(&self, thread_id: ThreadId) -> bool {
+        self.regenerating_titles.contains(&thread_id)
+    }
+
+    /// Whether the machine titles threads, so it can title one again.
+    pub fn can_regenerate_titles(&self) -> bool {
+        self.title_generation.settings.enabled
     }
 
     /// Changes how the machine titles threads. Shown at once; the server's answer, with the

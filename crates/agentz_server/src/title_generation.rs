@@ -24,6 +24,10 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
 /// t3code's budget for the user's message in the prompt.
 const MESSAGE_BUDGET: usize = 8_000;
 const TRUNCATED: &str = "\n[Content truncated]\n";
+/// t3code's budget for a thread's messages, when its title is regenerated, and for each.
+const CONTEXT_BUDGET: usize = 8_000;
+const MESSAGE_LIMIT: isize = 2_000;
+const EARLIER_TRUNCATED: &str = "[Earlier content truncated]\n\n";
 /// The prompt asks for under 40 characters; this only stops a runaway model.
 const MAX_TITLE_CHARS: usize = 120;
 
@@ -54,6 +58,44 @@ Editorial rules:
 - When a URL or attachment is the only source of the subject, use available tools to inspect it directly.
 - Local git history is not evidence of what a linked PR or issue is about. Never title the thread after branch names, commit messages, or merged commits found in the checkout.
 - If a linked PR or issue cannot be read, fall back to the user's stated action plus its number, such as \"Take Over PR 8588\". This is the one case where a PR or issue number belongs in the title.";
+
+/// t3code's `regenerateThreadTitlePrompt`, about agentZ, up to the previous title.
+const REGENERATION_PROMPT_START: &str =
+    "Regenerate the title for an existing agentZ thread so the user can recognize it weeks later.
+The previous title was ";
+
+/// The rest of t3code's `regenerateThreadTitlePrompt`, after the previous title.
+const REGENERATION_PROMPT: &str = "Return JSON with keys title and needsRefinement. Set needsRefinement to false.
+
+Determine the title in this order:
+1. Read the USER messages first. Identify the latest explicit durable goal. The original subject remains the subject until the user clearly changes what the thread is about.
+2. Use ASSISTANT messages to resolve vague links, unnamed code, and discovered product nouns. Do not promote one assistant finding into the thread subject unless the user adopts it as a new goal.
+3. Compare that subject with the previous title. Preserve accurate scope words, especially when earlier content is truncated. Replace the previous title when it is generic, artifact-based, a completion update, or contradicted by the thread.
+4. Title the durable subject and desired outcome, not the current workflow state.
+
+Editorial rules:
+- 3-8 words, fewer than 40 characters.
+- Use a compact noun phrase or clear action phrase.
+- Preserve the umbrella subject when later messages focus on one finding, provider, platform, or implementation detail.
+- A thread progressing through research, planning, implementation, review, CI, merge, and monitoring has usually not changed subjects.
+- Ignore deliverables and operations such as mocks, plans, HTML, branches, PRs, tests, CI, commits, merging, and monitoring unless they are the actual topic.
+- Models, subagents, tools, output formats, and monitoring instructions do not belong in the title unless they are themselves the topic.
+- Treat final operational follow-ups and assistant completion summaries as weak evidence of subject.
+- For reviews, name the reviewed feature or system and its durable concern, not one finding from the review.
+- For research, name the question domain rather than the research process.
+- Do not claim the work is complete.
+- Do not copy and truncate a thread message.
+- Avoid project names already visible in the UI, PR numbers, quotes, labels, filler, and trailing punctuation.
+- Use attached images as primary context for UI issues.
+- When a URL or attachment is the only source of the subject, use available tools to inspect it directly.
+- Local git history is not evidence of what a linked PR or issue is about. Never title the thread after branch names, commit messages, or merged commits found in the checkout.
+- If a linked PR or issue cannot be read, fall back to the user's stated action plus its number, such as \"Take Over PR 8588\". This is the one case where a PR or issue number belongs in the title.
+- Keep the previous title unchanged if it is already accurate. Otherwise return a meaningfully improved title, not a cosmetic paraphrase.
+
+Examples of the distinction:
+- A subagent-monitoring review that finds a Codex roster bug remains \"Review Subagent Monitoring Risks,\" not \"Codex Roster Bug Review.\"
+- A vague failing-test request later identified as a lazy thread-feed mismatch becomes \"Fix Lazy Thread Feed Test,\" not \"Prevent Mobile Feed Regressions.\"
+- A QR-sharing overhaul that ends with CI and merge work remains about QR sharing, not the PR lifecycle.";
 
 fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("title-generation.json")
@@ -251,6 +293,135 @@ pub(crate) fn prompt(message: &str) -> String {
     )
 }
 
+/// t3code's `buildThreadTitlePrompt` with a previous title: its regeneration prompt, about
+/// agentZ, over the thread's messages ([`thread_context`]).
+pub(crate) fn regeneration_prompt(previous_title: &str, contents: &str) -> String {
+    let previous_title = serde_json::to_string(previous_title).unwrap_or_default();
+    format!(
+        "{REGENERATION_PROMPT_START}{previous_title}.\n{REGENERATION_PROMPT}\n\nThread contents:\n{contents}"
+    )
+}
+
+/// Who said a message, for [`thread_context`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Speaker {
+    User,
+    Agent,
+}
+
+impl Speaker {
+    fn prefix(self) -> &'static str {
+        match self {
+            Speaker::User => "USER:\n",
+            Speaker::Agent => "ASSISTANT:\n",
+        }
+    }
+}
+
+/// t3code's `formatThreadTitleContext`: the thread's messages in order, each under who said
+/// it, within a budget. The first user message comes first, then the latest user messages, up
+/// to 6,000 characters the agent's replies can't take, then the agent's latest replies, and
+/// any room left lets the chosen ones grow.
+pub(crate) fn thread_context(messages: &[(Speaker, String)]) -> String {
+    let sections: Vec<(Speaker, &str)> = messages
+        .iter()
+        .map(|(speaker, text)| (*speaker, text.trim()))
+        .filter(|(_, text)| !text.is_empty())
+        .collect();
+    let mut context = Context {
+        sections: &sections,
+        selected: vec![None; sections.len()],
+        remaining: (CONTEXT_BUDGET - EARLIER_TRUNCATED.len()) as isize,
+    };
+    let from_latest = |speaker: Speaker| -> Vec<usize> {
+        (0..sections.len())
+            .rev()
+            .filter(|index| sections[*index].0 == speaker)
+            .collect()
+    };
+    if let Some(first) = sections
+        .iter()
+        .position(|(speaker, _)| *speaker == Speaker::User)
+    {
+        context.add(first, MESSAGE_LIMIT);
+    }
+    for index in from_latest(Speaker::User) {
+        context.add(index, MESSAGE_LIMIT.min(context.remaining - 2_000));
+    }
+    for index in from_latest(Speaker::Agent) {
+        context.add(index, MESSAGE_LIMIT);
+    }
+    // A short thread's messages fill the room left.
+    for speaker in [Speaker::User, Speaker::Agent] {
+        for index in from_latest(speaker) {
+            context.expand(index);
+        }
+    }
+    let shortened = sections
+        .iter()
+        .zip(&context.selected)
+        .any(|((speaker, text), section)| match section {
+            Some(section) => *section != format!("{}{text}", speaker.prefix()),
+            None => true,
+        });
+    let retained: Vec<String> = context.selected.into_iter().flatten().collect();
+    let contents = retained.join("\n\n");
+    if shortened && !contents.is_empty() {
+        format!("{EARLIER_TRUNCATED}{contents}")
+    } else {
+        contents
+    }
+}
+
+/// The messages [`thread_context`] has chosen so far, and the room left.
+struct Context<'a> {
+    sections: &'a [(Speaker, &'a str)],
+    selected: Vec<Option<String>>,
+    remaining: isize,
+}
+
+impl Context<'_> {
+    /// Chooses the message, shortened to `budget` or the room left, unless it's chosen already
+    /// or too little room is left for it.
+    fn add(&mut self, index: usize, budget: isize) {
+        if self.selected[index].is_some() {
+            return;
+        }
+        let (speaker, text) = self.sections[index];
+        let limit = budget.min(self.remaining) - chars(speaker.prefix()) - 2;
+        if limit <= chars(TRUNCATED) {
+            return;
+        }
+        let section = format!(
+            "{}{}",
+            speaker.prefix(),
+            limit_message(text, limit as usize)
+        );
+        self.remaining -= chars(&section) + 2;
+        self.selected[index] = Some(section);
+    }
+
+    /// Lets a chosen message grow into the room left.
+    fn expand(&mut self, index: usize) {
+        let Some(previous) = self.selected[index].as_ref() else {
+            return;
+        };
+        let (speaker, text) = self.sections[index];
+        let budget = chars(previous) + self.remaining - chars(speaker.prefix());
+        let expanded = format!(
+            "{}{}",
+            speaker.prefix(),
+            limit_message(text, budget.max(0) as usize)
+        );
+        self.remaining -= chars(&expanded) - chars(previous);
+        self.selected[index] = Some(expanded);
+    }
+}
+
+fn chars(text: &str) -> isize {
+    text.chars().count() as isize
+}
+
 fn output_schema() -> Value {
     json!({
         "type": "object",
@@ -285,11 +456,11 @@ pub(crate) fn sanitize_title(raw: &str) -> Option<String> {
     Some(format!("{}...", cut.trim_end()))
 }
 
-/// A title for a thread whose first message is `message`, from the chosen CLI on
-/// `search_path` (the server's `PATH` if `None`).
+/// A title from the chosen CLI on `search_path` (the server's `PATH` if `None`), for the
+/// [`prompt`] of a thread's first message or the [`regeneration_prompt`] of its messages.
 pub(crate) async fn generate(
     settings: TitleGeneration,
-    message: String,
+    prompt: String,
     search_path: Option<OsString>,
 ) -> Result<String> {
     let program = find_program(&settings.provider, search_path.as_ref()).ok_or_else(|| {
@@ -302,14 +473,7 @@ pub(crate) async fn generate(
     let directory = std::env::temp_dir().join(format!("agentz-title-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("creating {}", directory.display()))?;
-    let result = run(
-        &settings,
-        &program,
-        &directory,
-        &prompt(&message),
-        search_path,
-    )
-    .await;
+    let result = run(&settings, &program, &directory, &prompt, search_path).await;
     if let Err(error) = std::fs::remove_dir_all(&directory) {
         log::warn!("couldn't remove {}: {error}", directory.display());
     }
@@ -463,6 +627,51 @@ fn antigravity_title(stdout: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A short thread's messages go in whole, in order; a long one's keep the first and latest
+    /// user messages over the agent's replies, under a note that some were left out.
+    #[test]
+    fn a_threads_messages_fit_t3codes_budget() {
+        let short = [
+            (Speaker::User, "fix the login redirect".to_string()),
+            (Speaker::Agent, "Fixed it in auth.ts.".to_string()),
+            (Speaker::User, "  ".to_string()),
+        ];
+        assert_eq!(
+            thread_context(&short),
+            "USER:\nfix the login redirect\n\nASSISTANT:\nFixed it in auth.ts."
+        );
+        assert_eq!(thread_context(&[]), "");
+
+        let long: Vec<(Speaker, String)> = (0..20)
+            .flat_map(|turn| {
+                [
+                    (Speaker::User, format!("ask {turn} {}", "u".repeat(900))),
+                    (Speaker::Agent, format!("reply {turn} {}", "a".repeat(900))),
+                ]
+            })
+            .collect();
+        let context = thread_context(&long);
+        assert!(context.starts_with(EARLIER_TRUNCATED));
+        assert!(context.chars().count() <= CONTEXT_BUDGET);
+        assert!(context.contains("USER:\nask 0 "));
+        assert!(context.contains("USER:\nask 19 "));
+        assert!(context.contains("ASSISTANT:\nreply 19 "));
+        assert!(!context.contains("ASSISTANT:\nreply 0 "));
+        let first = context.find("ask 0 ").expect("the first message");
+        let latest = context.find("ask 19 ").expect("the latest message");
+        assert!(first < latest, "in the thread's order");
+    }
+
+    #[test]
+    fn regeneration_names_the_previous_title() {
+        let prompt = regeneration_prompt("Login \"redirect\"", "USER:\nfix it");
+        assert!(prompt.starts_with(
+            "Regenerate the title for an existing agentZ thread so the user can recognize it \
+             weeks later.\nThe previous title was \"Login \\\"redirect\\\"\".\nReturn JSON"
+        ));
+        assert!(prompt.ends_with("\n\nThread contents:\nUSER:\nfix it"));
+    }
 
     #[test]
     fn titles_are_sanitized_as_t3code_does() {

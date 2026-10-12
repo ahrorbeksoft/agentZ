@@ -12,6 +12,7 @@ use crate::machines::{
     MachineId, Machines, ProjectKey, Scope, ThreadKey, by_latest_activity, project_at,
 };
 use crate::project_store::{ProjectStore, ThreadStatus};
+use crate::server_client::ServerClient;
 use crate::settings_page::{AccountEntry, account_entry, render_entry_avatar};
 use crate::slide_drag::{
     DRAG_SCROLL_STEP, SlideDrag, drag_scroll_direction, render_raised_rows, scroll_while_held,
@@ -24,7 +25,8 @@ use gpui::{
     Subscription, Task, Window, anchored, canvas, deferred, svg,
 };
 use projects::{
-    GitHead, Project, Thread, ThreadOrder, ThreadSection, Workspace, WorkspaceKind, order_key,
+    GitHead, Project, Thread, ThreadId, ThreadOrder, ThreadSection, Workspace, WorkspaceKind,
+    order_key,
 };
 use text_input::{TextInput, TextInputEvent};
 use ui::{
@@ -749,6 +751,10 @@ impl Sidebar {
         let title = SharedString::from(thread.title.clone());
         let in_workspaces = thread.in_workspaces();
         let is_chat = thread.is_chat();
+        // A terminal thread and a draft have no conversation to title them by.
+        let titles_client = (!is_terminal && !thread.is_draft)
+            .then(|| Machines::global(cx).read(cx).client(machine, cx))
+            .flatten();
         // `None` for the threads that aren't pinned: shells, agent CLIs and Workspaces threads.
         let is_pinned = thread.can_pin().then(|| thread.is_pinned());
         let checkout = self.thread_checkout(machine, thread, cx);
@@ -771,7 +777,8 @@ impl Sidebar {
             let sidebar = sidebar.clone();
             let title = title.clone();
             let new_project = new_project.clone();
-            ContextMenu::build(window, cx, move |menu, _, _| {
+            let titles_client = titles_client.clone();
+            ContextMenu::build(window, cx, move |menu, _, cx| {
                 let pasture_action = |action: PastureAction| {
                     let sidebar = sidebar.clone();
                     move |window: &mut Window, cx: &mut App| {
@@ -859,6 +866,10 @@ impl Sidebar {
                             .icon_color(Color::Muted)
                             .handler(rename),
                     );
+                let menu = match &titles_client {
+                    Some(client) => with_regenerate_title(menu, client, thread_id.thread, cx),
+                    None => menu,
+                };
                 if is_chat {
                     return menu.separator().item(
                         ContextMenuEntry::new("Delete…")
@@ -4228,6 +4239,34 @@ mod view_tests {
         let_go(held, cx);
         assert_eq!(organizing_requests(cx), []);
     }
+}
+
+/// t3code's Regenerate title, after Rename in a thread's menus, while the thread's machine
+/// titles threads; "Regenerating Title…" and disabled till the new title is set.
+pub(crate) fn with_regenerate_title(
+    menu: ContextMenu,
+    client: &Entity<ServerClient>,
+    thread: ThreadId,
+    cx: &App,
+) -> ContextMenu {
+    if !client.read(cx).can_regenerate_titles() {
+        return menu;
+    }
+    let is_regenerating = client.read(cx).is_regenerating_title(thread);
+    let client = client.clone();
+    menu.item(
+        ContextMenuEntry::new(if is_regenerating {
+            "Regenerating Title…"
+        } else {
+            "Regenerate Title"
+        })
+        .icon(IconName::RefreshTitle)
+        .icon_color(Color::Muted)
+        .disabled(is_regenerating)
+        .handler(move |_, cx| {
+            client.update(cx, |client, cx| client.regenerate_title(thread, cx));
+        }),
+    )
 }
 
 /// The icon of the agent a thread runs, in `color`, on its account's color
