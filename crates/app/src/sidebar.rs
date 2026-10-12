@@ -484,6 +484,7 @@ impl Sidebar {
 
     fn render_rename_input(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .debug_selector(|| "sidebar-rename".into())
             .flex_1()
             .min_w_0()
             .key_context(RENAME_KEY_CONTEXT)
@@ -549,6 +550,7 @@ impl Sidebar {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = !self.search_query(cx).is_empty();
         h_flex()
+            .debug_selector(|| "sidebar-search".into())
             .key_context(SEARCH_KEY_CONTEXT)
             .on_action(
                 cx.listener(|this, _: &menu::SelectNext, _, cx| {
@@ -3638,6 +3640,69 @@ mod view_tests {
             )
         });
         cx.run_until_parked();
+    }
+
+    /// Asserts that `input` draws its cursor, at the end of its text, inside `selector`'s box.
+    fn assert_cursor_in_view(
+        input: &Entity<text_input::TextInput>,
+        selector: &'static str,
+        cx: &mut VisualTestContext,
+    ) {
+        use gpui::EntityInputHandler as _;
+        cx.run_until_parked();
+        let cursor = input
+            .update_in(cx, |input, window, cx| {
+                let end = input.text().len();
+                input.bounds_for_range(end..end, Bounds::default(), window, cx)
+            })
+            .expect("the input is laid out");
+        let frame = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is shown"));
+        assert!(
+            frame.left() <= cursor.left() && cursor.left() < frame.right(),
+            "the cursor {cursor:?} is outside {selector} {frame:?}"
+        );
+    }
+
+    /// The search and a thread's rename follow the cursor past their end, as a browser's
+    /// field does, on one line.
+    #[gpui::test]
+    fn the_search_and_a_rename_follow_the_cursor(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        show(&store, vec![thread(1, false, None)], cx);
+        let long = "a title far longer than the sidebar has room for ".repeat(10);
+
+        let search = sidebar.read_with(cx, |sidebar, _| sidebar.search.clone());
+        let focus = search.read_with(cx, |search, cx| gpui::Focusable::focus_handle(search, cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input(&long);
+        assert_cursor_in_view(&search, "sidebar-search", cx);
+        search.update(cx, |search, cx| search.set_text("", cx));
+        cx.run_until_parked();
+
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            let key = ThreadKey {
+                machine: MachineId::Local,
+                thread: ThreadId(1),
+            };
+            sidebar.start_renaming(key, "Thread 1".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let one_line = cx
+            .debug_bounds("sidebar-rename")
+            .expect("the rename is shown")
+            .size
+            .height;
+        cx.simulate_input(&long);
+        let rename = sidebar.read_with(cx, |sidebar, _| sidebar.rename_input.clone());
+        assert_cursor_in_view(&rename, "sidebar-rename", cx);
+        let height = cx
+            .debug_bounds("sidebar-rename")
+            .expect("the rename is shown")
+            .size
+            .height;
+        assert_eq!(height, one_line);
     }
 
     /// A thread's agent icon sits on its account's color while the agent has another account,

@@ -4391,6 +4391,7 @@ impl AgentView {
     fn render_rename_input(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
         div()
+            .debug_selector(|| "header-rename".into())
             .flex_1()
             .min_w_0()
             .max_w(px(480.))
@@ -15277,6 +15278,40 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(composer_text(cx), "");
         assert!(view.read_with(cx, |view, cx| view.is_untouched_draft(cx)));
+    }
+
+    /// Renaming in the header follows the cursor past the field's end, as a browser's field
+    /// does, on one line.
+    #[gpui::test]
+    fn the_headers_rename_follows_the_cursor(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        let (view, cx) = open(2, false, cx);
+        view.update_in(cx, |view, window, cx| view.start_rename(window, cx));
+        cx.run_until_parked();
+        let rename = view.read_with(cx, |view, _| view.rename_input.clone());
+        let focus = rename.read_with(cx, |rename, cx| rename.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let one_line = cx
+            .debug_bounds("header-rename")
+            .expect("the rename is shown")
+            .size
+            .height;
+        cx.simulate_input(&"a title far longer than the header has room for ".repeat(10));
+        cx.run_until_parked();
+        let cursor = rename
+            .update_in(cx, |rename, window, cx| {
+                let end = rename.text().len();
+                rename.bounds_for_range(end..end, Bounds::default(), window, cx)
+            })
+            .expect("the field is laid out");
+        let frame = cx
+            .debug_bounds("header-rename")
+            .expect("the rename is shown");
+        assert!(
+            frame.left() <= cursor.left() && cursor.left() < frame.right(),
+            "the cursor {cursor:?} is outside the field {frame:?}"
+        );
+        assert_eq!(frame.size.height, one_line);
     }
 
     #[gpui::test]
