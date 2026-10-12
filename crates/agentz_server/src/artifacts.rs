@@ -12,8 +12,8 @@ use std::time::SystemTime;
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::artifacts::{
     Artifact, ArtifactFile, ArtifactId, ArtifactKind, ArtifactVersion, Design, DesignDefaults,
-    DesignPicks, DesignSettings, DesignState, DesignTopic, MAX_ARTIFACT_SIZE, TODAY, TopicPicks,
-    VariantChange,
+    DesignPicks, DesignSettings, DesignState, DesignTopic, DesignVariant, MAX_ARTIFACT_SIZE, TODAY,
+    TopicPicks, VariantChange,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use projects::{ProjectId, ThreadId};
@@ -382,12 +382,15 @@ impl ArtifactStore {
             .iter()
             .any(|file| file.name == name);
         ensure!(known, "the version has no file {name}");
-        Ok(self
-            .folder
+        Ok(self.files_folder(id, version).join(name))
+    }
+
+    /// Where a version's files are kept, each by its name ([`ArtifactVersion::files`]).
+    pub fn files_folder(&self, id: &ArtifactId, version: u32) -> PathBuf {
+        self.folder
             .join(&id.0)
             .join("files")
             .join(version.to_string())
-            .join(name))
     }
 
     /// Deletes the artifact and its folder.
@@ -808,9 +811,11 @@ pub(crate) fn design_state(design: &Design, picks: &DesignPicks) -> DesignState 
     }
 }
 
-/// A design's picks and comments as the agent reads them (topic 24 B), like the design
-/// board's `decisions.md`: whether it's submitted, then a heading per topic with the pick by
-/// letter and name, each picked variant's description, and the comments.
+/// A design as the agent reads it (topic 24 B), like a design round's README and
+/// `decisions.md` together: whether it's submitted, the intro, then a heading per topic with
+/// the pick by letter and name, the topic's description, and every variant, today's first,
+/// with its words, its files by name, whether it's picked, an Also or recommended, and its
+/// comment. An agent reading another thread's design learns what the pick was up against.
 pub(crate) fn design_text(
     title: &str,
     version: u32,
@@ -834,6 +839,9 @@ pub(crate) fn design_text(
     } else {
         "The user's picks and comments so far.\n"
     });
+    if !design.intro.is_empty() {
+        text.push_str(&format!("\n{}\n", design.intro));
+    }
     for (index, topic) in design.topics.iter().enumerate() {
         let topic_picks = picks.topic(index);
         text.push('\n');
@@ -853,35 +861,78 @@ pub(crate) fn design_text(
             None => "not decided".to_string(),
         };
         text.push_str(&format!("## {}. {}: {heading}\n", index + 1, topic.title));
-        let mut described = Vec::new();
-        let picked = topic_picks.pick.iter().map(|key| (key, false));
-        let also = topic_picks.also.iter().map(|key| (key, true));
-        for (key, is_also) in picked.chain(also) {
-            let Some(variant) = topic.variant(key) else {
-                continue;
-            };
-            let label = topic.label(key);
-            let prefix = if is_also { "Also " } else { "" };
-            if variant.description.is_empty() {
-                text.push_str(&format!("**{prefix}{label}**\n"));
-            } else {
-                text.push_str(&format!("**{prefix}{label}:** {}\n", variant.description));
-            }
-            if let Some(comment) = topic_picks.comments.get(key) {
-                text.push_str(&format!(
-                    "**Comment on {}:** {comment}\n",
-                    topic.short_label(key)
-                ));
-            }
-            described.push(key.clone());
+        if !topic.description.is_empty() {
+            text.push_str(&format!("{}\n", topic.description));
         }
-        for (key, comment) in &topic_picks.comments {
-            if !described.contains(key) {
-                text.push_str(&format!("**Comment on {}:** {comment}\n", topic.label(key)));
-            }
+        let today = topic.today.iter().map(|today| (TODAY, today));
+        let variants = topic
+            .variants
+            .iter()
+            .map(|variant| (variant.name.as_str(), variant));
+        for (key, variant) in today.chain(variants) {
+            text.push('\n');
+            variant_text(&mut text, topic, key, variant, &topic_picks);
         }
     }
     text
+}
+
+/// A variant in [`design_text`]: "**B. Compare table (picked, recommended):** Its words.",
+/// then its Good, Cost, files and comment.
+fn variant_text(
+    text: &mut String,
+    topic: &DesignTopic,
+    key: &str,
+    variant: &DesignVariant,
+    picks: &TopicPicks,
+) {
+    let mut tags = Vec::new();
+    if key == TODAY {
+        tags.push("today's");
+    }
+    if picks.pick.as_deref() == Some(key) {
+        tags.push("picked");
+    }
+    if picks.also.iter().any(|also| also == key) {
+        tags.push("also");
+    }
+    if key != TODAY && topic.recommended.as_deref() == Some(key) {
+        tags.push("recommended");
+    }
+    let mut label = if key == TODAY {
+        variant.name.clone()
+    } else {
+        topic.label(key)
+    };
+    if !tags.is_empty() {
+        label.push_str(&format!(" ({})", tags.join(", ")));
+    }
+    if variant.description.is_empty() {
+        text.push_str(&format!("**{label}**\n"));
+    } else {
+        text.push_str(&format!("**{label}:** {}\n", variant.description));
+    }
+    if !variant.good.is_empty() {
+        text.push_str(&format!("- Good: {}\n", variant.good));
+    }
+    if !variant.cost.is_empty() {
+        text.push_str(&format!("- Cost: {}\n", variant.cost));
+    }
+    let files: Vec<String> = [
+        (&variant.picture, "picture"),
+        (&variant.page, "page"),
+        (&variant.phone_picture, "phone picture"),
+        (&variant.phone_page, "phone page"),
+    ]
+    .into_iter()
+    .filter_map(|(name, what)| Some(format!("{} ({what})", name.as_ref()?)))
+    .collect();
+    if !files.is_empty() {
+        text.push_str(&format!("- Files: {}\n", files.join(", ")));
+    }
+    if let Some(comment) = picks.comments.get(key) {
+        text.push_str(&format!("- The user's comment: {comment}\n"));
+    }
 }
 
 /// What Submit's message says (topic 17 B): "Submitted: picked B, also C, with 2 comments.",
@@ -1119,8 +1170,6 @@ pub(crate) fn millis(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use agentz_protocol::artifacts::DesignVariant;
-
     use super::*;
 
     fn document(title: &str, source: &str) -> Publish {
@@ -1346,16 +1395,23 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_reads_picks_as_text() {
+    fn the_agent_reads_the_design_with_its_picks_as_text() {
         let topic = DesignTopic {
             title: "The plans page".to_string(),
+            description: "How the plans are laid out.".to_string(),
             today: Some(variant("Today's page", "A plain table.")),
             variants: vec![
                 variant("Three tiers", "Cards."),
-                variant("Compare table", "Every feature in one table."),
+                DesignVariant {
+                    good: "Everything at once.".to_string(),
+                    cost: "Long on a phone.".to_string(),
+                    page: Some("1-B.html".to_string()),
+                    phone_picture: Some("1-B-phone.png".to_string()),
+                    ..variant("Compare table", "Every feature in one table.")
+                },
                 variant("Slider by size", "One plan priced by size."),
             ],
-            ..DesignTopic::default()
+            recommended: Some("Compare table".to_string()),
         };
         let other = DesignTopic {
             title: "The yearly discount".to_string(),
@@ -1363,7 +1419,7 @@ mod tests {
             ..DesignTopic::default()
         };
         let design = Design {
-            intro: String::new(),
+            intro: "Two decisions for the pricing page.".to_string(),
             topics: vec![topic, other],
             gone: Vec::new(),
         };
@@ -1400,14 +1456,35 @@ mod tests {
             "# Pricing, v2: 1 of 2 decided, not submitted\n\
              From storefront › Design the pricing. The user's picks and comments so far.\n\
              \n\
+             Two decisions for the pricing page.\n\
+             \n\
              ## 1. The plans page: B. Compare table, also C. Slider by size\n\
-             **B. Compare table:** Every feature in one table.\n\
-             **Comment on B:** Yearly by default.\n\
-             **Also C. Slider by size:** One plan priced by size.\n\
-             **Comment on Today's page (today's):** Keep its footer.\n\
+             How the plans are laid out.\n\
+             \n\
+             **Today's page (today's):** A plain table.\n\
+             - Files: Today's page.png (picture)\n\
+             - The user's comment: Keep its footer.\n\
+             \n\
+             **A. Three tiers:** Cards.\n\
+             - Files: Three tiers.png (picture)\n\
+             \n\
+             **B. Compare table (picked, recommended):** Every feature in one table.\n\
+             - Good: Everything at once.\n\
+             - Cost: Long on a phone.\n\
+             - Files: Compare table.png (picture), 1-B.html (page), 1-B-phone.png (phone picture)\n\
+             - The user's comment: Yearly by default.\n\
+             \n\
+             **C. Slider by size (also):** One plan priced by size.\n\
+             - Files: Slider by size.png (picture)\n\
              \n\
              ## 2. The yearly discount: not decided\n\
-             **Comment on B. 20% off:** What do others give?\n"
+             \n\
+             **A. 10% off**\n\
+             - Files: 10% off.png (picture)\n\
+             \n\
+             **B. 20% off**\n\
+             - Files: 20% off.png (picture)\n\
+             - The user's comment: What do others give?\n"
         );
     }
 

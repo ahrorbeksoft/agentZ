@@ -1355,11 +1355,14 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   how many variants, today's, sizes, pictures or pages), the project's or General's
   (`DesignSettings::for_project`, `Request::SetDesignDefaults`), so its tool list is made per
   caller (`Request::ListTools { caller }`). Any thread's or chat's agent can publish.
-- **Reading** (`agentz_artifact_read`): a document's Markdown, or a design's picks and
-  comments as text, like a round's decisions.md (`artifacts::design_text`): whether it's
-  submitted, a heading per topic with the pick by letter and name, the Alsos, each picked
-  variant's words and the comments. `file` gives one of the version's files by its path (from
-  another machine, copied over to this one). `agentz_artifact_list` lists the thread's, the
+- **Reading** (`agentz_artifact_read`): a document's Markdown, or the whole design as text,
+  like a round's README and decisions.md together (`artifacts::design_text`): whether it's
+  submitted, the intro, then a heading per topic with the pick by letter and name, the
+  topic's description, and every variant, today's first, with its words, Good, Cost, its
+  files by name, Picked, Also or Recommended, and the user's comment. `files` gives each of
+  the version's files with its path, so the agent looks at a picture or reads a page with its
+  own tools; another machine's have no paths, and `file` copies one over to this machine and
+  gives its path (`keep_fetched_file`). `agentz_artifact_list` lists the thread's, the
   project's (the default; a chat's lists the chats') or all, on every machine the app
   reaches, each with its machine and a design's state.
 - **Kept by each machine's server** (`agentz_server::artifacts`, `ArtifactStore`): in

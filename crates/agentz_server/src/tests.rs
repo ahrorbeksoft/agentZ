@@ -4756,6 +4756,47 @@ async fn agents_work_on_other_machines_through_the_app() {
     assert!(listed.contains(&(json!("mac"), json!(orchestrator.0))));
     assert_eq!(list["total"], json!(2));
 
+    // Another machine's design reads without paths, which would be there's; reading a file
+    // copies it here.
+    let picture = there.project_dir.path().join("cards.svg");
+    let svg = "<svg xmlns='http://www.w3.org/2000/svg'/>";
+    std::fs::write(&picture, svg).expect("picture");
+    let published = caller_there
+        .tool(
+            remote_thread_id,
+            "agentz_design_publish",
+            json!({
+                "title": "Plans page",
+                "topics": [{
+                    "title": "The plans page",
+                    "variants": [{"name": "Three cards", "picture": picture}],
+                }],
+            }),
+        )
+        .await;
+    let design_id = published["artifactId"].clone();
+    let read = caller
+        .tool(
+            orchestrator,
+            "agentz_artifact_read",
+            json!({"artifactId": design_id, "machine": "devbox"}),
+        )
+        .await;
+    let text = read["text"].as_str().expect("the design as text");
+    assert!(text.contains("- Files: 1-A.svg (picture)"), "{text}");
+    assert_eq!(read["files"][0]["name"], json!("1-A.svg"));
+    assert_eq!(read["files"][0].get("path"), None);
+    let file = caller
+        .tool(
+            orchestrator,
+            "agentz_artifact_read",
+            json!({"artifactId": design_id, "machine": "devbox", "file": "1-A.svg"}),
+        )
+        .await;
+    let copy = file["path"].as_str().expect("the copy's path");
+    assert!(copy.contains("fetched"), "{copy}");
+    assert_eq!(std::fs::read_to_string(copy).expect("the copy"), svg);
+
     // A task for another machine works there in a thread whose parent is this one, in its
     // mode, and a subthread here stands for it: the parent waits for it as for any task.
     caller
@@ -9564,6 +9605,11 @@ async fn artifacts_are_published_served_and_sent_back() {
         .await;
     assert_eq!(read["text"], json!("# Benchmarks\n\nFaster."));
     assert_eq!(read["files"][0]["name"], json!("runs.csv"));
+    let path = read["files"][0]["path"].as_str().expect("the file's path");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("the file"),
+        "run,ms\n1,20\n"
+    );
     let file = client
         .tool(
             thread,
@@ -9697,8 +9743,28 @@ async fn artifacts_are_published_served_and_sent_back() {
         .await;
     let text = read["text"].as_str().expect("the picks as text");
     assert!(text.contains("1 of 1 decided, not submitted"), "{text}");
-    assert!(text.contains("B. Three cards"), "{text}");
-    assert!(text.contains("Shorter"), "{text}");
+    assert!(
+        text.contains(
+            "**A. Compare table (also)**\n- Good: Every limit\n- Files: 1-A.svg (picture)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("**B. Three cards (picked, recommended)**\n"),
+        "{text}"
+    );
+    assert!(text.contains("- The user's comment: Shorter"), "{text}");
+    // Each variant's files are named in the text, and their paths are in files.
+    let files = read["files"].as_array().expect("the design's files");
+    let table_path = files
+        .iter()
+        .find(|file| file["name"] == json!("1-A.svg"))
+        .and_then(|file| file["path"].as_str())
+        .expect("Compare table's picture by its path");
+    assert_eq!(
+        std::fs::read_to_string(table_path).expect("the picture"),
+        "<svg xmlns='http://www.w3.org/2000/svg'/>"
+    );
 
     // Submit marks it decided, and with Also send puts a short message in the thread.
     let submit = json!({"id": design_id.0, "version": 1, "send": true, "note": "Go with it"});

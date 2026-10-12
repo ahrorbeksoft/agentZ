@@ -2,8 +2,9 @@
 //! publishes a Markdown file the agent wrote, and `agentz_design_publish` a design given as its
 //! arguments (topics of variants, each a picture and/or a live page), a version each time.
 //! `agentz_artifact_list` and `agentz_artifact_read` find them again on every machine the app
-//! reaches; a design reads as the user's picks and comments, and its files on request. Each
-//! publish is served to the user's browser by the pages server, whose link the answer carries.
+//! reaches; a design reads as its words with the user's picks and comments, and its files by
+//! their paths (another machine's on request, copied over). Each publish is served to the
+//! user's browser by the pages server, whose link the answer carries.
 
 use std::path::{Path, PathBuf};
 
@@ -374,26 +375,34 @@ impl Server {
             ));
         }
         let listing = self.listing(artifact);
-        let (text, truncated) = match artifact.kind {
-            ArtifactKind::Document => {
-                let source = self
-                    .artifacts
-                    .read_source(&id, version)
-                    .map_err(|error| invalid(format!("{error:#}")))?;
-                super::truncate(&source, MAX_READ_CHARS)
-            }
+        let text = match artifact.kind {
+            ArtifactKind::Document => self
+                .artifacts
+                .read_source(&id, version)
+                .map_err(|error| invalid(format!("{error:#}")))?,
             ArtifactKind::Design => {
                 let design = self
                     .artifacts
                     .read_design(&id, version)
                     .map_err(|error| invalid(format!("{error:#}")))?;
                 let picks = self.artifacts.read_picks(&id, version);
-                (
-                    design_text(&artifact.title, version, &listing.place, &design, &picks),
-                    false,
-                )
+                design_text(&artifact.title, version, &listing.place, &design, &picks)
             }
         };
+        let (text, truncated) = super::truncate(&text, MAX_READ_CHARS);
+        // A relayed read's paths would be on this machine, not the caller's.
+        let folder = (!caller.relayed).then(|| self.artifacts.files_folder(&id, version));
+        let files: Vec<Value> = published
+            .files
+            .iter()
+            .map(|file| {
+                let mut value = json!({"name": file.name, "bytes": file.bytes});
+                if let Some(folder) = &folder {
+                    value["path"] = json!(folder.join(&file.name));
+                }
+                value
+            })
+            .collect();
         let mut answer = json!({
             "artifactId": id.0,
             "title": artifact.title,
@@ -402,18 +411,20 @@ impl Server {
             "versions": artifact.latest(),
             "from": listing.place,
             "text": text,
-            "files": published.files.iter().map(|file| {
-                json!({"name": file.name, "bytes": file.bytes})
-            }).collect::<Vec<_>>(),
+            "files": files,
         });
         if truncated {
             answer["truncated"] = json!(true);
         }
         if artifact.kind == ArtifactKind::Design {
-            answer["note"] = json!(
-                "Pass file with one of files' names (each named by its topic and variant's \
-                 letter) to get its path, to look at a picture or page."
-            );
+            answer["note"] = json!(if caller.relayed {
+                "text names each variant's files. They're on another machine: pass file with \
+                 one's name to copy it here and get its path, to look at a picture or read a \
+                 page."
+            } else {
+                "text names each variant's files, and files gives each one's path, to look at \
+                 a picture or read a page."
+            });
         }
         Ok(Step::Done(answer))
     }
@@ -791,13 +802,13 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
         json!({
             "name": "agentz_artifact_read",
             "title": "Read an artifact",
-            "description": "Read an artifact, the latest version without version: a document's Markdown, or a design's state and the user's picks and comments as text, a heading per topic with the pick by letter and name. files lists the version's files; pass one's name as file to get its path, to look at a variant's picture or page.",
+            "description": "Read an artifact, the latest version without version: a document's Markdown, or a whole design as text: its state and intro, then a heading per topic with the user's pick by letter and name, and every variant with its words, its files by name, and the user's comment. files lists the version's files with their paths, to look at a variant's picture or read its page. For an artifact on another machine, pass a file's name as file to copy it here and get its path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "artifactId": {"type": "string", "maxLength": 64, "description": "From agentz_artifact_list, a publish's answer or a mention."},
                     "version": {"type": "integer", "minimum": 1, "description": "The version to read; the latest without one."},
-                    "file": {"type": "string", "maxLength": 256, "description": "One of the version's files, by name, to get its path instead of the text."},
+                    "file": {"type": "string", "maxLength": 256, "description": "One of the version's files, by name, to get its path instead of the text; from another machine, it's copied here first."},
                     "machine": {"type": "string", "maxLength": 256, "description": "The machine it's on, as agentz_artifact_list or a mention names it. Omit for this machine."},
                 },
                 "required": ["artifactId"],
