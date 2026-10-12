@@ -22,7 +22,7 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .nav a.on { background: var(--selected); color: var(--text); }
 .nav .n { width: 14px; text-align: right; color: var(--placeholder); font-size: 11px; flex: none; }
 .nav .t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.nav .s { font-size: 10px; font-weight: 600; color: var(--background); background: var(--success); border-radius: 4px; padding: 0 5px; flex: none; }
+.nav .s { font-size: 10px; font-weight: 600; color: var(--solid-background); background: var(--success); border-radius: 4px; padding: 0 5px; flex: none; }
 .nav .c { width: 6px; height: 6px; border-radius: 50%; background: var(--warning); flex: none; }
 .nav .sep { border-top: 1px solid var(--border); margin: 10px 4px 6px; }
 
@@ -43,7 +43,7 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .opt.also { border-color: var(--success); border-style: dashed; }
 .oh { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .letter { width: 20px; height: 20px; border-radius: 5px; background: var(--border); display: grid; place-items: center; font-weight: 600; font-size: 11px; flex: none; }
-.opt.picked .letter { background: var(--success); color: var(--background); }
+.opt.picked .letter { background: var(--success); color: var(--solid-background); }
 .oname { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
 .otag { font-size: 10px; border: 1px solid var(--border); color: var(--muted); border-radius: 9px; padding: 0 7px; white-space: nowrap; }
 .otag.rec { border-color: color-mix(in srgb, var(--accent) 55%, transparent); color: var(--accent); }
@@ -64,7 +64,7 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .grid.phone .comment { flex-basis: 100%; }
 .pick { flex: none; border: 1px solid var(--border); background: var(--background); border-radius: 7px; padding: 4px 11px; font-weight: 500; font-size: 12px; white-space: nowrap; cursor: pointer; color: var(--text); }
 .pick:hover { background: var(--hover); }
-.opt.picked .pick { background: var(--success); border-color: var(--success); color: var(--background); }
+.opt.picked .pick { background: var(--success); border-color: var(--success); color: var(--solid-background); }
 .alsob { flex: none; border: 1px dashed var(--border); border-radius: 7px; padding: 4px 8px; font-size: 11.5px; color: var(--muted); white-space: nowrap; background: none; cursor: pointer; }
 .alsob:hover { color: var(--text); }
 .opt.also .alsob { border-color: var(--success); color: var(--success); }
@@ -80,7 +80,7 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .summary tr.topic:hover td { background: var(--hover); }
 .summary .ph { color: var(--placeholder); }
 
-.subpop { position: fixed; z-index: 25; right: 12px; top: 48px; width: 380px; max-width: calc(100vw - 24px); background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 16px 40px rgba(0, 0, 0, .55); padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.subpop { position: fixed; z-index: 25; right: 12px; top: 48px; width: 380px; max-width: calc(100vw - 24px); background: var(--elevated); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 16px 40px rgba(0, 0, 0, .55); padding: 14px; display: flex; flex-direction: column; gap: 10px; }
 .subpop h4 { margin: 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
 .subpop .picks { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
 .subpop .picks b { color: var(--text); font-weight: 500; }
@@ -95,13 +95,13 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .sw i { position: absolute; inset: 0; border-radius: 8px; background: var(--selected); pointer-events: none; }
 .sw i::after { content: ''; position: absolute; left: 2px; top: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--muted); transition: left .1s; }
 .sw input:checked + i { background: var(--accent); }
-.sw input:checked + i::after { left: 13px; background: var(--background); }
+.sw input:checked + i::after { left: 13px; background: var(--solid-background); }
 
 .over { position: fixed; inset: 0; z-index: 20; background: rgba(8, 9, 12, .86); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 20px 64px 14px; }
 .over .stage { position: relative; max-width: 100%; max-height: calc(100vh - 64px); overflow: auto; border-radius: 6px; flex: none; }
 .over .stage img { display: block; max-width: 100%; }
 .over .stage iframe { display: block; border: none; background: #fff; }
-.over .stage .none { width: 320px; background: var(--background); }
+.over .stage .none { width: 320px; background: var(--solid-background); }
 .over .cap { color: #c9ccd1; font-size: 12px; display: flex; gap: 10px; align-items: center; }
 .over .cap a { color: #8fb2fa; cursor: pointer; }
 .arrow { position: fixed; top: 50%; margin-top: -16px; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: rgba(0, 0, 0, .55); color: #fff; border: none; cursor: pointer; z-index: 21; }

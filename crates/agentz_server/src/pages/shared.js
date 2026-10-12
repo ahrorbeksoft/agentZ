@@ -143,6 +143,7 @@ function applyTheme(theme) {
   const root = document.documentElement;
   root.style.colorScheme = theme.dark ? 'dark' : 'light';
   for (const [name, value] of theme.variables || []) root.style.setProperty(name, value);
+  root.style.setProperty('--picture', theme.picture ? `url("${theme.picture}")` : 'none');
 }
 
 // Publishes, picks, deletions and theme changes, as the server tells them.

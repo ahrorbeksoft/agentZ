@@ -210,6 +210,19 @@ pub struct ShownPicture {
     solid: Hsla,
 }
 
+impl ShownPicture {
+    /// The copy's file name in the data directory's `backgrounds`, which the server serves the
+    /// artifacts pages from.
+    pub fn file_name(&self) -> Option<String> {
+        Some(self.path.file_name()?.to_string_lossy().into_owned())
+    }
+
+    /// The layer of the editor's color over the picture.
+    pub fn tint(&self) -> Hsla {
+        self.tint
+    }
+}
+
 #[derive(Default)]
 struct WindowPicture {
     shown: Option<ShownPicture>,
@@ -272,6 +285,14 @@ pub fn apply(theme: Arc<Theme>, settings: &AppSettings, cx: &mut App) -> (Arc<Th
 /// The picture the window shows behind everything, if any.
 pub fn shown_picture(cx: &App) -> Option<ShownPicture> {
     cx.try_global::<WindowPicture>()?.shown.clone()
+}
+
+/// The theme the window's see-through one was made from, while a picture shows, for colors
+/// that must stay solid over it.
+pub fn solid_theme(cx: &App) -> Option<Arc<Theme>> {
+    let state = cx.try_global::<WindowPicture>()?;
+    state.shown.as_ref()?;
+    Some(state.see_through.as_ref()?.source.clone())
 }
 
 /// What to paint a surface's color over where it must hide what's under it, as a cover over the

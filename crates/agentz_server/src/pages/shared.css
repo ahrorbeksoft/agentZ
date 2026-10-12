@@ -4,9 +4,15 @@
   --hover: rgba(255, 255, 255, .06); --accent: #548af7; --accent-foreground: #1e1f22;
   --success: #73bd79; --warning: #f2c55c;
   --font-sans: system-ui, -apple-system, sans-serif; --font-mono: ui-monospace, monospace;
+  /* With a picture behind the app's window, the pages show it too, under the editor's color at
+     the user's opacity (--tint), and --background is clear over it. What needs the color itself
+     takes --solid-background: text on a fill, and a cover over a thumbnail. Menus are --elevated. */
+  --solid-background: #1e1f22; --elevated: #2b2d30; --tint: transparent; --picture: none;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; background: var(--background); color: var(--text); font: 13px var(--font-sans); }
+html { background: linear-gradient(var(--tint), var(--tint)), var(--picture) center / cover no-repeat fixed, var(--solid-background); }
+html, body { margin: 0; height: 100%; color: var(--text); font: 13px var(--font-sans); }
+body { background: var(--background); }
 button, input, textarea { font: inherit; color: inherit; }
 [hidden] { display: none !important; }
 svg { flex: none; display: block; }
@@ -46,7 +52,7 @@ svg { flex: none; display: block; }
 .zmark { width: 16px; height: 16px; border-radius: 4px; background: var(--selected); color: var(--text); display: inline-grid; place-items: center; font: 700 10px/1 var(--font-sans); flex: none; }
 
 /* Menus, as the app's */
-.menu { position: fixed; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 12px 32px rgba(0, 0, 0, .45); padding: 4px; min-width: 200px; max-height: 60vh; overflow: auto; z-index: 30; }
+.menu { position: fixed; background: var(--elevated); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 12px 32px rgba(0, 0, 0, .45); padding: 4px; min-width: 200px; max-height: 60vh; overflow: auto; z-index: 30; }
 .menu a, .menu button { display: flex; width: 100%; align-items: center; gap: 8px; padding: 6px 10px; border: none; border-radius: 5px; background: none; color: var(--text); text-decoration: none; cursor: pointer; text-align: left; white-space: nowrap; font-size: 13px; }
 .menu a:hover, .menu button:hover { background: var(--hover); }
 .menu .when { margin-left: auto; color: var(--placeholder); font-size: 11px; padding-left: 16px; }
@@ -59,7 +65,7 @@ svg { flex: none; display: block; }
 .versionbar { display: flex; align-items: center; gap: 8px; padding: 7px 12px; font-size: 12px; background: var(--panel); border-bottom: 1px solid var(--border); color: var(--muted); flex: none; }
 .versionbar b { color: var(--text); font-weight: 600; }
 .versionbar a { color: var(--accent); cursor: pointer; }
-.updatebar { position: fixed; left: 50%; transform: translateX(-50%); top: 52px; z-index: 20; display: flex; gap: 8px; align-items: center; padding: 7px 14px; border-radius: 8px; background: var(--panel); border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0, 0, 0, .4); font-size: 12px; }
+.updatebar { position: fixed; left: 50%; transform: translateX(-50%); top: 52px; z-index: 20; display: flex; gap: 8px; align-items: center; padding: 7px 14px; border-radius: 8px; background: var(--elevated); border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0, 0, 0, .4); font-size: 12px; }
 .updatebar a { color: var(--accent); cursor: pointer; font-weight: 600; }
 .message { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); padding: 24px; text-align: center; }
 .flash { font-size: 12px; color: var(--placeholder); white-space: nowrap; }

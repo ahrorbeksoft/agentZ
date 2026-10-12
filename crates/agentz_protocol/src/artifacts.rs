@@ -517,11 +517,34 @@ fn encode(text: &str) -> String {
     url::form_urlencoded::byte_serialize(text.as_bytes()).collect()
 }
 
-/// The app's theme, for pages: CSS variables (`--background`, …) and whether it's dark.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// The app's theme, for pages: CSS variables (`--background`, …) and whether it's dark, and
+/// the settings the pages follow.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageTheme {
     pub dark: bool,
     pub variables: Vec<(String, String)>,
+    /// The picture behind the app's window, for agentZ's own pages to show behind them too:
+    /// its copy's file name in the data directory's `backgrounds`.
+    #[serde(default)]
+    pub picture: Option<String>,
+    /// Chats are on in the app's settings, so the artifacts page lists them as a place.
+    #[serde(default = "default_true")]
+    pub chats: bool,
+}
+
+impl Default for PageTheme {
+    fn default() -> Self {
+        Self {
+            dark: false,
+            variables: Vec::new(),
+            picture: None,
+            chats: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// What the server that serves pages, or an agent's tool, asks of another machine's, through
@@ -574,6 +597,9 @@ pub enum ArtifactRequest {
     /// The artifacts whose words hold all of these, with the line that does:
     /// [`ArtifactReply::Found`].
     Search(String),
+    /// A project's icon file, the one picked or the favicon found
+    /// ([`ListingIcon::file`]): [`ArtifactReply::ProjectIcon`].
+    ProjectIcon(ProjectId),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -603,6 +629,11 @@ pub enum ArtifactReply {
     },
     /// Each artifact found, with its matching line.
     Found(Vec<(ArtifactId, String)>),
+    /// The file's name, for its type, and its bytes in base64.
+    ProjectIcon {
+        name: String,
+        data: String,
+    },
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -632,4 +663,21 @@ pub struct ArtifactListing {
     pub agent_name: Option<String>,
     /// The agent's icon, as SVG drawn in the text color.
     pub agent_icon: Option<String>,
+    /// The project's icon, as the app's sidebar shows it.
+    #[serde(default)]
+    pub project_icon: Option<ListingIcon>,
+}
+
+/// A project's icon for the artifacts page: its emoji, else its icon file, else letters on a
+/// tile, which also show while the file loads and if it can't. An icon of the app's own shows
+/// as the letters, in its color.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListingIcon {
+    pub emoji: Option<String>,
+    /// It has an icon file, from [`ArtifactRequest::ProjectIcon`].
+    pub file: bool,
+    pub text: String,
+    /// The tile's color as `#rrggbb`, in light themes' shade and in dark ones'.
+    pub light: String,
+    pub dark: String,
 }

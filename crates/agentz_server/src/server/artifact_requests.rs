@@ -5,11 +5,13 @@
 
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactListing, ArtifactReply, ArtifactRequest, DesignSettings,
+    ListingIcon,
 };
+use agentz_protocol::attachments::MAX_ATTACHMENT_SIZE;
 use agentz_protocol::{ConnectionId, Event, PeerMachine, PromptPart, Request, ServerMessage};
 use base64::Engine as _;
 use futures::channel::oneshot;
-use projects::ProjectId;
+use projects::{MONOGRAM_COLORS, Project, ProjectIcon, ProjectId, monogram, monogram_text};
 use util::ResultExt as _;
 
 use crate::artifacts::{design_text, submit_summary};
@@ -132,6 +134,27 @@ impl Server {
             ArtifactRequest::Search(query) => {
                 Ok(ArtifactReply::Found(self.artifacts.search(&query)))
             }
+            ArtifactRequest::ProjectIcon(project_id) => {
+                let path = self
+                    .projects
+                    .favicon(project_id)
+                    .ok_or_else(|| "the project has no icon".to_string())?;
+                let size = std::fs::metadata(path)
+                    .map_err(|error| format!("reading {}: {error}", path.display()))?
+                    .len();
+                if size > MAX_ATTACHMENT_SIZE as u64 {
+                    return Err(format!("{} is too large to send", path.display()));
+                }
+                let bytes = std::fs::read(path)
+                    .map_err(|error| format!("reading {}: {error}", path.display()))?;
+                Ok(ArtifactReply::ProjectIcon {
+                    name: path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                })
+            }
             ArtifactRequest::Unknown(_) => Err("the app doesn't know this request".to_string()),
         }
     }
@@ -150,8 +173,9 @@ impl Server {
         let project = artifact
             .project_id
             .filter(|project_id| *project_id != ProjectId::CHATS)
-            .and_then(|project_id| self.projects.project(project_id))
-            .map(|project| project.name().to_string());
+            .and_then(|project_id| self.projects.project(project_id));
+        let project_icon = project.map(|project| self.listing_icon(project));
+        let project = project.map(|project| project.name().to_string());
         let place = match thread {
             Some(thread) if thread.is_chat() => format!("Chat · {}", thread.title),
             Some(thread) => match &project {
@@ -179,7 +203,41 @@ impl Server {
                 .as_ref()
                 .map(|agent_id| self.agent_name(agent_id).to_string()),
             agent_icon,
+            project_icon,
         }
+    }
+
+    /// The project's icon as the app's sidebar shows it (`project_info::render_project_icon`):
+    /// the icon, emoji or monogram picked for it, else its icon file, else its monogram.
+    fn listing_icon(&self, project: &Project) -> ListingIcon {
+        let name = project.name();
+        let (_, light, dark) = projects::monogram_color(&name);
+        let mut icon = ListingIcon {
+            emoji: None,
+            file: false,
+            text: monogram(&name),
+            light: format!("#{light:06x}"),
+            dark: format!("#{dark:06x}"),
+        };
+        let mut set_color = |color: &str| {
+            if let Some((_, light, dark)) = MONOGRAM_COLORS.iter().find(|(name, ..)| *name == color)
+            {
+                icon.light = format!("#{light:06x}");
+                icon.dark = format!("#{dark:06x}");
+            }
+        };
+        match &project.icon {
+            Some(ProjectIcon::Icon { color, .. }) => set_color(color),
+            Some(ProjectIcon::Monogram { text, color }) => {
+                set_color(color);
+                icon.text = monogram_text(text);
+            }
+            Some(ProjectIcon::Emoji { emoji }) => icon.emoji = Some(emoji.clone()),
+            Some(ProjectIcon::Image { .. }) | None => {
+                icon.file = self.projects.favicon(project.id).is_some();
+            }
+        }
+        icon
     }
 
     /// Submit (topic 16 A): marks the design's version decided, and with `send`, puts a short

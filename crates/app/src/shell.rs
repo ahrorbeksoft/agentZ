@@ -360,6 +360,11 @@ impl Shell {
             }),
             // Pages an artifact publishes take the app's theme, live (`design/artifacts`).
             cx.observe_global::<theme::GlobalTheme>(|this, cx| this.push_page_theme(cx)),
+            // A new picture with the same theme and opacity keeps the theme as it was, and
+            // turning chats off or on changes what the pages list.
+            cx.observe(&AppSettingsStore::global(cx), |this, _, cx| {
+                this.push_page_theme(cx)
+            }),
         ];
         // Clicking a notification is the user asking for that thread, so it may come forward.
         let shell = cx.entity().downgrade();
@@ -2216,10 +2221,24 @@ gpui::actions!(
 );
 
 /// The app's theme as the pages' CSS variables (`design/artifacts`, topic 10): the shell's
-/// colors, under the names a page's CSS uses.
+/// colors, under the names a page's CSS uses. With a picture behind the window, the pages show
+/// it too, under the same see-through colors (`design/appearance`).
 fn page_theme(cx: &App) -> PageTheme {
     let theme = cx.theme();
     let colors = theme.colors();
+    let picture = window_background::shown_picture(cx);
+    // The see-through editor color is clear, so text on a fill and a cover over a thumbnail
+    // take the solid one, and menus over the page are its panel's color at the user's
+    // opacity, as the app's menus are their own.
+    let solid = window_background::solid_theme(cx).unwrap_or_else(|| theme.clone());
+    let solid_background = solid.colors().editor_background;
+    let (tint, elevated) = match &picture {
+        Some(picture) => (
+            picture.tint(),
+            solid.colors().panel_background.opacity(picture.tint().a),
+        ),
+        None => (gpui::transparent_black(), colors.panel_background),
+    };
     let css = |color: Hsla| {
         let rgb = color.to_rgb();
         if color.a >= 1.0 {
@@ -2249,10 +2268,10 @@ fn page_theme(cx: &App) -> PageTheme {
             ("--muted".to_string(), css(colors.text_muted)),
             ("--border".to_string(), css(colors.border)),
             ("--accent".to_string(), css(colors.text_accent)),
-            (
-                "--accent-foreground".to_string(),
-                css(colors.editor_background),
-            ),
+            ("--accent-foreground".to_string(), css(solid_background)),
+            ("--solid-background".to_string(), css(solid_background)),
+            ("--elevated".to_string(), css(elevated)),
+            ("--tint".to_string(), css(tint)),
             ("--hover".to_string(), css(colors.ghost_element_hover)),
             ("--selected".to_string(), css(colors.element_selected)),
             ("--placeholder".to_string(), css(colors.text_placeholder)),
@@ -2269,6 +2288,8 @@ fn page_theme(cx: &App) -> PageTheme {
                 "ui-monospace, Menlo, Consolas, monospace".to_string(),
             ),
         ],
+        picture: picture.and_then(|picture| picture.file_name()),
+        chats: Machines::chats_enabled(cx),
     }
 }
 

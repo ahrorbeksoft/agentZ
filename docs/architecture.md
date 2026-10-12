@@ -562,6 +562,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the theme's, as the thread's activity bar (plan, queue) does, goes through
   `see_through_color` to show through as the theme's own surfaces do; so the plan's current
   item is cut short with an ellipsis before "N left" rather than faded under a cover as Zed's.
+  The artifacts pages in the browser show the picture the same way (see Artifacts' theme).
 
 ### Agent threads
 
@@ -1393,7 +1394,11 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
 - **The theme** (`Shell::push_page_theme`, `page_theme`): the app's colors and fonts as CSS
   variables (`--background`, `--text`, `--accent`, `--selected`, `--success`, …), sent to
   every machine's server as the theme changes (`Request::SetPageTheme`) and given to pages as
-  they load and live.
+  they load and live. With a picture behind the window, agentZ's own pages show it too (the
+  server serves the copy the theme names at `/background/<name>`, with the token, so never to
+  what an agent made) under the window's see-through colors; text on a fill, covers over
+  thumbnails (`--solid-background`) and menus (`--elevated`) take the solid theme's
+  (`window_background::solid_theme`).
 - **In the thread** (`AgentView::render_published_artifact`, `tool_calls::published_artifact`):
   the newest publish of each artifact is a card (its kind's icon, title, "Document · v2 ·
   published 2m ago" or "Design · 5 variants · v1 · published 2m ago", Open, and a menu with

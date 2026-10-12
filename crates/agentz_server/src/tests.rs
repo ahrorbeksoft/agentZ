@@ -9209,6 +9209,112 @@ async fn page_request(address: &str, method: &str, target: &str, body: &str) -> 
     (status, body)
 }
 
+/// The picture behind the app's window is served to agentZ's own pages, and only the one the
+/// theme names, with the token.
+#[tokio::test(flavor = "multi_thread")]
+async fn pages_show_the_picture_behind_the_window() {
+    use agentz_protocol::artifacts::PageTheme;
+
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let pages = session.artifacts.pages.clone().expect("a pages server");
+    let (address, token) = (pages.address.as_str(), &pages.token);
+    let backgrounds = server.data_dir.path().join("backgrounds");
+    std::fs::create_dir_all(&backgrounds).expect("backgrounds");
+    std::fs::write(backgrounds.join("17-soft.jpg"), "picture").expect("picture");
+    std::fs::write(backgrounds.join("16.jpg"), "an older picture").expect("picture");
+
+    let (_, home) = page_request(address, "GET", &format!("/?t={token}"), "").await;
+    assert!(!home.contains("--picture:url"), "no picture yet");
+
+    client
+        .ok(Request::SetPageTheme(PageTheme {
+            dark: true,
+            variables: vec![("--tint".into(), "#1e1f22e0".into())],
+            picture: Some("17-soft.jpg".into()),
+            chats: true,
+        }))
+        .await;
+    let link = format!("/background/17-soft.jpg?t={token}");
+    let (_, home) = page_request(address, "GET", &format!("/?t={token}"), "").await;
+    assert!(
+        home.contains(&format!("--picture:url(\"{link}\")")),
+        "{home}"
+    );
+    assert_eq!(
+        page_request(address, "GET", &link, "").await,
+        (200, "picture".to_string())
+    );
+    let without_token = page_request(address, "GET", "/background/17-soft.jpg", "").await;
+    assert_eq!(without_token.0, 403);
+    let other = page_request(address, "GET", &format!("/background/16.jpg?t={token}"), "").await;
+    assert_eq!(other.0, 404);
+}
+
+/// The artifacts page shows a project's icon as the app's sidebar does: its favicon, from its
+/// machine, and its letters till then.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_artifacts_page_shows_projects_icons() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let folder = server.project_dir.path();
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let pages = session.artifacts.pages.clone().expect("a pages server");
+    let (address, token) = (pages.address.as_str(), &pages.token);
+    client.projects = Some(session.projects);
+    std::fs::create_dir_all(folder.join("public")).expect("a folder");
+    std::fs::write(folder.join("public/favicon.svg"), "<svg/>").expect("written");
+    let project_id = client.add_project(folder).await;
+    client
+        .wait_until(|client| {
+            client
+                .projects
+                .as_ref()
+                .is_some_and(|projects| projects.favicons.iter().any(|(id, _)| *id == project_id))
+        })
+        .await;
+    let thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread).await;
+    let report = folder.join("report.md");
+    std::fs::write(&report, "# Report").expect("report");
+    client
+        .tool(
+            thread,
+            "agentz_document_publish",
+            json!({"title": "Report", "file": report}),
+        )
+        .await;
+
+    let (status, everything) =
+        page_request(address, "GET", &format!("/api/artifacts?t={token}"), "").await;
+    assert_eq!(status, 200);
+    let everything: serde_json::Value = serde_json::from_str(&everything).expect("json");
+    let icon = &everything[0]["artifacts"][0]["project_icon"];
+    assert_eq!(icon["file"], json!(true), "{everything}");
+    assert_eq!(icon["emoji"], json!(null));
+    assert_eq!(icon["text"].as_str().map(str::len), Some(2));
+
+    let link = format!("/api/project-icon?project={}&t={token}", project_id.0);
+    assert_eq!(
+        page_request(address, "GET", &link, "").await,
+        (200, "<svg/>".to_string())
+    );
+    let without_token = format!("/api/project-icon?project={}", project_id.0);
+    assert_eq!(
+        page_request(address, "GET", &without_token, "").await.0,
+        403
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn artifacts_are_published_served_and_sent_back() {
     use agentz_protocol::artifacts::ArtifactId;

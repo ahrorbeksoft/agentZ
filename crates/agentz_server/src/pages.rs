@@ -12,7 +12,7 @@
 //! publishes, picks, deletions and theme changes over `/events` (SSE). The pages themselves
 //! are in `pages/`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use agentz_protocol::artifacts::{
@@ -82,6 +82,9 @@ pub(crate) struct Pages {
     pub token: String,
     theme: Arc<RwLock<PageTheme>>,
     events: tokio::sync::broadcast::Sender<PageEvent>,
+    /// Where the app keeps its copies of the picture behind its window, in the data
+    /// directory it shares with this server.
+    backgrounds: PathBuf,
 }
 
 impl Pages {
@@ -182,6 +185,7 @@ pub(crate) fn start(
         token: config.token,
         theme: Arc::new(RwLock::new(artifacts::load_theme(data_dir))),
         events,
+        backgrounds: data_dir.join("backgrounds"),
     };
     let task = {
         let pages = pages.clone();
@@ -295,6 +299,9 @@ async fn serve(
         let project = query.get("p").filter(|project| !project.is_empty());
         return html_reply(&mut writing, home(&pages, project.as_deref())).await;
     }
+    if segments.len() == 2 && segments[0] == "background" {
+        return background(&mut writing, &pages, &segments[1]).await;
+    }
     if at(&["api", "artifacts"]) {
         return json_reply(&mut writing, &everything(&inputs).await).await;
     }
@@ -303,6 +310,32 @@ async fn serve(
         return json_reply(&mut writing, &search(&inputs, &text).await).await;
     }
     let machine = query.get("machine").filter(|machine| !machine.is_empty());
+    if at(&["api", "project-icon"]) {
+        let project = query
+            .get("project")
+            .and_then(|project| project.parse().ok())
+            .map(projects::ProjectId);
+        let Some(project) = project else {
+            return text_reply(&mut writing, "404 Not Found", "no such project").await;
+        };
+        return match ask(&inputs, machine, ArtifactRequest::ProjectIcon(project)).await {
+            Ok(ArtifactReply::ProjectIcon { name, data }) => {
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap_or_default();
+                // A project's own file, so an SVG one's scripts mustn't run as the pages.
+                let headers = [
+                    ("content-security-policy", "sandbox".to_string()),
+                    ("cache-control", "private, max-age=300".to_string()),
+                ];
+                let content_type = icon_type(&name).unwrap_or("application/octet-stream");
+                reply(&mut writing, "200 OK", content_type, bytes, &headers).await
+            }
+            Ok(_) => text_reply(&mut writing, "404 Not Found", "no such icon").await,
+            Err(error) => text_reply(&mut writing, "404 Not Found", &error).await,
+        };
+    }
     if segments.len() == 3 && segments[0] == "api" && segments[1] == "artifact" {
         let id = ArtifactId(segments[2].clone());
         return match ask(&inputs, machine, ArtifactRequest::Listing(id)).await {
@@ -543,6 +576,17 @@ fn version_of(text: Option<&str>) -> Option<u32> {
         .filter(|version| *version > 0)
 }
 
+/// A project's icon file's type: a picture's, or a favicon's.
+fn icon_type(name: &str) -> Option<&'static str> {
+    if name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("ico"))
+    {
+        return Some("image/x-icon");
+    }
+    shown_as(name).filter(|content_type| content_type.starts_with("image/"))
+}
+
 /// The type a version's file is shown with in the browser: a picture or a page. Anything else
 /// downloads.
 fn shown_as(name: &str) -> Option<&'static str> {
@@ -712,7 +756,13 @@ async fn events(writing: &mut Writing, pages: &Pages) -> Result<()> {
             }
             PageEvent::Theme => {
                 let theme = pages.theme();
-                json!({"type": "theme", "dark": theme.dark, "variables": theme.variables})
+                json!({
+                    "type": "theme",
+                    "dark": theme.dark,
+                    "variables": theme.variables,
+                    "picture": picture_link(pages, &theme),
+                    "chats": theme.chats,
+                })
             }
         };
         if writing
@@ -817,6 +867,60 @@ fn esc(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// The picture behind the app's window, which only the theme names, so no other file of the
+/// data directory is served.
+async fn background(writing: &mut Writing, pages: &Pages, name: &str) -> Result<()> {
+    let theme = pages.theme();
+    let Some(picture) = theme.picture.as_deref().filter(|picture| *picture == name) else {
+        return text_reply(writing, "404 Not Found", "no such picture").await;
+    };
+    let Some(path) = picture_file(&pages.backgrounds, picture) else {
+        return text_reply(writing, "404 Not Found", "no such picture").await;
+    };
+    match tokio::fs::read(&path).await {
+        // Each picture's copy has a name of its own, so it never changes.
+        Ok(bytes) => {
+            let headers = [("cache-control", "private, max-age=86400".to_string())];
+            let content_type = shown_as(picture).unwrap_or("application/octet-stream");
+            reply(writing, "200 OK", content_type, bytes, &headers).await
+        }
+        Err(error) => {
+            log::debug!("couldn't read {}: {error}", path.display());
+            text_reply(writing, "404 Not Found", "no such picture").await
+        }
+    }
+}
+
+/// The picture's copy in `backgrounds`, for a name that's only a file's.
+fn picture_file(backgrounds: &Path, name: &str) -> Option<PathBuf> {
+    let plain = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    plain.then(|| backgrounds.join(name))
+}
+
+/// Where agentZ's own pages load the picture behind the window from. It carries the token, so
+/// it's never given to what an agent made.
+fn picture_link(pages: &Pages, theme: &PageTheme) -> Option<String> {
+    let picture = theme.picture.as_deref()?;
+    picture_file(&pages.backgrounds, picture)?;
+    Some(format!("/background/{picture}?t={}", pages.token))
+}
+
+/// The picture behind the window as the `--picture` the pages' background draws.
+fn picture_style(pages: &Pages, theme: &PageTheme) -> String {
+    picture_link(pages, theme)
+        // Only what can't end the rule it's in reaches the page's style.
+        .filter(|link| {
+            link.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./?=".contains(c))
+        })
+        .map(|link| format!(":root{{--picture:url(\"{link}\");}}"))
+        .unwrap_or_default()
+}
+
 /// The theme as a `:root` rule, before the first paint as t3code does it.
 fn vars_style(theme: &PageTheme) -> String {
     let mut css = String::from(":root{color-scheme:");
@@ -845,9 +949,13 @@ fn own_page(template: &str, pages: &Pages, data: Value) -> String {
     let data = serde_json::to_string(&data)
         .unwrap_or_default()
         .replace('<', "\\u003c");
+    let theme = pages.theme();
     template
         .replace("__SHARED_CSS__", SHARED_CSS)
-        .replace("__VARS__", &vars_style(&pages.theme()))
+        .replace(
+            "__VARS__",
+            &(vars_style(&theme) + &picture_style(pages, &theme)),
+        )
         .replace("__SHARED_JS__", SHARED_JS)
         .replace("__DATA__", &format!("const DATA = {data};"))
 }
@@ -857,7 +965,7 @@ fn home(pages: &Pages, project: Option<&str>) -> String {
     own_page(
         HOME,
         pages,
-        json!({"token": pages.token, "project": project}),
+        json!({"token": pages.token, "project": project, "chats": pages.theme().chats}),
     )
 }
 
@@ -886,9 +994,11 @@ fn artifact_page(
 
 /// A page that only says something: the artifact is gone, or its machine can't be reached.
 fn message_page(pages: &Pages, message: &str) -> String {
+    let theme = pages.theme();
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>agentZ</title><style>{SHARED_CSS}{}</style></head><body><div class=\"message\">{}</div></body></html>",
-        vars_style(&pages.theme()),
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>agentZ</title><style>{SHARED_CSS}{}{}</style></head><body><div class=\"message\">{}</div></body></html>",
+        vars_style(&theme),
+        picture_style(pages, &theme),
         esc(message)
     )
 }
@@ -1037,6 +1147,21 @@ mod tests {
         assert_eq!(shown_as("plans-B.html"), Some("text/html; charset=utf-8"));
         assert_eq!(shown_as("report.csv"), None);
         assert_eq!(shown_as("README"), None);
+        assert_eq!(icon_type("favicon.ICO"), Some("image/x-icon"));
+        assert_eq!(icon_type("favicon.svg"), Some("image/svg+xml"));
+        assert_eq!(icon_type("icon.html"), None);
+    }
+
+    #[test]
+    fn only_a_plain_picture_name_is_served() {
+        let backgrounds = Path::new("/data/backgrounds");
+        assert_eq!(
+            picture_file(backgrounds, "17-soft.jpg"),
+            Some(backgrounds.join("17-soft.jpg"))
+        );
+        for name in ["", "..", ".hidden", "../state.json", "a/b.jpg", "a\\b.jpg"] {
+            assert_eq!(picture_file(backgrounds, name), None, "{name}");
+        }
     }
 
     #[test]

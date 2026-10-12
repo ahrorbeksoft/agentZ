@@ -24,8 +24,13 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .item.on { background: var(--selected); }
 .item .n { font-size: 12px; color: var(--placeholder); }
 .sec { font-size: 11px; color: var(--placeholder); padding: 14px 8px 4px; }
-.mono { width: 16px; height: 16px; border-radius: 4px; display: inline-grid; place-items: center; font: 600 8px/1 var(--font-sans); color: #fff; flex: none; }
-.mono.small { width: 14px; height: 14px; font-size: 7px; border-radius: 3px; }
+/* A project's icon, as the app's sidebar draws it (project_info::render_project_icon). */
+.mono { width: 16px; height: 16px; border-radius: 4px; display: inline-grid; place-items: center; font: 700 8.25px/16px var(--font-mono); color: var(--tile); background: color-mix(in srgb, var(--tile) 14%, transparent); flex: none; }
+.mono.small { width: 14px; height: 14px; font-size: 7.2px; line-height: 14px; border-radius: 3.5px; }
+.pico { width: 16px; height: 16px; border-radius: 2px; object-fit: contain; flex: none; }
+.pico.small { width: 14px; height: 14px; }
+.pemoji { width: 16px; height: 16px; display: inline-grid; place-items: center; font-size: 12.8px; line-height: 16px; flex: none; }
+.pemoji.small { width: 14px; height: 14px; font-size: 11.2px; line-height: 14px; }
 
 .main { flex: 1; min-width: 0; padding: 18px 24px 48px; overflow-y: auto; }
 .head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
@@ -38,12 +43,13 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .card:hover { border-color: var(--accent); }
 .thumb { position: relative; aspect-ratio: 16 / 9; overflow: hidden; background: #111214; border-bottom: 1px solid var(--border); }
 .thumb .state { position: absolute; left: 8px; top: 8px; }
+.thumb .state .tag { background: var(--solid-background); }
 .mosaic { position: absolute; inset: 0; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 2px; }
 .mosaic.one { grid-template-columns: 1fr; grid-template-rows: 1fr; }
 .mosaic.two { grid-template-rows: 1fr; }
 .mosaic img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; }
-.blank { position: absolute; inset: 0; display: grid; place-items: center; color: var(--placeholder); background: var(--background); }
-.doc { position: absolute; inset: 0; background: var(--background); padding: 12px 14px; display: flex; flex-direction: column; gap: 5px; overflow: hidden; }
+.blank { position: absolute; inset: 0; display: grid; place-items: center; color: var(--placeholder); background: var(--solid-background); }
+.doc { position: absolute; inset: 0; background: var(--solid-background); padding: 12px 14px; display: flex; flex-direction: column; gap: 5px; overflow: hidden; }
 .doc b { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; }
 .doc p { margin: 0 0 3px; font-size: 10px; line-height: 1.45; color: var(--muted); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; flex: none; }
 .doc i { height: 5px; border-radius: 3px; background: var(--hover); display: block; flex: none; }
@@ -82,6 +88,8 @@ let found = null;
 let searchAsked = 0;
 let searchTimer = null;
 let loaded = false;
+// Chats are on in the app's settings; off, they aren't a place here either.
+let chats = DATA.chats !== false;
 
 const keyOf = (machine, id) => (machine || '') + '\u0000' + id;
 const items = () => machines.flatMap((entry) => entry.artifacts.map((listing) => ({ machine: entry.machine, listing })))
@@ -103,13 +111,23 @@ function placeName(where = place) {
   return 'All artifacts';
 }
 
-const COLORS = ['#3d8b5a', '#3a72c4', '#8a5cc7', '#b8673a', '#2f8f8f', '#b5485d', '#7a8a2e'];
-function mono(name, small = false) {
-  const parts = name.split(/[\s_\-./]+/).filter(Boolean);
-  const initials = (parts.length > 1 ? parts[0][0] + parts[1][0] : name.slice(0, 2)).toUpperCase();
-  let hash = 0;
-  for (const character of name) hash = (hash * 31 + character.codePointAt(0)) >>> 0;
-  return h('span', { class: 'mono' + (small ? ' small' : ''), style: { background: COLORS[hash % COLORS.length] }, text: initials });
+// The project's icon as the app's sidebar shows it: its emoji, its icon file from the project's
+// machine, or letters on a tile, which the file falls back to if it can't be loaded.
+function projectIcon(item, small = false) {
+  const listing = item.listing;
+  const icon = listing.project_icon;
+  if (!icon) return null;
+  const size = small ? ' small' : '';
+  if (icon.emoji) return h('span', { class: 'pemoji' + size, text: icon.emoji });
+  const letters = () => {
+    const tile = h('span', { class: 'mono' + size, text: icon.text });
+    tile.style.setProperty('--tile', `light-dark(${icon.light}, ${icon.dark})`);
+    return tile;
+  };
+  if (!icon.file) return letters();
+  const image = h('img', { class: 'pico' + size, alt: '', src: api('/api/project-icon', { machine: item.machine, project: listing.artifact.project_id }) });
+  image.addEventListener('error', () => image.replaceWith(letters()));
+  return image;
 }
 
 function renderBar() {
@@ -130,15 +148,20 @@ function renderSide() {
   const count = (where) => list.filter((item) => inPlace(item, where)).length;
   const row = (where, glyph, name) => h('button', { class: 'item' + (where === place ? ' on' : ''), onclick: () => setPlace(where) },
     glyph, h('span', { class: 'grow trunc', text: name }), h('span', { class: 'n', text: String(count(where)) }));
-  const projects = [...new Set(list.map((item) => item.listing.project).filter(Boolean))];
+  // Each project's icon is its first artifact's project's.
+  const firsts = new Map();
+  for (const item of list) {
+    if (item.listing.project && !firsts.has(item.listing.project)) firsts.set(item.listing.project, item);
+  }
+  const projects = [...firsts.keys()];
   if (place.startsWith('project:') && !projects.includes(place.slice('project:'.length))) projects.push(place.slice('project:'.length));
   projects.sort((first, second) => first.localeCompare(second));
   fill($('side'),
     row('all', icon('layers', 15), 'All artifacts'),
     row('waiting', icon('inbox', 15), 'Waiting for you'),
     h('div', { class: 'sec', text: 'Projects' }),
-    ...projects.map((name) => row('project:' + name, mono(name), name)),
-    row('chats', icon('chat', 15), 'Chats'),
+    ...projects.map((name) => row('project:' + name, firsts.has(name) ? projectIcon(firsts.get(name)) : null, name)),
+    chats ? row('chats', icon('chat', 15), 'Chats') : null,
   );
 }
 
@@ -180,7 +203,7 @@ function marked(line) {
 function fromLine(item) {
   const listing = item.listing;
   return h('div', { class: 'from' },
-    listing.chat ? icon('chat', 12) : listing.project ? mono(listing.project, true) : null,
+    listing.chat ? icon('chat', 12) : listing.project ? projectIcon(item, true) : null,
     h('span', { class: 'trunc grow', text: listing.place }),
     item.machine ? h('span', { class: 'mach', title: 'On ' + item.machine }, icon('server', 11), item.machine) : null,
     listing.archived ? h('span', { class: 'tag' }, icon('archive', 11), 'Archived') : null);
@@ -302,7 +325,14 @@ window.addEventListener('keydown', (event) => {
 
 let reloadTimer = null;
 listenEvents((event) => {
-  if (event.type === 'theme') return;
+  if (event.type === 'theme') {
+    if (event.chats !== chats) {
+      chats = event.chats;
+      if (!chats && place === 'chats') setPlace('all');
+      else renderSide();
+    }
+    return;
+  }
   clearTimeout(reloadTimer);
   reloadTimer = setTimeout(() => { load(); if (words.trim()) setWords(words); }, 300);
 });

@@ -183,6 +183,84 @@ pub enum ProjectIcon {
     },
 }
 
+/// A monogram's letters as its tile shows them.
+pub fn monogram_text(text: &str) -> String {
+    text.chars().take(2).collect::<String>().to_uppercase()
+}
+
+/// Two letters for a project: the first letter, then a digit from the first word, the first
+/// letter of the last word, or the first word's last letter (t3code's rule).
+pub fn monogram(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let Some(first_glyph) = words.first().and_then(|word| word.chars().next()) else {
+        return "PR".to_string();
+    };
+    let first_word: Vec<char> = words
+        .first()
+        .map(|word| word.chars().collect())
+        .unwrap_or_default();
+    let second_glyph = first_word
+        .iter()
+        .skip(1)
+        .find(|glyph| glyph.is_numeric())
+        .copied()
+        .or_else(|| {
+            if words.len() > 1 {
+                words.last().and_then(|word| word.chars().next())
+            } else {
+                first_word.last().copied()
+            }
+        })
+        .unwrap_or(first_glyph);
+    format!("{first_glyph}{second_glyph}")
+        .to_uppercase()
+        .chars()
+        .take(2)
+        .collect()
+}
+
+/// t3code's project colors: Tailwind's 600 shades on light themes and 400 shades on dark ones.
+pub const MONOGRAM_COLORS: [(&str, u32, u32); 18] = [
+    ("gray", 0x4b5563, 0x9ca3af),
+    ("red", 0xdc2626, 0xf87171),
+    ("orange", 0xea580c, 0xfb923c),
+    ("amber", 0xd97706, 0xfbbf24),
+    ("yellow", 0xca8a04, 0xfacc15),
+    ("lime", 0x65a30d, 0xa3e635),
+    ("green", 0x16a34a, 0x4ade80),
+    ("emerald", 0x059669, 0x34d399),
+    ("teal", 0x0d9488, 0x2dd4bf),
+    ("cyan", 0x0891b2, 0x22d3ee),
+    ("sky", 0x0284c7, 0x38bdf8),
+    ("blue", 0x2563eb, 0x60a5fa),
+    ("indigo", 0x4f46e5, 0x818cf8),
+    ("violet", 0x7c3aed, 0xa78bfa),
+    ("purple", 0x9333ea, 0xc084fc),
+    ("fuchsia", 0xc026d3, 0xe879f9),
+    ("pink", 0xdb2777, 0xf472b6),
+    ("rose", 0xe11d48, 0xfb7185),
+];
+
+/// The project's automatic color, one of [`MONOGRAM_COLORS`].
+pub fn monogram_color(name: &str) -> (&'static str, u32, u32) {
+    MONOGRAM_COLORS
+        .get(monogram_color_index(name))
+        .copied()
+        .unwrap_or(("blue", 0x2563eb, 0x60a5fa))
+}
+
+/// A stable color per project name, hashed the way t3code does.
+fn monogram_color_index(name: &str) -> usize {
+    let seed = name.trim().to_lowercase();
+    let seed = if seed.is_empty() { "project" } else { &seed };
+    seed.chars().fold(0, |index, glyph| {
+        (index * 31 + glyph as usize) % MONOGRAM_COLORS.len()
+    })
+}
+
 /// A thread's title until its first prompt names it.
 pub const NEW_THREAD_TITLE: &str = "New thread";
 
@@ -2232,6 +2310,24 @@ fn write_state(path: &Path, state: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monograms() {
+        assert_eq!(monogram("dramabot"), "DT");
+        assert_eq!(monogram("shop-landing"), "SL");
+        assert_eq!(monogram("web3app"), "W3");
+        assert_eq!(monogram("x"), "XX");
+        assert_eq!(monogram("--"), "PR");
+    }
+
+    #[test]
+    fn monogram_colors_are_stable() {
+        assert_eq!(
+            monogram_color_index("agentZ"),
+            monogram_color_index("AGENTZ")
+        );
+        assert!(monogram_color_index("anything") < MONOGRAM_COLORS.len());
+    }
 
     #[test]
     fn adding_removing_and_scoping_projects() {
