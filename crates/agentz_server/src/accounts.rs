@@ -13,7 +13,8 @@ mod login_checks;
 mod qoder;
 mod readers;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use agentz_protocol::accounts::{AccountId, AgentAccounts};
@@ -123,6 +124,27 @@ pub fn agent_folder(data_dir: &Path, agent_id: &AgentId) -> Result<PathBuf> {
 /// in, so what the reader leaves there (Droid's sessions) is its own.
 pub fn reader_folder(data_dir: &Path, agent_id: &AgentId) -> Result<PathBuf> {
     Ok(agent_folder(data_dir, agent_id)?.join("reader"))
+}
+
+/// The home variables ([`AgentDescription::home_variables`]) that `value_of` puts in a folder
+/// in `data_dir`'s `accounts`, as agentZ sets them for an account's agent. A server started
+/// from that agent's shell (an agent that relaunched the app) inherits them, and would run the
+/// External account in that account's folder, where its sessions aren't.
+pub fn inherited_account_variables(
+    data_dir: &Path,
+    descriptions: &[AgentDescription],
+    value_of: impl Fn(&str) -> Option<OsString>,
+) -> BTreeSet<String> {
+    let accounts = data_dir.join("accounts");
+    descriptions
+        .iter()
+        .flat_map(|description| description.home_variables.keys())
+        .filter(|variable| {
+            value_of(variable.as_str())
+                .is_some_and(|value| Path::new(&value).starts_with(&accounts))
+        })
+        .cloned()
+        .collect()
 }
 
 /// The API key the account in `home` logs in with, if it has one.
@@ -277,5 +299,39 @@ mod tests {
         remove_home(dir.path(), &mock, AccountId(1)).expect("remove");
         assert!(!home.exists());
         assert!(dir.path().join("accounts").join("mock").exists());
+    }
+
+    #[test]
+    fn finds_account_folders_inherited_from_an_accounts_agent() {
+        let data_dir = Path::new("/data");
+        let descriptions = [
+            built_in_description("factory-droid").expect("droid"),
+            built_in_description("devin").expect("devin"),
+        ];
+        let inherited = |environment: &[(&str, &str)]| {
+            let environment: BTreeMap<&str, &str> = environment.iter().copied().collect();
+            inherited_account_variables(data_dir, &descriptions, |variable| {
+                environment.get(variable).map(OsString::from)
+            })
+        };
+
+        assert_eq!(
+            inherited(&[
+                ("FACTORY_HOME_OVERRIDE", "/data/accounts/factory-droid/3"),
+                ("XDG_DATA_HOME", "/data/accounts/devin/1/.local/share"),
+                // The user's own.
+                ("XDG_CONFIG_HOME", "/Users/me/.config"),
+                // Not a home variable.
+                ("PWD", "/data/accounts/factory-droid/3"),
+            ]),
+            BTreeSet::from([
+                "FACTORY_HOME_OVERRIDE".to_string(),
+                "XDG_DATA_HOME".to_string()
+            ])
+        );
+        // The user's own home for Droid, even beside agentZ's data.
+        assert!(inherited(&[("FACTORY_HOME_OVERRIDE", "/Users/me/factory")]).is_empty());
+        assert!(inherited(&[("FACTORY_HOME_OVERRIDE", "/data/accounts-old/1")]).is_empty());
+        assert!(inherited(&[]).is_empty());
     }
 }

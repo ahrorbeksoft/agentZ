@@ -1204,8 +1204,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   login variables (`AgentCommand::env_remove`; a terminal login runs through `env -u`), then
   the account's Environment, where a login variable set on purpose stays, then the home
   variables and switches, then its key. The External account runs as before, in the normal
-  home. Removing an account stops its agents, then deletes its folder; its threads stay but
-  fail to start.
+  home. A home variable that puts the agent in `accounts/`, which a server started by an
+  account's agent (one that relaunched the app) inherits, is dropped as the server starts
+  (`agentz_server::inherited_account_variables`): it would run every External thread in that
+  account's folder. Removing an account stops its agents, then deletes its folder; its threads
+  stay but fail to start.
   Each account has its own `AgentSettings` (environment, defaults, the options it last
   offered, its login), since accounts of one agent don't get the same models; the External
   account's are the agent's settings from before

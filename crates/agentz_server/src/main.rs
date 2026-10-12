@@ -2,6 +2,7 @@
 //! in the data directory; the app starts it with `start`, and clients on other machines reach it
 //! through `proxy` over SSH.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::os::unix::fs::PermissionsExt as _;
@@ -10,12 +11,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agentz_protocol::agents::AgentId;
 use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, PROTOCOL_VERSION, Request, Response, ServerMessage,
     ServerWelcome, ToolCaller, read_message, write_message,
 };
 use agentz_server::handoff::{HandedOver, Takeover};
-use agentz_server::{AgentControl, ServerConfig};
+use agentz_server::{AgentControl, CustomAgent, ServerConfig};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use futures::FutureExt as _;
@@ -138,6 +140,16 @@ struct Handoff {
 }
 
 fn run(handoff: bool) -> Result<()> {
+    let data_dir = paths::data_dir();
+    let custom_agents = agentz_server::load_custom_agents(data_dir)
+        .log_err()
+        .unwrap_or_default();
+    // Every agent, terminal and newer server this one starts inherits its environment.
+    for variable in agentz_server::inherited_account_variables(data_dir, &custom_agents) {
+        log::info!("leaving out {variable}, which an account's agent passed on");
+        // SAFETY: no other thread runs yet.
+        unsafe { std::env::remove_var(&variable) };
+    }
     let socket = paths::server_socket();
     let handoff = if handoff {
         let connection = std::io::stdin()
@@ -159,10 +171,14 @@ fn run(handoff: bool) -> Result<()> {
         .enable_all()
         .build()
         .context("starting the runtime")?;
-    runtime.block_on(serve(&socket, handoff))
+    runtime.block_on(serve(&socket, handoff, custom_agents))
 }
 
-async fn serve(socket: &Path, handoff: Option<Handoff>) -> Result<()> {
+async fn serve(
+    socket: &Path,
+    handoff: Option<Handoff>,
+    custom_agents: BTreeMap<AgentId, CustomAgent>,
+) -> Result<()> {
     let (listener, handed_over, takeover) = match handoff {
         Some(handoff) => {
             handoff
@@ -207,9 +223,7 @@ async fn serve(socket: &Path, handoff: Option<Handoff>) -> Result<()> {
             version: VERSION.to_string(),
             http_client,
             shell_environment_ready,
-            custom_agents: agentz_server::load_custom_agents(paths::data_dir())
-                .log_err()
-                .unwrap_or_default(),
+            custom_agents,
             agent_control: Some(AgentControl {
                 executable: std::env::current_exe().context("finding this executable")?,
                 socket: socket.to_path_buf(),

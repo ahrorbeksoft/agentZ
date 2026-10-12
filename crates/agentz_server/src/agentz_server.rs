@@ -32,7 +32,7 @@ mod title_generation;
 mod transcripts;
 mod workspaces;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -129,6 +129,27 @@ pub fn load_custom_agents(data_dir: &Path) -> Result<BTreeMap<AgentId, CustomAge
 
 fn custom_agents_path(data_dir: &Path) -> PathBuf {
     data_dir.join("agents").join("custom.json")
+}
+
+/// The variables in the server's environment that put an agent in one of its accounts' folders,
+/// inherited from an account's agent that started this server
+/// ([`accounts::inherited_account_variables`]). The server drops them as it starts.
+pub fn inherited_account_variables(
+    data_dir: &Path,
+    custom_agents: &BTreeMap<AgentId, CustomAgent>,
+) -> BTreeSet<String> {
+    let descriptions: Vec<AgentDescription> = accounts::BUILT_IN_DESCRIPTIONS
+        .into_iter()
+        .filter_map(accounts::built_in_description)
+        .chain(
+            custom_agents
+                .values()
+                .filter_map(|agent| agent.accounts.clone()),
+        )
+        .collect();
+    accounts::inherited_account_variables(data_dir, &descriptions, |variable| {
+        std::env::var_os(variable)
+    })
 }
 
 /// The hash the SSH installer wrote beside this binary. Read at start, because a newer
