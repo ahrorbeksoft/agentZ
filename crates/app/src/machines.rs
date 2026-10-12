@@ -699,6 +699,7 @@ impl Machines {
             projects,
             settings.project_grouping,
             &settings.project_grouping_overrides,
+            settings.show_repository_owner,
         );
         if self.thread_order(cx) == ThreadOrder::LastActivity {
             let group_activity = |group: &ProjectGroup| {
@@ -746,6 +747,7 @@ impl Machines {
             projects,
             settings.project_grouping,
             &settings.project_grouping_overrides,
+            settings.show_repository_owner,
         )
         .into_iter()
         .find(|group| group.contains(machine, project.id))
@@ -1266,6 +1268,7 @@ fn build_project_groups(
     projects: Vec<(MachineId, Project)>,
     mode: ProjectGroupingMode,
     overrides: &std::collections::BTreeMap<GroupKey, ProjectGroupingMode>,
+    show_repository_owner: bool,
 ) -> Vec<ProjectGroup> {
     let mut groups: Vec<ProjectGroup> = Vec::new();
     for (machine, project) in projects {
@@ -1286,7 +1289,7 @@ fn build_project_groups(
     }
     for group in &mut groups {
         if group.members.len() > 1 {
-            group.label = group_label(&group.members);
+            group.label = group_label(&group.members, show_repository_owner);
         }
     }
     groups
@@ -1323,13 +1326,18 @@ fn path_in_repository(path: &std::path::Path, root: &std::path::Path) -> Option<
 }
 
 /// t3code's `deriveProjectGroupLabel`: the members' shared name unless it's just the
-/// repository's, else `owner/repo`, else the repository's name, else the first member's.
-fn group_label(members: &[(MachineId, Project)]) -> SharedString {
+/// repository's, else `owner/repo` (unless the owner is hidden), else the repository's name,
+/// else the first member's. Names are compared ignoring case, so an `agentZ` folder of the
+/// `agentz` repository is still just the repository's name.
+fn group_label(members: &[(MachineId, Project)], show_repository_owner: bool) -> SharedString {
+    fn same(a: &str, b: &str) -> bool {
+        a.to_lowercase() == b.to_lowercase()
+    }
     fn unique(values: impl Iterator<Item = Option<String>>) -> Vec<String> {
         let mut unique: Vec<String> = Vec::new();
         for value in values.flatten() {
             let value = value.trim().to_string();
-            if !value.is_empty() && !unique.contains(&value) {
+            if !value.is_empty() && !unique.iter().any(|other| same(other, &value)) {
                 unique.push(value);
             }
         }
@@ -1352,15 +1360,19 @@ fn group_label(members: &[(MachineId, Project)]) -> SharedString {
             .as_ref()
             .and_then(|repository| repository.name.clone())
     }));
+    let is_repository_name = |name: &str| {
+        display_names
+            .iter()
+            .chain(&repository_names)
+            .any(|other| same(other, name))
+    };
     match (
         names.as_slice(),
         display_names.as_slice(),
         repository_names.as_slice(),
     ) {
-        ([name], _, _) if !display_names.contains(name) && !repository_names.contains(name) => {
-            name.clone().into()
-        }
-        (_, [display_name], _) => display_name.clone().into(),
+        ([name], _, _) if !is_repository_name(name) => name.clone().into(),
+        (_, [display_name], _) if show_repository_owner => display_name.clone().into(),
         (_, _, [repository_name]) => repository_name.clone().into(),
         _ => members
             .first()
@@ -1478,7 +1490,7 @@ mod tests {
             ProjectGroupingMode::Repository,
             ProjectGroupingMode::RepositoryPath,
         ] {
-            let groups = build_project_groups(clones(), mode, &BTreeMap::new());
+            let groups = build_project_groups(clones(), mode, &BTreeMap::new(), true);
             assert_eq!(
                 member_ids(&groups),
                 [vec![
@@ -1503,7 +1515,12 @@ mod tests {
                 project(2, "/work/b", Some("Custom project")),
             ),
         ];
-        let groups = build_project_groups(named, ProjectGroupingMode::Repository, &BTreeMap::new());
+        let groups = build_project_groups(
+            named,
+            ProjectGroupingMode::Repository,
+            &BTreeMap::new(),
+            true,
+        );
         assert_eq!(groups[0].label.as_ref(), "Custom project");
 
         let repository_named = vec![
@@ -1514,6 +1531,7 @@ mod tests {
             repository_named,
             ProjectGroupingMode::Repository,
             &BTreeMap::new(),
+            true,
         );
         assert_eq!(groups[0].label.as_ref(), "T3 Code");
 
@@ -1521,14 +1539,55 @@ mod tests {
             vec![(MachineId::Local, project(1, "/work/t3code", None))],
             ProjectGroupingMode::Repository,
             &BTreeMap::new(),
+            true,
         );
         assert_eq!(alone[0].label.as_ref(), "t3code");
     }
 
     #[test]
+    fn labels_ignore_case_and_can_hide_the_owner() {
+        // Folders named `agentZ` and `AGENTZ`, of a remote written `Owner/agentz`.
+        let checkouts = || {
+            [
+                (MachineId::Local, "/work/agentZ"),
+                (MachineId::Remote(1), "/srv/AGENTZ"),
+            ]
+            .into_iter()
+            .map(|(machine, path)| {
+                let mut project = project(1, path, None);
+                if let Some(repository) = &mut project.repository {
+                    repository.display_name = Some("Owner/agentz".into());
+                    repository.name = Some("agentz".into());
+                }
+                (machine, project)
+            })
+            .collect::<Vec<_>>()
+        };
+        let groups = build_project_groups(
+            checkouts(),
+            ProjectGroupingMode::Repository,
+            &BTreeMap::new(),
+            true,
+        );
+        assert_eq!(groups[0].label.as_ref(), "Owner/agentz");
+
+        let groups = build_project_groups(
+            checkouts(),
+            ProjectGroupingMode::Repository,
+            &BTreeMap::new(),
+            false,
+        );
+        assert_eq!(groups[0].label.as_ref(), "agentz");
+    }
+
+    #[test]
     fn keeps_clones_apart_when_asked() {
-        let groups =
-            build_project_groups(clones(), ProjectGroupingMode::Separate, &BTreeMap::new());
+        let groups = build_project_groups(
+            clones(),
+            ProjectGroupingMode::Separate,
+            &BTreeMap::new(),
+            true,
+        );
         assert_eq!(groups.len(), 3);
         assert_eq!(
             groups
@@ -1545,7 +1604,8 @@ mod tests {
             }),
             ProjectGroupingMode::Separate,
         )]);
-        let groups = build_project_groups(clones(), ProjectGroupingMode::Repository, &overrides);
+        let groups =
+            build_project_groups(clones(), ProjectGroupingMode::Repository, &overrides, true);
         assert_eq!(
             member_ids(&groups),
             [
@@ -1578,6 +1638,7 @@ mod tests {
             projects.clone(),
             ProjectGroupingMode::RepositoryPath,
             &BTreeMap::new(),
+            true,
         );
         assert_eq!(
             member_ids(&by_path),
@@ -1586,8 +1647,12 @@ mod tests {
                 vec![(MachineId::Local, 2)]
             ]
         );
-        let by_repository =
-            build_project_groups(projects, ProjectGroupingMode::Repository, &BTreeMap::new());
+        let by_repository = build_project_groups(
+            projects,
+            ProjectGroupingMode::Repository,
+            &BTreeMap::new(),
+            true,
+        );
         assert_eq!(by_repository.len(), 1);
     }
 
@@ -1611,6 +1676,7 @@ mod tests {
             vec![(MachineId::Local, first), (MachineId::Local, second)],
             ProjectGroupingMode::Repository,
             &BTreeMap::new(),
+            true,
         );
         assert_eq!(groups.len(), 2);
     }

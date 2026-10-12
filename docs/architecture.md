@@ -1790,6 +1790,10 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   then asks which checkout. Each server looks a project's repository up again every 15 minutes;
   a lookup git couldn't answer (it didn't start, as when the server is out of file descriptors,
   or took over 10 seconds) keeps the repository it had, so the project stays combined.
+  Remotes match lowercased, but a combined project's label (`machines::group_label`, t3code's
+  `deriveProjectGroupLabel`) keeps the remote's case, and compares names ignoring it: a folder
+  named as its repository shows `owner/repo`, or just `repo` with General's Show repository
+  owner off.
   The project switcher's button and a combined project's row there show the icon of each
   machine it's on, named in the icon's tooltip (`project_switcher::render_machine_icons`).
   The switcher's name is the project's everywhere (`Machines::project_label`; project copies

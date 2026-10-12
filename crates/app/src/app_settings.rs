@@ -170,6 +170,9 @@ pub struct AppSettings {
     pub project_grouping_overrides: std::collections::BTreeMap<GroupKey, ProjectGroupingMode>,
     /// The combining mode General's switch turns back on.
     pub last_combined_grouping: ProjectGroupingMode,
+    /// Combined projects named by their repository show it as `owner/repo`, as t3code does,
+    /// rather than just `repo`.
+    pub show_repository_owner: bool,
     /// Terminals' font size, as Cmd-+ and Cmd-- in a terminal left it. `None` is the
     /// default.
     pub terminal_font_size: Option<f32>,
@@ -223,6 +226,7 @@ impl Default for AppSettings {
             project_grouping: ProjectGroupingMode::default(),
             project_grouping_overrides: Default::default(),
             last_combined_grouping: ProjectGroupingMode::default(),
+            show_repository_owner: true,
             terminal_font_size: None,
             is_sidebar_hidden: false,
             use_modifier_to_send: false,

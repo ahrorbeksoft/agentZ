@@ -90,8 +90,11 @@ fn primary_remote(remotes: &BTreeMap<String, String>) -> Option<(String, String)
 }
 
 fn identity(remote_name: String, remote_url: String, root_path: PathBuf) -> RepositoryIdentity {
-    let canonical_key = normalize_git_remote_url(&remote_url);
-    let repository_path = canonical_key
+    // Shown as the remote writes it, so `owner/agentZ` keeps its capital, while clones are
+    // matched by the lowercased key.
+    let repository_key = remote_repository_key(&remote_url);
+    let canonical_key = repository_key.to_lowercase();
+    let repository_path = repository_key
         .split('/')
         .skip(1)
         .collect::<Vec<_>>()
@@ -111,15 +114,15 @@ fn identity(remote_name: String, remote_url: String, root_path: PathBuf) -> Repo
     }
 }
 
-/// A stable comparison key for a remote URL: `host/owner/repo`, lowercased, for both URL and
-/// `user@host:path` forms.
-pub(crate) fn normalize_git_remote_url(value: &str) -> String {
+/// The repository a remote URL names, as `host/owner/repo`, for both URL and `user@host:path`
+/// forms, in the case it's written in. Lowercased, it's the stable key clones are matched by.
+fn remote_repository_key(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches('/');
     let trimmed = match trimmed.len().checked_sub(4) {
         Some(end) if trimmed[end..].eq_ignore_ascii_case(".git") => &trimmed[..end],
         _ => trimmed,
     };
-    let normalized = trimmed.to_lowercase();
+    let normalized = trimmed.to_string();
 
     if URL_REMOTE.is_match(&normalized) {
         let Ok(url) = url::Url::parse(&normalized) else {
@@ -152,13 +155,18 @@ pub(crate) fn normalize_git_remote_url(value: &str) -> String {
 /// Azure DevOps over SSH names a repository `ssh.dev.azure.com/v3/{org}/{project}/{repo}`, and
 /// everywhere else `dev.azure.com/{org}/{project}/_git/{repo}`. Both are keyed by the second.
 fn azure_devops_repository_key(host: &str, segments: &[&str]) -> Option<String> {
+    let host = host.to_lowercase();
     if host != "ssh.dev.azure.com" && host != "vs-ssh.visualstudio.com" {
         return None;
     }
     let [marker, organization, project, repository] = segments else {
         return None;
     };
-    if *marker != "v3" || organization.is_empty() || project.is_empty() || repository.is_empty() {
+    if !marker.eq_ignore_ascii_case("v3")
+        || organization.is_empty()
+        || project.is_empty()
+        || repository.is_empty()
+    {
         return None;
     }
     Some(if host == "ssh.dev.azure.com" {
@@ -343,8 +351,16 @@ mod tests {
             ("https://github.com/owner/repo/", "github.com/owner/repo"),
             ("/srv/git/repo.git", "/srv/git/repo"),
         ] {
-            assert_eq!(normalize_git_remote_url(remote), key, "{remote}");
+            assert_eq!(
+                remote_repository_key(remote).to_lowercase(),
+                key,
+                "{remote}"
+            );
         }
+        assert_eq!(
+            remote_repository_key("git@github.com:T3Tools/T3Code.git"),
+            "github.com/T3Tools/T3Code"
+        );
     }
 
     #[test]
@@ -372,9 +388,9 @@ mod tests {
             PathBuf::from("/code/repo"),
         );
         assert_eq!(identity.canonical_key, "github.com/team/repo");
-        assert_eq!(identity.display_name.as_deref(), Some("team/repo"));
-        assert_eq!(identity.owner.as_deref(), Some("team"));
-        assert_eq!(identity.name.as_deref(), Some("repo"));
+        assert_eq!(identity.display_name.as_deref(), Some("Team/Repo"));
+        assert_eq!(identity.owner.as_deref(), Some("Team"));
+        assert_eq!(identity.name.as_deref(), Some("Repo"));
     }
 
     #[test]

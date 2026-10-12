@@ -1708,6 +1708,21 @@ impl SettingsPage {
                 cx,
             ));
         }
+        let show_owner = self.app_settings.read(cx).settings().show_repository_owner;
+        let app_settings = self.app_settings.clone();
+        rows.push(render_row(
+            "Show repository owner",
+            "Combined projects named by their repository show it as owner/repo.",
+            Switch::new("show-repository-owner", show_owner.into())
+                .on_click(move |state, _, cx| {
+                    let show = *state == ToggleState::Selected;
+                    app_settings.update(cx, |store, cx| {
+                        store.update(|settings| settings.show_repository_owner = show, cx)
+                    })
+                })
+                .into_any_element(),
+            cx,
+        ));
         rows
     }
 
