@@ -51,3 +51,8 @@ preview) and not the current implementation elsewhere. Make it the same experien
 - A sent message should show its image mentions in place, as written, so text like "in this
   [image], it looks like that and this happened: [image]" reads the same after sending.
 - The image previews above user messages aren't wanted.
+
+### A forked thread looks like a new thread
+
+When a thread is forked, show the fork in something like the new thread view's style. The
+user doesn't like the current design.
