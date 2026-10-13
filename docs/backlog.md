@@ -34,3 +34,14 @@ artifact moves with its thread when the thread goes on on another machine. Nothi
 thread to another machine yet (Continue with Another Agent, workspace handoff and the limit
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
+
+### Images as mentions everywhere, as in the composer
+
+Rework images. The user likes how they look in the composer (a link/mention with a hover
+preview) and not the current implementation elsewhere. Make it the same experience everywhere:
+
+- Copying what was written in the composer and pasting it somewhere else should bring the
+  images along; today they're lost when pasted elsewhere.
+- A sent message should show its image mentions in place, as written, so text like "in this
+  [image], it looks like that and this happened: [image]" reads the same after sending.
+- The image previews above user messages aren't wanted.
