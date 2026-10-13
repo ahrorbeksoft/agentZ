@@ -25,6 +25,12 @@ more reliable way to stop a session's turn.
 With a long thread title, the header's project name shrinks to a few letters ("agentZ" shows
 as "age…"). Project names shouldn't shrink this much.
 
+### An edit's card has two headers
+
+An edit's tool call card shows two headers, one above the other
+([screenshot](backlog/edit-card-double-header.png)): "Edited docs/backlog.md +11 -0", then
+"docs/backlog.md +11 -0 Open". One header is enough.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
