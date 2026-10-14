@@ -56,3 +56,8 @@ preview) and not the current implementation elsewhere. Make it the same experien
 
 When a thread is forked, show the fork in something like the new thread view's style. The
 user doesn't like the current design.
+
+### A live page design doesn't need desktop and mobile views
+
+When a design is a live page, it doesn't need separate desktop and mobile views. Maybe make the
+preview resizable instead; the user is open to ideas.
