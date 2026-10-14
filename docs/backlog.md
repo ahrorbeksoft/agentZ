@@ -31,6 +31,15 @@ An edit's tool call card shows two headers, one above the other
 ([screenshot](backlog/edit-card-double-header.png)): "Edited docs/backlog.md +11 -0", then
 "docs/backlog.md +11 -0 Open". One header is enough.
 
+### A turn with background work ends too early
+
+With some agents (Claude Agent here, [screenshot](backlog/background-task-turn-ends.png)),
+a turn that leaves something running in the background ends, the thread shows "Waiting", and
+each message the agent sends as the background work goes on gets its own turn footer (time,
+copy, fork). The user likes those footers on real turns but finds them ugly here. Until
+everything the agent started stops, background jobs included, the agent is working: drop the
+"Waiting", and keep it all one turn.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
