@@ -70,3 +70,8 @@ user doesn't like the current design.
 
 When a design is a live page, it doesn't need separate desktop and mobile views. Maybe make the
 preview resizable instead; the user is open to ideas.
+
+### An optional Working group in the sidebar
+
+Add an optional Working group to the sidebar that groups the threads whose agents are working,
+as Archived groups archived threads, but with the normal thread row style. t3code has it.
