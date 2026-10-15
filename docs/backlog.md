@@ -40,6 +40,11 @@ copy, fork). The user likes those footers on real turns but finds them ugly here
 everything the agent started stops, background jobs included, the agent is working: drop the
 "Waiting", and keep it all one turn.
 
+### The new thread composer looks bad in small panes
+
+The new thread composer doesn't fit small panes: in the Workspaces view with many threads on
+one screen (3×3 or more), it looks bad. Make it more responsive.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
