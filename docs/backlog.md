@@ -111,7 +111,8 @@ something like a day, 3 days or a week of inactivity.
 Design artifacts need the feature selection that the repo's design rounds (`design/`) have. The
 user thinks it isn't in design artifacts yet.
 
-### A second send command that steers
+### Enter in an empty composer steers the queued message
 
-While a turn runs, a message is queued with one command (mostly Enter). Another command should
-send it to steer instead.
+While a turn runs, a message is queued with a command (mostly Enter). The same command again,
+while the composer is empty and focused, should make the queued message steer: an empty,
+focused composer shows the user means it.
