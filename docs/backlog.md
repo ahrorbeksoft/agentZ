@@ -51,6 +51,20 @@ Factory Droid can run a subagent and end its turn while it waits for the subagen
 Agent had this kind of issue and it was fixed; check whether that fix was only for Claude
 rather than every ACP agent, since Droid has the problem now.
 
+### The app uses 35–45% CPU while a turn runs
+
+While anything animates (a running turn's shimmering label or a spinner), GPUI redraws the
+whole window each frame at 60 Hz, and nothing is cached, so each frame takes about 5–6 ms of
+the main thread. macOS flagged agentZ for over 50% CPU for 3 minutes on Oct 9, 11 and 12, all
+in this drawing path. A profile showed each frame laying out the whole window again, and
+rebuilding every sidebar thread card (`render_threads`, `render_thread_card`,
+`thread_details`). Two fixes:
+
+- Cache the sidebar and thread views (`AnyView::cached`, as Zed does), so one spinner doesn't
+  rebuild the whole window.
+- Move per-frame work out of `render`: `Machines::archived_threads` sorts the threads, and the
+  agent view clones each agent's `SessionConfigSelectOption` lists, on every frame.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
