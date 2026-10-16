@@ -47,9 +47,11 @@ one screen (3×3 or more), it looks bad. Make it more responsive.
 
 ### Droid's turn ends while its subagents still run
 
-Factory Droid can run a subagent and end its turn while it waits for the subagents. Claude
-Agent had this kind of issue and it was fixed; check whether that fix was only for Claude
-rather than every ACP agent, since Droid has the problem now.
+Factory Droid can run a subagent and end its turn while it waits for the subagents
+([screenshot](backlog/droid-turn-ends-before-subagents.png): "The four reviewers are still
+reading pages, so I'll wait for their reports", then the turn's footer). Claude Agent had this
+kind of issue and it was fixed; check whether that fix was only for Claude rather than every
+ACP agent, since Droid has the problem now.
 
 ### The app uses 35–45% CPU while a turn runs
 
