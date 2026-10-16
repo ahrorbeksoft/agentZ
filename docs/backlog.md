@@ -89,6 +89,13 @@ may come from this, and so may this one
 ([screenshot](backlog/droid-waiting-for-you.png)): "Factory Droid is waiting for you ↓" shows
 over the conversation while the turn still has Stop; the user isn't sure what's wrong there.
 
+### OpenCode's thread isn't working while its subagents run
+
+While OpenCode runs subagents in the background, its thread doesn't show as working, yet a
+background process shows in it ([screenshot](backlog/opencode-subagents-not-working.png): the
+turn's footer, then "Running Author Foundation R1+R2 sets: shell" below it, and no Working in
+the sidebar).
+
 ## Features
 
 ### Artifacts move with their thread to another machine
