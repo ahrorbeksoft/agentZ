@@ -67,6 +67,13 @@ rebuilding every sidebar thread card (`render_threads`, `render_thread_card`,
 - Move per-frame work out of `render`: `Machines::archived_threads` sorts the threads, and the
   agent view clones each agent's `SessionConfigSelectOption` lists, on every frame.
 
+### Droid still shows Working after it's done
+
+A Factory Droid thread keeps showing Working after its turn is complete
+([screenshot](backlog/droid-working-after-done.png)): its final message ("Done — committed as
+… and pushed"), the plan All Done, yet the sidebar says Working, the thread says "Working for
+23m 15s" and the composer shows Stop.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
