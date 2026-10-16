@@ -91,3 +91,8 @@ as Archived groups archived threads, but with the normal thread row style. t3cod
 
 A setting that archives threads after a period of inactivity, going by their last activity:
 something like a day, 3 days or a week of inactivity.
+
+### Feature selection in design artifacts
+
+Design artifacts need the feature selection that the repo's design rounds (`design/`) have. The
+user thinks it isn't in design artifacts yet.
