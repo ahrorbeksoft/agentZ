@@ -111,6 +111,7 @@ something like a day, 3 days or a week of inactivity.
 Design artifacts need the feature selection that the repo's design rounds (`design/`) have. The
 user thinks it isn't in design artifacts yet.
 
-### Sending a queued message again steers
+### A second send command that steers
 
-When a message is queued (mostly with Enter), the same command again should make it steer.
+While a turn runs, a message is queued with one command (mostly Enter). Another command should
+send it to steer instead.
