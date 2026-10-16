@@ -74,6 +74,13 @@ A Factory Droid thread keeps showing Working after its turn is complete
 … and pushed"), the plan All Done, yet the sidebar says Working, the thread says "Working for
 23m 15s" and the composer shows Stop.
 
+### A turn often starts without a message
+
+Often a turn's response starts straight with the tool group, with no message from the agent
+before it (Factory Droid here, [screenshot](backlog/turn-starts-with-tool-group.png): "Ran 26
+commands, changed 1 file, and performed 8 other actions" right under the user's message). The
+user sees this a lot and asks whether agentZ is missing a first message in agent responses.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
