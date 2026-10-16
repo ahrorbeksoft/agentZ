@@ -81,6 +81,14 @@ before it (Factory Droid here, [screenshot](backlog/turn-starts-with-tool-group.
 commands, changed 1 file, and performed 8 other actions" right under the user's message). The
 user sees this a lot and asks whether agentZ is missing a first message in agent responses.
 
+### Catch up with Droid's ACP agent
+
+The Factory Droid team has been updating its ACP agent a lot lately, and the user guesses some
+things broke because of it. Check what's new in it and fix what broke. The Droid entries above
+may come from this, and so may this one
+([screenshot](backlog/droid-waiting-for-you.png)): "Factory Droid is waiting for you ↓" shows
+over the conversation while the turn still has Stop; the user isn't sure what's wrong there.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
