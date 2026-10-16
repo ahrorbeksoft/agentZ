@@ -80,3 +80,8 @@ preview resizable instead; the user is open to ideas.
 
 Add an optional Working group to the sidebar that groups the threads whose agents are working,
 as Archived groups archived threads, but with the normal thread row style. t3code has it.
+
+### Auto-archive settings
+
+A setting that archives threads after a period of inactivity, going by their last activity:
+something like a day, 3 days or a week of inactivity.
