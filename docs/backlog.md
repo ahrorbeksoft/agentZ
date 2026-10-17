@@ -108,6 +108,14 @@ The composer's account picker needs the session limits too
 ([screenshot](backlog/account-picker-usage.png), emails covered): each account there shows a
 single "N% left". The same setting applies there.
 
+### A read's card shows a summary line in place of the file
+
+A read's card now shows one line, the tool's summary, where the file's lines should be
+([screenshot](backlog/read-card-summary-line.png): "Read src/app.html 1 line", then "Read
+/Users/…/src/app.html: lines 1-109 (109 lines, 3.4 KiB); the file h…"). The user restarted
+recently and wonders whether an old server is running, or whether an ACP agent (Factory Droid)
+changed something; see "Catch up with Droid's ACP agent".
+
 ## Features
 
 ### Artifacts move with their thread to another machine
