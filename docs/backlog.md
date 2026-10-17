@@ -121,6 +121,12 @@ changed something; see "Catch up with Droid's ACP agent".
 Agents ignore the project's design preferences for artifacts. Find a way to make them follow
 them.
 
+### A remote thread's project icon
+
+A remote thread's card doesn't show its project's icon
+([screenshot](backlog/remote-thread-project-icon.png)): the local agentZ thread has the
+project's "Z" icon, while the remote one, on the SSH machine, shows a red "AZ" letter tile.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
