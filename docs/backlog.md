@@ -162,3 +162,7 @@ Zed announced ([screenshot](backlog/zed-smaller-binaries.png)) that its executab
 about 30% on every platform in the next Stable release (268.6 MB in 1.24.2, 183.7 MB in the
 1.25.0 Preview). Check whether whatever did that affects agentZ, and whether agentZ can shrink
 the same way.
+
+### An Open in Editor button
+
+Add an Open in Editor button, as t3code has.
