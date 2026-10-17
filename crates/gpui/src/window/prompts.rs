@@ -109,24 +109,22 @@ impl Render for FallbackPromptRenderer {
             .rounded_lg()
             .overflow_hidden()
             .p_3()
+            // A text's height is measured at the width the flex row gave it before it shrank to
+            // fit, so a long detail wrapped into more lines than its box had room for and the
+            // prompt's `overflow_hidden` cut them off. A block of the prompt's own width wraps
+            // at the width it is measured at.
             .child(
                 div()
                     .w_full()
-                    .flex()
-                    .flex_row()
-                    .justify_around()
-                    .child(div().overflow_hidden().child(self.message.clone())),
+                    .overflow_hidden()
+                    .text_center()
+                    .child(self.message.clone()),
             )
-            .children(self.detail.clone().map(|detail| {
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .justify_around()
-                    .text_sm()
-                    .mb_2()
-                    .child(div().child(detail))
-            }))
+            .children(
+                self.detail
+                    .clone()
+                    .map(|detail| div().w_full().text_center().text_sm().mb_2().child(detail)),
+            )
             .children(self.actions.iter().enumerate().map(|(ix, action)| {
                 div()
                     .flex()
