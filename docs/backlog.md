@@ -104,6 +104,10 @@ current session (the 5-hour window) instead. The one exception: when a longer wi
 monthly, is at 0, show that one, even if the current session has plenty left, since nothing
 works until it resets.
 
+The composer's account picker needs the session limits too
+([screenshot](backlog/account-picker-usage.png), emails covered): each account there shows a
+single "N% left".
+
 ## Features
 
 ### Artifacts move with their thread to another machine
