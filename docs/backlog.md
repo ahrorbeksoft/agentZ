@@ -147,3 +147,10 @@ user thinks it isn't in design artifacts yet.
 While a turn runs, a message is queued with a command (mostly Enter). The same command again,
 while the composer is empty and focused, should make the queued message steer: an empty,
 focused composer shows the user means it.
+
+### Zed's smaller binaries
+
+Zed announced ([screenshot](backlog/zed-smaller-binaries.png)) that its executable drops by
+about 30% on every platform in the next Stable release (268.6 MB in 1.24.2, 183.7 MB in the
+1.25.0 Preview). Check whether whatever did that affects agentZ, and whether agentZ can shrink
+the same way.
