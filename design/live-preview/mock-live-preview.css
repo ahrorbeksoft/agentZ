@@ -1,0 +1,27 @@
+/* Resizing a live page: the width controls and handles the round draws. The design page itself
+   is the artifacts-2 round's (.bd-*, .phd, .pg). */
+
+.m .lp-chip { height: 24px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--b); display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--mu); background: var(--ed); flex: none; white-space: nowrap; }
+.m .lp-chip.on { background: var(--sel); color: var(--t); }
+.m .lp-chip.sm { height: 20px; padding: 0 7px; font-size: 11px; border-radius: 5px; }
+.m .lp-chip i { font-style: normal; color: var(--ph); font-size: 11px; }
+.m .lp-chip.on i { color: var(--mu); }
+.m .lp-field { height: 24px; min-width: 46px; padding: 0 7px; border-radius: 6px; border: 1px solid var(--b); background: var(--ed); color: var(--t); font-size: 12px; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.m .lp-field.ac { border-color: var(--ac); }
+.m .lp-x { color: var(--ph); font-size: 12px; flex: none; }
+.m .lp-readout { background: rgba(0,0,0,.78); color: #fff; font: 11px 'IBM Plex Mono', monospace; border-radius: 6px; padding: 3px 8px; white-space: nowrap; flex: none; }
+.m .lp-handle { position: absolute; top: 50%; width: 12px; height: 64px; margin-top: -32px; border-radius: 6px; background: #c9ccd1; display: flex; align-items: center; justify-content: center; gap: 2px; box-shadow: 0 2px 8px rgba(0,0,0,.5); z-index: 5; }
+.m .lp-handle::before, .m .lp-handle::after { content: ''; width: 1.5px; height: 24px; background: #6b6f78; }
+.m .lp-ghost { position: absolute; top: 0; bottom: 0; border: 1px dashed rgba(255,255,255,.22); border-radius: 6px; pointer-events: none; }
+.m .lp-bar { display: inline-flex; align-items: center; gap: 10px; padding: 6px 12px; border-radius: 8px; background: var(--panel); border: 1px solid var(--b); font-size: 12px; color: var(--mu); flex: none; }
+.m .lp-bar b { color: var(--t); font-weight: 500; }
+.m .lp-slider { position: relative; height: 14px; flex: none; }
+.m .lp-slider .track { position: absolute; left: 0; right: 0; top: 5px; height: 4px; border-radius: 2px; background: var(--b); }
+.m .lp-slider .fill { position: absolute; left: 0; top: 5px; height: 4px; border-radius: 2px; background: var(--ac); }
+.m .lp-slider .thumb { position: absolute; top: 1px; width: 12px; height: 12px; margin-left: -6px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+.m .lp-slider .tick { position: absolute; top: 3px; width: 1px; height: 8px; background: var(--ph); }
+.m .lp-slider .lbl { position: absolute; top: 16px; transform: translateX(-50%); font-size: 10px; color: var(--ph); white-space: nowrap; }
+.m .lp-surround { background: #26272b; position: relative; overflow: hidden; }
+.m .lp-mini { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
+.m .lp-note { font-size: 11px; color: var(--ph); }
+.m .lp-own { font-size: 10px; border: 1px solid rgba(242,197,92,.55); color: var(--warn); border-radius: 9px; padding: 0 7px; white-space: nowrap; }

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forked Thread Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="forked-thread" data-title="Forked thread look">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Forked thread look <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>You said: “A forked thread looks like a new thread. I don’t like the current design.” The wish, as we read it: a fork should look like a fresh start in the style of the new thread screen, not like a long old conversation. This round shows ways to do that.</p>
+<p>Today, Fork from This Response opens a thread holding the source’s conversation up to that reply, in full, with a “Forked from conversation” pill at its end and a pill with the source’s title in the header; the agent gets that conversation with your first message. <b>Today’s pictures are recreated in HTML from the code, not captured from the running app</b> (no display here). Three topics: how the fork opens before its first message, how the carried conversation shows once the fork has its own messages, and where Open Source and Merge Back go. The mocks use the demo world: Add the checkout page, forked at its reply 3 of 5.</p>`;
+</script>
+<script src="mock-forked-thread.js"></script>
+<script src="topics-forked-thread.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
